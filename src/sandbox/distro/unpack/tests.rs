@@ -41,7 +41,7 @@ fn a_layer_lands_and_the_budget_it_spent_is_carried_to_the_next() {
     let after_one = budget.spent();
     assert_eq!(
         after_one,
-        (8, 2),
+        (8 + 2 * layers::ENTRY_BYTES, 2),
         "one member and the directory made for it"
     );
 
@@ -49,7 +49,7 @@ fn a_layer_lands_and_the_budget_it_spent_is_carried_to_the_next() {
     apply(bwrap, &second, TAR, &rootfs, &mut budget, &mut time).expect("the second layer applies");
     assert_eq!(
         budget.spent(),
-        (13, 3),
+        (13 + 3 * layers::ENTRY_BYTES, 3),
         "the second layer adds to the first"
     );
     assert_eq!(
@@ -255,7 +255,11 @@ fn a_layer_spends_the_images_time_and_none_left_refuses_the_next() {
          them"
     );
     assert!(!untouched.exists(), "nothing was started for it");
-    assert_eq!(budget.spent(), (5, 2), "a refused layer spends nothing");
+    assert_eq!(
+        budget.spent(),
+        (5 + 2 * layers::ENTRY_BYTES, 2),
+        "a refused layer spends nothing"
+    );
 }
 
 /// An unpack still running at its deadline is killed, and said to be out of time rather than

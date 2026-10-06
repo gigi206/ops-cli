@@ -86,11 +86,17 @@ pub(super) const MAX_MEMBERS: u64 = 1_000_000;
 /// filesystem has less this ([`Budget::within`]), so an image too large for the disk is refused
 /// with the host still able to write, rather than stopped by the disk once it is full.
 ///
-/// The comparison is an estimate either way, since the budget counts a file's length: a sparse
-/// file counts whole and takes nothing, and a file of one byte takes a block. The entry ceiling is
-/// not compared with the free inodes, which a filesystem that allocates them as it goes, btrfs
-/// among them, reports as none.
+/// The comparison is an estimate either way, since the budget counts a file's length and a block
+/// for every entry ([`ENTRY_BYTES`]): a sparse file counts whole and takes nothing. The entry
+/// ceiling is not compared with the free inodes, which a filesystem that allocates them as it
+/// goes, btrfs among them, reports as none.
 pub(super) const ROOM_KEPT: u64 = 1024 * 1024 * 1024;
+
+/// What every entry an unpack creates is charged against the byte ceiling besides its length: one
+/// block. A directory, a link or an empty file has no length the ceiling would see, and each takes
+/// an inode and a block: a million of them filled about 3.8 GiB of ext4 that a ceiling counting
+/// lengths alone never saw, past the room [`ROOM_KEPT`] keeps for the host.
+pub(super) const ENTRY_BYTES: u64 = 4096;
 
 /// What one image's unpack has spent, carried across its layers. See [`MAX_UNPACKED_BYTES`].
 pub(super) struct Budget {
@@ -140,8 +146,9 @@ impl Budget {
         (self.bytes, self.members)
     }
 
-    /// Count one entry, a member or a directory made for one, refusing past [`MAX_MEMBERS`].
-    fn member(&mut self) -> io::Result<()> {
+    /// Count one entry, a member or a directory made for one, at `at`, refusing past
+    /// [`MAX_MEMBERS`], and charge it [`ENTRY_BYTES`] against the byte ceiling.
+    fn member(&mut self, at: &Path) -> io::Result<()> {
         // Saturating, because a resumed count is a number another process handed over.
         self.members = self.members.saturating_add(1);
         if self.members > MAX_MEMBERS {
@@ -151,7 +158,7 @@ impl Budget {
                  rather than filling the store's filesystem"
             )));
         }
-        Ok(())
+        self.spend(ENTRY_BYTES, at)
     }
 
     /// What is left of the byte ceiling.
@@ -237,20 +244,23 @@ pub(super) fn apply(
     root: &Path,
     budget: &mut Budget,
 ) -> io::Result<()> {
-    fs::create_dir_all(root)?;
     let file = BufReader::new(blob);
-    if media_type.ends_with("+zstd") {
-        return Err(io::Error::other(format!(
-            "layer media type `{media_type}` is not supported (only tar and tar+gzip layers are)"
-        )));
-    }
     if media_type.ends_with("+gzip") || media_type.ends_with(".tar.gzip") || media_type.is_empty() {
+        fs::create_dir_all(root)?;
         // An empty media type is the ambiguous case a hand-written manifest can produce; gzip is
         // the overwhelmingly common framing, and a tar that is not one fails at its header rather
         // than being written as garbage.
         return unpack(GzipReader::new(file)?, root, budget);
     }
-    unpack(file, root, budget)
+    // The uncompressed spellings, OCI's (`.v1.tar`, its non-distributable twin included) and
+    // Docker's (`rootfs.diff.tar`): the type ends where the tar does.
+    if media_type.ends_with(".tar") {
+        fs::create_dir_all(root)?;
+        return unpack(file, root, budget);
+    }
+    Err(io::Error::other(format!(
+        "layer media type `{media_type}` is not supported (only tar and tar+gzip layers are)"
+    )))
 }
 
 /// Walk one layer's members, applying each.
@@ -274,7 +284,7 @@ fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result
             dates.apply();
             return Ok(());
         };
-        budget.member()?;
+        budget.member(root.path)?;
         let mut entry = entry?;
         // A PAX global header describes the archive rather than a member (`git archive` writes one
         // carrying the commit it archived), and every other reader ignores it. The tar reader hands
@@ -397,6 +407,12 @@ impl<'a> Root<'a> {
     /// ([`Self::first_link`]) answers instead; any other failure refuses the member, since a check
     /// that could not run is not one that passed.
     fn check_parents(&self, rel: &Path, parents: &Path) -> io::Result<()> {
+        let unresolved = |e: &io::Error| {
+            io::Error::other(format!(
+                "layer member `{}`: its directories cannot be resolved: {e}",
+                rel.display()
+            ))
+        };
         let through = |link: Option<PathBuf>| {
             let link = link.map_or_else(String::new, |l| format!(" `{}`", l.display()));
             io::Error::other(format!(
@@ -408,14 +424,13 @@ impl<'a> Root<'a> {
             Ok(()) => Ok(()),
             Err(e) => match e.raw_os_error() {
                 Some(libc::ENOENT | libc::ENOTDIR) => Ok(()),
-                Some(libc::ELOOP) => Err(through(self.first_link(rel))),
-                Some(libc::ENOSYS) => self
-                    .first_link(rel)
-                    .map_or(Ok(()), |l| Err(through(Some(l)))),
-                _ => Err(io::Error::other(format!(
-                    "layer member `{}`: its directories cannot be resolved: {e}",
-                    rel.display()
-                ))),
+                Some(libc::ELOOP) => Err(through(self.first_link(rel).ok().flatten())),
+                Some(libc::ENOSYS) => match self.first_link(rel) {
+                    Ok(None) => Ok(()),
+                    Ok(Some(link)) => Err(through(Some(link))),
+                    Err(e) => Err(unresolved(&e)),
+                },
+                _ => Err(unresolved(&e)),
             },
         }
     }
@@ -451,13 +466,15 @@ impl<'a> Root<'a> {
     }
 
     /// The first directory on the way to `rel`'s final component that is a symlink on disk, looked
-    /// at one at a time. The look stops at the first that is not there to look at, or is not a
-    /// directory: nothing past it is.
+    /// at one at a time. The look stops at the first that is not there (`ENOENT`, `ENOTDIR`) or is
+    /// not a directory: nothing past it is. Any other failure to look is an error, as it is in the
+    /// one resolution this stands in for ([`Self::check_parents`]): a directory that cannot be
+    /// looked at is one whose links cannot be ruled out.
     ///
     /// Each look is made from a descriptor on the directory before it, so it resolves one name: a
     /// look by path walks from the root every time, which at each directory of a member costs the
     /// square of its depth.
-    fn first_link(&self, rel: &Path) -> Option<PathBuf> {
+    fn first_link(&self, rel: &Path) -> io::Result<Option<PathBuf>> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::ffi::OsStrExt;
         let mut out = self.path.to_path_buf();
@@ -473,7 +490,8 @@ impl<'a> Root<'a> {
         for part in parents {
             out.push(part);
             let at = held.as_ref().unwrap_or(&self.dir).as_raw_fd();
-            let name = std::ffi::CString::new(part.as_bytes()).ok()?;
+            let name = std::ffi::CString::new(part.as_bytes())
+                .map_err(|_| io::Error::other("a layer member's path carries a NUL byte"))?;
             // SAFETY: `stat` is integer counters and times, so all-zero is a valid value, and the
             // call below fills it before any field is read.
             let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -482,12 +500,12 @@ impl<'a> Root<'a> {
             if unsafe { libc::fstatat(at, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) }
                 != 0
             {
-                return None;
+                return gone_or(io::Error::last_os_error());
             }
             match stat.st_mode & libc::S_IFMT {
-                libc::S_IFLNK => return Some(out),
+                libc::S_IFLNK => return Ok(Some(out)),
                 libc::S_IFDIR => {}
-                _ => return None,
+                _ => return Ok(None),
             }
             // SAFETY: as above, and the flags ask for a descriptor on the directory itself.
             let fd = unsafe {
@@ -498,12 +516,21 @@ impl<'a> Root<'a> {
                 )
             };
             if fd < 0 {
-                return None;
+                return gone_or(io::Error::last_os_error());
             }
             // SAFETY: a fresh descriptor the call returned, owned here and closed once, on drop.
             held = Some(unsafe { OwnedFd::from_raw_fd(fd) });
         }
-        None
+        Ok(None)
+    }
+}
+
+/// What [`Root::first_link`] makes of a look that failed with `e`: nothing more to look at when the
+/// entry is not there, as `openat2` answers it, and the failure itself otherwise.
+fn gone_or(e: io::Error) -> io::Result<Option<PathBuf>> {
+    match e.raw_os_error() {
+        Some(libc::ENOENT | libc::ENOTDIR) => Ok(None),
+        _ => Err(e),
     }
 }
 
@@ -709,7 +736,7 @@ fn create_parents(dir: &Path, budget: &mut Budget) -> io::Result<()> {
         }
     }
     for dir in missing.into_iter().rev() {
-        budget.member()?;
+        budget.member(dir)?;
         fs::create_dir(dir)?;
     }
     Ok(())
@@ -822,8 +849,10 @@ fn write_member<R: io::Read>(
 
     // A device node, fifo or socket: unprivileged creation would fail, and the cage mounts its own
     // `/dev` over whatever the image carries. Skipping is not a loss of anything the cage would use.
+    // What a lower layer put at its path goes all the same: the image says the path is no longer
+    // that, and keeping it kept bytes the image took out.
     if kind.is_block_special() || kind.is_character_special() || kind.is_fifo() {
-        return Ok(());
+        return remove(dest);
     }
     // Anything else is a type this does not know how to write, and dropping it is how a member the
     // image declares goes missing in silence. Named and refused, the way every other shape this

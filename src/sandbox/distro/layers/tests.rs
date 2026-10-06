@@ -102,10 +102,11 @@ fn an_image_that_unpacks_past_its_ceilings_is_refused_rather_than_filling_the_di
     let body = "x".repeat(100);
     let archive = tar_of(&[("big", Member::File(&body))]);
 
-    // A hundred bytes to write and nine left: the refusal names the member it stopped on, and the
-    // file on disk holds the nine the ceiling allowed plus the one that proves it was exceeded,
-    // never the hundred. Measuring after the copy would leave the whole member on disk.
-    let mut budget = Budget::resumed(MAX_UNPACKED_BYTES - 9, 0);
+    // A hundred bytes to write and nine left once the member's entry is charged: the refusal names
+    // the member it stopped on, and the file on disk holds the nine the ceiling allowed plus the
+    // one that proves it was exceeded, never the hundred. Measuring after the copy would leave the
+    // whole member on disk.
+    let mut budget = Budget::resumed(MAX_UNPACKED_BYTES - 9 - ENTRY_BYTES, 0);
     let root = tmp.join("over-bytes");
     let err = apply_tar_within(tmp.path(), &root, &archive, &mut budget)
         .expect_err("past the byte ceiling");
@@ -130,7 +131,7 @@ fn an_image_that_unpacks_past_its_ceilings_is_refused_rather_than_filling_the_di
     let root = tmp.join("ok");
     apply_tar_within(tmp.path(), &root, &archive, &mut budget).unwrap();
     assert_eq!(std::fs::read_to_string(root.join("big")).unwrap(), body);
-    assert_eq!((budget.bytes, budget.members), (100, 1));
+    assert_eq!((budget.bytes, budget.members), (100 + ENTRY_BYTES, 1));
 }
 
 /// The byte ceiling is held to the room the store's filesystem has, less what is kept for the
@@ -141,7 +142,7 @@ fn an_image_is_held_to_the_room_its_filesystem_has() {
     let tmp = crate::testutil::TmpDir::new();
     let archive = tar_of(&[("big", Member::File(&"x".repeat(100)))]);
 
-    let mut budget = Budget::resumed(5, 0).within(ROOM_KEPT + 9);
+    let mut budget = Budget::resumed(5, 0).within(ROOM_KEPT + 9 + ENTRY_BYTES);
     let root = tmp.join("short");
     let err =
         apply_tar_within(tmp.path(), &root, &archive, &mut budget).expect_err("past the room");
@@ -156,7 +157,7 @@ fn an_image_is_held_to_the_room_its_filesystem_has() {
     );
     assert_eq!(fs::metadata(root.join("big")).unwrap().len(), 10);
 
-    let mut budget = Budget::resumed(5, 0).within(ROOM_KEPT + 100);
+    let mut budget = Budget::resumed(5, 0).within(ROOM_KEPT + 100 + ENTRY_BYTES);
     apply_tar_within(tmp.path(), &tmp.join("fits"), &archive, &mut budget)
         .expect("the room is enough");
 
@@ -165,6 +166,28 @@ fn an_image_is_held_to_the_room_its_filesystem_has() {
         MAX_UNPACKED_BYTES,
         "room past the ceiling changes nothing"
     );
+}
+
+/// An entry with no length still costs room: each directory, link or empty file takes a block the
+/// length never shows, so the byte ceiling is charged [`ENTRY_BYTES`] for each. A layer of empty
+/// directories used to pass a byte ceiling of any size untouched.
+#[test]
+fn entries_without_length_are_charged_against_the_byte_ceiling() {
+    let tmp = crate::testutil::TmpDir::new();
+    let dirs: Vec<String> = (0..8).map(|i| format!("d{i}")).collect();
+    let archive = tar_of(
+        &dirs
+            .iter()
+            .map(|d| (d.as_str(), Member::Dir))
+            .collect::<Vec<_>>(),
+    );
+    let mut budget = Budget::resumed(MAX_UNPACKED_BYTES - 7 * ENTRY_BYTES, 0);
+    let err = apply_tar_within(tmp.path(), &tmp.join("over"), &archive, &mut budget)
+        .expect_err("eight blocks where seven are left");
+    assert!(err.to_string().contains("unpack to more than"), "{err}");
+    let mut budget = Budget::resumed(MAX_UNPACKED_BYTES - 8 * ENTRY_BYTES, 0);
+    apply_tar_within(tmp.path(), &tmp.join("fits"), &archive, &mut budget)
+        .expect("eight blocks where eight are left");
 }
 
 /// A directory the unpack makes on the way to a member is an entry of the budget, not free.
@@ -424,11 +447,14 @@ fn both_checks_of_a_members_parents_name_the_link_on_the_way() {
     std::os::unix::fs::symlink(tmp.path(), root.join("top")).unwrap();
     let dir = Root::open(&root).unwrap();
     assert_eq!(
-        dir.first_link(Path::new("top/file")),
+        dir.first_link(Path::new("top/file")).unwrap(),
         Some(root.join("top")),
         "a link at the first directory"
     );
-    assert_eq!(dir.first_link(Path::new("usr/lib/file/below")), None);
+    assert_eq!(
+        dir.first_link(Path::new("usr/lib/file/below")).unwrap(),
+        None
+    );
     let member = Path::new("usr/lib/link/deep/file");
 
     let err = safe_path(&dir, member).expect_err("the resolution refuses the link");
@@ -440,13 +466,78 @@ fn both_checks_of_a_members_parents_name_the_link_on_the_way() {
         "{err}"
     );
     assert_eq!(
-        dir.first_link(member),
+        dir.first_link(member).unwrap(),
         Some(root.join("usr/lib/link")),
         "the look at each directory finds the same link"
     );
     for clean in ["usr/lib/file", "usr/missing/deep/file", "file"] {
         assert!(safe_path(&dir, Path::new(clean)).is_ok(), "{clean}");
-        assert_eq!(dir.first_link(Path::new(clean)), None, "{clean}");
+        assert_eq!(dir.first_link(Path::new(clean)).unwrap(), None, "{clean}");
+    }
+}
+
+/// The look at each directory refuses what the one resolution refuses: a directory on the way that
+/// cannot be looked into is an error, not a clean path. It used to answer "no link" there, so on a
+/// kernel without `openat2` a member below such a directory was written without its parents ever
+/// being checked.
+#[test]
+fn the_look_at_each_directory_refuses_a_directory_it_cannot_look_into() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // SAFETY: `geteuid` reads the caller's effective uid and touches no memory.
+    if unsafe { libc::geteuid() } == 0 {
+        skip_incapable!("skipping a locked directory: root looks into any");
+        return;
+    }
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    fs::create_dir_all(root.join("usr/locked/deep")).unwrap();
+    fs::set_permissions(root.join("usr/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    let dir = Root::open(&root).unwrap();
+    let looked = dir.first_link(Path::new("usr/locked/deep/file"));
+    fs::set_permissions(root.join("usr/locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    let err = looked.expect_err("a directory that cannot be looked into is not a clean path");
+    assert_eq!(err.raw_os_error(), Some(libc::EACCES), "{err}");
+    let err = safe_path(&dir, Path::new("usr/locked/deep/file")).err();
+    assert!(err.is_none(), "unlocked again, the path is clean: {err:?}");
+}
+
+/// A device node or a FIFO is not written, but it still replaces what a lower layer put at its
+/// path: the image says that path is no longer the file below, and leaving the file there kept
+/// bytes the image had taken out, a key or a binary it replaced.
+#[test]
+fn a_device_or_fifo_member_takes_the_place_of_what_a_lower_layer_put_there() {
+    let tmp = crate::testutil::TmpDir::new();
+    for kind in [
+        tar::EntryType::Fifo,
+        tar::EntryType::Char,
+        tar::EntryType::Block,
+    ] {
+        let root = tmp.join(&format!("root-{}", kind.as_byte()));
+        apply_tar(
+            tmp.path(),
+            &root,
+            &tar_of(&[
+                ("etc/secret", Member::File("KEY")),
+                ("etc/dir/below", Member::File("x")),
+            ]),
+        )
+        .unwrap();
+        assert!(root.join("etc/secret").exists());
+        apply_tar(
+            tmp.path(),
+            &root,
+            &tar_of(&[
+                ("etc/secret", Member::Typed(kind, "")),
+                ("etc/dir", Member::Typed(kind, "")),
+            ]),
+        )
+        .unwrap();
+        for gone in ["etc/secret", "etc/dir"] {
+            assert!(
+                root.join(gone).symlink_metadata().is_err(),
+                "{gone} is still there under a {kind:?} member"
+            );
+        }
     }
 }
 
@@ -677,19 +768,36 @@ fn an_opaque_marker_never_empties_through_a_symlink_an_earlier_layer_planted() {
     }
 }
 
+/// A media type names the framing, and one this has no decoder for is refused by its name rather
+/// than read as a plain tar, which a compressed or encrypted layer is not: it used to be, and an
+/// `+lz4` layer, or any type a registry made up, reached the tar reader as whatever bytes it held.
+/// The tar spellings OCI and Docker use for an uncompressed layer are read as one.
 #[test]
 fn a_layer_media_type_with_no_decoder_is_refused_by_name() {
     let tmp = crate::testutil::TmpDir::new();
-    let blob = tmp.join("zstd");
-    fs::write(&blob, b"not really zstd").unwrap();
-    let err = apply(
-        &blob,
+    let blob = tmp.join("unknown");
+    fs::write(&blob, b"not a tar of any kind").unwrap();
+    for media_type in [
         "application/vnd.oci.image.layer.v1.tar+zstd",
-        &tmp.join("root"),
-        &mut Budget::new(),
-    )
-    .expect_err("an unsupported framing is refused");
-    assert!(err.to_string().contains("+zstd"), "{err}");
+        "application/vnd.oci.image.layer.v1.tar+lz4",
+        "application/vnd.oci.image.layer.v1.tar+gzip+encrypted",
+        "application/octet-stream",
+    ] {
+        let err = apply(&blob, media_type, &tmp.join("root"), &mut Budget::new())
+            .expect_err("an unsupported framing is refused");
+        assert!(err.to_string().contains(media_type), "{err}");
+    }
+    let tar = tmp.join("tar");
+    fs::write(&tar, tar_of(&[("f", Member::File("x"))])).unwrap();
+    for media_type in [
+        "application/vnd.oci.image.layer.v1.tar",
+        "application/vnd.oci.image.layer.nondistributable.v1.tar",
+        "application/vnd.docker.image.rootfs.diff.tar",
+    ] {
+        let root = tmp.join(&media_type.replace('/', "_"));
+        apply(&tar, media_type, &root, &mut Budget::new()).expect(media_type);
+        assert!(root.join("f").exists(), "{media_type}");
+    }
 }
 
 #[test]
@@ -1006,7 +1114,11 @@ fn a_sparse_members_holes_are_left_as_holes() {
     let content = fs::read(root.join("big")).unwrap();
     assert_eq!(&content[at as usize..at as usize + 4], b"data");
     assert!(content[..at as usize].iter().all(|&b| b == 0));
-    assert_eq!(budget.spent().0, size, "the budget counts the length");
+    assert_eq!(
+        budget.spent().0,
+        size + ENTRY_BYTES,
+        "the budget counts the length and the entry"
+    );
 }
 
 /// A tar of `(path, member)` pairs, each dated `mtime`.
@@ -1513,9 +1625,10 @@ fn honest() -> impl Strategy<Value = Honest> {
 /// What `layers` declare: the bytes of their files, and at most how many entries they cost.
 fn declared(layers: &[Vec<Honest>]) -> (u64, u64) {
     let members = || layers.iter().flatten();
+    let entries: u64 = members().map(Honest::entries_at_most).sum();
     (
-        members().map(|m| m.size as u64).sum(),
-        members().map(Honest::entries_at_most).sum(),
+        members().map(|m| m.size as u64).sum::<u64>() + entries * ENTRY_BYTES,
+        entries,
     )
 }
 

@@ -258,8 +258,10 @@ tree.
 The byte ceiling is also held to the room the store's filesystem has. Before each layer,
 `sbx` reads what is free there and lets the layer write all of it but **1 GiB**, kept so the
 host can still write once an image too large for the disk has been refused. The figure is
-an estimate both ways, since the budget counts a file's length: a sparse file counts whole
-and takes nothing, and a file of one byte takes a block. The entry ceiling is not compared
+an estimate both ways, since the budget counts a file's length and one 4 KiB block for every
+entry: a sparse file counts whole and takes nothing, and a directory, a link or an empty file
+is charged the block it takes, so a million of them count 4 GiB rather than nothing. The entry
+ceiling is not compared
 with the free inodes, which a filesystem that allocates them as it goes, btrfs among them,
 reports as none.
 
