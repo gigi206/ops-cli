@@ -4647,13 +4647,18 @@ mod tests {
     fn a_host_whose_first_address_fails_its_handshake_is_reached_at_its_second() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let trace = Arc::new(H2Trace::default());
-        let (addr, upstream_ca) = spawn_h2_upstream(
-            1,
-            vec![b"h2".to_vec()],
-            UpstreamReply::grpc("PONG"),
-            Arc::clone(&trace),
-        );
-        let not_tls = super::super::tests::refuse_tls_at([127, 0, 0, 2], addr.port());
+        let ((addr, upstream_ca), refusers) =
+            super::super::tests::refusing_tls_beside(&[[127, 0, 0, 2]], || {
+                let up = spawn_h2_upstream(
+                    1,
+                    vec![b"h2".to_vec()],
+                    UpstreamReply::grpc("PONG"),
+                    Arc::clone(&trace),
+                );
+                let port = up.0.port();
+                (up, port)
+            });
+        let not_tls = refusers[0].clone();
         let resolved = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&resolved);
         let (ctx, _stats, log, _dir) = relaying_ctx(upstream_ca);
@@ -4692,14 +4697,17 @@ mod tests {
     fn a_stream_no_address_serves_leaves_one_line_naming_the_last_failure() {
         let trace = Arc::new(H2Trace::default());
         // Only its port is used: no address below is the upstream's.
-        let (addr, upstream_ca) = spawn_h2_upstream(
-            1,
-            vec![b"h2".to_vec()],
-            UpstreamReply::grpc("PONG"),
-            Arc::clone(&trace),
-        );
-        let _first = super::super::tests::refuse_tls_at([127, 0, 0, 2], addr.port());
-        let _second = super::super::tests::refuse_tls_at([127, 0, 0, 3], addr.port());
+        let ((addr, upstream_ca), _refusers) =
+            super::super::tests::refusing_tls_beside(&[[127, 0, 0, 2], [127, 0, 0, 3]], || {
+                let up = spawn_h2_upstream(
+                    1,
+                    vec![b"h2".to_vec()],
+                    UpstreamReply::grpc("PONG"),
+                    Arc::clone(&trace),
+                );
+                let port = up.0.port();
+                (up, port)
+            });
         // 127.0.0.4 has nothing listening on the port, so its dial is refused.
         for (last, reason) in [
             ([127, 0, 0, 3], "upstream-cert-rejected"),

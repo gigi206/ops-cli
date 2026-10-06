@@ -3887,19 +3887,77 @@ fn a_host_whose_first_address_refuses_is_reached_at_its_second() {
     );
 }
 
-/// A listener on `ip:port` that accepts TCP and then answers with bytes no TLS client accepts, so a
-/// handshake with it fails after the connection succeeded. Counts what it accepted.
-pub(super) fn refuse_tls_at(ip: [u8; 4], port: u16) -> Arc<AtomicUsize> {
-    let listener = TcpListener::bind((IpAddr::from(ip), port)).unwrap();
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let counter = accepted.clone();
-    thread::spawn(move || {
-        while let Ok((mut sock, _)) = listener.accept() {
-            counter.fetch_add(1, Ordering::SeqCst);
-            let _ = sock.write_all(b"HTTP/1.1 400 Not TLS\r\n\r\n");
-        }
+/// Start `upstream`, then on each of `ips` a listener on the upstream's port that accepts TCP and
+/// answers with bytes no TLS client accepts, so a handshake with it fails after the connection
+/// succeeded. Returns what `upstream` built and, per address, a count of what it accepted.
+///
+/// `upstream` returns its value and the port it serves on, and is run again until that port is
+/// free on every one of `ips`. The kernel chose the port for `127.0.0.1` alone, and a test running
+/// beside this one can hold the same number on another loopback address, the source port of a
+/// connection to it included: binding it once and unwrapping failed the suite with `AddrInUse`.
+/// Every listener is bound before any is served, so an attempt that fails leaves none behind.
+pub(super) fn refusing_tls_beside<T>(
+    ips: &[[u8; 4]],
+    mut upstream: impl FnMut() -> (T, u16),
+) -> (T, Vec<Arc<AtomicUsize>>) {
+    loop {
+        let (built, port) = upstream();
+        let bound: std::io::Result<Vec<TcpListener>> = ips
+            .iter()
+            .map(|ip| TcpListener::bind((IpAddr::from(*ip), port)))
+            .collect();
+        let listeners = match bound {
+            Ok(listeners) => listeners,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => panic!("binding a TLS-refusing listener on port {port}: {e}"),
+        };
+        let counts = listeners
+            .into_iter()
+            .map(|listener| {
+                let accepted = Arc::new(AtomicUsize::new(0));
+                let counter = accepted.clone();
+                thread::spawn(move || {
+                    while let Ok((mut sock, _)) = listener.accept() {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let _ = sock.write_all(b"HTTP/1.1 400 Not TLS\r\n\r\n");
+                    }
+                });
+                accepted
+            })
+            .collect();
+        return (built, counts);
+    }
+}
+
+#[test]
+fn a_refusing_listener_waits_for_a_port_free_on_its_own_address() {
+    // The first port offered is already held on 127.0.0.2, as a neighbouring test's socket can hold
+    // it: the helper must start the upstream again rather than fail on `AddrInUse`.
+    let taken = TcpListener::bind("127.0.0.2:0").unwrap();
+    let taken_port = taken.local_addr().unwrap().port();
+    let mut offered = Vec::new();
+    let (port, counts) = refusing_tls_beside(&[[127, 0, 0, 2]], || {
+        let port = if offered.is_empty() {
+            taken_port
+        } else {
+            TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        offered.push(port);
+        (port, port)
     });
-    accepted
+    assert_eq!(
+        offered.len(),
+        2,
+        "the held port is passed over once: {offered:?}"
+    );
+    assert_ne!(port, taken_port);
+    assert_eq!(counts.len(), 1);
+    std::net::TcpStream::connect(("127.0.0.2", port)).unwrap();
+    drop(taken);
 }
 
 /// [`reuse_ctx`] resolving `upstream.test` to `ips`, in that order.
@@ -3920,9 +3978,12 @@ fn ctx_resolving_to(
 /// next address rather than ending the request.
 #[test]
 fn a_host_whose_first_address_fails_its_handshake_is_reached_at_its_second() {
-    let (addr, upstream_ca, upstream) =
-        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
-    let failing = refuse_tls_at([127, 0, 0, 2], addr.port());
+    let ((addr, upstream_ca, upstream), refusers) = refusing_tls_beside(&[[127, 0, 0, 2]], || {
+        let up = spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        let port = up.0.port();
+        (up, port)
+    });
+    let failing = refusers[0].clone();
     let (ctx, proxy_ca_der) = ctx_resolving_to(
         upstream_ca,
         vec![IpAddr::from([127, 0, 0, 2]), IpAddr::from([127, 0, 0, 1])],
@@ -3955,9 +4016,12 @@ fn a_host_whose_first_address_fails_its_handshake_is_reached_at_its_second() {
 fn a_request_an_operator_allowed_is_reached_at_its_second_address_too() {
     use crate::allowlist::DefaultAction;
     use crate::sandbox::control::{PendingState, Verdict};
-    let (addr, upstream_ca, upstream) =
-        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
-    let failing = refuse_tls_at([127, 0, 0, 2], addr.port());
+    let ((addr, upstream_ca, upstream), refusers) = refusing_tls_beside(&[[127, 0, 0, 2]], || {
+        let up = spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        let port = up.0.port();
+        (up, port)
+    });
+    let failing = refusers[0].clone();
     let mut roots = RootCertStore::empty();
     roots.add(upstream_ca).unwrap();
     let upstream_cfg = Arc::new(
@@ -4008,10 +4072,12 @@ fn a_request_an_operator_allowed_is_reached_at_its_second_address_too() {
 #[test]
 fn a_request_no_address_serves_leaves_one_line_naming_the_last_failure() {
     use crate::sandbox::control::{LOG_RING_CAP, LogRing, LogVerdict};
-    let (addr, upstream_ca, _upstream) =
-        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let ((addr, upstream_ca, _upstream), _failing) = refusing_tls_beside(&[[127, 0, 0, 2]], || {
+        let up = spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        let port = up.0.port();
+        (up, port)
+    });
     let port = addr.port();
-    let _failing = refuse_tls_at([127, 0, 0, 2], port);
     // 127.0.0.3 is loopback with nothing listening on this port: its dial is refused at once.
     for (ips, reason) in [
         ([[127, 0, 0, 2], [127, 0, 0, 3]], "upstream-unreachable"),
