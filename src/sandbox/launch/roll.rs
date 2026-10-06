@@ -362,8 +362,13 @@ pub(crate) fn upgrade_mise_packages(
                     rolled.push(name);
                 }
                 [only] => {
-                    // The token is redundant with the name column, so show just the version delta.
-                    let delta = only.split_once(' ').map_or(only.as_str(), |(_, v)| v);
+                    // A token that names the app is redundant with the name column, so only the
+                    // version delta is shown; a companion tool's token stays, or its versions
+                    // would read as the app's own.
+                    let delta = match only.split_once(' ') {
+                        Some((token, v)) if token_names_app(token, &name) => v,
+                        _ => only.as_str(),
+                    };
                     match transition_regression(only) {
                         Some(reg) => {
                             outln!(
@@ -864,6 +869,18 @@ fn transition_regression(line: &str) -> Option<crate::version::Regression> {
     let (before, new) = line.split_once(" → ")?;
     let old = before.rsplit(' ').next()?;
     crate::version::regression(old.trim(), new.trim())
+}
+
+/// Whether a mise `token` names the app `name` it was rolled for, so the roll line may drop it.
+///
+/// A group rolls whatever its home equips, which is not always the app's own tool: t3code's home
+/// equips `aqua:anthropics/claude-code`, orca-desktop's `opencode`. The token names the app when
+/// its last segment, past the backend prefix, the scope or owner and any `[option]` suffix, is the
+/// app's name.
+fn token_names_app(token: &str, name: &str) -> bool {
+    let bare = token.split('[').next().unwrap_or(token);
+    let last = bare.rsplit(['/', ':']).next().unwrap_or(bare);
+    last == name
 }
 
 /// Whether mise reported nothing to do. mise prints `All tools are up to date` (to stderr) when a

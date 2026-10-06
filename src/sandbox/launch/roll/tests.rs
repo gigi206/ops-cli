@@ -468,3 +468,23 @@ fn the_pool_roll_failure_quotes_the_stream_that_carried_the_diagnostic() {
         "mise upgrade failed: no output"
     );
 }
+
+#[test]
+fn a_roll_line_drops_only_a_token_that_names_the_app() {
+    // The app's own tool, under each backend spelling a profile uses.
+    assert!(token_names_app("opencode", "opencode"));
+    assert!(token_names_app(
+        "aqua:anthropics/claude-code",
+        "claude-code"
+    ));
+    assert!(token_names_app("npm:reasonix", "reasonix"));
+    assert!(token_names_app("aqua:earendil-works/pi", "pi"));
+    assert!(token_names_app(
+        "github:Kilo-Org/kilocode[version_prefix=v]",
+        "kilocode"
+    ));
+    // A companion the app's home equips: its versions must not read as the app's.
+    assert!(!token_names_app("aqua:anthropics/claude-code", "t3code"));
+    assert!(!token_names_app("opencode", "orca-desktop"));
+    assert!(!token_names_app("npm:agent-browser", "hermes"));
+}
