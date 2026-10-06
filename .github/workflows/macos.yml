@@ -55,7 +55,9 @@ jobs:
   acceptance:
     name: exercise the cage in a Lima guest
     runs-on: macos-26-intel
-    timeout-minutes: 60
+    # Above the sum of the deadlines below, so a step that hangs fails on its own deadline
+    # rather than the job being cancelled first.
+    timeout-minutes: 100
     env:
       # The wrapper reaches the instance it is told to and defaults to `sbx`. This run creates
       # `sbx-ci`, and every wrapper call below reaches it through this; without it each one fails on
@@ -102,6 +104,8 @@ jobs:
           }
 
       - name: Create the guest from the template this repository ships
+        # Past `limactl start`'s own thirty minutes, for the download and the creation before it.
+        timeout-minutes: 35
         run: |
           set -euo pipefail
           # A project under the host home, named by the same parameter a user would pass, so the
@@ -130,6 +134,7 @@ jobs:
           limactl start --tty=false --timeout=30m sbx-ci
 
       - name: Let nix ask GitHub as this run
+        timeout-minutes: 5
         # The first launch resolves the nixpkgs channel through GitHub's API, and an anonymous
         # request is counted against the hosted runner's shared address: once that quota is spent,
         # the launch fails on a 403 that says nothing about the Mac. The run's own token is counted
@@ -148,6 +153,7 @@ jobs:
             || { echo "the token did not reach the guest's nix configuration"; exit 1; }
 
       - name: The preflight must pass inside the guest
+        timeout-minutes: 5
         run: |
           set -uo pipefail
           cd "$HOME/ci-projects/project"
@@ -167,6 +173,9 @@ jobs:
             || { echo "doctor passed without proving capability-bearing namespaces"; exit 1; }
 
       - name: A real cage must launch, as the sandbox user, in the directory the Mac stood in
+        # The first launch fetches the cage's tools through nix, the one long step after the guest
+        # is up; it has taken six to nine minutes.
+        timeout-minutes: 20
         # The preflight is not the product. This also proves the wrapper carried the working
         # directory across: `sbx run` builds the cage around the cwd, so a wrapper that silently
         # landed in the guest home would report a different project here.
@@ -189,6 +198,7 @@ jobs:
             || { echo "the cage was not built around the directory the Mac stood in"; exit 1; }
 
       - name: The guest must have a compositor on its display and a sound card behind its sink
+        timeout-minutes: 5
         # Neither needs anyone looking at the screen. The compositor's socket under the fixed name
         # the wrapper looks for is what a `gui = "wayland"` launch binds; a default sink on the ALSA
         # card, rather than PipeWire's null sink, is what an `audio = true` cage plays into.
@@ -204,6 +214,7 @@ jobs:
           esac
 
       - name: The Mac's filesystem must be absent from the cage
+        timeout-minutes: 10
         # Confidentiality by absence is the model. The guest mounts one subtree of the host home,
         # so everything else on the Mac has two chances to leak: it can be visible to the guest, or
         # visible to the cage the guest builds. Both are asked here.
@@ -241,6 +252,7 @@ jobs:
           esac
 
       - name: A directory the guest also has must be refused, not swapped for the guest's own
+        timeout-minutes: 5
         # `/tmp` exists on both sides, so a wrapper that only tried to cd into the Mac's directory
         # would land in the guest's `/tmp` and build the cage there without a word. The witness is
         # written on the Mac, so a launch that ran anyway is told apart from one that was refused.
@@ -268,8 +280,11 @@ jobs:
         # provisioning was doing at that moment can still be read. Lima's logs on the host show the
         # boot; the guest's cloud-init log carries the provisioning scripts' output; the process
         # list and the pending systemd jobs tell a script still working from one waiting on
-        # something that will not come.
+        # something that will not come. Every step that reaches the guest has a deadline of its
+        # own: a step past it fails rather than being cancelled, so this runs after a hang, which it
+        # would not after the job itself was cancelled.
         if: failure()
+        timeout-minutes: 5
         run: |
           set -uo pipefail
           for f in "$HOME"/.lima/sbx-ci/ha.stderr.log "$HOME"/.lima/sbx-ci/serial*.log; do
@@ -283,7 +298,7 @@ jobs:
           echo "::endgroup::"
           echo "::group::processes and pending jobs in the guest"
           limactl shell --workdir / sbx-ci sh -c \
-            'ps -eo pid,etimes,args | grep -E "[a]pt|[d]pkg|[c]url|[u]nattended|[c]loud-init"; systemctl list-jobs --no-pager' \
+            'ps -eo pid,etimes,args | grep -E "[a]pt|[d]pkg|[c]url|[u]nattended|[c]loud-init|[n]ix|[s]bx|[b]wrap"; systemctl list-jobs --no-pager' \
             || true
           echo "::endgroup::"
 
