@@ -24,8 +24,8 @@
 # usage pane. Orca itself ships no model runtime: every "agent" in a worktree is a CLI installed
 # in the cage. This profile therefore also equips ONE pilot agent — `opencode` — via its bundle (`use`
 # below), so `orca worktree create --agent opencode --prompt "…"` works out of the box (Orca
-# preconfigures OpenCode; other TUI agents resolve by name once installed in the cage — add them
-# to `[packages]` the same way). Orca's own CLI — `orca-ide` — is the SAME Electron binary run
+# preconfigures OpenCode; other TUI agents resolve by name once installed in the cage — name their
+# bundles in `use` the same way). Orca's own CLI — `orca-ide` — is the SAME Electron binary run
 # with `ELECTRON_RUN_AS_NODE=1 out/cli/index.js` (upstream packages the CLI entrypoint outside
 # app.asar); the GUI and the CLI share one process model inside the cage.
 #
@@ -130,9 +130,10 @@ https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-sto
 orca-desktop = "deb:github:stablyai/orca"
 # In-cage Chromium, the browser the `[open]` table routes sign-in links to.
 chromium = "nix:chromium"
-# The PILOT interior agent — the same `opencode` the CLI profile equips (`mise:opencode`), so
-# `orca worktree create --agent opencode --prompt "…"` has something to launch. Add other agent
-# CLIs (claude-code, codex, …) here the same way; Orca resolves any installed TUI agent by name.
+# The PILOT interior agent — the same `opencode` the CLI profile equips (`mise:opencode`) — comes
+# from its bundle (`use` above), so `orca worktree create --agent opencode --prompt "…"` has
+# something to launch. Add other agent CLIs (claude-code, codex, …) by naming their bundles in
+# `use`; Orca resolves any installed TUI agent by name.
 
 [network]
 mode = "deny"

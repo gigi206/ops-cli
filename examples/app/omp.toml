@@ -26,7 +26,7 @@
 # project. mise picks the platform release asset (`omp-linux-x64` here) and installs it as `omp`,
 # verifying the release's GitHub artifact attestations and SLSA provenance before installing.
 # Advance an already-installed version with `sbx upgrade mise`. (The first-launch fetch from
-# GitHub rides sbx's built-in nix-cache allow-set, so github.com needs no `allow` entry.)
+# GitHub rides sbx's built-in read-only allow-set, so github.com needs no `allow` entry.)
 #
 # CREDENTIAL — omp is BYOK and multi-provider like `pi`. This template is set up for Anthropic;
 # any header-injectable provider works the same way: swap the allowlist and the `[secret]` block
@@ -107,11 +107,13 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle omp`, and what the
 # launch ends up with via `sbx config show --app omp`.
 allow = [
-    # The tool's own site. The runtime MODEL host is added below for the provider you key it to,
-    # exactly like `pi`; GitHub install traffic rides sbx's built-in nix-cache allow-set.
+    # Nothing here: the tool's site arrives with the bundle and is unioned in at resolution. The
+    # runtime MODEL host is added below for the provider you key it to, exactly like `pi`; GitHub
+    # install traffic rides sbx's built-in allow-set.
     # Anthropic BYOK — uncomment together with the [secret] block below.
     #"{*} https://api.anthropic.com",
-    # Direct-OpenRouter BYOK — uncomment together with the [secret] block below.
+    # Direct-OpenRouter BYOK — uncomment, and point the [secret] block below at `openrouter.ai` and
+    # OPENROUTER_API_KEY (see the CREDENTIAL note in the header).
     #"{*} https://openrouter.ai",
     # omp's /collab relay — refused by default (opt-in sessions); uncomment to join one.
     #"{*} https://my.omp.sh",

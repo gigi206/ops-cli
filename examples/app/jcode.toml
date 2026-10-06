@@ -22,8 +22,8 @@
 # The Linux artifact is a DYNAMIC glibc binary (upstream's installer patchelf's it for
 # Termux). The tarball ships a tiny launcher (sh: LD_LIBRARY_PATH=self-dir, then `exec`s
 # the sibling `.bin`) next to the real 155 MB ELF — the hermetic cage's nix-ld shim
-# provides the loader and libc, so it should start like other un-patchelf'd binaries (the
-# cursor-agent mould). UNPROVEN until verified: the equip + first launch under the allowlist.
+# provides the loader and libc, so it should start without being patched. UNPROVEN until
+# verified: the equip + first launch under the allowlist.
 #
 # CONFIG + STATE — `~/.jcode/` (config.toml, auth.json, openai-auth.json, gemini_oauth.json,
 # telemetry_id, mcp.json, pending-login/) and provider env files under `~/.config/jcode/`
@@ -135,23 +135,23 @@ allow = [
     #"{GET} https://jcode.sh",
 ]
 
-# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): jcode's telemetry
-# endpoint — fire-and-forget POSTs (install/session/feedback events; no prompts or code).
-# We opt out via the `JCODE_NO_TELEMETRY` env below AND leave the host denied; a `mute`
-# never changes the verdict (still refused) and never hides a count (`sbx net stats` still
-# tallies it). See it anytime with `sbx net logs --all`; edit with `sbx net mute|unmute
-# telemetry.jcode.sh -a jcode`. Remove both the env var and this entry the day you decide to
-# allow telemetry.
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`). A `mute` never
+# changes the verdict (still refused) and never hides a count (`sbx net stats` still tallies
+# it). See it anytime with `sbx net logs --all`; edit with `sbx net mute|unmute <host> -a jcode`.
 mute = [
+    # Nothing here: jcode's telemetry endpoint (`telemetry.jcode.sh` — fire-and-forget POSTs of
+    # install/session/feedback events; no prompts or code) arrives with the bundle and is unioned
+    # in at resolution, beside the bundle's `JCODE_NO_TELEMETRY` opt-out.
 ]
 
-# Telemetry: opt-out from the start (upstream also honors `DO_NOT_TRACK=1` and a
-# `~/.jcode/no_telemetry` file). No browser can open in the empty netns, so also suppress
-# the local browser launch outright (upstream checks `JCODE_NO_BROWSER`/`NO_BROWSER` in
-# `crates/jcode-base/src/auth/mod.rs` `browser_suppressed()`) — `login` then falls back
-# immediately to the paste/device flow instead of waiting out a callback timeout. The
-# provider-key placeholders below stay commented — the real key never enters the cage: the
-# proxy strips the placeholder and substitutes the key, read on the HOST, on the wire.
+# `JCODE_NO_TELEMETRY` (the telemetry opt-out; upstream also honors `DO_NOT_TRACK=1` and a
+# `~/.jcode/no_telemetry` file) and `JCODE_NO_BROWSER` (no browser can open in the empty netns:
+# upstream checks `JCODE_NO_BROWSER`/`NO_BROWSER` in `crates/jcode-base/src/auth/mod.rs`
+# `browser_suppressed()`, so `login` falls back at once to the paste/device flow instead of
+# waiting out a callback timeout) ride the bundle with the tool that reads them
+# (`sbx bundle jcode`). The provider-key placeholders below stay commented — the real key never
+# enters the cage: the proxy strips the placeholder and substitutes the key, read on the HOST, on
+# the wire.
 [env]
 #OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 #ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"

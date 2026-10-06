@@ -19,11 +19,12 @@
 #
 # Vibe (github.com/mistralai/mistral-vibe) is a Python coding agent published to PyPI as the
 # `mistral-vibe` package (it exposes the `vibe` command; requires Python >=3.12). sbx equips it via
-# mise's pipx backend — `mise:pipx:mistral-vibe` in [packages] — so `sbx upgrade mise` rolls it
+# mise's pipx backend — `mise:pipx:mistral-vibe`, in the bundle — so `sbx upgrade mise` rolls it
 # forward (it is a real backend-managed tool, not a one-shot install). mise's pipx backend runs
 # `uv tool install` because `nix:uv` puts uv on PATH (a supported Python comes from `nix:python312`),
 # resolving the wheels from PyPI on the first launch (a few tens of MiB, seconds) and reusing them
-# offline after. The launch `cmd` below only sets up the in-cage SSO browser, then execs `vibe`.
+# offline after. The launch `cmd` below only hands Vibe the cage's summary, then execs `vibe`; the
+# in-cage SSO browser is routed by the `[open]` table.
 #
 # AUTHENTICATION — Mistral account SSO, in an IN-CAGE browser (this profile's default).
 # On first launch (or `vibe --setup`) Vibe's onboarding offers "sign in with your Mistral account".
@@ -34,7 +35,7 @@
 # callback is server-side polling, no `forward` is needed — a browser INSIDE the cage is enough, and
 # everything (the sign-in page + the poll) closes in the sandbox.
 #
-# The browser is a real Chromium provisioned into the cage (see [packages] + `gui`/`gpu` below) and
+# The browser is a real Chromium provisioned into the cage (see the bundle + `gui`/`gpu` below) and
 # reached through the `[open]` table below. Two details make it work: (1) the handler runs in
 # `detach` mode, because Vibe's `webbrowser.open` hands the URL to sbx's router and does not wait,
 # so an `exec`ed Chromium would pour its output over the TUI; (2) under a filtering posture on a
@@ -144,8 +145,8 @@ allow = [
 ]
 
 # Keep Chromium's own denied telemetry out of the default `sbx net logs` (still denied, still counted
-# in `sbx net stats`; see them with `--all`). These are the usual Chromium background hosts; watch
-# `sbx net logs -a vibe` on your first sign-in and add any other host it hammers.
+# in `sbx net stats`; see them with `--all`). The bundle mutes the usual Chromium background hosts;
+# watch `sbx net logs -a vibe` on your first sign-in and add any other host it hammers.
 mute = [
     # Nothing here: the browser background services, the page telemetry and the analytics beacon
     # arrive with the bundle and are unioned in at resolution. One refusal is deliberately NOT
@@ -153,7 +154,8 @@ mute = [
 ]
 # NOT muted on purpose (refused by the allowlist, but only ONE hit — not spam, so keeping it VISIBLE in
 # `sbx net logs` is more useful than hiding it): `widget.intercom.io` (Intercom support-chat widget, not
-# used from the CLI). (`experiments.mistral.services` is now ALLOWED above — Mistral's first-party flags.)
+# used from the CLI). (`experiments.mistral.services` is ALLOWED by the bundle — Mistral's
+# first-party flags.)
 
 # API-KEY (BYOK) alternative to the SSO sign-in above. The real key is read on the HOST and injected
 # by the egress proxy — never in the cage. Uncomment both blocks and provide $MISTRAL_API_KEY on the

@@ -11,14 +11,19 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#
 # Nova ships on npm from the vendor's own scope, `@compass-ai/nova` (the CLI installs as both `nova`
 # and `compass`). It is a node CLI, so the cage gets a node runtime alongside it; `sbx upgrade mise`
 # rolls it forward. Upstream requires Node ≥ 22.12 — nixpkgs' `nodejs` satisfies it.
 #
 # THE PACKAGE NAME IS NOT `nova`, AND THAT MATTERS. mise's registry resolves the bare name `nova` to
 # `aqua:FairwindsOps/nova` — an unrelated Kubernetes helm-chart tool. The fully-qualified
-# `mise:npm:@compass-ai/nova` below is what pins this to the right product; a bare token would
-# silently equip the other one.
+# `mise:npm:@compass-ai/nova` the bundle declares is what pins this to the right product; a bare
+# token would silently equip the other one.
 #
 # WHY THERE IS NO `cmd` WRAPPER (checked, not assumed). mise's npm backend installs with
 # `--ignore-scripts=true` — a deliberate security default — which breaks packages whose install
@@ -105,21 +110,22 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle nova`, and what the
 # launch ends up with via `sbx config show --app nova`.
 allow = [
-    # Install: the packument (version resolution, also used by `sbx upgrade mise`) and the tarball.
-    # Runtime: the Compass platform — model resolution and prompt traffic.
-    # Compass' hosted MCP server, which the CLI enables by default (SSE + an upload endpoint). Comment
-    # it out if you run BYOK and want no vendor MCP.
+    # Nothing here: the install lane (`@npm-registry`), the Compass platform (model resolution and
+    # prompt traffic) and Compass' hosted MCP server, which the CLI enables by default (SSE + an
+    # upload endpoint), arrive with the bundle and are unioned in at resolution.
     # BYOK instead: uncomment the ONE provider you use (and supply its key as `cline.toml` shows).
     #"{*} https://api.anthropic.com",
     #"{*} https://api.openai.com",
     #"{*} https://generativelanguage.googleapis.com",
 ]
 
-# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): npm's audit endpoint, and
-# the Cloudflare tunnel host the observability dashboard would reach (a feature the cage cannot run,
-# see the header). A `mute` never changes the verdict (they stay refused) and never hides a count.
-# See everything with `sbx net logs --all`; edit with `sbx net mute|unmute <rule> -a nova`.
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`). A `mute` never changes
+# the verdict (they stay refused) and never hides a count. See everything with
+# `sbx net logs --all`; edit with `sbx net mute|unmute <rule> -a nova`.
 mute = [
+    # Nothing here: npm's audit endpoint, the JSR mirror and the Cloudflare tunnel host the
+    # observability dashboard would reach (a feature the cage cannot run, see the header) arrive
+    # with the bundle and are unioned in at resolution.
 ]
 
 # --- Compass platform key (commented). The in-cage placeholder lets the CLI start and issue its

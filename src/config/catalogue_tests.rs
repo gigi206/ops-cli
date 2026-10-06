@@ -1663,14 +1663,15 @@ fn every_shipped_profile_resolves_the_egress_groups_it_references() {
 }
 
 #[test]
-fn a_profile_header_that_lists_egress_groups_lists_every_one_it_needs() {
-    // A header block that enumerates `sbx net groups import` lines reads as the set of fragments
-    // to import before the app runs: a reader follows it, imports what it names, and is warned at
-    // import time about the group it was not told to import — the lane is then silently narrower
-    // than the profile claims. Most profiles enumerate nothing, make no such claim, and are left
-    // alone here: the bundle header is where the list lives, and
-    // `every_shipped_bundle_header_names_the_egress_groups_it_references` holds every shipped
-    // bundle to a complete one. The obligation is on the profile that chooses to restate it.
+fn every_shipped_profile_header_names_the_egress_groups_it_needs() {
+    // A profile's header is the import list a reader follows: the bundle, the profile, and the
+    // `sbx net groups import` lines for every fragment the launch resolves. A reader who imports
+    // what it names and nothing else must end with a complete lane, so every profile that reaches
+    // a group — through its own rules or its bundle's — names it there. A missing line is a group
+    // the reader is warned about at import time, and the lane is silently narrower than the
+    // profile claims. The bundle header carries the same list
+    // (`every_shipped_bundle_header_names_the_egress_groups_it_references`), so a reader importing
+    // from either file ends at the same set.
     //
     // Only the LEADING comment block counts, and that is the contract asserted rather than an
     // accident of the current tree. An import instruction written further down sits beside the
@@ -1682,7 +1683,7 @@ fn a_profile_header_that_lists_egress_groups_lists_every_one_it_needs() {
     // group nothing references) is not asserted, because a header may legitimately name the
     // fragment an optional, commented-out rule would need.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut enumerating = 0;
+    let mut needing = 0;
     let mut missing: Vec<String> = Vec::new();
 
     for entry in std::fs::read_dir(root.join("examples/app"))
@@ -1697,10 +1698,6 @@ fn a_profile_header_that_lists_egress_groups_lists_every_one_it_needs() {
         let text = std::fs::read_to_string(&path).expect("read the profile");
 
         let declared = header_named_groups(&text);
-        if declared.is_empty() {
-            continue;
-        }
-        enumerating += 1;
 
         // What the launch actually resolves: the profile's own group references plus those of
         // every bundle it names, which is what `sbx app import` warns about when one is undefined.
@@ -1723,11 +1720,14 @@ fn a_profile_header_that_lists_egress_groups_lists_every_one_it_needs() {
             ));
         }
 
+        if !required.is_empty() {
+            needing += 1;
+        }
         for group in required.difference(&declared) {
             missing.push(format!(
-                "`examples/app/{name}.toml` lists egress groups in its header but not @{group}, \
-                 which it reaches through its own rules or its bundle — add `sbx net groups \
-                 import examples/net-groups/{group}.toml` to that block"
+                "`examples/app/{name}.toml` reaches @{group} through its own rules or its bundle, \
+                 and its header does not name it — add `sbx net groups import \
+                 examples/net-groups/{group}.toml` to the header's EGRESS GROUPS block"
             ));
         }
     }
@@ -1739,8 +1739,8 @@ fn a_profile_header_that_lists_egress_groups_lists_every_one_it_needs() {
         missing.join("\n")
     );
     assert!(
-        enumerating >= 15,
-        "expected the enumerating profiles to be checked, saw {enumerating}"
+        needing >= 40,
+        "expected the profiles that reach a group to be checked, saw {needing}"
     );
 }
 

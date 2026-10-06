@@ -11,6 +11,11 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#
 # The tool is a pure-Node terminal CLI distributed on npm as `@qwen-code/qwen-code`
 # (bin `qwen`); it is equipped fresh from upstream via mise's npm backend — no nixpkgs
 # lag. It is equipped at the latest upstream version on the first launch in a project;
@@ -134,10 +139,12 @@ allow = [
 # deliberately leave DENIED. A `mute` never changes the verdict (still refused) and never
 # hides a count (`sbx net stats` still tallies it); it only keeps the line out of the
 # default log. See it anytime with `sbx net logs --all`, and edit from the CLI with
-# `sbx net mute|unmute <host> -a qwen-code`. Remove the entry here the day you allow it.
+# `sbx net mute|unmute <host> -a qwen-code`.
 mute = [
-    # Aliyun Real User Monitoring (RUM) beacon the CLI emits in the background. Upstream
-    # hard-codes one host (`packages/core/src/telemetry/qwen-logger/qwen-logger.ts`:
+    # Nothing here: the Aliyun Real User Monitoring (RUM) beacon the CLI emits in the background,
+    # and npm's audit/JSR refusals, arrive with the bundle and are unioned in at resolution. The
+    # bundle mutes the beacon as `*.rum.aliyuncs.com`: upstream hard-codes one host
+    # (`packages/core/src/telemetry/qwen-logger/qwen-logger.ts`:
     # `USAGE_STATS_HOSTNAME = 'gb4w8c3ygj-default-sea.rum.aliyuncs.com'`), but the project
     # prefix is theirs to change between releases, so the apex wildcard covers it across
     # upgrades. Denied (a mute is never a verdict); allow it in [network] above if you

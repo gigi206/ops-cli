@@ -3,6 +3,7 @@
 #   sbx bundle import examples/bundle/rovo.toml
 #   sbx app import examples/app/rovo.toml
 #   sbx app run rovo
+#   sbx app run rovo -- auth login
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The Atlassian CLI this agent rides on, and the
 # hosts it reaches, come from a shared BUNDLE, so import it too:
@@ -10,7 +11,6 @@
 #     sbx app import examples/app/rovo.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
-#   sbx app run rovo -- auth login
 #
 # PACKAGING — nixpkgs, host-side. Rovo Dev is an EXTENSION of the Atlassian CLI (ACLI): the
 # official path is `acli rovodev …`, so the bundle equips ACLI and this profile runs that
@@ -58,7 +58,7 @@
 # (`https://cb9d1981921394a7b83db200403b23d7@o55978.ingest.us.sentry.io/4508000192233472`,
 # `sentry.go/...`) AND posts usage events to Segment (`api.segment.io`). Neither has a
 # per-installation opt-out env var on the surface. The two hosts are DENIED and muted
-# below — a `mute` never changes the verdict (still refused) and never hides a count
+# by the bundle — a `mute` never changes the verdict (still refused) and never hides a count
 # (`sbx net stats` still tallies it). Local error logs are unaffected.
 #
 # MCP — ACLI itself does not implement MCP, but the agentic subcommand `rovodev run`
@@ -67,7 +67,7 @@
 # those — `allow` is the tightest working set; add the host of any connector you
 # actually use (the cage's deny-default is the point).
 #
-# UNVERIFIED (like every profile until run with a real API token): the live bootstrap
+# UNVERIFIED (like every profile until run with a real API token): the live launch
 # + first prompt under the allowlist, the `acli rovodev auth login` basic-auth flow,
 # and the rovodev session traffic. Grounded here: the packaging and the tarball
 # layout (read out of the downloaded `acli_linux_amd64.tar.gz`), the host set
@@ -146,8 +146,9 @@ allow = [
 # Silence the DENIED telemetry hosts. `mute` never changes the verdict (still
 # refused) and never hides a count (`sbx net stats` still tallies it; see with
 # `--all`). Both are baked into the binary; the CLI has no per-installation opt-out
-# env var, so denying them here is the only cage-side lever. Local error logs are
+# env var, so denying them is the only cage-side lever. Local error logs are
 # unaffected — only the outbox is silent.
 mute = [
-    # Nothing here: the refusals worth hiding arrive with the bundle.
+    # Nothing here: the Sentry and Segment telemetry, the CLI's own update check and the vendor
+    # sites no session needs arrive with the bundle and are unioned in at resolution.
 ]

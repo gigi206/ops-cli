@@ -25,7 +25,7 @@
 # This is the v1 line: GitHub Releases, where the `deb:github:` locator looks, only ever carry v1.
 # For the v2 line, see the `opencode-v2-desktop` profile and its bundle instead.
 #
-# THE `deb:github:` BACKEND (no third party, tracks upstream automatically). This profile names the
+# THE `deb:github:` BACKEND (no third party, tracks upstream automatically). The bundle names the
 # GitHub repo — `deb:github:anomalyco/opencode` — and sbx queries the repo's LATEST release, selects
 # its linux-amd64 `.deb` asset, resolves it to a content hash (asset URL and hash both pinned in the
 # per-project deb lock), and builds a generated derivation that `dpkg-deb -x`-unpacks it and
@@ -145,7 +145,10 @@ allow = [
 # Silence the denied telemetry: the desktop app POSTs crash/usage envelopes to Sentry, which the
 # allowlist already refuses (`denied-default`). `mute` keeps those refusals out of the default
 # `sbx net logs` (still denied, still counted in `sbx net stats`; see them with `--all`).
-mute = []  # the Sentry refusal is muted by the bundle
+mute = [
+    # Nothing here: the Sentry refusal and npm's audit/JSR refusals arrive with the bundle and are
+    # unioned in at resolution.
+]
 
 # The real key is read on the HOST and injected by the egress proxy — never in the cage. Provide
 # it on the host as $OPENROUTER_API_KEY (or point `from` at a resolver, e.g.

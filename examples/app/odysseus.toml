@@ -4,14 +4,14 @@
 #   sbx bundle import examples/bundle/odysseus.toml
 #   sbx app import examples/app/odysseus.toml
 #   sbx app run odysseus
+#   # then open http://127.0.0.1:7000 in your host browser
 #
-# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The substrate its source build needs and the hosts it reaches come from a
-# shared BUNDLE, so import it too:
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. Its install step, the substrate that build needs
+# and the hosts it reaches come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/odysseus.toml
 #     sbx app import examples/app/odysseus.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
-#   # then open http://127.0.0.1:7000 in your host browser
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-registry.toml
@@ -22,9 +22,9 @@
 #
 # Odysseus is a Docker-compose stack upstream (app + ChromaDB + SearXNG + ntfy),
 # but the cage cannot run Docker. This profile uses the UPSTREAM NATIVE path instead:
-# a plain Python/uvicorn server. The `cmd` clones the repo into the app's isolated
-# $HOME on first launch, builds a venv, installs requirements, and runs uvicorn on
-# 127.0.0.1:7000. `forward = [7000]` bridges that loopback port into the cage so
+# a plain Python/uvicorn server. The bundle's install step clones the repo into the app's
+# isolated $HOME on first launch, builds a venv and installs requirements; the `cmd` runs uvicorn
+# on 127.0.0.1:7000. `forward = [7000]` bridges that loopback port into the cage so
 # your host browser reaches the workspace — the exact headless-serve pattern of
 # `opencode-web` / `hermes-web` (no Electron, no in-cage browser, no `gui` hole).
 #
@@ -42,7 +42,7 @@
 # Your data lives outside the checkout and is untouched.
 #
 # FIRST LAUNCH IS HEAVY — it clones the repo and installs `requirements.txt`
-# (a few hundred MiB of wheels over the allowlist below, minutes on first run). The
+# (a few hundred MiB of wheels over the bundle's PyPI lane, minutes on first run). The
 # clone + venv persist in the app's isolated home, and the install is stamped with the
 # commit it was built for, so later launches skip straight to uvicorn without touching
 # the network. The first admin password is printed to the terminal logs on first boot
@@ -137,19 +137,19 @@ forward = [7000]
 # shares your existing workspace (db, uploads, settings) instead of the app's isolated
 # home. `binds` is a security field, honored only because this profile is trusted by
 # location. Uncomment and point it at your clone's ./data (or wherever you keep it);
-# without it, data lives under the app's isolated home (the default). Mutually
-# exclusive with the in-cage clone above — if you bind a host checkout, drop the
-# `git clone` from `cmd` and run from that path instead.
+# without it, data lives under the app's isolated home (the default). The checkout itself
+# is the bundle's install step (`sbx bundle odysseus`), which a bind here does not replace.
 #binds = [
 #    { path = "~/odysseus-data", mode = "rw" },
 #]
 
 # --- The agent's requirements come from its bundle ------------------------------------------------
-# `use` pulls in the `odysseus` BUNDLE — the git/python/uv/node/chromium substrate its source build needs, the hosts that build and the
-# workspace reach, and the environment the workspace reads —
-# from one declaration shared with the bundle file itself, so this profile cannot fall behind when
-# the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
-# the `cmd` above, and a consuming app has to reproduce it to get the agent at all.
+# `use` pulls in the `odysseus` BUNDLE — the git/python/uv/node/chromium substrate its source
+# build needs, the hosts that build and the workspace reach, and the environment the workspace
+# reads — from one declaration shared with the bundle file itself, so this profile cannot fall
+# behind when the agent's requirements change. The install step rides the bundle too, as its
+# `provision`, which sbx runs before this command; what stays here is the command, the posture and
+# the credential choices.
 #
 # THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/odysseus.toml

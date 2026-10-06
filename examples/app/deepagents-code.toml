@@ -11,6 +11,9 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/pypi.toml
+#
 # Deep Agents Code is the terminal agent LangChain builds on its Deep Agents SDK: a Textual TUI
 # with planning, subagent delegation, persistent memory, skills and approval controls. It is
 # model-agnostic and picks its provider from whichever credential it finds, so it needs ONE

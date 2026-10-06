@@ -33,8 +33,9 @@
 # Electron needs, which the hermetic cage lacks) wrapped around the from-source-built renderer, with
 # the Python backend WIRED IN: the derivation sets `HERMES_DESKTOP_HERMES` to the flake's own
 # fully-equipped `hermes`, so the desktop app spawns that as its backend (no venv, no repo clone, no
-# `HERMES_DESKTOP_HERMES_ROOT`). The `cmd` therefore just sets up the in-cage OAuth browser and execs
-# the `hermes-desktop` launcher with the cage's Electron flags.
+# `HERMES_DESKTOP_HERMES_ROOT`). The `cmd` therefore only hands the app the cage's summary (see the
+# note below it) and execs the `hermes-desktop` launcher with the cage's Electron flags; the in-cage
+# OAuth browser is the `[open]` table's.
 #
 # WHY `--no-sandbox`. Electron's own Chromium sandbox can never work in the cage (seccomp blocks the
 # userns clone it needs), and there is no privilege to configure its setuid chrome-sandbox helper — so
@@ -44,10 +45,10 @@
 # LOGIN NEEDS AN IN-CAGE BROWSER. Sign-in is a Privy device-code grant: the app shows a code and opens
 # `portal.nousresearch.com/…?user_code=…` in a browser for you to authorize, then polls the token
 # endpoint. The hermetic cage has no host browser, so the `[open]` table routes http(s) to an
-# IN-CAGE Chromium (`nix:chromium`, see [packages]) — one declaration covering both the opener `PATH`
-# reaches and the desktop entry the portal resolves under `dbus = true`. You
+# IN-CAGE Chromium (`nix:chromium`, which the bundle carries) — one declaration covering both the
+# opener `PATH` reaches and the desktop entry the portal resolves under `dbus = true`. You
 # then sign in there (Privy: email / social / wallet). Google was live-proven; the login pulls Privy +
-# Cloudflare Turnstile + Google OAuth hosts, all in the allowlist below.
+# Cloudflare Turnstile + Google OAuth hosts, all in the bundle's allowlist.
 #
 # FIRST LAUNCH IS HEAVY — the flake's `#desktop` output builds from source HOST-SIDE (a few minutes),
 # and the Chromium and Node closures are provisioned beside it. That build goes over the HOST
@@ -61,18 +62,10 @@
 # also BYOK/multi-provider: uncomment the [env] placeholder + the [secret] block below and provide
 # $OPENROUTER_API_KEY on the host to have the egress proxy inject an OpenRouter key on the wire
 # instead (the plaintext never enters the cage).
-# The flake-built Electron app. `hermes-desktop` (from flake:#desktop) is nixpkgs' Electron wrapped
-# around the built renderer, with HERMES_DESKTOP_HERMES already pointing at the flake's own
-# fully-equipped `hermes` — so the Python backend is wired natively (no venv, no
-# HERMES_DESKTOP_HERMES_ROOT). --no-sandbox is mandatory (Electron's own Chromium sandbox needs a
-# userns clone that seccomp blocks in the cage); the Wayland flags map the window through the gui hole.
 #
 # The `.install_method` marker this profile used to write here now lives in the `hermes-desktop`
 # bundle as its `provision` step: it finishes the install rather than launching anything, so it
-# belongs with the tool. Writing it here also cost a `bash -c` wrapper, and this list needs none:
-# `sbx app run hermes-desktop -- <args>` appends the arguments to this array, so they reach the
-# program directly instead of travelling through a script's `"$@"` behind a `$0` filler sbx has
-# to supply.
+# belongs with the tool.
 cmd = [
     "bash",
     "-c",
@@ -156,8 +149,8 @@ exec hermes-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usag
 # `hooks_auto_accept`, which would approve any hook of yours still waiting. The managed layer would
 # replace a `pre_llm_call` list of your own, so when your `config.yaml` has one the command adds
 # nothing. `HERMES_SAFE_MODE=1` turns every shell hook off, this one included.
-# The dashboard registers these hooks the way the CLI does (read in its `tui_gateway`); the reply
-# of a model was measured on the CLI, not here.
+# Whether the desktop app's backend registers these hooks was not measured here; the reply of a
+# model was measured on the CLI.
 
 # The native desktop window: the Wayland socket (gui), the GPU render node + scoped /sys (gpu), and
 # a private in-cage desktop portal (dbus) so the app's file chooser renders in-cage and follows the
@@ -198,9 +191,9 @@ https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-sto
 [network]
 mode = "deny"
 allow = [
-    # The install lane, the provider and catalog hosts, the voice-asset hosts and the whole login
-    # chain arrive with the `hermes-desktop` bundle (`use` above) and are unioned into this list at
-    # resolution — inspect them with `sbx bundle hermes-desktop`, and see the launch's own view with
+    # Nothing here: the install lane, the provider and catalog hosts, the voice-asset hosts and the
+    # whole login chain arrive with the bundle and are unioned in at resolution — inspect them with
+    # `sbx bundle hermes-desktop`, and see the launch's own view with
     # `sbx config show --app hermes-desktop`.
     #
     # Nothing is added here on purpose. A remote `flake:` ref builds HOST-SIDE, over the host
@@ -218,7 +211,8 @@ allow = [
 # this list from the CLI with `sbx net mute|unmute -a hermes-desktop`.
 mute = [
     # Nothing here: the npm audit POST, the metadata-endpoint probe, the RUM/wallet telemetry,
-    # `@chromium-background` and the tag manager all arrive with the bundle.
+    # `@chromium-background` and the tag manager arrive with the bundle and are unioned in at
+    # resolution.
 ]
 
 # BYOK (the shipped default is the NousResearch account login instead). The real API key is read on

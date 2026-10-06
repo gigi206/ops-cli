@@ -3,6 +3,7 @@
 #   sbx bundle import examples/bundle/opencode.toml
 #   sbx app import examples/app/opencode-web.toml
 #   sbx app run opencode-web
+#   # then open http://127.0.0.1:4096 in your browser
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
 # BUNDLE, so import it too:
@@ -10,7 +11,12 @@
 #     sbx app import examples/app/opencode-web.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
-#   # then open http://127.0.0.1:4096 in your browser
+#
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # This is the third face of opencode (alongside the `opencode` CLI/TUI and the `opencode-desktop`
 # Electron app). `opencode web` runs the SAME opencode server the desktop app wraps, but serves
@@ -66,10 +72,11 @@ use = ["opencode"]
 # No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 [network]
 mode = "deny"
-# Same runtime egress as the `opencode` CLI profile — the web server is the same opencode server.
-# models.dev is the read-only model catalogue; opencode.ai is the gateway ("Zen") plus auth and
-# the config/theme schemas, opened to every verb with `{*}`. registry.npmjs.org equips opencode
-# via mise. If a request is refused, the proxy names the host — watch `sbx net logs -a opencode-web`
+# Same runtime egress as the `opencode` CLI profile — the web server is the same opencode server,
+# and the same bundle opens it: models.dev is the read-only model catalogue; opencode.ai is the
+# gateway ("Zen") plus auth and the config/theme schemas, opened to every verb with `{*}`;
+# registry.npmjs.org is opencode's plugin loader (the install itself is a GitHub release asset).
+# If a request is refused, the proxy names the host — watch `sbx net logs -a opencode-web`
 # and add it here (or check with `sbx test net <url>`). For a DIRECT provider instead of the
 # gateway, add its host (`{*} https://api.anthropic.com`, `{*} https://api.openai.com`, or
 # `{*} https://openrouter.ai`) and fill the [secret] block below.

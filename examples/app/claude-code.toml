@@ -57,27 +57,26 @@ use = ["claude-code"]
 
 # No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
-# Egress is denied by construction except the Anthropic API, the Claude platform host
-# the CLI contacts at startup (its connectivity/account check — without it the tool
-# reports "Unable to connect to Anthropic services"), the Claude downloads host and the
-# Anthropic MCP proxy the CLI reaches for updates and MCP connectors, and the one Google
-# Cloud Storage bucket Anthropic ships the `claude` binary from (so the tool can
-# self-equip fresh at first launch). The two pure-download hosts — downloads.claude.ai and the
-# GCS dist bucket (path-scoped to exactly that bucket, not the rest of GCS) — are method-scoped
-# `{GET,HEAD}`, so the agent can only *read* from them, never POST/upload. The API, platform
-# (account/connectivity check), and MCP proxy (JSON-RPC: POST/SSE/DELETE) hosts stay open to
-# every verb. The agent may run on untrusted project code, but it can only reach these. (If a
-# future `claude-code` release moves hosts or needs another verb, the proxy reports the refusal
-# — add it; check ahead with `sbx test net <url>`.)
-# An app is read-by-default ({GET,HEAD}): the API/MCP hosts the agent POSTs to are opened to
-# all verbs with `{*}`; the pure download hosts stay `{GET,HEAD}` (least privilege).
+# Egress is denied by construction except the hosts the bundle opens: the Anthropic API, the Claude
+# platform host the CLI contacts at startup (its connectivity/account check — without it the tool
+# reports "Unable to connect to Anthropic services"), `console.anthropic.com`, the Claude downloads
+# host and the Anthropic MCP proxy the CLI reaches for updates and MCP connectors, and the one
+# Google Cloud Storage bucket Anthropic ships the `claude` binary from (so the tool can self-equip
+# fresh at first launch). The two pure-download hosts — downloads.claude.ai and the GCS dist bucket
+# (path-scoped to exactly that bucket, not the rest of GCS) — are method-scoped `{GET}`, so the
+# agent can only *read* from them, never POST/upload. The API, platform (account/connectivity
+# check), console and MCP proxy (JSON-RPC: POST/SSE/DELETE) hosts stay open to every verb. The agent
+# may run on untrusted project code, but it can only reach these. (If a future `claude-code` release
+# moves hosts or needs another verb, the proxy reports the refusal — add it; check ahead with `sbx
+# test net <url>`.) An app is read-by-default ({GET,HEAD}): the API/MCP hosts the agent POSTs to are
+# opened to all verbs with `{*}`; the pure download hosts stay `{GET}` (least privilege).
 #
 # Third-party telemetry (the CLI ships operational logs to Datadog) is NOT hard-denied here: in
 # `deny` mode any host absent from `allow` is already refused, so Datadog never gets out, and
-# the [env] telemetry cut below also stops the CLI from generating that traffic at the source. To
-# restore an explicit, self-documenting hard block — a backstop if the mode is ever loosened, and it
-# also covers every port plus the raw-TCP path — uncomment the rule below. `deny` always wins; the
-# `*.` wildcard covers the apex plus every regional intake host.
+# the bundle's [env] telemetry cut (`sbx bundle claude-code`) also stops the CLI from generating
+# that traffic at the source. To restore an explicit, self-documenting hard block — a backstop if
+# the mode is ever loosened, and it also covers every port plus the raw-TCP path — uncomment the
+# rule below. `deny` always wins; the `*.` wildcard covers the apex plus every regional intake host.
 [network]
 mode = "deny"
 # deny = [
@@ -87,6 +86,8 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle claude-code`, and what
 # the launch ends up with via `sbx config show --app claude-code`.
 allow = [
+    # Nothing here: the Anthropic, Claude and GCS hosts above arrive with the bundle and are unioned
+    # in at resolution.
 ]
 
 # BYOK (API-key auth) is commented out below, so this profile ships with no baked-in credential —

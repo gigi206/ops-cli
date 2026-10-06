@@ -11,6 +11,9 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#
 # The tool is equipped fresh from upstream: mise's `github` backend pulls Kilo Code's
 # standalone release binary (`kilo-linux-x64.tar.gz`) — verified by GitHub artifact
 # attestation + SLSA provenance, self-contained (no node/bun runtime), no nixpkgs lag. It
@@ -24,13 +27,12 @@
 # version its own build script requires — and its `bun install` step does not fetch through
 # the cage's egress proxy. The release binary above sidesteps both.)
 #
-# Kilo Code is MULTI-PROVIDER (it shares opencode's model layer). This template is set up
-# for Anthropic; for another provider change the allowlist + the [secret] block + the env
-# var (e.g. OpenAI: allow "api.openai.com", header "Authorization", type "bearer", env
-# OPENAI_API_KEY; or OpenRouter: allow "openrouter.ai", header "Authorization", type
-# "bearer", env OPENROUTER_API_KEY). The real key is read on the HOST and injected by the
-# egress proxy — never in the cage. If a request is blocked, the proxy reports the host it
-# refused — add it to `allow` (or check ahead with `sbx test net <url>`).
+# Kilo Code is MULTI-PROVIDER (it shares opencode's model layer). The commented template
+# below is set up for OpenRouter; for another provider change the allowlist host, the
+# [secret] block and the env var (e.g. OpenAI: allow "api.openai.com", header
+# "Authorization", type "bearer", env OPENAI_API_KEY). The real key is read on the HOST and
+# injected by the egress proxy — never in the cage. If a request is blocked, the proxy reports
+# the host it refused — add it to `allow` (or check ahead with `sbx test net <url>`).
 cmd = "kilo"
 
 # Your host Kilo Code config, mounted read-write at its real absolute path. `binds` is a security
@@ -56,32 +58,33 @@ use = ["kilocode"]
 
 [network]
 mode = "deny"
-# api.anthropic.com: the provider API — opened to every verb with `{*}` (an app is read-by-default,
-# and the CLI POSTs completions). models.dev: the model catalogue — a read-only fetch, `{GET,HEAD}`.
+# A provider host the CLI POSTs completions to is opened to every verb with `{*}` (an app is
+# read-by-default).
 # The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
 # unioned into this list at resolution. Check what that adds with `sbx bundle kilocode`, and what the
 # launch ends up with via `sbx config show --app kilocode`.
 allow = [
-  # Kilo's session-export / cloud-sync ingest (POST /v1/session-export/batch) — the feature that
-  # backs up/syncs your coding sessions to the cloud. Allowed so cloud sync works; the host stays
-  # out of `mute` so a sync failure stays visible in the log.
+  # Nothing here: Kilo's API, the model catalogue and its session-export / cloud-sync ingest
+  # (`supermassive-black-hole.kiloapps.io`, POST /v1/session-export/batch — allowed so cloud sync
+  # works, and kept out of `mute` so a sync failure stays visible) arrive with the bundle and are
+  # unioned in at resolution.
+  # Kilo's PostHog product telemetry, refused and muted by the bundle: uncomment to let it out.
   #"{*} https://us.i.posthog.com",
   # Direct-OpenRouter BYOK: uncomment together with the [secret] block below.
   #"{*} https://openrouter.ai",
 ]
 
 # Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): hosts we deliberately
-# leave DENIED and do NOT want to hear about. Here Kilo Code's PostHog product telemetry (POST
-# /batch/), which a live run hits periodically and whose `denied-default` lines would clutter the
-# ones worth acting on. `*.i.posthog.com` is regional (apex + subdomains muted together, spoof-safe).
-# A `mute` never changes the verdict (the telemetry is still refused) and never hides a count
-# (`sbx net stats` still tallies it); it only keeps the line out of the default log. See it
-# anytime with `sbx net logs --all`, and edit this list from the CLI with `sbx net mute|unmute
-# <host> -a kilocode`. Remove the entry here the day you decide to allow the endpoint.
-#
-# Not here: `supermassive-black-hole.kiloapps.io` (Kilo's session-export / cloud-sync ingest) is
-# ALLOWED in `allow` above (cloud sync enabled), so it never reaches the mute filter.
-mute = []
+# leave DENIED and do NOT want to hear about. A `mute` never changes the verdict (the telemetry is
+# still refused) and never hides a count (`sbx net stats` still tallies it); it only keeps the line
+# out of the default log. See it anytime with `sbx net logs --all`, and edit this list from the CLI
+# with `sbx net mute|unmute <host> -a kilocode`.
+mute = [
+    # Nothing here: Kilo Code's PostHog product telemetry (POST /batch/, which a live run hits
+    # periodically; `*.i.posthog.com`, regional — apex + subdomains muted together, spoof-safe)
+    # arrives with the bundle and is unioned in at resolution. To allow the endpoint, uncomment its
+    # line in `allow` above.
+]
 
 # The real key is read on the HOST and injected by the egress proxy — never in the cage.
 # Provide it on the host as $OPENROUTER_API_KEY (or point `from` at a resolver, e.g.

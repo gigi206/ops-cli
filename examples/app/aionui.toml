@@ -48,7 +48,7 @@
 # to its releases after `v2.1.47-final` (2026-08-05) — the ones published since carry none at all,
 # so `deb:github:iOfficeAI/AionUi` resolves to nothing. It did not stop publishing for Linux: it
 # moved distribution to its own release store at `static.aionui.com`, which is where the vendor's
-# site sends every download and which this profile already allows for the in-app update feed. The
+# site sends every download and which also serves the in-app update feed (muted below). The
 # `resolve` command at the end of this file reads the version off the release upstream tags,
 # composes that store's URL for the machine sbx runs on, and confirms the object is there before
 # handing it over, so a tagged release with no build published yet fails by name instead of pinning
@@ -117,7 +117,7 @@
 # RESIDUAL: the bundled CLIs beside it (`managed-resources/cli/`, ~590 MB — claude, codex) are
 # installed ON DEMAND, only when you pick one as the agent, and may hit the same read-only-rewrite
 # failure. That path was not exercised, so it is not staged here; the co-worked CLIs below come from
-# [packages] instead and are unaffected.
+# their bundle (`use`) instead and are unaffected.
 cmd = [
     "bash",
     "-c",
@@ -226,8 +226,9 @@ mode = "deny"
 # actually use for least privilege. If a request is refused, the proxy names the host: watch
 # `sbx net logs -a aionui` and add it here (or check ahead with `sbx test net <url>`).
 #
-# The app's update check + the `.deb`/`.rpm` it fetches ride GitHub, already covered by sbx's
-# built-in github/githubusercontent allow-set — no entry needed. "Browse the web" (a Cowork power)
+# The app's own update feed (`static.aionui.com`) is muted below rather than allowed: the `.deb`
+# comes in host-side, through the `resolve` command at the end of this file, and `sbx upgrade` moves
+# it, so the cage needs no entry for it. "Browse the web" (a Cowork power)
 # reaches arbitrary hosts and is DENIED by design (that is the confinement); allow specific hosts
 # here if you want the agent to reach them.
 allow = [

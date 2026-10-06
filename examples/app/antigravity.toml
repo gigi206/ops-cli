@@ -52,7 +52,7 @@
 # back to software (still renders, slower). `dbus = true` gives the cage its OWN private desktop portal
 # (an in-cage `dbus-daemon` + `xdg-desktop-portal` with the reference GTK backend), so the IDE's FILE
 # CHOOSER opens IN-CAGE and lists only the cage filesystem, seeds + follows your host light/dark theme,
-# and bridges `org.freedesktop.Notifications` — while the login keyring stays absent. The Electron
+# and bridges `org.freedesktop.Notifications` — while the host keyring stays absent. The Electron
 # flags: `--no-sandbox` is mandatory and acceptable (bwrap + seccomp + the empty netns IS the boundary,
 # replacing Chromium's own redundant sandbox); `--ozone-platform=wayland` selects the Wayland backend;
 # `--disable-dev-shm-usage` avoids the small cage `/dev/shm`. (`audio` is NOT enabled — add `audio =
@@ -82,7 +82,7 @@
 #   (Chromium then uses `xdg-open` directly, no portal/index) — the token persists in the isolated home,
 #   and daily use returns to `dbus = true`.
 #
-#   The allowlist below is grounded on a real login (the `agy` Google chain + the observed
+#   The bundle's allowlist is grounded on a real login (the `agy` Google chain + the observed
 #   `cloudcode-pa` model backend + the VS Code CDN); if a request is refused, watch
 #   `sbx net logs -a antigravity --all` and add the host (or check ahead with `sbx test net <url>`).
 # A pragmatic one-time escape: `sbx app run antigravity --net allow` for the login only (allow-by-
@@ -103,15 +103,16 @@
 #     the flag it falls back to the plaintext store. Confirm the login survives a relaunch.
 #   * In-app self-update — the IDE self-updates in the background from the same updater API + gvt1 CDN.
 #     A self-downloaded binary is NOT autoPatchelf'd, so it cannot run in the cage — the in-app updater
-#     is inert; **`sbx upgrade --app antigravity` is the real upgrade path**. Those hosts are muted below.
+#     is inert; **`sbx upgrade --app antigravity` is the real upgrade path**. The bundle mutes those
+#     hosts.
 #   * The real build + launch + Google login with your account is the pending live validation, as for
 #     every GUI profile (heavy build; not a per-run committed test).
 #
-# `--password-store=gnome-libsecret` (on both the app and Chromium): Chromium normally encrypts its session
-# cookie with a key from the OS keyring (over dbus), which the cage's private bus does not expose — so
-# without it the cookie cannot be re-decrypted next launch and you are logged out. `basic` forces the
-# file store in the isolated $HOME (a weak fixed key — acceptable: the token lives only in the per-app
-# isolated cage home, never the project shell).
+# `--password-store=gnome-libsecret` (on both the app and Chromium): Chromium encrypts its session
+# cookie with a key from the OS keyring, and under `dbus = true` the cage's private bus carries a
+# Secret Service of its own, whose keyring file lives in the app's isolated $HOME (the host's
+# keyring is never exposed). Chromium picks its backend from `XDG_CURRENT_DESKTOP`, which a cage
+# does not set, so the flag is what makes it use that keyring rather than the plaintext store.
 cmd = [
     "bash",
     "-c",
@@ -119,9 +120,7 @@ cmd = [
 # IN-CAGE BROWSER LOGIN. Antigravity's Google Sign-In opens an external browser for the consent,
 # then hands the result back as a deep-link to the running editor. What each of those opens with is
 # declared in `[open]` below; all that is left here is the one thing a declaration cannot express,
-# Chromium's managed policy. See the header's LIVE-GATE note: the deep-link scheme is the VS
-# Code-fork convention and UNVERIFIED — correct the `[open]` key if the editor does not complete
-# the login after the Google consent.
+# Chromium's managed policy.
 
 # Chromium managed policy: auto-launch the deep-link with no confirmation dialog, else the callback
 # never reaches the editor and login silently fails. /etc is a writable cage tmpfs; Chromium reads
@@ -192,9 +191,6 @@ use = ["antigravity"]
 
 # No `[packages]` table here, and no `[tarball.antigravity-ide]` resolver: both come from the bundle.
 
-# An app is read-by-default ({GET,HEAD}); a host the editor/agent WRITES to (POSTing completions,
-# tokens) is opened to all verbs with `{*}`. Grounded on the `agy` CLI profile's Google chain +
-# claude-desktop's Google Sign-In set. See the header's LIVE-GATE note — refine from `sbx net logs`.
 # Where a link opens, declared rather than scripted. `http`/`https` go to the in-cage Chromium for
 # the web auth; `antigravity-ide` is the callback the provider redirects to, which must reach the
 # running editor (`--open-url` is how it accepts one). One declaration covers both ways a link is
@@ -208,6 +204,9 @@ http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-stor
 https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
 antigravity-ide = ["antigravity-ide", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--open-url"]
 
+# An app is read-by-default ({GET,HEAD}); a host the editor/agent WRITES to (POSTing completions,
+# tokens) is opened to all verbs with `{*}`. The bundle's set is grounded on the `agy` CLI profile's
+# Google chain + claude-desktop's Google Sign-In set; refine it from `sbx net logs`.
 [network]
 mode = "deny"
 # NOTE on HTTP/2: `cloudcode-pa` serves BOTH HTTP/1.1 (the REST account-setup + agent calls) and
@@ -216,11 +215,11 @@ mode = "deny"
 # used here — the backend works over h1, exactly as it did before (observed: 104 h1 requests to
 # `daily-cloudcode-pa`). Only add an `http2` entry if a host is proven h2-*only*.
 allow = [
-    # The Cloud Code backend, the docs host, the Google Sign-In chain, the VS Code asset CDN and
-    # the Open VSX marketplace all arrive with the `antigravity` bundle (`use` above) and are
-    # unioned into this list at resolution — inspect them with `sbx bundle antigravity`, and see
-    # the launch's own view with `sbx config show --app antigravity`. A host the flow reaches that
-    # is not in the union is refused and named: watch `sbx net logs -a antigravity --all`.
+    # Nothing here: the Cloud Code backend, the docs host, the Google Sign-In chain, the VS Code
+    # asset CDN and the Open VSX marketplace arrive with the bundle and are unioned in at resolution
+    # — inspect them with `sbx bundle antigravity`, and see the launch's own view with
+    # `sbx config show --app antigravity`. A host the flow reaches that is not in the union is
+    # refused and named: watch `sbx net logs -a antigravity --all`.
 ]
 # Silence deliberately-DENIED noise so `sbx net logs` reads clean (a `mute` never changes the verdict —
 # the host stays denied and still counts in `sbx net stats`; see them with `--all`). These are

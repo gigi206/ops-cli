@@ -43,15 +43,15 @@
 # leaner and the more robust choice here.
 #
 # VERSION — AUTO-UPGRADE via `tarball:resolve`. Kiro's `.tar.gz` URL embeds a version with no
-# `…/latest/…` alias, so a fixed `tarball:<url>` would freeze. Instead this profile uses
-# `tarball:resolve` paired with the `[tarball.kiro]` table below: sbx runs its `resolve` command in a
+# `…/latest/…` alias, so a fixed `tarball:<url>` would freeze. Instead the bundle uses
+# `tarball:resolve` paired with its `[tarball.kiro]` table: sbx runs that `resolve` command in a
 # hermetic sandbox to read Kiro's release metadata JSON and print the CURRENT signed `.tar.gz` URL
 # (the metadata's own `releases[].url`), pins it per project on first launch, and `sbx upgrade --app
 # kiro-desktop` re-runs it to roll forward — no manual URL bump.
 #
-# FIRST LAUNCH resolves + builds the `.deb` host-side, pulling the Electron closure (hundreds of MiB —
-# a couple of minutes, over your HOST network, NOT the cage allowlist). Later launches reuse the
-# pinned build offline.
+# FIRST LAUNCH resolves + builds the `.tar.gz` host-side, pulling the Electron closure (hundreds of
+# MiB — a couple of minutes, over your HOST network, NOT the cage allowlist). Later launches reuse
+# the pinned build offline.
 #
 # DISPLAY + GPU + DBUS (identical to the other Electron profiles). `gui = "wayland"` binds the host
 # Wayland compositor socket (read-only) and provisions fonts so the window maps; X11 is never offered;
@@ -78,8 +78,9 @@
 # Chromium, and because the callback is a normal `http://localhost` URL the browser follows it right
 # back to the IDE's own in-cage callback server (same cage, same empty-netns loopback) — no scheme
 # handler needed. Two load-bearing details carried over from `kiro.toml` (both proven there):
-#   * BACKGROUND Chromium (`nohup … &`), never `exec` it — an opener that blocks (waiting for the
-#     browser to exit) stalls the login before the token exchange runs;
+#   * a DETACHED opener (`mode = "detach"` in `[open]`), never one that becomes the browser — an
+#     opener that blocks (waiting for the browser to exit) stalls the login before the token
+#     exchange runs;
 #   * `--host-resolver-rules="MAP localhost 127.0.0.1"` — the cage's synthetic /etc/hosts advertises
 #     `::1` for localhost but the empty netns brings up NO IPv6 loopback, so the callback must be
 #     pinned to the IPv4 listener. The callback port is DYNAMIC (kiro picks the first free candidate —
@@ -126,8 +127,9 @@
 # resort, fall back to `network = "shared"` (you keep bubblewrap + seccomp + the isolated home + the
 # minimal /dev, and lose only egress FILTERING).
 #
-# STATUS — honest scope. This profile IMPORTS and RESOLVES cleanly. The packaging/transport mirrors
-# the proven `cursor` desktop path (deb:resolve + autoPatchelf + gui/gpu/dbus). STILL TO VALIDATE with
+# STATUS — honest scope. This profile IMPORTS and RESOLVES cleanly. The packaging/transport follows
+# the proven `cursor` desktop path (a resolver-pinned vendor artifact + autoPatchelf + gui/gpu/dbus;
+# `tarball:resolve` here where cursor rides `deb:resolve`). STILL TO VALIDATE with
 # a real Kiro account: the account LOGIN (wired below, but see the UPSTREAM GATE above) and an
 # end-to-end AI turn. If a request is blocked, the proxy names the host it refused — add it to `allow`
 # (or check ahead with `sbx test net <url>`).
@@ -191,10 +193,10 @@ use = ["kiro-desktop"]
 # No `[packages]` table here, and no `[tarball.kiro]` resolver: both come from the bundle.
 
 # An app is read-by-default ({GET,HEAD}); a host the editor WRITES to (POSTing prompts/context) is
-# opened to all verbs with `{*}`. Hosts are from Kiro's own IDE firewall doc
+# opened to all verbs with `{*}`. The bundle's hosts are from Kiro's own IDE firewall doc
 # (kiro.dev/docs/privacy-and-security/firewalls) PLUS the Google browser-login chain proven live for
 # `kiro.toml`. Kiro's firewall doc is known to mix IDE/CLI hosts and omit some (issue #6314), so treat
-# `sbx net logs -a kiro-desktop` as ground truth on the first `--net shared` run.
+# `sbx net logs -a kiro-desktop` as ground truth on the first `--net allow` run.
 # Where a web link opens, declared rather than scripted. sbx generates the `xdg-open` the cage
 # reaches and the desktop entry the in-cage portal resolves, and freezes both, so a link opens the
 # same way whichever of the two a caller uses.
@@ -226,9 +228,9 @@ allow = [
     # resolution — inspect them with `sbx bundle kiro-desktop`, and see the launch's own view with
     # `sbx config show --app kiro-desktop`.
     #
-    # Optional Kiro "Powers" / agent tool use (git operations). github.com {GET} is already covered
-    # by sbx's built-in nix-cache set; uncomment the raw host if a Power fetches from it.
-    #"{GET} https://raw.githubusercontent.com",
+    # Optional Kiro "Powers" / agent tool use (git operations): github.com and
+    # `*.githubusercontent.com` (raw.githubusercontent.com included) are already readable through
+    # sbx's built-in allow-set, so a Power's read-only fetches need no entry here.
 ]
 # HTTP/2 (gRPC) transport — an exact host or a `*.domain` wildcard (host-level; orthogonal to the
 # `allow` verdict — a host here must ALSO be in `allow`, every stream still verdict-checked). The

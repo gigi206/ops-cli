@@ -11,6 +11,10 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/github-install.toml
+#
 # DISTINCT FROM THE `traycer` PROFILE. That one is the CLI, headless, and the natural fit for a
 # sandbox. This one maps a window: it is the same product with a planning and inspection surface,
 # and it delegates the host's lifecycle to its own bundled copy of the CLI. Run either, or both;

@@ -11,6 +11,12 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#
 # The tool is equipped fresh from upstream (mise's registry resolves `opencode` to
 # its standalone release binary) — no nixpkgs lag. It is equipped at the latest
 # upstream version on the first launch in a project and pinned there, so a later upstream
@@ -18,11 +24,11 @@
 # This is the v1 line: mise's registry only ever sees GitHub Releases, where upstream keeps
 # v1. For the v2 line, see the `opencode-v2` profile and its bundle instead.
 #
-# opencode is MULTI-PROVIDER, so its egress depends on the model you use. This
-# template is set up for Anthropic; for another provider, change the allowlist and
-# the [secret] block (e.g. OpenAI: allow "api.openai.com", header "Authorization",
-# type "bearer", env OPENAI_API_KEY). If a request is blocked, the proxy reports
-# the host it refused — add it to `allow` (or check with `sbx test net <url>`).
+# opencode is MULTI-PROVIDER, so its egress depends on the model you use. The
+# commented template below is set up for OpenRouter; for another provider change the
+# allowlist host, the [secret] block and the env var (e.g. OpenAI: allow "api.openai.com",
+# header "Authorization", type "bearer", env OPENAI_API_KEY). If a request is blocked, the
+# proxy reports the host it refused — add it to `allow` (or check with `sbx test net <url>`).
 cmd = "opencode"
 
 # Your host opencode config, mounted read-write at its real absolute path. `binds` is a security
@@ -49,18 +55,18 @@ use = ["opencode"]
 
 [network]
 mode = "deny"
-# opencode.ai: the opencode gateway ("Zen", e.g. `opencode.ai/zen/v1/chat/completions`) plus auth and
-# the config/theme schemas — opened to every verb with `{*}` (an app is read-by-default, and the CLI
-# POSTs completions through the gateway). For a DIRECT provider instead of the gateway, add its host
-# here (`{*} https://api.anthropic.com` for Anthropic, `{*} https://api.openai.com` for OpenAI) and
-# fill the [secret] block below. models.dev: the model catalogue, a read-only fetch.
+# opencode.ai (opened by the bundle): the opencode gateway ("Zen", e.g.
+# `opencode.ai/zen/v1/chat/completions`) plus auth and the config/theme schemas — opened to every
+# verb with `{*}` (an app is read-by-default, and the CLI POSTs completions through the gateway).
+# For a DIRECT provider instead of the gateway, add its host here (`{*} https://api.anthropic.com`
+# for Anthropic, `{*} https://api.openai.com` for OpenAI) and fill the [secret] block below.
+# models.dev (the bundle's `@models-catalog`): the model catalogue, a read-only fetch.
 #
 # registry.npmjs.org is NOT the install path, despite `mise:` looking like it would be: mise's
 # registry resolves the bare name `opencode` to `aqua:anomalyco/opencode`, a GitHub release asset,
 # and sbx's built-in allow-set already covers github — so equipping needs nothing here. What was
 # observed reaching npm is opencode's PLUGIN loader (`@opencode-ai/plugin`, seen live in the egress
-# log of the `opencode-desktop` profile, the same tool). Keep it if you use plugins; a setup that
-# loads none can drop this line and lose nothing.
+# log of the `opencode-desktop` profile, the same tool), through the bundle's `@npm-registry` lane.
 # The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
 # unioned into this list at resolution. Check what that adds with `sbx bundle opencode`, and what the
 # launch ends up with via `sbx config show --app opencode`.
@@ -69,7 +75,7 @@ allow = [
   # a WebSocket. Uncomment to allow sharing.
   #"{*} https://opncd.ai",
   # opencode streams completions over HTTPS (SSE), NOT a WebSocket, so the default posture
-  # (Anthropic, or a model routed through the opencode gateway) needs no `{WS}` grant — and it
+  # (the opencode gateway, or a direct Anthropic/OpenRouter key) needs no `{WS}` grant — and it
   # never opens a WebSocket to `opencode.ai`. A WebSocket is opened only by the OpenAI "Responses"
   # transport, and it targets the OpenAI provider's OWN base host: `api.openai.com` for a direct
   # key, or your gateway host if you route OpenAI through one. A WebSocket is a distinct capability

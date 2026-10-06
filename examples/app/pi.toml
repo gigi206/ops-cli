@@ -18,11 +18,12 @@
 # advances that pin.
 #
 # Pi is MULTI-PROVIDER (it speaks each provider's native API directly), so its egress
-# depends on the provider you key it to. This template is set up for Anthropic; for
-# OpenAI, change the allowlist to "api.openai.com" and the [secret] block to header
-# "Authorization", type "bearer", env OPENAI_API_KEY. (Pi's Google Gemini path uses a
-# query-parameter key, which the header-injection model below cannot broker — use
-# Anthropic or OpenAI for the sandboxed credential boundary.) If a request is blocked,
+# depends on the provider you key it to. The commented template below is set up for
+# OpenRouter; for another provider change the allowlist host, the [secret] block and the env
+# var (e.g. OpenAI: allow "api.openai.com", header "Authorization", type "bearer", env
+# OPENAI_API_KEY). (Pi's Google Gemini path uses a query-parameter key, which the
+# header-injection model below cannot broker — use OpenRouter, Anthropic or OpenAI for the
+# sandboxed credential boundary.) If a request is blocked,
 # the proxy reports the host it refused — add it to `allow` (or check ahead with
 # `sbx test net <url>`).
 # The command hands Pi the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which

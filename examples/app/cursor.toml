@@ -31,8 +31,8 @@
 # seeded into the store, offline-reusable after the first launch.
 #
 # VERSION — AUTO-UPGRADE via `deb:resolve`. Cursor's `.deb` URL embeds a version + build hash and has
-# no `…/latest/…` alias, so a fixed `deb:<url>` would freeze at one version. Instead this profile uses
-# `deb:resolve` paired with the `[deb.cursor]` table below: sbx runs its `resolve` command in a
+# no `…/latest/…` alias, so a fixed `deb:<url>` would freeze at one version. Instead the bundle uses
+# `deb:resolve` paired with its `[deb.cursor]` table: sbx runs that `resolve` command in a
 # hermetic sandbox to query Cursor's download API for the CURRENT `.deb` URL, pins it per project on
 # first launch, and `sbx upgrade --app cursor` re-runs it to roll forward — no manual URL bump. The API
 # (`https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable`) returns
@@ -46,7 +46,8 @@
 # per-session CA. Electron/Chromium trusts its own NSS database, not the CA-file env vars sbx sets,
 # so a Chromium app would otherwise fail every HTTPS with `ERR_CERT_AUTHORITY_INVALID`. For a
 # `gui = "wayland"` cage under a filtering posture, sbx seeds its MITM CA into the cage's NSS db
-# automatically (part of the GUI hole, like fonts); `--use-system-ca` tells Electron to consult it.
+# automatically (part of the GUI hole, like fonts); `--use-system-ca` asks Electron to consult it,
+# though this build does not know the flag yet and trusts the seed regardless (OBSERVED AT RUNTIME).
 # Cursor's own Node backend (the extension host that makes model calls) additionally honours
 # `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE`, which sbx also sets — so both halves trust the proxy.
 #
@@ -80,7 +81,8 @@
 # to an in-cage Chromium for the web auth and the `cursor://` callback goes to `cursor --open-url`.
 # One declaration covers both ways a link is opened — a tool calling `xdg-open` and an Electron app
 # calling the portal under `dbus = true` — and sbx freezes the routing so nothing in the cage can
-# answer a sign-in link in its place. It needs `nix:chromium` (a large closure — see `[packages]`).
+# answer a sign-in link in its place. It needs `nix:chromium` (a large closure, which the bundle
+# carries).
 #
 # FIRST LOGIN — run it once under `--net allow` (allow-by-default, so no allowlist whack-a-mole while
 # you discover which SSO hosts the flow touches), let the session persist in the isolated home, then
@@ -92,10 +94,11 @@
 # token the flow mints is minted where sbx can see it. `--net shared` opens the same doors but removes
 # the proxy entirely — nothing is recorded, and the MITM CA is not seeded — so keep it as the last
 # resort for a client whose TLS refuses interception.
-# If you sign in with Google/GitHub SSO, add the provider's host chain to `allow` (for Google the
-# repo-standard bounded regex — see `examples/app/claude-desktop.toml`; the `accounts.google.<ccTLD>/…/SetSID`
-# redirect is load-bearing). A plain EMAIL sign-in stays on Cursor's own domain and needs no SSO hosts.
-# Whether the session token survives a relaunch under `--password-store=gnome-libsecret` is the thing to confirm.
+# Google SSO already rides the bundle's `@google-signin-incage` lane (its bounded
+# `accounts.google.<ccTLD>` regex keeps the load-bearing `/SetSID` redirect working); for GitHub
+# SSO, add to `allow` the hosts the proxy names. A plain EMAIL sign-in stays on Cursor's own domain
+# and needs no SSO hosts. Whether the session token survives a relaunch under
+# `--password-store=gnome-libsecret` is the thing to confirm.
 #
 # EGRESS AND HTTP/2 (gRPC). sbx's MITM proxy speaks HTTP/1.1 by default; a host listed in
 # `[network] http2` is instead man-in-the-middled as HTTP/2 (ALPN h2) for gRPC, every stream still
@@ -124,8 +127,8 @@
 # the window maps on Wayland, the editor reaches startup, and its API traffic filters through the MITM
 # (api2.cursor.sh allowed, telemetry/component hosts denied). STILL TO VALIDATE with a real Cursor
 # account: the account LOGIN (now WIRED via the in-cage browser below — validate it on the first
-# `--net shared` run) and an end-to-end AI turn. If a request is blocked, the proxy names the host it
-# refused — add it to `allow` (or check ahead with `sbx test net <url>`).
+# `--net allow` run, see FIRST LOGIN above) and an end-to-end AI turn. If a request is blocked, the
+# proxy names the host it refused — add it to `allow` (or check ahead with `sbx test net <url>`).
 #
 # OBSERVED AT RUNTIME — all benign, all inherent to the Mode-B cage (do NOT "fix" by widening it):
 #   - `Failed to connect to /run/dbus/system_bus_socket` — the SYSTEM bus is privileged and never
@@ -218,10 +221,10 @@ cursor = ["cursor", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-s
 [network]
 mode = "deny"
 allow = [
-    # The Cursor backends, the login/billing domain, WorkOS, the marketplace and asset hosts, the
-    # Google SSO chain and the Stripe checkout all arrive with the `cursor` bundle (`use` above)
-    # and are unioned into this list at resolution — inspect them with `sbx bundle cursor`, and see
-    # what the launch ends up with via `sbx config show --app cursor`.
+    # Nothing here: the Cursor backends, the login/billing domain, WorkOS, the marketplace and asset
+    # hosts, the Google SSO chain and the Stripe checkout arrive with the bundle and are unioned in
+    # at resolution — inspect them with `sbx bundle cursor`, and see what the launch ends up with
+    # via `sbx config show --app cursor`.
     #
     # Other client update / CDN hosts — uncomment whichever the editor names in `sbx net logs -a
     # cursor` (least privilege; not needed for the editor's core edit/AI path).

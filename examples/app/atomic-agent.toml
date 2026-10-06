@@ -11,6 +11,9 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/huggingface-hub.toml
+#
 # Atomic Agent runs the agent LOOP and all its state on your machine: sessions, memory, tasks,
 # traces, skills and config are plain files and SQLite databases under a state directory, and the
 # model can be a local `llama.cpp` server rather than a vendor API. That is a claim about where the

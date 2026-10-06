@@ -33,13 +33,12 @@
 # reuse the pinned build offline.
 #
 # VERSIONS — tracked automatically. Anthropic's apt pool has **no "latest" URL** (each `.deb` is
-# version-stamped `claude-desktop_<ver>_amd64.deb`), so instead of hand-pinning one version this
-# profile uses the `deb:apt:` backend pointed at the pool's `Packages` index: sbx reads the index,
+# version-stamped `claude-desktop_<ver>_amd64.deb`), so instead of hand-pinning one version the
+# bundle uses the `deb:apt:` backend pointed at the pool's `Packages` index: sbx reads the index,
 # picks the **newest** version's `.deb`, and pins it per project on first launch. `sbx upgrade --app
-# claude-desktop` re-reads the index and **rolls forward** to the newest — no manual URL bump. (sbx does no
-# GPG/ InRelease signature check and expects this single-application pool — the same TLS-plus-unpack trust
-# level as a direct `deb:` URL.) ARCH: the index below is `binary-amd64` (x86_64); on arm64 point it
-# at `.../binary-arm64/Packages` instead.
+# claude-desktop` re-reads the index and **rolls forward** to the newest — no manual URL bump. The
+# bundle's header says how the pool's signed `InRelease` is verified and its key pinned, and why one
+# declaration serves x86_64 and arm64 alike (sbx reads the index of the host's own architecture).
 #
 # CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
 # per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
@@ -67,10 +66,11 @@
 # IN-CAGE and lists only the cage filesystem (a host-privileged file manager over the host bus would
 # never be summonable from the cage). It also seeds your host light/dark theme at launch and follows
 # it live, and a host-side relay bridges `org.freedesktop.Notifications` so desktop notifications
-# work — while the login keyring (`org.freedesktop.secrets`) stays absent. The Electron flags: `--no-sandbox` is
-# mandatory and acceptable (bubblewrap + seccomp + the empty netns IS the boundary, replacing
-# Chromium's own redundant sandbox); `--ozone-platform=wayland` selects the Wayland backend;
-# `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
+# work — while the host's keyring stays out of reach (the cage's own one is described under
+# CREDENTIAL STORAGE below). The Electron flags: `--no-sandbox` is mandatory and acceptable
+# (bubblewrap + seccomp + the empty netns IS the boundary, replacing Chromium's own redundant
+# sandbox); `--ozone-platform=wayland` selects the Wayland backend; `--disable-dev-shm-usage`
+# avoids the small cage `/dev/shm`.
 #
 # CREDENTIAL POSTURE — account / OAuth, NOT a header-injectable API key. Claude Desktop signs in
 # with your **claude.ai subscription or your organization's SSO**; the docs are explicit that
@@ -90,8 +90,8 @@
 #     cross-session bridge, so the browser's cookie jar is NOT the channel (a common misconception).
 #     The browser MUST be in-cage: a HOST browser's `claude://` would find no claude-desktop on the
 #     host. The `cmd` writes a Chromium managed policy so that deep-link opens with no
-#     confirmation dialog. Google is the heavier path (it pulls Chromium); if you only ever use
-#     email, drop the `[open]` table + the `chromium` package, and the `cmd` with them.
+#     confirmation dialog. Google is the heavier path (it pulls Chromium, which the bundle
+#     carries); an email-only login never uses the `[open]` routing or that managed policy.
 #   * Quitting — a single Ctrl+C does nothing (a GUI Electron app ignores SIGINT), and by default
 #     closing the window does NOT quit: Claude Desktop hides to a tray, and the cage exposes none, so
 #     the window goes away with nothing left to bring it back. Press **Ctrl+C twice within 2s** to
@@ -119,13 +119,13 @@
 # deep-link `claude://login/google-auth?code=…&anon_id=…`, which Electron's single-instance mechanism
 # delivers to the already-running app. So http(s) is routed to an IN-CAGE Chromium for the consent and
 # `claude` back to claude-desktop, and the whole flow closes inside the sandbox. The command stays a
-# small bash wrapper for the one thing a declaration cannot express: a Chromium managed policy so
-# Chromium follows the `claude://`
-# redirect with no "open external app?" confirmation dialog (without it the code never reaches the app
-# and the login silently fails — the real bug behind "the browser signed in but the app didn't").
+# small bash wrapper for what a declaration cannot express: a Chromium managed policy so Chromium
+# follows the `claude://` redirect with no "open external app?" confirmation dialog (without it the
+# code never reaches the app and the login silently fails — the real bug behind "the browser signed
+# in but the app didn't"), and the link that hands the cage's summary to the Code engine.
 # A HOST browser cannot do this: its `claude://` would find no claude-desktop installed on the host.
-# Chromium gets the cage flags (`--no-sandbox` since bwrap+seccomp is the boundary; Wayland; the file
-# password store), and trusts the egress MITM CA because sbx seeds it into the shared `~/.pki/nssdb`
+# Chromium gets the cage flags (`--no-sandbox` since bwrap+seccomp is the boundary; Wayland), and
+# trusts the egress MITM CA because sbx seeds it into the shared `~/.pki/nssdb`
 # (catrust). You can also just sign in with EMAIL — that stays in the app's webview and needs none of
 # this (see the header).
 #
@@ -133,9 +133,10 @@
 # Service (`org.freedesktop.secrets`) on the cage's private bus, backed by a keyring file inside the
 # app's isolated home. Chromium and Electron both find it, so the session cookie is encrypted with a
 # real key and survives a relaunch, and `safeStorage` reports itself available — which recent
-# versions of this app require before they will finish rendering. This profile therefore passes NO
-# `--password-store` override: forcing `basic` makes the app treat encryption as unavailable and it
-# stops at its error screen, keyring or not.
+# versions of this app require before they will finish rendering. The `cmd` names that keyring
+# with `--password-store=gnome-libsecret`, because Chromium picks its backend from
+# `XDG_CURRENT_DESKTOP`, which a cage does not set; forcing `basic` instead makes the app treat
+# encryption as unavailable and it stops at its error screen, keyring or not.
 #
 # MIGRATING an app home created before the in-cage keyring existed: its old secrets were sealed with
 # the plaintext fallback's fixed key, which the keyring cannot read, so the first launch after this
@@ -203,7 +204,7 @@ use = ["claude-desktop"]
 # pure-download host is scoped to `{GET}` (least privilege — no HEAD, the app never issues one).
 # Grounded on Anthropic's documented "Network access requirements" (code.claude.com/docs/en/network-
 # config). `raw.githubusercontent.com` (changelog / plugin marketplace) is already covered by sbx's
-# built-in nix-cache/github allow-set, so it is not repeated here.
+# built-in read-only allow-set, so it is not repeated here.
 # Where a link opens, declared rather than scripted. `http`/`https` go to the in-cage Chromium for
 # the web auth (Google consent, the device re-verification page); `claude` is the OAuth callback the
 # provider redirects to, which must reach the desktop app. One declaration covers both ways a link
@@ -219,10 +220,10 @@ claude = ["claude-desktop", "--no-sandbox", "--ozone-platform=wayland", "--disab
 [network]
 mode = "deny"
 allow = [
-    # The Anthropic API and account hosts, the UI asset hosts, the MCP proxy, the artifact domain
-    # and the Google Sign-In chain all arrive with the `claude-desktop` bundle (`use` above) and are
-    # unioned into this list at resolution — inspect them with `sbx bundle claude-desktop`, and see
-    # the launch's own view with `sbx config show --app claude-desktop`.
+    # Nothing here: the Anthropic API and account hosts, the UI asset hosts, the MCP proxy, the
+    # artifact domain and the Google Sign-In chain arrive with the bundle and are unioned in at
+    # resolution — inspect them with `sbx bundle claude-desktop`, and see the launch's own view with
+    # `sbx config show --app claude-desktop`.
     #
     # Enterprise routing — if your org routes Desktop to Google Vertex, Bedrock, Microsoft Foundry,
     # or an LLM gateway, model traffic goes THERE instead of the hosts above; add that host and see

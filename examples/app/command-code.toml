@@ -12,6 +12,12 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/github-install.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#
 # The package's own short bin is `cmd` (that is what `cmd` below execs), but the app is
 # launched by its PROFILE name — `sbx app run command-code`, never `sbx app run cmd`.
 #
@@ -56,14 +62,14 @@
 # CONFIG + STATE — `~/.commandcode/` (auth.json — the API-key file, plus taste
 # profile, skills, mods, sessions). The `taste push`/`taste pull` flow reaches
 # `api.github.com` and `github.com` (taste profiles are git repos in the GitHub
-# registry). All project-level config rides the project bind
-# (`.commandcode/taste/`, `.commandcode/skills/`, …); the rest lives in the
-# isolated home.
+# registry); the shipped lane is read-only, so a pull works and a push, which POSTs
+# `git-receive-pack`, needs that path opened in `allow`. All project-level config rides the project
+# bind (`.commandcode/taste/`, `.commandcode/skills/`, …); the rest lives in the isolated home.
 #
 # TELEMETRY — Command Code ships `@opentelemetry/*` deps and POSTs observability
 # events to Axiom (`api.axiom.co`, the host is hard-coded in `dist/cli.mjs` — the
 # Axiom Node SDK pushes logs/events to a vendor-controlled dataset). The OTel sink
-# is denied and muted below — a `mute` never changes the verdict (still refused) and
+# is denied and the bundle mutes it — a `mute` never changes the verdict (still refused) and
 # never hides a count (`sbx net stats` still tallies it). The binary also has a
 # stray `https://ingestion.claicode.com` host in its strings (likely a
 # third-party/legacy telemetry endpoint, the suffix `claicode.com` is
@@ -145,26 +151,18 @@ use = ["command-code"]
 # An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing prompts /
 # context, reading completions) is opened to all verbs with `{*}`. Hosts are from the
 # shipped binary (`api.commandcode.ai` first-party, `api.github.com` + `github.com` for
-# taste push/pull) and the vendor docs.
+# taste pulls) and the vendor docs.
 [network]
 mode = "deny"
 # The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
 # unioned into this list at resolution. Check what that adds with `sbx bundle command-code`, and what the
 # launch ends up with via `sbx config show --app command-code`.
 allow = [
-    # Install: mise's npm backend fetches the packument (version resolution, also used by
-    # `sbx upgrade mise`) and the tarball IN-CAGE, so the registry is subject to this policy —
-    # the built-in self-equip allow-set covers the nix cache, GitHub and mise's version index,
-    # never npm. Opened read-only as a whole, like the other npm-backed profiles.
-    # First-party Command Code API — auth, account, the `taste-1` model sessions, MCP
-    # registry. The binary POSTs to `api.commandcode.ai` for every prompt (verified in
-    # `dist/cli.mjs`). The vendor owns the dataset; the user chose to authenticate.
-    # Taste push/pull — profiles are git repos in the GitHub registry; the user runs
-    # `npx taste push` to publish, `npx taste pull` to install one. `{GET,HEAD}` for
-    # `api.github.com`/`github.com` covers the LFS-less git object fetch.
+    # Nothing here: the npm install lane, the first-party `api.commandcode.ai` and the GitHub read
+    # lane for taste pulls arrive with the bundle and are unioned in at resolution.
     # Provider BYOK — uncomment the ONE you use (the model you call with `cmd -m
     # <model>` picks the provider; `cmd --list-models` shows the live list). The
-    # first-party `api.commandcode.ai` above is enough for `taste-1`; open another
+    # first-party `api.commandcode.ai` (in the bundle) is enough for `taste-1`; open another
     # only if you switch models.
     #"{*} https://api.openai.com",
     #"{*} https://api.anthropic.com",
@@ -176,8 +174,9 @@ allow = [
 
 # Silence the DENIED telemetry / staging hosts. `mute` never changes the verdict
 # (still refused) and never hides a count (`sbx net stats` still tallies it; see
-# with `--all`). The Axiom endpoint is the OTel sink; `ingestion.claicode.com` is
-# the legacy-domain (pre-rename) telemetry host; the `staging-*` siblings are
-# only used in dev.
+# with `--all`).
 mute = [
+    # Nothing here: the Axiom OTel sink, the legacy-domain `ingestion.claicode.com`, the `staging-*`
+    # hosts only used in dev, the hosts the binary merely references and the npm audit and JSR
+    # probes arrive with the bundle and are unioned in at resolution.
 ]

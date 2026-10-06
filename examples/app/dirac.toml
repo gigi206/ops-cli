@@ -11,15 +11,21 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#
 # Dirac ships on npm as `dirac-cli` from its own vendor scope (`dirac-run/dirac`, Apache-2.0). It is
 # a node CLI, so the cage gets a node runtime alongside it; `sbx upgrade mise` rolls it forward.
 # Upstream supports Node 22.13 through 24.x — nixpkgs' `nodejs` is in that range.
 #
-# WHY `ripgrep` IS A PACKAGE HERE, AND WHY NO `cmd` WRAPPER IS NEEDED. Dirac's search stack shells
+# WHY THE BUNDLE CARRIES `ripgrep`, AND WHY NO `cmd` WRAPPER IS NEEDED. Dirac's search stack shells
 # out to ripgrep, and it declares `@vscode/ripgrep` as a dependency — a package whose **postinstall**
 # downloads the actual `rg` binary. mise's npm backend installs with `--ignore-scripts=true` (a
 # deliberate security default: it will not run arbitrary package scripts), so that download never
-# happens. Unlike `amp`/`junie`, this needs no vendor-script wrapper: Dirac resolves the binary
+# happens. Unlike `amp` (whose `cmd` runs the vendor's fallback) or `junie` (whose bundle runs the
+# vendor script as its `provision`), this needs neither: Dirac resolves the binary
 # **PATH-first** — it runs `which rg` and only falls back to the (never-downloaded) package path —
 # so a plain `nix:ripgrep` cures it outright, host-provisioned and available offline. Read out of the
 # shipped bundle rather than assumed; the cage's curated base toolset already carries `which`.
@@ -27,16 +33,19 @@
 # BYOK, MULTI-PROVIDER — no vendor account. `dirac auth` configures the provider of your choice:
 # Anthropic, OpenAI (API key or the Codex OAuth flow), OpenRouter, Google Gemini / Vertex, Cerebras,
 # DashScope, or AWS Bedrock. Pick ONE below: uncomment its allowlist host, its `[env]` placeholder
-# and its `[secret]` block. The real key is read on the HOST and injected by the egress proxy on the
-# wire — never in the cage. So an unedited launch installs and starts, but reaches no model until you
-# make that choice; that is deliberate for a BYOK agent with no default provider.
+# and its `[secret]` block. This file carries all three for Anthropic, OpenAI and OpenRouter and the
+# host alone for Gemini and Cerebras; write the missing parts for any other provider the same way.
+# The real key is read on the HOST and injected by the egress proxy on the wire — never in the cage.
+# So an unedited launch installs and starts, but reaches no model until you make that choice; that
+# is deliberate for a BYOK agent with no default provider.
 #
 # WHAT IS DELIBERATELY LEFT DENIED. `dirac.run` is not an API host: the only requests to it are
 # telemetry — it fronts PostHog at `/v1/event`, with `us.i.posthog.com` as the client's direct
-# fallback. All three are refused and `mute`d below (the domain also appears in the binary as a
-# docs link and as the `HTTP-Referer` header value OpenRouter wants, neither of which is a request
-# to it). Dirac's self-update check is a plain `GET` on its own npm packument, already covered by the
-# install rule; upstream ships no environment key to switch that check off, so none is invented here.
+# fallback. All three are refused and the bundle `mute`s them (the domain also appears in the
+# binary as a docs link and as the `HTTP-Referer` header value OpenRouter wants, neither of which
+# is a request to it). Dirac's self-update check is a plain `GET` on its own npm packument, already
+# covered by the bundle's install rule; upstream ships no environment key to switch that check off,
+# so none is invented here.
 #
 # A NAMED RESIDUAL: Dirac can drive a browser (it downloads a chrome-for-testing build on demand).
 # That is not wired here — a headless browser in the cage needs `gui = "offscreen"` plus a chromium
@@ -80,7 +89,7 @@ exec dirac "$@"
 # honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
 # `dirac` read and write these host files (auth, sessions). Uncommented, the bind appears at that
 # host path and not under the cage's `$HOME` (`/home/sandbox`), so the app keeps its isolated home
-# and reaches these files only by their absolute path.dirac` lives.
+# and reaches these files only by their absolute path.
 #binds = [
 #    { path = "~/.dirac", mode = "rw" },
 #]
@@ -105,8 +114,9 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle dirac`, and what the
 # launch ends up with via `sbx config show --app dirac`.
 allow = [
-    # Install: the packument (version resolution, also used by `sbx upgrade mise` and by Dirac's own
-    # update check) and the package tarball.
+    # Nothing here: the npm install lane (the packument, also read by `sbx upgrade mise` and by
+    # Dirac's own update check, and the tarball) arrives with the bundle and is unioned in at
+    # resolution.
     # Runtime: uncomment the ONE provider you configured with `dirac auth` (and its key below).
     #"{*} https://api.anthropic.com",
     #"{*} https://api.openai.com",
@@ -115,12 +125,13 @@ allow = [
     #"{*} https://api.cerebras.ai",
 ]
 
-# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): Dirac's telemetry proxy
-# and the PostHog hosts behind it, plus npm's audit endpoint. A `mute` never changes the verdict
-# (they stay refused) and never hides a count (`sbx net stats` still tallies them); it only keeps the
-# lines out of the default log, so the refusals worth acting on stay visible. See everything with
-# `sbx net logs --all`; edit this list with `sbx net mute|unmute <rule> -a dirac`.
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`). A `mute` never changes
+# the verdict (they stay refused) and never hides a count (`sbx net stats` still tallies them); it
+# only keeps the lines out of the default log, so the refusals worth acting on stay visible. See
+# everything with `sbx net logs --all`; edit this list with `sbx net mute|unmute <rule> -a dirac`.
 mute = [
+    # Nothing here: Dirac's telemetry proxy, the PostHog hosts behind it and the npm audit and JSR
+    # probes arrive with the bundle and are unioned in at resolution.
 ]
 
 # --- Provider key (commented) — uncomment the placeholder and the matching [secret] block. The

@@ -27,12 +27,13 @@
 # `--ignore-scripts=true` — a deliberate security default: it will not run arbitrary package
 # scripts — so the vendor's postinstall never runs and a plain `junie` exits with
 # "[Junie] Shim not found at …". The `junie` bundle declares that vendor script as its `provision`,
-# and sbx runs it before this command, in this cage; the step's own guard (the shim's existence in
-# the persistent home) is what keeps it to once, and the extraction is pure JavaScript (the package
-# bundles `yauzl`), so the cage needs no `unzip`. (`mise where` accepts a SCOPED package name and
-# answers with the install directory; what sits under it is not fixed — both
-# `lib/node_modules/<scope>/<name>` and `node_modules/<scope>/<name>` have shipped — so the step
-# finds the one that is present rather than naming one.)
+# and sbx runs it before this command, in this cage; the step's own guard (a non-empty
+# `versions/<v>/` for the build the package names, in the persistent home — not the shim, which the
+# script writes before it downloads) is what keeps it to once, and the extraction is pure
+# JavaScript (the package bundles `yauzl`), so the cage needs no `unzip`. (`mise where` accepts a
+# SCOPED package name and answers with the install directory; what sits under it is not fixed —
+# both `lib/node_modules/<scope>/<name>` and `node_modules/<scope>/<name>` have shipped — so the
+# step finds the one that is present rather than naming one.)
 #
 # THE CAVEAT THAT WAS: the build Junie downloads at runtime is a JVM application sbx never patches
 # (unlike a `nix:`/`deb:`/`tarball:` package, autoPatchelf'd host-side), running through the cage's

@@ -4,15 +4,15 @@
 #   sbx bundle import examples/bundle/prime-agent.toml
 #   sbx app import examples/app/prime-agent.toml
 #   sbx app run prime-agent                      # interactive TUI, working on the current project
+#   sbx app run prime-agent -- -p "<task>"       # one-shot, non-interactive
+#   sbx app run prime-agent -- agents            # browse running, idle and saved sessions
 #
-# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The runtime its installer needs and the hosts it reaches come from a
-# shared BUNDLE, so import it too:
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. Its install step, the runtime that installer
+# needs and the hosts it reaches come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/prime-agent.toml
 #     sbx app import examples/app/prime-agent.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
-#   sbx app run prime-agent -- -p "<task>"       # one-shot, non-interactive
-#   sbx app run prime-agent -- agents            # browse running, idle and saved sessions
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-registry.toml
@@ -44,9 +44,11 @@
 # verifies it against the release `SHA256SUMS` and runs `npm install -g`. So the `prime-agent`
 # bundle's install step runs THAT installer inside the cage on the first launch — contained by
 # bubblewrap + seccomp + the empty netns + the egress allowlist — into the app's isolated home, and
-# `sbx app upgrade prime-agent` is what runs it again to advance the release. The tarball's internal dependencies
-# are rewritten at packaging time into absolute tarball URLs on Prime Intellect's release bucket,
-# and its third-party dependencies resolve from npm: both hosts are in `allow` for that reason.
+# again at any launch where the release channel serves a version other than the installed one;
+# `sbx app upgrade prime-agent` forces a re-install. The tarball's internal dependencies are
+# rewritten at packaging time into absolute tarball URLs on Prime Intellect's release bucket, and
+# its third-party dependencies resolve from npm: both hosts are in the bundle's `allow` for that
+# reason.
 #
 # THE PYTHON KERNEL is bootstrapped by `uv` into `~/.prime/agent/kernel-venv` (Python 3.11,
 # `ipykernel`, `prime-agent-runtime`, `dill`, and a default working set: requests, httpx, pyyaml,
@@ -57,9 +59,9 @@
 # absent (it checks PATH first). uv's own interpreter and the wheels for the compiled packages are
 # foreign binaries; the cage's base userland supplies the glibc loader and the `nix-ld` shim for
 # exactly that. If one fails to start for a missing shared library, the network gating is fine and
-# you add that library as a `nix:` package (the pattern `cursor-agent.toml` uses). To skip the
-# managed environment entirely, point `PRIME_AGENT_KERNEL_PYTHON` at a Python that already has
-# `ipykernel` and a current `prime-agent-runtime`.
+# you add that library as a `nix:` package. To skip the managed environment entirely, point
+# `PRIME_AGENT_KERNEL_PYTHON` at a Python that already has `ipykernel` and a current
+# `prime-agent-runtime`.
 #
 # CONFIG + STATE — `~/.prime/agent/` in the app's isolated home: `auth.json` (API keys and the
 # OAuth credentials `/login` stores), `sessions/`, the kernel venv, and the global `AGENTS.md`. So a
@@ -75,13 +77,14 @@
 #
 # CREDENTIALS — Prime Agent is multi-provider. Two paths:
 #
-#   1. BYOK (set up below, for Anthropic). The real key is read on the HOST and injected by the
-#      egress proxy on the wire; the in-cage placeholder only lets the agent start and issue the
-#      request. Uncomment the `[env]` line and the `[secret]` block. For another provider, change
-#      the host, the allowlist entry and the env var: OpenAI (`OPENAI_API_KEY`, `Authorization`,
-#      `bearer`), Prime Inference (`PRIME_API_KEY`, api.pinference.ai), OpenRouter, DeepSeek,
-#      Mistral, Groq, xAI and more all take a header the broker can strip and replace. Google
-#      Gemini's key rides a query parameter, which header injection cannot broker.
+#   1. BYOK. The real key is read on the HOST and injected by the egress proxy on the wire; an
+#      in-cage placeholder only lets the agent start and issue the request. This profile ships no
+#      template for it: add the provider's host to `allow`, its placeholder to `[env]` and a
+#      `[secret]` block for that host (the shape `examples/app/cline.toml` shows). OpenAI
+#      (`OPENAI_API_KEY`, `Authorization`, `bearer`), Prime Inference (`PRIME_API_KEY`,
+#      api.pinference.ai), OpenRouter, DeepSeek, Mistral, Groq, xAI and more all take a header
+#      the broker can strip and replace. Google Gemini's key rides a query parameter, which
+#      header injection cannot broker.
 #   2. SUBSCRIPTION LOGIN — `/login` inside the TUI, for Claude Pro/Max, ChatGPT Plus/Pro (Codex) or
 #      GitHub Copilot, storing OAuth credentials in `auth.json`. Whether each provider's flow
 #      completes in a cage is UNVERIFIED: a server-side poll works, while a `localhost` OAuth

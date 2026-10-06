@@ -11,6 +11,12 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/huggingface-hub.toml
+#
 # **The profile with no credential at all.** Every other agent here talks to somebody's API; siGit
 # Code runs the model itself — it downloads a Qwen3 GGUF from Hugging Face on first launch (roughly
 # 1–2 GB, into the app's persistent isolated home) and infers in-process. So there is no account, no
@@ -19,14 +25,15 @@
 #
 # That also makes it the profile the cage fits best. A local model means the code you point it at
 # never leaves your machine — and here it additionally cannot leave the cage, since the only hosts
-# it can reach are the two model-download ones below.
+# it can reach are read-only lanes: the bundle's npm install lane and model downloads, beside sbx's
+# built-in read-only set.
 #
 # PACKAGING. Upstream publishes the npm package as `@getsigit/sigit` (formerly `@smbcloud/sigit`,
 # which now prints a notice pointing to the new name) alongside cargo/brew/pip; it is a small shim
 # that dispatches to a prebuilt platform package (`@getsigit/sigit-linux-x64`, ~78 MB) — a plain
 # optional dependency with **no install script**, so mise's `--ignore-scripts` costs nothing. The
-# binary is dynamically linked and runs through the cage's nix-ld shim, the same path
-# `cursor-agent`'s bootstrap binary takes. `sbx upgrade mise` rolls it forward.
+# binary is dynamically linked and runs through the cage's nix-ld shim. `sbx upgrade mise` rolls
+# it forward.
 #
 # COST AND SPEED, stated plainly: the first launch pays a 1–2 GB download, and inference runs on
 # **your CPU** unless you have GPU offload configured (`gpu = true` opens the render node — see
@@ -46,9 +53,10 @@
 # point of this profile is that nothing leaves the cage.
 #
 # UNVERIFIED (like every profile until run for real): the model download and the first inference in
-# the cage. The two rules below were measured against the shapes Hugging Face redirects to — both
-# `cdn-lfs-us-1.hf.co` and `cas-bridge.xethub.hf.co` are covered — but whether a real download stays
-# inside them is not proven; if a fetch is refused, `sbx net logs -a sigit` names the host it wanted.
+# the cage. The bundle's two model-download rules were measured against the shapes Hugging Face
+# redirects to — both `cdn-lfs-us-1.hf.co` and `cas-bridge.xethub.hf.co` are covered — but whether
+# a real download stays inside them is not proven; if a fetch is refused, `sbx net logs -a sigit`
+# names the host it wanted.
 # Grounded here: the packaging (read out of the published packages), the model provider and the
 # absence of any credential (read out of the shipped binary and upstream's README).
 # The command hands siGit the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
@@ -111,17 +119,21 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle sigit`, and what the
 # launch ends up with via `sbx config show --app sigit`.
 allow = [
-    # Install: the packument (version resolution, also used by `sbx upgrade mise`) and the tarballs
-    # (the shim plus its ~78 MB platform package).
-    # The model itself: the repository metadata, and the LFS/CAS content hosts it redirects to.
+    # Nothing here: the install lane (the packument, also used by `sbx upgrade mise`, and the
+    # tarballs — the shim plus its ~78 MB platform package) and the model itself (the repository
+    # metadata, and the LFS/CAS content hosts it redirects to) arrive with the bundle and are
+    # unioned in at resolution.
     # Its web-search tool's backend — refused on purpose, since a local-model agent that reaches no
-    # network at all is the point of this profile. Uncomment to let that tool work; the `mute` below
-    # then has nothing to suppress (a mute only ever hides a *refusal*), so you can leave it.
+    # network at all is the point of this profile. Uncomment to let that tool work; the bundle's
+    # mute of that host then has nothing to suppress (a mute only ever hides a *refusal*).
     #"{*} https://html.duckduckgo.com",
 ]
 
-# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): npm's audit endpoint, and
-# the web-search backend left denied just above. A `mute` never changes the verdict and never hides
-# a count. See everything with `sbx net logs --all`; edit with `sbx net mute|unmute <rule> -a sigit`.
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`). A `mute` never changes
+# the verdict and never hides a count. See everything with `sbx net logs --all`; edit with
+# `sbx net mute|unmute <rule> -a sigit`.
 mute = [
+    # Nothing here: npm's audit endpoint, the JSR mirror, the web-search backend left denied just
+    # above and the vendor's MCP server (`sigit.si`) arrive with the bundle and are unioned in at
+    # resolution.
 ]

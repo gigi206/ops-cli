@@ -11,6 +11,11 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#
 # Qoder publishes the CLI on npm in its own scope, `@qoder-ai/qodercli` (the command it installs is
 # `qodercli`). It is a node CLI, so the cage gets a node runtime alongside it; `sbx upgrade mise`
 # rolls it forward. Two facts about the packaging are worth stating rather than glossing:
@@ -23,11 +28,11 @@
 # Like `qwen-code`, this CLI is a fork of Google's Gemini CLI (its own install script still carries
 # the Google copyright header), which is why parts of it will look familiar.
 #
-# WHY `ripgrep` IS A PACKAGE HERE. Qoder's search shells out to `rg`, shipped as a platform optional
-# dependency plus a `postinstall` that only *warns* when it is missing. mise's npm backend installs
-# with `--ignore-scripts=true`, so that check never runs — harmless, because the resolution is
-# **PATH-first** (`which rg`, then the packaged path), read out of the shipped bundle. A plain
-# `nix:ripgrep` therefore satisfies it, host-provisioned and available offline.
+# WHY THE BUNDLE CARRIES `ripgrep`. Qoder's search shells out to `rg`, shipped as a platform
+# optional dependency plus a `postinstall` that only *warns* when it is missing. mise's npm backend
+# installs with `--ignore-scripts=true`, so that check never runs — harmless, because the
+# resolution is **PATH-first** (`which rg`, then the packaged path), read out of the shipped
+# bundle. A plain `nix:ripgrep` therefore satisfies it, host-provisioned and available offline.
 #
 # CREDENTIAL POSTURE — a Qoder account, with a headless token.
 #   - **Browser login** (`qodercli login`): the hermetic cage has no browser, so complete the flow
@@ -37,7 +42,8 @@
 #     `[secret]` block so the real value is injected host-side and never enters the cage.
 #
 # CHINA EDITION. The CLI serves two sites, selected by `QODER_SITE`: the default `GLOBAL` (the
-# `*.qoder.sh` hosts allowed below) and `CN` (`*.qoder.com.cn`, commented out). Set one, not both.
+# `*.qoder.sh` hosts the bundle allows) and `CN` (`*.qoder.com.cn`, commented out below). Set one,
+# not both.
 #
 # UNVERIFIED (like every profile until run with a real account): the live authentication and the
 # model traffic through sbx's MITM; the `Authorization: Bearer` shape below is the standard one —
@@ -85,21 +91,23 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle qoder`, and what the
 # launch ends up with via `sbx config show --app qoder`.
 allow = [
-    # Install: the packument (version resolution, also used by `sbx upgrade mise`) and the tarball.
-    # Runtime, GLOBAL site (the default): the model gateway, the OpenAPI surface, and the account
-    # centre the login flow talks to.
-    # CN site instead (`QODER_SITE=CN`) — uncomment these and comment the three above.
+    # Nothing here: the install lane (`@npm-registry`) and the GLOBAL site (the default) — the model
+    # gateway, the OpenAPI surface, and the account centre the login flow talks to — arrive with the
+    # bundle and are unioned in at resolution.
+    # CN site instead (`QODER_SITE=CN`) — uncomment these; the GLOBAL hosts stay open through the
+    # bundle.
     #"{*} https://gateway.qoder.com.cn",
     #"{*} https://openapi.qoder.com.cn",
     #"{GET} https://static.qoder.com.cn",
 ]
 
-# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): npm's audit endpoint, and
-# the vendor's download host, which serves the shell-installer channel sbx deliberately does not use
-# (`sbx upgrade mise` owns updates here). A `mute` never changes the verdict (they stay refused) and
-# never hides a count. See everything with `sbx net logs --all`; edit with
-# `sbx net mute|unmute <rule> -a qoder`.
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`). A `mute` never changes
+# the verdict (they stay refused) and never hides a count. See everything with
+# `sbx net logs --all`; edit with `sbx net mute|unmute <rule> -a qoder`.
 mute = [
+    # Nothing here: npm's audit endpoint, the JSR mirror, and the vendor's download host (which
+    # serves the shell-installer channel sbx deliberately does not use — `sbx upgrade mise` owns
+    # updates here) arrive with the bundle and are unioned in at resolution.
 ]
 
 # --- Personal Access Token (commented). The in-cage placeholder lets the CLI start and issue its

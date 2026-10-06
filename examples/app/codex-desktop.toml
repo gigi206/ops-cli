@@ -11,7 +11,7 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #
-#   EGRESS GROUP — a shared lane, imported once (shared, not per-agent):
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
 #     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #
@@ -64,18 +64,20 @@
 # `xdg-desktop-portal` with the reference GTK backend, all in-cage), so the app's FILE CHOOSER opens
 # IN-CAGE and lists only the cage filesystem, and its `libnotify` notifications reach a host-side
 # relay bridging `org.freedesktop.Notifications`. It also seeds your host light/dark theme at launch
-# and follows it live, while the login keyring (`org.freedesktop.secrets`) stays absent. The
-# Electron flags: `--no-sandbox` is mandatory and acceptable (bubblewrap + seccomp + the empty netns
-# IS the boundary, replacing Chromium's own redundant sandbox); `--ozone-platform=wayland` selects
-# the Wayland backend; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
+# and follows it live, while the host's keyring stays out of reach (the cage's own one is described
+# under CREDENTIAL STORAGE below). The Electron flags: `--no-sandbox` is mandatory and acceptable
+# (bubblewrap + seccomp + the empty netns IS the boundary, replacing Chromium's own redundant
+# sandbox); `--ozone-platform=wayland` selects the Wayland backend; `--disable-dev-shm-usage` avoids
+# the small cage `/dev/shm`.
 #
 # CREDENTIAL STORAGE — the cage carries its own keyring. Under `dbus = true` sbx puts a Secret
 # Service (`org.freedesktop.secrets`) on the cage's private bus, backed by a keyring file inside the
 # app's isolated home. Chromium and Electron both find it, so the session cookie is encrypted with a
 # real key and survives a relaunch, and `safeStorage` reports itself available — which recent
-# versions of this app require before they will finish rendering. This profile therefore passes NO
-# `--password-store` override: forcing `basic` makes the app treat encryption as unavailable and it
-# stops at its error screen, keyring or not.
+# versions of this app require before they will finish rendering. The `cmd` names that keyring
+# with `--password-store=gnome-libsecret`, because Chromium picks its backend from
+# `XDG_CURRENT_DESKTOP`, which a cage does not set; forcing `basic` instead makes the app treat
+# encryption as unavailable and it stops at its error screen, keyring or not.
 #
 # MIGRATING an app home created before the in-cage keyring existed: its old secrets were sealed with
 # the plaintext fallback's fixed key, which the keyring cannot read, so the first launch after this
@@ -115,7 +117,7 @@
 #
 # A hermetic cage had none, so sbx now synthesises `/usr/bin/ldd` as a symlink to the base glibc's
 # own `ldd`, beside the `/bin/sh` and `/usr/bin/env` it already provided. Nothing here works around
-# it any more: the command below is a plain argv again. What was measured and what was not: the
+# it any more: the command below no longer touches `ldd`. What was measured and what was not: the
 # trap was measured on this app, and the code path between the missing file and the trap was not —
 # the trace ends at `getcwd`, and the faulting frame is in the app's own binary rather than in any
 # bundled `.node`.
@@ -133,7 +135,7 @@
 # CAVEATS (honest, and labelled by what was actually established):
 #   * The `.deb` build is MEASURED — it resolves, unpacks, patches and wraps the right binary.
 #     Whether every surface (Chat, Work, Codex, the browser panel) is fully functional in the cage
-#     is for your live session, and the defect above bounds what a session can reach today.
+#     is for your live session.
 #   * The `[open]` routing is REASONED FROM PRECEDENT, not from a live sign-in: the loopback
 #     callback and the issuer are read out of the shipped artifact, but which of the app's sign-in
 #     paths a first run actually takes is not. If a login stalls, watch `sbx net logs -a
@@ -225,9 +227,8 @@ use = ["codex-desktop"]
 # tool calling `xdg-open` and an Electron app calling the portal under `dbus = true` — and sbx
 # freezes the routing, so nothing running in the cage can answer a sign-in link instead.
 #
-# Chromium gets the cage flags (`--no-sandbox` since bwrap+seccomp is the boundary; Wayland; the
-# file password store) and trusts the egress MITM CA because sbx seeds it into the shared
-# `~/.pki/nssdb`.
+# Chromium gets the cage flags (`--no-sandbox` since bwrap+seccomp is the boundary; Wayland) and
+# trusts the egress MITM CA because sbx seeds it into the shared `~/.pki/nssdb`.
 #
 # Must stay below every top-level key: written above one, TOML would fold that key into this table.
 [open]
@@ -238,10 +239,10 @@ codex = ["codex-desktop", "--no-sandbox", "--ozone-platform=wayland", "--disable
 [network]
 mode = "deny"
 allow = [
-    # The ChatGPT backend and its WebSocket hosts, the sign-in issuer, the OpenAI API, the UI's
-    # asset CDNs and the user-content domain all arrive with the `codex-desktop` bundle (`use`
-    # above) and are unioned into this list at resolution — inspect them with `sbx bundle
-    # codex-desktop`, and see the launch's own view with `sbx config show --app codex-desktop`.
+    # Nothing here: the ChatGPT backend and its WebSocket hosts, the sign-in issuer, the OpenAI API,
+    # the UI's asset CDNs and the user-content domain arrive with the bundle and are unioned in at
+    # resolution — inspect them with `sbx bundle codex-desktop`, and see the launch's own view with
+    # `sbx config show --app codex-desktop`.
     #
     # Enterprise routing — if your organization fronts OpenAI with a gateway or a proxy of its own,
     # model traffic goes THERE instead of the hosts above; add that host.

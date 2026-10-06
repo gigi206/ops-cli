@@ -5,6 +5,12 @@
 #   sbx app run open-design
 #   # then open http://127.0.0.1:17573 in your host browser
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#
 # Open Design does not currently publish a Linux desktop asset in its GitHub releases.  This
 # profile therefore runs the official source distribution: it clones nexu-io/open-design into the
 # app's persistent isolated home on first launch, installs its lockfile-pinned dependencies, and
@@ -28,7 +34,8 @@
 # `vela` runtime (internal id `amr`), and on a fresh app home with no engine selected the web UI boots
 # against vela and then triggers a vela login -> `vela binary not found; install vela or configure
 # VELA_BIN`.  Selecting OpenCode here avoids that entirely; the `opencode` bundle named below puts the
-# `opencode-cli` binary on PATH so the daemon's agent detection finds it.  To use another supported
+# `opencode` binary on PATH, which the daemon's agent detection falls back to after `opencode-cli`
+# (see `use` below).  To use another supported
 # agent instead, add its package and its narrowly scoped runtime hosts, then select it in Open Design's
 # Settings -> Execution mode (that writes the engine into app-config.json and the seed below will then
 # leave your choice alone).
@@ -219,11 +226,13 @@ allow = [
     # matching [secret] block, unless you reuse a host OpenCode login (see the commented bind).
 ]
 
-# To authenticate OpenCode with an API key: set the key on the host and uncomment a [secret] block
-# (adjust the host/header to your provider).  The real key is read on the host and injected into
-# the provider's outbound request by sbx's egress proxy; the plaintext never enters the cage.  This
-# needs no shared OAuth callback port.  To reuse a host OpenCode login instead, see the commented
-# `binds` block near the top of this file — it has to sit at the top level, not here.
+# To authenticate OpenCode with an API key: set the key on the host and add a [secret] block for
+# your provider plus its placeholder in [env] (`examples/app/opencode.toml` carries a commented
+# OpenRouter pair to copy; adjust the host/header to your provider).  The real key is read on the
+# host and injected into the provider's outbound request by sbx's egress proxy; the plaintext never
+# enters the cage.  This needs no shared OAuth callback port.  To reuse a host OpenCode login
+# instead, see the commented `binds` block near the top of this file — it has to sit at the top
+# level, not here.
 [env]
 # Node 24's built-in fetch (used by Corepack) ignores HTTPS_PROXY unless this opt-in is set.  Without
 # it, its DNS lookup bypasses sbx's loopback egress proxy and fails in the empty network namespace.

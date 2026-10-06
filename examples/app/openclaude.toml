@@ -12,6 +12,11 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#
 # OpenClaude is a Claude-Code-style terminal coding agent that routes to OpenAI-compatible APIs
 # (OpenRouter, OpenAI, DeepSeek, Groq, Mistral, LM Studio, …), Gemini, GitHub Models, Codex OAuth,
 # Ollama and partner gateways ("GitLawb Opengateway" is the startup default), with the same
@@ -38,7 +43,7 @@
 #    corresponding [secret] block. The real key is read on the HOST and substituted by the egress
 #    proxy on the wire — it never enters the cage.
 #  - **Anthropic native**: this fork keeps the upstream Claude-Code default route — uncomment
-#    `{*} https://api.anthropic.com`, set `ANTHROPIC_API_KEY`, keep the [secret] block.
+#    `{*} https://api.anthropic.com`, set `ANTHROPIC_API_KEY`, uncomment its [secret] block.
 #  - **Saved provider settings**: `/provider` stores its choice in `~/.openclaude/settings.json`
 #    inside the app's isolated home. The browser sign-in flows (Codex OAuth → ChatGPT,
 #    `/onboard-github` → GitHub) open a localhost callback the empty netns breaks — like `jcode`,
@@ -50,7 +55,7 @@
 # `examples/app/openfox.toml` documents.)
 #
 # TELEMETRY — none: OpenClaude REMOVED telemetry from its source (`src/init.ts` — telemetry
-# initialization is a no-op). Nothing to mute or deny, and no privacy banner to click past.
+# initialization is a no-op). No telemetry to mute or deny, and no privacy banner to click past.
 #
 # UNVERIFIED (like every profile until run with a real key): the live equip + first prompt under
 # the allowlist. Grounded here: the npm packaging (bin, engines `>= 22`, three deps, no
@@ -116,8 +121,9 @@ allow = [
     #"{*} https://opengateway.gitlawb.com",
 ]
 
-# This profile deliberately has NO `mute`: OpenClaude removed telemetry from its source —
-# nothing is refused except what the allowlist above deliberately does not open.
+# No `mute` of this profile's own: OpenClaude removed telemetry from its source, and the only
+# refusals worth hiding — npm's audit endpoint and the JSR mirror the install probes — arrive
+# muted with the bundle and are unioned in at resolution.
 
 # BYOK: real key read on the HOST, injected by the egress proxy — never in the cage. In the
 # cage the placeholders let the CLI start and issue the request; the proxy strips them and

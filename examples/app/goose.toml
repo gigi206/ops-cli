@@ -57,15 +57,10 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle goose`, and what the
 # launch ends up with via `sbx config show --app goose`.
 allow = [
-    # Install: Goose's GitHub release carries artifact attestations, which mise verifies via
-    # Sigstore (the CNCF signing/transparency infrastructure). The TUF root repository
-    # (tuf-repo-cdn.sigstore.dev) is fetched at install time to validate the attestation; it is
-    # NOT in sbx's built-in nix-cache allow-set, so it needs an explicit entry. The wildcard
-    # covers the apex + every sigstore subdomain (rekor/fulcio are read-only verification
-    # endpoints); sigstore.dev hosts only the Sigstore project, nothing else. The binary
-    # download itself (github.com + release-assets.githubusercontent.com) rides the built-in
-    # github allow-set. Verification is install-time only — a warm/offline relaunch reuses the
-    # installed binary and never touches sigstore.
+    # Nothing here: the Sigstore lane (`*.sigstore.dev`), which mise reaches at install time to
+    # verify the release's artifact attestations, arrives with the bundle and is unioned in at
+    # resolution. The binary download itself (github.com + release-assets.githubusercontent.com)
+    # rides the built-in github allow-set.
     # Runtime provider host — uncomment the ONE matching your chosen provider (see the
     # [env]/[secret] examples below): OpenRouter, Anthropic, or OpenAI. An app is read-by-default
     # ({GET,HEAD}); the completions endpoint is a POST, so each is opened to all verbs with `{*}`.
@@ -81,11 +76,9 @@ allow = [
 # around. It is added next to the project's `.goosehints`/`AGENTS.md` and next to a
 # `GOOSE_MOIM_MESSAGE_TEXT` of yours, never in place of them.
 GOOSE_MOIM_MESSAGE_FILE = "/opt/sbx/contract-summary.md"
-# Provider-neutral: disable the parts that have no business in a cage, regardless of provider.
-# No system keyring exists in the hermetic cage; tell Goose to read the key from the env (or its
-# config file) instead.
-# Cut Goose's non-essential traffic at the source (telemetry, update checks) so the tool never
-# generates it — complementing the [network] deny-by-construction backstop.
+# `GOOSE_DISABLE_KEYRING` (read the key from the env or the config file, not a system keyring) and
+# `GOOSE_TELEMETRY_OFF` (cut telemetry and update checks at the source) ride the bundle with the
+# tool that reads them (`sbx bundle goose`).
 
 # --- Provider example (commented) — uncomment ONE block to inject a key host-side. ---
 # OpenRouter (one key, hundreds of models, OpenAI-compatible bearer auth):

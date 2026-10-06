@@ -51,9 +51,11 @@
 # need a real Warp account), the wire header for `WARP_API_KEY` (see the credentials section),
 # and in-cage BYOK (no system keyring here — this profile declares no bus, so the CLI's own log
 # reports `no secret service provider or dbus session found`; a cage with `dbus = true` does carry
-# a Secret Service, which is what the Electron profiles name with `--password-store=gnome-libsecret`). VERIFIED live in this cage: the full
-# bootstrap (download, payload validation, install) and the TUI launch — it starts, initializes
-# its server stack, loads its bundled skills, and logs its expected endpoints
+# a Secret Service, which is what the Electron profiles name with
+# `--password-store=gnome-libsecret`).
+# VERIFIED live in this cage: the install (host-side now, the bundle's `tarball:resolve`) and the
+# TUI launch — it starts, initializes its server stack, loads its bundled skills, and logs its
+# expected endpoints
 # (`app.warp.dev` + `wss://rtc.app.warp.dev/graphql/v2` + `wss://sessions.app.warp.dev`), with
 # its Sentry/RudderStack telemetry refused (403) exactly as the bundle's mutes intend. Grounded
 # here: the packaging and payload layout (read out of the downloaded
@@ -103,7 +105,7 @@ exec warp "$@"
 #]
 
 # --- The agent's requirements come from its bundle ------------------------------------------------
-# `use` pulls in the `warp` BUNDLE — the package(s) (gnutar/gzip for the bootstrap wrapper), the
+# `use` pulls in the `warp` BUNDLE — the agent's tarball and the resolver that keeps it current, the
 # hosts it must reach, and its telemetry mutes — from one declaration shared with the bundle
 # file itself, so this profile cannot fall behind when the agent's requirements change.
 #

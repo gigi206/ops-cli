@@ -3,6 +3,7 @@
 #   sbx bundle import examples/bundle/pool.toml
 #   sbx app import examples/app/pool.toml
 #   sbx app run pool -- "<task>"            # run a task (the agent's entrypoint)
+#   sbx app run pool                        # interactive REPL / terminal
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent itself, the resolver that keeps it
 # current and the hosts it reaches come from a shared BUNDLE, so import it too:
@@ -10,7 +11,6 @@
 #     sbx app import examples/app/pool.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
-#   sbx app run pool                        # interactive REPL / terminal
 #
 # PACKAGING — the vendor's own tarball, tracked automatically. Poolside publishes a statically
 # linked Go binary alone inside a per-platform archive, plus a bare text file naming the current
@@ -114,8 +114,8 @@ use = ["pool"]
 # No `[packages]` here: what the bundle provisions comes from it — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing tasks /
-# context, reading completions) is opened to all verbs with a `{*}` prefix. The
-# download host is a plain `{GET}`.
+# context, reading completions) is opened to all verbs with a `{*}` prefix. No download host:
+# the resolver and the fetch run host-side, outside any cage allowlist.
 [network]
 mode = "deny"
 allow = [

@@ -11,6 +11,9 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#
 # This is the GUI sibling of the `goose` CLI profile — the same multi-provider agent with a
 # desktop UI (sessions, recipe browser, extension marketplace). Upstream ships it on Linux only
 # as a versioned `.deb` (`goose_<ver>_amd64.deb`), which does not install in the hermetic cage, so
@@ -34,8 +37,8 @@
 # seccomp + the empty netns IS the boundary, replacing Chromium's own redundant sandbox).
 #
 # VERSIONS — automatic. Goose's `.deb` filename embeds the version (`goose_<v>_amd64.deb`), so there
-# is no stable URL to hard-code; this profile names the REPO instead (`deb:github:aaif-goose/goose`,
-# below) and sbx pins the newest release's version-stamped asset. A warm launch reuses that pin
+# is no stable URL to hard-code; the bundle names the REPO instead (`deb:github:aaif-goose/goose`)
+# and sbx pins the newest release's version-stamped asset. A warm launch reuses that pin
 # offline; `sbx upgrade --app goose-desktop` re-queries GitHub and rolls it forward (the rebuilt app lands
 # at the next launch). No manual version bump.
 #
@@ -55,7 +58,7 @@
 # NVIDIA-only machine falls back to software (still renders, slower). `dbus = true` gives the
 # cage its OWN private desktop portal so the app's FILE CHOOSER opens IN-CAGE (lists only the
 # cage FS), seeds your host light/dark theme at launch and follows it live, and relays desktop
-# notifications — the login keyring stays absent (see docs-site/docs/guide/configuration/dbus.md).
+# notifications — the host keyring stays absent (see docs-site/docs/guide/configuration/dbus.md).
 # AUDIO is deliberately NOT enabled: the Goose desktop plays only notification sounds (output),
 # and `audio = true` would also expose the microphone AND every system-audio `.monitor` source —
 # a trusted-only cost not worth it for notification blips (parity with the opencode/droid
@@ -102,11 +105,12 @@ dbus = true
 #]
 
 # --- The app's requirements come from its bundle --------------------------------------------------
-# `use` pulls in the `goose-desktop` BUNDLE — the tracked `.deb` and the two environment variables
-# that disable the keyring lookup and the telemetry — from one declaration shared with the bundle
-# file itself, so this profile cannot fall behind when the app's requirements change. The bundle
-# carries NO egress, faithfully: Goose is multi-provider, so the model host is the one you pick
-# below. The posture (`gui`/`gpu`/`dbus`) stays here too — a bundle may never widen it.
+# `use` pulls in the `goose-desktop` BUNDLE — the tracked `.deb`, the two environment variables
+# that disable the keyring lookup and the telemetry, and the Electron engine's spellcheck lane
+# (`@chromium-spellcheck`) — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the app's requirements change. The bundle carries NO model host,
+# faithfully: Goose is multi-provider, so the model host is the one you pick below. The posture
+# (`gui`/`gpu`/`dbus`) stays here too — a bundle may never widen it.
 #
 # THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/goose-desktop.toml

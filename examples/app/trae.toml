@@ -4,14 +4,14 @@
 #   sbx bundle import examples/bundle/trae.toml
 #   sbx app import examples/app/trae.toml
 #   sbx app run trae
+#   sbx app run trae -- run "Add unit tests to utils.py"
 #
-# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The interpreter its source install needs and the hosts it reaches come from a
-# shared BUNDLE, so import it too:
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. Its install step, the interpreter that source
+# install needs and the hosts it reaches come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/trae.toml
 #     sbx app import examples/app/trae.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
-#   sbx app run trae -- run "Add unit tests to utils.py"
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/pypi.toml
@@ -30,10 +30,11 @@
 # is NO PyPI release (`pip install trae-agent` fails; the README's
 # `trae-cli run` example trips up GitHub issues with the same error), no
 # released binary, and no flake/nixpkgs attribute. So none of sbx's
-# `nix:`/`mise:`/`deb:`/`tarball:` backends fit. Instead the `cmd` wrapper
-# below clones the repo, builds an isolated `uv` env, and runs the resulting
-# `trae-cli` from the cage's persistent isolated home — the same pattern
-# `cursor-agent.toml` and `prime-agent.toml` use, generalised to a source build.
+# `nix:`/`mise:`/`deb:`/`tarball:` backends fit. Instead the bundle's install step
+# (its `provision`, run before this command) clones the repo and builds an isolated
+# `uv tool` env, and the `cmd` below runs the resulting `trae-cli` from the cage's
+# persistent isolated home — the same pattern `prime-agent.toml` uses, generalised to a
+# source build.
 #
 # Installed once on the first launch; persistent across projects (the same
 # isolated home). Trae rides no `[packages]` backend, so what advances it is running its install
@@ -66,8 +67,9 @@
 #
 # CONFIG + STATE — `~/.trae/` (config: `trae_config.yaml` is git-ignored, plus
 # `trajectories/*.json` per-run debug logs). Project-level state rides the
-# project bind. The in-cage `uv` env lives at `~/.trae/.venv/` (host-side,
-# not seeded).
+# project bind. The bundle's install step clones the source to `~/.trae/src`, builds the
+# agent's isolated env from it with `uv tool install`, and links `trae-cli` into
+# `~/.local/bin` — all in the app's isolated home.
 #
 # MCP — `mcp_servers:` block in `trae_config.yaml` (stdio / http). The
 # profile does NOT pre-open MCP server hosts — add the host of any server you
@@ -147,16 +149,17 @@ exec trae-cli "$@"
 # = "rw"` lets the caged `trae-cli` read and write these host files (config, trajectories).
 # Uncommented, the bind appears at that host path and not under the cage's `$HOME`
 # (`/home/sandbox`), so the app keeps its isolated home and reaches these files only by their
-# absolute path. The `~/.trae/.venv` is host-side, NOT seeded.
+# absolute path.
 #binds = [
 #    { path = "~/.trae", mode = "rw" },
 #]
 
 # --- The agent's requirements come from its bundle ------------------------------------------------
-# `use` pulls in the `trae` BUNDLE — the uv/python substrate its source install needs and the two lanes that install uses —
-# from one declaration shared with the bundle file itself, so this profile cannot fall behind when
-# the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
-# the `cmd` above, and a consuming app has to reproduce it to get the agent at all.
+# `use` pulls in the `trae` BUNDLE — the uv/python substrate its source install needs and the two
+# lanes that install uses — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change. The install step rides the
+# bundle too, as its `provision`, which sbx runs before this command; what stays here is the
+# command, the posture and the credential choices.
 #
 # THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/trae.toml
@@ -167,13 +170,14 @@ use = ["trae"]
 
 # An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing
 # prompts / context, reading completions) is opened to all verbs with `{*}`.
-# Hosts are from the `pyproject.toml` deps + the YAML config example (the
-# provider API hosts) and the upstream README (Doubao + Ollama routes).
+# No provider host is opened by default: Trae is BYOK across the providers its
+# `pyproject.toml` deps, its YAML config example and the upstream README (Doubao + Ollama
+# routes) name, so add the one you use here.
 [network]
 mode = "deny"
 allow = [
-    # Every host this agent reaches arrives with the `trae` bundle (`use` above) and is unioned
-    # into this list at resolution — inspect them with `sbx bundle trae`, and see the launch's own
-    # view with `sbx config show --app trae`. A host the flow reaches that is not in the union is
-    # refused and named: watch `sbx net logs -a trae`.
+    # Nothing here: the clone and install lanes (`@github`, `@pypi`) arrive with the `trae` bundle
+    # (`use` above) and are unioned into this list at resolution — inspect them with
+    # `sbx bundle trae`, and see the launch's own view with `sbx config show --app trae`. A host
+    # the flow reaches that is not in the union is refused and named: watch `sbx net logs -a trae`.
 ]

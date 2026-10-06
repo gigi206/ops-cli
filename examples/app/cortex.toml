@@ -26,8 +26,8 @@
 # and the loader, the cage's base userland already provides through its nix-ld shim). Without it the
 # CLI does not start at all: `error while loading shared libraries: libasound.so.2`.
 #
-# The proportionate fix is the one below: declare `nix:alsa-lib` — host-provisioned, seeded, offline
-# — and let the wrapper put its `lib/` on the loader path, derived from the `aserver` binary that
+# The proportionate fix: the bundle declares `nix:alsa-lib` — host-provisioned, seeded, offline —
+# and the wrapper below puts its `lib/` on the loader path, derived from the `aserver` binary that
 # same package puts on PATH (a store path is content-addressed, so it cannot be written literally).
 # **`audio = true` would also supply the library and is deliberately NOT used**: that hole binds the
 # host PulseAudio socket, which exposes the microphone *and* every `.monitor` source — an
@@ -109,8 +109,8 @@ use = ["cortex"]
 [network]
 mode = "deny"
 allow = [
-    # The vendor's service host arrives with the bundle (`use` above) and is unioned into this list
-    # at resolution — inspect it with `sbx bundle cortex`.
+    # Nothing here: the vendor's service host arrives with the bundle and is unioned in at
+    # resolution — inspect it with `sbx bundle cortex`.
     #
     # BYOK instead: uncomment this and supply an OpenAI key below rather than a Cortex one.
     #"{*} https://api.openai.com",
@@ -125,8 +125,8 @@ allow = [
 # stay refused) and never hides a count (`sbx net stats` still tallies them). See everything with
 # `sbx net logs --all`; edit with `sbx net mute|unmute <rule> -a cortex`.
 mute = [
-    # Nothing here: the vendor installer/docs hosts and the optional tool backends are muted by
-    # the bundle.
+    # Nothing here: the mutes of the vendor installer/docs hosts and the optional tool backends
+    # arrive with the bundle and are unioned in at resolution.
 ]
 
 # --- Provider key (commented) — uncomment the placeholder and the matching [secret] block. The

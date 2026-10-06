@@ -11,6 +11,11 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#
 # FIRST-RUN SETUP — OpenClaw ships with NO provider configured, so it reports
 # "no models available" until you set one up. Run its configuration wizard as the
 # app's OWN command (it needs a real controlling terminal) — NOT from inside a
@@ -82,9 +87,10 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle openclaw`, and what the
 # launch ends up with via `sbx config show --app openclaw`.
 allow = [
-    # OpenAI API — the primary BYOK provider (completions, embeddings, …), reached via the
-    # `openai` SDK the package bundles. Opened to all verbs (request bodies).
-    # npm registry — equipping openclaw via mise at first launch (and `sbx upgrade mise`).
+    # Nothing here: the OpenAI API (the primary BYOK provider — completions, embeddings, … — reached
+    # via the `openai` SDK the package bundles, opened to all verbs) and the npm registry (equipping
+    # openclaw via mise at first launch, and `sbx upgrade mise`) arrive with the bundle and are
+    # unioned in at resolution.
     #
     # --- ChatGPT-account login (Codex-style OAuth) — UNVERIFIED for OpenClaw -------------
     # Uncomment these together only if you sign in with a ChatGPT account instead of a BYOK
@@ -119,6 +125,8 @@ allow = [
 # still tallies it); it only keeps the line out of the default log. Edit it from the CLI
 # with `sbx net mute|unmute <host> -a openclaw`, or see everything with `sbx net logs --all`.
 mute = [
+    # Nothing here: npm's audit endpoint and the JSR mirror the install probes arrive with the
+    # bundle and are unioned in at resolution.
 ]
 
 # CREDENTIALS — OpenClaw keeps provider auth in its OWN config (see FIRST-RUN SETUP at
@@ -133,13 +141,14 @@ mute = [
 #      real key on the wire to api.openai.com. For another provider, change the host in
 #      [secret] + the header/type/env var.
 [env]
-# REQUIRED — OpenClaw is a pure-Node CLI that reaches its providers through Node's built-in
-# fetch (undici) and the `openai` SDK, which — unlike npm and mise — do NOT honour the
+# `NODE_USE_ENV_PROXY` (REQUIRED) rides the bundle with the tool that reads it
+# (`sbx bundle openclaw`). OpenClaw is a pure-Node CLI that reaches its providers through Node's
+# built-in fetch (undici) and the `openai` SDK, which — unlike npm and mise — do NOT honour the
 # http_proxy/https_proxy variables sbx injects. In the Model-B cage (empty network namespace,
 # no DNS resolver) a fetch that bypasses the proxy resolves the host itself and dies with
 # `EAI_AGAIN: getaddrinfo <host>` — never even reaching the proxy (so it shows as 0 deny in
-# `sbx net stats`). NODE_USE_ENV_PROXY (Node 24+, which `nix:nodejs` provides) makes fetch
-# route through the proxy, so every runtime request is subject to the allowlist above.
+# `sbx net stats`). That variable (Node 24+, which the bundle's `nix:nodejs` provides) makes
+# fetch route through the proxy, so every runtime request is subject to the allowlist.
 
 #OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
 

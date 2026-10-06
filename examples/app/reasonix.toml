@@ -11,6 +11,11 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#
 # Reasonix is a config- and plugin-driven coding harness: a single static Go binary
 # whose append-only session history is aligned to DeepSeek's prefix cache, so long
 # sessions keep a 90%+ cache-hit and cheap input tokens. It ships a DeepSeek provider
@@ -25,13 +30,13 @@
 # launcher is the JS shim, so **node is needed at RUNTIME** (engines >= 18), not only to
 # install — hence `nix:nodejs` stays in the launch environment. sbx equips it fresh via
 # mise's npm backend; the first launch in a project fetches shim + binary from
-# registry.npmjs.org (the allowlist below), then pins the version until `sbx upgrade mise`.
+# registry.npmjs.org (the bundle's npm lane), then pins the version until `sbx upgrade mise`.
 #
 # CREDENTIAL — BYOK, but with a catch unique to Reasonix. It resolves its provider key
 # ONLY from Reasonix home's global `~/.reasonix/.env` (verified in the upstream source:
 # `ProviderEntry.APIKey()` reads `storedCredentialValue(api_key_env)`, and CONFIG_PATHS.md
 # states that process environment variables are never a runtime fallback). `DEEPSEEK_API_KEY`
-# set in the process environment is consumed only by Reasonix's setup probe). sbx cannot
+# set in the process environment is consumed only by Reasonix's setup probe. sbx cannot
 # inject an env var into the cage's requests, so the standard `[env] + [secret]` substitution alone would not reach the request — the real key never enters the cage: the `cmd` wrapper below pre-seeds `.env` with the PROXY PLACEHOLDER on first launch, and the egress proxy strip-and-replaces it on the wire to api.deepseek.com.
 #
 #   export DEEPSEEK_API_KEY=sk-…   # on the HOST; the proxy injects it on the wire
@@ -112,22 +117,23 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle reasonix`, and what the
 # launch ends up with via `sbx config show --app reasonix`.
 allow = [
-    # Install: the shim's packument and tarball plus the platform binary optional dep — npm
-    # spreads these across sibling paths, so the registry host is opened read-only as a whole
-    # (like the other npm-backed profiles), not path-scoped.
-    # Runtime: DeepSeek's OpenAI-compatible endpoint — `POST /chat/completions` for prompts
-    # (the prefix-cache loop keeps replaying the same growing prefix), plus the optional
-    # `GET /user/balance` balance check. A direct provider is still any OpenAI-compatible
-    # base_url in `reasonix.toml`; add its host here if you configure one.
+    # Nothing here: the install lane (the shim's packument and tarball plus the platform binary
+    # optional dep, through `@npm-registry`) and DeepSeek's OpenAI-compatible endpoint
+    # (`POST /chat/completions` for prompts, plus the optional `GET /user/balance` balance check)
+    # arrive with the bundle and are unioned in at resolution. A direct provider is still any
+    # OpenAI-compatible base_url in Reasonix's `config.toml`; add its host here if you configure
+    # one.
 ]
 
-# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): npm's audit POST at
-# install time, and Reasonix's own telemetry/upgrade gateway (`crash.reasonix.io` — a daily
-# /ping and /metrics the CLI sends only with your in-TUI consent, plus the host `reasonix
-# upgrade` resolves its release list from). Both stay DENIED and tallied (`sbx net stats` still
-# counts them); `mute` only keeps their otherwise-noisy `denied-default` lines out of the default
-# log. See them anytime with `sbx net logs --all -a reasonix`.
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`). They stay DENIED and
+# tallied (`sbx net stats` still counts them); `mute` only keeps their otherwise-noisy
+# `denied-default` lines out of the default log. See them anytime with
+# `sbx net logs --all -a reasonix`.
 mute = [
+    # Nothing here: npm's audit POST and the JSR probe at install time, and Reasonix's own
+    # telemetry/upgrade gateway (`crash.reasonix.io` — a daily /ping and /metrics the CLI sends
+    # only with your in-TUI consent, plus the host `reasonix upgrade` resolves its release list
+    # from), arrive with the bundle and are unioned in at resolution.
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the cage.

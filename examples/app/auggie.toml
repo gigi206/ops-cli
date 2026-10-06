@@ -11,6 +11,11 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#
 # Auggie ships as an npm package (`@augmentcode/auggie`), a genuine terminal CLI that
 # runs anywhere Node.js runs — so sbx equips it in-cage with a node runtime (Node 20+
 # is required) plus mise's npm backend. Unlike the `cline`/`droid` profiles (whose npm
@@ -18,7 +23,7 @@
 # is needed at RUNTIME, not only to install. The cage synthesises `/usr/bin/env`, so its
 # `#!/usr/bin/env node` shebang resolves. The install fetches the package from
 # registry.npmjs.org, so the first launch in a project needs the network and the
-# allowlist below.
+# bundle's npm lane.
 #
 # CREDENTIAL POSTURE — Augment ACCOUNT, NOT a header-injectable provider key. Auggie
 # authenticates to your Augment account and routes all model traffic through Augment's own
@@ -43,8 +48,9 @@
 #      runs in an empty network namespace; sbx synthesises `/etc/hosts` so `localhost`
 #      resolves in-cage), but the HOST browser's redirect hits the HOST's loopback, not the
 #      cage's — so the loopback callback likely cannot complete across the namespace boundary.
-#      Prefer path 1. If you try path 1's `auggie login` FLOW in-cage anyway, uncomment the
-#      auth hosts in `allow` below (the proxy will name the exact host it refuses).
+#      Prefer path 1. If you try the `auggie login` flow in-cage anyway, its auth host
+#      (`auth.augmentcode.com`) already arrives with the bundle; the proxy names any other host it
+#      refuses (`app.augmentcode.com` is offered commented in `allow` below).
 #
 # When you log in interactively in-cage, the credential persists in the app's dedicated,
 # persistent, isolated home, never bleeding into the project shell or another app. Either
@@ -93,7 +99,10 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle auggie`, and what the
 # launch ends up with via `sbx config show --app auggie`.
 allow = [
-    # GitHub (PR workflows / repository indexing) rides sbx's built-in nix-cache allow-set
+    # Nothing here: the npm install lane and Augment's tenant and auth hosts arrive with the bundle
+    # and are unioned in at resolution.
+    #
+    # GitHub (PR workflows / repository indexing) rides sbx's built-in read-only allow-set
     # (github.com / api.github.com / githubusercontent) — no extra `allow` needed here.
     #
     # `app.augmentcode.com` may also be touched mid-flow. With the proxy fix in place, a missing host
@@ -105,10 +114,12 @@ allow = [
 # Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): a `mute` never changes
 # the verdict (the host is still denied) and never hides a count (`sbx net stats` still tallies it);
 # it only keeps the line out of the default log. See it anytime with `sbx net logs --all`, and edit
-# this list from the CLI with `sbx net mute|unmute <host> -a auggie`. Augment's own telemetry, if
-# any, is refused by construction in `deny` mode (nothing outside `allow` gets out); add its host
-# here the day the proxy names it, to keep the log clean.
+# this list from the CLI with `sbx net mute|unmute <host> -a auggie`. Any other telemetry is
+# refused by construction in `deny` mode (nothing outside `allow` gets out); add its host here the
+# day the proxy names it, to keep the log clean.
 mute = [
+    # Nothing here: the npm audit and JSR probes and the Segment and Sentry telemetry arrive with
+    # the bundle and are unioned in at resolution.
 ]
 
 # No [secret] block and no baked [env] credential: Auggie's account token is a session JSON /

@@ -48,8 +48,8 @@
 # (project, committed) for general settings; `~/.config/devin/mcp_config.json` and
 # `.devin/mcp_config.json` for MCP servers; `~/.config/devin/credentials` for the
 # authenticated session; `~/.local/share/devin/cli/_versions/<v>/bin/devin` for the
-# installed binary (managed by `devin update`, allowed below). All project-level
-# config rides the project bind; the rest lives in the isolated home.
+# installed binary (managed by `devin update`, whose manifest host the bundle allows). All
+# project-level config rides the project bind; the rest lives in the isolated home.
 #
 # TELEMETRY — Devin CLI bakes in a Sentry DSN for crash + error reporting
 # (`https://…@o4507463137361920.ingest.us.sentry.io/4510507667685376` —
@@ -57,7 +57,7 @@
 # manager`, the package name in the binary). The CLI has NO per-installation opt-out
 # env var (unlike `AMP_SKIP_UPDATE_CHECK`); the org/user toggles `disable_telemetry`
 # server-side via the Devin web app, and the CLI then stops posting. The Sentry host
-# is DENIED and muted below — a `mute` never changes the verdict (still refused) and
+# is DENIED and the bundle mutes it — a `mute` never changes the verdict (still refused) and
 # never hides a count (`sbx net stats` still tallies it). Local error logs are
 # unaffected.
 #
@@ -68,7 +68,7 @@
 #
 # UNVERIFIED (like every profile until run with a real API key): the first prompt under the
 # allowlist, the `DEVIN_API_KEY` proxy injection, and the
-# wiki feature (`cognition.ai/wiki/...`, allowed but optional). Grounded here: the
+# wiki feature (`cognition.ai/wiki/...`, optional and not allowed). Grounded here: the
 # packaging and release manifest (read out of `static.devin.ai/cli/current/manifest
 # .json`), the `DEVIN_*` env-var list and the `api.devin.ai` / `app.devin.ai` hosts
 # (read out of the shipped binary, the version-string `3000.3.27` from
@@ -132,23 +132,24 @@ use = ["devin"]
 # No `[packages]` here: what the bundle provisions comes from it — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing prompts /
-# model traffic) is opened to all verbs with `{*}`. Hosts are from the shipped binary
-# (`api.devin.ai`, `app.devin.ai`, `cognition.ai`, `static.devin.ai`) — see the header.
+# model traffic) is opened to all verbs with `{*}`. The bundle's hosts are from the shipped binary
+# (`api.devin.ai`, `app.devin.ai`, `static.devin.ai`) — see the header.
 [network]
 mode = "deny"
 allow = [
-    # Every host this agent reaches arrives with the `devin` bundle (`use` above) and is unioned
-    # into this list at resolution — inspect them with `sbx bundle devin`, and see the launch's own
-    # view with `sbx config show --app devin`.
+    # Nothing here: every host this agent reaches arrives with the bundle and is unioned in at
+    # resolution — inspect them with `sbx bundle devin`, and see the launch's own view with
+    # `sbx config show --app devin`.
 ]
 
 # Silence the DENIED error-reporting host. `mute` never changes the verdict (still
 # refused) and never hides a count (`sbx net stats` still tallies it; see with
 # `--all`). The Sentry endpoint is baked into the binary; the CLI has no
-# per-installation opt-out env var, so denying it here is the only cage-side lever.
+# per-installation opt-out env var, so refusing it at the proxy is the only cage-side lever.
 # Local error logs are unaffected — only the outbox is silent.
 mute = [
-    # Nothing here: the vendor's crash reporter is muted by the bundle.
+    # Nothing here: the mute of the vendor's crash reporter arrives with the bundle and is unioned
+    # in at resolution.
 ]
 
 # --- BYOK API key (commented, headless). The in-cage placeholder lets `devin auth

@@ -18,9 +18,9 @@
 #     sbx net groups import examples/net-groups/google-signin-incage.toml
 #     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #
-# Kiro CLI is a **native glibc terminal program** (a Rust TUI: kiro-cli + kiro-cli-chat +
-# kiro-cli-term) — NOT an Electron/Chromium app. It runs like any other CLI in the cage; the
-# in-cage Chromium below is used ONLY to complete the OAuth sign-in, never for daily runs.
+# Kiro CLI is a **native glibc terminal program** (kiro-cli + kiro-cli-chat + kiro-cli-term) —
+# NOT an Electron/Chromium app. It runs like any other CLI in the cage; the in-cage Chromium the
+# bundle provisions is used ONLY to complete the OAuth sign-in, never for daily runs.
 #
 # It is packaged from nixpkgs' own `kiro-cli` derivation, at the `.unwrapped` attribute the
 # bundle names and explains (`nix:kiro-cli.unwrapped`): built host-side
@@ -32,17 +32,18 @@
 #
 # ── LOGIN: the in-cage browser (default flow) ─────────────────────────────────────────────
 # `kiro-cli login` (without `--use-device-flow`) opens its sign-in page in a browser and then
-# waits on a `http://localhost:3128` OAuth callback. In a hermetic cage the host browser cannot
-# reach the CAGE's loopback, so the login happens IN the cage: kiro-cli opens the page by calling
-# `xdg-open <url>`, and the `[open]` table below routes that to an **in-cage Chromium**. You complete Google / GitHub / Builder ID sign-in in that Chromium; the redirect to
-# `http://localhost:3128` is a normal http URL Chromium follows back to kiro-cli's own in-cage
-# listener, so the whole flow closes inside the cage. The token persists in the app's isolated
-# `$HOME` — login is a one-time step.
+# waits on a `http://localhost:<port>` OAuth callback (the port is dynamic — see the NOTE below).
+# In a hermetic cage the host browser cannot reach the CAGE's loopback, so the login happens IN
+# the cage: kiro-cli opens the page by calling `xdg-open <url>`, and the `[open]` table below
+# routes that to an **in-cage Chromium**. You complete Google / GitHub / Builder ID sign-in in
+# that Chromium; the redirect to `http://localhost:<port>` is a normal http URL Chromium follows
+# back to kiro-cli's own in-cage listener, so the whole flow closes inside the cage. The token
+# persists in the app's isolated `$HOME` — login is a one-time step.
 #
 #     sbx app run kiro -- login --license free    # Builder ID / Google / GitHub
 #     sbx app run kiro -- login --license pro     # enterprise Identity Center
 #
-# This works under the STRICT `deny` allowlist below — the `[network]` block already permits the
+# This works under the STRICT `deny` allowlist — the bundle's allow list already permits the
 # Kiro sign-in hosts AND the Google Sign-In chain (including the `accounts.google.<ccTLD>/SetSID`
 # cross-domain cookie step, the classic blank-SetSID-page blocker). GitHub / Builder ID sign-in
 # stay on their own domains and need even less. Once the token is persisted, daily use needs no
@@ -50,8 +51,8 @@
 #
 # TWO ESCAPES if a login still stalls on a blank/partial page:
 #   * A refused host. Watch `sbx net logs -a kiro --all` for a `denied-*` line and add it:
-#     `sbx net allow <host> -a kiro`. Chromium's own stderr is captured in `chromium-login.log`
-#     in the app home (path via `sbx app show kiro`) — read it to see what the page is waiting on.
+#     `sbx net allow <host> -a kiro`. Chromium's own output is captured in `.sbx-open.log` in
+#     the app home (path via `sbx app show kiro`) — read it to see what the page is waiting on.
 #   * `sbx app run kiro --net allow -- login …` — allow-by-default instead of the allowlist, for the
 #     login only (you keep bubblewrap + seccomp + the isolated home + the minimal /dev, AND the proxy,
 #     so `sbx net logs -a kiro --all` still names every host the flow touched). The token then
@@ -129,7 +130,7 @@ exec kiro-cli "$@"
 # Google OAuth sign-in (the cross-domain `SetSID` cookie step); without it the Google page hangs
 # blank/spinning. Every other sbx profile that completes an OAuth inside the cage carries it. kiro
 # still opens the sign-in URL via `xdg-open` (a native CLI, not the portal `OpenURI`), and its
-# `http://localhost:3128` callback is normal in-browser navigation, so the private bus never
+# `http://localhost:<port>` callback is normal in-browser navigation, so the private bus never
 # intercepts the launch or the callback. All three are trusted-only fields, honored because this
 # profile is trusted by location once imported.
 gui = "wayland"
@@ -177,13 +178,14 @@ use = ["kiro"]
 #header = "Authorization"
 #type = "bearer"
 
-# Egress — deny by construction except Kiro's own service hosts. Two regions are listed
-# (us-east-1 primary, eu-central-1 Europe); the CLI talks to whichever your account uses.
-# A host the CLI reaches that is not listed returns a 403 whose body names the exact rule to
-# add — `sbx net allow <host> -a kiro` — so extend this as your first login/run surfaces one.
-# NOTE: this allowlist governs DAILY runs (`chat`/`kiro-cli`), which need no browser. The
-# in-cage browser LOGIN is done under `--net allow` (see the LOGIN note), which replaces this
-# list for that one run — do not try to enumerate the IdP's host sprawl here.
+# Egress — deny by construction except Kiro's own service hosts, which the bundle carries. Two
+# regions are listed there (us-east-1 primary, eu-central-1 Europe); the CLI talks to whichever
+# your account uses. A host the CLI reaches that is not listed returns a 403 whose body names the
+# exact rule to add — `sbx net allow <host> -a kiro` — so extend this as your first login/run
+# surfaces one.
+# NOTE: the bundle's allowlist covers DAILY runs (`chat`/`kiro-cli`), which need no browser, AND
+# the default in-cage browser LOGIN (see the LOGIN note); `--net allow` is only the escape for a
+# login that still stalls — do not try to enumerate the IdP's host sprawl here.
 # Where a web link opens, declared rather than scripted. sbx generates the `xdg-open` the cage
 # reaches and the desktop entry the in-cage portal resolves, and freezes both, so a link opens the
 # same way whichever of the two a caller uses.
@@ -218,7 +220,7 @@ allow = [
     #
     # Enterprise AWS IAM Identity Center (`--license pro`) also needs your org's portal +
     # directory hosts — uncomment and replace <region>/<directory> with yours (the OIDC host
-    # above is already allowed). See kiro.dev/docs/cli/authentication.
+    # is already allowed by the bundle). See kiro.dev/docs/cli/authentication.
     #"{*} https://portal.sso.us-east-1.amazonaws.com",
     #"{*} https://<directory>.awsapps.com",
     #"{GET} https://signin.aws",
@@ -235,11 +237,12 @@ allow = [
 # set in the cage, emits an ABSOLUTE-form request INSIDE the CONNECT tunnel (`POST https://…/`
 # instead of `POST /`). sbx's proxy requires the tunneled request to be origin-form and refuses
 # that as `blocked (bad-request)` — a pre-verdict SECURITY GUARD, not a `deny`, and `mute` only
-# suppresses `deny`. So it cannot be muted; instead the `kiro` bundle's `provision` step disables
-# telemetry at the SOURCE at install time (`kiro-cli settings telemetry.enabled false`, persisted in
-# the isolated ~/.kiro/settings/cli.json), which stops cognito-identity AND every telemetry host
-# below from being called at all. The mutes below stay as a belt-and-suspenders in case telemetry is
-# re-enabled.
+# suppresses `deny`. So it cannot be muted; instead the `kiro` bundle disables telemetry at the
+# SOURCE: its `[env]` opt-out (`Q_DISABLE_TELEMETRY`, `KIRO_DISABLE_TELEMETRY`), read before any
+# settings file, backed by its `provision` step (`kiro-cli settings telemetry.enabled false`,
+# persisted in the isolated ~/.kiro/settings/cli.json), which stops cognito-identity AND every
+# muted telemetry host from being called at all. The bundle's mutes stay as a belt-and-suspenders
+# in case telemetry is re-enabled.
 mute = [
     # Nothing here: the telemetry hosts, the cookie-banner beacons, `@chromium-background` and the
     # translation service arrive with the bundle and are unioned into this list at resolution.

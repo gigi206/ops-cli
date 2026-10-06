@@ -12,6 +12,9 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/github-install.toml
+#
 # Crush is Charm's "Your new coding bestie" — a Go-binary terminal coding agent (TUI)
 # distributed on GitHub releases as `crush_<ver>_Linux_x86_64.tar.gz` (verified
 # v0.88.0, static-pie ELF, ~27 MiB compressed, ~80 MiB unpacked, with man pages and
@@ -40,8 +43,7 @@
 # environment variable names (verified in the README's `API Keys` table):
 #
 #  - **Hyper (Charm's first-party, ZDR, GDPR)** — `HYPER_API_KEY`, base
-#    `https://hyper.charm.land` (the default — comment it out only if you switch
-#    providers exclusively)
+#    `https://hyper.charm.land` (the default, which the bundle opens)
 #  - **Anthropic** — `ANTHROPIC_API_KEY` → `api.anthropic.com`
 #  - **OpenAI** — `OPENAI_API_KEY` → `api.openai.com`
 #  - **Google Gemini / Vertex** — `GEMINI_API_KEY` (Google AI Studio) or
@@ -83,11 +85,11 @@
 # hash)" per the README: "prompts and responses are NEVER collected". The metric
 # host is internal to Charm and is not in the published binary's outbound URL
 # table (the metric POSTs are served by `hyper.charm.land` on the same
-# infrastructure as the model API). The profile opts out at the in-cage env
-# level — `[env] CRUSH_DISABLE_METRICS = "1"` (vendor-recommended) and
+# infrastructure as the model API). The bundle opts out at the in-cage env
+# level — `CRUSH_DISABLE_METRICS = "1"` (vendor-recommended) and
 # `DO_NOT_TRACK = "1"` (the universal "respect the convention" knob) — so the
-# metrics POSTs are never sent. The cage's deny-default is the belt; the env
-# opt-out is the suspenders.
+# metrics POSTs are never sent. The allowlist is no backstop here: the bundle
+# opens `hyper.charm.land` to every verb for the model API.
 #
 # MCP — `mcp add <name> --type stdio|http|sse …` from inside `crush` or from
 # the `crushrc` (Bash DSL). HTTP/SSE servers can use Crush's built-in OAuth
@@ -169,21 +171,12 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle crush`, and what the
 # launch ends up with via `sbx config show --app crush`.
 allow = [
-    # First-party Hyper — Charm's subscription model API. ZDR + GDPR, the
-    # default provider when no other `*_API_KEY` is set (verified in the
-    # binary's outbound URL table).
-    # Catwalk — the community-supported model registry Crush pulls on startup
-    # to refresh its provider list (auto-update can be disabled in the
-    # `crushrc` with `option provider-auto-update false`, but the cage opens
-    # it by default).
-    # GitHub — OAuth device flow (`github.com/login/device/code`),
-    # OAuth token exchange (`github.com/login/oauth/access_token`), the
-    # Copilot API (`api.githubcopilot.com`), and `api.github.com` for the
-    # MCP server catalog and any GitHub-flavored tools the user wires in.
-    # `{GET}` for the catalog and the device-code page; `{*}` for the
-    # post-flow token exchange and Copilot POSTs.
+    # Nothing here: Hyper (Charm's first-party provider), Catwalk (the provider registry Crush
+    # refreshes on startup — `option provider-auto-update false` in the `crushrc` turns that off)
+    # and the GitHub lanes (OAuth, the Copilot API, the MCP catalog) arrive with the bundle and are
+    # unioned in at resolution.
     # Provider BYOK — uncomment the ONE(s) the model you call with
-    # `crush --model <model>` picks. The first-party `hyper.charm.land` above
+    # `crush --model <model>` picks. The first-party `hyper.charm.land` (in the bundle)
     # is enough for the default route; open another only if you switch
     # providers. The matching env var (e.g. `ANTHROPIC_API_KEY`) carries
     # the key — host-side, injected on the wire, never in the cage.
@@ -220,11 +213,9 @@ allow = [
     #"{*} https://aiplatform.googleapis.com",
 ]
 
-# Opt out of the in-binary pseudonymous metrics at the in-cage env level.
-# The vendor publishes the opt-out knobs in the README; both are honored by
-# the binary. The cage's deny-default already refuses the metrics host
-# (whatever sub-path of `hyper.charm.land` it lives on), so these envs are
-# the suspenders to the belt.
+# `CRUSH_DISABLE_METRICS` and `DO_NOT_TRACK` (the vendor's opt-outs of the in-binary pseudonymous
+# metrics, published in its README) ride the bundle with the tool that reads them
+# (`sbx bundle crush`).
 [env]
 
 # --- BYOK example (commented, headless). The in-cage placeholder lets

@@ -38,13 +38,14 @@
 # into a generated nix expression). And `appimage:github:CodebuffAI/codebuff-community` does NOT work
 # either: that repo is a MONOREPO whose `releases/latest` is the freebuff CLI (a `.tar.gz`, no AppImage),
 # with the desktop on interspersed `freebuff-desktop-v*` tags — so "latest" would never be the desktop.
-# The clean answer is the auto-upgrade resolver form: `appimage:resolve` paired with the
-# `[appimage.freebuff]` table below. sbx runs its `resolve` command in a HERMETIC sandbox (sbx's own base
-# tools — curl; a shared network to reach the vendor; sbx's own CA bundle for TLS), the command prints the
-# CURRENT `.AppImage` URL by following the redirect, and sbx re-validates that URL, resolves it to a
-# content hash, and pins BOTH in the per-project appimage lock. `sbx upgrade --app freebuff-desktop` re-runs
-# the command and rolls the pin forward when the vendor bumps the version; a warm launch reuses the pin
-# WITHOUT re-running it (offline). No manual version bump, no third party.
+# The clean answer is the auto-upgrade resolver form: the bundle's `appimage:resolve`, paired with
+# its `[appimage.freebuff]` table. sbx runs that `resolve` command in a HERMETIC sandbox (sbx's own
+# base tools — curl; a shared network to reach the vendor; sbx's own CA bundle for TLS), the command
+# prints the CURRENT `.AppImage` URL by reading the redirect's target, and sbx re-validates that
+# URL, resolves it to a content hash, and pins BOTH in the per-project appimage lock. `sbx upgrade
+# --app freebuff-desktop` re-runs the command and rolls the pin forward when the vendor bumps the
+# version; a warm launch reuses the pin WITHOUT re-running it (offline). No manual version bump, no
+# third party.
 #
 # The AppImage is EXTRACTED at BUILD time, never self-mounted at runtime: `appimage-run`/`wrapType2`/the
 # raw AppImage all need a runtime FUSE/namespace mount the cage's seccomp denylist blocks, so sbx unpacks
@@ -61,16 +62,15 @@
 # https URL, which Electron's main process hands to `shell.openExternal` (verified in the app's own
 # `main.cjs`). A hermetic cage has NO system browser and NO registered URL handler, so `openExternal` does
 # NOTHING — the click is silently dropped. Freebuff's login is a device-code flow (open a codebuff.com URL,
-# then the in-cage orchestrator polls for completion), so the WHOLE flow must close IN-CAGE. The profile
-# therefore provisions an IN-CAGE Chromium and names it in `[open]`, which covers both ways a link is
-# opened: a direct `xdg-open` call, and — the load-bearing one under `dbus = true`, where
-# `openExternal` routes through the portal's `org.freedesktop.portal.OpenURI` and consults the desktop
-# database instead — the desktop entry sbx generates from the same declaration.
-# `--password-store=gnome-libsecret` names the in-cage keyring a `dbus = true` portal now starts (Chromium
-# picks its backend
-# from `XDG_CURRENT_DESKTOP`, which a cage does not set) so a login survives a relaunch. If you would
-# rather sign in with an API key (no browser), drop the
-# `chromium` package and the wrapper for a bare `freebuff` argv with the Electron flags.
+# then the in-cage orchestrator polls for completion), so the WHOLE flow must close IN-CAGE. The
+# bundle therefore provisions an IN-CAGE Chromium and this profile names it in `[open]`, which
+# covers both ways a link is opened: a direct `xdg-open` call, and — the load-bearing one under
+# `dbus = true`, where `openExternal` routes through the portal's `org.freedesktop.portal.OpenURI`
+# and consults the desktop database instead — the desktop entry sbx generates from the same
+# declaration. `--password-store=gnome-libsecret` names the in-cage keyring a `dbus = true` portal
+# now starts (Chromium picks its backend from `XDG_CURRENT_DESKTOP`, which a cage does not set) so a
+# login survives a relaunch. If you would rather sign in with an API key (no browser), the `[open]`
+# routing simply goes unused; the Chromium it names rides the bundle.
 #
 # CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
 # per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS database
@@ -140,7 +140,7 @@ dbus = true
 # `use` pulls in the `freebuff-desktop` BUNDLE — the `.AppImage` and its auto-upgrade resolver, the
 # sign-in Chromium, the hosts both reach and the noise mutes — from one declaration shared with the
 # bundle file itself, so this profile cannot fall behind when the app's requirements change. What
-# the bundle may never carry is posture: the `gui`/`gpu`/`dbus` grants and the sign-in wrapper in
+# the bundle may never carry is posture: the `gui`/`gpu`/`dbus` grants, the `[open]` routing and the
 # `cmd` stay here.
 #
 # THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
@@ -179,11 +179,10 @@ mode = "deny"
 # freebuff-desktop` on your first launch/login and add any refused host (or check ahead with
 # `sbx test net <url>`).
 allow = [
-  # The Codebuff backend, the Freebuff vendor domain, the runtime npm lane, the GitHub and Google
-  # sign-in chains and the favicon services all arrive with the `freebuff-desktop` bundle (`use`
-  # above) and are unioned into this list at resolution — inspect them with
-  # `sbx bundle freebuff-desktop`, and see the launch's own view with
-  # `sbx config show --app freebuff-desktop`.
+  # Nothing here: the Codebuff backend, the Freebuff vendor domain, the runtime npm lane, the GitHub
+  # and Google sign-in chains and the favicon services arrive with the bundle and are unioned in at
+  # resolution — inspect them with `sbx bundle freebuff-desktop`, and see the launch's own view
+  # with `sbx config show --app freebuff-desktop`.
   #
   # OPTIONAL — using your OWN Claude/ChatGPT subscription through Freebuff (not the default Codebuff
   # account). Uncomment the provider(s) you log into; discover exact hosts via `sbx net logs`.
@@ -220,9 +219,9 @@ mute = [
 # OPTIONAL direct-OpenRouter BYOK (commented). By default Freebuff authenticates to a CODEBUFF account and
 # routes ALL model traffic through Codebuff's backend — there is no provider key to inject, so this block
 # does nothing on its own and is NOT the shipped path. It is here only for parity with the BYOK profiles:
-# it takes effect solely if a Freebuff release lets you point it at OpenRouter directly (uncomment
-# `openrouter.ai` in `allow` too). The real key is then read on the HOST and injected by the egress proxy
-# on the wire — never in the cage.
+# it takes effect solely if a Freebuff release lets you point it at OpenRouter directly (add
+# `{*} https://openrouter.ai` to `allow` too). The real key is then read on the HOST and injected by
+# the egress proxy on the wire — never in the cage.
 #[env]
 #OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 #

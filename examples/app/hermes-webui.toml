@@ -11,6 +11,13 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/huggingface-hub.toml
+#
 # NOT the same app as the `hermes-web` profile. `hermes-web` runs `hermes dashboard`, the browser
 # dashboard shipped INSIDE NousResearch's own hermes-agent. This profile runs a SEPARATE, third-party
 # project — https://github.com/nesquena/hermes-webui — an unofficial, community-maintained web UI for
@@ -21,16 +28,17 @@
 # The BINARY still comes from that project's own official upstream (its own nix flake), not from a
 # third-party repackager.
 #
-# HOW IT RUNS THE AGENT — the reason this profile declares TWO packages. Hermes WebUI is only a
-# front-end: it runs the Hermes agent IN-PROCESS, importing the agent's Python modules directly and
-# reading its `$HERMES_HOME` config. It does NOT talk to an external agent API server. Its own
+# HOW IT RUNS THE AGENT — the reason this profile runs TWO flake packages: the WebUI, declared here,
+# and the agent, from the `hermes` bundle. Hermes WebUI is only a front-end: it runs the Hermes
+# agent IN-PROCESS, importing the agent's Python modules directly and reading its `$HERMES_HOME`
+# config. It does NOT talk to an external agent API server. Its own
 # dependency set is tiny (pyyaml + cryptography — its `requirements.txt` says so verbatim: "All heavy
 # ML/agent deps live in the Hermes agent venv"), so the agent must be present or the server refuses to
 # start. The nix package launches bootstrap with `--skip-agent-install`, which is what you want here:
 # without it, a missing agent would make bootstrap run `curl … install.sh | bash` from the network.
-# sbx supplies the agent declaratively instead, as the same `#default` flake output the `hermes`,
-# `hermes-web`, and `hermes-desktop` profiles use — so the (large) build is SHARED with them in the
-# store rather than duplicated.
+# sbx supplies the agent declaratively instead, as the same `#default` flake output the `hermes` and
+# `hermes-web` profiles use (all three name the `hermes` bundle) — so the (large) build is SHARED
+# with them in the store rather than duplicated.
 #
 # Both packages are remote `flake:` refs, which sbx builds HOST-SIDE into its shared store (like
 # `nix:`) and seeds per project — so the build uses the HOST network and is unaffected by the cage's
@@ -256,17 +264,17 @@ enable = { env = "HERMES_WEBUI_SBX_GATEWAY", not = "0" }
 # with `--foreground --no-browser --skip-agent-install`, and carries the WebUI's own pyyaml +
 # cryptography). Built host-side into sbx's shared store; rolled by `sbx upgrade --app hermes-webui`.
 hermes-webui = "flake:github:nesquena/hermes-webui#default"
-# The agent the WebUI imports and runs in-process. The SAME `#default` output as the `hermes`,
-# `hermes-web`, and `hermes-desktop` profiles, so the heavy build is shared with them rather than
-# duplicated. It supplies the `run_agent` module, its interpreter, and every provider client.
+# The agent the WebUI imports and runs in-process is not declared here: it rides the `hermes` bundle
+# (the flake's `#default` output, shared with the `hermes` and `hermes-web` profiles) and supplies
+# the `run_agent` module, its interpreter, and every provider client.
 # The browser toolset (see `gui = "offscreen"` above). `agent-browser` is Hermes' own browser-driver
 # CLI: a self-contained Rust binary shipped in its npm tarball, so mise's `--ignore-scripts` install
 # is not merely harmless but wanted — it skips the postinstall that would otherwise download a
-# Playwright browser, which nixpkgs' Chromium replaces. `nodejs` is required because mise's npm
-# backend needs a node in the cage (the flake's own bundled node is only on the `hermes` wrapper's
-# PATH, not the cage's). Chromium is HEAVY — ~620 MB unpacked, a larger closure — and lands in the
-# project store on the first launch. agent-browser finds Chromium on PATH by itself; point it
-# elsewhere with `AGENT_BROWSER_EXECUTABLE_PATH` if you ever need to.
+# Playwright browser, which nixpkgs' Chromium replaces. `nodejs` (in the bundle) is required because
+# mise's npm backend needs a node in the cage (the flake's own bundled node is only on the `hermes`
+# wrapper's PATH, not the cage's). Chromium is HEAVY — ~620 MB unpacked, a larger closure — and
+# lands in the project store on the first launch. agent-browser finds Chromium on PATH by itself;
+# point it elsewhere with `AGENT_BROWSER_EXECUTABLE_PATH` if you ever need to.
 chromium = "nix:chromium"
 agent-browser = "mise:npm:agent-browser"
 
@@ -279,7 +287,8 @@ mode = "deny"
 # semantics). Still visible via `sbx net logs --all`.
 mute = [
     "169.254.169.254",
-    # npm's audit POST on every install: refused anyway, just kept out of the default log.
+    # The npm audit and JSR mutes (refused anyway, just kept out of the default log) arrive with
+    # the bundle and are unioned in at resolution.
 ]
 # The agent's OWN hosts arrive with its bundle (`use` above) and are unioned into this list at
 # resolution. Check the union with `sbx config show --app hermes-webui`.
@@ -289,15 +298,10 @@ allow = [
     # (`sbx net groups import examples/net-groups/openrouter.toml`), set OPENROUTER_API_KEY, and
     # uncomment the [secret."openrouter.ai"] block further down.
     #"@openrouter",
-    # The browser toolset's `agent-browser` CLI, fetched from npm at launch (mise's npm backend
-    # installs in-cage, unlike the host-side `flake:` build). The audit POST is noisy and
-    # non-essential, so it is muted rather than allowed.
-    # Runtime — the LLM provider. With a BYOK key (the [secret] block below) that is OpenRouter; with
-    # a NousResearch account login instead (the shipped default, no BYOK key set), the model traffic
-    # goes to the account's own API: portal is the OAuth token endpoint, inference-api serves the
-    # models. The agent runs in-process, so this is the same provider egress as the `hermes` CLI.
-    # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked).
-    # Other providers the WebUI's picker offers — uncomment the one you use, and add a matching
+    # Nothing here: the npm lane `agent-browser` installs from, the NousResearch account hosts
+    # (portal, inference-api) and the model catalogs arrive with the bundle and are unioned in at
+    # resolution. The agent runs in-process, so this is the same provider egress as the `hermes`
+    # CLI. Other providers the WebUI's picker offers — uncomment the one you use, and add a matching
     # [secret] block (or set the key in Settings → Providers, which stores it in the isolated home).
     #"{*} https://api.anthropic.com",
     #"{*} https://api.openai.com",
@@ -314,11 +318,9 @@ allow = [
 ]
 
 [env]
-# Flags agent-browser passes to the Chromium it launches. `--no-sandbox` is MANDATORY: Chromium's own
-# SUID/userns sandbox cannot come up in the cage (sbx's seccomp denylist blocks
-# `clone(CLONE_NEWUSER)`), so without it the browser aborts at startup and every browser tool fails.
-# Dropping Chromium's inner sandbox is acceptable here because bubblewrap + seccomp + the empty netns
-# IS the boundary. `--disable-dev-shm-usage` keeps it off the cage's small /dev/shm.
+# `AGENT_BROWSER_ARGS` (the flags agent-browser passes to the Chromium it launches: the mandatory
+# `--no-sandbox`, since Chromium's own sandbox cannot come up in the cage, and
+# `--disable-dev-shm-usage`) rides the bundle with the tool that reads it (`sbx bundle hermes`).
 # Bind address + port INSIDE the cage. 127.0.0.1 is the upstream default and the right value: the
 # forwarder above bridges the host's loopback to the cage's, so there is no reason to expose the
 # server on 0.0.0.0 (which would publish it to your LAN if the netns were ever shared). Keep this

@@ -11,6 +11,12 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#
 # MiMo Code is a terminal-native AI coding assistant distributed as a CLI (bin `mimo`), shipped
 # on npm as `@mimo-ai/cli`. It is a fork of opencode: the same TUI, LSP, MCP and plugin stack,
 # plus persistent memory, context management, subagent orchestration and the Compose workflows.
@@ -25,23 +31,24 @@
 # notice; mise's npm backend skips scripts, the cache is not needed, and no `cmd` wrapper is
 # required (the `dirac` near-miss, resolved PATH-first, in reverse: the shim resolves the
 # binary itself). Because the launched file IS the JS shim, **node is needed at RUNTIME**
-# (`nix:nodejs` below), not only to install — like reasonix.
+# (`nix:nodejs`, which the bundle carries), not only to install — like reasonix.
 #
 # CREDENTIALS — three postures, matching the first-launch wizard:
 #
 #  - **MiMo Auto** (built-in, free for a limited time): anonymous and zero-config — the CLI
-#    talks to the Xiaomi MiMo platform backend below. Nothing to inject, nothing to log in to.
+#    talks to the Xiaomi MiMo platform backend the bundle opens. Nothing to inject, nothing to
+#    log in to.
 #  - **Xiaomi MiMo Platform** (account): OAuth at `platform.xiaomimimo.com`. Complete the login
 #    once inside the cage and the token persists in the app's isolated `$HOME`
-#    (`~/.local/share/mimocode/auth.json`), never in the project shell. The allowlist opens
-#    the OAuth host.
+#    (`~/.local/share/mimocode/auth.json`), never in the project shell. The bundle's allowlist
+#    opens the OAuth host.
 #  - **BYOK** (provider list / custom provider in the TUI): any OpenAI-compatible API. Point
 #    the allowlist and a `[secret]` block at that provider's host — the OpenRouter example is
 #    wired up commented at the bottom.
 #
 # Because mimo is MULTI-PROVIDER its egress depends on the model you actually use. The
-# allowlist below is the MiMo-flavored default. If a request is blocked, the proxy reports the
-# refused host — add it to `allow` (or check ahead with `sbx test net <url>`).
+# bundle's allowlist is the MiMo-flavored default (`sbx bundle mimo`). If a request is blocked,
+# the proxy reports the refused host — add it to `allow` (or check ahead with `sbx test net <url>`).
 cmd = "mimo"
 
 # Your host mimo config/data, mounted read-write at their real absolute paths. `binds` is a
@@ -79,9 +86,10 @@ allow = [
     #"{*} https://api.openai.com",
 ]
 
-# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): nothing grounded
-# yet — a host the CLI reaches that is not listed returns a 403 naming `sbx net allow <host>`,
-# so add any the proxy surfaces (and mute the ones you deliberately leave denied).
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): the npm audit and JSR
+# refusals arrive muted with the bundle; nothing else is grounded yet — a host the CLI reaches
+# that is not listed returns a 403 naming `sbx net allow <host>`, so add any the proxy surfaces
+# (and mute the ones you deliberately leave denied).
 #mute = [
 #]
 

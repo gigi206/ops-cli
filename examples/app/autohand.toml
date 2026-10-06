@@ -11,6 +11,12 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/github-install.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#
 # Autohand Code (autohand.ai/code) is "the open, composable, self-evolving coding
 # agent" — a Bun-compiled TypeScript CLI distributed on npm as `autohand-cli`
 # (verified v0.9.3 — Apache-2.0, package `name=autohand-cli`, `engines.node >= 22`,
@@ -126,10 +132,10 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle autohand`, and what the
 # launch ends up with via `sbx config show --app autohand`.
 allow = [
-    # First-party Autohand API — auth, account, the `code.autohand.ai` agent
-    # loop, the `api.autohand.ai` backend (verified in `dist/index.js`).
+    # Nothing here: the first-party Autohand API (`api.autohand.ai`, `code.autohand.ai`), the npm
+    # install lane and the GitHub read lane arrive with the bundle and are unioned in at resolution.
     # Provider BYOK — uncomment the ONE(s) the model you call with `autohand
-    # --model <model>` picks. The first-party `code.autohand.ai` above is
+    # --model <model>` picks. The first-party `code.autohand.ai` (in the bundle) is
     # enough for the default route; open another only if you switch models.
     #"{*} https://api.openai.com",
     #"{*} https://api.x.ai",
@@ -144,11 +150,4 @@ allow = [
     #"{*} https://api.exa.ai",
     #"{*} https://api.search.brave.com",
     #"{*} https://api.llmgateway.io",
-    # Install: mise's npm backend fetches the packument (version resolution, also used
-    # by `sbx upgrade mise`) and the tarball IN-CAGE, so the registry is subject to this
-    # policy — the built-in self-equip allow-set covers the nix cache, GitHub and mise's
-    # version index, never npm. Opened read-only as a whole, like the other npm-backed
-    # profiles.
-    # GitHub — MCP server installs and the slash-command/skill fetches the agent runs
-    # from inside the cage. `{GET}` only (a git-over-HTTPS clone would also need POST).
 ]

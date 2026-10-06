@@ -3,6 +3,7 @@
 #   sbx bundle import examples/bundle/cursor-agent.toml
 #   sbx app import examples/app/cursor-agent.toml
 #   sbx app run cursor-agent -- -p "your task here"        # headless: prompt in, result out
+#   sbx app run cursor-agent                               # interactive TUI
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent itself and the hosts it reaches come from a
 # shared BUNDLE, so import it too:
@@ -10,7 +11,6 @@
 #     sbx app import examples/app/cursor-agent.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
-#   sbx app run cursor-agent                               # interactive TUI
 #
 # This is the Cursor **CLI** (`cursor-agent`, a.k.a. `agent`), NOT the Cursor desktop editor
 # (that Electron app is packaged from Cursor's `.deb` — see `examples/app/cursor.toml`). The CLI runs the same
@@ -118,9 +118,9 @@ use = ["cursor-agent"]
 [network]
 mode = "deny"
 allow = [
-    # Every host this agent reaches arrives with the `cursor-agent` bundle (`use` above) and is unioned
-    # into this list at resolution — inspect them with `sbx bundle cursor-agent`, and see the launch's own
-    # view with `sbx config show --app cursor-agent`. A host the flow reaches that is not in the union is
+    # Nothing here: every host this agent reaches arrives with the bundle and is unioned in at
+    # resolution — inspect them with `sbx bundle cursor-agent`, and see the launch's own view with
+    # `sbx config show --app cursor-agent`. A host the flow reaches that is not in the union is
     # refused and named: watch `sbx net logs -a cursor-agent`.
 ]
 # HTTP/2 (gRPC) transport — an exact host or a `*.domain` wildcard (host-level; this is the

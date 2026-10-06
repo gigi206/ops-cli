@@ -101,7 +101,7 @@
 #
 # The SECOND scheme is what closes the loop, and it is specific to this app. OpenWork's Den sign-in
 # ends by handing back an `openwork://` deep link, and the browser that receives it is the in-cage
-# Chromium, not the app. So the wrapper registers `x-scheme-handler/openwork` as well, pointing at
+# Chromium, not the app. So `[open]` declares the `openwork` scheme as well, pointing at
 # `openwork` itself: launching the app a second time with the link as its argument hands it to the
 # instance already running, through Electron's single-instance relay, which is the path the app's own
 # `second-instance` handler expects. Without that registration the browser has nowhere to send the
@@ -111,14 +111,15 @@
 # `openwork "openwork://…"` aborts on Chromium's SUID sandbox helper (`chrome-sandbox` is not
 # setuid root in the store, and it refuses to run unsandboxed on its own) — it dies before relaying,
 # the app shows nothing, and the sign-in page keeps polling a grant that never arrives. That is why
-# the shim's default branch passes the same flags, rather than exec'ing the bare command.
+# the `openwork` entry of `[open]` passes the same flags, rather than naming the bare command.
 #
 # The app ALSO embeds a browser panel that intercepts `openwork://` on its own ("so in-app browser
 # auth works without the system protocol handler", in upstream's words), so a sign-in driven entirely
 # from inside that panel closes without any of the above. It is a second route, not a replacement:
-# every link the app hands to `openExternal` still needs the wrapper. `--password-store=gnome-libsecret`
-# names the in-cage keyring a `dbus = true` portal now starts (Chromium picks its backend
-# from `XDG_CURRENT_DESKTOP`, which a cage does not set) so a login survives a relaunch.
+# every link the app hands to `openExternal` still needs `[open]`.
+# `--password-store=gnome-libsecret` names the in-cage keyring a `dbus = true` portal now starts
+# (Chromium picks its backend from `XDG_CURRENT_DESKTOP`, which a cage does not set) so a login
+# survives a relaunch.
 #
 # WHAT DOES NOT WORK IN THE CAGE, and why. OpenWork-MANAGED OAuth — the flow that connects a
 # third-party service (Google Workspace, Microsoft 365) through OpenWork rather than through your own

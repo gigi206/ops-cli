@@ -11,11 +11,16 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#
 # Freebuff is a Node CLI distributed on npm, so sbx equips it in-cage with a node
 # runtime (nix) plus mise's npm backend. The npm package is a thin launcher: on the
 # first run it downloads the real ~46 MB binary from www.codebuff.com into the app's
 # isolated home (`~/.config/manicode/`), where it persists across launches. (This is
-# why the first launch needs the network and the allowlist below.)
+# why the first launch needs the network and the bundle's allowlist.)
 #
 # CREDENTIAL POSTURE — different from the BYOK profiles. Freebuff is NOT bring-your-
 # own-key against a provider endpoint; it authenticates to a Codebuff ACCOUNT and
@@ -91,30 +96,32 @@ use = ["freebuff"]
 
 [network]
 mode = "deny"
-# registry.npmjs.org: the npm install of the launcher. codebuff.com: the launcher's
-# hard-coded download URL, which 301-redirects to www.codebuff.com. www.codebuff.com:
-# the real binary download AND Codebuff's runtime backend (REST + websocket). Add any
-# further runtime host the proxy reports on first real use.
-# An app is read-by-default ({GET,HEAD}); these are write hosts (install/login/REST POSTs),
-# so each is opened to all verbs with `{*}`.
+# The bundle's hosts — registry.npmjs.org: the npm install of the launcher. codebuff.com: the
+# launcher's hard-coded download URL, which 301-redirects to www.codebuff.com. www.codebuff.com:
+# the real binary download AND Codebuff's runtime backend (REST + websocket; no rule grants `WS`,
+# so a websocket upgrade is refused and named in `sbx net logs`). freebuff.com: read, plus one
+# POST path. Add any further runtime host the proxy reports on first real use.
+# An app is read-by-default ({GET,HEAD}): the downloads stay `{GET}`, and only the REST API
+# (`www.codebuff.com/api/*`) and that one freebuff.com path take the write verbs.
 # The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
 # unioned into this list at resolution. Check what that adds with `sbx bundle freebuff`, and what the
 # launch ends up with via `sbx config show --app freebuff`.
 allow = [
+  # Nothing here: the hosts above arrive with the bundle and are unioned in at resolution.
   # Uncomment only if you route freebuff to a direct OpenRouter endpoint (see the note below).
   #"{*} https://openrouter.ai",
 ]
 
-# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): hosts we deliberately
-# leave DENIED — here Codebuff's PostHog product telemetry (POST /batch/), which a live run hits
-# periodically and whose `denied-default` lines would clutter the ones worth acting on. PostHog's
-# ingest endpoint is regional (`us.i.posthog.com`, `eu.i.posthog.com`), so the apex + subdomains are
-# muted together via `*.i.posthog.com` (spoof-safe). A `mute` never changes the verdict (the
-# telemetry is still refused) and never hides a count (`sbx net stats` still tallies it); it only
-# keeps the line out of the default log. See it anytime with `sbx net logs --all`, and edit this list
-# from the CLI with `sbx net mute|unmute <host> -a freebuff`. Remove the entry here the day you
-# decide to allow the endpoint (uncomment the `{POST} https://us.i.posthog.com/batch/` line above).
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`), so the ones worth acting
+# on stay visible. A `mute` never changes the verdict (the telemetry is still refused) and never
+# hides a count (`sbx net stats` still tallies it); it only keeps the line out of the default log.
+# See it anytime with `sbx net logs --all`, and edit this list from the CLI with
+# `sbx net mute|unmute <host> -a freebuff`. The day you decide to let the telemetry through, allow
+# it with `sbx net allow '{POST} https://us.i.posthog.com/batch/' -a freebuff`.
 mute = [
+  # Nothing here: the mute of Codebuff's PostHog telemetry (POST /batch/ on a regional ingest
+  # host, hence `*.i.posthog.com`) and the npm audit and JSR probes arrive with the bundle and
+  # are unioned in at resolution.
 ]
 
 # OPTIONAL direct-OpenRouter BYOK (commented). By default freebuff authenticates to a CODEBUFF

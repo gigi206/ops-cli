@@ -111,10 +111,10 @@
 # unused while the environment carries the placeholder — pick one posture, not both.
 #
 # WEB SEARCH is on and is the SAME host and the SAME key: the shipped search provider calls
-# `https://api.deepseek.com/anthropic/v1`, a separate endpoint on the host already allowed below.
-# `web_fetch` is disabled upstream in this composition (no fetch provider is mounted, because that
-# provider defers SSRF protection and the model would choose the target), so the agent cannot fetch
-# a URL of its own choosing — the allowlist below is the whole runtime egress surface.
+# `https://api.deepseek.com/anthropic/v1`, a separate endpoint on the host the bundle already
+# allows. `web_fetch` is disabled upstream in this composition (no fetch provider is mounted,
+# because that provider defers SSRF protection and the model would choose the target), so the agent
+# cannot fetch a URL of its own choosing — the allowlist below is the whole runtime egress surface.
 #
 # CONFIG + STATE — `$DSH_HOME`, `~/.dsh` by default, inside the app's isolated home: `settings.yaml`
 # (hot-reloaded), the managed `.credentials.yaml`, `profiles/web`, and the session logs. Each
@@ -124,9 +124,10 @@
 # GROUNDED, and how: this profile was LAUNCHED. In the cage, mise installed the harness, the guard
 # built `pty.node` with no host outside `@npm-registry` reached (the egress log for the run names
 # only the packument fetch), and the browser UI answered `200` on the host's `127.0.0.1:3080`
-# through the forward — its page titled `DeepSeek Harness`. Both wrapper clauses come from that run
-# rather than from reading: the first launch died on the missing addon binary, the second on the
-# internals loader, and the third served. The rest is read from upstream
+# through the forward — its page titled `DeepSeek Harness`. Both fixes come from that run rather
+# than from reading: the first launch died on the missing addon binary (now the bundle's
+# `provision`), the second on the internals loader (the `--expose-internals` of `cmd`), and the
+# third served. The rest is read from upstream
 # sources: the launcher grammar and the `web` alias passing app flags through (apps/cli/src/args.ts,
 # confirmed by `dsh web --help` printing the web app's own flags), the default port and the
 # `--host 0.0.0.0` refusal (packages/bundle/web-app/src/startup.ts, apps/cli/reference/README.md),
@@ -144,12 +145,11 @@
 # TWO THINGS THAT WILL BREAK THIS, AND THEIR TRIGGER. First, dsh is a DEVELOPER PREVIEW at
 # 0.1.0-rc.6 and says so: "THERE WILL BE COMPATIBILITY-BREAKING CHANGES." Config paths, profile
 # layout, and flag names are all fair game upstream — re-read this header against whatever
-# `sbx upgrade mise` lands on. Second, the equip depends on mise resolving npm through npm itself:
-# newer mise releases install npm packages with their own embedded package manager, which refused
-# the `@deepseek-ai` scope with "user aborted" in every case tried, while other scoped packages and
-# plain npm on the same package succeeded. The day the pinned
-# nixpkgs channel moves mise past that switch, this profile stops installing, and the fix is to make
-# that install shell out to npm rather than to change anything here.
+# `sbx upgrade mise` lands on. Second, the equip depends on mise installing the package through npm
+# itself: mise's own default client refused the `@deepseek-ai` scope with "user aborted" in every
+# case tried, while other scoped packages and plain npm on the same package succeeded, so the bundle
+# names npm as the client (`MISE_NPM_PACKAGE_MANAGER = "npm"`, see `sbx bundle deepseek-harness`).
+# A mise that stops honouring that setting stops installing this profile.
 cmd = [
     "bash",
     "-c",
@@ -210,8 +210,9 @@ forward = [3080]
 # `use` pulls in the `deepseek-harness` BUNDLE — the harness package, the node runtime and the
 # node-gyp toolchain its one source-built addon needs, the host it must reach, and its install-time
 # mute — from one declaration shared with the bundle file itself, so this profile cannot fall behind
-# when the agent's requirements change. What the bundle cannot carry is the build step: that is the
-# guarded wrapper in `cmd` above, and it stays here with the rest of this app's posture.
+# when the agent's requirements change. The install step rides the bundle too, as its `provision`,
+# which sbx runs before this command; what stays here is the command, the posture and the
+# credential choices.
 #
 # THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/deepseek-harness.toml

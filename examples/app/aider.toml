@@ -11,6 +11,9 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/pypi.toml
+#
 # Aider is the original open-source pair-programming agent: a Python terminal REPL that works
 # DIRECTLY on your git repo (edits go through commits you review; `git diff` drives the workflow).
 # It routes to any provider via model-name prefixes (`--model sonnet`, `--model openrouter/…`,
@@ -44,8 +47,8 @@
 #
 # ANALYTICS — aider asks once on first run (opt-in, random by default) and posts usage events
 # to PostHog (`us.i.posthog.com`); `--analytics-disable` opts out permanently, or answer the
-# prompt "no". The host is DENIED and muted below — a `mute` never changes the verdict (still
-# refused) and never hides a count (`sbx net stats` still tallies it). Aider survives the
+# prompt "no". The host is DENIED and the bundle mutes it — a `mute` never changes the verdict
+# (still refused) and never hides a count (`sbx net stats` still tallies it). Aider survives the
 # failure (it disables PostHog on post errors — aider/analytics.py `posthog_error`).
 #
 # GIT IDENTITY — aider does not start in a repository with no `user.name`/`user.email`: it tries
@@ -132,14 +135,15 @@ use = ["aider"]
 [network]
 mode = "deny"
 # Egress is denied by construction except the ONE provider you actually use (the model host the
-# agent POSTs to is opened to all verbs with `{*}`; an app is read-by-default). The PyPI hosts
-# are the install-time fetch (same as `vibe`); the self-update/`aider --version` check rides the
-# built-in github allow-set.
+# agent POSTs to is opened to all verbs with `{*}`; an app is read-by-default). The PyPI hosts of
+# the install-time fetch are the bundle's `@pypi` (same as `vibe`); the self-update/
+# `aider --version` check rides the built-in github allow-set.
 # The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
 # unioned into this list at resolution. Check what that adds with `sbx bundle aider`, and what the
 # launch ends up with via `sbx config show --app aider`.
 allow = [
-    # Install-time (mise's `uv tool install`): the Python wheels and the package index.
+    # Nothing here: the install lane (`@pypi`) arrives with the bundle and is unioned in at
+    # resolution.
     # BYOK provider — uncomment the ONE you use, with the matching [secret] block below.
     #"{*} https://api.openai.com",
     #"{*} https://api.anthropic.com",
@@ -151,6 +155,7 @@ allow = [
 # denied, still counted in `sbx net stats`; see them with `--all`). Aider disables PostHog
 # automatically when the post fails, so the first-run consent question still behaves.
 mute = [
+    # Nothing here: the PostHog mute arrives with the bundle and is unioned in at resolution.
 ]
 
 # BYOK: the real key is read on the HOST and injected by the egress proxy — never in the cage.

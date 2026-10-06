@@ -4,13 +4,15 @@
 #   sbx app import examples/app/reasonix-desktop.toml
 #   sbx app run reasonix-desktop
 #
-# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The `.deb`, its resolver and library list, the
-# environment the shell needs to start, and its provider host come from a shared BUNDLE, so import
-# it too:
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The `.deb`, its resolver, its provider host and
+# its crash-reporter mute come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/reasonix-desktop.toml
 #     sbx app import examples/app/reasonix-desktop.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
+#
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #
 # PACKAGING — a prebuilt `.deb` of an Electron app. `desktop-v1.39.0` ships Electron 44.2.0
 # (`resources/build.json`) at `usr/lib/reasonix/app/Reasonix`, with the Go service it starts,
@@ -29,9 +31,10 @@
 # UPGRADES — `deb:resolve`, because this repo publishes TWO release trains from one repository (the
 # CLI as `v<x>` and the desktop as `desktop-v<x>`), so `/releases/latest` alternates between them
 # and a `deb:github:` locator would find no `.deb` at all whenever the CLI release is the newer one.
-# The command below picks the newest `desktop-v*` tag explicitly. sbx runs it in a hermetic sandbox
-# (its own base tools — `curl`, `jq`, `sed`, … — on PATH), re-validates the URL it prints, and pins
-# it with its content hash; `sbx upgrade --app reasonix-desktop` re-runs it to roll forward.
+# The bundle's resolve command picks the newest `desktop-v*` tag explicitly. sbx runs it in a
+# hermetic sandbox (its own base tools — `curl`, `jq`, `sed`, … — on PATH), re-validates the URL it
+# prints, and pins it with its content hash; `sbx upgrade --app reasonix-desktop` re-runs it to roll
+# forward.
 #
 # DISPLAY — `gui = "wayland"` binds the host compositor socket read-only and provisions fonts;
 # `gpu = true` opens hardware rendering (mesa into sbx's own store, the render node under /dev/dri,

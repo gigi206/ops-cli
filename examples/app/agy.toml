@@ -16,8 +16,8 @@
 # app), shipped as a self-contained native Linux binary — so it needs no display and
 # runs headless in the hermetic cage. sbx equips it in-cage from the upstream GitHub
 # release via mise's `aqua` backend (the aqua registry entry renames the archive's inner
-# `antigravity` binary to `agy`), so the first launch in a project needs the network and
-# the allowlist below.
+# `antigravity` binary to `agy`), so the first launch in a project needs the network (the
+# release download rides sbx's built-in GitHub read lane).
 #
 # CREDENTIAL POSTURE — account / Google OAuth, NOT a header-injectable provider key.
 # Antigravity authenticates with **Google Sign-In** and, per Google, does **not** support
@@ -45,7 +45,7 @@
 #     launches (or may fail outright). This is the one unproven blocker; test it with your
 #     account before relying on the profile.
 #   * Self-update — the binary self-updates in the background during runs, phoning a Google
-#     Cloud Run host (allowlisted below). That fights version pinning; it is the price of
+#     Cloud Run host (allowlisted by the bundle). That fights version pinning; it is the price of
 #     the vendor's distribution model.
 #   * Provenance — the `google-antigravity` GitHub org that ships the release binary is not
 #     a *verified* GitHub org, though the product is clearly Google's (domain, Sign-In,
@@ -126,11 +126,13 @@ allow = [
     "@google-oauth",
 ]
 
-# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): hosts we deliberately
-# leave DENIED — telemetry, feature flags, the optional Playwright browser driver — whose refusals
-# would otherwise drown the ones worth acting on. A `mute` never changes the verdict (each host is
-# still denied) and never hides a count (`sbx net stats` still tallies them); it only keeps the line
-# out of the default log. See them anytime with `sbx net logs --all`, and edit this list from the CLI
-# with `sbx net mute|unmute <host> -a agy`. Remove an entry here the day you decide to `allow` it.
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`), so the ones worth
+# acting on stay visible. A `mute` never changes the verdict (each host is still denied) and never
+# hides a count (`sbx net stats` still tallies them); it only keeps the line out of the default
+# log. See them anytime with `sbx net logs --all`, and edit this list from the CLI with
+# `sbx net mute|unmute <host> -a agy`. To let a muted host through, allow it with
+# `sbx net allow <host> -a agy`.
 mute = [
+    # Nothing here: the telemetry, feature-flag and Playwright-driver refusals arrive with the
+    # bundle and are unioned in at resolution.
 ]

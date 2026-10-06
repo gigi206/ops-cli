@@ -2,10 +2,11 @@
 #
 #   sbx bundle import examples/bundle/openfox.toml
 #   sbx app import examples/app/openfox.toml
-#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
 #   sbx app run openfox
+#   # then open http://127.0.0.1:10369 in your browser
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
 # BUNDLE, so import it too:
@@ -13,8 +14,6 @@
 #     sbx app import examples/app/openfox.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
-#
-#   # then open http://127.0.0.1:10369 in your browser
 #
 # OpenFox is a Node.js/TypeScript coding agent with a "Plan → Builder" workflow, an integrated
 # terminal, and sub-agents — but instead of a cloud provider it drives a LOCAL, OpenAI-compatible
@@ -64,14 +63,16 @@
 # deny is a port to add to `allow`, not a reason to drop the allowlist.
 #
 # NATIVE ADDONS — carried by the bundle, not by this command. OpenFox depends on two NATIVE node
-# addons — `better-sqlite3` (its session DB) and `node-pty` (its integrated terminal) — whose
-# compiled `.node` binaries are placed by a package install script that mise deliberately does not
-# run, so a plain install leaves the agent crashing at startup with "Could not locate the bindings
-# file … better_sqlite3.node". The `openfox` bundle declares the `npm rebuild` that heals it as its
-# `provision`, and sbx runs that before this command, in this cage: the fetch is therefore subject
-# to the allowlist below, and the step is skipped once the binary exists. `cmd` is back to being
-# what this app runs. Keeping openfox as a `mise:npm:` entry in its bundle means `sbx upgrade mise`
-# still rolls it, and the fresh install directory that follows is what makes the step run again.
+# addons — `better-sqlite3` (its session DB) and `node-pty` (its integrated terminal). `node-pty`
+# ships its prebuilt `.node` in the package; `better-sqlite3`'s is placed by a package install
+# script that mise deliberately does not run, so a plain install leaves the agent crashing at
+# startup with "Could not locate the bindings file … better_sqlite3.node". The `openfox` bundle
+# declares the step that heals it as its `provision` — it runs better-sqlite3's own
+# `prebuild-install` helper, which downloads the binding published for this platform — and sbx runs
+# that before this command, in this cage: the fetch is therefore subject to the allowlist, and the
+# step is skipped once the binary exists. `cmd` is back to being what this app runs. Keeping openfox
+# as a `mise:npm:` entry in its bundle means `sbx upgrade mise` still rolls it, and the fresh
+# install directory that follows is what makes the step run again.
 #
 # The web server auto-opens a browser by default; the hermetic cage has none, so `cmd` passes
 # `--no-browser` and you open the URL yourself. Do NOT set OPENFOX_HOST=0.0.0.0 (that exposes the
@@ -130,8 +131,8 @@ mode = "deny"
 # port does not expose the rest of what listens on your machine. OpenFox probes the common ones on
 # first run (8000 vLLM, 11434 ollama, 8080 llama.cpp): a probe to a port not listed here is refused
 # by the allowlist, so uncomment the one your backend serves (or all three, if you switch between
-# them). The npm entry is the in-cage `npm rebuild` of the bundle's `provision`; the release assets
-# it then downloads ride the built-in github allow-set.
+# them). The npm entry is mise's in-cage install of the `openfox` package; the binding the bundle's
+# `provision` then downloads rides the built-in github allow-set.
 allow = [
     "tcp://localhost:8000",    # vLLM — the OPENFOX_LLM_URL default
     #"tcp://localhost:11434",  # ollama

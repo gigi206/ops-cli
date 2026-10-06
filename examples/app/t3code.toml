@@ -23,7 +23,7 @@
 # agent CLI installed AND authorized in the same environment (per T3's own docs: "you need Codex CLI
 # installed and authorized for T3 Code to work"). In the hermetic cage no CLI is present unless you
 # provision one, so this profile enables **claude-code by default** (below); enable/disable the others
-# in [packages]. Each agent you add ALSO needs its install + runtime + login hosts in [network].
+# in `use`. Each agent's bundle brings the hosts its own profile opens into [network] with it.
 #
 # THE `appimage:` BACKEND (no third party, tracks upstream automatically). Upstream distributes T3
 # Code for Linux ONLY as an `.AppImage` (no `.deb`, no nixpkgs attr, no buildable flake), and the
@@ -195,7 +195,7 @@ https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-sto
 t3code = "appimage:github:pingdotgg/t3code"
 
 # In-cage Chromium for the sub-agents' OAuth login flow (see "IN-CAGE BROWSER" above). HEAVY — pulls a
-# large nixpkgs closure into the project store on first launch. Drop this (and the wrapper in `cmd`) if
+# large nixpkgs closure into the project store on first launch. Drop this (and `[open]`) if
 # every agent you use authenticates with an API key rather than OAuth.
 chromium = "nix:chromium"
 

@@ -11,12 +11,17 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#
 # Droid ships a genuine terminal CLI on npm (the `droid` package), distributed as a
 # self-contained native binary resolved through a platform-specific optional dependency
 # — so sbx equips it in-cage with a node runtime (for the npm install) plus mise's npm
 # backend. The native binary needs no node at runtime; the install fetches it from
-# registry.npmjs.org, so the first launch in a project needs the network and the allowlist
-# below.
+# registry.npmjs.org, so the first launch in a project needs the network and the bundle's npm
+# lane.
 #
 # CREDENTIAL POSTURE — account-centric (like the freebuff profile), NOT a header-injectable
 # provider key. Droid authenticates to a Factory ACCOUNT: an interactive launch logs in, and
@@ -80,35 +85,34 @@ use = ["droid"]
 
 # No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
-# An app is read-by-default ({GET,HEAD}); these are write hosts (install/login/API POSTs), so
-# each is opened to all verbs with `{*}`.
+# An app is read-by-default ({GET,HEAD}); the login and API hosts the agent POSTs to are opened to
+# all verbs with `{*}`.
 [network]
 mode = "deny"
 # The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
 # unioned into this list at resolution. Check what that adds with `sbx bundle droid`, and what the
 # launch ends up with via `sbx config show --app droid`.
 allow = [
-    # Install: the npm package and its platform binary (an optional dep).
-    # Runtime: Factory's account/login and API gateway. Model traffic flows through Factory's
-    # gateway by default (so no separate provider host is needed unless you switch to BYOK).
+    # Nothing here: the npm install lane and Factory's account/login and API gateway arrive with
+    # the bundle and are unioned in at resolution. Model traffic flows through Factory's gateway by
+    # default (so no separate provider host is needed unless you switch to BYOK).
     # (Add `downloads.factory.ai` only if you let Droid self-update its binary, and a model
     #  provider host — e.g. `openrouter.ai` — only if you configure direct BYOK in settings.json.)
     # Uncomment for the direct-OpenRouter BYOK path below.
     #"{*} https://openrouter.ai",
 ]
 
-# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): hosts we deliberately
-# leave DENIED — here Factory's telemetry sink (POST /api/ingest), which a live run hits every few
-# seconds and whose `denied-default` lines would drown the ones worth acting on. A `mute` never
-# changes the verdict (the telemetry is still refused) and never hides a count (`sbx net stats`
-# still tallies it); it only keeps the line out of the default log. See it anytime with
-# `sbx net logs --all`, and edit this list from the CLI with `sbx net mute|unmute <host> -a droid`.
-# Remove the entry here the day you decide to allow the endpoint (uncomment the `{POST} telemetry.factory.ai`
-# line above instead).
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`), so the ones worth acting
+# on stay visible. A `mute` never changes the verdict (the telemetry is still refused) and never
+# hides a count (`sbx net stats` still tallies it); it only keeps the line out of the default log.
+# See it anytime with `sbx net logs --all`, and edit this list from the CLI with
+# `sbx net mute|unmute <host> -a droid`. The day you decide to let the telemetry through, allow it
+# with `sbx net allow '{POST} https://telemetry.factory.ai' -a droid`.
 mute = [
-    # Factory's OpenTelemetry collector on Google Cloud Run — a regional host whose `us-central1`
-    # (or other region) label varies while the project number `123358924663` stays stable, so a
-    # regex covers every regional variant rather than enumerating them. POST /v1/metrics.
+    # Nothing here: the mutes of Factory's telemetry sink (`telemetry.factory.ai`, POST /api/ingest,
+    # hit every few seconds) and of its OpenTelemetry collector on Google Cloud Run (a regex over
+    # the regional hosts of project `123358924663`, POST /v1/metrics), plus the npm audit and JSR
+    # probes, arrive with the bundle and are unioned in at resolution.
 ]
 
 # OPTIONAL direct-OpenRouter BYOK (commented). Droid's default is the Factory account above,

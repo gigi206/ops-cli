@@ -4,8 +4,8 @@
 #   sbx app import examples/app/muse.toml
 #   sbx app run muse
 #
-# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The zone database it reads and the hosts it reaches come from a
-# shared BUNDLE, so import it too:
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. Its install step, the hosts it reaches and its
+# auto-update opt-out come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/muse.toml
 #     sbx app import examples/app/muse.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
@@ -27,9 +27,9 @@
 # standalone binary, so none of `nix:`/`mise:`/`flake:`/`deb:` fit. Nor does `tarball:`: Meta's
 # channel and manifest do name a versioned artifact, but it is a BARE BINARY
 # (`…/download/?…&file=muse-x86-linux`), not an archive, and that backend takes a `.tar.gz`.
-# `cursor-agent` and `prime-agent` stay on the same pattern for their own reasons; `pool`, `rovo`,
-# `devin` and `warp` left it once a backend fit their artifact. The `cmd`
-# below runs Meta's OWN installer INSIDE the cage on the first launch, contained by
+# `prime-agent` stays on the same pattern for its own reasons; `cursor-agent`, `pool`, `rovo`,
+# `devin` and `warp` left it once a backend fit their artifact. The bundle's `provision` runs
+# Meta's OWN installer INSIDE the cage before this command, on the first launch, contained by
 # bubblewrap + seccomp + the empty netns + the egress allowlist.
 #
 # No toolchain package needed: the launcher's whole toolchain — `curl`, `date`,
@@ -49,21 +49,16 @@
 # the cage's `date` together, so the cron store and the clock agree.
 #
 # VERSION / UPGRADE — the launcher normally re-checks the channel hourly and rolls
-# the binary in the background; that would silently move the version, breaking the
-# "versions move only on an explicit upgrade" contract every profile here keeps. So
-# the profile pins the launcher behavior with `MUSE_NO_AUTO_UPDATE=1` and refreshes
-# only on an explicit one-launch override:
-#     sbx app run muse --env MUSE_SBX_UPDATE=1
-# (`--env` is an authoritative one-shot override read on the HOST). The override is
-# the same contract a one-shot `--env` override gives any bootstrap profile:
-# the wrapper re-runs the installer, which re-resolves the channel and re-downloads
-# the binary only if the channel version changed (the launcher short-circuits when
-# `.muse-version` matches and `<dir>/muse-bin-<version>` exists).
-# `sbx upgrade` does NOT reach this binary, and cannot: it rolls managed channels
-# (`nix`/`mise`/`flake`/`deb`/`appimage`/`tarball`), and a bootstrap exposes no
-# download URL for a `<backend>:resolve` to re-resolve — Meta's launcher resolves
-# the channel itself, which is exactly what the override above re-runs. Nothing
-# else in this profile rolls: it declares no package for `sbx upgrade` to move.
+# the binary in the background, behind sbx's back; the bundle's `MUSE_NO_AUTO_UPDATE=1` turns
+# that off. What moves the version instead is the bundle's install step: at every launch it
+# compares the installed `.muse-version` with the version the release channel serves and
+# re-installs when the channel moved, so this profile follows Meta's channel without being asked
+# (an unreachable channel leaves the installed version alone). To force a re-install:
+#     sbx app upgrade muse                       # re-runs the step in this app's cage
+#     sbx app run muse --env MUSE_SBX_UPDATE=1   # the same, for one launch
+# (`--env` is an authoritative one-shot override read on the HOST). The installer re-resolves
+# the channel and re-downloads the binary only if the channel version changed (the launcher
+# short-circuits when `.muse-version` matches and `<dir>/muse-bin-<version>` exists).
 #
 # CREDENTIAL POSTURE — two ways in, headless-first:
 #
@@ -87,7 +82,7 @@
 #     (`$XDG_CONFIG_HOME/muse/auth.json`) lets later downloads authenticate; it
 #     persists in the app's isolated home.
 #
-# EGRESS — honest scope. The four hosts below are GROUNDED: `dev.meta.ai`
+# EGRESS — honest scope. The four hosts the bundle opens are GROUNDED: `dev.meta.ai`
 # (the installer, fetched to build this profile), `api.meta.ai` (launcher script +
 # channel manifest + the Model API base the CLI POSTs to), `lookaside.facebook.com`
 # (the CDN the release manifest and binary come from), and `auth.meta.com` (the
@@ -144,7 +139,7 @@ exec "$bin" "$@"
 # `TBH_EVAL_APPEND_SYSTEM_PROMPT` family is not used, since a provider without base instructions
 # (`--provider echo`, for one) then refuses to run.
 
-# Your host Meta Code config/auth, mounted read-write at its real absolute paths. `binds` is a
+# Your host Muse Code config/auth, mounted read-write at its real absolute paths. `binds` is a
 # security field, honored only because this profile lives in your trusted config dir; `mode =
 # "rw"` lets the caged `muse` read and write these host files (config, auth.json, history).
 # Uncommented, the bind appears at that host path and not under the cage's `$HOME`
@@ -155,10 +150,11 @@ exec "$bin" "$@"
 #]
 
 # --- The agent's requirements come from its bundle ------------------------------------------------
-# `use` pulls in the `muse` BUNDLE — the install step, the hosts it reaches and its auto-update opt-out —
-# from one declaration shared with the bundle file itself, so this profile cannot fall behind when
-# the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
-# the `cmd` above, and a consuming app has to reproduce it to get the agent at all.
+# `use` pulls in the `muse` BUNDLE — the install step, the hosts it reaches and its auto-update
+# opt-out — from one declaration shared with the bundle file itself, so this profile cannot fall
+# behind when the agent's requirements change. The install step rides the bundle too, as its
+# `provision`, which sbx runs before this command; what stays here is the command, the posture
+# and the credential choices.
 #
 # THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/muse.toml
@@ -182,8 +178,8 @@ allow = [
 
 [env]
 # The auto-update opt-out rides the bundle with the tool that reads it (`sbx bundle muse`): it
-# disables the launcher's hourly check and background re-download, so a long-lived project store
-# keeps the version it was installed at until you run `--env MUSE_SBX_UPDATE=1`.
+# disables the launcher's hourly check and background re-download, so the version moves only when
+# the bundle's install step re-installs (see VERSION / UPGRADE in the header).
 # BYOK API key (commented, headless) — the in-cage placeholder lets `muse` start
 # and issue its first request; the egress proxy strips it and substitutes the real
 # key, read on the HOST (as $META_API_KEY), on the wire to `api.meta.ai`.

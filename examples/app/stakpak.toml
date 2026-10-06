@@ -11,6 +11,9 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#
 # Stakpak ships as a **static** Rust release binary on its own GitHub releases
 # (`stakpak-linux-x86_64.tar.gz`, Apache-2.0) — checked here: it is a `static-pie` ELF, so it needs
 # no runtime libraries and not even the cage's nix-ld shim. sbx equips it fresh from upstream via
@@ -83,20 +86,22 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle stakpak`, and what the
 # launch ends up with via `sbx config show --app stakpak`.
 allow = [
-    # Stakpak's own service: model traffic, rulebooks, its MCP endpoints, and the version check.
+    # Nothing here: Stakpak's service (model traffic, rulebooks, its MCP endpoints, and the version
+    # check) and the model catalogue arrive with the bundle and are unioned in at resolution.
     # BYOK instead: uncomment the ONE provider you use (and supply its key as `cline.toml` shows).
     #"{*} https://api.anthropic.com",
     #"{*} https://api.openai.com",
 ]
 
-# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): the chat integrations the
-# binary can post to (Slack, Discord, Telegram — it reads `STAKPAK_BOT_TOKEN`, `STAKPAK_CHAT_ID`,
-# `STAKPAK_DISCORD_TOKEN` for them). They are muted because **this profile does not wire any of
-# them**; if you enable one, add its host to `allow` above AND drop its line here, or the refusal
-# will be silent and the integration will look broken for no visible reason. A `mute` never changes
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`). A `mute` never changes
 # the verdict (they stay refused) and never hides a count (`sbx net stats` still tallies them). See
 # everything with `sbx net logs --all`; edit with `sbx net mute|unmute <rule> -a stakpak`.
 mute = [
+    # Nothing here: the chat integrations the binary can post to (Slack, Discord, Telegram — it
+    # reads `STAKPAK_BOT_TOKEN`, `STAKPAK_CHAT_ID`, `STAKPAK_DISCORD_TOKEN` for them) arrive muted
+    # with the bundle, because **this profile does not wire any of them**. If you enable one, open
+    # its host in `allow` above (or with `sbx net allow <host> -a stakpak`): a mute never touches a
+    # request an allow entry has admitted.
 ]
 
 # --- Stakpak key (commented). The in-cage placeholder lets the CLI start and issue its request; the

@@ -35,9 +35,10 @@
 #        sbx app run copilot --env GH_TOKEN=github_pat_…
 #    (`GH_TOKEN` takes precedence over `GITHUB_TOKEN`, per GitHub's docs.)
 #
-# EGRESS. The hosts below come from GitHub's own Copilot allowlist reference, narrowed to what a
-# CLI session needs; the telemetry/experimentation endpoints are deliberately left DENIED and
-# `mute`d (they are refused either way — the mute only keeps their lines out of the default log).
+# EGRESS. The bundle's hosts come from GitHub's own Copilot allowlist reference, narrowed to what a
+# CLI session needs; the telemetry/experimentation endpoints are deliberately left DENIED and the
+# bundle `mute`s them (they are refused either way — the mute only keeps their lines out of the
+# default log).
 # If a real session is refused a host, the proxy names it: add it with
 # `sbx net allow -a copilot '{*} https://<host>'`, or check ahead with `sbx test net <url>`.
 #
@@ -119,8 +120,11 @@ allow = [
 # One nuance, measured rather than assumed: `copilot-telemetry.githubusercontent.com` sits under
 # sbx's built-in always-on `{GET,HEAD} *.githubusercontent.com` lane (the self-equip read-only
 # allowance), so its GETs are ALLOWED and only its writes — which is what a telemetry upload is —
-# are refused and muted here. The other two are refused outright.
+# are refused and muted. The bundle's other two (`collector.github.com`, `default.exp-tas.com`) are
+# refused outright.
 mute = [
+    # Nothing here: the three telemetry and experimentation mutes arrive with the bundle and are
+    # unioned in at resolution.
 ]
 
 [env]

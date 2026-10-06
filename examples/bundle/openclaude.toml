@@ -24,9 +24,9 @@
 # app therefore opens its OWN provider host (and supplies the key). What is here is the install
 # lane only.
 #
-# There is deliberately NO `mute` either: OpenClaude removed telemetry from its source
-# (`src/init.ts` — telemetry initialization is a no-op), so nothing is refused beyond what the
-# consuming app's own allowlist does not open.
+# There is deliberately no telemetry mute: OpenClaude removed telemetry from its source
+# (`src/init.ts` — telemetry initialization is a no-op). The two mutes below are the npm install
+# lane's, the same as every npm-backed bundle's.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
