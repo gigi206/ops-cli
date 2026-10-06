@@ -26,10 +26,10 @@
 #
 # THE `tarball:resolve` BACKEND (auto-upgrade). Google's download URL is **version-stamped**
 # (`.../stable/<version>-<execution_id>/...`) with no stable "latest" alias, so a direct
-# `tarball:<url>` would freeze at one version. Instead this profile uses `tarball:resolve` paired with
-# the `[tarball.antigravity-ide]` table below: sbx runs its `resolve` command in a hermetic sandbox to
-# discover the newest release's download URL, then pins it per project on first launch. `sbx upgrade
-# tarball` re-runs the command and **rolls forward** to the newest — no manual URL bump. The tarball is
+# `tarball:<url>` would freeze at one version. Instead the bundle uses `tarball:resolve` paired with
+# its `[tarball.antigravity-ide]` table: sbx runs that `resolve` command in a hermetic sandbox to
+# discover the newest release's download URL, then pins it per project on first launch. `sbx upgrade`
+# re-runs the command and **rolls forward** to the newest — no manual URL bump. The tarball is
 # fetched + `tar -xz`-unpacked + `autoPatchelfHook`'d into sbx's store HOST-SIDE (safe: a tarball runs
 # no build script), seeded and offline-reusable. FIRST LAUNCH resolves + builds it, pulling the Electron
 # closure (~220 MiB tarball plus its runtime closure — a few minutes, over your HOST network, NOT the
@@ -85,7 +85,7 @@
 #   The allowlist below is grounded on a real login (the `agy` Google chain + the observed
 #   `cloudcode-pa` model backend + the VS Code CDN); if a request is refused, watch
 #   `sbx net logs -a antigravity --all` and add the host (or check ahead with `sbx test net <url>`).
-# A pragmatic one-time escape: `sbx app run antigravity-ide --net allow` for the login only (allow-by-
+# A pragmatic one-time escape: `sbx app run antigravity --net allow` for the login only (allow-by-
 # default, no allowlist whack-a-mole; the token persists in the isolated home), then strict daily use.
 # Prefer `allow` over `shared` here: it opens the same doors while keeping the proxy in front of the
 # cage, so `sbx net logs -a antigravity --all` still names every host the sign-in touched and the MITM

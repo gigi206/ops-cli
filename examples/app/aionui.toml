@@ -250,14 +250,9 @@ allow = [
     # A DIRECT provider for the co-worked agent, rather than its own gateway, is already covered by
     # the provider hosts above (Anthropic / OpenAI / OpenRouter / DeepSeek) — configure the key in
     # that CLI's own config inside this app's isolated home.
-    # "Login with Google" for Gemini (instead of an API key) needs the Google OAuth hosts. The login
-    # runs in the IN-CAGE browser, so it takes the shared in-cage sign-in lane the desktop profiles
-    # use: the locale-bounded, anchored accounts regex (the consent and the `/SetSID` step on your
-    # country domain, never a look-alike such as accounts.google.com.evil.com), the token endpoint
-    # and the page's assets. Import the group before uncommenting the line:
-    #     sbx net groups import examples/net-groups/google-signin-incage.toml
+    # "Login with Google" for Gemini (instead of an API key) runs in the same IN-CAGE browser, so it
+    # takes the same `@google-signin-incage` line as the account sign-in above: uncomment that one.
     # (accounts.youtube.com's CheckConnection is non-essential; `@chromium-background` mutes it.)
-    #"@google-signin-incage",
     # A provider that uses a realtime/streaming WebSocket (some voice/live modes) needs `{WS}` on its
     # host, e.g. change its line above to `{*,WS} https://api.openai.com`.
     #

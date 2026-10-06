@@ -19,7 +19,7 @@
 #
 # Qwen Code is MULTI-PROVIDER (OpenAI / Anthropic / Gemini / Qwen / Dashscope, plus any
 # OpenAI-compatible endpoint). This profile is wired for the native Alibaba provider by
-# default — Dashscope's OpenAI-compatible API, keyed by `DASHSCAPE_API_KEY` (sk-…) — but
+# default — Dashscope's OpenAI-compatible API, keyed by `DASHSCOPE_API_KEY` (sk-…) — but
 # every other protocol is a one-line change (see the [network] / [secret] / [env] notes
 # below). The egress allowlist below is scoped to whichever provider you pick; if a request
 # is blocked, the proxy reports the refused host — add it (`sbx net allow <host> -a qwen-code`)
@@ -36,7 +36,8 @@
 #    then `/auth` inside the cage. The Coding Plan (Alibaba Cloud) and third-party providers
 #    (OpenRouter, Requesty, ModelScope, …) authenticate with a key you paste; the Qwen OAuth
 #    free tier was discontinued on 2026-04-15, so there is no browser OAuth loopback to forward.
-#    The allowlist already opens the Dashscope + Coding Plan hosts the keyed flows hit.
+#    The bundle opens the Dashscope host; a Coding Plan key needs its own host, commented in
+#    `allow` below.
 #
 # The command hands Qwen Code the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
 # which files it protects, which operations it offers) through `--append-system-prompt`, which adds
@@ -99,8 +100,8 @@ use = ["qwen-code"]
 #   - Dashscope OpenAI-compatible API: https://dashscope.aliyuncs.com/compatible-mode/v1
 #     (the `DASHSCOPE_API_KEY` keyed flow — opened to every verb with `{*}`).
 #   - Alibaba Cloud Coding Plan: https://coding.dashscope.aliyuncs.com/v1 (cn-beijing) or
-#     https://coding-intl.dashscope.aliyuncs.com/v1 (intl) — same apex, covered by the
-#     dashscope.aliyuncs.com rule above.
+#     https://coding-intl.dashscope.aliyuncs.com/v1 (intl) — separate hosts: the exact
+#     dashscope.aliyuncs.com rule does not cover them, so uncomment yours in `allow` below.
 #   - registry.npmjs.org: equipping `@qwen-code/qwen-code` via mise's npm backend.
 #
 # Nothing else is opened. The list is grounded in Qwen Code's own source, not guessed: a
@@ -112,9 +113,10 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle qwen-code`, and what the
 # launch ends up with via `sbx config show --app qwen-code`.
 allow = [
-    # Native Alibaba / Dashscope provider (compatible-mode + Coding Plan endpoints).
-    # Install: the npm packument + tarball for `@qwen-code/qwen-code`, plus the
-    # platform-specific optional dependencies npm resolves alongside it.
+    # The Alibaba Cloud Coding Plan, on its own hosts (the Dashscope host and the npm install lane
+    # come with the bundle). Uncomment the one your key belongs to:
+    #"{*} https://coding.dashscope.aliyuncs.com",       # cn-beijing
+    #"{*} https://coding-intl.dashscope.aliyuncs.com",  # international
     # ── Alternative providers (uncomment the host(s) you actually use) ──────────────
     # OpenRouter (one key, hundreds of models — the universal OpenAI-compatible choice):
     #   set OPENAI_BASE_URL=https://openrouter.ai/api/v1, OPENROUTER_API_KEY, and uncomment

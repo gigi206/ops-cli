@@ -37,7 +37,7 @@
 # $OPENROUTER_API_KEY on the host, to have the egress proxy inject the key on the wire to
 # openrouter.ai — the plaintext never enters the cage. To use a different provider, change the
 # allowlist host + the [secret] block + the env var — e.g. Anthropic (api.anthropic.com,
-# ANTHROPER_API_KEY, header "x-api-key", type "raw") or OpenAI (api.openai.com, OPENAI_API_KEY,
+# ANTHROPIC_API_KEY, header "x-api-key", type "raw") or OpenAI (api.openai.com, OPENAI_API_KEY,
 # header "Authorization", type "bearer"). The dashboard itself may ask you to complete an auth
 # step in the browser (the same provider login, or a local dashboard password); that traffic
 # rides the allowlist below. If a request is blocked, the proxy reports the host it refused —

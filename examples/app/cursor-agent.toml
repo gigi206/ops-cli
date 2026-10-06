@@ -44,9 +44,10 @@
 #          sbx app run cursor-agent --env CURSOR_API_KEY=… -- -p "your task"
 #      (`--env` is an authoritative one-shot override read on the HOST; the value reaches the cage
 #      env for that launch only, so the key never lands in the committed profile. `$SBX_ENV_CURSOR_API_KEY`
-#      works too. The CLI also accepts a `--api-key` flag.) Do NOT put `CURSOR_API_KEY` in `[env]`
-#      below: profile `[env]` is highest-precedence, so a placeholder value would BLANK the key the
-#      `--env` override supplies.
+#      works too. The CLI also accepts a `--api-key` flag.) This profile ships no `CURSOR_API_KEY`
+#      in `[env]` simply because a committed placeholder is noise here — NOT because it would shadow
+#      the flag: the one-shot override is applied after the app overlay and is the final word, so it
+#      beats a profile `[env]` value of the same key.
 #
 #   2. INTERACTIVE `cursor-agent login` — CAVEAT, may not complete inside the cage. Login opens a
 #      browser (or, with NO_OPEN_BROWSER=1, prints the URL); whether it then polls Cursor's backend
@@ -146,6 +147,6 @@ http2 = [
 [env]
 # `NODE_USE_ENV_PROXY`, which routes the CLI's undici fetch through the proxy so every request is
 # subject to the allowlist, rides the bundle with the tool that reads it (`sbx bundle cursor-agent`).
-# Do NOT add `CURSOR_API_KEY` here — see the credential note in the header; a placeholder in `[env]`
-# would blank the `--env` key. sbx injects its MITM CA into the cage automatically under a filtering
+# No `CURSOR_API_KEY` here — see the credential note in the header: a committed placeholder is
+# noise, and the `--env` override wins over it anyway. sbx injects its MITM CA into the cage automatically under a filtering
 # posture via NODE_EXTRA_CA_CERTS / SSL_CERT_FILE, which Cursor honours.

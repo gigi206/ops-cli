@@ -28,12 +28,14 @@
 #
 #   sbx app run droid        # then log in interactively (the token persists in the isolated home)
 #
-# Headless use (`droid exec`) reads `FACTORY_API_KEY` from the environment — but sbx has NO
-# host->cage env passthrough for a credential (its passthrough channel carries only TERM/LANG,
-# and the [secret] broker injects an HTTP header on the wire, not an env var). So this profile
-# ships no key and no [env]: for unattended use you would add a local `[env] FACTORY_API_KEY =
-# "fk-…"` yourself (a plaintext key in the config file — your call), accepting it then lives in
-# the isolated cage. The shipped default is the interactive login above. Either way the sandbox
+# Headless use (`droid exec`) reads `FACTORY_API_KEY` from the environment, and the [secret]
+# broker injects an HTTP header on the wire, not an env var, so this profile ships no key and no
+# [env]. For unattended use, pass the key for a single launch, accepting that it then lives in the
+# cage env:
+#     sbx app run droid --env FACTORY_API_KEY=… -- exec "<task>"
+# (`--env` is an authoritative one-shot override read on the HOST; the value reaches the cage env
+# for that launch only, so the key never lands in the committed profile. `$SBX_ENV_FACTORY_API_KEY`
+# works too.) The shipped default is the interactive login above. Either way the sandbox
 # + the egress allowlist bound everything Droid can reach.
 #
 # BYOK (optional): Droid can talk DIRECTLY to a model provider instead of Factory's gateway by

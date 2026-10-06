@@ -16,8 +16,8 @@
 # `https://static.devin.ai/cli/`, laid out as `bin/devin` plus bundled docs and man pages. The
 # binary IS the agent: no node, no Electron, no companion runtime, and static-pie means no dynamic
 # loader for autoPatchelf to fix. The bundle declares it `tarball:resolve`, so sbx reads the
-# vendor's live manifest host-side, pins the URL with its own content hash, and `sbx upgrade
-# tarball` rolls it forward.
+# vendor's live manifest host-side, pins the URL with its own content hash, and `sbx upgrade`
+# rolls it forward.
 #
 # This profile used to bootstrap that download from `cmd`, because the shared install phase refused
 # an archive whose program lands on `$out/bin/<name>` — the wrapper's own destination. It now moves

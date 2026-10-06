@@ -126,7 +126,7 @@ allow = [
 ]
 
 [env]
-# Do NOT add `POOLSIDE_API_KEY` here — see the credential note in the header; a
-# placeholder in `[env]` would blank the `--env` key. sbx injects its MITM CA into
+# No `POOLSIDE_API_KEY` here — see the credential note in the header: a committed
+# placeholder is noise, and the `--env` override wins over it anyway. sbx injects its MITM CA into
 # the cage automatically under a filtering posture via NODE_EXTRA_CA_CERTS /
 # SSL_CERT_FILE, which `pool` honours for outbound TLS.

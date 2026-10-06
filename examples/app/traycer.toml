@@ -129,5 +129,5 @@ allow = [
     #
     # A REMOTE host, rather than the one this cage runs, is attached over the relay's WebSocket.
     # Name it with `{WS}` if you use that, and only then:
-    #"{WS} wss://relay.traycer.ai",
+    #"{WS} https://relay.traycer.ai",
 ]

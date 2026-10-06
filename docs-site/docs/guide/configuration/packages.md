@@ -391,8 +391,8 @@ WebKit app that declares the GStreamer packages above actually finds their eleme
 **Auto-upgrade, `deb:resolve`.** When a vendor ships a version-stamped `.deb` URL with no
 `…/latest/…` alias and no apt index (so `deb:<url>` would freeze and neither `deb:github:` nor
 `deb:apt:` applies), pair a `deb:resolve` sentinel with a `[deb.<name>]` table carrying a `resolve`
-**command** that prints the current `.deb` URL: sbx runs it on the first launch and on `sbx upgrade
-deb` to roll forward. This is the exact `deb:` twin of [`tarball:resolve`](#tarball-a-prebuilt-application-tarball):
+**command** that prints the current `.deb` URL: sbx runs it on the first launch and on `sbx upgrade`
+to roll forward. This is the exact `deb:` twin of [`tarball:resolve`](#tarball-a-prebuilt-application-tarball):
 
 ```toml
 [packages]
@@ -433,8 +433,8 @@ offline-reusable. The AppImage is **never self-mounted at runtime**: `appimage-r
 raw AppImage all rely on a runtime FUSE/namespace mount that the cage's seccomp denylist blocks, so
 build-time extraction is the only mechanism that runs in-cage. Two forms: a direct `https://` URL
 ending in `.AppImage`, or `appimage:github:<owner>/<repo>`: which tracks the newest release's
-linux `.AppImage` asset (so a version-embedding asset name still rolls forward). `sbx upgrade
-appimage` re-resolves it. Pairs with [`gui = "wayland"`](gui), [`gpu = true`](gpu), and
+linux `.AppImage` asset (so a version-embedding asset name still rolls forward). `sbx upgrade`
+re-resolves it. Pairs with [`gui = "wayland"`](gui), [`gpu = true`](gpu), and
 [`dbus = true`](dbus) exactly like a `.deb` desktop app.
 
 **Auto-upgrade, `appimage:resolve`.** For a vendor whose `.AppImage` URL is version-stamped with no
@@ -543,7 +543,7 @@ Two forms:
 
 - **Direct**, `tarball:https://host/path/App.tar.gz`, a URL ending in `.tar.gz` or `.tgz`. A
   version-stamped vendor URL does not roll forward on its own (the version is in the path); `sbx
-  upgrade tarball` only re-resolves the same URL.
+  upgrade` only re-resolves the same URL.
 - **Auto-upgrade**, `tarball:resolve`, paired with a `[tarball.<name>]` table carrying a `resolve`
   **command** that prints the newest release's download URL, so `sbx upgrade` can roll the app
   forward automatically (the direct form's version-stamped URL cannot). Use this when there is no

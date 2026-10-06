@@ -6,14 +6,13 @@
 #   sbx net groups import examples/net-groups/openrouter.toml
 #   # then in an app profile's [network]:   allow = ["@openrouter"]
 #
-# The OpenRouter API host, for agents that route through OpenRouter. It is a BYOK CHOICE, not a
-# shipped default: the `hermes`, `hermes-web` and `hermes-webui` profiles run on the NousResearch
-# account login and reference it COMMENTED, so nothing changes until you enable it — uncomment
-# `"@openrouter"` in the app, or add it live with `sbx net allow @openrouter -a <app>`. The
-# `hermes-desktop` bundle and the `aionui` profile name it opened, beside the other providers they
-# offer. OpenRouter is an API-KEY provider, not OAuth: the group carries the egress only — the
-# consuming app still provides the key itself, with the commented `[secret."openrouter.ai"]` block
-# (`env://OPENROUTER_API_KEY`, bearer) and the `OPENROUTER_API_KEY` env placeholder. Groups are
+# The OpenRouter API host, for agents that route through OpenRouter. It is a BYOK CHOICE: where a
+# profile references it COMMENTED, nothing changes until you enable it — uncomment `"@openrouter"`
+# in the app, or add it live with `sbx net allow @openrouter -a <app>` — and a profile or bundle
+# that offers several providers side by side names it opened beside the others. OpenRouter is an
+# API-KEY provider, not OAuth: the group carries the egress only, and the consuming app supplies
+# the key, either through a `[secret."openrouter.ai"]` block (`env://OPENROUTER_API_KEY`, bearer)
+# beside an in-cage `OPENROUTER_API_KEY` placeholder, or in the app's own settings. Groups are
 # global-only (like bundles): an app's allow may reference one, a project may not define one.
 
 entries = [

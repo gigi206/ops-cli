@@ -150,6 +150,8 @@ ATOMIC_AGENT_BROWSER_CHANNEL = "chromium"
 # rule together, or leave both alone for managed in-cage models (option 2) or a cloud provider
 # (option 3).
 #ATOMIC_AGENT_LLAMA_URL = "http://127.0.0.1:11434"
+# The in-cage placeholder for an injected OpenRouter key — see CREDENTIAL POSTURE at the end.
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 [network]
 mode = "deny"
@@ -202,14 +204,12 @@ allow = [
 # The agent reads secrets for skills and channels from a `.env` in its state dir, which is inside
 # the cage: a key you put there is a key the agent, its skills and its shell commands can all read.
 # The injected path avoids that entirely — the in-cage placeholder lets the agent start and issue
-# the request, and the egress proxy substitutes the real value on the wire. Uncomment both blocks,
-# uncomment the matching host in `allow` above, and provide $OPENROUTER_API_KEY on the host. For a
-# different provider, change the host, the header and the env var: Anthropic is
-# (api.anthropic.com, ANTHROPIC_API_KEY, header "x-api-key", type "raw"), OpenAI is
-# (api.openai.com, OPENAI_API_KEY, header "Authorization", type "bearer").
-#[env]
-#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
-#
+# the request, and the egress proxy substitutes the real value on the wire. Uncomment the
+# placeholder in the `[env]` table above and the `[secret]` block below, uncomment the matching
+# host in `allow` above, and provide $OPENROUTER_API_KEY on the host. For a different provider,
+# change the host, the header and the env var: Anthropic is (api.anthropic.com, ANTHROPIC_API_KEY,
+# header "x-api-key", type "raw"), OpenAI is (api.openai.com, OPENAI_API_KEY, header
+# "Authorization", type "bearer").
 #[secret."openrouter.ai"]
 #from = "env://OPENROUTER_API_KEY"
 #header = "Authorization"

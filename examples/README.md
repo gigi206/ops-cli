@@ -111,7 +111,8 @@ change.
 **When the install is a command, the bundle carries it too.** Some tools are not finished by
 unpacking a package: a vendor postinstall mise's `--ignore-scripts` skips (`junie`), a native addon
 with no prebuilt binary for this platform (`deepseek-harness`, `openfox`), a source checkout that
-has to be cloned and built (`odysseus`, `trae`). Those bundles declare that one-time step as
+has to be cloned and built (`odysseus`, `trae`), a vendor installer script that is the only thing
+the vendor publishes (`muse`, `prime-agent`). Those bundles declare that one-time step as
 [`provision`](../docs-site/docs/guide/configuration/bundles.md), and sbx runs it in the consuming
 app's own cage, before that app's command and never in its place. So the bundle is complete: name
 it and you get the agent, not a package that cannot start.
@@ -120,12 +121,11 @@ A step runs on every launch and guards itself — sbx does not remember that one
 what proves an install finished is a path only the step knows. That is also what makes it
 self-healing: delete what it produced and the next launch puts it back.
 
-Four profiles left this shape entirely once their artifact was measured rather than assumed:
-`devin` and `warp` moved to `tarball:resolve`, `pool` too, and `rovo` to the nixpkgs attribute that
-now exists. Three keep a `cmd` that installs, because no backend fits their artifact and the step
-is not a one-time install but the launch itself: `cursor-agent` (a JavaScript tree with no binary
-to wrap), `muse` (a bare binary rather than an archive) and `prime-agent` (a packed npm tarball).
-Their headers say which, measured rather than assumed.
+Five profiles left this shape entirely once their artifact was measured rather than assumed:
+`cursor-agent`, `devin`, `pool` and `warp` moved to `tarball:resolve`, and `rovo` to the nixpkgs
+attribute that now exists. One keeps a `cmd` that installs: `open-design`, a source checkout whose
+profile consumes the `opencode` bundle rather than publishing one of its own, so there is no
+bundle to carry the step. Its header says so.
 
 A related discriminator is worth keeping in mind: "is a postinstall skipped" is not the question —
 **can the tool still find what that postinstall would have placed** is. An agent that looks its
@@ -159,15 +159,16 @@ The Google sign-in comes as **two** fragments, because the posture decides the r
 host and the token endpoints, nothing more. `google-signin-incage` serves the consent rendered
 INSIDE the cage, which needs three things the first does not — the country domain the `/SetSID`
 cookie step redirects to (an anchored regex, so a look-alike is refused), the consent page's fonts
-and static assets, and the JS client it loads. Three bundles converged on that exact set, entry for
-entry, so it is described once; the other in-cage sign-in profiles keep their own list because
-theirs genuinely differ (wildcard asset hosts, an extra favicon service, a missing `apis.google.com`),
-and harmonizing them would change what each cage can reach.
+and static assets, and the JS client it loads. The in-cage sign-in bundles reference that set
+rather than each carrying a copy, and one that needs more names the extra beside the reference
+(wildcard asset hosts, a favicon service, the userinfo endpoint) instead of widening the group for
+every consumer.
 
 One of them is a **mute** group rather than an allow group: `chromium-background`, the background
-services a Chromium engine reaches on its own whatever it is embedded in. Every profile that ships a
-browser engine references it, so that lane is described once instead of once per app, which is
-exactly the drift this directory exists to prevent.
+services a Chromium engine reaches on its own whatever it is embedded in. The profiles that quiet
+that lane reference it, so it is described once instead of once per app, which is exactly the
+drift this directory exists to prevent; one that embeds a browser engine and has not needed it
+simply does not reference it.
 
 A bundle that references groups says so in its header under `REQUIRES`, because the bundle alone is
 then not enough: import it *and* its groups. A reference to a fragment that does not exist is
@@ -293,31 +294,35 @@ bucket gets that one bucket path-scoped, not the whole storage host.
 
 ## How a profile upgrades: three classes
 
-A tool declared through a `[packages]` backend is rolled by `sbx upgrade <backend>` (`nix` / `mise`
-/ `flake` / `deb` / `appimage` / `tarball`), which re-resolves the source and rewrites the lock;
-`sbx upgrade` with no argument rolls them all. A `mise:` tool is equipped at the latest upstream
+A tool declared through a `[packages]` backend is rolled by `sbx upgrade`, which re-resolves the
+source and rewrites the lock; `sbx upgrade --app <name>` narrows the roll to one app, and `sbx
+upgrade nix` or `sbx upgrade mise` to one channel. A `mise:` tool is equipped at the latest upstream
 version on the **first launch in a project** and then pinned to it: until you upgrade, a long-lived
 project store keeps that version. That is the contract, not a gap. Versions move only on an explicit
 upgrade, never on an sbx binary update.
 
 A few profiles install their tool from inside the cage instead, because upstream ships no artifact
 any backend can consume: a vendor `curl … | sh` bootstrap, or a source checkout. Those have no lock
-to roll, so each exposes an explicit, one-launch refresh through a one-shot env override:
+to roll. The install step is their bundle's `provision`, which `sbx upgrade provision` (or `sbx app
+upgrade <name>`) re-runs; `open-design`, which has no bundle of its own, installs from its `cmd`.
+Each also takes an explicit, one-launch refresh through a one-shot env override:
 
 | Profile | Refresh |
 | ------- | ------- |
-| `cursor-agent` | `sbx app run cursor-agent --env CURSOR_AGENT_SBX_UPDATE=1` |
 | `muse` | `sbx app run muse --env MUSE_SBX_UPDATE=1` |
 | `odysseus` | `sbx app run odysseus --env ODYSSEUS_SBX_UPDATE=1` |
 | `open-design` | `sbx app run open-design --env OPEN_DESIGN_SBX_UPDATE=1` |
 | `prime-agent` | `sbx app run prime-agent --env PRIME_AGENT_SBX_UPDATE=1` |
 | `trae` | `sbx app run trae --env TRAE_SBX_UPDATE=1` |
 
-`devin`, `pool`, `rovo` and `warp` used to be in that table and are not any more: their artifact
-turned out to fit a backend, so `sbx upgrade` rolls them like every other package.
+`cursor-agent`, `devin`, `pool`, `rovo` and `warp` used to be in that table and are not any more:
+their artifact turned out to fit a backend, so `sbx upgrade` rolls them like every other package.
 
-`--env` is authoritative and read on the host, so these keep the same contract as `sbx upgrade`:
-**the version moves only when you ask**, never on a launch and never on an sbx binary update.
+`--env` is authoritative and read on the host. A source checkout keeps the same contract as `sbx
+upgrade`: **its version moves only when you ask**, never on an sbx binary update. Two vendor
+installers go further on their own: the `muse` and `prime-agent` steps compare the installed
+version with the one the vendor's release channel serves, at every launch, and re-install when it
+moved, so those two follow their vendor without being asked.
 
 The third class is narrower: a tool with a built-in updater that the profile deliberately allows, so
 the tool can also advance itself from inside the cage. Most profiles do the opposite and leave the

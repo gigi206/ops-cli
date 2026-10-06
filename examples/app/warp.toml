@@ -112,17 +112,17 @@ exec warp "$@"
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["warp"]
 
-# No `[packages]` here: the bootstrap's tar/gzip come from its bundle — see `use` above.
+# No `[packages]` here: the agent itself comes from its bundle — see `use` above.
 
 [network]
 mode = "deny"
 # The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
 # unioned into this list at resolution. Check what that adds with `sbx bundle warp`, and what the
 # launch ends up with via `sbx config show --app warp`.
-# Optional extras (uncomment what you use):
-#   "{*} https://oz.warp.dev",        # cloud handoff (`/handoff`) + cloud-agent runs
-#   "{GET,HEAD} https://api.github.com",  # the statusline GitHub-PR chip (a read-only fetch)
 allow = [
+    # Optional (uncomment if you use it): cloud handoff (`/handoff`) and cloud-agent runs. The
+    # statusline's GitHub-PR chip needs no entry: sbx's built-in set already reads api.github.com.
+    #"{*} https://oz.warp.dev",
 ]
 
 # No credential is baked in — the device-code login persists its token in the app's isolated

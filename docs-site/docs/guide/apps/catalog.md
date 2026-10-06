@@ -55,21 +55,21 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `copilot` | `mise:aqua:github/copilot-cli` | `*.githubcopilot.com` (GitHub account / `GH_TOKEN`) |
 | `cortex` | `mise:github:CortexLM/cortex-code` (+ `nix:alsa-lib`) | `api.cortex.foundation` (`CORTEX_API_KEY`) or BYOK |
 | `crush` | `mise:github:charmbracelet/crush` | `hyper.charm.land` (Hyper account) or multi-provider BYOK |
-| `cursor-agent` | `nix:gnutar` (+ `nix:gzip`) | `*.cursor.sh` (Cursor account / `CURSOR_API_KEY`) |
+| `cursor-agent` | `tarball:resolve` (the version in the vendor's install script) | `*.cursor.sh` (Cursor account / `CURSOR_API_KEY`) |
 | `deepagents-code` | `mise:pipx:deepagents-code` (+ `nix:uv`, `nix:python312`, `nix:gcc.cc`) | provider-dependent (BYOK: OpenAI / Anthropic / Google) |
 | `devin` | `tarball:resolve` (the vendor's live manifest) | `api.devin.ai` (BYOK API key) |
 | `dirac` | `nix:nodejs` (+ `mise:npm:dirac-cli`, `nix:ripgrep`) | provider-dependent (BYOK, no vendor account) |
 | `droid` | `nix:nodejs` (+ `mise:npm:droid`) | `*.factory.ai` (account) |
 | `freebuff` | `nix:nodejs` (+ `mise:npm:freebuff`) | `www.codebuff.com` (account) |
 | `goose` | `mise:aqua:block/goose` | provider-dependent (BYOK) |
-| `grok` | `mise:aqua:x.ai/cli/grok` | `api.x.ai` (BYOK) or an xAI account |
+| `grok` | `binary:resolve` (the vendor's stable channel file) | `api.x.ai` (BYOK) or an xAI account |
 | `hermes` | `flake:github:NousResearch/hermes-agent#default` (+ `nix:nodejs`, `nix:chromium`, …) | `openrouter.ai` (BYOK) |
 | `jcode` | `mise:github:1jehuang/jcode` | provider-dependent (BYOK) |
 | `junie` | `nix:nodejs` (+ `mise:npm:@jetbrains/junie`) | `api.jetbrains.ai` (JetBrains account / `JUNIE_API_KEY` / BYOK) |
 | `kilocode` | `mise:github:Kilo-Org/kilocode` | provider-dependent (BYOK) |
 | `kimi` | `nix:nodejs` (+ `mise:npm:@moonshot-ai/kimi-code`) | `api.kimi.com` (`KIMI_API_KEY` / Moonshot account) |
 | `mimo` | `nix:nodejs` (+ `mise:npm:@mimo-ai/cli`) | `api.xiaomimimo.com` (MiMo Auto / Xiaomi account) |
-| `muse` | bootstrap installer (`cmd` wrapper), no toolchain package | `api.meta.ai` (Meta Model API / Muse Spark BYOK) or a Meta account (device login) |
+| `muse` | bootstrap installer (the bundle's `provision`), no toolchain package | `api.meta.ai` (Meta Model API / Muse Spark BYOK) or a Meta account (device login) |
 | `nanobot` | `mise:pipx:nanobot-ai` (+ `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenRouter / OpenAI / Anthropic / Gemini / DeepSeek / any OpenAI-compatible / local) |
 | `nova` | `nix:nodejs` (+ `mise:npm:@compass-ai/nova`) | `api.compassap.ai` (`COMPASS_API_KEY`) or BYOK |
 | `omp` | `mise:github:can1357/oh-my-pi` (a high-capability fork of Pi, this repo's `pi`) | provider-dependent (BYOK) |
@@ -88,7 +88,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `sigit` | `nix:nodejs` (+ `mise:npm:@getsigit/sigit`) | **none**: the model runs in-cage |
 | `snow` | `nix:nodejs` (+ `mise:npm:snow-ai`) | provider-dependent (BYOK) |
 | `stakpak` | `mise:github:stakpak/agent` | `apiv2.stakpak.dev` (`STAKPAK_API_KEY`) or BYOK: a DevOps agent |
-| `trae` | bootstrap installer (`cmd` wrapper; + `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / OpenRouter / Doubao / Azure / Ollama) |
+| `trae` | source checkout (the bundle's `provision`; + `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / OpenRouter / Doubao / Azure / Ollama) |
 | `traycer` | `mise:npm:@traycerai/cli` (+ `nix:nodejs`) | `authn`/`platform.traycer.ai` (Traycer account, device login); an orchestrator, it drives whichever agent you name in `use` |
 | `warp` | `tarball:resolve` (the vendor's artifact redirect) | `app.warp.dev` + `sessions`/`rtc.app.warp.dev` WS (Warp account, device-code login; `WARP_API_KEY`) |
 | `vtcode` | `mise:github:vinhnx/VTCode` (+ `nix:ripgrep`, `nix:ast-grep`) | provider-dependent (BYOK, default OpenRouter) |

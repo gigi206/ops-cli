@@ -165,8 +165,11 @@ use = ["kiro"]
 # generated at app.kiro.dev). The exact wire header the CLI sends this key in is NOT
 # publicly documented, so sbx does not header-inject it (a guessed injection could silently
 # fail or leak). If you have a key, either use interactive login above, or — accepting that
-# the value then lives inside the cage — set it explicitly with a one-shot override:
-#     KIRO_API_KEY=… sbx app run kiro          (via OPS_ENV_KIRO_API_KEY, or `--env`)
+# the value then lives inside the cage — pass it for a single launch:
+#     sbx app run kiro --env KIRO_API_KEY=…
+# (`--env` is an authoritative one-shot override read on the HOST; the value reaches the cage env
+# for that launch only, so the key never lands in the committed profile. `$SBX_ENV_KIRO_API_KEY`
+# works too.)
 # Only if you have verified the CLI sends it as `Authorization: Bearer` to the runtime host
 # is the never-in-cage `[secret]` broker below usable — verify before uncommenting.
 #[secret."runtime.us-east-1.kiro.dev"]
