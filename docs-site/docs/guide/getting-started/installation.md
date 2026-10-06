@@ -24,7 +24,7 @@ The script runs as you, never as root, and does this:
 2. Looks up the newest **stable** release through the GitHub API. A pre-release is never
    chosen on its own.
 3. Downloads the binary and the `.sha256` published beside it, and stops without installing
-   anything when they do not match.
+   anything when they do not match, or when the `.sha256` names another file.
 4. Places the binary at `~/.local/bin/sbx`, writing it beside its destination and renaming
    it over the old one, so an `sbx` already running keeps its file.
 5. Says so when that directory is not on your `PATH`, with the line to add to your shell's

@@ -163,6 +163,13 @@ install_linux() {
     case "$expected" in
         *[!0-9a-f]*) die "the published checksum of $asset is not a SHA-256" ;;
     esac
+    # The releases publish the digest alone; a name beside it, `*` marking binary mode, is the
+    # asset's or the checksum is another file's.
+    named=$(head -n 1 <"$tmp/sbx.sha256" | awk '{print $2}')
+    case "${named#\*}" in
+        '' | "$asset") ;;
+        *) die "the published checksum of $asset names another file: $named" ;;
+    esac
     [ "${#expected}" -eq 64 ] || die "the published checksum of $asset is not a SHA-256"
     actual=$(sha256sum "$tmp/sbx" | cut -d ' ' -f 1)
     [ "$actual" = "$expected" ] || die "checksum mismatch for $asset: expected $expected, got \

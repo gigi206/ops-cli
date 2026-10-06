@@ -211,7 +211,9 @@ the binary running now, nothing is downloaded and the command says it is up to d
 Otherwise the new binary is downloaded through sbx's own nix with that digest enforced,
 so a download that does not match never lands. It is written beside the old one, run
 once with `--version`, and renamed over it only if that run succeeds: a binary that does
-not run on this machine never replaces one that does.
+not run on this machine never replaces one that does. It keeps the permissions the old one
+was installed with. A checksum file that names a file, as `sha256sum` writes one, must name
+this binary's asset, or nothing is downloaded.
 
 ```
 $ sbx upgrade self

@@ -220,8 +220,9 @@ fn upgrade(run: &Upgrade) -> Result<Outcome, String> {
     let url = format!("{}/{tag}/{asset}", run.source.download);
     let sums = nixhub::fetch_url_text(run.nix, run.layout, &format!("{url}.sha256"), true)
         .map_err(in_flux)?;
-    let expected = parse_checksum(&sums)
-        .ok_or_else(|| format!("the checksum `{tag}` publishes for {asset} is not a SHA-256"))?;
+    let expected = parse_checksum(&sums, &asset).ok_or_else(|| {
+        format!("the checksum `{tag}` publishes for {asset} is not a SHA-256 of {asset}")
+    })?;
     if matches!(channel, Channel::Rolling(_)) {
         let running = std::fs::read(run.running)
             .map_err(|e| format!("cannot read the running binary to compare it: {e}"))?;
@@ -234,8 +235,14 @@ fn upgrade(run: &Upgrade) -> Result<Outcome, String> {
         .map_err(in_flux)?;
     let bytes = std::fs::read(store::physical_path(run.layout, &fetched.store_path))
         .map_err(|e| format!("cannot read the downloaded {asset}: {e}"))?;
+    // The mode the binary was installed with, its special bits aside; executable by its owner
+    // whatever it was, since the run below proves the new one through that bit.
+    let mode = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(run.target).map_or(0o755, |m| m.permissions().mode() & 0o777) | 0o100
+    };
     let mut to = String::new();
-    atomicfile::write_atomic_checked(run.target, &bytes, Some(0o755), |staged| {
+    atomicfile::write_atomic_checked(run.target, &bytes, Some(mode), |staged| {
         to = version_of(staged)?;
         Ok(())
     })
@@ -255,9 +262,17 @@ fn newest_stable(run: &Upgrade) -> Result<String, String> {
     }
 }
 
-/// The digest a `.sha256` asset holds: its first field, as `sha256sum` writes it.
-fn parse_checksum(text: &str) -> Option<&str> {
-    let digest = text.split_whitespace().next()?;
+/// The digest a `.sha256` asset holds for `asset`: its first field, as `sha256sum` writes it, when
+/// the name beside it, if the file gives one (`*` marking binary mode), is `asset`'s. The releases
+/// publish the digest alone; a name that is another file's says the checksum is not this one's.
+fn parse_checksum<'a>(text: &'a str, asset: &str) -> Option<&'a str> {
+    let mut fields = text.split_whitespace();
+    let digest = fields.next()?;
+    if let Some(name) = fields.next()
+        && name.strip_prefix('*').unwrap_or(name) != asset
+    {
+        return None;
+    }
     release::is_hex(digest, 64).then_some(digest)
 }
 
@@ -347,6 +362,7 @@ mod tests {
             let target = dir.join("bin/sbx");
             std::fs::create_dir_all(target.parent().unwrap()).unwrap();
             std::fs::write(&target, "the old binary").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
             let running = dir.join("running");
             std::fs::write(&running, "the old binary").unwrap();
             Bench {
@@ -404,7 +420,7 @@ mod tests {
     fn a_release_serving_the_running_bytes_downloads_nothing() {
         let bench = Bench::new(
             "unused",
-            &format!("{}  sbx-linux\n", sha256("the old binary")),
+            &format!("{}  {}\n", sha256("the old binary"), asset()),
             "{}",
         );
         assert_eq!(bench.run("latest"), Ok(Outcome::Current));
@@ -430,7 +446,14 @@ mod tests {
     #[test]
     fn a_new_build_replaces_the_binary_once_it_runs_and_the_digest_rides_the_fetch() {
         let served = binary("sbx 0.1.0 (latest, 1111111)", 0);
-        let bench = Bench::new(&served, &format!("{}  sbx-linux\n", sha256(&served)), "{}");
+        let bench = Bench::new(
+            &served,
+            &format!("{}  {}\n", sha256(&served), asset()),
+            "{}",
+        );
+        // The binary keeps the mode it was installed with, not one sbx picks: a `0750` install,
+        // executable by its group alone, is not made world-executable by an upgrade.
+        std::fs::set_permissions(&bench.target, std::fs::Permissions::from_mode(0o750)).unwrap();
         assert_eq!(
             bench.run("latest"),
             Ok(Outcome::Replaced {
@@ -442,7 +465,7 @@ mod tests {
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(mode & 0o7777, 0o750);
         let calls = bench.calls();
         assert!(
             calls.contains(&format!("--expected-hash sha256:{}", sha256(&served))),
@@ -454,7 +477,11 @@ mod tests {
     #[test]
     fn a_build_that_does_not_run_here_never_replaces_the_one_that_does() {
         let served = binary("Exec format error", 126);
-        let bench = Bench::new(&served, &format!("{}  sbx-linux\n", sha256(&served)), "{}");
+        let bench = Bench::new(
+            &served,
+            &format!("{}  {}\n", sha256(&served), asset()),
+            "{}",
+        );
         let why = bench
             .run("latest")
             .expect_err("a binary that fails is refused");
@@ -488,7 +515,7 @@ mod tests {
     #[test]
     fn a_version_tag_follows_the_newest_stable_release_and_never_steps_back() {
         let served = binary("sbx 0.1.0 (v2.0.0, 2222222)", 0);
-        let sums = format!("{}  sbx-linux\n", sha256(&served));
+        let sums = format!("{}  {}\n", sha256(&served), asset());
 
         let bench = Bench::new(&served, &sums, r#"{"tag_name":"v2.0.0"}"#);
         assert_eq!(
@@ -595,19 +622,32 @@ mod tests {
     }
 
     #[test]
-    fn the_checksum_is_the_first_field_and_nothing_but_a_sha256() {
+    fn the_checksum_is_the_first_field_and_nothing_but_a_sha256_of_the_asset() {
         let digest = sha256("x");
+        let asset = "sbx-linux-x86_64";
+        for named in [
+            format!("{digest}  {asset}\n"),
+            format!("{digest} *{asset}\n"),
+        ] {
+            assert_eq!(
+                parse_checksum(&named, asset),
+                Some(digest.as_str()),
+                "{named}"
+            );
+        }
         assert_eq!(
-            parse_checksum(&format!("{digest}  sbx-linux-x86_64\n")),
+            parse_checksum(&format!("{digest}\n"), asset),
             Some(digest.as_str())
         );
+        // A name, when the file gives one, is the asset's: a checksum of another file is not one
+        // of this download, whatever bytes it names.
         assert_eq!(
-            parse_checksum(&format!("{digest}\n")),
-            Some(digest.as_str())
+            parse_checksum(&format!("{digest}  sbx-linux-aarch64\n"), asset),
+            None
         );
-        assert_eq!(parse_checksum(""), None);
-        assert_eq!(parse_checksum(&digest.to_uppercase()), None);
-        assert_eq!(parse_checksum(&digest[1..]), None);
+        assert_eq!(parse_checksum("", asset), None);
+        assert_eq!(parse_checksum(&digest.to_uppercase(), asset), None);
+        assert_eq!(parse_checksum(&digest[1..], asset), None);
     }
 
     #[test]

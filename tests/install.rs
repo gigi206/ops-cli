@@ -356,6 +356,31 @@ fn a_version_is_installed_when_asked_for_and_refused_when_it_is_not_a_tag() {
     assert!(!fx.installed().exists());
 }
 
+/// A `.sha256` that names a file names the asset, `*` marking binary mode or not; one naming
+/// another file is not this download's checksum, whatever digest it holds, and installs nothing.
+#[test]
+fn a_checksum_naming_another_file_installs_nothing() {
+    let digest = sha256_hex(FAKE_SBX.as_bytes());
+    for (named, installs) in [
+        (format!("{digest}  sbx-linux-x86_64"), true),
+        (format!("{digest} *sbx-linux-x86_64"), true),
+        (format!("{digest}  sbx-linux-aarch64"), false),
+    ] {
+        let fx = Release::new();
+        fx.announce("v2.0.0");
+        fx.publish("v2.0.0", "sbx-linux-x86_64", FAKE_SBX, Some(&named));
+        let run = fx.run(&script(), &[], &[&fx.fake_uname("Linux", "x86_64")]);
+        assert_eq!(fx.installed().exists(), installs, "{named}: {}", run.text);
+        if !installs {
+            assert!(
+                run.text.contains("names another file"),
+                "{named}: {}",
+                run.text
+            );
+        }
+    }
+}
+
 #[test]
 fn a_download_that_does_not_match_its_checksum_installs_nothing() {
     let fx = Release::new();
