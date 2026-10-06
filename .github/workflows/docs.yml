@@ -1,7 +1,10 @@
 # Docs — builds the Docusaurus docs site and publishes it to GitHub Pages.
 #
 # Triggered on every push to `main` and `ops-v2`, and on every `v*` tag, so the
-# published documentation always matches the shipping release.
+# published documentation always matches the shipping release. A pull request
+# runs the build alone and deploys nothing: an update to the site's dependencies
+# that breaks it, which is most of what Dependabot proposes there, is then seen
+# before it is merged rather than by the deployment that follows.
 #
 # The build is the same as `mise run docs-build` (check-docs + docusaurus build +
 # pagefind), so broken links, missing anchors, a page nothing links to, a stale
@@ -18,14 +21,16 @@ on:
       - ops-v2
     tags:
       - "v*.*.*"
+  pull_request:
 
+# Each job asks for what it uses; only the deployment writes to Pages.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
+# The publishing runs share one group, so a newer push replaces an older deployment. A pull
+# request gets a group of its own, so its build never cancels one.
 concurrency:
-  group: docs-pages
+  group: ${{ github.event_name == 'pull_request' && format('docs-pr-{0}', github.ref) || 'docs-pages' }}
   cancel-in-progress: true
 
 jobs:
@@ -62,15 +67,20 @@ jobs:
         run: npm run build
 
       - name: Upload the Pages artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: docs-site/build
 
   deploy:
     name: Deploy to GitHub Pages
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     needs: build
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
