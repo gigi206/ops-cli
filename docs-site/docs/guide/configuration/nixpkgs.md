@@ -44,11 +44,12 @@ channel:
 project pin  >  global override  >  default (nixos-unstable)
 ```
 
-This is deliberate. The cage exports the base glibc on `LD_LIBRARY_PATH` for foreign
-binaries, and nixpkgs uses `RUNPATH` (searched after it), so a tool pinned to a
-*different* glibc than the base would load the base `libc.so.6` under its own loader
-and crash with a `GLIBC_PRIVATE` mismatch. Keeping base and tools on one channel keeps
-their glibc aligned.
+This is deliberate. nixpkgs uses `RUNPATH`, which the loader searches *after*
+`LD_LIBRARY_PATH`, so a glibc directory on that path would make a tool pinned to a
+*different* glibc load the base `libc.so.6` under its own loader and fail
+(`GLIBC_PRIVATE`, or `version 'GLIBC_2.xx' not found`). The cage therefore never puts
+the base glibc there: foreign binaries reach it through the nix-ld shim's
+`NIX_LD_LIBRARY_PATH`. Keeping base and tools on one channel keeps their glibc aligned.
 
 (An exception: `nix:` tools declared in a [`[tools]`](tools) mise file each resolve
 to their own revision and run via the [nix-ld shim](../concepts/provisioning), which

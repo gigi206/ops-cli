@@ -324,18 +324,35 @@ pub(crate) fn no_socket_warning(candidates: &[PathBuf]) -> String {
 /// launch failure, exactly like GPU degrading to software rendering.
 ///
 /// `LD_LIBRARY_PATH` is a shared, composable variable (unlike mesa's dedicated driver-path vars): the
-/// cage sets no baseline value, so this is the sole setter, and the app's own libraries still win — a
-/// nix binary resolves them by RUNPATH first, and the `deb:` launcher's own `makeWrapper --prefix
-/// LD_LIBRARY_PATH` prepends the app's closure ahead of these directories, so the client libraries
-/// (present nowhere else) are found without shadowing anything. It is reserved against an untrusted
+/// cage sets no baseline value, so this is the sole setter. It is searched AHEAD of a nix binary's
+/// `RUNPATH`, for every binary the cage runs — the engine's `mise` and the shims that exec it
+/// included. So the base glibc is left off it: `foreign_lib_paths` is `NIX_LD_LIBRARY_PATH`'s set,
+/// and the directory holding `base_loader` is dropped from it here. With it, a binary of a newer
+/// nixpkgs revision loads the base `libc`/`libm` under its own loader and refuses to start
+/// (`version 'GLIBC_2.44' not found`), which the engine's `mise` met once `sbx upgrade` rolled the
+/// engine past an audio app's pinned base. glibc is never missing from a process that loads a
+/// library: the process already runs on one, and its loader searches its own directory.
+///
+/// The C++ runtime stays, and that is a limit rather than a guarantee: the base's `libstdc++` and
+/// `libgcc_s` still come first for every binary that links them. A binary is served when its own
+/// runtime is no newer than the base's and its glibc no older than the base's, which is the shape
+/// of an engine rolled ahead of an app's pin. The reverse is not served: a binary that needs a
+/// newer `GLIBCXX` than the base carries, or that runs on an older glibc than the base runtime was
+/// built against.
+/// The `deb:` launcher's own `makeWrapper --prefix LD_LIBRARY_PATH` prepends the app's closure ahead
+/// of these directories. It is reserved against an untrusted
 /// `[env]` (a code-load path, denylisted alongside `LD_*`); the `ALSA_*` keys are data paths (a
 /// project re-pointing them only self-DoSes its own cage's audio); a trusted config overriding any of
 /// them only breaks its own cage's audio.
-pub(crate) fn env(layer: Option<&AudioLayer>, base_lib_dirs: &[PathBuf]) -> Vec<(String, String)> {
+pub(crate) fn env(
+    layer: Option<&AudioLayer>,
+    foreign_lib_paths: &[PathBuf],
+    base_loader: &Path,
+) -> Vec<(String, String)> {
     let mut env = vec![("PULSE_SERVER".to_string(), format!("unix:{CAGE_SOCK}"))];
     if let Some(l) = layer {
-        // LD_LIBRARY_PATH = the provisioned audio client libraries, then the base C++/glibc runtime
-        // (`base_lib_dirs`, the same directories as `NIX_LD_LIBRARY_PATH`). A voice speech-to-text
+        // LD_LIBRARY_PATH = the provisioned audio client libraries, then the base C++ runtime
+        // (`NIX_LD_LIBRARY_PATH`'s directories without glibc's, see above). A voice speech-to-text
         // engine's native library — faster-whisper's ctranslate2, or onnxruntime, both foreign
         // manylinux `.so`s — is `dlopen`ed by the tool's own interpreter, and `dlopen` honors
         // `LD_LIBRARY_PATH` but NOT `NIX_LD_LIBRARY_PATH` (which only nix-ld consults, and only for a
@@ -346,7 +363,11 @@ pub(crate) fn env(layer: Option<&AudioLayer>, base_lib_dirs: &[PathBuf]) -> Vec<
         let ld = l
             .lib_dirs
             .iter()
-            .chain(base_lib_dirs)
+            .chain(
+                foreign_lib_paths
+                    .iter()
+                    .filter(|p| Some(p.as_path()) != base_loader.parent()),
+            )
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
             .join(":");
@@ -500,12 +521,14 @@ mod tests {
         let get = |e: &[(String, String)], k: &str| {
             e.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
         };
+        // The cage's `foreign_lib_paths` and its loader: glibc's directory is the loader's.
         let base = [
             PathBuf::from("/nix/store/eee-glibc-2.42/lib"),
             PathBuf::from("/nix/store/fff-gcc-15.2.0-lib/lib"),
         ];
+        let loader = Path::new("/nix/store/eee-glibc-2.42/lib/ld-linux-x86-64.so.2");
         let layer = sample_layer();
-        let full = env(Some(&layer), &base);
+        let full = env(Some(&layer), &base, loader);
         // The client connects to the fixed cage socket path, not the host's XDG_RUNTIME_DIR.
         assert_eq!(
             get(&full, "PULSE_SERVER").as_deref(),
@@ -513,14 +536,15 @@ mod tests {
         );
         // All three client libraries (native libpulse + ALSA libasound + PortAudio) are on the loader
         // path — the last so `sounddevice`'s `find_library` shim can resolve `libportaudio.so.2` — then
-        // the base C++/glibc runtime, so a voice STT engine's `dlopen`ed native library finds
-        // `libstdc++.so.6` (it is not on NIX_LD_LIBRARY_PATH, which `dlopen` ignores).
+        // the base C++ runtime, so a voice STT engine's `dlopen`ed native library finds
+        // `libstdc++.so.6` (it is not on NIX_LD_LIBRARY_PATH, which `dlopen` ignores). The base glibc
+        // is not: ahead of a nix binary's RUNPATH it made the engine's `mise`, built against a newer
+        // glibc, load the base `libm` and refuse to start.
         assert_eq!(
             get(&full, "LD_LIBRARY_PATH").as_deref(),
             Some(
                 "/nix/store/aaa-libpulseaudio-17.0/lib:/nix/store/bbb-alsa-lib-1.2.16/lib:\
-                 /nix/store/ddd-portaudio-19/lib:/nix/store/eee-glibc-2.42/lib:\
-                 /nix/store/fff-gcc-15.2.0-lib/lib"
+                 /nix/store/ddd-portaudio-19/lib:/nix/store/fff-gcc-15.2.0-lib/lib"
             )
         );
         // ALSA finds its base config and the pulse plugin.
@@ -537,7 +561,7 @@ mod tests {
         // Without a provisioned userspace (best-effort failure), only PULSE_SERVER is set — the socket
         // is still bound, but the app finds no client library and simply has no audio. The base
         // runtime is not added either (there is no audio library for it to support).
-        let bare = env(None, &base);
+        let bare = env(None, &base, loader);
         assert_eq!(
             get(&bare, "PULSE_SERVER").as_deref(),
             Some("unix:/run/sbx-pulse")
@@ -562,7 +586,8 @@ mod tests {
             pyshim: None,
         };
         let base = [PathBuf::from("/nix/store/fff-gcc-15.2.0-lib/lib")];
-        let e = env(Some(&pulse_only), &base);
+        let loader = Path::new("/nix/store/eee-glibc-2.42/lib/ld-linux-x86-64.so.2");
+        let e = env(Some(&pulse_only), &base, loader);
         assert_eq!(
             get(&e, "LD_LIBRARY_PATH").as_deref(),
             Some("/nix/store/aaa-libpulseaudio-17.0/lib:/nix/store/fff-gcc-15.2.0-lib/lib"),

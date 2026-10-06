@@ -2156,12 +2156,14 @@ fn audio_binds(prep: &Prepared, hw: &HardwareLayers) -> GuiWiring {
                         writable: false,
                     });
                 }
-                // Pass the base C++/glibc runtime dirs (the same set as NIX_LD_LIBRARY_PATH) so a
-                // voice speech-to-text engine's `dlopen`ed native library (ctranslate2/onnxruntime)
-                // finds `libstdc++.so.6` — `dlopen` consults LD_LIBRARY_PATH, not NIX_LD_LIBRARY_PATH.
+                // Pass the base runtime dirs (the same set as NIX_LD_LIBRARY_PATH) so a voice
+                // speech-to-text engine's `dlopen`ed native library (ctranslate2/onnxruntime) finds
+                // `libstdc++.so.6` — `dlopen` consults LD_LIBRARY_PATH, not NIX_LD_LIBRARY_PATH. The
+                // loader names the glibc directory `audio::env` leaves out of that set.
                 env.extend(crate::sandbox::audio::env(
                     hw.audio.as_ref(),
                     &prep.userland.foreign_lib_paths,
+                    &prep.userland.base_loader,
                 ));
             }
             // Named from the list that was searched, so a WSL host is not sent to a runtime dir its

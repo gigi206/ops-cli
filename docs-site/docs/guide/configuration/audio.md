@@ -59,6 +59,12 @@ point ALSA at them). An ALSA `default` capture/playback is then transparently ro
 PulseAudio socket, the same mechanism a desktop uses to let ALSA apps reach PipeWire. `libasound`
 itself is provisioned too, for a CLI binary that does not carry its own.
 
+The base C++ runtime (`libstdc++`) follows these libraries on `LD_LIBRARY_PATH`, so a voice
+engine's `dlopen`ed native library (ctranslate2, onnxruntime) finds it. The base glibc does not:
+that path is searched ahead of a nix binary's own `RUNPATH`, and a binary built against a newer
+glibc, such as the mise an `sbx upgrade` rolled forward, would load the older one and refuse to
+start.
+
 Everything is hermetic (the same pinned nixpkgs as the app, no host library path). The socket bind
 and `PULSE_SERVER` are firm; the client libraries and the ALSA shim are **best-effort**: if they
 cannot be provisioned (no network on a first launch), the app still runs, it simply finds no audio
