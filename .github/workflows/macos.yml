@@ -129,6 +129,24 @@ jobs:
           # gives up still leaves the step below the time to read the guest.
           limactl start --tty=false --timeout=30m sbx-ci
 
+      - name: Let nix ask GitHub as this run
+        # The first launch resolves the nixpkgs channel through GitHub's API, and an anonymous
+        # request is counted against the hosted runner's shared address: once that quota is spent,
+        # the launch fails on a 403 that says nothing about the Mac. The run's own token is counted
+        # against this repository instead. It is written to the guest user's nix configuration,
+        # which the bundled nix reads and the cage never sees (the guest home is absent from it),
+        # and it crosses into the guest on standard input rather than on a command line.
+        env:
+          NIX_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ -n "${NIX_GITHUB_TOKEN:-}" ] || { echo "the run has no token to hand to nix"; exit 1; }
+          printf 'access-tokens = github.com=%s\n' "$NIX_GITHUB_TOKEN" \
+            | limactl shell --workdir / sbx-ci sh -c \
+                'umask 077 && mkdir -p "$HOME/.config/nix" && cat > "$HOME/.config/nix/nix.conf"'
+          limactl shell --workdir / sbx-ci sh -c 'test -s "$HOME/.config/nix/nix.conf"' \
+            || { echo "the token did not reach the guest's nix configuration"; exit 1; }
+
       - name: The preflight must pass inside the guest
         run: |
           set -uo pipefail
