@@ -184,11 +184,6 @@ impl Judge {
         // would hit the resolver each time (and any hiccup fails a fetch). A short-TTL cache
         // resolves each host once and reuses it: `[network] dns_cache_ttl`, where `0` disables the
         // cache and an unset field takes the named default.
-        let resolve = caching_resolver(
-            policy
-                .dns_cache_ttl()
-                .unwrap_or(crate::allowlist::DEFAULT_DNS_CACHE_TTL),
-        );
         // Twice the proxy's own connection bound: a connection of an honest proxy asks one question
         // at a time, and an HTTP/2 tunnel two (a stream's check beside another's connection), so an
         // honest proxy never meets this bound.
@@ -196,6 +191,14 @@ impl Judge {
             .max_connections()
             .unwrap_or(crate::allowlist::DEFAULT_MAX_CONNECTIONS)
             .saturating_mul(2);
+        // The same bound on names in flight: one question asks for at most one name, so an honest
+        // proxy never has more lookups running than questions being answered.
+        let resolve = caching_resolver(
+            policy
+                .dns_cache_ttl()
+                .unwrap_or(crate::allowlist::DEFAULT_DNS_CACHE_TTL),
+            cap,
+        );
         Ok(Judge {
             policy,
             overlay: RwLock::new((0, Arc::new(Overlay::default()))),

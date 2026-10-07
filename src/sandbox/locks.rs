@@ -20,10 +20,10 @@
 //! **A lock degrades when what it guards is handed back out for reuse** — a pooled upstream
 //! connection, a cached resolution. There, redoing the work beats reusing something a panic touched
 //! mid-flight, and the caller already has a path for "not available". Those sites take `.ok()`
-//! rather than these helpers, and keep it: `proxy/pool.rs` and `proxy/dns.rs`. Named rather than
+//! rather than these helpers, and keep it: `proxy/pool.rs` and the resolution cache in `proxy/dns.rs`. Named rather than
 //! linked because both are private to the proxy, so a doc link from here would resolve to nothing.
 //!
-//! Three sites recover on neither argument, and each says so where it lives, because a lock that
+//! Four sites recover on neither argument, and each says so where it lives, because a lock that
 //! guards a decision rather than data owes that argument in full at its own definition and does not
 //! inherit one from here. `ProcOverlay` in `sandbox/proc_enforce/overlay.rs` and `ManualRules` in
 //! `sandbox/control` are the live `--session` exec and egress rule overlays: **live policy**, which
@@ -32,7 +32,11 @@
 //! or the thread that decides a request — removes the policy entirely rather than weakening it. The
 //! third is `Confirmer`'s prompt gate in `sandbox/sshagent.rs`, which guards no data at all: it
 //! serialises askpass dialogs so a burst of requests cannot open one window per connection. A
-//! prompt thread that panicked must not leave a broker that can never confirm again.
+//! prompt thread that panicked must not leave a broker that can never confirm again. The fourth is
+//! the table of name lookups in flight in `proxy/dns.rs`, beside the cache that degrades: it guards
+//! coordination rather than a reusable result, its mutations are single calls, and a table that
+//! refused to hand itself out would leave every caller of every name waiting for an answer that
+//! cannot arrive.
 //!
 //! The line between the two cases above is what the data is *for*, not what type it has. A record whose reader
 //! would act on it as if nothing had happened is the case to look at twice: recovery must not turn

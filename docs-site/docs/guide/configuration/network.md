@@ -220,6 +220,14 @@ on the screen rather than something you have to know.
 (There is no proxy-level retry: the client, `nix`/`git`/`curl`, already retries the whole request,
 which re-triggers resolution, so a retry here would be redundant.)
 
+A lookup the host's resolver does not answer is given up on after 10 seconds, and the connection
+that asked is refused. Requests for a name already being looked up wait for that lookup rather than
+starting another, and no more names are looked up at once than twice `max_connections`: past that,
+a new name is refused straight away, so a host resolver that hangs costs a bounded number of
+threads however many names the cage invents. Case and trailing dots do not make a different name,
+and a host name over 253 bytes, or one carrying whitespace or a control character, is refused
+without being looked up.
+
 ```toml
 [network]
 mode = "deny"

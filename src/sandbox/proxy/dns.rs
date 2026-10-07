@@ -5,10 +5,13 @@
 //! and wrapped in a small cache so a proxy fronting a long `nix`/flake build does not re-resolve the
 //! same host thousands of times.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+use crate::sandbox::locks::locked;
 
 /// A host name resolver, injectable so tests can map a name to a fixed address deterministically.
 pub(super) type Resolver = Box<dyn Fn(&str) -> io::Result<Vec<IpAddr>> + Send + Sync>;
@@ -34,42 +37,183 @@ fn default_resolve(host: &str) -> io::Result<Vec<IpAddr>> {
 /// at all. The proxy is what the cage waits on, so that number becomes the cage's.
 const RESOLVE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// [`default_resolve`] under [`RESOLVE_DEADLINE`], so a slow host resolver cannot hold a connection
-/// thread for as long as it likes.
+/// What a lookup leaves for the callers waiting on it. `io::Error` is not `Clone` and one answer is
+/// read by every caller that joined the lookup, so an error travels as its kind and its text.
+type Answer = Result<Vec<IpAddr>, (io::ErrorKind, String)>;
+
+/// One name being looked up, shared by every caller that asks for it while the lookup runs.
+type InFlight = Arc<(Mutex<Option<Answer>>, Condvar)>;
+
+/// Name lookups under a deadline: one per name at a time, and at most `cap` at once.
 ///
-/// `getaddrinfo` is a blocking call with no cancellation and no timeout of its own, and it runs on
-/// the connection's thread. A resolver that accepts queries and never answers therefore pinned one
-/// thread per name for its whole libc timeout, and on the HTTP/2 plane that thread is the tunnel's
-/// runtime — so every stream multiplexed onto that connection waited for a name only one of them
-/// had asked for.
+/// `getaddrinfo` is a blocking call with no cancellation and no timeout of its own. Run on the
+/// connection's thread, a resolver that accepts queries and never answers pinned that thread for its
+/// whole libc timeout, and on the HTTP/2 plane that thread is the tunnel's runtime — so every stream
+/// multiplexed onto it waited for a name only one of them had asked for. Each lookup therefore runs
+/// on a thread of its own, and the caller waits at most `deadline` for it.
 ///
-/// **Two things this does not do, both of them consequences of that missing cancellation.** The
-/// lookup is not stopped: the thread carrying it stays until libc returns, and what the deadline
-/// frees is the *caller*, not the work. And those threads accumulate while that lasts: a name is
-/// looked up on the connection that asked for it, so their number is the connection cap **per libc
-/// timeout window** rather than the connection cap outright — a failed lookup is deliberately not
-/// cached, so a client that retries asks again and starts another one. What this replaces is worse
-/// in kind rather than in degree: the same threads were held with no bound at all, and on the
-/// HTTP/2 plane one of them is the tunnel's whole runtime.
+/// The deadline frees the *caller*, not the work: the lookup thread stays until libc returns. Two
+/// bounds keep those threads from piling up while a resolver hangs. A caller asking for a name
+/// already being looked up joins that lookup instead of starting another, so a client that retries
+/// a failing name costs no new thread. And no more than `cap` names are in flight at once: past it a
+/// lookup is refused at once rather than queued, which turns a flood of invented names into refused
+/// connections instead of a thread per name.
 ///
-/// The channel is bounded at one rather than rendezvous-synchronised, so the lookup that finishes
-/// after its caller walked away deposits its answer and ends instead of blocking forever on a
-/// receiver nobody holds.
-fn deadlined_resolve(host: &str) -> io::Result<Vec<IpAddr>> {
-    let (answer, wait) = std::sync::mpsc::sync_channel(1);
-    let name = host.to_string();
-    std::thread::spawn(move || {
-        let _ = answer.send(default_resolve(&name));
-    });
-    wait.recv_timeout(RESOLVE_DEADLINE).unwrap_or_else(|_| {
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "resolving `{host}` took longer than {}s",
-                RESOLVE_DEADLINE.as_secs()
-            ),
-        ))
-    })
+/// The table and the answer slots recover from a poisoned lock ([`locked`]): their mutations are
+/// single calls with nothing that can panic under them, and a lookup that refused to hand out its
+/// table would leave every caller of every name waiting for an answer that cannot arrive.
+struct Lookups<F> {
+    resolve: Arc<F>,
+    in_flight: Arc<Mutex<HashMap<String, InFlight>>>,
+    cap: usize,
+    deadline: Duration,
+    /// How a lookup gets its thread: [`spawn_lookup`], replaced in tests to stand for a host that
+    /// has no thread to give.
+    spawn: fn(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+}
+
+/// Start one lookup on a thread of its own.
+fn spawn_lookup(work: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("sbx-dns".to_string())
+        .spawn(work)
+        .map(drop)
+}
+
+impl<F> Lookups<F>
+where
+    F: Fn(&str) -> io::Result<Vec<IpAddr>> + Send + Sync + 'static,
+{
+    fn new(resolve: F, cap: usize, deadline: Duration) -> Self {
+        Lookups {
+            resolve: Arc::new(resolve),
+            in_flight: Arc::default(),
+            cap,
+            deadline,
+            spawn: spawn_lookup,
+        }
+    }
+
+    /// Resolve `host`, joining the lookup already in flight for it if there is one.
+    fn lookup(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+        let slot = {
+            let mut table = locked(&self.in_flight);
+            match table.get(host) {
+                Some(slot) => Arc::clone(slot),
+                None => {
+                    if table.len() >= self.cap {
+                        return Err(io::Error::other(format!(
+                            "resolving `{host}` was refused: {} lookups are already in flight",
+                            self.cap
+                        )));
+                    }
+                    let slot = InFlight::default();
+                    let (name, mine, in_flight) = (
+                        host.to_string(),
+                        Arc::clone(&slot),
+                        Arc::clone(&self.in_flight),
+                    );
+                    let resolve = Arc::clone(&self.resolve);
+                    // The table stays locked across the spawn, so the lookup cannot settle and
+                    // remove its entry before the entry is there. Its `Settle` is built inside the
+                    // thread, never before: a spawn that fails drops the closure on this thread,
+                    // which holds the table, and a `Settle` dropped here would lock it again.
+                    (self.spawn)(Box::new(move || {
+                        let mut settle = Settle {
+                            name,
+                            slot: mine,
+                            in_flight,
+                            answer: None,
+                        };
+                        settle.answer = Some(match resolve(&settle.name) {
+                            Ok(ips) if ips.is_empty() => Err((
+                                io::ErrorKind::NotFound,
+                                format!("`{}` resolved to no address", settle.name),
+                            )),
+                            Ok(ips) => Ok(ips),
+                            Err(e) => Err((e.kind(), e.to_string())),
+                        });
+                    }))
+                    .map_err(|e| {
+                        io::Error::new(
+                            e.kind(),
+                            format!("resolving `{host}` could not start a lookup: {e}"),
+                        )
+                    })?;
+                    table.insert(host.to_string(), Arc::clone(&slot));
+                    slot
+                }
+            }
+        };
+        let (answer, ready) = &*slot;
+        let (answer, _) = ready
+            .wait_timeout_while(locked(answer), self.deadline, |a| a.is_none())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*answer {
+            Some(Ok(ips)) => Ok(ips.clone()),
+            Some(Err((kind, text))) => Err(io::Error::new(*kind, text.clone())),
+            None => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "resolving `{host}` took longer than {}s",
+                    self.deadline.as_secs()
+                ),
+            )),
+        }
+    }
+}
+
+/// The end of one lookup, run when its thread ends however it ends: the answer is published to the
+/// callers waiting on it and the name leaves the table. A lookup that panicked publishes an error
+/// rather than leaving its name in flight for good, where every later caller would wait out the
+/// deadline on it and it would hold one of the `cap` places forever.
+struct Settle {
+    name: String,
+    slot: InFlight,
+    in_flight: Arc<Mutex<HashMap<String, InFlight>>>,
+    answer: Option<Answer>,
+}
+
+impl Drop for Settle {
+    fn drop(&mut self) {
+        let answer = self.answer.take().unwrap_or_else(|| {
+            Err((
+                io::ErrorKind::Other,
+                format!("the lookup for `{}` ended without an answer", self.name),
+            ))
+        });
+        let (stored, ready) = &*self.slot;
+        *locked(stored) = Some(answer);
+        ready.notify_all();
+        let mut table = locked(&self.in_flight);
+        if table
+            .get(&self.name)
+            .is_some_and(|s| Arc::ptr_eq(s, &self.slot))
+        {
+            table.remove(&self.name);
+        }
+    }
+}
+
+/// The form a host takes as a lookup and a cache key: lowercase and without trailing dots, so
+/// `Example.COM.` and `example.com` are one entry. The same spelling `canonical_host` in the
+/// allowlist gives the host the proxy connects to, so a name that reaches here through the proxy
+/// is already in it. Refused when it
+/// cannot be a name at all — empty, longer than the 253 bytes DNS allows, or carrying whitespace or
+/// a control byte — before it reaches `getaddrinfo` or an error message.
+fn lookup_name(host: &str) -> io::Result<String> {
+    let name = host.trim_end_matches('.');
+    if name.is_empty()
+        || name.len() > 253
+        || name.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a host name a lookup can take (empty, over 253 bytes, or with whitespace or a \
+             control character)",
+        ));
+    }
+    Ok(name.to_ascii_lowercase())
 }
 
 /// A [`Resolver`] wrapping [`default_resolve`] with a short-TTL cache — the resolution resilience a
@@ -80,9 +224,11 @@ fn deadlined_resolve(host: &str) -> io::Result<Vec<IpAddr>> {
 /// are cached (a failure is never cached, so the client's own retry re-resolves). A transient failure
 /// is not retried here: the client (nix/git/curl) already retries the whole request, which re-triggers
 /// this resolution, so a proxy-level retry would be redundant. It holds at most
-/// [`DNS_CACHE_CAP`] hosts.
-pub(super) fn caching_resolver(ttl: Duration) -> Resolver {
-    cached_resolver(ttl, deadlined_resolve)
+/// [`DNS_CACHE_CAP`] hosts. Each lookup runs under [`RESOLVE_DEADLINE`], joined by every caller of
+/// the same name, with at most `cap` names in flight at once ([`Lookups`]).
+pub(super) fn caching_resolver(ttl: Duration, cap: usize) -> Resolver {
+    let lookups = Lookups::new(default_resolve, cap, RESOLVE_DEADLINE);
+    cached_resolver(ttl, move |host| lookups.lookup(host))
 }
 
 /// The most hosts cached at once. Past it a host is resolved per request but not stored, so a name
@@ -97,18 +243,19 @@ pub(super) const DNS_CACHE_CAP: usize = super::ca::LEAF_CACHE_CAP;
 
 /// The cache core of [`caching_resolver`], parameterised by the inner resolver so its behaviour is
 /// unit-testable without real DNS. Only a successful, non-empty resolution is cached; `ttl == 0`
-/// disables the cache (resolve every request); any error propagates unchanged.
+/// disables the cache (resolve every request); any error propagates unchanged. The host is put in
+/// its [`lookup_name`] form first, for the lookup and the key alike.
 fn cached_resolver<F>(ttl: Duration, inner: F) -> Resolver
 where
     F: Fn(&str) -> io::Result<Vec<IpAddr>> + Send + Sync + 'static,
 {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
     use std::time::Instant;
     // host name -> (resolved addresses, when they were resolved)
     type DnsCache = Mutex<HashMap<String, (Vec<IpAddr>, Instant)>>;
     let cache: Arc<DnsCache> = Arc::new(Mutex::new(HashMap::new()));
     Box::new(move |host: &str| {
+        let host = lookup_name(host)?;
+        let host = host.as_str();
         if !ttl.is_zero()
             && let Ok(map) = cache.lock()
             && let Some((ips, at)) = map.get(host)
@@ -241,6 +388,237 @@ mod tests {
         // a different host is a separate cache entry
         r("pypi.org").unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A resolver held shut until the test opens it, counting how many lookups it was asked for and
+    /// signalling each one as it starts.
+    struct Gate {
+        open: Arc<(Mutex<bool>, Condvar)>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        started: std::sync::mpsc::Receiver<String>,
+    }
+
+    fn gated(
+        answer: Vec<IpAddr>,
+    ) -> (
+        Gate,
+        impl Fn(&str) -> io::Result<Vec<IpAddr>> + Send + Sync + 'static,
+    ) {
+        let open: Arc<(Mutex<bool>, Condvar)> = Arc::default();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tell, started) = std::sync::mpsc::channel();
+        let tell = Mutex::new(tell);
+        let (o, c) = (Arc::clone(&open), Arc::clone(&calls));
+        let resolve = move |host: &str| {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = locked(&tell).send(host.to_string());
+            let (gate, opened) = &*o;
+            let _held = opened
+                .wait_while(locked(gate), |open| !*open)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Ok(answer.clone())
+        };
+        (
+            Gate {
+                open,
+                calls,
+                started,
+            },
+            resolve,
+        )
+    }
+
+    impl Gate {
+        fn release(&self) {
+            let (gate, opened) = &*self.open;
+            *locked(gate) = true;
+            opened.notify_all();
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn callers_of_one_name_share_one_lookup() {
+        let (gate, resolve) = gated(vec![IpAddr::from([1, 2, 3, 4])]);
+        let lookups = Arc::new(Lookups::new(resolve, 8, Duration::from_secs(10)));
+        let first = {
+            let l = Arc::clone(&lookups);
+            std::thread::spawn(move || l.lookup("a.test"))
+        };
+        gate.started.recv().unwrap();
+        let second = {
+            let l = Arc::clone(&lookups);
+            std::thread::spawn(move || l.lookup("a.test"))
+        };
+        // Wait until the second caller holds the in-flight slot too: the table's entry, the lookup's
+        // own end and the two callers make four holders.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while locked(&lookups.in_flight)
+            .get("a.test")
+            .is_none_or(|slot| Arc::strong_count(slot) < 4)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second caller never joined"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        gate.release();
+        assert_eq!(
+            first.join().unwrap().unwrap(),
+            vec![IpAddr::from([1, 2, 3, 4])]
+        );
+        assert_eq!(
+            second.join().unwrap().unwrap(),
+            vec![IpAddr::from([1, 2, 3, 4])]
+        );
+        assert_eq!(
+            gate.calls(),
+            1,
+            "two callers of one name started two lookups"
+        );
+    }
+
+    #[test]
+    fn a_caller_past_the_deadline_leaves_and_a_retry_joins_the_hanging_lookup() {
+        let (gate, resolve) = gated(vec![IpAddr::from([1, 2, 3, 4])]);
+        let lookups = Lookups::new(resolve, 8, Duration::from_millis(50));
+        let late = lookups.lookup("hang.test").unwrap_err();
+        assert_eq!(late.kind(), io::ErrorKind::TimedOut, "{late}");
+        let again = lookups.lookup("hang.test").unwrap_err();
+        assert_eq!(again.kind(), io::ErrorKind::TimedOut, "{again}");
+        assert_eq!(
+            gate.calls(),
+            1,
+            "a retry of a hanging name started another lookup"
+        );
+        gate.release();
+    }
+
+    #[test]
+    fn names_past_the_cap_are_refused_at_once_instead_of_each_taking_a_thread() {
+        let (gate, resolve) = gated(vec![IpAddr::from([1, 2, 3, 4])]);
+        let lookups = Arc::new(Lookups::new(resolve, 1, Duration::from_secs(10)));
+        let held = {
+            let l = Arc::clone(&lookups);
+            std::thread::spawn(move || l.lookup("one.test"))
+        };
+        gate.started.recv().unwrap();
+        let started = std::time::Instant::now();
+        let refused = lookups.lookup("two.test").unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a name past the cap waited instead of being refused: {refused}"
+        );
+        assert_eq!(refused.kind(), io::ErrorKind::Other, "{refused}");
+        assert_eq!(gate.calls(), 1);
+        gate.release();
+        held.join().unwrap().unwrap();
+        // Settled, the place is free again.
+        lookups.lookup("two.test").unwrap();
+        assert_eq!(gate.calls(), 2);
+    }
+
+    #[test]
+    fn a_lookup_that_panics_answers_an_error_and_frees_its_name() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let lookups = Lookups::new(
+            move |_: &str| -> io::Result<Vec<IpAddr>> {
+                if c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    panic!("resolver failure");
+                }
+                Ok(vec![IpAddr::from([1, 2, 3, 4])])
+            },
+            1,
+            Duration::from_secs(10),
+        );
+        let failed = lookups.lookup("p.test").unwrap_err();
+        assert_eq!(failed.kind(), io::ErrorKind::Other, "{failed}");
+        // Neither the name nor the cap's one place is held by the dead lookup.
+        assert_eq!(
+            lookups.lookup("p.test").unwrap(),
+            vec![IpAddr::from([1, 2, 3, 4])]
+        );
+    }
+
+    #[test]
+    fn a_lookup_with_no_thread_to_run_on_answers_an_error_and_wedges_nothing() {
+        // A failed spawn drops the closure on the caller's thread, which holds the table — the
+        // way std's own spawn does when `pthread_create` refuses.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let mut lookups = Lookups::new(
+            move |_: &str| {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![IpAddr::from([1, 2, 3, 4])])
+            },
+            8,
+            Duration::from_secs(10),
+        );
+        lookups.spawn = |work| {
+            drop(work);
+            Err(io::Error::other("no thread to give"))
+        };
+        let lookups = Arc::new(lookups);
+        for attempt in 0..2 {
+            let (tell, told) = std::sync::mpsc::channel();
+            let l = Arc::clone(&lookups);
+            std::thread::spawn(move || {
+                let _ = tell.send(l.lookup("t.test").map_err(|e| e.to_string()));
+            });
+            let answer = told
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("attempt {attempt}: the lookup hung"));
+            assert!(answer.is_err(), "attempt {attempt}: {answer:?}");
+        }
+        assert!(
+            locked(&lookups.in_flight).is_empty(),
+            "a failed spawn left its name in flight"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_lookup_with_no_address_is_an_error_not_an_empty_success() {
+        let lookups = Lookups::new(|_: &str| Ok(Vec::new()), 8, Duration::from_secs(10));
+        let empty = lookups.lookup("nothing.test").unwrap_err();
+        assert_eq!(empty.kind(), io::ErrorKind::NotFound, "{empty}");
+    }
+
+    #[test]
+    fn one_name_in_any_spelling_is_one_cache_entry_and_a_non_name_is_never_looked_up() {
+        use std::sync::atomic::Ordering;
+        let (r, calls) = counting_resolver(Duration::from_secs(60));
+        for spelling in [
+            "example.com",
+            "Example.COM",
+            "example.com.",
+            "example.com..",
+        ] {
+            r(spelling).unwrap();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one name cached under three keys"
+        );
+        let long = "a".repeat(254);
+        for bad in ["", ".", "a b.test", "a\nb.test", long.as_str()] {
+            let refused = r(bad).unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a non-name reached the resolver"
+        );
+        // An address literal is a name a lookup takes, IPv6 included.
+        r("::1").unwrap();
+        r("127.0.0.1").unwrap();
     }
 
     #[test]
