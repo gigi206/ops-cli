@@ -3930,6 +3930,44 @@ fn bundle_export_writes_the_same_file_through_the_flag_as_through_a_redirect() {
 }
 
 #[test]
+fn an_install_step_that_names_no_program_is_dropped_with_a_note() {
+    // Left in, it would put an empty word between two `&&`s, and bash refuses the whole start-up
+    // script as a syntax error before the first step runs.
+    let fx = Project::new("cfg");
+    fx.write_bundle("empty", "provision = []\n");
+    fx.write_bundle("blank", "provision = [\"\"]\n");
+    fx.write_bundle("real", "provision = [\"bash\", \"-c\", \"real-step\"]\n");
+    fx.write_profile(
+        "builder",
+        r#"
+cmd = "build"
+use = ["empty", "blank", "real"]
+[network]
+mode = "deny"
+"#,
+    );
+    let out = fx.run(&["config", "show", "--app", "builder", "--json"]);
+    assert!(out.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let steps: Vec<&str> = doc["provisions"]
+        .as_array()
+        .expect("provisions in the view")
+        .iter()
+        .map(|s| s["bundle"].as_str().unwrap())
+        .collect();
+    assert_eq!(steps, vec!["real"], "{doc:#}");
+    let notes = doc["notes"].to_string();
+    for bundle in ["empty", "blank"] {
+        assert!(
+            notes.contains(&format!(
+                "bundle `{bundle}`: ignoring `provision` — it names no program"
+            )),
+            "the dropped step of `{bundle}` must be said: {doc:#}"
+        );
+    }
+}
+
+#[test]
 fn install_steps_arrive_in_use_order_and_name_the_bundle_that_declared_them() {
     // A `provision` is not merged like a key: two bundles each finish their own tool, so both are
     // carried, in the order the app named them. The bundle travels with each step because

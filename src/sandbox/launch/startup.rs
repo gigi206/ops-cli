@@ -45,11 +45,12 @@ fn service_log_path(name: &str) -> String {
 ///
 /// The expansion is the one substitution a service's argv gets, and it exists because a service is
 /// declared where the home's path is not knowable — `~/chroma-data` is the only way to name a
-/// directory under a home whose location sbx chooses. Everything else is quoted verbatim: a `$VAR`
+/// directory under a home whose location sbx chooses. It falls back to `/tmp` as the service's log
+/// does ([`service_log_path`]), so an unset `HOME` never turns `~/x` into `/x`. Everything else is quoted verbatim: a `$VAR`
 /// stays four characters, because the argv is data and a shell that re-read it would find syntax.
 fn service_arg(arg: &str) -> String {
     match arg.strip_prefix("~/") {
-        Some(rest) => format!("\"${{HOME}}\"/{}", shell_quote(rest)),
+        Some(rest) => format!("\"${{HOME:-/tmp}}\"/{}", shell_quote(rest)),
         None => shell_quote(arg),
     }
 }
@@ -75,23 +76,28 @@ fn service_lines(name: &str, svc: &crate::config::ServiceSpec) -> String {
     let log = service_log_path(name);
     out.push_str(&format!("( {argv} ) >>{log} 2>&1 </dev/null &\n"));
     if let Some(ready) = svc.ready {
-        // A tenth-of-the-budget poll on bash's own `/dev/tcp`, so the wait needs no tool the base
-        // userland might not carry. The connection is opened in a subshell and dropped immediately:
-        // the question is whether anything accepts, and a fd left open in the launch would outlive
-        // the answer. On expiry the launch goes on — a gate that failed here would turn a slow
-        // auxiliary process into a broken app, which is the outcome it exists to avoid.
+        // A poll every half second on bash's own `/dev/tcp`, counted by bash's own arithmetic loop,
+        // so the wait needs no tool beyond the `sleep` the base userland's coreutils carries — and
+        // a long budget costs a counter, not a list of every attempt held in memory. The connection
+        // is opened in a subshell and dropped immediately: the question is whether anything
+        // accepts, and a fd left open in the launch would outlive the answer. On expiry the launch
+        // goes on — a gate that failed here would turn a slow auxiliary process into a broken app,
+        // which is the outcome it exists to avoid.
         let attempts = ready.timeout.as_millis().div_ceil(500).max(1);
+        // The budget the loop actually waits, so the expiry message names it rather than a rounded
+        // `timeout`: 1.5 s is three polls, and reads as `1.5s`.
+        let budget = Duration::from_millis(u64::try_from(attempts * 500).unwrap_or(u64::MAX));
         let port = ready.tcp;
         out.push_str(&format!(
             "sbx_ready=0\n\
-             for _ in $(seq 1 {attempts}); do\n\
+             for ((sbx_try = 0; sbx_try < {attempts}; sbx_try++)); do\n\
              \x20 if ( exec 3<>/dev/tcp/127.0.0.1/{port} ) 2>/dev/null; then sbx_ready=1; break; fi\n\
              \x20 sleep 0.5\n\
              done\n\
              if [ \"$sbx_ready\" != 1 ]; then\n\
              \x20 echo \"sbx: service {name} did not answer on port {port} within {}s — starting anyway; see {log}\" >&2\n\
              fi\n",
-            ready.timeout.as_secs().max(1)
+            budget.as_secs_f64()
         ));
     }
     out

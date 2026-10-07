@@ -67,7 +67,7 @@ gateway = ["hermes", "gateway", "run"]
 The argv is never a shell line: each element is one argument, whatever it contains, and a `$VAR`
 inside one stays the characters it was written as. The single exception is a **leading `~/`**, which
 is expanded against the cage's home, because a service is declared where that home's path is not
-knowable.
+knowable (`/tmp` if the cage has no `HOME`, the same fallback as the service's log).
 
 The name is also where the service's output goes: `~/.sbx-service-<name>.log` in the cage's isolated
 home. A service shares its terminal with the application, and a chatty daemon would bury the
@@ -152,7 +152,9 @@ connection on the cage's loopback:
 ready = { tcp = 8100, timeout = "30s" }
 ```
 
-`timeout` is optional and defaults to fifteen seconds. When it expires the launch **starts the
+`timeout` is optional and defaults to fifteen seconds. The gate tries the port every half second, so
+the budget it waits is the timeout rounded up to the next half second, and that is the figure its
+message names. When it expires the launch **starts the
 application anyway** and says which service it did not see come up. That direction is deliberate: a
 gate that failed the launch would turn a slow auxiliary process into a broken application, and the
 application is the thing you asked for. If it needs the service and the service is late, the

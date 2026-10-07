@@ -92,6 +92,9 @@ packages  = { demo = "mise:npm:demo" }
 provision = ["bash", "-c", "npm rebuild demo-addon"]
 ```
 
+A `provision` that names no program (`[]`, or an empty first element) is ignored with a
+note, the way an empty [`[service]`](service) command is.
+
 What using it grants is stated where the decision is made: `sbx bundle` counts it in
 the summary and prints the command verbatim when a bundle is named,
 `sbx bundle import` says an install step arrived alongside the egress and credential

@@ -1649,11 +1649,21 @@ fn expand_bundles(
             // An install step does not merge like a key: two bundles each finish their own tool, so
             // both run, in the order the app named them. Collected here rather than in `acc`, which
             // is a `RawBundle` and could hold only the last one.
+            // A step that names no program would leave an empty word between two `&&`s, which
+            // bash refuses as a syntax error before the first step runs: it is dropped alone, as
+            // an empty `[service]` command is.
             if let Some(provision) = bundle.provision.take() {
-                provisions.push(crate::config::BundleProvision {
-                    bundle: name.clone(),
-                    argv: provision.into_argv(),
-                });
+                let argv = provision.into_argv();
+                if argv.first().is_none_or(String::is_empty) {
+                    notes.push(format!(
+                        "bundle `{name}`: ignoring `provision` — it names no program to run"
+                    ));
+                } else {
+                    provisions.push(crate::config::BundleProvision {
+                        bundle: name.clone(),
+                        argv,
+                    });
+                }
             }
             absorb_bundle(&mut acc, bundle, notes);
         }

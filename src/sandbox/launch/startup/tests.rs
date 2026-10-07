@@ -151,7 +151,7 @@ fn a_service_argument_is_data_except_a_leading_home_tilde() {
         .to_string_lossy()
         .to_string();
     assert!(
-        script.contains("'--path' \"${HOME}\"/'chroma-data'"),
+        script.contains("'--path' \"${HOME:-/tmp}\"/'chroma-data'"),
         "a leading `~/` becomes the cage's home, the rest still one quoted word: {script}"
     );
     assert!(
@@ -308,7 +308,7 @@ fn a_readiness_gate_waits_for_the_port_then_starts_the_app_regardless() {
         .to_string_lossy()
         .to_string();
     assert!(
-        script.contains("for _ in $(seq 1 30); do"),
+        script.contains("for ((sbx_try = 0; sbx_try < 30; sbx_try++)); do"),
         "the wait polls twice a second for the declared budget: {script}"
     );
     assert!(
@@ -323,4 +323,72 @@ fn a_readiness_gate_waits_for_the_port_then_starts_the_app_regardless() {
         script.ends_with("exec \"$@\"\n"),
         "the command still runs after an expired gate: {script}"
     );
+}
+
+#[test]
+fn an_expired_readiness_gate_runs_in_bash_and_names_the_budget_it_waited() {
+    // The loop is bash's own arithmetic `for`, so it needs no `seq`, and a long budget is a
+    // counter rather than a list. Run for real: a port nothing listens on, a 1.5 s budget.
+    let (_held, port) = refusing_port();
+    let mut services = std::collections::BTreeMap::new();
+    services.insert(
+        "slow".to_string(),
+        crate::config::ServiceSpec {
+            argv: vec!["true".into()],
+            enable: Vec::new(),
+            ready: Some(crate::config::ServiceReady {
+                tcp: port,
+                timeout: std::time::Duration::from_millis(1500),
+            }),
+        },
+    );
+    let home = crate::testutil::TmpDir::new();
+    let argv = compose_startup_cmd(&[], &services, &[], vec![OsString::from("true")]);
+    let started = std::time::Instant::now();
+    let out = std::process::Command::new("bash")
+        .args(&argv[1..])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .output()
+        .unwrap();
+    let took = started.elapsed();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the command runs after an expired gate: {said}"
+    );
+    assert!(
+        said.contains(&format!("did not answer on port {port} within 1.5s")),
+        "the message names the budget the loop waited: {said}"
+    );
+    assert!(
+        took >= std::time::Duration::from_millis(1400),
+        "the gate polled for its budget, not for no time at all: {took:?}"
+    );
+}
+
+/// A loopback port that refuses every connection for as long as the returned descriptor lives: a
+/// socket bound to it and never listening. Unlike a listener bound and dropped, nothing else in the
+/// test binary can take the port meanwhile and answer the gate.
+fn refusing_port() -> (std::os::fd::OwnedFd, u16) {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain socket calls on a descriptor this function owns; the address structs are
+    // zeroed and sized for `AF_INET`.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+        let owned = std::os::fd::OwnedFd::from_raw_fd(fd);
+        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+        let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        let rc = libc::bind(fd, (&raw const addr).cast(), len);
+        assert_eq!(rc, 0, "bind: {}", std::io::Error::last_os_error());
+        let mut bound: libc::sockaddr_in = std::mem::zeroed();
+        let mut bound_len = len;
+        let rc = libc::getsockname(fd, (&raw mut bound).cast(), &mut bound_len);
+        assert_eq!(rc, 0, "getsockname: {}", std::io::Error::last_os_error());
+        (owned, u16::from_be(bound.sin_port))
+    }
 }
