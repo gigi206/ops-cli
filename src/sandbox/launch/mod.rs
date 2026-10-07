@@ -146,8 +146,9 @@ struct Prepared {
     /// line joins by reading it. It suppresses narration only: no warning, no refusal, and nothing
     /// the cage does is conditioned on it.
     in_batch: bool,
-    /// Whether the cage installs what it declares before running its command: the two mise equip
-    /// lanes and the inline flakes' build. `true` for every launch and every roll; `false` only for
+    /// Whether the cage installs what it declares before running its command: the project's `nix:`
+    /// tools, the two mise equip lanes and the inline flakes' build. `true` for every launch and
+    /// every roll; `false` only for
     /// the cage `sbx upgrade --dry-run` asks mise in, which must report what a home holds without
     /// installing what it lacks. The environment the equip lanes contribute is kept either way, so
     /// the in-cage mise reads the same configuration it would after equipping.
@@ -1378,6 +1379,36 @@ pub(crate) fn effective_lock_target(
             cfg.nixpkgs_global.as_deref(),
         )),
     }
+}
+
+/// Which channel a preparation for this launch identity would pin before anything ran, `None` when
+/// both the base channel and the mise engine already pin the source they ask for.
+///
+/// Resolving either one writes its lock when it finds none for its source: a seed from the global
+/// channel, or a first resolution. `sbx upgrade --dry-run` writes no lock, so it asks this before
+/// it builds a cage, and says the reason instead of building one. Pure file reads: no nix, no
+/// network.
+pub(crate) fn first_channel_pin(
+    layout: &Layout,
+    cwd: &Path,
+    cfg: &crate::config::Resolved,
+    app: Option<&str>,
+) -> Option<&'static str> {
+    let base = effective_lock_target(cwd, layout, cfg, app)
+        .ok()
+        .and_then(|target| target.locked_revision());
+    if base.is_none() {
+        return Some("its base channel");
+    }
+    let engine = crate::store::LockTarget::engine(
+        layout,
+        cfg.mise_engine.as_deref(),
+        cfg.nixpkgs_global.as_deref(),
+    );
+    engine
+        .locked_revision()
+        .is_none()
+        .then_some("the mise engine")
 }
 
 /// Seed (or top up) the project's own writable store with the closure of everything

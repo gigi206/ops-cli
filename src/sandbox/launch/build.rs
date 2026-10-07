@@ -532,7 +532,17 @@ fn provision_tools(prep: &Prepared, runtime: binds::Runtime) -> Result<Provision
     // Provision a trusted project's `nix:` mise tools — the exact-pinned dev toolchain.
     // Their bin dirs go ahead of the native `[packages]` ones, so a project's pinned
     // tool wins over the coarser package layer on a name clash.
-    let tools = mise_tools(prep)?;
+    // A cage that does not equip provisions none of them either: realising a tool, or resolving
+    // one not pinned yet, is the installing it was asked not to do.
+    let tools = if prep.equips {
+        mise_tools(prep)?
+    } else {
+        crate::sandbox::packages::Provisioned {
+            bins: Vec::new(),
+            roots: Vec::new(),
+            warnings: Vec::new(),
+        }
+    };
     for warning in &tools.warnings {
         crate::diag::warn_config(warning);
     }

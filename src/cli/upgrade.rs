@@ -1507,6 +1507,9 @@ fn prebuilt_upgrade_summary(
                 "  {n}{kind}:{url}{r}: {dim}same URL — whether its content changed is only known \
                  by downloading it.{r}"
             ),
+            NotChecked { url, why } => {
+                format!("  {n}{kind}:{url}{r}: {dim}not checked — {why}.{r}")
+            }
             Unpinned { url, source } => format!(
                 "  {n}{kind}:{url}{r}: {dim}not pinned yet — would pin{r} {n}{}{r}{dim}.{r}",
                 sandbox::sanitize(source)
@@ -3580,6 +3583,10 @@ mod tests {
                     url: "github:example/other".into(),
                     source: "https://e/v3/other.deb\u{1b}[2K".into(),
                 },
+                NotChecked {
+                    url: "resolve:demo".into(),
+                    why: "its resolve command's cage would first pin its base channel here".into(),
+                },
             ],
             0,
             &style::Palette::plain(),
@@ -3595,6 +3602,10 @@ mod tests {
         );
         assert!(text.contains(
             "deb:github:example/other: not pinned yet — would pin https://e/v3/other.deb"
+        ));
+        assert!(text.contains(
+            "deb:resolve:demo: not checked — its resolve command's cage would first pin its base \
+             channel here."
         ));
         assert!(
             !text.chars().any(|c| c == '\u{1b}'),

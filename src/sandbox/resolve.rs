@@ -77,11 +77,16 @@ impl UpgradeCage {
     /// whole `PATH` — see [`ResolveCage::bins`] for what is left out and why. Best-effort: `None`
     /// when the host cannot resolve an engine or a sandbox, and the caller then reports each
     /// resolver reference as un-rollable rather than silently frozen.
+    ///
+    /// Under [`crate::sandbox::RollMode::DryRun`] the baseline packages are not provisioned, since
+    /// that can build or download them; a resolve command then has the base tools alone. The caller
+    /// builds no cage at all where resolving the channels would first pin one.
     pub(crate) fn build(
         nix: &Path,
         layout: &Layout,
         project: &Path,
         cfg: &crate::config::Resolved,
+        mode: crate::sandbox::RollMode,
     ) -> Option<Self> {
         let bwrap = crate::store::resolve_bwrap(Some(layout))?.path;
         // The project's channel, never an app's, and the reason is the CAGE rather than the roll.
@@ -107,7 +112,9 @@ impl UpgradeCage {
         // here as it does at launch. Best-effort — the base tools are always present regardless.
         // This is the baseline layer only; `cfg.apps` is not walked and the mise/prebuilt layers are
         // not provisioned, so the set is narrower than a launch's.
-        if let Ok(p) = super::packages::provision(nix, layout, project, &nixpkgs, &cfg.packages) {
+        if mode.applies()
+            && let Ok(p) = super::packages::provision(nix, layout, project, &nixpkgs, &cfg.packages)
+        {
             bins.extend(p.bins);
         }
         Some(UpgradeCage {

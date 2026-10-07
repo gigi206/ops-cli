@@ -59,8 +59,8 @@ itself. Lock writes are atomic (a reader sees old-or-new, never torn).
 
 ### Checking before rolling
 
-`-n, --dry-run` resolves every channel the roll would and writes nothing: no lock is
-rewritten, nothing is installed or downloaded, and no install step runs. It takes the
+`-n, --dry-run` resolves every channel the roll would and writes no lock: nothing
+is installed or downloaded, and no install step runs. It takes the
 same target, `--app` and `--project`, so it answers for exactly the roll it precedes, in
 that roll's words:
 
@@ -100,7 +100,9 @@ computes one. A source that now names another URL (a new GitHub release asset, a
 index entry) is reported with both URLs; a URL that did not move is reported as
 unverified, since the bytes behind a fixed address may still have changed. A
 `<backend>:resolve` command that prints the URL already pinned is reported as unchanged,
-which is the roll's own decision there: it does not fetch that artefact either.
+which is the roll's own decision there: it does not fetch that artefact either. The
+command runs with the base tools only, without the project's own packages, which a dry
+run does not build.
 
 **`mise:` packages are asked in each app's cage**, with the app's egress and environment
 and without its install steps, services or equip. `mise outdated --bump` names where
@@ -112,6 +114,10 @@ An app never launched has nothing installed and is named as such without a cage
 declared since the app's last launch is named as not equipped yet; a tool whose registry
 refused the lookup is named as not checked rather than as current. The cage carries only the
 app's `mise:` packages, so asking it builds and downloads none of the others.
+
+A group, or a resolve command, whose cage would first pin a lock (a channel never resolved
+in this project, an image never unpacked) is named as not checked, since a dry run writes
+no lock.
 
 **What a dry run cannot report, it names.** An install step records no version, so the
 apps that carry one are listed as not checked, and `sbx upgrade provision --dry-run` is
@@ -307,7 +313,7 @@ fails and says to try again in a few minutes.
 
 ```sh
 sbx upgrade                        # roll everything, current directory
-sbx upgrade --dry-run              # what `sbx upgrade` would move, changing nothing
+sbx upgrade --dry-run              # what `sbx upgrade` would move, writing no lock
 sbx upgrade nix                    # just the nixpkgs channel
 sbx upgrade mise                   # the mise engine + tools/packages
 sbx upgrade --app freebuff-desktop # roll one app, whatever it rides

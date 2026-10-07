@@ -60,7 +60,7 @@ it is the table in [What each backend does on upgrade](#what-each-backend-does-o
 
 See [`sbx upgrade`](../cli/upgrade) for the flags (`-a <name>`, `--project <path>`,
 `-n, --dry-run`) and the per-target behavior. `--dry-run` reports what a roll would move
-and changes nothing; [Checking before rolling](../cli/upgrade#checking-before-rolling)
+and writes no lock; [Checking before rolling](../cli/upgrade#checking-before-rolling)
 says what each channel can and cannot report that way.
 
 The three are **decoupled**: `sbx upgrade nix` leaves `mise-engine.lock` untouched, and
@@ -253,7 +253,7 @@ runs on the tree it provisioned; the next launch takes the newer one.
 
 ```sh
 sbx upgrade              # roll everything the current context tracks
-sbx upgrade --dry-run    # what that roll would move, writing nothing
+sbx upgrade --dry-run    # what that roll would move, writing no lock
 sbx upgrade --app kiro   # roll one app, whatever backends it rides
 sbx upgrade nix          # just the nixpkgs channel
 sbx upgrade mise         # the mise engine + this project's mise-managed tools

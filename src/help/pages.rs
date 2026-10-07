@@ -1966,8 +1966,8 @@ pub(super) const PAGES: &[Page] = &[
             Sessions already running keep the sbx they started with until they end. `all` never\n\
             includes `self`, and `self` takes neither `--app` nor `--project`.\n\
             \n\
-            `-n, --dry-run` RESOLVES EVERY CHANNEL THE ROLL WOULD AND WRITES NOTHING: no lock is\n\
-            rewritten and nothing is installed or downloaded. It takes the same target, `--app` and\n\
+            `-n, --dry-run` RESOLVES EVERY CHANNEL THE ROLL WOULD AND WRITES NO LOCK, and nothing\n\
+            is installed or downloaded. It takes the same target, `--app` and\n\
             `--project`, so it answers for exactly the roll it precedes, and it reports in that\n\
             roll's words: `from → to`, what is already current, what would be pinned or pruned.\n\
             What a version means differs by channel. The nixpkgs channel and the mise engine report\n\
@@ -1980,7 +1980,8 @@ pub(super) const PAGES: &[Page] = &[
             that now names another URL is reported with both, and a URL that did not move is\n\
             reported as unverified, since the bytes behind it may still have changed. A resolve\n\
             command that prints the URL already pinned is reported as unchanged, which is the roll's\n\
-            own decision there.\n\
+            own decision there. It runs with the base tools only, without the project's packages,\n\
+            which a dry run does not build.\n\
             \n\
             The `mise:` packages are asked in each app's cage, with its egress and environment and\n\
             without its install steps, services or equip: `mise outdated --bump` names where\n\
@@ -1989,6 +1990,10 @@ pub(super) const PAGES: &[Page] = &[
             install is still announced. An app never launched has nothing installed and is named\n\
             as such without a cage; a tool declared since its last launch is named as not equipped\n\
             yet. That cage carries only the app's `mise:` packages, so it builds none of the others.\n\
+            \n\
+            A group, or a resolve command, whose cage would first pin a lock (a channel never\n\
+            resolved here, an image never unpacked) is named as not checked, since a dry run\n\
+            writes no lock.\n\
             \n\
             What a dry run cannot report it names. An install step records no version, so the apps\n\
             that carry one are listed as not checked, and `provision --dry-run` is refused. The\n\

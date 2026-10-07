@@ -1245,6 +1245,12 @@ pub(crate) enum Upgrade {
         url: String,
         source: String,
     },
+    /// A dry run only: a resolver whose cage is not built, because building it would first pin a
+    /// lock. Not a failure: the roll would pin it and run, and `why` says what it would pin.
+    NotChecked {
+        url: String,
+        why: String,
+    },
 }
 
 /// What one reference resolved to: a URL with its content hash, or, on a dry run that would have
@@ -1275,8 +1281,10 @@ enum Resolution {
 /// pinned keeps that pin's hash rather than fetching the artefact again, so a change of URL is what
 /// makes it look at the bytes at all: content that moves behind an unchanged URL is never seen.
 ///
-/// `cage` is the sandbox resolve commands run in. When it is `None` (the host cannot sandbox), a
-/// resolver reference is reported as failed rather than silently frozen at its current pin.
+/// `cage` is the sandbox resolve commands run in. When it is `None` because the host cannot
+/// sandbox, a resolver reference is reported as failed rather than silently frozen at its current
+/// pin. When it is `None` because a dry run would have had to pin a lock to build it, `unchecked`
+/// carries that reason and the reference is reported as [`Upgrade::NotChecked`].
 ///
 /// Under [`super::RollMode::DryRun`] nothing is downloaded and the lock is not written. A locator
 /// resolves to its URL only, so a URL that moved is reported as [`Upgrade::Moved`] and one that did
@@ -1291,6 +1299,7 @@ pub(crate) fn upgrade(
     project: &Path,
     cfg: &crate::config::Resolved,
     cage: Option<&super::resolve::ResolveCage>,
+    unchecked: Option<&str>,
     only: Option<&str>,
     mode: super::RollMode,
 ) -> io::Result<Vec<Upgrade>> {
@@ -1342,6 +1351,13 @@ pub(crate) fn upgrade(
                 .map(Resolution::Url),
             // A resolver: re-run its command for the concrete URL. If it equals the stored pin's URL,
             // reuse the pinned hash rather than prefetching the (large) artefact again.
+            Ref::Resolve { .. } if cage.is_none() && unchecked.is_some() => {
+                outcomes.push(Upgrade::NotChecked {
+                    url: key,
+                    why: unchecked.unwrap_or_default().to_string(),
+                });
+                continue;
+            }
             Ref::Resolve { name, command } => match cage {
                 None => Err(io::Error::other(
                     "cannot run the resolve command (no usable sandbox on this host)",
@@ -1438,13 +1454,31 @@ pub(crate) fn upgrade_project(
     only: Option<&str>,
     mode: super::RollMode,
 ) -> io::Result<Vec<Upgrade>> {
-    let held = if has_resolve_ref(kind, cfg, only) {
-        super::resolve::UpgradeCage::build(nix, layout, project, cfg)
-    } else {
-        None
+    // A dry run writes no lock, and resolving the project's channels for the cage would pin one
+    // where none is yet; the resolver references are then reported with that reason.
+    let first_pin = (!mode.applies())
+        .then(|| super::launch::first_channel_pin(layout, project, cfg, None))
+        .flatten();
+    let held = match first_pin {
+        None if has_resolve_ref(kind, cfg, only) => {
+            super::resolve::UpgradeCage::build(nix, layout, project, cfg, mode)
+        }
+        _ => None,
     };
+    let unchecked = first_pin
+        .map(|channel| format!("its resolve command's cage would first pin {channel} here"));
     let cage = held.as_ref().map(super::resolve::UpgradeCage::as_cage);
-    upgrade(kind, nix, layout, project, cfg, cage.as_ref(), only, mode)
+    upgrade(
+        kind,
+        nix,
+        layout,
+        project,
+        cfg,
+        cage.as_ref(),
+        unchecked.as_deref(),
+        only,
+        mode,
+    )
 }
 
 #[cfg(test)]
@@ -1698,6 +1732,7 @@ mod tests {
             &cfg,
             None,
             None,
+            None,
             crate::sandbox::RollMode::Apply,
         )
         .expect("the roll writes its lock");
@@ -1798,6 +1833,7 @@ mod tests {
             &cfg,
             None,
             None,
+            None,
             crate::sandbox::RollMode::Apply,
         )
         .expect("the roll reconciles its lock");
@@ -1855,6 +1891,7 @@ mod tests {
             &layout,
             project.path(),
             &cfg,
+            None,
             None,
             None,
             crate::sandbox::RollMode::Apply,
@@ -1961,6 +1998,7 @@ mod tests {
             &cfg,
             None,
             None,
+            None,
             crate::sandbox::RollMode::DryRun,
         )
         .expect("a dry run reports");
@@ -1990,6 +2028,47 @@ mod tests {
         assert!(said(
             &|o| matches!(o, Upgrade::Pruned { url } if url == gone)
         ));
+    }
+
+    /// A dry run that could not build the resolvers' cage without first pinning a lock reports each
+    /// resolver as not checked — not as failed, since the roll would pin and run — and still writes
+    /// nothing.
+    #[test]
+    fn a_dry_run_names_a_resolver_it_could_not_ask_without_failing() {
+        let data = TmpDir::new();
+        let project = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let kind = Recording::default();
+        let cfg = resolved(
+            vec![pkg(
+                "demo-app",
+                crate::config::Backend::TarballResolve {
+                    command: vec!["print-the-newest-url".to_string()],
+                },
+                true,
+            )],
+            vec![],
+        );
+        let why = "its resolve command's cage would first pin its base channel here";
+        let outcomes = upgrade(
+            &kind,
+            Path::new("/nonexistent/nix"),
+            &layout,
+            project.path(),
+            &cfg,
+            None,
+            Some(why),
+            None,
+            crate::sandbox::RollMode::DryRun,
+        )
+        .expect("a dry run reports");
+        assert!(
+            matches!(outcomes.as_slice(), [Upgrade::NotChecked { url, why: w }]
+                if url == "resolve:demo-app" && w == why),
+            "the resolver is named as not checked, and nothing is failed"
+        );
+        let id = super::super::binds::project_runtime_id(project.path()).unwrap();
+        assert!(pins(&layout, &id, &lock_file(&kind)).is_empty());
     }
 
     /// `--app <name>` narrows the roll set and leaves the prune universe whole.

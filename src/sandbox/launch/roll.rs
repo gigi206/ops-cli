@@ -684,30 +684,19 @@ fn check_mise_packages(
 /// What building this group's cage would pin before anything ran in it, `None` when every lock the
 /// preparation resolves already pins what it asks for.
 ///
-/// A cage's preparation resolves the base channel of its launch identity, the mise engine and, when
-/// the project declares one, the distribution image, and each of them writes its lock when it finds
-/// none for its source: a seed from the global channel, a first resolution, an image unpacked and
-/// pinned. A dry run must write no lock, so a group whose cage would do one of those is not asked,
-/// and the reason is said. Pure file reads: no nix, no network.
+/// A cage's preparation resolves the base channel of its launch identity and the mise engine
+/// ([`first_channel_pin`]) and, when the project declares one, the distribution image, and each of
+/// them writes its lock when it finds none for its source: a seed from the global channel, a first
+/// resolution, an image unpacked and pinned. A dry run must write no lock, so a group whose cage
+/// would do one of those is not asked, and the reason is said. Pure file reads: no nix, no network.
 fn first_pin_of_a_launch(
     layout: &crate::store::Layout,
     cwd: &Path,
     cfg: &crate::config::Resolved,
     app: Option<&str>,
 ) -> Option<&'static str> {
-    let base = effective_lock_target(cwd, layout, cfg, app)
-        .ok()
-        .and_then(|target| target.locked_revision());
-    if base.is_none() {
-        return Some("its base channel");
-    }
-    let engine = crate::store::LockTarget::engine(
-        layout,
-        cfg.mise_engine.as_deref(),
-        cfg.nixpkgs_global.as_deref(),
-    );
-    if engine.locked_revision().is_none() {
-        return Some("the mise engine");
+    if let Some(channel) = first_channel_pin(layout, cwd, cfg, app) {
+        return Some(channel);
     }
     if let Some(locator) = cfg.distro.as_deref() {
         let pinned = distro_lock_path(cwd, layout, cfg)
