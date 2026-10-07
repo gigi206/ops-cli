@@ -816,7 +816,13 @@ fn decide_target(cx: &Deciding<'_>, caller: &[String], pid: u32, target: &str) -
     if let Some(learn) = cx.learn
         && learnable(pid, target)
     {
-        learn.record(target);
+        // A refusal the config's own rules do not make came from a live `--session` deny. Kept
+        // apart, so the synthesis reports it instead of proposing an allow that undoes it.
+        if verdict == Verdict::Deny && cx.policy.decide(caller, target) != Verdict::Deny {
+            learn.record_session_denied(target);
+        } else {
+            learn.record(target);
+        }
     }
     verdict
 }

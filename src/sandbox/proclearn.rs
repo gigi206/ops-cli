@@ -84,7 +84,8 @@ impl Granularity {
 /// - [`Verdict::Ask`] — nothing speaks about it. This is what a rule is synthesized for.
 ///
 /// Never emits a rule the write path would reject ([`proc_policy::validate_rule`] is the same gate
-/// `sbx proc allow` passes through), and never drops a target without a note.
+/// `sbx proc allow` passes through), never one that would admit more than the target it was learned
+/// from ([`literal_rule`]), and never drops a target without a note.
 pub(crate) fn synthesize(record: &Record, policy: &ProcPolicy, gran: Granularity) -> Synthesis {
     // The rules as they are, asked under `ask`. Cloned rather than rebuilt from strings: the
     // compiled rules are what the supervisor decides with, so the oracle answers with the same
@@ -104,7 +105,16 @@ pub(crate) fn synthesize(record: &Record, policy: &ProcPolicy, gran: Granularity
             Learned::CAP
         ));
     }
-    for target in &record.targets {
+    // Refused during the run by a live `sbx proc deny --session` rule: the config's own rules did
+    // not refuse it, so the oracle below would propose it, and turning a refusal a person just made
+    // into a persistent allow is the opposite of what they asked for.
+    for target in &record.session_denied {
+        notes.push(format!(
+            "proc-learn: `{target}` was refused by a `--session` deny rule during the run — left \
+             alone, an allow would undo that refusal"
+        ));
+    }
+    for target in record.targets.difference(&record.session_denied) {
         match oracle.decide(&[], target) {
             Verdict::Allow => continue,
             Verdict::Deny => {
@@ -124,7 +134,7 @@ pub(crate) fn synthesize(record: &Record, policy: &ProcPolicy, gran: Granularity
         // but the record does not promise either) has nothing to write a rule about. Said out loud,
         // because dropping the one program a run cared about in silence is how an allowlist ends up
         // one rule short.
-        if let Err(why) = proc_policy::validate_rule(rule) {
+        if let Err(why) = proc_policy::validate_rule(rule).and_then(|()| literal_rule(rule, gran)) {
             notes.push(format!(
                 "proc-learn: `{target}` produced no rule at `{}` granularity ({why})",
                 gran.as_str()
@@ -137,6 +147,34 @@ pub(crate) fn synthesize(record: &Record, policy: &ProcPolicy, gran: Granularity
         rules: rules.into_iter().collect(),
         notes,
     }
+}
+
+/// Refuse a candidate rule that, written to a config file, would not name exactly the target it
+/// was learned from.
+///
+/// The rule grammar has no escape: `*` and `?` in a rule are always wildcards, so a program whose
+/// name carries one (a legal file name) would be learned as a pattern — a binary called `*` would
+/// become the rule `*`, which admits every program. Surrounding whitespace is trimmed when a config
+/// rule is compiled ([`ProcPolicy::new`]), so ` git` would be read back as `git` and admit another
+/// program than the one that ran. `..`, which only a relative target can leave as its basename,
+/// names a directory rather than a program. And a `path` rule is a path rule only while it holds a
+/// `/` ([`ProcRule::new`](proc_policy::ProcRule::new)): a relative target spelled without one
+/// (`execve("build.sh")`) would be written as a name rule admitting that basename anywhere, wider
+/// than the granularity that was asked for.
+fn literal_rule(rule: &str, gran: Granularity) -> Result<(), String> {
+    if rule.contains(['*', '?']) {
+        return Err("the name carries `*` or `?`, which a rule reads as a wildcard".to_string());
+    }
+    if rule.trim() != rule {
+        return Err("the name has surrounding whitespace, which a rule does not keep".to_string());
+    }
+    if rule == ".." {
+        return Err("`..` names a directory, not a program".to_string());
+    }
+    if gran == Granularity::Path && !rule.contains('/') {
+        return Err("a relative name with no `/` would be read as a name rule".to_string());
+    }
+    Ok(())
 }
 
 /// The distinct exec targets one run decided against — the record `--proc-learn` synthesizes from.
@@ -155,6 +193,9 @@ pub(crate) fn synthesize(record: &Record, policy: &ProcPolicy, gran: Granularity
 #[derive(Debug, Default)]
 pub(crate) struct Learned {
     targets: std::sync::Mutex<BTreeSet<String>>,
+    /// The targets a live `--session` deny rule refused and the config's own rules did not, kept
+    /// apart because a learned allow must not undo that refusal.
+    session_denied: std::sync::Mutex<BTreeSet<String>>,
     /// Set when a target was dropped for want of room. Read with the set, so the synthesis can say
     /// that its input was cut rather than let a short allowlist look complete.
     truncated: std::sync::atomic::AtomicBool,
@@ -169,23 +210,54 @@ impl Learned {
     /// Record one target a decision was taken against. Called at the decision point, so what is
     /// learned is what the policy was actually asked about — including the interpreter of a script
     /// and the program a dynamic loader names, neither of which the `execve` itself carried.
+    ///
+    /// An absolute target is stored folded ([`proc_policy::lexical_path`]), the spelling the policy
+    /// decides against, so `/usr//bin/git` and `/usr/bin/git` are one program and a rule
+    /// synthesized from either is written in the form it matches. A relative target is kept as the
+    /// cage spelled it: folding `./build.sh` to `build.sh` would drop the `/` that makes a `path`
+    /// rule a path rule.
     pub(crate) fn record(&self, target: &str) {
-        let Ok(mut set) = self.targets.lock() else {
-            return; // a poisoned lock costs this run its learning, never the run itself
+        self.insert(&self.targets, target);
+    }
+
+    /// Record a target a live `--session` deny rule refused and the config's own rules did not.
+    pub(crate) fn record_session_denied(&self, target: &str) {
+        self.insert(&self.session_denied, target);
+    }
+
+    fn insert(&self, into: &std::sync::Mutex<BTreeSet<String>>, target: &str) {
+        let target = if target.starts_with('/') {
+            proc_policy::lexical_path(target)
+        } else {
+            std::borrow::Cow::Borrowed(target)
         };
-        if set.len() >= Self::CAP && !set.contains(target) {
+        // A poisoned lock still holds a consistent set: nothing panics between the check and the
+        // insert below, so the learning a run has done is kept rather than dropped.
+        let mut set = into
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if set.contains(target.as_ref()) {
+            return; // the hot path: the same program run again allocates nothing
+        }
+        if set.len() >= Self::CAP {
             self.truncated
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         }
-        set.insert(target.to_string());
+        set.insert(target.into_owned());
     }
 
     /// The targets recorded so far. Read once the workload has exited: nothing execs after that, so
     /// the set is the run's.
     pub(crate) fn snapshot(&self) -> Record {
+        let read = |set: &std::sync::Mutex<BTreeSet<String>>| {
+            set.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
         Record {
-            targets: self.targets.lock().map(|s| s.clone()).unwrap_or_default(),
+            targets: read(&self.targets),
+            session_denied: read(&self.session_denied),
             truncated: self.truncated.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -194,8 +266,11 @@ impl Learned {
 /// One run's exec record, as the synthesizer reads it.
 #[derive(Debug, Default)]
 pub(crate) struct Record {
-    /// The distinct targets, already folded to the spelling the policy matches against.
+    /// The distinct targets, absolute ones already folded to the spelling the policy matches
+    /// against.
     pub(crate) targets: BTreeSet<String>,
+    /// The targets a live `--session` deny rule refused during the run. Reported, never learned.
+    pub(crate) session_denied: BTreeSet<String>,
     /// Whether [`Learned::CAP`] was reached, so the set is a prefix of what ran rather than all of
     /// it. Carried beside the targets because a short allowlist and a truncated record look the same
     /// from the outside, and only one of them is safe to act on.
@@ -209,7 +284,7 @@ mod tests {
     fn record(targets: &[&str]) -> Record {
         Record {
             targets: targets.iter().map(|t| (*t).to_string()).collect(),
-            truncated: false,
+            ..Record::default()
         }
     }
 
@@ -271,6 +346,7 @@ mod tests {
         let rec = Record {
             targets: ["/usr/bin/git"].iter().map(|t| t.to_string()).collect(),
             truncated: true,
+            ..Record::default()
         };
         let synth = synthesize(&rec, &policy(&[], &[]), Granularity::Name);
         assert_eq!(synth.rules, vec!["git".to_string()]);
@@ -307,6 +383,147 @@ mod tests {
                 synth.notes
             );
         }
+    }
+
+    #[test]
+    fn a_name_the_grammar_would_read_as_more_than_itself_is_reported_not_learned() {
+        // `*` and `?` are always wildcards and surrounding whitespace is trimmed when a rule is
+        // compiled, so each of these would be written as a rule admitting other programs.
+        let rec = record(&["/tmp/*", "/tmp/a?c", "/tmp/ git", "/tmp/git ", ".."]);
+        for gran in [Granularity::Name, Granularity::Path] {
+            let synth = synthesize(&rec, &policy(&[], &[]), gran);
+            let widened: Vec<&String> = synth
+                .rules
+                .iter()
+                .filter(|r| r.contains(['*', '?']) || r.trim() != r.as_str() || *r == "..")
+                .collect();
+            assert!(widened.is_empty(), "{gran:?} learned {widened:?}");
+            assert_eq!(
+                synth.rules.len() + synth.notes.len(),
+                rec.targets.len(),
+                "{gran:?} dropped a target in silence: {:?} / {:?}",
+                synth.rules,
+                synth.notes
+            );
+        }
+        let by_name = synthesize(&rec, &policy(&[], &[]), Granularity::Name);
+        assert!(by_name.rules.is_empty(), "{:?}", by_name.rules);
+        assert_eq!(
+            by_name.notes.len(),
+            rec.targets.len(),
+            "{:?}",
+            by_name.notes
+        );
+    }
+
+    #[test]
+    fn a_target_is_recorded_in_the_spelling_the_policy_decides_against() {
+        let learned = Learned::default();
+        for spelling in [
+            "/usr/bin/git",
+            "/usr//bin/git",
+            "/usr/./bin/git",
+            "/usr/lib/../bin/git",
+        ] {
+            learned.record(spelling);
+        }
+        let snap = learned.snapshot();
+        assert_eq!(
+            snap.targets.iter().collect::<Vec<_>>(),
+            vec!["/usr/bin/git"],
+            "every spelling of one program is one target"
+        );
+        let synth = synthesize(&snap, &policy(&[], &[]), Granularity::Path);
+        assert_eq!(synth.rules, vec!["/usr/bin/git".to_string()]);
+    }
+
+    #[test]
+    fn a_path_rule_is_always_a_path_rule() {
+        // `path` is the strict reading: every rule it writes must compile as a path rule, never as
+        // a name rule admitting the basename anywhere. Relative targets are where that can slip.
+        let learned = Learned::default();
+        for target in [
+            "./build.sh",
+            "build.sh",
+            "a/../x",
+            "../tool",
+            "/usr//bin/git",
+        ] {
+            learned.record(target);
+        }
+        let snap = learned.snapshot();
+        let synth = synthesize(&snap, &policy(&[], &[]), Granularity::Path);
+        for rule in &synth.rules {
+            assert!(rule.contains('/'), "`path` wrote a name rule: {rule:?}");
+        }
+        assert!(
+            synth.rules.contains(&"./build.sh".to_string()),
+            "{:?}",
+            synth.rules
+        );
+        assert!(
+            synth.rules.contains(&"/usr/bin/git".to_string()),
+            "{:?}",
+            synth.rules
+        );
+        assert_eq!(
+            synth.rules.len() + synth.notes.len(),
+            snap.targets.len(),
+            "{:?} / {:?}",
+            synth.rules,
+            synth.notes
+        );
+    }
+
+    #[test]
+    fn a_target_a_session_deny_refused_is_reported_never_learned() {
+        let learned = Learned::default();
+        learned.record("/usr/bin/git");
+        learned.record("/usr/bin/curl");
+        learned.record_session_denied("/usr/bin/curl");
+        learned.record_session_denied("/usr/bin/wget");
+        let snap = learned.snapshot();
+        for gran in [Granularity::Name, Granularity::Path] {
+            let synth = synthesize(&snap, &policy(&[], &[]), gran);
+            assert!(
+                synth
+                    .rules
+                    .iter()
+                    .all(|r| !r.contains("curl") && !r.contains("wget")),
+                "{gran:?} learned a refused target: {:?}",
+                synth.rules
+            );
+            assert_eq!(synth.rules.len(), 1, "{:?}", synth.rules);
+            for refused in ["curl", "wget"] {
+                assert!(
+                    synth
+                        .notes
+                        .iter()
+                        .any(|n| n.contains(refused) && n.contains("--session")),
+                    "{gran:?} did not report {refused}: {:?}",
+                    synth.notes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_poisoned_record_keeps_what_it_learned_and_goes_on_learning() {
+        let learned = std::sync::Arc::new(Learned::default());
+        learned.record("/usr/bin/git");
+        let held = learned.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.targets.lock().unwrap();
+            panic!("poison the record");
+        })
+        .join();
+        assert!(learned.targets.is_poisoned());
+        learned.record("/usr/bin/env");
+        let snap = learned.snapshot();
+        assert_eq!(
+            snap.targets.iter().collect::<Vec<_>>(),
+            vec!["/usr/bin/env", "/usr/bin/git"]
+        );
     }
 
     #[test]

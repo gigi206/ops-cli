@@ -4329,3 +4329,39 @@ fn a_file_the_scan_cannot_read_is_allowed_and_reported() {
          nothing to do with it"
     );
 }
+
+#[test]
+fn a_learning_run_keeps_a_session_deny_apart_from_what_the_config_refused() {
+    // A refusal the config's own rules make is learned as a target (the synthesis reports it beside
+    // its deny rule); one only a live `--session` deny makes is kept apart, so the synthesis never
+    // proposes an allow that undoes it. Relative targets, so `learnable` needs no `/proc` probe.
+    let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["wget".to_string()]);
+    let overlay = ProcOverlay::new();
+    overlay.remember(Verdict::Deny, "curl");
+    let learned = crate::sandbox::proclearn::Learned::default();
+    let cx = Deciding {
+        policy: &policy,
+        overlay: &overlay,
+        ring: &ExecRing::new(16),
+        pending: &PendingExec::new(),
+        notifier: &crate::sandbox::notify_sink::Notifier::disabled(),
+        open: None,
+        mounts: &CageMounts::default(),
+        binfmt: &[],
+        undecidable: &Undecidable::default(),
+        learn: Some(&learned),
+    };
+    let pid = std::process::id();
+    assert_eq!(decide_target(&cx, &[], pid, "./curl"), Verdict::Deny);
+    assert_eq!(decide_target(&cx, &[], pid, "./wget"), Verdict::Deny);
+    assert_eq!(decide_target(&cx, &[], pid, "./git"), Verdict::Allow);
+    let record = learned.snapshot();
+    assert_eq!(
+        record.session_denied.iter().collect::<Vec<_>>(),
+        vec!["./curl"]
+    );
+    assert_eq!(
+        record.targets.iter().collect::<Vec<_>>(),
+        vec!["./git", "./wget"]
+    );
+}

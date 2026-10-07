@@ -850,7 +850,7 @@ fn only_bubblewraps_report_or_an_empty_exec_record_say_the_command_was_never_rea
     use crate::sandbox::proclearn::Record;
     let ran = Record {
         targets: ["/usr/bin/agent".to_string()].into_iter().collect(),
-        truncated: false,
+        ..Record::default()
     };
     let empty = Record::default();
     // The code, bubblewrap's report, whether `--proc-learn` asked for the run, the exec record,

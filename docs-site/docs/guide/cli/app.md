@@ -130,6 +130,16 @@ left exactly as its author wrote it, and a program a `deny` rule names is never 
 into an allow: the rule would be inert beside it, and writing one would read as undoing
 a refusal that was meant.
 
+A program whose name a rule cannot spell literally is reported rather than learned. The
+rule grammar has no escape, so a name carrying `*` or `?` would be written as a wildcard
+(a program called `*` would become a rule admitting everything), and surrounding
+whitespace is trimmed when a rule is read back, so ` git` would admit `git`. At `path`
+level, a program the app started by a relative name with no `/` in it would be written
+as a name rule, so it is reported too. Each such program gets a note naming it, and
+stays for [`sbx proc allow`](proc#allow--deny) to decide. A program refused during the
+run by a [`sbx proc deny --session`](proc#allow--deny) rule is reported and never
+turned into an allow, which would undo that refusal.
+
 Every posture is learnable except `ask` itself, which is refused: under `ask` an
 unmatched exec is already put to a person, and a run cannot pre-answer a question that
 is theirs. Under `off` or `observe` the app's config declares no exec policy, and the
