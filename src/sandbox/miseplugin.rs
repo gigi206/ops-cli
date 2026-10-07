@@ -39,6 +39,11 @@ pub(crate) const INCAGE_DIR: &str = "/opt/sbx/mise-nix-plugin";
 pub(crate) fn stage(data_dir: &Path) -> io::Result<PathBuf> {
     let base = data_dir.join("mise-plugin");
     let dir = base.join(content_hash());
+    // Before the fast path, so a crash's temps are swept even when the tree they were staging is
+    // already in place; a `base` that does not exist yet lists nothing.
+    sweep_dead_temps(&base, stage_temp_pid, |name| {
+        let _ = std::fs::remove_dir_all(base.join(name));
+    });
     // The sentinel proves a complete prior materialization (the rename below is
     // atomic, so its presence means the whole tree is there).
     if dir.join("metadata.lua").is_file() {
@@ -51,6 +56,7 @@ pub(crate) fn stage(data_dir: &Path) -> io::Result<PathBuf> {
         std::process::id(),
         super::atomicfile::unique()
     ));
+    fresh_temp(&tmp)?;
     if let Err(e) = write_tree(&tmp) {
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(e);
@@ -68,6 +74,14 @@ pub(crate) fn stage(data_dir: &Path) -> io::Result<PathBuf> {
             Err(e)
         }
     }
+}
+
+/// Create `tmp` empty and exclusively. A crashed launch whose pid this one reuses can have left a
+/// temp under this very name, and writing into it would merge that older tree's files into the one
+/// about to be renamed into place.
+fn fresh_temp(tmp: &Path) -> io::Result<()> {
+    let _ = std::fs::remove_dir_all(tmp);
+    std::fs::create_dir(tmp)
 }
 
 /// Register the staged plugin for a cage's mise by placing the `<plugins_dir>/nix`
@@ -102,11 +116,19 @@ pub(crate) fn register(root: &Path, rel: &str) -> io::Result<()> {
 /// can change the tree between the two, the way a running cage can.
 fn place(plugins_dir: &OwnedFd) -> io::Result<()> {
     let link = super::cagedir::entry(plugins_dir, OsStr::new(PLUGIN_NAME))?;
-    // The temp name carries the pid (like `stage`): `super::atomicfile::unique()` is a process-local counter starting
-    // at 0, so without the pid two concurrent same-project launches would share `.nix.0.tmp` and one
-    // could `remove_file` the other's temp mid-rename. A crashed launch's pid-tagged temp is then a
-    // tiny dangling symlink the next launch does not match — the same self-healing GC class `stage`
-    // already accepts.
+    // The temp name carries the pid (like `stage`): `super::atomicfile::unique()` is a process-local
+    // counter starting at 0, so without the pid two concurrent same-project launches would share
+    // `.nix.0.tmp` and one could `remove_file` the other's temp mid-rename. A crashed launch's temp
+    // is swept by the next placement once its pid is gone, as `stage` sweeps its own.
+    let listed = PathBuf::from(format!(
+        "/proc/self/fd/{}",
+        std::os::fd::AsRawFd::as_raw_fd(plugins_dir)
+    ));
+    sweep_dead_temps(&listed, register_temp_pid, |name| {
+        if let Ok(dead) = super::cagedir::entry(plugins_dir, name) {
+            let _ = std::fs::remove_file(dead);
+        }
+    });
     let tmp = super::cagedir::entry(
         plugins_dir,
         OsStr::new(&register_temp_name(
@@ -116,11 +138,16 @@ fn place(plugins_dir: &OwnedFd) -> io::Result<()> {
     )?;
     let _ = std::fs::remove_file(&tmp);
     std::os::unix::fs::symlink(INCAGE_DIR, &tmp)?;
-    let placed = std::fs::rename(&tmp, &link).or_else(|_| {
+    let placed = std::fs::rename(&tmp, &link).or_else(|e| {
         // `rename` replaces an existing symlink or file atomically, but not a real
         // directory — which only appears if an agent ran its own `mise plugins`
         // command into the slot. Clear it and retry (best-effort, self-inflicted case),
         // by descriptor, so the removal stays inside the directory that was checked.
+        // Any other failure is returned as it is: clearing the slot cannot cure it, and
+        // would delete what the slot held for nothing.
+        if !slot_holds_a_directory(&e) {
+            return Err(e);
+        }
         let _ = super::gc::remove_child(plugins_dir, OsStr::new(PLUGIN_NAME));
         std::fs::rename(&tmp, &link)
     });
@@ -128,6 +155,55 @@ fn place(plugins_dir: &OwnedFd) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     placed
+}
+
+/// Whether a failed `rename` of the temp link onto the slot failed because the slot is a real
+/// directory, the one case clearing the slot can cure: `EISDIR` for an empty or full directory,
+/// and `ENOTEMPTY`/`EEXIST`, which `rename(2)` documents for a non-empty one.
+fn slot_holds_a_directory(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EISDIR | libc::ENOTEMPTY | libc::EEXIST)
+    )
+}
+
+/// Remove, through `remove`, each entry of `dir` that `pid_of` reads as a temp of a launch whose
+/// process is gone. A live pid's temp is left alone: it may be another launch's, mid-rename. A pid
+/// reused since the crash keeps its orphan until that process exits too, which costs one stray
+/// entry, never a live one. Pids are read in this process's namespace, which is the host's: both
+/// callers ([`stage`] and [`register`]) run in the launcher, before any cage exists.
+fn sweep_dead_temps(dir: &Path, pid_of: fn(&str) -> Option<u32>, remove: impl Fn(&OsStr)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if let Some(pid) = name.to_str().and_then(pid_of)
+            && pid != std::process::id()
+            && !crate::session::pid_is_live(pid)
+        {
+            remove(&name);
+        }
+    }
+}
+
+/// The pid in a `stage` temp's name (`.tmp-<pid>-<seq>`).
+fn stage_temp_pid(name: &str) -> Option<u32> {
+    let (pid, seq) = name.strip_prefix(".tmp-")?.split_once('-')?;
+    seq.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
+/// The pid in a `register` temp's name ([`register_temp_name`]).
+fn register_temp_pid(name: &str) -> Option<u32> {
+    let (pid, seq) = name
+        .strip_prefix('.')?
+        .strip_prefix(PLUGIN_NAME)?
+        .strip_prefix('.')?
+        .strip_suffix(".tmp")?
+        .split_once('.')?;
+    seq.parse::<u64>().ok()?;
+    pid.parse().ok()
 }
 
 /// The temp name `register` stages the plugin symlink at. It carries the pid because `super::atomicfile::unique()` is a
@@ -177,6 +253,116 @@ mod tests {
         assert_ne!(register_temp_name(1000, 0), register_temp_name(1000, 1));
         // and the pid is actually in the name
         assert!(register_temp_name(4242, 7).contains("4242"));
+    }
+
+    /// A pid no process holds: a child that has been waited for.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn only_a_directory_in_the_slot_lets_the_placement_clear_it() {
+        for errno in [libc::EISDIR, libc::ENOTEMPTY, libc::EEXIST] {
+            assert!(slot_holds_a_directory(&io::Error::from_raw_os_error(errno)));
+        }
+        for errno in [
+            libc::EACCES,
+            libc::EROFS,
+            libc::EIO,
+            libc::ENOSPC,
+            libc::EXDEV,
+        ] {
+            assert!(
+                !slot_holds_a_directory(&io::Error::from_raw_os_error(errno)),
+                "errno {errno} would clear the slot for nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_directory_in_the_slot_is_replaced_by_the_registration() {
+        let home = TmpDir::new();
+        const REL: &str = ".local/share/mise/plugins";
+        std::fs::create_dir_all(home.join(REL).join("nix").join("own")).unwrap();
+        register(home.path(), REL).expect("a directory in the slot is cleared");
+        assert_eq!(
+            std::fs::read_link(home.join(REL).join("nix")).unwrap(),
+            Path::new(INCAGE_DIR)
+        );
+    }
+
+    #[test]
+    fn temps_a_dead_launch_left_are_swept_and_a_live_ones_are_kept() {
+        let data = TmpDir::new();
+        let base = data.path().join("mise-plugin");
+        let dead = dead_pid();
+        let orphan = base.join(format!(".tmp-{dead}-0"));
+        std::fs::create_dir_all(orphan.join("hooks")).unwrap();
+        // The parent of this test process is alive and not this process.
+        let parent = std::os::unix::process::parent_id();
+        let busy = base.join(format!(".tmp-{parent}-3"));
+        std::fs::create_dir_all(&busy).unwrap();
+        stage(data.path()).unwrap();
+        assert!(!orphan.exists(), "a dead launch's staging temp was kept");
+        assert!(busy.exists(), "a live launch's staging temp was swept");
+        // A crash under a tree that is already in place: the next stage takes the fast path, and
+        // still sweeps.
+        std::fs::create_dir_all(&orphan).unwrap();
+        stage(data.path()).unwrap();
+        assert!(
+            !orphan.exists(),
+            "the fast path kept a dead launch's staging temp"
+        );
+
+        let home = TmpDir::new();
+        const REL: &str = ".local/share/mise/plugins";
+        let plugins = home.join(REL);
+        std::fs::create_dir_all(&plugins).unwrap();
+        let stale = plugins.join(register_temp_name(dead, 0));
+        let held = plugins.join(register_temp_name(parent, 1));
+        std::os::unix::fs::symlink(INCAGE_DIR, &stale).unwrap();
+        std::os::unix::fs::symlink(INCAGE_DIR, &held).unwrap();
+        register(home.path(), REL).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&stale).is_err(),
+            "a dead launch's link temp was kept"
+        );
+        assert!(
+            std::fs::symlink_metadata(&held).is_ok(),
+            "a live launch's link temp was swept"
+        );
+    }
+
+    #[test]
+    fn a_staging_temp_left_under_a_reused_name_starts_empty() {
+        let data = TmpDir::new();
+        let reused = data.path().join(".tmp-1-0");
+        std::fs::create_dir_all(reused.join("hooks")).unwrap();
+        std::fs::write(reused.join("stale.lua"), b"left by an older build").unwrap();
+        fresh_temp(&reused).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&reused).unwrap().count(),
+            0,
+            "an older tree's files would be staged with the new one"
+        );
+    }
+
+    #[test]
+    fn every_embedded_path_is_a_plain_relative_path() {
+        // `write_tree` joins each path onto the staging temp, so none may climb out of it.
+        for (rel, _) in PLUGIN_FILES {
+            let path = Path::new(rel);
+            assert!(
+                !rel.is_empty()
+                    && path
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_))),
+                "embedded path {rel:?} is not a plain relative path"
+            );
+        }
     }
 
     #[test]
