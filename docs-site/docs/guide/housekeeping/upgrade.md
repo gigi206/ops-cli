@@ -33,7 +33,7 @@ lock. Its `self` target is the binary update itself, and rewrites none.
 ## The upgrade targets
 
 ```sh
-sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>]
+sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>] [-n]
 ```
 
 | Target | Rolls forward |
@@ -58,8 +58,10 @@ what belongs to the project alone: the mise engine, the project's `nix:` tools, 
 pool, the baseline's packages, and the image. What each backend does when a roll reaches
 it is the table in [What each backend does on upgrade](#what-each-backend-does-on-upgrade).
 
-See [`sbx upgrade`](../cli/upgrade) for the flags (`-a <name>`, `--project <path>`) and
-the per-target behavior.
+See [`sbx upgrade`](../cli/upgrade) for the flags (`-a <name>`, `--project <path>`,
+`-n, --dry-run`) and the per-target behavior. `--dry-run` reports what a roll would move
+and changes nothing; [Checking before rolling](../cli/upgrade#checking-before-rolling)
+says what each channel can and cannot report that way.
 
 The three are **decoupled**: `sbx upgrade nix` leaves `mise-engine.lock` untouched, and
 `sbx upgrade mise` leaves `nixpkgs.lock` intact.
@@ -251,6 +253,7 @@ runs on the tree it provisioned; the next launch takes the newer one.
 
 ```sh
 sbx upgrade              # roll everything the current context tracks
+sbx upgrade --dry-run    # what that roll would move, writing nothing
 sbx upgrade --app kiro   # roll one app, whatever backends it rides
 sbx upgrade nix          # just the nixpkgs channel
 sbx upgrade mise         # the mise engine + this project's mise-managed tools

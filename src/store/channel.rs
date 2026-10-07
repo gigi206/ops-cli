@@ -244,6 +244,12 @@ impl LockTarget {
     pub(crate) fn refresh(&self, nix: &Path, layout: &Layout) -> io::Result<Upgrade> {
         refresh_ref(nix, layout, &self.source, &self.lock_path)
     }
+
+    /// Resolve this source exactly as [`Self::refresh`] does and report what it would lock, without
+    /// writing the lock — what `sbx upgrade --dry-run` shows.
+    pub(crate) fn peek(&self, nix: &Path, layout: &Layout) -> io::Result<Upgrade> {
+        peek_ref(nix, layout, &self.source, &self.lock_path)
+    }
 }
 
 /// The (source, origin) the global channel resolves to: a global-config override, else
@@ -510,10 +516,17 @@ fn resolve_ref(
 /// witnessed against the repository, which is a nix-driven HTTPS request that degrades silently
 /// when it cannot run.
 fn refresh_ref(nix: &Path, layout: &Layout, source: &str, lock_path: &Path) -> io::Result<Upgrade> {
+    let upgrade = peek_ref(nix, layout, source, lock_path)?;
+    write_lock(lock_path, source, &upgrade.revision)?;
+    Ok(upgrade)
+}
+
+/// The resolution half of [`refresh_ref`]: a fresh resolution of `source`, and the revision the lock
+/// records for it now, with the lock left as it is.
+fn peek_ref(nix: &Path, layout: &Layout, source: &str, lock_path: &Path) -> io::Result<Upgrade> {
     ensure(layout)?;
     let previous = read_lock(lock_path).and_then(|(s, r)| (s == source).then_some(r));
     let revision = resolve_source_rev(nix, layout, source, true)?;
-    write_lock(lock_path, source, &revision)?;
     Ok(Upgrade {
         source: source.to_string(),
         previous,

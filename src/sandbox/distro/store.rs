@@ -239,13 +239,15 @@ pub(crate) struct Rolled {
 ///
 /// Nothing is fetched or unpacked. The new digest names a tree the next launch provisions, on the
 /// rule every channel here follows: a roll rewrites a lock, and the build happens when something is
-/// actually run.
+/// actually run. Under [`crate::sandbox::RollMode::DryRun`] the registry is asked the same question
+/// and the lock is left as it is.
 pub(crate) fn refresh(
     layout: &Layout,
     locator: &str,
     run: &[String],
     lock_path: &Path,
     credential: Option<&str>,
+    mode: crate::sandbox::RollMode,
 ) -> io::Result<Rolled> {
     let credential = credential.map(registry::Credential::basic);
     let image = reference::parse(locator)
@@ -271,7 +273,9 @@ pub(crate) fn refresh(
     } else {
         derived_key(&base, run)
     };
-    crate::store::write_lock(lock_path, locator, &key)?;
+    if mode.applies() {
+        crate::store::write_lock(lock_path, locator, &key)?;
+    }
     Ok(Rolled {
         locator: locator.to_string(),
         key,

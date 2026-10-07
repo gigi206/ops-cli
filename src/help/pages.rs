@@ -1843,7 +1843,7 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["upgrade"],
-        synopsis: "sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>] [--project <path>]",
+        synopsis: "sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>] [--project <path>] [-n]",
         summary: "roll managed channels forward (versions move only here)",
         options: &[
             (
@@ -1877,6 +1877,10 @@ pub(super) const PAGES: &[Page] = &[
             (
                 "--project <path>",
                 "roll another project instead of the current directory",
+            ),
+            (
+                "-n, --dry-run",
+                "say what each channel would move to, writing no lock and installing nothing",
             ),
         ],
         details: "Rolls managed channels forward by re-resolving and rewriting their locks, so\n\
@@ -1960,7 +1964,37 @@ pub(super) const PAGES: &[Page] = &[
             not the release genuine. A build from source has no release and is refused, as is a\n\
             binary in a directory you cannot write: replace that one the way it was installed.\n\
             Sessions already running keep the sbx they started with until they end. `all` never\n\
-            includes `self`, and `self` takes neither `--app` nor `--project`.",
+            includes `self`, and `self` takes neither `--app` nor `--project`.\n\
+            \n\
+            `-n, --dry-run` RESOLVES EVERY CHANNEL THE ROLL WOULD AND WRITES NOTHING: no lock is\n\
+            rewritten and nothing is installed or downloaded. It takes the same target, `--app` and\n\
+            `--project`, so it answers for exactly the roll it precedes, and it reports in that\n\
+            roll's words: `from → to`, what is already current, what would be pinned or pruned.\n\
+            What a version means differs by channel. The nixpkgs channel and the mise engine report\n\
+            a nixpkgs revision, not the version of each package built from it; the `nix:` tools and\n\
+            the `mise:` packages report versions; a `flake:` package reports a revision; the image\n\
+            reports a digest.\n\
+            \n\
+            The prebuilt backends (`deb`, `appimage`, `tarball`, `binary`) pin a content hash, and\n\
+            only a download computes one, so a dry run downloads nothing and compares URLs: a source\n\
+            that now names another URL is reported with both, and a URL that did not move is\n\
+            reported as unverified, since the bytes behind it may still have changed. A resolve\n\
+            command that prints the URL already pinned is reported as unchanged, which is the roll's\n\
+            own decision there.\n\
+            \n\
+            The `mise:` packages are asked in each app's cage, with its egress and environment and\n\
+            without its install steps, services or equip: `mise outdated --bump` names where\n\
+            `mise upgrade --bump` would go, under the same `minimum_release_age` window. It is a\n\
+            second command, not the roll minus a write, so a release that would then fail to\n\
+            install is still announced. An app never launched has nothing installed and is named\n\
+            as such without a cage; a tool declared since its last launch is named as not equipped\n\
+            yet. That cage carries only the app's `mise:` packages, so it builds none of the others.\n\
+            \n\
+            What a dry run cannot report it names. An install step records no version, so the apps\n\
+            that carry one are listed as not checked, and `provision --dry-run` is refused. The\n\
+            declared operations' tool pool is not checked either. `self --dry-run` reads the\n\
+            release's checksum, or the newest stable tag, and says whether another build is served,\n\
+            without downloading it.",
     },
     Page {
         path: &["gc"],
@@ -2232,9 +2266,15 @@ pub(super) const PAGES: &[Page] = &[
     // ---- app subcommands ----------------------------------------------------------
     Page {
         path: &["app", "upgrade"],
-        synopsis: "sbx app upgrade <name>",
+        synopsis: "sbx app upgrade <name> [-n]",
         summary: "advance one app: every channel it rides",
-        options: &[("<name>", "the app to advance")],
+        options: &[
+            ("<name>", "the app to advance"),
+            (
+                "-n, --dry-run",
+                "say what the roll would move, writing no lock and installing nothing",
+            ),
+        ],
         details: "Advances a named app without asking which channel it rides: sbx reads what the\n\
             app declares and rolls all of it. The same roll as `sbx upgrade --app <name>`, under\n\
             its own name, because \"advance this app\" is the question a user actually has and\n\
@@ -2260,7 +2300,11 @@ pub(super) const PAGES: &[Page] = &[
             one that declares none.\n\n\
             An app name that selects no work is refused with the reason rather than reported as a\n\
             clean roll of nothing: unknown, never launchable, or declaring no packages and no\n\
-            install step of its own.",
+            install step of its own.\n\n\
+            `-n, --dry-run` reports what this roll would move and does none of it, exactly as\n\
+            `sbx upgrade --app <name> --dry-run`: no lock is written, nothing is downloaded, and the\n\
+            install step is named rather than run. `sbx upgrade` describes what each channel can and\n\
+            cannot report without applying.",
     },
     Page {
         path: &["app", "import"],

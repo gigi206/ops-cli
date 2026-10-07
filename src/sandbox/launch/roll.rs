@@ -12,9 +12,47 @@
 
 use super::build::build;
 use super::cage::{echo_cage_output, run_captured};
-use super::equip::mise_upgrade_cmd;
+use super::equip::{MISE_STATE_MARKER, mise_state_cmd, mise_upgrade_cmd};
 use super::startup::provision_only_cmd;
 use super::*;
+
+/// Whether an `sbx upgrade` run applies what it resolves, or only reports it (`--dry-run`).
+///
+/// One value carried through every channel rather than a flag per call site, because the two
+/// modes must select the same work and differ in exactly two places: whether a lock is written
+/// (or an install run), and the tense the report is written in. A dry run resolves with the same
+/// freshness the roll does, so what it announces is what the roll would lock at that moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RollMode {
+    /// Resolve, write the locks and run the installs.
+    Apply,
+    /// Resolve and report; write no lock and install nothing.
+    DryRun,
+}
+
+impl RollMode {
+    /// Whether this run writes locks and runs installs.
+    pub(crate) fn applies(self) -> bool {
+        self == RollMode::Apply
+    }
+
+    /// The heading of one channel's report: `sbx upgrade — <what>`, with the flag named under a
+    /// dry run so a report pasted elsewhere still says that nothing moved.
+    pub(crate) fn heading(self, what: &str) -> String {
+        match self {
+            RollMode::Apply => format!("sbx upgrade — {what}"),
+            RollMode::DryRun => format!("sbx upgrade --dry-run — {what}"),
+        }
+    }
+
+    /// The wording of one outcome: `done` when the run applied it, `would` when it only reported.
+    pub(crate) fn says(self, done: &'static str, would: &'static str) -> &'static str {
+        match self {
+            RollMode::Apply => done,
+            RollMode::DryRun => would,
+        }
+    }
+}
 
 /// Which persistent home a `mise:` package group is equipped in, owning its app name so a
 /// group can outlive the config it was derived from. Mirrors [`binds::Runtime`], which borrows
@@ -194,14 +232,18 @@ fn prepare_roll_cage(cwd: &Path, app: Option<&str>) -> Result<Prepared, ExitCode
 /// `sbx upgrade nix`/`all` keeps its cheap, sandbox-free common path. With work to do, a host
 /// that cannot sandbox warns and rolls nothing rather than failing (best-effort, like the
 /// cgroup limits).
+///
+/// Under [`RollMode::DryRun`] nothing is rolled: [`check_mise_packages`] asks each group's home what
+/// it holds and what a roll would move it to.
 pub(crate) fn upgrade_mise_packages(
     cwd: &Path,
     cfg: &crate::config::Resolved,
     pal: &crate::style::Palette,
     only: Option<&str>,
+    mode: RollMode,
 ) -> bool {
     let (h, warn, dim, r, ok_c) = (pal.head, pal.warn, pal.dim, pal.reset, pal.ok);
-    outln!("{h}sbx upgrade — mise packages{r}");
+    outln!("{h}{}{r}", mode.heading("mise packages"));
     let groups = mise_package_groups(cfg, only);
     // Surface withheld (untrusted) `mise:` packages so an untrusted project does not silently
     // read as "nothing declared" — parity with the `nix:` tools path, which warns the same.
@@ -236,6 +278,9 @@ pub(crate) fn upgrade_mise_packages(
             outln!("  {dim}no mise: packages to roll.{r}");
         }
         return true;
+    }
+    if !mode.applies() {
+        return check_mise_packages(cwd, groups, !pool_tokens.is_empty(), pal);
     }
 
     // Only now, with something to roll, take on the sandbox prerequisites — against `cwd`, the
@@ -485,6 +530,347 @@ pub(crate) fn upgrade_mise_packages(
     };
     outln!("  {hue}{recap}{r}");
     ok
+}
+
+/// The dry run of [`upgrade_mise_packages`]: for each group, what its home holds and what
+/// `mise upgrade --bump` would move it to, with nothing installed and no config rewritten.
+///
+/// A home whose global mise config does not exist on the host has never been equipped, so it is
+/// reported as such without a cage. Every other group gets the cage its roll would get, with its
+/// install steps, its services, its equip lanes and its packages other than `mise:` removed, running
+/// [`mise_state_cmd`]. The same
+/// egress and environment apply, so `minimum_release_age` and the exemptions an app declares bound
+/// the answer exactly as they bound the roll.
+///
+/// The declared operations' tool pool is named as not checked: its install cage streams its output
+/// to the terminal and keeps its configuration inside the pool, so it has no seat for this question.
+///
+/// Returns whether every group could be asked.
+fn check_mise_packages(
+    cwd: &Path,
+    groups: Vec<MiseGroup>,
+    has_pool: bool,
+    pal: &crate::style::Palette,
+) -> bool {
+    let (warn, dim, r, ok_c) = (pal.warn, pal.dim, pal.reset, pal.ok);
+    let width = groups
+        .iter()
+        .map(|g| g.home.name().chars().count())
+        .chain(has_pool.then_some("task pool".len()))
+        .max()
+        .unwrap_or(0);
+    let mut ok = true;
+    let mut behind: Vec<String> = Vec::new();
+    let layout = crate::store::Layout::from_env();
+    for MiseGroup { home, cfg, tokens } in groups {
+        let name = home.name();
+        let say = |status: String| outln!("{}", roll_line(&name, width, &status, pal));
+        if matches!(cfg.network, crate::config::NetworkPolicy::Isolated) {
+            say(format!("{dim}network \"none\" — not checked{r}"));
+            continue;
+        }
+        let equipped = layout
+            .as_ref()
+            .and_then(|layout| binds::home_src(layout.data_dir(), cwd, home.runtime()).ok())
+            .is_some_and(|home| home.join(MISE_GLOBAL_CONFIG_REL).is_file());
+        if !equipped {
+            say(format!(
+                "{dim}never equipped — its next launch installs the latest release{r}"
+            ));
+            continue;
+        }
+        if let Some(what) = layout
+            .as_ref()
+            .and_then(|layout| first_pin_of_a_launch(layout, cwd, &cfg, home.app()))
+        {
+            say(format!(
+                "{dim}not checked — a launch here would first pin {what}{r}"
+            ));
+            continue;
+        }
+        let mut prep = match prepare_roll_cage(cwd, home.app()) {
+            Ok(p) => p,
+            Err(_) => {
+                say(format!("{warn}failed to prepare{r}"));
+                ok = false;
+                continue;
+            }
+        };
+        let mut cfg = cfg;
+        cfg.warnings.clear();
+        // What a launch would run before the command — the bundles' install steps and the app's
+        // services — has no place in a cage asked a question, and the equip lanes would install the
+        // very tools whose absence this reports. Nor do the app's other packages: the host would
+        // build them, and fetch a prebuilt one its store does not hold yet, for a question only mise
+        // answers. The `mise:` ones stay, because the environment the exemptions are written into
+        // derives from them.
+        cfg.provisions.clear();
+        cfg.service.clear();
+        cfg.packages
+            .retain(|p| matches!(p.backend, crate::config::Backend::Mise(_)));
+        prep.cfg = cfg;
+        prep.equips = false;
+        let runtime = home.runtime();
+        let cmd = mise_state_cmd(
+            runtime,
+            &prep.userland.mise_bin,
+            &prep.userland.shell_bin,
+            &tokens,
+        );
+        let (spec, guard, _, _store_lock) = match build(&prep, runtime, cmd) {
+            Ok(v) => v,
+            Err(_) => {
+                say(format!("{warn}failed to launch{r}"));
+                ok = false;
+                continue;
+            }
+        };
+        let (code, out) = run_captured(&prep.bwrap, &spec, &prep.cfg.limits);
+        drop(guard);
+        let checks = match (code, parse_mise_state(&out, &tokens, "bump")) {
+            (0, Ok(checks)) => checks,
+            (code, parsed) => {
+                let why = match parsed {
+                    Err(why) => why,
+                    Ok(_) => format!("mise exited {code}"),
+                };
+                say(format!("{warn}could not be checked — {why}{r}"));
+                crate::diag::warn(&format!("`{}`: the mise check failed", home.label()));
+                echo_cage_output(&out);
+                ok = false;
+                continue;
+            }
+        };
+        let lines = mise_check_lines(&checks, pal);
+        let current = checks
+            .iter()
+            .all(|c| matches!(c, MiseCheck::Current { .. }));
+        if current {
+            say(format!("{dim}up to date{r}"));
+        } else {
+            say(format!("{ok_c}{}{r}", mise_check_tally(&checks)));
+            for line in lines {
+                outln!("       {line}");
+            }
+            if checks.iter().any(|c| matches!(c, MiseCheck::Behind { .. })) {
+                behind.push(name.clone());
+            }
+        }
+    }
+    if has_pool {
+        outln!(
+            "{}",
+            roll_line(
+                "task pool",
+                width,
+                &format!("{dim}not checked by a dry run — `sbx upgrade mise` rolls it{r}"),
+                pal
+            )
+        );
+    }
+    let recap = if behind.is_empty() {
+        format!("{dim}nothing would roll.{r}")
+    } else {
+        format!(
+            "{ok_c}{} would roll: {}.{r}",
+            behind.len(),
+            behind.join(", ")
+        )
+    };
+    outln!("  {recap}");
+    ok
+}
+
+/// What building this group's cage would pin before anything ran in it, `None` when every lock the
+/// preparation resolves already pins what it asks for.
+///
+/// A cage's preparation resolves the base channel of its launch identity, the mise engine and, when
+/// the project declares one, the distribution image, and each of them writes its lock when it finds
+/// none for its source: a seed from the global channel, a first resolution, an image unpacked and
+/// pinned. A dry run must write no lock, so a group whose cage would do one of those is not asked,
+/// and the reason is said. Pure file reads: no nix, no network.
+fn first_pin_of_a_launch(
+    layout: &crate::store::Layout,
+    cwd: &Path,
+    cfg: &crate::config::Resolved,
+    app: Option<&str>,
+) -> Option<&'static str> {
+    let base = effective_lock_target(cwd, layout, cfg, app)
+        .ok()
+        .and_then(|target| target.locked_revision());
+    if base.is_none() {
+        return Some("its base channel");
+    }
+    let engine = crate::store::LockTarget::engine(
+        layout,
+        cfg.mise_engine.as_deref(),
+        cfg.nixpkgs_global.as_deref(),
+    );
+    if engine.locked_revision().is_none() {
+        return Some("the mise engine");
+    }
+    if let Some(locator) = cfg.distro.as_deref() {
+        let pinned = distro_lock_path(cwd, layout, cfg)
+            .ok()
+            .and_then(|lock| crate::store::read_lock_lines(&lock))
+            .is_some_and(|(source, key)| source == locator && key.is_some());
+        if !pinned {
+            return Some("the distribution image");
+        }
+    }
+    None
+}
+
+/// Where a home's global mise config sits, relative to the home: the file the launch's
+/// `mise use -g --pin` writes, so its absence means the home was never equipped.
+const MISE_GLOBAL_CONFIG_REL: &str = ".config/mise/config.toml";
+
+/// What a dry run found for one declared `mise:` tool in one home.
+#[derive(Debug, PartialEq, Eq)]
+enum MiseCheck {
+    /// Installed, and a roll would leave it where it is.
+    Current { tool: String, version: String },
+    /// Installed, and a roll would move it from `from` to `to`.
+    Behind {
+        tool: String,
+        from: String,
+        to: String,
+    },
+    /// Declared, but not installed in this home: its next launch installs it.
+    NotEquipped { tool: String },
+    /// Installed, but mise could not ask the tool's registry what is newest.
+    Unknown { tool: String, why: String },
+}
+
+/// The key mise files a declared token under in its JSON reports: the token without its
+/// `[options]` and without an explicit `@version`. `github:example/tool[version_prefix=v]` is
+/// reported as `github:example/tool`; an npm scope is not a version (see
+/// [`crate::sandbox::taskpool::split_version`]).
+fn mise_tool_key(token: &str) -> String {
+    let bare = match (token.find('['), token.rfind(']')) {
+        (Some(open), Some(close)) if open < close => {
+            format!("{}{}", &token[..open], &token[close + 1..])
+        }
+        _ => token.to_string(),
+    };
+    crate::sandbox::taskpool::split_version(&bare).0.to_string()
+}
+
+/// Read what [`mise_state_cmd`] printed into one [`MiseCheck`] per declared tool.
+///
+/// `target` is the field of `mise outdated` that names where a roll would go: `bump` for a roll
+/// that runs `mise upgrade --bump`, `latest` for a plain one, which leaves `bump` null.
+///
+/// A tool absent from `outdated` is current only when mise did not say it failed to look it up:
+/// mise reports that failure as a warning on stderr, exits 0, and leaves the tool out, which would
+/// otherwise read exactly like a tool with nothing newer. Every string here was chosen by a remote
+/// registry, so each is sanitised before it reaches a terminal.
+fn parse_mise_state(
+    captured: &str,
+    tokens: &[String],
+    target: &str,
+) -> Result<Vec<MiseCheck>, String> {
+    let (_, after) = captured
+        .split_once(MISE_STATE_MARKER)
+        .ok_or_else(|| "mise printed no report".to_string())?;
+    let doc = serde_json::Deserializer::from_str(after.trim_start())
+        .into_iter::<serde_json::Value>()
+        .next()
+        .and_then(Result::ok)
+        .ok_or_else(|| "mise's report is not JSON".to_string())?;
+    let text = |v: Option<&serde_json::Value>| {
+        v.and_then(serde_json::Value::as_str)
+            .map(crate::sandbox::sanitize)
+    };
+    let mut checks = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for token in tokens {
+        let key = mise_tool_key(token);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key.clone());
+        let tool = crate::sandbox::sanitize(&key);
+        let installed = doc
+            .get("ls")
+            .and_then(|ls| ls.get(&key))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|entries| {
+                entries.iter().find(|e| {
+                    e.get("installed")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                })
+            })
+            .and_then(|e| text(e.get("version")));
+        let Some(version) = installed else {
+            checks.push(MiseCheck::NotEquipped { tool });
+            continue;
+        };
+        let entry = doc.get("outdated").and_then(|o| o.get(&key));
+        let to = text(entry.and_then(|e| e.get(target)));
+        let from = text(entry.and_then(|e| e.get("current"))).unwrap_or_else(|| version.clone());
+        match to {
+            Some(to) if to != from => checks.push(MiseCheck::Behind { tool, from, to }),
+            _ => {
+                let failed = format!("Error getting latest version for {key}:");
+                match captured.lines().find_map(|l| l.split_once(&failed)) {
+                    Some((_, why)) => checks.push(MiseCheck::Unknown {
+                        tool,
+                        why: crate::sandbox::sanitize(why.trim()),
+                    }),
+                    None => checks.push(MiseCheck::Current { tool, version }),
+                }
+            }
+        }
+    }
+    Ok(checks)
+}
+
+/// The status column of one group's dry-run line: how many tools would roll, how many are not
+/// equipped yet, how many could not be checked. Called only when at least one tool is not current.
+fn mise_check_tally(checks: &[MiseCheck]) -> String {
+    let count = |f: fn(&MiseCheck) -> bool| checks.iter().filter(|c| f(c)).count();
+    let behind = count(|c| matches!(c, MiseCheck::Behind { .. }));
+    let missing = count(|c| matches!(c, MiseCheck::NotEquipped { .. }));
+    let unknown = count(|c| matches!(c, MiseCheck::Unknown { .. }));
+    let mut parts = Vec::new();
+    if behind > 0 {
+        parts.push(format!("{behind} would roll"));
+    }
+    if missing > 0 {
+        parts.push(format!("{missing} not equipped yet"));
+    }
+    if unknown > 0 {
+        parts.push(format!("{unknown} not checked"));
+    }
+    parts.join(", ")
+}
+
+/// One line per tool that is not current, indented under its group's line. A move the versions do
+/// not call forward is named, as the roll names it.
+fn mise_check_lines(checks: &[MiseCheck], pal: &crate::style::Palette) -> Vec<String> {
+    let (n, ok, warn, dim, r) = (pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
+    checks
+        .iter()
+        .filter_map(|check| match check {
+            MiseCheck::Current { .. } => None,
+            MiseCheck::Behind { tool, from, to } => {
+                Some(match crate::version::regression(from, to) {
+                    Some(reg) => {
+                        format!("{n}{tool}{r} {from} → {to} — {warn}{}{r}", reg.describe())
+                    }
+                    None => format!("{n}{tool}{r} {from} → {to} — {ok}would roll forward.{r}"),
+                })
+            }
+            MiseCheck::NotEquipped { tool } => Some(format!(
+                "{n}{tool}{r}: {dim}not equipped yet — its next launch installs it.{r}"
+            )),
+            MiseCheck::Unknown { tool, why } => Some(format!(
+                "{n}{tool}{r}: {warn}could not be checked{r} — {why}"
+            )),
+        })
+        .collect()
 }
 
 /// One in-cage provision roll: the app whose bundles carry install steps, the merged config to

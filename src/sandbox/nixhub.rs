@@ -443,12 +443,16 @@ fn prune_tool_roots(roots: &Path, declared: &[NixTool]) {
 /// dropped — but only for the current `system`, so a data directory shared across machines
 /// never loses another host's still-valid pins. The caller invokes this only for a trusted
 /// project (an untrusted one's tools are never locked).
+///
+/// Under [`super::RollMode::DryRun`] every request is resolved the same way and the outcomes are
+/// the same, but the lock is not written.
 pub(crate) fn upgrade_tools(
     nix: &Path,
     layout: &Layout,
     project: &Path,
     files: &[(String, Vec<u8>)],
     system: &str,
+    mode: super::RollMode,
 ) -> io::Result<Vec<ToolUpgrade>> {
     let declared = parse_nix_tools(files);
     let id = super::binds::project_runtime_id(project)?;
@@ -538,7 +542,9 @@ pub(crate) fn upgrade_tools(
         });
     }
 
-    lock.write(&lock_path)?;
+    if mode.applies() {
+        lock.write(&lock_path)?;
+    }
     Ok(outcomes)
 }
 
@@ -1486,8 +1492,36 @@ mod resolve_tests {
         )];
 
         let bogus_nix = Path::new("/nonexistent/sbx-test-nix");
-        let outcomes = upgrade_tools(bogus_nix, &layout, project.path(), &mise_files, &system)
-            .expect("upgrade_tools rewrites the lock");
+        // A dry run first: the same outcomes, and the lock exactly as it was seeded.
+        let seeded = std::fs::read(&lock_path).expect("the seeded lock");
+        let dry = upgrade_tools(
+            bogus_nix,
+            &layout,
+            project.path(),
+            &mise_files,
+            &system,
+            crate::sandbox::RollMode::DryRun,
+        )
+        .expect("a dry run reports");
+        assert_eq!(
+            std::fs::read(&lock_path).expect("the lock"),
+            seeded,
+            "a dry run writes nothing"
+        );
+        let outcomes = upgrade_tools(
+            bogus_nix,
+            &layout,
+            project.path(),
+            &mise_files,
+            &system,
+            crate::sandbox::RollMode::Apply,
+        )
+        .expect("upgrade_tools rewrites the lock");
+        assert_eq!(
+            format!("{dry:?}"),
+            format!("{outcomes:?}"),
+            "a dry run reports what the roll then does"
+        );
 
         assert!(
             outcomes

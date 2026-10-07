@@ -488,3 +488,210 @@ fn a_roll_line_drops_only_a_token_that_names_the_app() {
     assert!(!token_names_app("opencode", "orca-desktop"));
     assert!(!token_names_app("npm:agent-browser", "hermes"));
 }
+
+/// What `mise_state_cmd` prints, rebuilt from the answers mise 2026.9.18 gave in a cage: one tool
+/// installed and pinned behind, one declared with options and never installed, one whose registry
+/// refused the lookup — that refusal reaching stderr only, after the document.
+fn captured_state(outdated: &str) -> String {
+    format!(
+        "noise a wrap printed\n{MISE_STATE_MARKER}\n{{\"ls\":{{\n\
+  \"aqua:example/demo-tool\": [{{\"version\": \"1.7\", \"requested_version\": \"1.7\", \"installed\": true, \"active\": true}}],\n\
+  \"github:example/opt-tool\": [{{\"version\": \"1.7.1\", \"installed\": false}}],\n\
+  \"npm:@example/scoped\": [{{\"version\": \"0.0.1\", \"installed\": true}}],\n\
+  \"pipx:current-tool\": [{{\"version\": \"2.0.0\", \"installed\": true}}]\n\
+}},\"outdated\":{outdated}}}\n\
+mise WARN  Error getting latest version for npm:@example/scoped: HTTP error: 403 Forbidden\n"
+    )
+}
+
+#[test]
+fn a_mise_check_tells_behind_current_unequipped_and_unknown_apart() {
+    let outdated = r#"{
+  "aqua:example/demo-tool": {"name": "aqua:example/demo-tool", "requested": "1.7", "current": "1.7", "bump": "1.8", "latest": "1.8.2"},
+  "github:example/opt-tool": {"name": "github:example/opt-tool", "requested": "1.7.1", "current": null, "bump": "1.8.2", "latest": "1.8.2"}
+}"#;
+    let tokens: Vec<String> = [
+        "aqua:example/demo-tool",
+        "github:example/opt-tool[version_prefix=v]",
+        "npm:@example/scoped",
+        "pipx:current-tool",
+        "pipx:current-tool",
+    ]
+    .map(String::from)
+    .to_vec();
+    let checks = parse_mise_state(&captured_state(outdated), &tokens, "bump").unwrap();
+    assert_eq!(
+        checks,
+        vec![
+            // `bump` is what `mise upgrade --bump` writes, and it keeps the request's precision:
+            // `1.8`, not the `1.8.2` `latest` names.
+            MiseCheck::Behind {
+                tool: "aqua:example/demo-tool".into(),
+                from: "1.7".into(),
+                to: "1.8".into(),
+            },
+            // Listed in the config but not installed: `outdated` reports it with a null `current`.
+            MiseCheck::NotEquipped {
+                tool: "github:example/opt-tool".into(),
+            },
+            // Absent from `outdated` because the lookup failed, which mise says only on stderr.
+            MiseCheck::Unknown {
+                tool: "npm:@example/scoped".into(),
+                why: "HTTP error: 403 Forbidden".into(),
+            },
+            // Repeated in the declaration, reported once.
+            MiseCheck::Current {
+                tool: "pipx:current-tool".into(),
+                version: "2.0.0".into(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_plain_roll_reads_latest_where_a_bump_roll_reads_bump() {
+    // `mise outdated` without `--bump` leaves `bump` null and names the target in `latest`.
+    let outdated =
+        r#"{"aqua:example/demo-tool": {"current": "1.7", "bump": null, "latest": "1.8.2"}}"#;
+    let tokens = vec!["aqua:example/demo-tool".to_string()];
+    let captured = captured_state(outdated);
+    assert_eq!(
+        parse_mise_state(&captured, &tokens, "latest").unwrap(),
+        vec![MiseCheck::Behind {
+            tool: "aqua:example/demo-tool".into(),
+            from: "1.7".into(),
+            to: "1.8.2".into(),
+        }]
+    );
+    assert_eq!(
+        parse_mise_state(&captured, &tokens, "bump").unwrap(),
+        vec![MiseCheck::Current {
+            tool: "aqua:example/demo-tool".into(),
+            version: "1.7".into(),
+        }],
+        "a null target is no move"
+    );
+}
+
+#[test]
+fn a_mise_check_that_found_no_document_is_an_error_not_a_clean_report() {
+    let tokens = vec!["aqua:example/demo-tool".to_string()];
+    assert!(parse_mise_state("mise ERROR something broke\n", &tokens, "bump").is_err());
+    assert!(
+        parse_mise_state(&format!("{MISE_STATE_MARKER}\n{{\"ls\":"), &tokens, "bump").is_err(),
+        "a document cut short is not read as an empty one"
+    );
+}
+
+#[test]
+fn a_mise_check_drives_nothing_on_the_terminal() {
+    let outdated = "{\"aqua:example/demo-tool\": {\"current\": \"1.7\", \"bump\": \"9\\u001b[2K\\rsbx: trusted\"}}";
+    let tokens = vec!["aqua:example/demo-tool".to_string()];
+    let checks = parse_mise_state(&captured_state(outdated), &tokens, "bump").unwrap();
+    let lines = mise_check_lines(&checks, &crate::style::Palette::plain());
+    assert_eq!(lines.len(), 1);
+    assert!(
+        !lines[0].chars().any(|c| c.is_control()),
+        "a version a registry chose forges no line: {:?}",
+        lines[0]
+    );
+}
+
+#[test]
+fn a_mise_token_is_keyed_without_its_options_or_its_version() {
+    assert_eq!(
+        mise_tool_key("aqua:example/demo-tool"),
+        "aqua:example/demo-tool"
+    );
+    assert_eq!(
+        mise_tool_key("github:example/tool[version_prefix=v]"),
+        "github:example/tool"
+    );
+    assert_eq!(mise_tool_key("npm:@example/scoped"), "npm:@example/scoped");
+    assert_eq!(
+        mise_tool_key("npm:@example/scoped@1.2"),
+        "npm:@example/scoped"
+    );
+    assert_eq!(mise_tool_key("npm:demo@1.2"), "npm:demo");
+    assert_eq!(mise_tool_key("opencode"), "opencode");
+}
+
+#[test]
+fn a_dry_run_tally_counts_only_what_is_not_current() {
+    let checks = [
+        MiseCheck::Behind {
+            tool: "a".into(),
+            from: "1".into(),
+            to: "2".into(),
+        },
+        MiseCheck::NotEquipped { tool: "b".into() },
+        MiseCheck::NotEquipped { tool: "c".into() },
+        MiseCheck::Current {
+            tool: "d".into(),
+            version: "1".into(),
+        },
+    ];
+    assert_eq!(
+        mise_check_tally(&checks),
+        "1 would roll, 2 not equipped yet"
+    );
+}
+
+#[test]
+fn the_dry_run_heading_names_the_flag() {
+    assert_eq!(
+        RollMode::Apply.heading("mise packages"),
+        "sbx upgrade — mise packages"
+    );
+    assert_eq!(
+        RollMode::DryRun.heading("mise packages"),
+        "sbx upgrade --dry-run — mise packages"
+    );
+    assert_eq!(RollMode::DryRun.says("rolled", "would roll"), "would roll");
+}
+
+/// A dry run builds a group's cage only where the preparation would write no lock: each lock it
+/// resolves already pins what it asks for. Revision sources resolve without nix, so the bogus path
+/// is never run.
+#[test]
+fn a_dry_run_skips_a_group_whose_cage_would_first_pin_a_lock() {
+    let data = crate::testutil::TmpDir::new();
+    let project = crate::testutil::TmpDir::new();
+    let layout = crate::store::Layout::under(data.path());
+    std::fs::create_dir_all(layout.data_dir()).unwrap();
+    let nix = Path::new("/nonexistent-nix");
+    let rev = "a".repeat(40);
+    let mut cfg = crate::testutil::resolved_channels(Some(&rev), None);
+    let app = Some("demo-app");
+    let first =
+        |cfg: &crate::config::Resolved| first_pin_of_a_launch(&layout, project.path(), cfg, app);
+
+    assert_eq!(first(&cfg), Some("its base channel"));
+    effective_lock_target(project.path(), &layout, &cfg, app)
+        .unwrap()
+        .refresh(nix, &layout)
+        .unwrap();
+    assert_eq!(first(&cfg), Some("the mise engine"));
+    crate::store::LockTarget::engine(&layout, None, Some(&rev))
+        .refresh(nix, &layout)
+        .unwrap();
+    assert_eq!(first(&cfg), None, "every lock the cage resolves is pinned");
+
+    let locator = "oci:docker.io/library/debian:12";
+    cfg.distro = Some(locator.to_string());
+    assert_eq!(first(&cfg), Some("the distribution image"));
+    let lock = distro_lock_path(project.path(), &layout, &cfg).unwrap();
+    crate::store::write_lock(
+        &lock,
+        "oci:docker.io/library/debian:11",
+        &format!("sha256:{}", "1".repeat(64)),
+    )
+    .unwrap();
+    assert_eq!(
+        first(&cfg),
+        Some("the distribution image"),
+        "a lock left by another image is not this one's pin"
+    );
+    crate::store::write_lock(&lock, locator, &format!("sha256:{}", "2".repeat(64))).unwrap();
+    assert_eq!(first(&cfg), None);
+}

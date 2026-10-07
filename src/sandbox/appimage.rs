@@ -124,16 +124,28 @@ pub(crate) fn resolve_source(
     system: &str,
     fresh: bool,
 ) -> io::Result<(String, String)> {
-    let url = match parse_source(locator) {
-        AppImageSource::Url(url) => url,
-        AppImageSource::Github { owner, repo } => {
-            prebuilt::github_release_asset(&AppImage, nix, layout, &owner, &repo, system, fresh)?
-        }
-    };
+    let url = resolve_url(nix, layout, locator, system, fresh)?;
     // A re-resolve (`fresh`) is an `sbx upgrade` step — capture nix's output and fold the cause
     // into the error; a first launch streams the download progress live.
     let hash = prebuilt::prefetch_hash(nix, layout, &url, fresh, None)?;
     Ok((url, hash))
+}
+
+/// The download URL an `appimage:` locator names now: the locator itself for a direct URL, the
+/// matching release asset for `github:`. No download happens here.
+fn resolve_url(
+    nix: &Path,
+    layout: &Layout,
+    locator: &str,
+    system: &str,
+    fresh: bool,
+) -> io::Result<String> {
+    match parse_source(locator) {
+        AppImageSource::Url(url) => Ok(url),
+        AppImageSource::Github { owner, repo } => {
+            prebuilt::github_release_asset(&AppImage, nix, layout, &owner, &repo, system, fresh)
+        }
+    }
 }
 
 /// The generated nix expression building one `appimage:` package: fetch the pinned `.AppImage`,
@@ -230,6 +242,18 @@ impl prebuilt::Kind for AppImage {
         resolve_source(nix, layout, locator, system, fresh)
     }
 
+    fn resolve_url(
+        &self,
+        nix: &Path,
+        layout: &Layout,
+        locator: &str,
+        system: &str,
+        fresh: bool,
+        _allow_insecure_http: bool,
+    ) -> io::Result<String> {
+        resolve_url(nix, layout, locator, system, fresh)
+    }
+
     fn derivation_expr(
         &self,
         nixpkgs: &str,
@@ -275,8 +299,9 @@ pub(crate) fn upgrade_project(
     project: &Path,
     cfg: &crate::config::Resolved,
     only: Option<&str>,
+    mode: super::RollMode,
 ) -> io::Result<Vec<AppImageUpgrade>> {
-    prebuilt::upgrade_project(&AppImage, nix, layout, project, cfg, only)
+    prebuilt::upgrade_project(&AppImage, nix, layout, project, cfg, only, mode)
 }
 
 /// How many declared `appimage:` packages are withheld for being untrusted. See

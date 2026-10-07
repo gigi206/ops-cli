@@ -85,7 +85,7 @@ use session::{launch_display_name, render_gui_stop_hint};
 
 pub(crate) use detach::{SessionHeader, detach_log_path, parse_session_header};
 pub(crate) use reclaim::{gc, superseded_reclaimable_hint};
-pub(crate) use roll::{upgrade_mise_packages, upgrade_provision_steps};
+pub(crate) use roll::{RollMode, upgrade_mise_packages, upgrade_provision_steps};
 pub(crate) use session::{attach, stop};
 // Re-exported at the width they had as one file: `pub(super)` on a child would now mean "visible in
 // `launch`", and these four are read from `sandbox` itself.
@@ -146,6 +146,12 @@ struct Prepared {
     /// line joins by reading it. It suppresses narration only: no warning, no refusal, and nothing
     /// the cage does is conditioned on it.
     in_batch: bool,
+    /// Whether the cage installs what it declares before running its command: the two mise equip
+    /// lanes and the inline flakes' build. `true` for every launch and every roll; `false` only for
+    /// the cage `sbx upgrade --dry-run` asks mise in, which must report what a home holds without
+    /// installing what it lacks. The environment the equip lanes contribute is kept either way, so
+    /// the in-cage mise reads the same configuration it would after equipping.
+    equips: bool,
     /// What an unresolvable credential costs this launch. `Abort` everywhere but the batch rolls,
     /// which run one captured command per app and must not let a credential that command never
     /// sends decide whether the app is upgraded — see [`crate::sandbox::egress::Unresolved`].
@@ -1301,6 +1307,7 @@ fn prepare_engines(
         engine_ref,
         userland,
         in_batch: false,
+        equips: true,
         unresolved_secret: crate::sandbox::egress::Unresolved::Abort,
         learn_exec: false,
         contract_text: None,

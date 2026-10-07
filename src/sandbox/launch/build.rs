@@ -2551,16 +2551,24 @@ pub(super) fn build(
     // told to trust the project config so they resolve through the shims on PATH. Both fetch, so
     // both wrap the command *before* the egress wrap below — under an allowlist the forwarder is
     // up before either install — and both are skipped under `network = "none"`.
-    // The two mise equip lanes, and the one environment key the open lane needs.
-    let autoequip_env = mise_equip_lanes(prep, runtime, &mut wraps);
+    // The two mise equip lanes, and the one environment key the open lane needs. A cage that does
+    // not equip keeps that key and drops the lanes, so its mise reads the configuration an equipped
+    // cage would.
+    let mut equip_wraps = Vec::new();
+    let autoequip_env = mise_equip_lanes(prep, runtime, &mut equip_wraps);
+    if prep.equips {
+        wraps.extend(equip_wraps);
+    }
 
     // The inline flakes' in-cage build, wrapped around the command.
-    inline_flake_build(
-        prep,
-        &provisioned.flake_pairs,
-        &provisioned.inline_flake_names,
-        &mut wraps,
-    );
+    if prep.equips {
+        inline_flake_build(
+            prep,
+            &provisioned.flake_pairs,
+            &provisioned.inline_flake_names,
+            &mut wraps,
+        );
+    }
 
     // A network allowlist runs the Model-B egress path: stand up the host filtering
     // proxy on a per-launch socket, wire the cage to reach it (the bound socket, the

@@ -1,10 +1,13 @@
-//! `sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>] [--project <path>]`: roll the
+//! `sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>] [--project <path>] [-n]`: roll the
 //! managed channels and `[packages]` backends forward by re-resolving and rewriting their locks, so
 //! versions advance only on an explicit upgrade, never on an sbx binary update. `-a` narrows the
 //! whole roll to one app, across every backend that app rides; `--project` retargets it at another
 //! project, exactly as running the command from that directory would. The lock-rewriting parts need
 //! nix to resolve but not the sandbox boundary; the in-cage `mise:` roll needs the cage and degrades
 //! to a warning where it is unavailable.
+//!
+//! `-n, --dry-run` carries a [`sandbox::RollMode`] through the same channels: each resolves as it
+//! would for the roll and reports in the conditional, and no lock is written and nothing installed.
 //!
 //! The five package backends are rolled by `all` and are not targets of their own: the unit a user
 //! narrows by is the app, not the backend its profile happens to declare. See [`TARGETS`].
@@ -59,6 +62,7 @@ enum ParsedArgs {
         what: &'static str,
         project: Option<OsString>,
         app: Option<String>,
+        mode: sandbox::RollMode,
     },
     Error(String),
 }
@@ -71,11 +75,16 @@ fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
     let mut what: Option<&'static str> = None;
     let mut project: Option<OsString> = None;
     let mut app: Option<String> = None;
+    let mut mode = sandbox::RollMode::Apply;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         match arg.to_str() {
             Some("--help" | "-h") => return ParsedArgs::Help,
+            Some("--dry-run" | "-n") => {
+                mode = sandbox::RollMode::DryRun;
+                i += 1;
+            }
             // `--project <path>`: the value is the next argument, kept as a raw `OsString` so a
             // non-UTF-8 path survives.
             Some("--project") => {
@@ -175,8 +184,23 @@ fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
                 .into(),
         );
     }
+    // `provision` re-runs install steps, and an install step records no version: its guard answers
+    // only whether to install. A dry run of it would have nothing to report but that, so it is
+    // refused with the reason rather than run as a list of question marks.
+    if what == Some("provision") && mode == sandbox::RollMode::DryRun {
+        return ParsedArgs::Error(
+            "sbx: upgrade: `provision` re-runs install steps, which record no version to \
+             compare, so it has nothing to report under --dry-run."
+                .into(),
+        );
+    }
     let what = what.unwrap_or("all");
-    ParsedArgs::Run { what, project, app }
+    ParsedArgs::Run {
+        what,
+        project,
+        app,
+        mode,
+    }
 }
 
 /// `sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>] [--project <path>]`: parse, then
@@ -192,16 +216,29 @@ fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
 pub(crate) fn upgrade_cmd(args: &[OsString]) -> ExitCode {
     // Parse an optional target word and an optional `--project <path>`, in any order, before
     // touching anything so a typo fails cleanly.
-    let (what, project_arg, app_arg) = match parse_upgrade_args(args) {
+    let (what, project_arg, app_arg, mode) = match parse_upgrade_args(args) {
         ParsedArgs::Help => return help::show(&["upgrade"]),
-        ParsedArgs::Run { what: "self", .. } => return super::upgrade_self::upgrade_self_cmd(),
-        ParsedArgs::Run { what, project, app } => (what, project, app),
+        ParsedArgs::Run {
+            what: "self", mode, ..
+        } => return super::upgrade_self::upgrade_self_cmd(mode),
+        ParsedArgs::Run {
+            what,
+            project,
+            app,
+            mode,
+        } => (what, project, app, mode),
         ParsedArgs::Error(message) => {
             diag::error(&message);
             return ExitCode::from(2);
         }
     };
-    run_upgrade("upgrade", what, project_arg.as_deref(), app_arg.as_deref())
+    run_upgrade(
+        "upgrade",
+        what,
+        project_arg.as_deref(),
+        app_arg.as_deref(),
+        mode,
+    )
 }
 
 /// The roll itself, behind both spellings that reach it: `sbx upgrade [target] [--app <name>]` and
@@ -212,12 +249,14 @@ pub(crate) fn upgrade_cmd(args: &[OsString]) -> ExitCode {
 /// per-app verb had become: it rolled two channels and *named* the rest, while `--app` on the same
 /// app rolled whichever channel was typed.
 ///
-/// `verb` is what precedes the colon in a refusal, so each spelling names itself.
+/// `verb` is what precedes the colon in a refusal, so each spelling names itself. `mode` decides
+/// whether the locks are written and the installs run, or the run only reports what it resolved.
 fn run_upgrade(
     verb: &'static str,
     what: &'static str,
     project_arg: Option<&std::ffi::OsStr>,
     app_arg: Option<&str>,
+    mode: sandbox::RollMode,
 ) -> ExitCode {
     // `--project <path>` retargets the whole upgrade at another project — exactly as `cd <path>
     // && sbx upgrade` would: the path is canonicalized (so the per-project lock derivation matches
@@ -313,7 +352,7 @@ fn run_upgrade(
     // close (below).
     let mut moved = Moved::default();
     if matches!(what, "nix" | "all") {
-        let (roll, scope) = upgrade_nix_channel(&nix, &layout, &cwd, &cfg, only, &pal);
+        let (roll, scope) = upgrade_nix_channel(&nix, &layout, &cwd, &cfg, only, mode, &pal);
         ok &= roll.ok;
         if roll.moved {
             moved.base = scope;
@@ -328,8 +367,8 @@ fn run_upgrade(
             // its own private home under sbx's data directory, so no app home ever holds a path
             // into it. The project's `nix:` tools are the opposite — they resolve to store paths
             // the cage binds, so rolling one repoints exactly what a home can hold.
-            ok &= upgrade_mise_engine(&nix, &layout, &cfg, &pal);
-            let roll = upgrade_mise_tools(&nix, &layout, &cwd, &cfg, &pal);
+            ok &= upgrade_mise_engine(&nix, &layout, &cfg, mode, &pal);
+            let roll = upgrade_mise_tools(&nix, &layout, &cwd, &cfg, mode, &pal);
             ok &= roll.ok;
             moved.project_tools |= roll.moved;
         }
@@ -338,13 +377,13 @@ fn run_upgrade(
         // Pass the target directory and its already-loaded config: the groups are computed from the
         // config before any sandbox work (so a project with no `mise:` package keeps this cheap and
         // sandbox-free), and the cage is built against `cwd` so `--project` retargets it too.
-        ok &= sandbox::upgrade_mise_packages(&cwd, &cfg, &pal, only);
+        ok &= sandbox::upgrade_mise_packages(&cwd, &cfg, &pal, only, mode);
     }
     if matches!(what, "all") {
         // The project's and apps' `flake:` `[packages]` re-resolve to a fixed revision and the
         // per-project flake lock is rewritten — a host-side lock rewrite (the new pin builds
         // in-cage at the next launch), like the `nix:` tools.
-        let roll = upgrade_flake_packages(&nix, &layout, &cwd, &cfg, only, &pal);
+        let roll = upgrade_flake_packages(&nix, &layout, &cwd, &cfg, only, mode, &pal);
         ok &= roll.ok;
         moved.flake |= roll.moved;
     }
@@ -352,17 +391,17 @@ fn run_upgrade(
         // The project's and apps' `deb:` `[packages]` re-resolve their `.deb` URL to a new content
         // hash and the per-project deb lock is rewritten — a host-side lock rewrite (the new hash
         // builds host-side at the next launch), like the `nix:` tools and `flake:` packages.
-        ok &= upgrade_deb_packages(&nix, &layout, &cwd, &cfg, only, &pal);
+        ok &= upgrade_deb_packages(&nix, &layout, &cwd, &cfg, only, mode, &pal);
     }
     if matches!(what, "all") {
         // The project's and apps' `appimage:` `[packages]` re-resolve their `.AppImage` URL to a new
         // content hash and the per-project appimage lock is rewritten — the exact `deb:` shape.
-        ok &= upgrade_appimage_packages(&nix, &layout, &cwd, &cfg, only, &pal);
+        ok &= upgrade_appimage_packages(&nix, &layout, &cwd, &cfg, only, mode, &pal);
     }
     if matches!(what, "all") {
         // The project's and apps' `binary:` `[packages]` re-resolve to a new content hash and the
         // per-project binary lock is rewritten — the same shape as the three archive backends.
-        ok &= upgrade_binary_packages(&nix, &layout, &cwd, &cfg, only, &pal);
+        ok &= upgrade_binary_packages(&nix, &layout, &cwd, &cfg, only, mode, &pal);
     }
     if matches!(what, "distro" | "all") && only.is_none() {
         // The declared distribution image: its tag is re-resolved to whatever digest the registry
@@ -373,12 +412,12 @@ fn run_upgrade(
         // than a choice: `ResolvedApp` carries no `distro` field, so the image is the project's and
         // there is no per-app unit to select. `sbx upgrade distro --app <name>` is refused before
         // this point; what this guard covers is the defaulted `all`.
-        ok &= upgrade_distro(&layout, &cwd, &cfg, &pal);
+        ok &= upgrade_distro(&layout, &cwd, &cfg, mode, &pal);
     }
     if matches!(what, "all") {
         // The project's and apps' `tarball:` `[packages]` re-resolve their `.tar.gz` URL to a new
         // content hash and the per-project tarball lock is rewritten — the exact `deb:` shape.
-        ok &= upgrade_tarball_packages(&nix, &layout, &cwd, &cfg, only, &pal);
+        ok &= upgrade_tarball_packages(&nix, &layout, &cwd, &cfg, only, mode, &pal);
     }
     // The bundles' install steps: an agent with no `[packages]` backend has no lock to rewrite, so
     // what advances it is running its install again. Part of `all`, because "bring everything up to
@@ -393,7 +432,14 @@ fn run_upgrade(
     // reports nothing to do. Raising `SBX_UPGRADE` is the only thing that advances an agent whose
     // guard cannot tell — a checkout of a branch has no version to compare — and the way to
     // re-install over a guard that is wrong; the rule below says which runs raise it.
-    if matches!(what, "provision" | "all") {
+    if matches!(what, "all") && !mode.applies() {
+        // An install step records no version, so a dry run has nothing to compare for it and runs
+        // none: it names the apps whose install step a real roll would run, so the report does not
+        // read as though they were checked and found current.
+        for line in provision_dry_run_summary(&cfg, only, &pal) {
+            outln!("{line}");
+        }
+    } else if matches!(what, "provision" | "all") {
         // ONE rule for forcing, written once. Naming a single app is a request to re-install it,
         // not to poll it: the user who typed the name has already decided, and that is the same
         // reading the `provision` verb carries. So `sbx upgrade provision`, `sbx upgrade --app
@@ -410,14 +456,18 @@ fn run_upgrade(
         }
         ok &= sandbox::upgrade_provision_steps(&cwd, &cfg, &pal, only, force);
     }
-    match closing_note(what, moved) {
-        ClosingNote::StoreMoved => store_moved_hint(&cfg, only, moved, &pal),
-        ClosingNote::None => {}
+    // Both closing notes speak of what this run replaced or left behind, and a dry run replaced
+    // nothing.
+    if mode.applies() {
+        match closing_note(what, moved) {
+            ClosingNote::StoreMoved => store_moved_hint(&cfg, only, moved, &pal),
+            ClosingNote::None => {}
+        }
+        // A roll is what eventually supersedes a build. Point the user at `sbx gc --prune` when the
+        // project's store is already holding superseded builds — cheap, filesystem-only, and silent
+        // when there is nothing to reclaim (see the function).
+        sandbox::superseded_reclaimable_hint(&layout, &cwd, &cfg, only, &pal);
     }
-    // A roll is what eventually supersedes a build. Point the user at `sbx gc --prune` when the
-    // project's store is already holding superseded builds — cheap, filesystem-only, and silent
-    // when there is nothing to reclaim (see the function).
-    sandbox::superseded_reclaimable_hint(&layout, &cwd, &cfg, only, &pal);
 
     if ok {
         ExitCode::SUCCESS
@@ -639,11 +689,21 @@ fn install_step_notice(name: &str, cfg: &config::Resolved, pal: &style::Palette)
 /// run resolves only what the named app declares and leaves the lock's other entries — and its
 /// prune — alone.
 pub(crate) fn app_upgrade_cmd(args: &[OsString]) -> ExitCode {
-    let name = match crate::cli::one_name(args, &["app", "upgrade"], &[], "name an app") {
-        Ok((name, _)) => name,
+    let (name, dry_run) = match crate::cli::one_name(
+        args,
+        &["app", "upgrade"],
+        &["-n", "--dry-run"],
+        "name an app",
+    ) {
+        Ok(parsed) => parsed,
         Err(code) => return code,
     };
-    run_upgrade("app upgrade", "all", None, Some(name))
+    let mode = if dry_run {
+        sandbox::RollMode::DryRun
+    } else {
+        sandbox::RollMode::Apply
+    };
+    run_upgrade("app upgrade", "all", None, Some(name), mode)
 }
 
 /// Whether this app rides a `flake:` package the flake roll advances — whose paths a replaced pin
@@ -672,6 +732,43 @@ fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
         .collect();
     apps.sort_unstable();
     apps
+}
+
+/// What a dry run reports for the bundles' install steps, in place of running them.
+///
+/// An install step records no version: its guard answers only whether to install, and asking it
+/// means running it in the app's cage. So there is nothing to resolve and compare, and the apps that
+/// carry one are named as not checked, which keeps the report from reading as though they had been
+/// checked and found current. The selection is the roll's: [`apps_with_install_steps`], narrowed by
+/// the `--app` selector and without the apps whose launch is refused, which the roll leaves out.
+///
+/// Pure over the resolved config, so the wording is pinned by a test without a cage.
+fn provision_dry_run_summary(
+    cfg: &config::Resolved,
+    only: Option<&str>,
+    pal: &style::Palette,
+) -> Vec<String> {
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    let mut lines = vec![format!(
+        "{h}{}{r}",
+        sandbox::RollMode::DryRun.heading("bundle install steps")
+    )];
+    let apps: Vec<&str> = apps_with_install_steps(cfg)
+        .into_iter()
+        .filter(|name| only.is_none_or(|want| want == *name))
+        .filter(|name| cfg.apps.get(*name).is_some_and(|a| a.refusals.is_empty()))
+        .collect();
+    if apps.is_empty() {
+        lines.push(format!("  {dim}no install steps to run.{r}"));
+        return lines;
+    }
+    for name in apps {
+        lines.push(format!(
+            "  {n}{name}{r}: {dim}installed by its bundle, which records no version — not \
+             checked; `sbx app upgrade {name}` re-installs it.{r}"
+        ));
+    }
+    lines
 }
 
 /// What a roll that moved nix store paths did to the app homes built against them.
@@ -835,6 +932,7 @@ fn upgrade_nix_channel(
     cwd: &Path,
     cfg: &config::Resolved,
     only: Option<&str>,
+    mode: sandbox::RollMode,
     pal: &style::Palette,
 ) -> (Roll, Option<store::Scope>) {
     let target = match sandbox::effective_lock_target(cwd, layout, cfg, only) {
@@ -864,7 +962,12 @@ fn upgrade_nix_channel(
     // roll forward). Those two must not collapse — the second is precisely the case that leaves a
     // home holding a path that is gone.
     let before = target.previously_locked();
-    let upgrade = match target.refresh(nix, layout) {
+    let resolved = if mode.applies() {
+        target.refresh(nix, layout)
+    } else {
+        target.peek(nix, layout)
+    };
+    let upgrade = match resolved {
         Ok(u) => u,
         Err(e) => {
             diag::error(&format!("sbx: cannot upgrade the nixpkgs channel: {e}"));
@@ -873,7 +976,8 @@ fn upgrade_nix_channel(
     };
     let moved = before.is_some_and(|prev| prev != upgrade.revision);
     for line in channel_upgrade_summary(
-        "sbx upgrade — nix channel",
+        mode,
+        "nix channel",
         "channel",
         "the new base and tools download",
         target.origin().label(),
@@ -936,6 +1040,7 @@ fn upgrade_distro(
     layout: &store::Layout,
     cwd: &Path,
     cfg: &config::Resolved,
+    mode: sandbox::RollMode,
     pal: &style::Palette,
 ) -> bool {
     // Only a private registry needs one, so bubblewrap is resolved only when a credential was
@@ -976,6 +1081,7 @@ fn upgrade_distro(
         &cfg.distro_run,
         &lock,
         credential.as_deref(),
+        mode,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -986,7 +1092,7 @@ fn upgrade_distro(
             return false;
         }
     };
-    for line in distro_upgrade_summary(cfg.distro_origin, &rolled, pal) {
+    for line in distro_upgrade_summary(mode, cfg.distro_origin, &rolled, pal) {
         outln!("{line}");
     }
     true
@@ -1002,6 +1108,7 @@ fn upgrade_mise_engine(
     nix: &Path,
     layout: &store::Layout,
     cfg: &config::Resolved,
+    mode: sandbox::RollMode,
     pal: &style::Palette,
 ) -> bool {
     let target = store::LockTarget::engine(
@@ -1009,7 +1116,12 @@ fn upgrade_mise_engine(
         cfg.mise_engine.as_deref(),
         cfg.nixpkgs_global.as_deref(),
     );
-    let upgrade = match target.refresh(nix, layout) {
+    let resolved = if mode.applies() {
+        target.refresh(nix, layout)
+    } else {
+        target.peek(nix, layout)
+    };
+    let upgrade = match resolved {
         Ok(u) => u,
         Err(e) => {
             diag::error(&format!("sbx: cannot upgrade the mise engine: {e}"));
@@ -1017,7 +1129,8 @@ fn upgrade_mise_engine(
         }
     };
     for line in channel_upgrade_summary(
-        "sbx upgrade — mise engine",
+        mode,
+        "mise engine",
         "engine",
         "the new engine is provisioned",
         target.origin().label(),
@@ -1040,10 +1153,11 @@ fn upgrade_mise_tools(
     layout: &store::Layout,
     cwd: &Path,
     cfg: &config::Resolved,
+    mode: sandbox::RollMode,
     pal: &style::Palette,
 ) -> Roll {
     let Some(mise) = &cfg.mise else {
-        for line in upgrade_tools_summary(&[], pal) {
+        for line in upgrade_tools_summary(mode, &[], pal) {
             outln!("{line}");
         }
         return Roll::CLEAN;
@@ -1056,15 +1170,21 @@ fn upgrade_mise_tools(
         ));
         return Roll::CLEAN;
     }
-    let outcomes =
-        match sandbox::upgrade_tools(nix, layout, cwd, &mise.files, &sandbox::current_system()) {
-            Ok(o) => o,
-            Err(e) => {
-                diag::error(&format!("sbx: cannot roll the mise tools: {e}"));
-                return Roll::FAILED;
-            }
-        };
-    for line in upgrade_tools_summary(&outcomes, pal) {
+    let outcomes = match sandbox::upgrade_tools(
+        nix,
+        layout,
+        cwd,
+        &mise.files,
+        &sandbox::current_system(),
+        mode,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            diag::error(&format!("sbx: cannot roll the mise tools: {e}"));
+            return Roll::FAILED;
+        }
+    };
+    for line in upgrade_tools_summary(mode, &outcomes, pal) {
         outln!("{line}");
     }
     Roll {
@@ -1082,12 +1202,16 @@ fn upgrade_mise_tools(
 /// The human-readable summary of a mise tools roll: one line per declared tool (rolled,
 /// unchanged, newly pinned, or failed), the entries pruned, and any token sbx does not
 /// handle. Pure, so every outcome is unit-tested without invoking nix.
-fn upgrade_tools_summary(outcomes: &[sandbox::ToolUpgrade], pal: &style::Palette) -> Vec<String> {
+fn upgrade_tools_summary(
+    mode: sandbox::RollMode,
+    outcomes: &[sandbox::ToolUpgrade],
+    pal: &style::Palette,
+) -> Vec<String> {
     use sandbox::ToolUpgrade::*;
     let (h, n, ok, warn, err, dim, r) = (
         pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
     );
-    let mut lines = vec![format!("{h}sbx upgrade — mise tools{r}")];
+    let mut lines = vec![format!("{h}{}{r}", mode.heading("mise tools"))];
     if outcomes.is_empty() {
         lines.push(format!("  {dim}no nix: tools to roll.{r}"));
         return lines;
@@ -1097,12 +1221,14 @@ fn upgrade_tools_summary(outcomes: &[sandbox::ToolUpgrade], pal: &style::Palette
             Unchanged { pkg, version, .. } => {
                 format!("  {n}nix:{pkg}{r}: {n}{version}{r} — {dim}unchanged.{r}")
             }
-            Rolled { pkg, from, to, .. } => {
-                format!("  {n}nix:{pkg}{r}: {n}{from}{r} → {n}{to}{r} — {ok}rolled forward.{r}")
-            }
-            Pinned { pkg, version, .. } => {
-                format!("  {n}nix:{pkg}{r}: {n}{version}{r} — {ok}newly pinned.{r}")
-            }
+            Rolled { pkg, from, to, .. } => format!(
+                "  {n}nix:{pkg}{r}: {n}{from}{r} → {n}{to}{r} — {ok}{}{r}",
+                mode.says("rolled forward.", "would roll forward.")
+            ),
+            Pinned { pkg, version, .. } => format!(
+                "  {n}nix:{pkg}{r}: {n}{version}{r} — {ok}{}{r}",
+                mode.says("newly pinned.", "would be pinned.")
+            ),
             Failed {
                 pkg, error, kept, ..
             } => {
@@ -1117,7 +1243,8 @@ fn upgrade_tools_summary(outcomes: &[sandbox::ToolUpgrade], pal: &style::Palette
                 }
             }
             Pruned { pkg, request } => format!(
-                "  {n}nix:{pkg}{r} ({request}): {dim}removed from the lock (no longer declared).{r}"
+                "  {n}nix:{pkg}{r} ({request}): {dim}{} (no longer declared).{r}",
+                mode.says("removed from the lock", "would be removed from the lock")
             ),
             Ignored {
                 token,
@@ -1150,16 +1277,22 @@ fn upgrade_flake_packages(
     cwd: &Path,
     cfg: &config::Resolved,
     only: Option<&str>,
+    mode: sandbox::RollMode,
     pal: &style::Palette,
 ) -> Roll {
-    let outcomes = match sandbox::upgrade_flake(nix, layout, cwd, cfg, only) {
+    let outcomes = match sandbox::upgrade_flake(nix, layout, cwd, cfg, only, mode) {
         Ok(o) => o,
         Err(e) => {
             diag::error(&format!("sbx: cannot roll the flake packages: {e}"));
             return Roll::FAILED;
         }
     };
-    for line in flake_upgrade_summary(&outcomes, sandbox::withheld_flake_packages(cfg, only), pal) {
+    for line in flake_upgrade_summary(
+        mode,
+        &outcomes,
+        sandbox::withheld_flake_packages(cfg, only),
+        pal,
+    ) {
         outln!("{line}");
     }
     Roll {
@@ -1180,6 +1313,7 @@ fn upgrade_flake_packages(
 /// for being untrusted (so an untrusted project does not read as "none declared" — parity with
 /// the `nix:` tools path). Pure, so every outcome is unit-tested without invoking nix.
 fn flake_upgrade_summary(
+    mode: sandbox::RollMode,
     outcomes: &[sandbox::FlakeUpgrade],
     withheld: usize,
     pal: &style::Palette,
@@ -1188,7 +1322,7 @@ fn flake_upgrade_summary(
     let (h, n, ok, warn, err, dim, r) = (
         pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
     );
-    let mut lines = vec![format!("{h}sbx upgrade — flake packages{r}")];
+    let mut lines = vec![format!("{h}{}{r}", mode.heading("flake packages"))];
     let withheld_note = || {
         style::prose(
             &format!(
@@ -1217,16 +1351,19 @@ fn flake_upgrade_summary(
                 from,
                 to,
             } => format!(
-                "  {n}flake:{reference}{r}: {n}{}{r} → {n}{}{r} — {ok}rolled forward.{r}",
+                "  {n}flake:{reference}{r}: {n}{}{r} → {n}{}{r} — {ok}{}{r}",
                 short_rev(from),
-                short_rev(to)
+                short_rev(to),
+                mode.says("rolled forward.", "would roll forward.")
             ),
             Pinned { reference, rev } => format!(
-                "  {n}flake:{reference}{r}: {n}{}{r} — {ok}newly pinned.{r}",
-                short_rev(rev)
+                "  {n}flake:{reference}{r}: {n}{}{r} — {ok}{}{r}",
+                short_rev(rev),
+                mode.says("newly pinned.", "would be pinned.")
             ),
             Pruned { reference } => format!(
-                "  {n}flake:{reference}{r}: {dim}removed from the lock (no longer declared).{r}"
+                "  {n}flake:{reference}{r}: {dim}{} (no longer declared).{r}",
+                mode.says("removed from the lock", "would be removed from the lock")
             ),
             Failed {
                 reference,
@@ -1264,9 +1401,10 @@ fn upgrade_deb_packages(
     cwd: &Path,
     cfg: &config::Resolved,
     only: Option<&str>,
+    mode: sandbox::RollMode,
     pal: &style::Palette,
 ) -> bool {
-    let outcomes = match sandbox::upgrade_deb(nix, layout, cwd, cfg, only) {
+    let outcomes = match sandbox::upgrade_deb(nix, layout, cwd, cfg, only, mode) {
         Ok(o) => o,
         Err(e) => {
             diag::error(&format!("sbx: cannot roll the deb packages: {e}"));
@@ -1274,6 +1412,7 @@ fn upgrade_deb_packages(
         }
     };
     for line in prebuilt_upgrade_summary(
+        mode,
         "deb",
         &outcomes,
         sandbox::withheld_deb_packages(cfg, only),
@@ -1302,6 +1441,7 @@ fn short_hash(hash: &str) -> &str {
 /// `channel_upgrade_summary` below is told its heading rather than being written twice. Pure, so
 /// every outcome is unit-tested without invoking nix.
 fn prebuilt_upgrade_summary(
+    mode: sandbox::RollMode,
     kind: &str,
     outcomes: &[sandbox::PrebuiltUpgrade],
     withheld: usize,
@@ -1311,7 +1451,10 @@ fn prebuilt_upgrade_summary(
     let (h, n, ok, warn, err, dim, r) = (
         pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
     );
-    let mut lines = vec![format!("{h}sbx upgrade — {kind} packages{r}")];
+    let mut lines = vec![format!(
+        "{h}{}{r}",
+        mode.heading(&format!("{kind} packages"))
+    )];
     let withheld_note = || {
         style::prose(
             &format!(
@@ -1336,17 +1479,38 @@ fn prebuilt_upgrade_summary(
                 short_hash(hash)
             ),
             Rolled { url, from, to } => format!(
-                "  {n}{kind}:{url}{r}: {n}{}{r} → {n}{}{r} — {ok}rolled forward.{r}",
+                "  {n}{kind}:{url}{r}: {n}{}{r} → {n}{}{r} — {ok}{}{r}",
                 short_hash(from),
-                short_hash(to)
+                short_hash(to),
+                mode.says("rolled forward.", "would roll forward.")
             ),
             Pinned { url, hash } => format!(
-                "  {n}{kind}:{url}{r}: {n}{}{r} — {ok}newly pinned.{r}",
-                short_hash(hash)
+                "  {n}{kind}:{url}{r}: {n}{}{r} — {ok}{}{r}",
+                short_hash(hash),
+                mode.says("newly pinned.", "would be pinned.")
             ),
-            Pruned { url } => {
-                format!("  {n}{kind}:{url}{r}: {dim}removed from the lock (no longer declared).{r}")
-            }
+            Pruned { url } => format!(
+                "  {n}{kind}:{url}{r}: {dim}{} (no longer declared).{r}",
+                mode.says("removed from the lock", "would be removed from the lock")
+            ),
+            // The three below come out of a dry run only, which downloads nothing and so knows a
+            // URL but never the hash of what it serves. The URLs are a remote server's answer (a
+            // release asset, an apt index entry), so they are sanitised before they reach the
+            // terminal.
+            Moved { url, from, to } => format!(
+                "  {n}{kind}:{url}{r}: {n}{}{r} → {n}{}{r} — {ok}would roll forward{r} {dim}(the \
+                 new content is hashed when it is downloaded).{r}",
+                sandbox::sanitize(from),
+                sandbox::sanitize(to)
+            ),
+            Unverified { url } => format!(
+                "  {n}{kind}:{url}{r}: {dim}same URL — whether its content changed is only known \
+                 by downloading it.{r}"
+            ),
+            Unpinned { url, source } => format!(
+                "  {n}{kind}:{url}{r}: {dim}not pinned yet — would pin{r} {n}{}{r}{dim}.{r}",
+                sandbox::sanitize(source)
+            ),
             Failed { url, error } => {
                 // A resolve command's or nix's report, the latter carrying the endpoint's response
                 // body: one line, with nothing in it that drives the terminal.
@@ -1370,9 +1534,10 @@ fn upgrade_appimage_packages(
     cwd: &Path,
     cfg: &config::Resolved,
     only: Option<&str>,
+    mode: sandbox::RollMode,
     pal: &style::Palette,
 ) -> bool {
-    let outcomes = match sandbox::upgrade_appimage(nix, layout, cwd, cfg, only) {
+    let outcomes = match sandbox::upgrade_appimage(nix, layout, cwd, cfg, only, mode) {
         Ok(o) => o,
         Err(e) => {
             diag::error(&format!("sbx: cannot roll the appimage packages: {e}"));
@@ -1380,6 +1545,7 @@ fn upgrade_appimage_packages(
         }
     };
     for line in prebuilt_upgrade_summary(
+        mode,
         "appimage",
         &outcomes,
         sandbox::withheld_appimage_packages(cfg, only),
@@ -1401,9 +1567,10 @@ fn upgrade_binary_packages(
     cwd: &Path,
     cfg: &config::Resolved,
     only: Option<&str>,
+    mode: sandbox::RollMode,
     pal: &style::Palette,
 ) -> bool {
-    let outcomes = match sandbox::upgrade_binary(nix, layout, cwd, cfg, only) {
+    let outcomes = match sandbox::upgrade_binary(nix, layout, cwd, cfg, only, mode) {
         Ok(o) => o,
         Err(e) => {
             diag::error(&format!("sbx: cannot roll the binary packages: {e}"));
@@ -1411,6 +1578,7 @@ fn upgrade_binary_packages(
         }
     };
     for line in prebuilt_upgrade_summary(
+        mode,
         "binary",
         &outcomes,
         sandbox::withheld_binary_packages(cfg, only),
@@ -1432,9 +1600,10 @@ fn upgrade_tarball_packages(
     cwd: &Path,
     cfg: &config::Resolved,
     only: Option<&str>,
+    mode: sandbox::RollMode,
     pal: &style::Palette,
 ) -> bool {
-    let outcomes = match sandbox::upgrade_tarball(nix, layout, cwd, cfg, only) {
+    let outcomes = match sandbox::upgrade_tarball(nix, layout, cwd, cfg, only, mode) {
         Ok(o) => o,
         Err(e) => {
             diag::error(&format!("sbx: cannot roll the tarball packages: {e}"));
@@ -1442,6 +1611,7 @@ fn upgrade_tarball_packages(
         }
     };
     for line in prebuilt_upgrade_summary(
+        mode,
         "tarball",
         &outcomes,
         sandbox::withheld_tarball_packages(cfg, only),
@@ -1460,6 +1630,7 @@ fn upgrade_tarball_packages(
 /// revision that cannot roll, or a roll-forward — naming what `downloads`/re-provisions on
 /// the next launch. Pure, so every outcome is unit-tested without invoking nix.
 fn channel_upgrade_summary(
+    mode: sandbox::RollMode,
     heading: &str,
     item: &str,
     downloads: &str,
@@ -1469,12 +1640,13 @@ fn channel_upgrade_summary(
 ) -> Vec<String> {
     let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
     let mut lines = vec![
-        format!("{h}{heading}{r}"),
+        format!("{h}{}{r}", mode.heading(heading)),
         format!("  {item}: {n}{}{r}  ({dim}{origin}{r})", up.source),
     ];
     let outcome = match &up.previous {
         None => format!(
-            "  resolved to {n}{}{r} {ok}(first pin){r} — {downloads} on the next launch.",
+            "  {} {n}{}{r} {ok}(first pin){r} — {downloads} on the next launch.",
+            mode.says("resolved to", "would resolve to"),
             short_rev(&up.revision)
         ),
         Some(prev) if prev == &up.revision && store::is_pinned_revision(&up.source) => format!(
@@ -1486,7 +1658,8 @@ fn channel_upgrade_summary(
             short_rev(&up.revision)
         ),
         Some(prev) => format!(
-            "  {ok}rolled forward{r} {n}{}{r} → {n}{}{r} — {downloads} on the next launch.",
+            "  {ok}{}{r} {n}{}{r} → {n}{}{r} — {downloads} on the next launch.",
+            mode.says("rolled forward", "would roll forward"),
             short_rev(prev),
             short_rev(&up.revision)
         ),
@@ -1503,6 +1676,7 @@ fn channel_upgrade_summary(
 /// function would mean teaching it a second one — and the branch that matters here (a digest
 /// resolving to itself) would silently take the wrong arm.
 fn distro_upgrade_summary(
+    mode: sandbox::RollMode,
     origin: config::Provenance,
     rolled: &sandbox::distro::store::Rolled,
     pal: &style::Palette,
@@ -1532,7 +1706,8 @@ fn distro_upgrade_summary(
     let noun = if derived { "userland" } else { "image" };
     let outcome = match &rolled.previous {
         None => format!(
-            "  resolved to {n}{now}{r} {ok}(first pin){r} — the {noun} is built on the next launch."
+            "  {} {n}{now}{r} {ok}(first pin){r} — the {noun} is built on the next launch.",
+            mode.says("resolved to", "would resolve to")
         ),
         Some(prev) if prev == &rolled.key && pinned && !derived => {
             format!("  pinned to a fixed digest {n}{now}{r} — {dim}nothing to roll.{r}")
@@ -1553,18 +1728,19 @@ fn distro_upgrade_summary(
                 None => "the base it was built from is no longer recorded".to_string(),
             };
             format!(
-                "  {ok}rebuilt{r} {n}{}{r} → {n}{now}{r} ({why}) — built on the next launch.",
+                "  {ok}{}{r} {n}{}{r} → {n}{now}{r} ({why}) — built on the next launch.",
+                mode.says("rebuilt", "would rebuild"),
                 short(prev)
             )
         }
         Some(prev) => format!(
-            "  {ok}rolled forward{r} {n}{}{r} → {n}{now}{r} — the {noun} is unpacked on the next \
-             launch.",
+            "  {ok}{}{r} {n}{}{r} → {n}{now}{r} — the {noun} is unpacked on the next launch.",
+            mode.says("rolled forward", "would roll forward"),
             short(prev)
         ),
     };
     vec![
-        format!("{h}sbx upgrade — distribution image{r}"),
+        format!("{h}{}{r}", mode.heading("distribution image")),
         format!("  image: {n}{}{r}  ({dim}{origin}{r})", rolled.locator),
         outcome,
     ]
@@ -1587,6 +1763,7 @@ mod tests {
                 what: "all",
                 project: None,
                 app: None,
+                mode: sandbox::RollMode::Apply,
             }
         );
     }
@@ -1613,12 +1790,17 @@ mod tests {
         let tag = "oci:docker.io/library/debian:10";
         let pin = "oci:docker.io/library/debian@sha256:".to_string() + &"a".repeat(64);
 
-        let first =
-            distro_upgrade_summary(config::Provenance::Global, &rolled(tag, "a", None), &pal);
+        let first = distro_upgrade_summary(
+            sandbox::RollMode::Apply,
+            config::Provenance::Global,
+            &rolled(tag, "a", None),
+            &pal,
+        );
         assert!(first[2].contains("(first pin)"), "{first:?}");
         assert!(first[1].contains("(global)"), "{first:?}");
 
         let moved = distro_upgrade_summary(
+            sandbox::RollMode::Apply,
             config::Provenance::Project,
             &rolled(tag, "b", Some("a")),
             &pal,
@@ -1631,6 +1813,7 @@ mod tests {
         assert!(moved[1].contains("(project)"), "{moved:?}");
 
         let still = distro_upgrade_summary(
+            sandbox::RollMode::Apply,
             config::Provenance::Global,
             &rolled(tag, "a", Some("a")),
             &pal,
@@ -1640,6 +1823,7 @@ mod tests {
         // A locator that names a digest resolves to itself, and says so in the word a pin earns
         // rather than in the word a tag that did not move earns.
         let pinned = distro_upgrade_summary(
+            sandbox::RollMode::Apply,
             config::Provenance::Global,
             &rolled(&pin, "a", Some("a")),
             &pal,
@@ -1663,7 +1847,12 @@ mod tests {
             base: full("b"),
             previous_base: Some(full("a")),
         };
-        let out = distro_upgrade_summary(config::Provenance::Global, &base_moved, &pal);
+        let out = distro_upgrade_summary(
+            sandbox::RollMode::Apply,
+            config::Provenance::Global,
+            &base_moved,
+            &pal,
+        );
         assert!(out[2].contains("rebuilt"), "{out:?}");
         assert!(out[2].contains("the base moved"), "{out:?}");
         assert!(
@@ -1678,7 +1867,12 @@ mod tests {
             base: full("a"),
             previous_base: Some(full("a")),
         };
-        let out = distro_upgrade_summary(config::Provenance::Project, &run_changed, &pal);
+        let out = distro_upgrade_summary(
+            sandbox::RollMode::Apply,
+            config::Provenance::Project,
+            &run_changed,
+            &pal,
+        );
         assert!(out[2].contains("rebuilt"), "{out:?}");
         assert!(out[2].contains("run"), "{out:?}");
         assert!(!out[2].contains("the base moved"), "{out:?}");
@@ -1692,7 +1886,12 @@ mod tests {
             base: full("a"),
             previous_base: Some(full("a")),
         };
-        let out = distro_upgrade_summary(config::Provenance::Global, &same, &pal);
+        let out = distro_upgrade_summary(
+            sandbox::RollMode::Apply,
+            config::Provenance::Global,
+            &same,
+            &pal,
+        );
         assert!(out[2].contains("already at"), "{out:?}");
         assert!(!out[2].contains("rebuilt"), "{out:?}");
     }
@@ -1706,6 +1905,7 @@ mod tests {
                     what: t,
                     project: None,
                     app: None,
+                    mode: sandbox::RollMode::Apply,
                 }
             );
         }
@@ -1989,6 +2189,7 @@ mod tests {
             what: "distro",
             project: Some(OsString::from("/some/dir")),
             app: None,
+            mode: sandbox::RollMode::Apply,
         };
         // space form, target first
         assert_eq!(
@@ -2012,6 +2213,7 @@ mod tests {
                 what: "all",
                 project: Some(OsString::from("/some/dir")),
                 app: None,
+                mode: sandbox::RollMode::Apply,
             }
         );
     }
@@ -2033,6 +2235,7 @@ mod tests {
                     what: "provision",
                     project: None,
                     app: Some("demo-app".to_string()),
+                    mode: sandbox::RollMode::Apply,
                 },
                 "{args:?}"
             );
@@ -2044,6 +2247,7 @@ mod tests {
                 what: "mise",
                 project: Some(OsString::from("/some/dir")),
                 app: Some("demo-app".to_string()),
+                mode: sandbox::RollMode::Apply,
             }
         );
 
@@ -2059,6 +2263,7 @@ mod tests {
                     what: t,
                     project: None,
                     app: Some("demo-app".to_string()),
+                    mode: sandbox::RollMode::Apply,
                 },
                 "`{t}` must accept --app"
             );
@@ -2089,6 +2294,7 @@ mod tests {
                 what: "all",
                 project: None,
                 app: Some("demo-app".to_string()),
+                mode: sandbox::RollMode::Apply,
             }
         );
 
@@ -2400,7 +2606,8 @@ mod tests {
         let newer = "1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c";
         let text = |up| {
             channel_upgrade_summary(
-                "sbx upgrade — nix channel",
+                sandbox::RollMode::Apply,
+                "nix channel",
                 "channel",
                 "the new base and tools download",
                 "default",
@@ -2453,7 +2660,8 @@ mod tests {
         // `engine` item word, and the engine-specific "provisioned" tail — so the two
         // roll commands read differently.
         let engine = channel_upgrade_summary(
-            "sbx upgrade — mise engine",
+            sandbox::RollMode::Apply,
+            "mise engine",
             "engine",
             "the new engine is provisioned",
             "default",
@@ -2474,7 +2682,8 @@ mod tests {
         // each closed by a reset — the feature a captured (plain) stream never exercises.
         let p = style::Palette::colored();
         let colored = channel_upgrade_summary(
-            "sbx upgrade — nix channel",
+            sandbox::RollMode::Apply,
+            "nix channel",
             "channel",
             "the new base and tools download",
             "default",
@@ -2509,6 +2718,7 @@ mod tests {
             proj.path(),
             &cfg,
             Some("demo-app"),
+            sandbox::RollMode::Apply,
             &style::Palette::plain(),
         );
         assert!(!roll.ok, "the roll must refuse rather than run");
@@ -2530,6 +2740,7 @@ mod tests {
             proj.path(),
             &unpinned,
             Some("demo-app"),
+            sandbox::RollMode::Apply,
             &style::Palette::plain(),
         );
         assert!(roll.ok);
@@ -2578,10 +2789,18 @@ mod tests {
             bogus_nix,
             &layout,
             &cfg(&rev_a),
+            sandbox::RollMode::Apply,
             &plain
         ));
-        let (seed, seed_scope) =
-            upgrade_nix_channel(bogus_nix, &layout, data.path(), &cfg(&rev_a), None, &plain);
+        let (seed, seed_scope) = upgrade_nix_channel(
+            bogus_nix,
+            &layout,
+            data.path(),
+            &cfg(&rev_a),
+            None,
+            sandbox::RollMode::Apply,
+            &plain,
+        );
         assert!(seed.ok);
         assert_eq!(
             seed_scope,
@@ -2599,6 +2818,7 @@ mod tests {
             bogus_nix,
             &layout,
             &cfg(&rev_b),
+            sandbox::RollMode::Apply,
             &plain
         ));
         assert_eq!(
@@ -2619,11 +2839,19 @@ mod tests {
             bogus_nix,
             &layout,
             &cfg(&rev_a),
+            sandbox::RollMode::Apply,
             &plain
         ));
         let engine_reseed = std::fs::read(&engine_lock).unwrap();
-        let (rolled, rolled_scope) =
-            upgrade_nix_channel(bogus_nix, &layout, data.path(), &cfg(&rev_b), None, &plain);
+        let (rolled, rolled_scope) = upgrade_nix_channel(
+            bogus_nix,
+            &layout,
+            data.path(),
+            &cfg(&rev_b),
+            None,
+            sandbox::RollMode::Apply,
+            &plain,
+        );
         assert!(rolled.ok);
         assert_eq!(rolled_scope, Some(store::Scope::Global));
         assert!(
@@ -2646,10 +2874,12 @@ mod tests {
         use sandbox::ToolUpgrade::*;
 
         // an empty roll (no nix: tools, or no mise file) says so plainly
-        let empty = upgrade_tools_summary(&[], &style::Palette::plain()).join("\n");
+        let empty = upgrade_tools_summary(sandbox::RollMode::Apply, &[], &style::Palette::plain())
+            .join("\n");
         assert!(empty.contains("no nix: tools"));
 
         let text = upgrade_tools_summary(
+            sandbox::RollMode::Apply,
             &[
                 Unchanged {
                     pkg: "jq".into(),
@@ -2708,6 +2938,7 @@ mod tests {
         // Colored: the package identifier rides the name span and the failure rides err.
         let p = style::Palette::colored();
         let colored = upgrade_tools_summary(
+            sandbox::RollMode::Apply,
             &[Failed {
                 pkg: "fd".into(),
                 request: "latest".into(),
@@ -2726,18 +2957,23 @@ mod tests {
         use sandbox::FlakeUpgrade::*;
 
         // an empty roll (no flake: packages) says so plainly
-        let empty = flake_upgrade_summary(&[], 0, &style::Palette::plain()).join("\n");
+        let empty =
+            flake_upgrade_summary(sandbox::RollMode::Apply, &[], 0, &style::Palette::plain())
+                .join("\n");
         assert!(empty.starts_with("sbx upgrade — flake packages"));
         assert!(empty.contains("no flake: packages"));
 
         // an empty roll on an untrusted project names the withheld package instead of "none"
-        let withheld = flake_upgrade_summary(&[], 2, &style::Palette::plain()).join("\n");
+        let withheld =
+            flake_upgrade_summary(sandbox::RollMode::Apply, &[], 2, &style::Palette::plain())
+                .join("\n");
         assert!(withheld.contains("2 flake: package(s) withheld (untrusted)"));
         assert!(!withheld.contains("no flake: packages"));
 
         let rev_a = "11707dc2f618dd54ca8739b309ec4fc024de578b";
         let rev_b = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
         let text = flake_upgrade_summary(
+            sandbox::RollMode::Apply,
             &[
                 Unchanged {
                     reference: "github:o/a#default".into(),
@@ -2784,6 +3020,7 @@ mod tests {
         // Colored: the reference rides the name span and the withheld note rides warn.
         let p = style::Palette::colored();
         let colored = flake_upgrade_summary(
+            sandbox::RollMode::Apply,
             &[Pinned {
                 reference: "github:o/c".into(),
                 rev: rev_b.into(),
@@ -2816,16 +3053,31 @@ mod tests {
         use sandbox::PrebuiltUpgrade::*;
 
         // an empty roll (no deb: packages) says so plainly; an untrusted one names the withheld
-        let empty = prebuilt_upgrade_summary("deb", &[], 0, &style::Palette::plain()).join("\n");
+        let empty = prebuilt_upgrade_summary(
+            sandbox::RollMode::Apply,
+            "deb",
+            &[],
+            0,
+            &style::Palette::plain(),
+        )
+        .join("\n");
         assert!(empty.starts_with("sbx upgrade — deb packages"));
         assert!(empty.contains("no deb: packages"));
-        let withheld = prebuilt_upgrade_summary("deb", &[], 1, &style::Palette::plain()).join("\n");
+        let withheld = prebuilt_upgrade_summary(
+            sandbox::RollMode::Apply,
+            "deb",
+            &[],
+            1,
+            &style::Palette::plain(),
+        )
+        .join("\n");
         assert!(withheld.contains("1 deb: package(s) withheld (untrusted)"));
         assert!(!withheld.contains("no deb: packages"));
 
         let h_a = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
         let h_b = "sha256-XH0ykkcZdoyYdI7tQAS55CsvPwv96Tlr2lYF30qltkE=";
         let text = prebuilt_upgrade_summary(
+            sandbox::RollMode::Apply,
             "deb",
             &[
                 Unchanged {
@@ -2863,6 +3115,7 @@ mod tests {
         // "none declared" line. Colored: the URL rides the name span, the note rides warn.
         let p = style::Palette::colored();
         let colored = prebuilt_upgrade_summary(
+            sandbox::RollMode::Apply,
             "deb",
             &[Pinned {
                 url: "https://e/c.deb".into(),
@@ -2885,18 +3138,31 @@ mod tests {
         use sandbox::PrebuiltUpgrade::*;
 
         // an empty roll (no appimage: packages) says so plainly; an untrusted one names the withheld
-        let empty =
-            prebuilt_upgrade_summary("appimage", &[], 0, &style::Palette::plain()).join("\n");
+        let empty = prebuilt_upgrade_summary(
+            sandbox::RollMode::Apply,
+            "appimage",
+            &[],
+            0,
+            &style::Palette::plain(),
+        )
+        .join("\n");
         assert!(empty.starts_with("sbx upgrade — appimage packages"));
         assert!(empty.contains("no appimage: packages"));
-        let withheld =
-            prebuilt_upgrade_summary("appimage", &[], 1, &style::Palette::plain()).join("\n");
+        let withheld = prebuilt_upgrade_summary(
+            sandbox::RollMode::Apply,
+            "appimage",
+            &[],
+            1,
+            &style::Palette::plain(),
+        )
+        .join("\n");
         assert!(withheld.contains("1 appimage: package(s) withheld (untrusted)"));
         assert!(!withheld.contains("no appimage: packages"));
 
         let h_a = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
         let h_b = "sha256-XH0ykkcZdoyYdI7tQAS55CsvPwv96Tlr2lYF30qltkE=";
         let text = prebuilt_upgrade_summary(
+            sandbox::RollMode::Apply,
             "appimage",
             &[
                 Unchanged {
@@ -2939,6 +3205,7 @@ mod tests {
         // The withheld note also rides *after* a roll that did happen, not only in place of the
         // "none declared" line.
         let trailing = prebuilt_upgrade_summary(
+            sandbox::RollMode::Apply,
             "appimage",
             &[Pinned {
                 url: "https://e/c.AppImage".into(),
@@ -2957,18 +3224,31 @@ mod tests {
         use sandbox::PrebuiltUpgrade::*;
 
         // an empty roll (no tarball: packages) says so plainly; an untrusted one names the withheld
-        let empty =
-            prebuilt_upgrade_summary("tarball", &[], 0, &style::Palette::plain()).join("\n");
+        let empty = prebuilt_upgrade_summary(
+            sandbox::RollMode::Apply,
+            "tarball",
+            &[],
+            0,
+            &style::Palette::plain(),
+        )
+        .join("\n");
         assert!(empty.starts_with("sbx upgrade — tarball packages"));
         assert!(empty.contains("no tarball: packages"));
-        let withheld =
-            prebuilt_upgrade_summary("tarball", &[], 1, &style::Palette::plain()).join("\n");
+        let withheld = prebuilt_upgrade_summary(
+            sandbox::RollMode::Apply,
+            "tarball",
+            &[],
+            1,
+            &style::Palette::plain(),
+        )
+        .join("\n");
         assert!(withheld.contains("1 tarball: package(s) withheld (untrusted)"));
         assert!(!withheld.contains("no tarball: packages"));
 
         let h_a = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
         let h_b = "sha256-XH0ykkcZdoyYdI7tQAS55CsvPwv96Tlr2lYF30qltkE=";
         let text = prebuilt_upgrade_summary(
+            sandbox::RollMode::Apply,
             "tarball",
             &[
                 Unchanged {
@@ -3007,6 +3287,7 @@ mod tests {
         // The withheld note also rides *after* a roll that did happen, not only in place of the
         // "none declared" line.
         let trailing = prebuilt_upgrade_summary(
+            sandbox::RollMode::Apply,
             "tarball",
             &[Pinned {
                 url: "https://e/c.tar.gz".into(),
@@ -3030,6 +3311,7 @@ mod tests {
                      nix:jq: 1.7.1 → 9.9.9 — rolled forward.";
         let summaries = [
             upgrade_tools_summary(
+                sandbox::RollMode::Apply,
                 &[sandbox::ToolUpgrade::Failed {
                     pkg: "fd".into(),
                     request: "latest".into(),
@@ -3039,6 +3321,7 @@ mod tests {
                 &style::Palette::plain(),
             ),
             flake_upgrade_summary(
+                sandbox::RollMode::Apply,
                 &[sandbox::FlakeUpgrade::Failed {
                     reference: "github:o/d#default".into(),
                     error: error.into(),
@@ -3048,6 +3331,7 @@ mod tests {
                 &style::Palette::plain(),
             ),
             prebuilt_upgrade_summary(
+                sandbox::RollMode::Apply,
                 "tarball",
                 &[sandbox::PrebuiltUpgrade::Failed {
                     url: "https://e/d.tar.gz".into(),
@@ -3082,6 +3366,7 @@ mod tests {
         // A `[tools]` key is a quoted TOML string, so the mise file spells every character of it:
         // one that mise equips, and one written as `nix:` that sbx cannot resolve.
         let lines = upgrade_tools_summary(
+            sandbox::RollMode::Apply,
             &[
                 sandbox::ToolUpgrade::Ignored {
                     token: "x\u{1b}[2K\rsbx: trusted\u{202e}".into(),
@@ -3116,5 +3401,235 @@ mod tests {
             lines[2],
             "  nix:jq   nix:fd: 1.0 → 9.9 — rolled forward.: malformed nix: token — cannot resolve."
         );
+    }
+
+    #[test]
+    fn dry_run_is_a_flag_of_every_target_but_provision() {
+        for flag in ["--dry-run", "-n"] {
+            assert_eq!(
+                parse_upgrade_args(&os(&[flag])),
+                ParsedArgs::Run {
+                    what: "all",
+                    project: None,
+                    app: None,
+                    mode: sandbox::RollMode::DryRun,
+                },
+                "{flag} alone is a dry run of `all`"
+            );
+            for target in ["all", "nix", "mise", "distro", "self"] {
+                assert!(
+                    matches!(
+                        parse_upgrade_args(&os(&[target, flag])),
+                        ParsedArgs::Run {
+                            mode: sandbox::RollMode::DryRun,
+                            ..
+                        }
+                    ),
+                    "`{target} {flag}` is a dry run"
+                );
+            }
+            // An install step records no version, so there is nothing for a dry run to compare.
+            let ParsedArgs::Error(message) = parse_upgrade_args(&os(&["provision", flag])) else {
+                panic!("`provision {flag}` is refused");
+            };
+            assert!(message.contains("record no version"), "{message}");
+        }
+        assert!(matches!(
+            parse_upgrade_args(&os(&["--app", "demo-app", "--dry-run"])),
+            ParsedArgs::Run {
+                app: Some(_),
+                mode: sandbox::RollMode::DryRun,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_dry_run_of_the_channels_reports_the_move_and_writes_no_lock() {
+        // Revision sources resolve without nix, so the bogus path is never invoked; what is proved
+        // is that the two locks a roll would rewrite keep their bytes under a dry run, while the
+        // report still names the revision the roll would move to.
+        let bogus_nix = Path::new("/nonexistent-nix");
+        let rev_a = "a".repeat(40);
+        let rev_b = "b".repeat(40);
+        let cfg = |global: &str| crate::testutil::resolved_channels(Some(global), None);
+        let data = TmpDir::new();
+        let layout = store::Layout::under(data.path());
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        let plain = style::Palette::plain();
+        let apply = sandbox::RollMode::Apply;
+        let dry = sandbox::RollMode::DryRun;
+        assert!(upgrade_mise_engine(
+            bogus_nix,
+            &layout,
+            &cfg(&rev_a),
+            apply,
+            &plain
+        ));
+        let (seed, _) = upgrade_nix_channel(
+            bogus_nix,
+            &layout,
+            data.path(),
+            &cfg(&rev_a),
+            None,
+            apply,
+            &plain,
+        );
+        assert!(seed.ok);
+        let locks = ["nixpkgs.lock", "mise-engine.lock"].map(|f| layout.data_dir().join(f));
+        let before = locks.each_ref().map(|l| std::fs::read(l).unwrap());
+
+        assert!(upgrade_mise_engine(
+            bogus_nix,
+            &layout,
+            &cfg(&rev_b),
+            dry,
+            &plain
+        ));
+        let (peek, _) = upgrade_nix_channel(
+            bogus_nix,
+            &layout,
+            data.path(),
+            &cfg(&rev_b),
+            None,
+            dry,
+            &plain,
+        );
+        assert!(peek.ok);
+        assert!(
+            peek.moved,
+            "the dry run still sees that the revision would move"
+        );
+        for (lock, bytes) in locks.iter().zip(&before) {
+            assert_eq!(
+                &std::fs::read(lock).unwrap(),
+                bytes,
+                "{} is left as the seed wrote it",
+                lock.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_run_report_names_the_flag_and_speaks_in_the_conditional() {
+        let plain = style::Palette::plain();
+        let dry = sandbox::RollMode::DryRun;
+        let up = store::Upgrade {
+            source: "nixos-unstable".into(),
+            previous: Some("a".repeat(40)),
+            revision: "b".repeat(40),
+        };
+        let text = channel_upgrade_summary(
+            dry,
+            "nix channel",
+            "channel",
+            "it downloads",
+            "default",
+            &up,
+            &plain,
+        )
+        .join("\n");
+        assert!(
+            text.starts_with("sbx upgrade --dry-run — nix channel"),
+            "{text}"
+        );
+        assert!(text.contains("would roll forward"), "{text}");
+        assert!(!text.contains("  rolled forward"), "{text}");
+
+        let tools = upgrade_tools_summary(
+            dry,
+            &[
+                sandbox::ToolUpgrade::Rolled {
+                    pkg: "jq".into(),
+                    request: "latest".into(),
+                    from: "1.7".into(),
+                    to: "1.8".into(),
+                },
+                sandbox::ToolUpgrade::Pruned {
+                    pkg: "old".into(),
+                    request: "1".into(),
+                },
+            ],
+            &plain,
+        )
+        .join("\n");
+        assert!(tools.starts_with("sbx upgrade --dry-run — mise tools"));
+        assert!(
+            tools.contains("nix:jq: 1.7 → 1.8 — would roll forward."),
+            "{tools}"
+        );
+        assert!(tools.contains("would be removed from the lock"), "{tools}");
+    }
+
+    #[test]
+    fn a_dry_run_of_a_prebuilt_says_what_it_knows_without_downloading() {
+        use sandbox::PrebuiltUpgrade::*;
+        let text = prebuilt_upgrade_summary(
+            sandbox::RollMode::DryRun,
+            "deb",
+            &[
+                Moved {
+                    url: "github:example/tool".into(),
+                    from: "https://e/v1/tool.deb".into(),
+                    to: "https://e/v2/tool.deb".into(),
+                },
+                Unverified {
+                    url: "https://e/latest/tool.deb".into(),
+                },
+                Unpinned {
+                    url: "github:example/other".into(),
+                    source: "https://e/v3/other.deb\u{1b}[2K".into(),
+                },
+            ],
+            0,
+            &style::Palette::plain(),
+        );
+        let text = text.join("\n");
+        assert!(text.starts_with("sbx upgrade --dry-run — deb packages"));
+        assert!(text.contains(
+            "deb:github:example/tool: https://e/v1/tool.deb → https://e/v2/tool.deb — would roll \
+             forward (the new content is hashed when it is downloaded)."
+        ));
+        assert!(
+            text.contains("deb:https://e/latest/tool.deb: same URL — whether its content changed")
+        );
+        assert!(text.contains(
+            "deb:github:example/other: not pinned yet — would pin https://e/v3/other.deb"
+        ));
+        assert!(
+            !text.chars().any(|c| c == '\u{1b}'),
+            "a URL a server chose drives nothing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_names_the_install_steps_it_does_not_run() {
+        let plain = style::Palette::plain();
+        let mut cfg = crate::testutil::resolved(vec![], vec![]);
+        assert_eq!(
+            provision_dry_run_summary(&cfg, None, &plain),
+            vec![
+                "sbx upgrade --dry-run — bundle install steps".to_string(),
+                "  no install steps to run.".to_string(),
+            ]
+        );
+        for name in ["demo-app", "other-app"] {
+            let mut app = crate::testutil::app_with(vec![]);
+            app.cmd = vec!["demo".into()];
+            app.provisions = vec![crate::config::BundleProvision {
+                bundle: "demo-bundle".into(),
+                argv: vec!["true".into()],
+            }];
+            cfg.apps.insert(name.to_string(), app);
+        }
+        let all = provision_dry_run_summary(&cfg, None, &plain);
+        assert_eq!(all.len(), 3, "{all:?}");
+        assert!(
+            all[1].starts_with("  demo-app: installed by its bundle, which records no version")
+        );
+        assert!(all[1].ends_with("`sbx app upgrade demo-app` re-installs it."));
+        let one = provision_dry_run_summary(&cfg, Some("other-app"), &plain);
+        assert_eq!(one.len(), 2, "the selector narrows it: {one:?}");
+        assert!(one[1].starts_with("  other-app:"));
     }
 }

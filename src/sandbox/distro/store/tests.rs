@@ -203,3 +203,46 @@ fn a_launch_leaves_a_lock_that_moved_while_it_provisioned() {
         Some((locator.to_string(), Some(newest)))
     );
 }
+
+/// A dry run asks the same question a roll asks and reports the same answer, with the lock left
+/// as it was. A locator that carries its digest resolves to itself, so this needs no registry.
+#[test]
+fn a_dry_run_reports_the_new_digest_and_leaves_the_lock() {
+    let tmp = crate::testutil::TmpDir::new();
+    let layout = layout_under(&tmp.join("data"));
+    let lock = tmp.join("distro.lock");
+    let old = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    let new = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    let locator = format!("oci:docker.io/library/debian@{new}");
+    crate::store::write_lock(&lock, "oci:docker.io/library/debian:10", old).unwrap();
+    let seeded = std::fs::read(&lock).unwrap();
+
+    let dry = refresh(
+        &layout,
+        &locator,
+        &[],
+        &lock,
+        None,
+        crate::sandbox::RollMode::DryRun,
+    )
+    .unwrap();
+    assert_eq!(dry.key, new);
+    assert_eq!(dry.previous.as_deref(), Some(old));
+    assert_eq!(
+        std::fs::read(&lock).unwrap(),
+        seeded,
+        "a dry run writes nothing"
+    );
+
+    let rolled = refresh(
+        &layout,
+        &locator,
+        &[],
+        &lock,
+        None,
+        crate::sandbox::RollMode::Apply,
+    )
+    .unwrap();
+    assert_eq!(rolled, dry, "the roll locks what the dry run reported");
+    assert_eq!(locked_key(&lock, &locator).as_deref(), Some(new));
+}

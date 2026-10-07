@@ -6,7 +6,7 @@ description: "Launch, import, export and inspect the named application profiles.
 
 ```
 sbx app run <name> [--detach] [--observe] [--net-learn[=level]] [--proc-learn[=level]] [[-g|--global|-l|--local] [--dry-run]] [override flags] [-- <args>...]
-sbx app upgrade <name>
+sbx app upgrade <name> [-n]
 sbx app import <file> [--as <new-name>] [--force] [--with-deps]
 sbx app export <name> [--out <file>]
 sbx app rm <name>... [--purge] [--gc]
@@ -171,6 +171,16 @@ and the [`distro`](../configuration/distro) image, which no app can declare.
 It also **prunes nothing**. Dropping a lock entry that no layer declares any more is a
 statement about the project, and a roll narrowed to one app never makes one, so another
 app's pin is never touched.
+
+`-n, --dry-run` says what this roll would move and does none of it: no lock is written,
+nothing is downloaded, and the install step is named rather than run. It is
+`sbx upgrade --app <name> --dry-run` under this name; [Checking before
+rolling](upgrade#checking-before-rolling) lists what each channel can and cannot report
+without applying.
+
+```
+sbx app upgrade claude-code --dry-run
+```
 
 This is newer than the verb. `sbx app upgrade` used to roll the two channels whose unit
 of work was already the app's cage and merely **name** the rest, because a `deb:` or

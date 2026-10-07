@@ -5,7 +5,7 @@ description: "Roll managed toolchains forward by re-resolving and rewriting thei
 # `sbx upgrade`
 
 ```
-sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>] [--project <path>]
+sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>] [--project <path>] [-n]
 ```
 
 Roll managed channels forward by re-resolving and rewriting their locks, so versions
@@ -25,6 +25,7 @@ replaces `sbx` and rolls no channel.
 |---|---|
 | `-a, --app <name>` | narrow the roll to one app, across every channel it rides (`--app=<name>` also accepted) |
 | `--project <path>` | roll another project instead of the current directory (`--project=<path>` also accepted) |
+| `-n, --dry-run` | say what each channel would move to, writing no lock and installing nothing (see [Checking before rolling](#checking-before-rolling)) |
 
 The five package backends (`flake`, `deb`, `appimage`, `tarball` and `binary`) are
 **not targets**. `all` rolls every one of them, and to advance a single app you name the
@@ -55,6 +56,68 @@ itself. Lock writes are atomic (a reader sees old-or-new, never torn).
   `SBX_UPGRADE=1` so each step installs whatever its guard would have said. `all` runs
   the same steps without it, leaving each guard to decide, so an agent whose guard
   compares the upstream release advances there and one whose guard cannot tell does not.
+
+### Checking before rolling
+
+`-n, --dry-run` resolves every channel the roll would and writes nothing: no lock is
+rewritten, nothing is installed or downloaded, and no install step runs. It takes the
+same target, `--app` and `--project`, so it answers for exactly the roll it precedes, in
+that roll's words:
+
+```
+$ sbx upgrade --dry-run
+sbx upgrade --dry-run — nix channel
+  channel: nixos-unstable  (default)
+  already at the latest revision 151fa4e — nothing to do.
+sbx upgrade --dry-run — mise packages
+  aider ......... up to date
+  claude-code ... 1 would roll
+       aqua:anthropics/claude-code 2.1.292 → 2.1.293 — would roll forward.
+  codex ......... 1 would roll
+       aqua:openai/codex 0.160.1 → 0.161.0 — would roll forward.
+  2 would roll: claude-code, codex.
+sbx upgrade --dry-run — deb packages
+  deb:github:aaif-goose/goose: https://github.com/aaif-goose/goose/releases/download/v1.52.0/goose_1.52.0_amd64.deb → https://github.com/aaif-goose/goose/releases/download/v1.53.0/goose_1.53.0_amd64.deb — would roll forward (the new content is hashed when it is downloaded).
+  deb:github:anomalyco/opencode: same URL — whether its content changed is only known by downloading it.
+sbx upgrade --dry-run — bundle install steps
+  trae: installed by its bundle, which records no version — not checked; `sbx app upgrade trae` re-installs it.
+```
+
+What a version is depends on the channel:
+
+| Channel | What a dry run reports |
+|---|---|
+| `nix`, the mise engine | the nixpkgs revision, not the version of each package built from it |
+| the project's `nix:` tools | the version each request resolves to |
+| `mise:` packages | the installed version and the one `mise upgrade --bump` would install |
+| `flake:` packages | the revision |
+| `deb`, `appimage`, `tarball`, `binary` | the download URL, compared with the pinned one |
+| `distro` | the image digest |
+| `self` | whether the release serves another build |
+
+**The prebuilt backends download nothing.** They pin a content hash, and only a download
+computes one. A source that now names another URL (a new GitHub release asset, a new apt
+index entry) is reported with both URLs; a URL that did not move is reported as
+unverified, since the bytes behind a fixed address may still have changed. A
+`<backend>:resolve` command that prints the URL already pinned is reported as unchanged,
+which is the roll's own decision there: it does not fetch that artefact either.
+
+**`mise:` packages are asked in each app's cage**, with the app's egress and environment
+and without its install steps, services or equip. `mise outdated --bump` names where
+`mise upgrade --bump` would go, under the same `minimum_release_age` window and the same
+exemptions, so a release too fresh to install is not announced. It is a second command,
+not the roll minus a write: a release that would then fail to install is still announced.
+An app never launched has nothing installed and is named as such without a cage
+(`never equipped — its next launch installs the latest release`); a tool
+declared since the app's last launch is named as not equipped yet; a tool whose registry
+refused the lookup is named as not checked rather than as current. The cage carries only the
+app's `mise:` packages, so asking it builds and downloads none of the others.
+
+**What a dry run cannot report, it names.** An install step records no version, so the
+apps that carry one are listed as not checked, and `sbx upgrade provision --dry-run` is
+refused. The declared operations' [tool pool](../tasks/execution#the-task-tool-pool) is
+not checked either. `sbx upgrade self --dry-run` reads the release's checksum, or the
+newest stable tag, and says whether another build is served, without downloading it.
 
 ### After a roll that moved the store
 
@@ -244,6 +307,7 @@ fails and says to try again in a few minutes.
 
 ```sh
 sbx upgrade                        # roll everything, current directory
+sbx upgrade --dry-run              # what `sbx upgrade` would move, changing nothing
 sbx upgrade nix                    # just the nixpkgs channel
 sbx upgrade mise                   # the mise engine + tools/packages
 sbx upgrade --app freebuff-desktop # roll one app, whatever it rides

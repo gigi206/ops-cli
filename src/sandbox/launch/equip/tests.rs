@@ -686,3 +686,43 @@ fn wrap_flake_equip_hard_fails_when_a_build_fails_and_no_good_build_exists() {
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("no prior build to fall back to"));
 }
+
+#[test]
+fn mise_state_cmd_asks_both_questions_in_the_pool_the_roll_advances() {
+    let mise = PathBuf::from("/nix/store/mise/bin/mise");
+    let bash = PathBuf::from("/nix/store/bash/bin/bash");
+    let tokens = vec![
+        "aqua:example/demo-tool".to_string(),
+        "x'; rm -rf ~; echo '".to_string(),
+    ];
+    let data_dir = crate::sandbox::binds::mise_app_global_data_dir();
+    for (rt, pinned) in [
+        (binds::Runtime::GlobalApp("cc"), true),
+        (binds::Runtime::ProjectApp("cc"), false),
+        (binds::Runtime::ProjectDefault, false),
+    ] {
+        let cmd = mise_state_cmd(rt, &mise, &bash, &tokens);
+        assert_eq!(cmd[0], OsString::from("/nix/store/bash/bin/bash"));
+        assert_eq!(cmd[1], OsString::from("-c"));
+        let script = cmd[2].to_string_lossy();
+        assert!(
+            script.starts_with("set -e; "),
+            "a failing mise fails the cage: {script}"
+        );
+        assert_eq!(
+            script.contains(&format!("export MISE_DATA_DIR='{data_dir}'; ")),
+            pinned,
+            "only a global app's installs live in the app-global pool: {script}"
+        );
+        assert!(script.contains(MISE_STATE_MARKER));
+        assert!(script.contains("'/nix/store/mise/bin/mise' ls --global --json"));
+        // The roll's own flag, so the target `outdated` names is the one the roll would write.
+        assert!(script.contains("'/nix/store/mise/bin/mise' outdated --bump --json \"$@\""));
+        // The tokens are data: positional, never in the script.
+        assert!(!script.contains("rm -rf"));
+        assert_eq!(
+            cmd[4..],
+            tokens.iter().map(OsString::from).collect::<Vec<_>>()[..]
+        );
+    }
+}

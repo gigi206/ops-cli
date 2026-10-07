@@ -188,6 +188,19 @@ impl prebuilt::Kind for Binary {
         resolve_source(nix, layout, locator, fresh)
     }
 
+    /// The locator is the download URL itself, so there is nothing to ask the network.
+    fn resolve_url(
+        &self,
+        _nix: &Path,
+        _layout: &Layout,
+        locator: &str,
+        _system: &str,
+        _fresh: bool,
+        _allow_insecure_http: bool,
+    ) -> io::Result<String> {
+        Ok(locator.to_string())
+    }
+
     fn derivation_expr(
         &self,
         nixpkgs: &str,
@@ -233,8 +246,9 @@ pub(crate) fn upgrade_project(
     project: &Path,
     cfg: &crate::config::Resolved,
     only: Option<&str>,
+    mode: super::RollMode,
 ) -> io::Result<Vec<BinaryUpgrade>> {
-    prebuilt::upgrade_project(&Binary, nix, layout, project, cfg, only)
+    prebuilt::upgrade_project(&Binary, nix, layout, project, cfg, only, mode)
 }
 
 /// How many declared `binary:` packages are withheld for being untrusted. See [`prebuilt::withheld`].

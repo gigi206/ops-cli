@@ -770,6 +770,19 @@ pub(crate) trait Kind {
         allow_insecure_http: bool,
     ) -> io::Result<(String, String)>;
 
+    /// The download URL `locator` resolves to now, without the content hash: the half of
+    /// [`Kind::resolve_source`] that needs no download. What `sbx upgrade --dry-run` compares with
+    /// the pinned URL, since the hash is only known once the artefact has been fetched.
+    fn resolve_url(
+        &self,
+        nix: &Path,
+        layout: &Layout,
+        locator: &str,
+        system: &str,
+        fresh: bool,
+        allow_insecure_http: bool,
+    ) -> io::Result<String>;
+
     /// The generated nix expression that fetches the pinned artefact, unpacks it this backend's own
     /// way (a `dpkg-deb` data tarball, an AppImage squashfs, a plain `.tar.gz`) and autoPatchelfs the
     /// result — the one step that is genuinely a backend's own.
@@ -1214,6 +1227,31 @@ pub(crate) enum Upgrade {
         url: String,
         error: String,
     },
+    /// A dry run only: the source now resolves to another download URL than the one pinned. The new
+    /// content hash is not known, because computing it means downloading the artefact.
+    Moved {
+        url: String,
+        from: String,
+        to: String,
+    },
+    /// A dry run only: a locator resolves to the URL already pinned, and only a download could tell
+    /// whether the bytes behind it changed.
+    Unverified {
+        url: String,
+    },
+    /// A dry run only: nothing is pinned yet, and `source` is the URL a roll or a first launch would
+    /// pin.
+    Unpinned {
+        url: String,
+        source: String,
+    },
+}
+
+/// What one reference resolved to: a URL with its content hash, or, on a dry run that would have
+/// had to download the artefact to hash it, the URL alone.
+enum Resolution {
+    Hashed(String, String),
+    Url(String),
 }
 
 /// Re-resolve a project's declared references for one backend and rewrite its per-project lock —
@@ -1239,6 +1277,13 @@ pub(crate) enum Upgrade {
 ///
 /// `cage` is the sandbox resolve commands run in. When it is `None` (the host cannot sandbox), a
 /// resolver reference is reported as failed rather than silently frozen at its current pin.
+///
+/// Under [`super::RollMode::DryRun`] nothing is downloaded and the lock is not written. A locator
+/// resolves to its URL only, so a URL that moved is reported as [`Upgrade::Moved`] and one that did
+/// not as [`Upgrade::Unverified`]. A resolver whose URL equals the pinned one is
+/// [`Upgrade::Unchanged`], which is exactly the roll's own decision, since the roll does not fetch
+/// that artefact either.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn upgrade(
     kind: &dyn Kind,
     nix: &Path,
@@ -1247,6 +1292,7 @@ pub(crate) fn upgrade(
     cfg: &crate::config::Resolved,
     cage: Option<&super::resolve::ResolveCage>,
     only: Option<&str>,
+    mode: super::RollMode,
 ) -> io::Result<Vec<Upgrade>> {
     let project_id = super::binds::project_runtime_id(project)?;
     let project_id = project_id.as_str();
@@ -1288,9 +1334,12 @@ pub(crate) fn upgrade(
         let resolved = match reference {
             // A locator: always re-resolve, since its source can move (a `latest` alias, a new
             // release, a new apt index entry) and even a fixed URL's content can change.
-            Ref::Locator(locator) => {
-                kind.resolve_source(nix, layout, locator, &system, true, cfg.allow_insecure_http)
-            }
+            Ref::Locator(locator) if mode.applies() => kind
+                .resolve_source(nix, layout, locator, &system, true, cfg.allow_insecure_http)
+                .map(|(url, hash)| Resolution::Hashed(url, hash)),
+            Ref::Locator(locator) => kind
+                .resolve_url(nix, layout, locator, &system, true, cfg.allow_insecure_http)
+                .map(Resolution::Url),
             // A resolver: re-run its command for the concrete URL. If it equals the stored pin's URL,
             // reuse the pinned hash rather than prefetching the (large) artefact again.
             Ref::Resolve { name, command } => match cage {
@@ -1306,15 +1355,28 @@ pub(crate) fn upgrade(
                     kind.artefact(),
                 ) {
                     Ok(url) => match &previous {
-                        Some(pin) if pin.url == url => Ok((url, pin.hash.clone())),
-                        _ => prefetch_hash(nix, layout, &url, true, None).map(|h| (url, h)),
+                        Some(pin) if pin.url == url => {
+                            Ok(Resolution::Hashed(url, pin.hash.clone()))
+                        }
+                        _ if !mode.applies() => Ok(Resolution::Url(url)),
+                        _ => prefetch_hash(nix, layout, &url, true, None)
+                            .map(|h| Resolution::Hashed(url, h)),
                     },
                     Err(e) => Err(e),
                 },
             },
         };
         match resolved {
-            Ok((url, hash)) => {
+            Ok(Resolution::Url(source)) => outcomes.push(match &previous {
+                Some(pin) if pin.url == source => Upgrade::Unverified { url: key },
+                Some(pin) => Upgrade::Moved {
+                    url: key,
+                    from: pin.url.clone(),
+                    to: source,
+                },
+                None => Upgrade::Unpinned { url: key, source },
+            }),
+            Ok(Resolution::Hashed(url, hash)) => {
                 let outcome = match &previous {
                     Some(pin) if pin.hash == hash => Upgrade::Unchanged {
                         url: key.clone(),
@@ -1340,6 +1402,9 @@ pub(crate) fn upgrade(
         }
     }
 
+    if !mode.applies() {
+        return Ok(outcomes);
+    }
     let mut disk = pins(layout, project_id, &lock_file);
     for (key, previous) in pruned {
         // Compare and swap, key by key. An entry that changed while this roll resolved was written
@@ -1371,6 +1436,7 @@ pub(crate) fn upgrade_project(
     project: &Path,
     cfg: &crate::config::Resolved,
     only: Option<&str>,
+    mode: super::RollMode,
 ) -> io::Result<Vec<Upgrade>> {
     let held = if has_resolve_ref(kind, cfg, only) {
         super::resolve::UpgradeCage::build(nix, layout, project, cfg)
@@ -1378,7 +1444,7 @@ pub(crate) fn upgrade_project(
         None
     };
     let cage = held.as_ref().map(super::resolve::UpgradeCage::as_cage);
-    upgrade(kind, nix, layout, project, cfg, cage.as_ref(), only)
+    upgrade(kind, nix, layout, project, cfg, cage.as_ref(), only, mode)
 }
 
 #[cfg(test)]
@@ -1544,6 +1610,8 @@ mod tests {
         /// Run once, inside the first source resolution, standing in for whatever another process
         /// writes to the lock during the network work a roll does.
         meanwhile: std::cell::Cell<Option<Box<dyn FnOnce()>>>,
+        /// How many resolutions hashed an artefact, which in a real backend is a download.
+        hashed: std::cell::Cell<usize>,
     }
 
     const RECORDED_HASH: &str = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
@@ -1568,10 +1636,23 @@ mod tests {
             _allow_insecure_http: bool,
         ) -> io::Result<(String, String)> {
             self.fresh.set(Some(fresh));
+            self.hashed.set(self.hashed.get() + 1);
             if let Some(meanwhile) = self.meanwhile.take() {
                 meanwhile();
             }
             Ok((locator.to_string(), RECORDED_HASH.to_string()))
+        }
+        fn resolve_url(
+            &self,
+            _nix: &Path,
+            _layout: &Layout,
+            locator: &str,
+            _system: &str,
+            fresh: bool,
+            _allow_insecure_http: bool,
+        ) -> io::Result<String> {
+            self.fresh.set(Some(fresh));
+            Ok(locator.to_string())
         }
         fn derivation_expr(
             &self,
@@ -1617,6 +1698,7 @@ mod tests {
             &cfg,
             None,
             None,
+            crate::sandbox::RollMode::Apply,
         )
         .expect("the roll writes its lock");
 
@@ -1716,6 +1798,7 @@ mod tests {
             &cfg,
             None,
             None,
+            crate::sandbox::RollMode::Apply,
         )
         .expect("the roll reconciles its lock");
 
@@ -1774,6 +1857,7 @@ mod tests {
             &cfg,
             None,
             None,
+            crate::sandbox::RollMode::Apply,
         )
         .expect("the roll still rewrites its lock");
 
@@ -1829,6 +1913,83 @@ mod tests {
             libs: Vec::new(),
             main: String::new(),
         }
+    }
+
+    /// A dry run asks each source for its URL and stops there: nothing is hashed, so nothing is
+    /// downloaded, and the lock keeps every entry, the one a real roll would prune included. What it
+    /// can say is said per entry: a URL that moved, one that did not, one never pinned.
+    #[test]
+    fn a_dry_run_downloads_nothing_and_writes_no_lock() {
+        let data = TmpDir::new();
+        let project = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let kind = Recording::default();
+        let id = super::super::binds::project_runtime_id(project.path()).unwrap();
+        let lock_name = lock_file(&kind);
+        let same = "https://example.com/same.tar.gz";
+        let moved = "https://example.com/moved.tar.gz";
+        let unpinned = "https://example.com/unpinned.tar.gz";
+        let gone = "https://example.com/gone.tar.gz";
+        let tarball = |url: &str| crate::config::Backend::Tarball(url.to_string());
+        let cfg = resolved(
+            vec![
+                pkg("same-app", tarball(same), true),
+                pkg("moved-app", tarball(moved), true),
+                pkg("new-app", tarball(unpinned), true),
+            ],
+            vec![],
+        );
+        let pin = |url: &str| Pin {
+            hash: RECORDED_HASH.to_string(),
+            url: url.to_string(),
+        };
+        let seeded = BTreeMap::from([
+            (same.to_string(), pin(same)),
+            (
+                moved.to_string(),
+                pin("https://example.com/v1/moved.tar.gz"),
+            ),
+            (gone.to_string(), pin(gone)),
+        ]);
+        write_pins(&layout, &id, &lock_name, &seeded).unwrap();
+
+        let outcomes = upgrade(
+            &kind,
+            Path::new("/nonexistent/nix"),
+            &layout,
+            project.path(),
+            &cfg,
+            None,
+            None,
+            crate::sandbox::RollMode::DryRun,
+        )
+        .expect("a dry run reports");
+
+        assert_eq!(
+            kind.hashed.get(),
+            0,
+            "a dry run hashes, so downloads, nothing"
+        );
+        assert_eq!(
+            kind.fresh.get(),
+            Some(true),
+            "it asks past the fetch cache, as the roll does"
+        );
+        assert!(
+            pins(&layout, &id, &lock_name) == seeded,
+            "the lock is left as it was"
+        );
+        let said = |want: &dyn Fn(&Upgrade) -> bool| outcomes.iter().any(want);
+        assert!(said(
+            &|o| matches!(o, Upgrade::Unverified { url } if url == same)
+        ));
+        assert!(said(&|o| matches!(o, Upgrade::Moved { url, from, to }
+            if url == moved && from == "https://example.com/v1/moved.tar.gz" && to == moved)));
+        assert!(said(&|o| matches!(o, Upgrade::Unpinned { url, source }
+            if url == unpinned && source == unpinned)));
+        assert!(said(
+            &|o| matches!(o, Upgrade::Pruned { url } if url == gone)
+        ));
     }
 
     /// `--app <name>` narrows the roll set and leaves the prune universe whole.

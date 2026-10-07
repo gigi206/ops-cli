@@ -62,6 +62,8 @@ enum Outcome {
     NoNewer { newest: String },
     /// The binary was replaced, and the new one reports `to` as its version.
     Replaced { to: String },
+    /// A dry run only: `tag` serves another build than the one running, and nothing was fetched.
+    Available { tag: String },
 }
 
 /// One upgrade: which release to follow, through which tools, and which file it replaces.
@@ -75,10 +77,17 @@ struct Upgrade<'a> {
     /// The bytes running now, hashed to tell whether the release still serves them:
     /// `/proc/self/exe`, which names them even when the path has moved on.
     running: &'a Path,
+    /// Whether to replace the binary, or stop at saying a newer one is served.
+    mode: crate::sandbox::RollMode,
 }
 
 /// `sbx upgrade self`: find the binary to replace, then fetch and install what its release serves.
-pub(crate) fn upgrade_self_cmd() -> ExitCode {
+///
+/// Under [`crate::sandbox::RollMode::DryRun`] it stops once it knows whether the release serves
+/// another build: the checksum and, for a version tag, the releases API are read, and nothing is
+/// downloaded or replaced. A binary its user could not replace is still checked, and the reason a
+/// real run would refuse is said beside the answer.
+pub(crate) fn upgrade_self_cmd(mode: crate::sandbox::RollMode) -> ExitCode {
     let Some(release) = release::PUBLISHED else {
         diag::error(
             "sbx: upgrade self: this sbx was built from source rather than published as a \
@@ -87,8 +96,9 @@ pub(crate) fn upgrade_self_cmd() -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
-    let target = match replaceable_target() {
-        Ok(target) => target,
+    let (target, unreplaceable) = match replaceable_target() {
+        Ok(target) => (target, None),
+        Err(why) if !mode.applies() => (PathBuf::from("/proc/self/exe"), Some(why)),
         Err(why) => {
             diag::error(&format!("sbx: upgrade self: {why}"));
             return ExitCode::FAILURE;
@@ -116,6 +126,7 @@ pub(crate) fn upgrade_self_cmd() -> ExitCode {
         layout: &layout,
         target: &target,
         running: Path::new("/proc/self/exe"),
+        mode,
     };
     match upgrade(&run) {
         Ok(Outcome::Current) => {
@@ -140,6 +151,15 @@ pub(crate) fn upgrade_self_cmd() -> ExitCode {
                     "the sessions already running ({running}) keep the sbx they started with \
                      until they end; `sbx session ls` lists them."
                 ));
+            }
+        }
+        Ok(Outcome::Available { tag }) => {
+            outln!(
+                "sbx upgrade --dry-run — self: `{tag}` serves another build than this one, {from}; \
+                 `sbx upgrade self` installs it."
+            );
+            if let Some(why) = unreplaceable {
+                diag::note(&format!("a real run would refuse: {why}"));
             }
         }
         Err(why) => {
@@ -202,6 +222,11 @@ fn upgrade(run: &Upgrade) -> Result<Outcome, String> {
             {
                 return Ok(Outcome::NoNewer { newest });
             }
+            // A newer stable release is a newer build: a dry run has its answer without the
+            // checksum.
+            if !run.mode.applies() {
+                return Ok(Outcome::Available { tag: newest });
+            }
             newest
         }
     };
@@ -229,6 +254,11 @@ fn upgrade(run: &Upgrade) -> Result<Outcome, String> {
         if crate::trust::hash_bytes(&running) == expected {
             return Ok(Outcome::Current);
         }
+    }
+    // Only a rolling tag reaches this with nothing installed yet to decide: its checksum named
+    // another build.
+    if !run.mode.applies() {
+        return Ok(Outcome::Available { tag });
     }
 
     let fetched = crate::sandbox::prefetch_file(run.nix, run.layout, &url, true, Some(expected))
@@ -326,6 +356,7 @@ mod tests {
         nix: PathBuf,
         target: PathBuf,
         running: PathBuf,
+        mode: crate::sandbox::RollMode,
     }
 
     impl Bench {
@@ -371,6 +402,7 @@ mod tests {
                 nix,
                 target,
                 running,
+                mode: crate::sandbox::RollMode::Apply,
             }
         }
 
@@ -386,6 +418,7 @@ mod tests {
                 layout: &self.layout,
                 target: &self.target,
                 running: &self.running,
+                mode: self.mode,
             })
         }
 
@@ -441,6 +474,41 @@ mod tests {
             std::fs::read_to_string(&bench.target).unwrap(),
             "the old binary"
         );
+    }
+
+    #[test]
+    fn a_dry_run_says_a_newer_build_is_served_and_fetches_nothing() {
+        let served = binary("sbx 0.1.0 (latest, 1111111)", 0);
+        let mut bench = Bench::new(
+            &served,
+            &format!("{}  {}\n", sha256(&served), asset()),
+            r#"{"tag_name": "v0.2.0"}"#,
+        );
+        bench.mode = crate::sandbox::RollMode::DryRun;
+        assert_eq!(
+            bench.run("latest"),
+            Ok(Outcome::Available {
+                tag: "latest".into()
+            })
+        );
+        // A version tag is followed to the newest stable release, and named.
+        assert_eq!(
+            bench.run("v0.1.0"),
+            Ok(Outcome::Available {
+                tag: "v0.2.0".into()
+            })
+        );
+        let calls = bench.calls();
+        assert!(
+            !calls.contains("prefetch-file"),
+            "nothing is downloaded: {calls}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&bench.target).unwrap(),
+            "the old binary",
+            "nothing is replaced"
+        );
+        assert_eq!(left_alone(&bench), vec!["sbx".to_string()]);
     }
 
     #[test]
@@ -583,6 +651,7 @@ mod tests {
                 layout: &layout,
                 target: &target,
                 running: &running,
+                mode: crate::sandbox::RollMode::Apply,
             })
         };
 

@@ -278,13 +278,14 @@ pub(crate) fn withheld(cfg: &crate::config::Resolved, only: Option<&str>) -> usi
 /// reference is no longer declared (so a removed-then-readded package never reuses a stale pin).
 /// References are collected generically by [`declared`]; resolution is best-effort per
 /// reference (a failure keeps the prior pin and is reported), and the lock is rewritten once at
-/// the end.
+/// the end — or, under [`super::RollMode::DryRun`], left as it is.
 pub(crate) fn upgrade(
     nix: &Path,
     layout: &Layout,
     project: &Path,
     cfg: &crate::config::Resolved,
     only: Option<&str>,
+    mode: super::RollMode,
 ) -> io::Result<Vec<FlakeUpgrade>> {
     let project_id = super::binds::project_runtime_id(project)?;
     let project_id = project_id.as_str();
@@ -348,7 +349,9 @@ pub(crate) fn upgrade(
         }
     }
 
-    write_pins(layout, project_id, &lock)?;
+    if mode.applies() {
+        write_pins(layout, project_id, &lock)?;
+    }
     Ok(outcomes)
 }
 
@@ -494,6 +497,61 @@ mod tests {
         let read = pins(&layout, "proj");
         assert_eq!(read.len(), 1, "only the valid pin survives");
         assert!(read.contains_key("github:o/r#default"));
+    }
+
+    /// A dry run reports the entry a roll would prune and leaves it in the lock; the roll then
+    /// removes it. Offline: nothing is declared, so nothing is resolved.
+    #[test]
+    fn a_dry_run_reports_the_prune_and_leaves_the_lock_whole() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let project = TmpDir::new();
+        let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+        let reference = "github:o/gone#default".to_string();
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            reference.clone(),
+            FlakePin {
+                rev: REV.to_string(),
+                locked_ref: format!("github:o/gone/{REV}#default"),
+            },
+        );
+        write_pins(&layout, &id, &entries).unwrap();
+        let seeded = std::fs::read(lock_path(&layout, &id)).unwrap();
+        let cfg = resolved(vec![], vec![]);
+        let nix = Path::new("/nonexistent/nix");
+
+        let dry = upgrade(
+            nix,
+            &layout,
+            project.path(),
+            &cfg,
+            None,
+            crate::sandbox::RollMode::DryRun,
+        )
+        .unwrap();
+        assert!(
+            matches!(dry.as_slice(), [FlakeUpgrade::Pruned { reference: r }] if *r == reference)
+        );
+        assert_eq!(
+            std::fs::read(lock_path(&layout, &id)).unwrap(),
+            seeded,
+            "a dry run writes nothing"
+        );
+
+        upgrade(
+            nix,
+            &layout,
+            project.path(),
+            &cfg,
+            None,
+            crate::sandbox::RollMode::Apply,
+        )
+        .unwrap();
+        assert!(
+            pins(&layout, &id).is_empty(),
+            "the roll prunes what the dry run named"
+        );
     }
 
     #[test]

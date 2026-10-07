@@ -91,6 +91,48 @@ pub(super) fn mise_upgrade_cmd(
     }
 }
 
+/// The line [`mise_state_cmd`] prints before its JSON document, so the reader finds the document
+/// whatever a wrap printed on stdout ahead of it.
+pub(super) const MISE_STATE_MARKER: &str = "@@sbx-mise-state@@";
+
+/// The command a dry run asks a group's home with: what that home's global mise config holds
+/// (`mise ls --global --json`) and what `mise upgrade --bump` would move it to
+/// (`mise outdated --bump --json <tokens>`), printed as one JSON document `{"ls": …, "outdated": …}`
+/// after [`MISE_STATE_MARKER`].
+///
+/// Both questions are needed. `outdated` lists only what is behind: a tool that is current and one
+/// that was never installed are both absent from it, and only `ls` tells them apart.
+///
+/// Run through bash in every runtime, with the same `MISE_DATA_DIR` pin [`mise_upgrade_cmd`] takes
+/// for a global app, so `ls` reads the installs the roll would advance. `set -e` makes a failing
+/// mise the cage's exit status. The tokens ride `"$@"` positionally and the two interpolated values
+/// go through [`shell_quote`], for the reasons given there.
+pub(super) fn mise_state_cmd(
+    runtime: binds::Runtime,
+    mise: &Path,
+    bash: &Path,
+    tokens: &[String],
+) -> Vec<OsString> {
+    let pin = match binds::app_equip_data_dir(runtime) {
+        Some(data_dir) => format!("export MISE_DATA_DIR={}; ", shell_quote(&data_dir)),
+        None => String::new(),
+    };
+    let mise = shell_quote(&mise.to_string_lossy());
+    let script = format!(
+        "set -e; {pin}printf '%s\\n{{\"ls\":' '{MISE_STATE_MARKER}'; {mise} ls --global --json; \
+         printf ',\"outdated\":'; {mise} outdated {MISE_ROLL_FLAG} --json \"$@\"; printf '}}\\n'"
+    );
+    let mut cmd = vec![
+        bash.as_os_str().to_os_string(),
+        OsString::from("-c"),
+        OsString::from(script),
+        // `$0` — a label; the tokens are `$1..$n`.
+        OsString::from("sbx-mise-state"),
+    ];
+    cmd.extend(tokens.iter().map(OsString::from));
+    cmd
+}
+
 /// A list of mise tool tokens, rendered for the launching terminal.
 ///
 /// The tokens [`auto_equip_tokens`] produces are a `[tools]` key and version copied verbatim out of

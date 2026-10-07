@@ -162,23 +162,37 @@ pub(crate) fn resolve_source(
     fresh: bool,
     allow_insecure_http: bool,
 ) -> io::Result<(String, String)> {
-    // `expected` is `Some` only for an apt repository whose index a pinned key attests: that is the
-    // one source here that publishes a digest sbx did not compute itself. A plain URL and a GitHub
-    // asset pin what arrived, which is what the lock has always recorded for them.
-    let (url, expected) = match parse_source(locator) {
-        DebSource::Url(url) => (url, None),
-        DebSource::Github { owner, repo } => (
-            prebuilt::github_release_asset(&Deb, nix, layout, &owner, &repo, system, fresh)?,
-            None,
-        ),
-        DebSource::Apt { packages_url } => {
-            resolve_apt_deb_url(nix, layout, &packages_url, fresh, allow_insecure_http)?
-        }
-    };
+    let (url, expected) = locate(nix, layout, locator, system, fresh, allow_insecure_http)?;
     // A re-resolve (`fresh`) is an `sbx upgrade` step — capture nix's output and fold the cause
     // into the error; a first launch streams the download progress live.
     let hash = prebuilt::prefetch_hash(nix, layout, &url, fresh, expected.as_deref())?;
     Ok((url, hash))
+}
+
+/// The download URL a `deb:` locator names now, with the digest an attested apt index publishes for
+/// it. No `.deb` is downloaded here.
+///
+/// `expected` is `Some` only for an apt repository whose index a pinned key attests: that is the
+/// one source here that publishes a digest sbx did not compute itself. A plain URL and a GitHub
+/// asset pin what arrived, which is what the lock has always recorded for them.
+fn locate(
+    nix: &Path,
+    layout: &Layout,
+    locator: &str,
+    system: &str,
+    fresh: bool,
+    allow_insecure_http: bool,
+) -> io::Result<(String, Option<String>)> {
+    match parse_source(locator) {
+        DebSource::Url(url) => Ok((url, None)),
+        DebSource::Github { owner, repo } => Ok((
+            prebuilt::github_release_asset(&Deb, nix, layout, &owner, &repo, system, fresh)?,
+            None,
+        )),
+        DebSource::Apt { packages_url } => {
+            resolve_apt_deb_url(nix, layout, &packages_url, fresh, allow_insecure_http)
+        }
+    }
 }
 
 /// Resolve an `apt:` locator's Packages index to the concrete `.deb` URL of its highest-version
@@ -876,6 +890,18 @@ impl prebuilt::Kind for Deb {
         resolve_source(nix, layout, locator, system, fresh, allow_insecure_http)
     }
 
+    fn resolve_url(
+        &self,
+        nix: &Path,
+        layout: &Layout,
+        locator: &str,
+        system: &str,
+        fresh: bool,
+        allow_insecure_http: bool,
+    ) -> io::Result<String> {
+        locate(nix, layout, locator, system, fresh, allow_insecure_http).map(|(url, _)| url)
+    }
+
     fn derivation_expr(
         &self,
         nixpkgs: &str,
@@ -919,8 +945,9 @@ pub(crate) fn upgrade_project(
     project: &Path,
     cfg: &crate::config::Resolved,
     only: Option<&str>,
+    mode: super::RollMode,
 ) -> io::Result<Vec<DebUpgrade>> {
-    prebuilt::upgrade_project(&Deb, nix, layout, project, cfg, only)
+    prebuilt::upgrade_project(&Deb, nix, layout, project, cfg, only, mode)
 }
 
 /// How many declared `deb:` packages are withheld for being untrusted. See [`prebuilt::withheld`].
