@@ -737,10 +737,13 @@ fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
 /// What a dry run reports for the bundles' install steps, in place of running them.
 ///
 /// An install step records no version: its guard answers only whether to install, and asking it
-/// means running it in the app's cage. So there is nothing to resolve and compare, and the apps that
-/// carry one are named as not checked, which keeps the report from reading as though they had been
-/// checked and found current. The selection is the roll's: [`apps_with_install_steps`], narrowed by
-/// the `--app` selector and without the apps whose launch is refused, which the roll leaves out.
+/// means running it in the app's cage. Nor is every step an installation: one installs the agent,
+/// another rebuilds part of a `mise:` package, another writes a setting, so the line names the step
+/// without calling it one or offering to re-run it. There is nothing to resolve and compare, and the
+/// apps that carry one are named as not checked, which keeps the report from reading as though they
+/// had been checked and found current. The selection is the roll's: [`apps_with_install_steps`],
+/// narrowed by the `--app` selector and without the apps whose launch is refused, which the roll
+/// leaves out.
 ///
 /// Pure over the resolved config, so the wording is pinned by a test without a cage.
 fn provision_dry_run_summary(
@@ -764,8 +767,8 @@ fn provision_dry_run_summary(
     }
     for name in apps {
         lines.push(format!(
-            "  {n}{name}{r}: {dim}installed by its bundle, which records no version — not \
-             checked; `sbx app upgrade {name}` re-installs it.{r}"
+            "  {n}{name}{r}: {dim}carries an install step, which records no version — not \
+             checked.{r}"
         ));
     }
     lines
@@ -3635,10 +3638,12 @@ mod tests {
         }
         let all = provision_dry_run_summary(&cfg, None, &plain);
         assert_eq!(all.len(), 3, "{all:?}");
-        assert!(
-            all[1].starts_with("  demo-app: installed by its bundle, which records no version")
+        // Neutral on purpose: a step may install the agent, rebuild part of a package or write a
+        // setting, so the line neither calls it an installation nor offers to re-run it.
+        assert_eq!(
+            all[1],
+            "  demo-app: carries an install step, which records no version — not checked."
         );
-        assert!(all[1].ends_with("`sbx app upgrade demo-app` re-installs it."));
         let one = provision_dry_run_summary(&cfg, Some("other-app"), &plain);
         assert_eq!(one.len(), 2, "the selector narrows it: {one:?}");
         assert!(one[1].starts_with("  other-app:"));

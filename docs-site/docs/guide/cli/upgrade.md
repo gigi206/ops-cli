@@ -80,7 +80,7 @@ sbx upgrade --dry-run — deb packages
   deb:github:aaif-goose/goose: https://github.com/aaif-goose/goose/releases/download/v1.52.0/goose_1.52.0_amd64.deb → https://github.com/aaif-goose/goose/releases/download/v1.53.0/goose_1.53.0_amd64.deb — would roll forward (the new content is hashed when it is downloaded).
   deb:github:anomalyco/opencode: same URL — whether its content changed is only known by downloading it.
 sbx upgrade --dry-run — bundle install steps
-  trae: installed by its bundle, which records no version — not checked; `sbx app upgrade trae` re-installs it.
+  trae: carries an install step, which records no version — not checked.
 ```
 
 What a version is depends on the channel:
@@ -119,8 +119,9 @@ A group, or a resolve command, whose cage would first pin a lock (a channel neve
 in this project, an image never unpacked) is named as not checked, since a dry run writes
 no lock.
 
-**What a dry run cannot report, it names.** An install step records no version, so the
-apps that carry one are listed as not checked, and `sbx upgrade provision --dry-run` is
+**What a dry run cannot report, it names.** An install step records no version (it may
+install the agent, rebuild part of a package or write a setting), so the apps that carry
+one are listed as not checked, and `sbx upgrade provision --dry-run` is
 refused. The declared operations' [tool pool](../tasks/execution#the-task-tool-pool) is
 not checked either. `sbx upgrade self --dry-run` reads the release's checksum, or the
 newest stable tag, and says whether another build is served, without downloading it.

@@ -1995,8 +1995,9 @@ pub(super) const PAGES: &[Page] = &[
             resolved here, an image never unpacked) is named as not checked, since a dry run\n\
             writes no lock.\n\
             \n\
-            What a dry run cannot report it names. An install step records no version, so the apps\n\
-            that carry one are listed as not checked, and `provision --dry-run` is refused. The\n\
+            What a dry run cannot report it names. An install step records no version (it may\n\
+            install the agent, rebuild part of a package or write a setting), so the apps that\n\
+            carry one are listed as not checked, and `provision --dry-run` is refused. The\n\
             declared operations' tool pool is not checked either. `self --dry-run` reads the\n\
             release's checksum, or the newest stable tag, and says whether another build is served,\n\
             without downloading it.",
