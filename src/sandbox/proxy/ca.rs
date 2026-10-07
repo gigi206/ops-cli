@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -22,17 +22,17 @@ use rustls::{ClientConfig, RootCertStore};
 /// `ClientConfig` builder needs this to have run first. Idempotent and racing-safe.
 pub(super) fn ensure_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        #[expect(
-            clippy::expect_used,
-            reason = "the only way this fails is a provider already installed, and the `Once` \
-                      around it is what makes this the single installer in the process; a \
-                      process with no provider builds no TLS config at all"
-        )]
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("install the ring crypto provider");
-    });
+    ONCE.call_once(install_ring_provider);
+}
+
+/// Install `ring` as the process default provider, or leave the one already installed.
+///
+/// The only way installing fails is a provider already being the default, and that is all a config
+/// builder needs: the `Once` above makes this the single installer sbx runs, but a panic here would
+/// also poison it, so every later TLS config in the process would panic in turn. An `Err` is
+/// therefore the outcome sought, reached another way.
+fn install_ring_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 /// An ephemeral certificate authority: a self-signed CA minted fresh for one proxy session,
@@ -72,7 +72,9 @@ impl Ca {
         ensure_provider();
         let key = KeyPair::generate().map_err(io::Error::other)?;
         let mut params = CertificateParams::new(Vec::new()).map_err(io::Error::other)?;
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        // A path length of zero: this CA signs leaves and nothing else, so a certificate it issued
+        // can never act as an intermediate, whatever that certificate claims.
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         params
             .distinguished_name
@@ -135,10 +137,16 @@ impl Ca {
         //
         // What would reopen it: a way to ask the *existing* matcher whether a host is reachable at
         // all — a host-level predicate the decision itself goes through, not a copy of it.
-        if let Ok(mut leaves) = self.leaves.lock()
-            && leaves.len() < LEAF_CACHE_CAP
-        {
-            leaves.insert(host.to_string(), ck.clone());
+        //
+        // Two handshakes for one new host can both miss and both mint. The first to insert wins and
+        // the other hands out the winner, so a host is served one certificate, not two.
+        if let Ok(mut leaves) = self.leaves.lock() {
+            if let Some(winner) = leaves.get(host) {
+                return Ok(winner.clone());
+            }
+            if leaves.len() < LEAF_CACHE_CAP {
+                leaves.insert(host.to_string(), ck.clone());
+            }
         }
         Ok(ck)
     }
@@ -190,8 +198,17 @@ impl CertResolver {
 
 impl ResolvesServerCert for CertResolver {
     fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        // rustls hands the SNI over already lowercased, without a trailing dot, and validated as a
+        // DNS name; an IP literal in the extension reaches here as no SNI at all.
         let host = client_hello.server_name()?;
-        self.ca.leaf_for(host).ok()
+        self.ca
+            .leaf_for(host)
+            .map_err(|e| {
+                crate::diag::warn(&format!(
+                    "sbx: egress proxy: no certificate for `{host}`, the handshake is refused: {e}"
+                ));
+            })
+            .ok()
     }
 }
 
@@ -199,30 +216,34 @@ impl ResolvesServerCert for CertResolver {
 /// validate the server against the bundled root certificates (`webpki-roots`), so the
 /// interception never weakens the transport — a forged or self-signed upstream is rejected
 /// exactly as it would be without the proxy.
+///
+/// Built once per process and shared: the root store is the same bundled set every time, and a
+/// shared config is what lets rustls resume sessions across connections.
 pub(crate) fn upstream_config() -> Arc<ClientConfig> {
-    ensure_provider();
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    )
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    Arc::clone(CONFIG.get_or_init(|| Arc::new(upstream_client(Vec::new()))))
 }
 
-/// The upstream config for the HTTP/2 branch: identical trust anchoring to [`upstream_config`] (so
-/// the interception never weakens transport — a forged upstream is still rejected), but advertising
-/// ALPN `h2` so the proxy negotiates HTTP/2 with the real gRPC server. gRPC is HTTP/2 end-to-end;
-/// the h2 branch does not translate to HTTP/1.1, so an upstream that will not speak `h2` fails closed.
-pub(crate) fn upstream_config_h2() -> Arc<ClientConfig> {
+/// A client config anchored on the bundled roots, advertising `alpn`.
+fn upstream_client(alpn: Vec<Vec<u8>>) -> ClientConfig {
     ensure_provider();
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut cfg = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    cfg.alpn_protocols = vec![b"h2".to_vec()];
-    Arc::new(cfg)
+    cfg.alpn_protocols = alpn;
+    cfg
+}
+
+/// The upstream config for the HTTP/2 branch: identical trust anchoring to [`upstream_config`] (so
+/// the interception never weakens transport — a forged upstream is still rejected), but advertising
+/// ALPN `h2` so the proxy negotiates HTTP/2 with the real gRPC server. gRPC is HTTP/2 end-to-end;
+/// the h2 branch does not translate to HTTP/1.1, so an upstream that will not speak `h2` fails closed.
+/// Built once per process and shared, as [`upstream_config`] is.
+pub(crate) fn upstream_config_h2() -> Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    Arc::clone(CONFIG.get_or_init(|| Arc::new(upstream_client(vec![b"h2".to_vec()]))))
 }
 
 /// A static `ServerName` for a host string, for opening the proxy's upstream connection.
@@ -230,12 +251,68 @@ pub(crate) fn upstream_config_h2() -> Arc<ClientConfig> {
 /// Shared by the serve loop and the tests so they build it identically.
 pub(crate) fn upstream_server_name(host: &str) -> io::Result<ServerName<'static>> {
     ServerName::try_from(host.to_string())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_already_installed_is_not_a_panic() {
+        // Twice in a row: the second install finds the first one in place.
+        install_ring_provider();
+        install_ring_provider();
+    }
+
+    #[test]
+    fn the_upstream_configs_are_built_once_and_shared() {
+        assert!(Arc::ptr_eq(&upstream_config(), &upstream_config()));
+        assert!(Arc::ptr_eq(&upstream_config_h2(), &upstream_config_h2()));
+        assert!(upstream_config().alpn_protocols.is_empty());
+        assert_eq!(upstream_config_h2().alpn_protocols, vec![b"h2".to_vec()]);
+    }
+
+    #[test]
+    fn handshakes_racing_on_a_new_host_are_served_one_certificate() {
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let leaves: Vec<Arc<CertifiedKey>> = (0..8)
+            .map(|_| {
+                let (ca, start) = (Arc::clone(&ca), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    ca.leaf_for("race.example.com").unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        let kept = ca.leaf_for("race.example.com").unwrap();
+        for leaf in &leaves {
+            assert!(
+                Arc::ptr_eq(leaf, &kept),
+                "a racing handshake was served its own leaf"
+            );
+        }
+    }
+
+    /// The CA's basicConstraints carries a path length of zero, so nothing it signs can serve as an
+    /// intermediate. DER: `SEQUENCE { BOOLEAN TRUE, INTEGER 0 }`; unconstrained it would end after
+    /// the boolean (`30 03 01 01 ff`).
+    #[test]
+    fn the_ca_can_sign_leaves_and_nothing_below_them() {
+        const CA_PATHLEN_0: &[u8] = &[0x30, 0x06, 0x01, 0x01, 0xff, 0x02, 0x01, 0x00];
+        let ca = Ca::ephemeral().unwrap();
+        assert!(
+            ca.ca_cert_der()
+                .as_ref()
+                .windows(CA_PATHLEN_0.len())
+                .any(|w| w == CA_PATHLEN_0),
+            "the CA certificate must constrain its path length to zero"
+        );
+    }
 
     #[test]
     fn upstream_config_builds() {
