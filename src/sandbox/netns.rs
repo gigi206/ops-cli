@@ -54,6 +54,13 @@ const DUMMY_PREFIX: u8 = 24;
 ///
 /// The tap's end of the report channel rides along as a descriptor the command carries, which the
 /// holder's argument list names by number ([`super::nettap::ReportChannel`]).
+///
+/// So does the holder's own program: the running build, opened by descriptor
+/// ([`super::selfcage::running`]) and executed through `/proc/self/fd/<n>`. A path would not do.
+/// The holder is executed by `systemd-run` when the cage runs in a scope, where
+/// [`super::selfcage::RUNNING`] names `systemd-run`, and the file at sbx's path may have been
+/// replaced since this process started — by a rebuild, or by `sbx upgrade self` — in which case it
+/// names nothing, or another build.
 pub(crate) fn behind_holder(
     mut cage: super::argv::CageCommand,
     dummy: Option<&NetnsDummy>,
@@ -70,27 +77,45 @@ pub(crate) fn behind_holder(
         }
         None => None,
     };
-    Ok(cage.wrapped(|bwrap, argv| holder_wrap(bwrap, argv, dummy, report_fd)))
+    let exe_fd = match dummy {
+        Some(_) => {
+            let (binary, _) = super::selfcage::running()?;
+            let fd = binary.as_raw_fd();
+            cage.hand(binary);
+            Some(fd)
+        }
+        None => None,
+    };
+    Ok(cage.wrapped(|bwrap, argv| holder_wrap(bwrap, argv, dummy, report_fd, exe_fd)))
 }
 
 /// Wrap a bwrap invocation so it runs behind the netns holder, when `dummy` is set. Returns the
 /// program to spawn and its argument list; with `None` it is the unchanged `(bwrap, argv)`, so the
 /// ordinary launch path is byte-for-byte identical. The result is what the cgroup scope wrapper
-/// then splices, giving `systemd-run --scope -- <sbx> __netns-holder <bwrap> <argv…>`.
+/// then splices, giving `systemd-run --scope -- /proc/self/fd/<n> __netns-holder --exe-fd <n> …
+/// -- <bwrap> <argv…>` when a descriptor on the running build was handed, and `<sbx>` in place of
+/// the descriptor's path otherwise.
 ///
 /// `report_fd` is the number of the descriptor the tap's end of the report channel was handed on
-/// ([`behind_holder`]), named only when the tap is wired.
+/// ([`behind_holder`]), named only when the tap is wired. `exe_fd` is the one the running build was
+/// handed on: the holder is then executed through it and told its number, so it can close it
+/// ([`release_exe_fd`]). Without one, the holder is executed at [`NetnsDummy`]'s path.
 pub(crate) fn holder_wrap(
     bwrap: &Path,
     bwrap_argv: Vec<OsString>,
     dummy: Option<&NetnsDummy>,
     report_fd: Option<RawFd>,
+    exe_fd: Option<RawFd>,
 ) -> (PathBuf, Vec<OsString>) {
     match dummy {
         None => (bwrap.to_path_buf(), bwrap_argv),
         Some(nd) => {
-            let mut argv = Vec::with_capacity(bwrap_argv.len() + 10);
+            let mut argv = Vec::with_capacity(bwrap_argv.len() + 12);
             argv.push(OsString::from("__netns-holder"));
+            if let Some(fd) = exe_fd {
+                argv.push(OsString::from("--exe-fd"));
+                argv.push(OsString::from(fd.to_string()));
+            }
             if let Some(tap) = &nd.tap {
                 argv.push(OsString::from("--tap"));
                 argv.push(tap.uds.as_os_str().to_owned());
@@ -108,9 +133,38 @@ pub(crate) fn holder_wrap(
             argv.push(OsString::from("--"));
             argv.push(bwrap.as_os_str().to_owned());
             argv.extend(bwrap_argv);
-            (nd.holder_exe.clone(), argv)
+            let program = match exe_fd {
+                Some(fd) => PathBuf::from(format!("/proc/self/fd/{fd}")),
+                None => nd.holder_exe.clone(),
+            };
+            (program, argv)
         }
     }
+}
+
+/// Close the descriptor the launcher opened on its own binary to execute this holder through
+/// (`--exe-fd`), once it is proved to be that binary. Its work is done by then: the kernel holds
+/// the image. Left open, it would follow the holder's exec into bwrap and the cage.
+///
+/// `None` for a descriptor that is one of the standard three, not open, or not the file this
+/// process was executed from, compared by device and inode with [`super::selfcage::RUNNING`]: a
+/// descriptor the holder cannot account for refuses the whole list, as an unaccountable report
+/// descriptor does, rather than being closed blindly.
+fn release_exe_fd(fd: RawFd) -> Option<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    if fd <= 2 {
+        return None;
+    }
+    let held = std::fs::metadata(format!("/proc/self/fd/{fd}")).ok()?;
+    let running = std::fs::metadata(super::selfcage::RUNNING).ok()?;
+    if !held.is_file() || (held.dev(), held.ino()) != (running.dev(), running.ino()) {
+        return None;
+    }
+    // SAFETY: `fd` is open (its link resolved just above) and names the binary this process was
+    // executed from; nothing in this process has adopted it, so taking ownership to close it
+    // closes nothing another owner holds.
+    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+    Some(())
 }
 
 /// The holder's own options, split from the command it will exec.
@@ -147,6 +201,10 @@ fn split_holder_args(argv: &[OsString]) -> Option<(Option<TapWiring>, &[OsString
                 }
                 let end = super::nettap::adopt_report_end(fd).ok()?;
                 report = Some(super::nettap::ReportChannel::new(end));
+            }
+            Some("--exe-fd") => {
+                let fd = opts.get(i + 1)?.to_str()?.parse::<RawFd>().ok()?;
+                release_exe_fd(fd)?;
             }
             _ => return None,
         }
@@ -1623,7 +1681,7 @@ mod tests {
     #[test]
     fn holder_wrap_is_a_byte_for_byte_passthrough_without_a_dummy() {
         let argv = vec![OsString::from("--unshare-net"), OsString::from("--")];
-        let (prog, out) = holder_wrap(Path::new("/usr/bin/bwrap"), argv.clone(), None, None);
+        let (prog, out) = holder_wrap(Path::new("/usr/bin/bwrap"), argv.clone(), None, None, None);
         assert_eq!(prog, PathBuf::from("/usr/bin/bwrap"));
         assert_eq!(out, argv);
     }
@@ -1638,6 +1696,7 @@ mod tests {
             Path::new("/usr/bin/bwrap"),
             vec![OsString::from("--cap-drop"), OsString::from("ALL")],
             Some(&nd),
+            None,
             None,
         );
         // The program becomes sbx itself, invoked as `__netns-holder -- <bwrap> <args…>`.
@@ -1738,6 +1797,7 @@ mod tests {
             vec![OsString::from("--cap-drop"), OsString::from("ALL")],
             Some(&holder_with_tap(Some(report.clone()))),
             Some(fd),
+            None,
         );
         assert_eq!(
             argv,
@@ -1817,6 +1877,96 @@ mod tests {
             "the command carries the descriptor it names"
         );
         assert_eq!(inode(fd), inode(report.as_raw_fd()), "the tap's end");
+    }
+
+    /// The holder is executed through a descriptor on the running build, which its command carries
+    /// and its argument list names, so a binary replaced since sbx started still runs this build.
+    #[test]
+    fn the_holder_is_executed_through_a_descriptor_on_the_running_build() {
+        use std::os::unix::fs::MetadataExt as _;
+        let spec = crate::sandbox::spec::SandboxSpec::new(
+            PathBuf::from("/work"),
+            vec![],
+            vec![],
+            crate::sandbox::spec::NetPolicy::Isolated,
+            vec![OsString::from("true")],
+        )
+        .expect("a valid spec");
+        let cage =
+            crate::sandbox::argv::compose(Path::new("/usr/bin/bwrap"), &spec).expect("compose");
+        let cage = behind_holder(cage, Some(&holder_with_tap(None))).expect("behind the holder");
+        let args = cage.args();
+        assert_eq!(args[0], "__netns-holder");
+        assert_eq!(
+            args[1], "--exe-fd",
+            "named first, before the `--`: {args:?}"
+        );
+        let fd: RawFd = args[2]
+            .to_str()
+            .and_then(|n| n.parse().ok())
+            .expect("a number");
+        let carried = cage
+            .files()
+            .iter()
+            .find(|f| std::os::fd::AsRawFd::as_raw_fd(*f) == fd)
+            .expect("the command carries the descriptor it names");
+        let carried = carried.metadata().expect("its file");
+        let running = std::fs::metadata("/proc/self/exe").expect("the running build");
+        assert_eq!(
+            (carried.dev(), carried.ino()),
+            (running.dev(), running.ino()),
+            "the running build, not a file at its path"
+        );
+
+        let (program, _) = holder_wrap(
+            Path::new("/usr/bin/bwrap"),
+            vec![],
+            Some(&holder_with_tap(None)),
+            None,
+            Some(fd),
+        );
+        assert_eq!(program, PathBuf::from(format!("/proc/self/fd/{fd}")));
+    }
+
+    /// The holder closes the descriptor it was executed through once it proves it is its own
+    /// binary, and refuses the whole list for any other: a file that is not it, one not open, and
+    /// one of the standard three.
+    #[test]
+    fn the_holder_closes_its_own_binary_descriptor_and_refuses_any_other() {
+        let tail = [OsString::from("--"), OsString::from("/usr/bin/bwrap")];
+        let with = |fd: &str| {
+            let mut argv = vec![OsString::from("--exe-fd"), OsString::from(fd)];
+            argv.extend_from_slice(&tail);
+            argv
+        };
+        let own = std::fs::File::open("/proc/self/exe").expect("the running build");
+        let fd = std::os::fd::IntoRawFd::into_raw_fd(own);
+        let argv = with(&fd.to_string());
+        let (tap, rest) = split_holder_args(&argv).expect("accounted for");
+        assert!(tap.is_none());
+        assert_eq!(rest, &tail[1..]);
+        assert!(
+            std::fs::metadata(format!("/proc/self/fd/{fd}")).is_err(),
+            "the descriptor is closed"
+        );
+
+        let other = std::fs::File::open("/dev/null").expect("a file");
+        for fd in [
+            std::os::fd::AsRawFd::as_raw_fd(&other).to_string(),
+            i32::MAX.to_string(),
+            "0".to_string(),
+            "1".to_string(),
+            "2".to_string(),
+        ] {
+            assert!(
+                split_holder_args(&with(&fd)).is_none(),
+                "descriptor {fd} is refused"
+            );
+        }
+        assert!(
+            other.metadata().is_ok(),
+            "a descriptor that is not the binary is left as it was"
+        );
     }
 
     /// A descriptor the holder cannot account for refuses the whole list rather than being left

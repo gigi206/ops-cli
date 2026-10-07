@@ -392,14 +392,6 @@ fn report_transparent_capture(rep: &mut Report<'_>, launches_run: bool, bwrap: O
     // Recorded as the `capture` check rather than as a note: a note lands under whichever check
     // was recorded last, which would file this verdict under a neighbouring probe and leave a
     // consumer keyed on check names with no capture answer at all.
-    let Ok(exe) = std::env::current_exe() else {
-        rep.check(
-            "warn",
-            "capture",
-            "unknown — sbx cannot locate its own binary",
-        );
-        return;
-    };
     let Some(bwrap) = bwrap else {
         rep.check(
             "warn",
@@ -408,7 +400,10 @@ fn report_transparent_capture(rep: &mut Report<'_>, launches_run: bool, bwrap: O
         );
         return;
     };
-    report_capture(rep, &sandbox::probe_capture(&exe, bwrap), launches_run);
+    // Through the running build rather than its path, which names nothing once the file has been
+    // replaced (see [`sandbox::SELF_EXE`]).
+    let exe = Path::new(sandbox::SELF_EXE);
+    report_capture(rep, &sandbox::probe_capture(exe, bwrap), launches_run);
 }
 
 /// Record the `capture` check for what the probe answered, with the context that answer calls for.

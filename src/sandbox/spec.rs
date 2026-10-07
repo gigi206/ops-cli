@@ -275,10 +275,13 @@ impl Eq for HeldSource {}
 
 /// The netns-holder wiring for a cage that needs a `dummy0` interface (see
 /// [`SandboxSpec::netns_dummy`]): the path to sbx's own binary (the `__netns-holder` subcommand),
-/// resolved once at build time, and the tap's wiring.
+/// resolved once at build time, and the tap's wiring. A launch runs the holder through a descriptor
+/// on the running build instead ([`crate::sandbox::netns::behind_holder`]); the path is what runs it
+/// when no descriptor is handed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NetnsDummy {
-    /// Absolute path to sbx's own binary, invoked as `<exe> __netns-holder … -- <bwrap> <args…>`.
+    /// Absolute path to sbx's own binary, invoked as `<exe> __netns-holder … -- <bwrap> <args…>` only
+    /// when no descriptor on the running build was handed to the holder's command.
     pub(super) holder_exe: PathBuf,
     /// What the holder needs to stand the transparent-capture tap up inside the namespace it
     /// creates, or `None` to leave the cage with the environment-variable egress path alone.

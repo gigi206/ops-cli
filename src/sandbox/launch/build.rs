@@ -3326,11 +3326,12 @@ pub(super) fn build(
 /// Each leaves the cage to bwrap's own `--unshare-net` alone — as does a holder that fails — so a
 /// cage is never on the host network either way.
 ///
-/// `netns` is asked last, with sbx's own path and `bwrap`, so a launch that needs no holder never
-/// pays for the probe; the launch passes [`crate::sandbox::netns::probe_namespace`]. It is asked
-/// rather than left to the holder's own degradation because the cage's `/etc/resolv.conf` names
-/// the tap's resolver once the holder is chosen, and a tap that could never stand up would leave
-/// the cage with no DNS. A setuid `bwrap` on a host that restricts unprivileged user namespaces is
+/// `netns` is asked last, with the running build ([`crate::sandbox::selfcage::RUNNING`], which still
+/// names this image once the file at sbx's path has been replaced) and `bwrap`, so a launch that
+/// needs no holder never pays for the probe; the launch passes
+/// [`crate::sandbox::netns::probe_namespace`]. It is asked rather than left to the holder's own
+/// degradation because the cage's `/etc/resolv.conf` names the tap's resolver once the holder is
+/// chosen, and a tap that could never stand up would leave the cage with no DNS. A setuid `bwrap` on a host that restricts unprivileged user namespaces is
 /// the one it refuses: the holder cannot have it run unprivileged there, and the namespace it
 /// creates belongs to the host's user namespace, where sbx holds no capability.
 ///
@@ -3376,7 +3377,9 @@ pub(super) fn holder_plan(
             return None;
         }
     };
-    if let Err(why) = netns(&exe, bwrap) {
+    // The probe is run by this process's own spawn, so the running build answers it even when the
+    // file at `exe` has been replaced since this process started.
+    if let Err(why) = netns(Path::new(crate::sandbox::selfcage::RUNNING), bwrap) {
         let lost = match (tap.is_some(), gui_renders) {
             (true, true) => {
                 "a client that ignores the proxy variables will fail to connect rather than be \

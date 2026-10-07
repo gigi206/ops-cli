@@ -213,6 +213,10 @@ pub(crate) use proxy::{
     union_with_builtin,
 };
 pub(crate) use search::run as search;
+/// The running build's path as the kernel resolves it for the process that asks. Re-exported so
+/// `sbx doctor` runs its capture probe through the same image a launch does, not through a path
+/// that names nothing once the binary has been replaced.
+pub(crate) use selfcage::RUNNING as SELF_EXE;
 pub(crate) use smoke::run as smoke;
 pub(crate) use tarball::{
     TarballUpgrade, pinned_hashes as tarball_pinned_hashes, upgrade_project as upgrade_tarball,

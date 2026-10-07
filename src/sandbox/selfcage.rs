@@ -53,11 +53,19 @@ use std::path::Path;
 /// Where the binary is inside a helper's cage.
 pub(crate) const BINARY: &str = "/sbx";
 
+/// The running build, as the kernel names it to the process asking: it stays that image when its
+/// file has been replaced or removed since, which the path `std::env::current_exe` returns then
+/// does not (it gains a ` (deleted)` suffix and names nothing on disk). A command sbx spawns itself
+/// resolves it in the child, which is still sbx's image until its exec completes, so it is the
+/// path to run a probe of this build through. A command another program execs (`systemd-run`, a
+/// shell) would resolve it to that program instead: that one is handed [`running`] by descriptor.
+pub(crate) const RUNNING: &str = "/proc/self/exe";
+
 /// The build that is running, whatever has become of its file since, and whether that file has been
 /// deleted: a helper started from a binary replaced mid-session would speak another build's
 /// messages.
 pub(crate) fn running() -> io::Result<(File, bool)> {
-    let binary = File::open("/proc/self/exe")?;
+    let binary = File::open(RUNNING)?;
     let gone = deleted(&binary);
     Ok((binary, gone))
 }
