@@ -55,11 +55,17 @@ pub(crate) fn find_all_in_dirs(name: &str, dirs: impl Iterator<Item = PathBuf>) 
 /// Every non-absolute entry is dropped, not the empty one alone: `.`, `bin`, and `../tools` name
 /// the same class of thing and would resolve the same way. A `PATH` entry that means anything to
 /// sbx is one that means the same thing from any directory.
+///
+/// And `name` must be a bare file name. One holding a `/` is not a `PATH` lookup at all —
+/// `dir.join("/bin/sh")` is `/bin/sh` whatever `dir` is, and `dir.join("../x")` leaves it — so it
+/// would be answered by a file the `PATH` never named. Such a name, an empty one, `.` and `..`
+/// yield no candidate.
 fn candidates<'a>(
     name: &'a str,
     dirs: impl Iterator<Item = PathBuf> + 'a,
 ) -> impl Iterator<Item = PathBuf> + 'a {
-    dirs.filter(|dir| dir.is_absolute())
+    let bare = !name.is_empty() && !name.contains('/') && name != "." && name != "..";
+    dirs.filter(move |dir| bare && dir.is_absolute())
         .map(move |dir| dir.join(name))
 }
 
@@ -100,6 +106,23 @@ mod tests {
     fn write_exec(path: &Path) {
         std::fs::write(path, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_bare_file_name_yields_no_candidate() {
+        let dir = TmpDir::new();
+        let bin = dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        write_exec(&dir.join("outside"));
+        let dirs = || std::iter::once(bin.clone());
+        let absolute = dir.join("outside");
+        for name in [absolute.to_str().unwrap(), "../outside", "", ".", ".."] {
+            assert_eq!(find_in_dirs(name, dirs()), None, "{name:?} was found");
+            assert!(
+                find_all_in_dirs(name, dirs()).is_empty(),
+                "{name:?} was found"
+            );
+        }
     }
 
     #[test]
@@ -241,6 +264,35 @@ mod tests {
         );
     }
 
+    /// Whether `line` names [`find_on_path`] as a whole identifier, not as part of a longer one.
+    fn names_find_on_path(line: &str) -> bool {
+        const NAME: &str = "find_on_path";
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        line.match_indices(NAME).any(|(at, _)| {
+            !line[..at].ends_with(ident) && !line[at + NAME.len()..].starts_with(ident)
+        })
+    }
+
+    #[test]
+    fn the_inventory_sees_a_search_however_it_is_spelled() {
+        for spelled in [
+            "let x = crate::pathfind::find_on_path(\"tool\");",
+            "use crate::pathfind::find_on_path;",
+            "let x = find_on_path(name);",
+            "names.iter().filter_map(|n| pathfind::find_on_path(n))",
+            ".map(crate::pathfind::find_on_path)",
+        ] {
+            assert!(names_find_on_path(spelled), "missed: {spelled}");
+        }
+        for other in [
+            "crate::store::find_trusted_on_path(\"nix\")",
+            "crate::pathfind::find_all_on_path(name)",
+            "fn my_find_on_path_helper()",
+        ] {
+            assert!(!names_find_on_path(other), "flagged: {other}");
+        }
+    }
+
     /// Every production `PATH` search that skips the trust check is named here, with its reason.
     ///
     /// [`find_on_path`] answers "what would `execvp` run"; [`crate::store::find_trusted_on_path`]
@@ -270,8 +322,18 @@ mod tests {
             if crate::testutil::is_test_only_source(&file) || declared_test_only.contains(&file) {
                 continue;
             }
+            if file.ends_with("src/pathfind.rs") {
+                continue;
+            }
             let text = std::fs::read_to_string(&file).unwrap_or_default();
-            if !crate::testutil::production_half(&text).contains("pathfind::find_on_path(") {
+            // The name as a token on a code line, however it is reached: qualified, imported and
+            // called bare, or passed as a value. Comment lines are skipped, since a doc that names
+            // the function searches nothing.
+            let searches = crate::testutil::production_half(&text)
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .any(names_find_on_path);
+            if !searches {
                 continue;
             }
             found.push(file.display().to_string().replacen(&root, "", 1));
