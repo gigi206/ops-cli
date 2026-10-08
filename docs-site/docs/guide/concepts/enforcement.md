@@ -325,8 +325,8 @@ gives every cage the same bound plus a name that reads back to it in `systemctl 
 
 Resource limits are hardening, not the security boundary: so unlike the
 namespace / seccomp / egress layers, they **never hard-fail**. Where there is no
-cgroup v2, no reachable systemd user session, no `systemd-run`, or an
-undelegated controller, the cage launches **without** limits rather than refusing a
+cgroup v2, no reachable systemd user session, no `systemd-run` (or one that does
+not answer `--help`), or an undelegated controller, the cage launches **without** limits rather than refusing a
 launch the host can otherwise run. `sbx doctor` reports whether it could create a limited
 scope on this host.
 

@@ -70,9 +70,10 @@ integer is a valid task count, not bytes.)
 
 The cage runs inside a transient systemd user scope
 (`systemd-run --user --scope`) carrying these as cgroup v2 properties. This is
-**best-effort**: on a host with no cgroup v2, no reachable systemd user session, or no
-delegated controller, the cage launches **without** limits rather than failing: the
-limits are hardening, never the boundary. See [Enforcement stack](../concepts/enforcement).
+**best-effort**: on a host with no cgroup v2, no reachable systemd user session, no
+delegated controller, or a `systemd-run` that does not answer `--help` (sbx then cannot
+tell whether it would rewrite the cage's arguments), the cage launches **without** limits
+rather than failing: the limits are hardening, never the boundary. See [Enforcement stack](../concepts/enforcement).
 
 The memory ceiling is honestly **per-cage**, not host-global (N concurrent cages can
 sum past total RAM); the task cap is the clean host-wide anti-DoS guarantee.
@@ -265,6 +266,6 @@ sbx config show            # what survived, and from which layer
 sbx doctor                 # whether this host can apply limits at all
 ```
 
-On a host with no cgroup v2 or no reachable systemd user session, the cage launches
-**without** limits rather than failing. That is deliberate (they are hardening, never
+On a host with no cgroup v2, no reachable systemd user session, or a `systemd-run` that
+does not answer `--help`, the cage launches **without** limits rather than failing. That is deliberate (they are hardening, never
 the boundary), and `doctor` is where you see it.

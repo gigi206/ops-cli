@@ -326,11 +326,15 @@ fn limiter(limits: &Limits) -> Result<(PathBuf, Vec<String>), LimiterMiss> {
 /// How long [`socket_answers`] waits for a socket to take a connection.
 const MANAGER_DIAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Whether the user manager under the runtime directory `runtime` takes a connection, the way
-/// `systemd-run --user` reaches it: its private socket `systemd/private` first, the session bus
-/// `bus` when that one does not answer.
+/// Whether the user manager under the runtime directory `runtime` takes a connection on its private
+/// socket, `systemd/private`, which is where `systemd-run --user` reaches it.
+///
+/// The session bus beside it is not a way in. Measured on systemd 259: with `systemd/private`
+/// missing and `bus` answering, `systemd-run --user --scope` fails ("Failed to connect to user scope
+/// bus via local transport") without trying the bus, so a launch let through on the bus alone
+/// would stop there.
 fn manager_answers(runtime: &Path) -> bool {
-    socket_answers(&runtime.join("systemd/private")) || socket_answers(&runtime.join("bus"))
+    socket_answers(&runtime.join("systemd/private"))
 }
 
 /// Whether the socket at `socket` takes a connection.
@@ -967,24 +971,36 @@ pub(crate) fn probe(limits: &Limits) -> LimitReport {
     cmd.args(["--", "true"]);
     // Bounded, so a manager that never answers is a line in the report rather than a `doctor` that
     // never returns.
-    match super::resolver::output_within(&mut cmd, PROBE_DEADLINE, "`systemd-run --scope`")
-        .map(|o| o.status)
-    {
-        Ok(s) if s.success() => LimitReport {
-            properties: props,
-            verified: true,
-            note: None,
-        },
-        Ok(_) => LimitReport {
-            properties: props,
-            verified: false,
-            note: Some("systemd-run could not create a limited scope".into()),
-        },
-        Err(e) => LimitReport {
-            properties: props,
-            verified: false,
-            note: Some(format!("systemd-run failed to run: {e}")),
-        },
+    live_scope_report(
+        props,
+        super::resolver::output_within(&mut cmd, PROBE_DEADLINE, "`systemd-run --scope`"),
+    )
+}
+
+/// What `doctor` reports for the live scope [`probe`] asked for, given how `systemd-run` ended.
+///
+/// The run's stderr is captured to bound it, so a refusal quotes what `systemd-run` said, folded to
+/// one line, rather than leaving the reader with no cause.
+fn live_scope_report(
+    properties: Vec<String>,
+    ran: std::io::Result<std::process::Output>,
+) -> LimitReport {
+    let note = match ran {
+        Ok(out) if out.status.success() => None,
+        Ok(out) => {
+            let said = super::resolver::one_line(&out.stderr);
+            Some(if said.is_empty() {
+                "systemd-run could not create a limited scope".to_string()
+            } else {
+                format!("systemd-run could not create a limited scope: {said}")
+            })
+        }
+        Err(e) => Some(format!("systemd-run failed to run: {e}")),
+    };
+    LimitReport {
+        properties,
+        verified: note.is_none(),
+        note,
     }
 }
 
@@ -1875,21 +1891,54 @@ mod tests {
         assert!(socket_answers(&tmp.join("live")));
     }
 
-    /// The manager is reached as `systemd-run --user` reaches it: its private socket, or the
-    /// session bus where that one does not answer.
+    /// The manager is reached as `systemd-run --user` reaches it, on its private socket: the
+    /// session bus answering beside it is not enough.
     #[test]
-    fn the_manager_answers_on_its_private_socket_or_the_bus() {
+    fn the_manager_answers_on_its_private_socket_and_not_the_bus() {
         let tmp = TmpDir::new();
         let runtime = tmp.path();
         assert!(!manager_answers(runtime));
-        let bus = std::os::unix::net::UnixListener::bind(runtime.join("bus")).unwrap();
-        assert!(manager_answers(runtime), "the bus alone answers");
-        drop(bus);
-        std::fs::remove_file(runtime.join("bus")).unwrap();
+        let _bus = std::os::unix::net::UnixListener::bind(runtime.join("bus")).unwrap();
+        assert!(
+            !manager_answers(runtime),
+            "the bus alone does not answer for the manager"
+        );
         std::fs::create_dir(runtime.join("systemd")).unwrap();
         let _private =
             std::os::unix::net::UnixListener::bind(runtime.join("systemd/private")).unwrap();
-        assert!(manager_answers(runtime), "the private socket alone answers");
+        assert!(manager_answers(runtime), "the private socket answers");
+    }
+
+    /// A refused live scope quotes what `systemd-run` said, on one line.
+    #[test]
+    fn a_refused_live_scope_quotes_the_launchers_reason() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let refused = |stderr: &[u8]| {
+            live_scope_report(
+                vec!["TasksMax=16384".into()],
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(1 << 8),
+                    stdout: Vec::new(),
+                    stderr: stderr.to_vec(),
+                }),
+            )
+        };
+        let report = refused(crate::testutil::HOSTILE_STDERR);
+        assert!(!report.verified);
+        assert_eq!(
+            report.note.as_deref(),
+            Some(
+                format!(
+                    "systemd-run could not create a limited scope: {}",
+                    crate::testutil::HOSTILE_STDERR_SHOWN
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            refused(b"").note.as_deref(),
+            Some("systemd-run could not create a limited scope")
+        );
     }
 
     /// The profile properties must produce the intended kernel limits, not merely
