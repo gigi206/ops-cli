@@ -2314,7 +2314,7 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "import"],
-        synopsis: "sbx app import <file> [--as <new-name>] [--force] [--with-deps]",
+        synopsis: "sbx app import <file> [--as <new-name>] [-f|--force] [--with-deps]",
         summary: "place a portable app profile (trusted by location)",
         options: &[
             (
@@ -2326,7 +2326,7 @@ pub(super) const PAGES: &[Page] = &[
                 "name the imported app (default: the source file's stem)",
             ),
             (
-                "--force",
+                "-f, --force",
                 "overwrite an existing profile of the same name (naming what it drops)",
             ),
             (

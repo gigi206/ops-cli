@@ -7,7 +7,7 @@ description: "Launch, import, export and inspect the named application profiles.
 ```
 sbx app run <name> [--detach] [--observe] [--net-learn[=level]] [--proc-learn[=level]] [[-g|--global|-l|--local] [--dry-run]] [override flags] [-- <args>...]
 sbx app upgrade <name> [-n]
-sbx app import <file> [--as <new-name>] [--force] [--with-deps]
+sbx app import <file> [--as <new-name>] [-f|--force] [--with-deps]
 sbx app export <name> [--out <file>]
 sbx app rm <name>... [--purge] [--gc]
 sbx app list
@@ -232,7 +232,7 @@ of is not sent to it.
 
 | Subcommand | Purpose |
 |---|---|
-| `import <file> [--as <new-name>] [--force] [--with-deps]` | place a portable profile (trusted by location); the granted posture is printed |
+| `import <file> [--as <new-name>] [-f\|--force] [--with-deps]` | place a portable profile (trusted by location); the granted posture is printed |
 | `export <name> [--out <file>]` | write a named app out as a portable profile (stdout by default) |
 | `rm <name>...` | remove an **imported** profile (a project `[app.<name>]` lives in that project's `.sbx.toml`) |
 | `rm <name> --purge` | also remove the app's isolated **home(s)**, the tools its `mise:` backends installed, its config, and its login state |
@@ -244,6 +244,10 @@ always goes through `run`, so an app is never confused with a subcommand and **m
 like one** (reached as `sbx app run <name>`). `import` is a deliberate consent act: an agent in the
 cage cannot run it, and the profile stays inert until `sbx app run <name>`. See
 [Portable profiles](../apps/profiles).
+
+`import` reads the same flags as [`sbx bundle import`](bundle#sbx-bundle-import) and
+`sbx net groups import`: `--as <name>` may be written `--as=<name>`, and a `--` ends the flags,
+so a file whose name begins with `-` can still be imported.
 
 ### What the import says you are still missing
 

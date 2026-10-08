@@ -501,69 +501,27 @@ struct Learning {
     dry_run: bool,
 }
 
-/// `sbx app import <file> [--as <name>] [--force]`: validate a portable app profile and place it
-/// under the imported-profiles directory, where it is trusted by location (honored even on an
-/// untrusted project). The deliberate command IS the consent — an agent in the cage cannot run it,
+/// `sbx app import <file> [--as <name>] [-f|--force] [--with-deps]`: validate a portable app
+/// profile and place it under the imported-profiles directory, where it is trusted by location
+/// (honored even on an untrusted project). The deliberate command IS the consent — an agent in the cage cannot run it,
 /// and the profile stays inert until `sbx app <name>` launches it — so there is no interactive
 /// prompt, but the granted posture is printed so the act is informed. The bytes are copied
 /// verbatim (comments and formatting preserved); the name comes from `--as` or the source file
 /// stem, never the file's contents, so the profile is name-agnostic and re-namable for free.
 fn app_import(args: &[OsString]) -> ExitCode {
-    let mut source: Option<&OsString> = None;
-    let mut as_name: Option<String> = None;
-    let mut force = false;
-    let mut with_deps = false;
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.to_str() {
-            Some("--as") => {
-                match crate::cli::option_value(it.next(), "app import", "--as", "a name") {
-                    Ok(n) => as_name = Some(n.to_string()),
-                    Err(why) => {
-                        diag::error(&why);
-                        return ExitCode::from(2);
-                    }
-                }
-            }
-            Some("--force") => force = true,
-            Some("--with-deps") => with_deps = true,
-            Some(flag) if flag.starts_with("--") => {
-                diag::error(&format!(
-                    "sbx: unknown flag '{flag}' (usage: {})",
-                    help::synopsis_of(&["app", "import"])
-                ));
-                return ExitCode::from(2);
-            }
-            _ if source.is_none() => source = Some(arg),
-            _ => {
-                diag::error("sbx: sbx app import takes a single file");
-                return ExitCode::from(2);
-            }
-        }
-    }
-    let Some(source) = source else {
-        diag::error(&format!(
-            "sbx: usage: {}",
-            help::synopsis_of(&["app", "import"])
-        ));
-        return ExitCode::from(2);
+    const PATH: &[&str] = &["app", "import"];
+    let parsed = match crate::cli::import_args(args, PATH, true) {
+        Ok(a) => a,
+        Err(code) => return code,
     };
-    let src_path = Path::new(source);
+    let (force, with_deps) = (parsed.force, parsed.with_deps);
+    let src_path = parsed.file.as_path();
 
     // The app name: `--as`, else the source file stem. It keys an on-disk file, so it is validated
     // for charset/length and refused otherwise — fail-closed.
-    let name = match as_name {
-        Some(n) => n,
-        None => match src_path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s.to_string(),
-            None => {
-                diag::error(&format!(
-                    "sbx: cannot derive a name from {} — pass --as <name>",
-                    src_path.display()
-                ));
-                return ExitCode::from(2);
-            }
-        },
+    let name = match crate::cli::imported_name(&parsed, PATH) {
+        Ok(n) => n,
+        Err(code) => return code,
     };
     if !config::is_valid_app_name(&name) {
         diag::error(&format!(

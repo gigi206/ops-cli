@@ -80,6 +80,9 @@ sbx bundle import frag.toml --as claude-code
 sbx bundle import claude-code.toml --force
 ```
 
+`--as <name>` may be written `--as=<name>`, and a `--` ends the flags, so a file whose name
+begins with `-` can still be imported.
+
 Copies the file into `bundles/<name>.toml`, where the loader reads it. The name comes
 from the file: its own stem, or `--as <name>`. The bytes are copied verbatim, so the
 author's comments survive. Bundles are global-only, and that directory is trusted by its

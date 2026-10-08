@@ -372,34 +372,62 @@ pub(crate) struct ImportArgs {
     pub(crate) as_name: Option<String>,
     /// Whether `--force` was given.
     pub(crate) force: bool,
+    /// Whether `--with-deps` was given, on the one verb that takes it.
+    pub(crate) with_deps: bool,
 }
 
-/// Parse `<file> [--as <name>] [-f|--force]` — the shape `sbx bundle import` and `sbx net groups
-/// import` share, reported with `path`'s synopsis. `--as` exists because an entry is named by its
-/// file: a fragment downloaded under another name is filed under the name it is given here.
-pub(crate) fn import_args(args: &[OsString], path: &[&str]) -> Result<ImportArgs, ExitCode> {
+/// Parse `<file> [--as <name>] [-f|--force]` — the shape `sbx app import`, `sbx bundle import` and
+/// `sbx net groups import` share, reported with `path`'s synopsis; `takes_with_deps` adds the
+/// `--with-deps` switch `sbx app import` carries on top. `--as` exists because an entry is named by
+/// its file: a fragment downloaded under another name is filed under the name it is given here.
+///
+/// `--as=<name>` is the same flag written inline, held to the same refusals as the separate form,
+/// the spelling the launch parsers accept for every flag that takes a value. A `--` ends the flags,
+/// so a file whose name begins with `-` can still be imported.
+pub(crate) fn import_args(
+    args: &[OsString],
+    path: &[&str],
+    takes_with_deps: bool,
+) -> Result<ImportArgs, ExitCode> {
+    let verb = path.join(" ");
     let mut file: Option<PathBuf> = None;
     let mut as_name: Option<String> = None;
     let mut force = false;
+    let mut with_deps = false;
+    let mut only_files = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
-        match arg.to_str() {
+        let inline_as = arg
+            .to_str()
+            .and_then(|a| a.strip_prefix("--as="))
+            .map(OsString::from);
+        let text = if only_files { None } else { arg.to_str() };
+        match text {
+            Some("--") => only_files = true,
             Some("-f") | Some("--force") => force = true,
-            Some("--as") => match option_value(it.next(), &path.join(" "), "--as", "a name") {
-                Ok(n) => as_name = Some(n.to_string()),
-                Err(why) => {
-                    diag::error(&why);
-                    return Err(ExitCode::from(2));
+            Some("--with-deps") if takes_with_deps => with_deps = true,
+            Some(a) if a == "--as" || inline_as.is_some() => {
+                let value = inline_as.as_ref().or_else(|| it.next());
+                match option_value(value, &verb, "--as", "a name") {
+                    Ok(n) if !n.is_empty() => as_name = Some(n.to_string()),
+                    Ok(_) => {
+                        diag::error(&format!("sbx: {verb}: `--as` needs a name"));
+                        return Err(ExitCode::from(2));
+                    }
+                    Err(why) => {
+                        diag::error(&why);
+                        return Err(ExitCode::from(2));
+                    }
                 }
-            },
+            }
             Some(flag) if flag.starts_with('-') => {
-                diag::error(&format!("sbx: {}: unknown flag `{flag}`", path.join(" ")));
+                diag::error(&format!("sbx: {verb}: unknown flag `{flag}`"));
                 diag::error(&format!("sbx: usage: {}", crate::help::synopsis_of(path)));
                 return Err(ExitCode::from(2));
             }
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
             _ => {
-                diag::error(&format!("sbx: {} takes a single file", path.join(" ")));
+                diag::error(&format!("sbx: {verb} takes a single file"));
                 return Err(ExitCode::from(2));
             }
         }
@@ -409,6 +437,7 @@ pub(crate) fn import_args(args: &[OsString], path: &[&str]) -> Result<ImportArgs
             file,
             as_name,
             force,
+            with_deps,
         }),
         None => {
             diag::error(&format!("sbx: usage: {}", crate::help::synopsis_of(path)));
@@ -485,6 +514,9 @@ pub(crate) struct Installed {
 /// nothing has nothing to keep. Every failure refuses before writing — including a previous file
 /// that cannot be READ, because dropping what sbx could not look at is the one outcome the copy
 /// exists to prevent.
+///
+/// The file name `<name>.toml` must be one plain component of `dir`, whatever each caller's own
+/// name check allows: a separator or an absolute form would make the `join` write outside it.
 pub(crate) fn install_named_file(
     dir: &Path,
     name: &str,
@@ -492,7 +524,15 @@ pub(crate) fn install_named_file(
     force: bool,
     noun: &str,
 ) -> Result<Installed, ExitCode> {
-    let dest = dir.join(format!("{name}.toml"));
+    let file = format!("{name}.toml");
+    if !crate::sandbox::gc::is_safe_tree_id(&file) {
+        diag::error(&format!(
+            "sbx: the {noun} name `{}` is not a plain file name — nothing was written",
+            diag::visible(name)
+        ));
+        return Err(ExitCode::from(2));
+    }
+    let dest = dir.join(file);
     if dest.exists() && !force {
         diag::error(&format!(
             "sbx: the {noun} '{name}' already exists at {} (use --force to overwrite)",
@@ -544,12 +584,13 @@ pub(crate) fn install_named_file(
 /// re-indentation alone is not a loss either.
 pub(crate) fn settings_dropped_by(previous: &str, incoming: &str) -> Vec<String> {
     let kept: std::collections::HashSet<&str> = incoming.lines().map(str::trim).collect();
+    let mut seen = std::collections::HashSet::new();
     let mut out: Vec<String> = Vec::new();
     for line in previous.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') || kept.contains(line) {
             continue;
         }
-        if !out.iter().any(|s| s == line) {
+        if seen.insert(line) {
             out.push(line.to_string());
         }
     }
@@ -646,17 +687,21 @@ pub(crate) fn dedupe_names(names: &mut Vec<&str>) {
 /// A source with no grandparent — a bare filename, `./x.toml` — yields `None` and the caller keeps
 /// the generic wording. The candidate is built by walking up and is never canonicalized, so what is
 /// printed is a path the user can retype as-is.
+///
+/// The name is the imported file's to choose, so `<name>.toml` is read only when it is one plain
+/// component of that sibling directory: a separator or an absolute form would point the read
+/// anywhere on disk.
 pub(crate) fn fragment_beside<T>(
     src: &std::path::Path,
     dir: &str,
     name: &str,
     read: impl Fn(&std::path::Path) -> Result<std::collections::BTreeMap<String, T>, String>,
 ) -> Option<PathBuf> {
-    let candidate = src
-        .parent()?
-        .parent()?
-        .join(dir)
-        .join(format!("{name}.toml"));
+    let file = format!("{name}.toml");
+    if !crate::sandbox::gc::is_safe_tree_id(&file) {
+        return None;
+    }
+    let candidate = src.parent()?.parent()?.join(dir).join(file);
     read(&candidate)
         .ok()?
         .contains_key(name)
@@ -920,11 +965,17 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         "secret" | "secrets" => secret::secret_cmd(&rest),
         "plugins" => plugins::plugins_cmd(&rest),
         other => {
-            diag::error(&format!("sbx: unknown command '{other}'"));
+            diag::error(&unknown_command(other));
             diag::hint("Run `sbx --help` for the list of commands.");
             ExitCode::from(2)
         }
     }
+}
+
+/// The refusal for a command name sbx does not have, with the name as typed made visible: it is
+/// echoed back from argv, and a newline in it would print as a line sbx never wrote.
+fn unknown_command(name: &str) -> String {
+    format!("sbx: unknown command '{}'", diag::visible(name))
 }
 
 #[cfg(test)]
@@ -1118,6 +1169,112 @@ mod tests {
                 declaring(&["demo-app"])
             ),
             None,
+        );
+    }
+
+    /// A reference is the imported file's own text, so a name that walks out of the sibling
+    /// directory is no sibling: nothing is read, and the generic wording stands.
+    #[test]
+    fn a_reference_that_is_not_a_plain_name_reads_nothing() {
+        let src = std::path::Path::new("examples/app/demo-app.toml");
+        for name in ["../../etc/passwd", "/etc/passwd", "a/b"] {
+            let read =
+                |p: &std::path::Path| -> Result<std::collections::BTreeMap<String, ()>, String> {
+                    panic!("{name:?} read {}", p.display())
+                };
+            assert_eq!(
+                super::fragment_beside(src, "bundle", name, read),
+                None,
+                "{name:?}"
+            );
+        }
+        // The dot names stay file names once suffixed, so they are still looked up.
+        assert_eq!(
+            super::fragment_beside(src, "bundle", "..", declaring(&[".."])),
+            Some(PathBuf::from("examples/bundle/...toml")),
+        );
+    }
+
+    /// The write behind the three import verbs stays inside its directory whatever name it is
+    /// handed, and a refused name writes nothing anywhere.
+    #[test]
+    fn an_installed_file_never_lands_outside_its_directory() {
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("bundles");
+        std::fs::create_dir(&dir).unwrap();
+        for name in ["../escape", "/abs/escape", "a/b"] {
+            assert!(
+                super::install_named_file(&dir, name, b"x", true, "bundle").is_err(),
+                "{name:?}"
+            );
+        }
+        assert!(!base.path().join("escape.toml").exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        // `..` is a name the bundle and group checks accept, and `...toml` is a file in `dir`.
+        let installed = super::install_named_file(&dir, "..", b"x", false, "bundle")
+            .unwrap_or_else(|_| panic!("`..` files as `...toml`"));
+        assert_eq!(installed.dest, dir.join("...toml"));
+    }
+
+    /// `--as=<name>` is `--as <name>` written inline and held to the same refusals, and a `--`
+    /// ends the flags so a file named like one is still the file.
+    #[test]
+    fn an_import_reads_as_inline_and_stops_its_flags_at_a_double_dash() {
+        let path = &["bundle", "import"];
+        let parsed = super::import_args(&os(&["--as=other", "frag.toml"]), path, false)
+            .unwrap_or_else(|_| panic!("`--as=other` parses"));
+        assert_eq!(parsed.as_name.as_deref(), Some("other"));
+        assert_eq!(parsed.file, PathBuf::from("frag.toml"));
+
+        let parsed = super::import_args(&os(&["-f", "--", "--force.toml"]), path, false)
+            .unwrap_or_else(|_| panic!("a file after `--` parses"));
+        assert!(parsed.force);
+        assert_eq!(parsed.file, PathBuf::from("--force.toml"));
+
+        for bad in [
+            vec!["--as=", "frag.toml"],
+            vec!["--as", "", "frag.toml"],
+            vec!["--as=-x", "frag.toml"],
+            vec!["--", "a.toml", "b.toml"],
+            vec!["--with-deps", "frag.toml"],
+        ] {
+            assert!(
+                super::import_args(&os(&bad), path, false).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// `--with-deps` is `sbx app import`'s alone, and that verb reads `-f` like its siblings.
+    #[test]
+    fn the_app_import_reads_with_deps_and_the_short_force() {
+        let parsed = super::import_args(
+            &os(&["--with-deps", "-f", "demo.toml"]),
+            &["app", "import"],
+            true,
+        )
+        .unwrap_or_else(|_| panic!("the app import line parses"));
+        assert!(parsed.with_deps && parsed.force);
+        assert_eq!(parsed.file, PathBuf::from("demo.toml"));
+    }
+
+    /// A line the replacement no longer sets is named once, in the order the previous file had it.
+    #[test]
+    fn a_dropped_setting_is_named_once_in_its_first_place() {
+        let previous = "a = 1\nb = 2\na = 1\n  b = 2\nc = 3\n";
+        assert_eq!(
+            super::settings_dropped_by(previous, "c = 3\n"),
+            vec!["a = 1".to_string(), "b = 2".to_string()]
+        );
+    }
+
+    /// The name of an unknown command is echoed from argv, so its control bytes come back
+    /// visible rather than as a second line.
+    #[test]
+    fn an_unknown_command_is_quoted_without_its_control_bytes() {
+        assert_eq!(
+            super::unknown_command("fo\no\u{1b}[31m"),
+            "sbx: unknown command 'fo\\x0ao\\x1b[31m'"
         );
     }
 
@@ -1328,7 +1485,7 @@ mod tests {
     fn a_file_whose_name_is_not_utf8_is_still_the_file() {
         use std::os::unix::ffi::OsStringExt;
         let raw = OsString::from_vec(vec![0x66, 0xff, 0x2e, 0x74, 0x6f, 0x6d, 0x6c]);
-        let parsed = super::import_args(std::slice::from_ref(&raw), &["bundle", "import"])
+        let parsed = super::import_args(std::slice::from_ref(&raw), &["bundle", "import"], false)
             .unwrap_or_else(|_| panic!("a non-UTF-8 path is still a file"));
         assert_eq!(parsed.file, PathBuf::from(&raw));
         assert!(!parsed.force);
@@ -1346,7 +1503,7 @@ mod tests {
             vec!["--force", "--as", "other", "frag.toml"],
             vec!["frag.toml", "--as", "other", "-f"],
         ] {
-            let parsed = super::import_args(&os(&spelling), &["bundle", "import"])
+            let parsed = super::import_args(&os(&spelling), &["bundle", "import"], false)
                 .unwrap_or_else(|_| panic!("{spelling:?} parses"));
             assert_eq!(parsed.file, PathBuf::from("frag.toml"));
             assert!(parsed.force, "{spelling:?}");
@@ -1361,7 +1518,7 @@ mod tests {
     /// With no `--as`, the file's own stem is the name — the rule that keeps one name in one place.
     #[test]
     fn an_import_without_as_is_named_by_its_file() {
-        let parsed = super::import_args(&os(&["/tmp/demo.toml"]), &["bundle", "import"])
+        let parsed = super::import_args(&os(&["/tmp/demo.toml"]), &["bundle", "import"], false)
             .unwrap_or_else(|_| panic!("a bare path parses"));
         assert_eq!(
             super::imported_name(&parsed, &["bundle", "import"]).ok(),

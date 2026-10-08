@@ -53,7 +53,7 @@ catch-all spellings](../networking/rules#the-catch-all-spellings).
 ```
 sbx net groups [<name>…] [--json]
 sbx net groups export [<name>…] [-o|--out <file>]
-sbx net groups import <file> [-f|--force]
+sbx net groups import <file> [--as <name>] [-f|--force]
 ```
 
 An egress group is a named set of egress entries declared once beside the global

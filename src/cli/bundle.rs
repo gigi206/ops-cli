@@ -743,7 +743,7 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `sbx bundle import <file> [--as <name>] [--force]`: file a portable bundle under
+/// `sbx bundle import <file> [--as <name>] [-f|--force]`: file a portable bundle under
 /// `bundles/<name>.toml`, where the loader reads it. Bundles are global-only, so the target is
 /// always that directory; the deliberate command is the consent (an agent in the cage cannot run
 /// it), and the directory is trusted by location, so there is no prompt. An existing bundle of the
@@ -754,7 +754,7 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
 /// round-trip through a catalogue, and the name comes from the file rather than from the contents.
 fn bundle_import(args: &[OsString]) -> ExitCode {
     const PATH: &[&str] = &["bundle", "import"];
-    let parsed = match crate::cli::import_args(args, PATH) {
+    let parsed = match crate::cli::import_args(args, PATH, false) {
         Ok(a) => a,
         Err(code) => return code,
     };

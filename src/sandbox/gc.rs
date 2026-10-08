@@ -691,10 +691,13 @@ pub(crate) enum ReapOneOutcome {
 /// Whether `id` is safe to use as a project-tree directory name — a single, ordinary path
 /// component with no separator, no `.`/`..`, and no absolute form. This is the anti-traversal
 /// guard every caller that joins a user-supplied name onto a directory shares: `sbx projects show`
-/// and `sbx projects rm` for a project id, and the app-home purge behind `sbx app rm` for an app
-/// name. The value is joined onto the data directory and fed to a recursive delete, so a value like
-/// `/etc` (which `Path::join` treats as absolute and *replaces* the base with) or `../x` (which
-/// escapes the tree) must never reach the `join`. A real id is a 16-hex hash, but the check does
+/// and `sbx projects rm` for a project id, the app-home purge behind `sbx app rm` for an app
+/// name, the `<name>.toml` the three import verbs write under the config directory
+/// ([`crate::cli::install_named_file`]), and the one they read beside a catalogue for a reference
+/// the imported file names ([`crate::cli::fragment_beside`]). A tree id or an app
+/// name is joined onto the data directory and fed to a recursive delete, so a value like `/etc`
+/// (which `Path::join` treats as absolute and *replaces* the base with) or `../x` (which escapes
+/// the tree) must never reach the `join`. A real id is a 16-hex hash, but the check does
 /// not hard-code that — any legitimate directory name under `projects/` is one normal component;
 /// anything that is not is refused.
 pub(crate) fn is_safe_tree_id(id: &str) -> bool {

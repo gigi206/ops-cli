@@ -250,7 +250,7 @@ fn write_group_file(path: &Path, name: &str, text: &str) -> ExitCode {
     }
 }
 
-/// `sbx net groups import <file> [--as <name>] [--force]`: file a portable egress group under
+/// `sbx net groups import <file> [--as <name>] [-f|--force]`: file a portable egress group under
 /// `net-groups/<name>.toml`, where the loader reads it. Groups are global-only, so the target is
 /// always that directory; the deliberate command is the consent (an agent in the cage cannot run
 /// it), and the directory is trusted by location, so there is no prompt. An existing group of the
@@ -261,7 +261,7 @@ fn write_group_file(path: &Path, name: &str, text: &str) -> ExitCode {
 /// and the author's comments survive the round-trip.
 pub(super) fn net_groups_import(args: &[OsString]) -> ExitCode {
     const PATH: &[&str] = &["net", "groups", "import"];
-    let parsed = match crate::cli::import_args(args, PATH) {
+    let parsed = match crate::cli::import_args(args, PATH, false) {
         Ok(a) => a,
         Err(code) => return code,
     };

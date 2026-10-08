@@ -41,7 +41,7 @@ agent *on* untrusted code, safely).
 ## Import
 
 ```sh
-sbx app import <file> [--as <name>] [--force]
+sbx app import <file> [--as <name>] [-f|--force] [--with-deps]
 ```
 
 - The **deliberate command is the consent**: an agent in the cage cannot run it, and
