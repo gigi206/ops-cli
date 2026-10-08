@@ -191,13 +191,21 @@ impl Drop for Egress {
         self.supervisor.close();
         self.proxy.stop(super::proxy::child::STOP_WAIT);
         // Whatever it wrote before it went, applied: its end of the report channel went with it.
+        // Waited on for a bounded time, so a teardown never hangs on it; what it failed to apply is
+        // said, since the record is where an operator would look for it.
         if let Some(applier) = self.applier.take() {
-            let deadline = std::time::Instant::now() + super::proxy::child::STOP_WAIT;
-            while !applier.is_finished() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            if applier.is_finished() {
-                let _ = applier.join();
+            match settle(applier, super::proxy::child::STOP_WAIT) {
+                Settled::Finished => {}
+                Settled::Panicked => crate::diag::warn(
+                    "the thread recording this session's egress decisions ended in a panic — \
+                     what the proxy decided after it is missing from `sbx net logs` and the \
+                     session's egress stats",
+                ),
+                Settled::Running => crate::diag::warn(
+                    "the thread recording this session's egress decisions had not finished when \
+                     the session ended — the last decisions may be missing from `sbx net logs` \
+                     and the session's egress stats",
+                ),
             }
         }
         // The ring is final from here. A `--follow` that read this session is given its next read
@@ -227,6 +235,33 @@ impl Drop for Egress {
         if let Some(stats) = &self.stats {
             stats.flush_final();
         }
+    }
+}
+
+/// How a thread waited on for a bounded time ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Settled {
+    /// It returned, and was joined.
+    Finished,
+    /// It panicked, and was joined.
+    Panicked,
+    /// It was still running at the deadline, and was left to finish on its own.
+    Running,
+}
+
+/// Wait up to `wait` for `thread` to end, and join it if it did. Never blocks past `wait`: a thread
+/// still running then is detached, which is what dropping its handle does.
+fn settle(thread: std::thread::JoinHandle<()>, wait: std::time::Duration) -> Settled {
+    let deadline = std::time::Instant::now() + wait;
+    while !thread.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if !thread.is_finished() {
+        return Settled::Running;
+    }
+    match thread.join() {
+        Ok(()) => Settled::Finished,
+        Err(_) => Settled::Panicked,
     }
 }
 
@@ -272,13 +307,11 @@ pub(crate) struct Wiring {
 /// The rest of the script string is sbx-owned ASCII — the socat store path, the fixed port and
 /// socket — with one exception worth naming rather than leaving to be rediscovered: each `tcp://`
 /// destination's host goes in verbatim through [`tcp_forwarders`]. That one is a value from a rule,
-/// so it is safe by **charset**, not by ownership. A name that reaches the plan has passed the
-/// grammar's hostname production (alphanumerics, `-` and `.` between labels), and every IP literal
-/// but IPv4 loopback is dropped from the plan with a reason — which is also what keeps an IPv6
-/// literal's `:` out of a socat clause it would split. Adding a value here that holds to neither
-/// property would need the treatment [`ssh_config_host_ok`] gives its own: re-checked at the
-/// emitter, because there the stakes (a `Host` line is a pattern, not a name) do not allow resting
-/// on a property proved a layer away.
+/// so it is safe by **charset**, not by ownership, and the charset is checked where the plan is
+/// made ([`tcp_destinations`], through [`ssh_config_host_ok`]) rather than trusted from the
+/// grammar's hostname production a layer away. Every IP literal but IPv4 loopback is dropped from
+/// the plan with a reason, which is also what keeps an IPv6 literal's `:` out of a socat clause it
+/// would split.
 pub(crate) fn wrap_command(
     socat: &Path,
     bash: &Path,
@@ -493,7 +526,8 @@ const CAGE_HOSTNAME_PREFIX: &str = "sbx-";
 ///
 /// A rule is skipped when it names no single port (`:*`, or a range — sbx will not open a thousand
 /// listeners on a guess), a **privileged** port (below 1024, which a capability-less cage cannot
-/// bind), or a non-loopback IP literal, which the cage's network namespace has no way to hold.
+/// bind), a non-loopback IP literal, which the cage's network namespace has no way to hold, or the
+/// cage's own proxy port on its loopback, which the proxy's listener already holds.
 ///
 /// Skipping is reported, never silent: the rule still governs the proxy's verdict, so what the
 /// author loses is the convenience, and they need to know they must tunnel themselves.
@@ -531,6 +565,17 @@ pub(crate) fn tcp_destinations(policy: &crate::allowlist::EgressPolicy) -> TcpPl
                 continue;
             }
         };
+        // A name goes verbatim into the cage's preamble, as a shell word and a socat address, and
+        // into its `/etc/hosts`, where a space, a quote or a newline would be syntax. The grammar
+        // admits none of them a layer away; re-checked here, because these files must not rest on a
+        // property proved elsewhere. An IP literal is spelled by sbx, from the parsed address.
+        if literal.is_none() && !ssh_config_host_ok(&host) {
+            plan.skipped.push(format!(
+                "tcp://{} — not a name the cage's forwarder and hosts file can be written with",
+                host.escape_debug()
+            ));
+            continue;
+        }
         let ports = match ports {
             Ports::Ranges(ranges) if ranges.iter().all(|(lo, hi)| lo == hi) => {
                 ranges.iter().map(|(p, _)| *p).collect::<Vec<u16>>()
@@ -635,6 +680,17 @@ pub(crate) fn tcp_destinations(policy: &crate::allowlist::EgressPolicy) -> TcpPl
         // clash on the host side — the loser is the later spelling, so the plan stays the order the
         // rules were written in.
         let mut ports = ports;
+        // The cage's own proxy listens on its loopback at `CAGE_PROXY_PORT`, started beside these
+        // listeners in the same preamble. A second listener there races it for the address and
+        // whichever binds second fails in silence; lost by the proxy, that is every HTTP request
+        // the cage makes.
+        if addr == Ipv4Addr::LOCALHOST && ports.contains(&CAGE_PROXY_PORT) {
+            ports.retain(|port| *port != CAGE_PROXY_PORT);
+            plan.skipped.push(format!(
+                "tcp://{host}:{CAGE_PROXY_PORT} — that port on the cage's loopback is its own \
+                 proxy's, and one address holds one listener"
+            ));
+        }
         ports.retain(|port| {
             let Some(other) = plan
                 .destinations
@@ -699,7 +755,8 @@ fn tcp_forwarders(socat: &Path, destinations: &[TcpDestination]) -> String {
     out
 }
 
-/// Whether a host may be written into a generated `ssh_config` as itself.
+/// Whether a host may be written into a generated `ssh_config` as itself. The same test admits a
+/// name to the cage's forwarder preamble and hosts file ([`tcp_destinations`]).
 ///
 /// A `Host` line is a **pattern**, not a name: a `*` or `?` in it would silently widen the block to
 /// destinations the rule never named, and a newline would close the block and turn the rest of the
@@ -846,8 +903,6 @@ pub(crate) fn start(
     // at the same path would truncate the first.
     record: Option<&super::lens::RecordWiring>,
 ) -> io::Result<(Egress, Wiring)> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     // Tighten the data directory to owner-only before anything reads from it. A resolver plugin
     // is trusted by location — it is run only because it sits under `<data>/plugins`, a tree a
     // project cannot write — and that perimeter rests on `<data>` being `0700`. Established here
@@ -948,6 +1003,10 @@ pub(crate) fn start(
     // under it. `instance` is what makes each proxy's names its own; the session's own proxy passes
     // an empty one, so its paths are unchanged. A stale file from a crashed predecessor with a
     // reused pid would block the bind, so clear it first.
+    debug_assert!(
+        !instance.contains(['/', '\0']),
+        "an instance is part of a file name: {instance:?}"
+    );
     let pid = std::process::id();
     let host_uds = dir.join(format!("proxy-{pid}{instance}.sock"));
     let ca_file = dir.join(format!("ca-{pid}{instance}.pem"));
@@ -1206,24 +1265,12 @@ pub(crate) fn start(
     // on the full file. `[network] ca_roots = false` buys that back for a cage whose tools are known
     // not to make the check — a preference the splice arm above still overrides.
     let roots_needed = splices_any || wants_ca_roots;
-    let write_ca = || -> io::Result<()> {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&ca_file)?;
-        f.write_all(launched.ca.as_bytes())?;
-        if let Some(bundle) = ca_bundle.filter(|_| roots_needed)
-            && let Ok(roots) = std::fs::read(bundle)
-        {
-            f.write_all(b"\n")?;
-            f.write_all(&roots)?;
-        }
-        Ok(())
-    };
-    write_ca().map_err(&unwind_control)?;
+    write_session_ca(
+        &ca_file,
+        launched.ca.as_bytes(),
+        ca_bundle.filter(|_| roots_needed),
+    )
+    .map_err(&unwind_control)?;
 
     let proxy_url = format!("http://127.0.0.1:{CAGE_PROXY_PORT}");
     // Exempt loopback from the proxy: an agent's own in-cage service (a dev server, a test
@@ -1813,6 +1860,41 @@ fn read_sops(
             run_sops_as(&sops, &copy.file, &path, key, header, deadline)
         }
     }
+}
+
+/// Write the session's CA bundle at `path`, owner-only: the MITM certificate, then the roots read
+/// from `roots` when one is given and readable.
+///
+/// Always a new file. Whatever is at the name is unlinked first, the way the proxy's socket is
+/// cleared before its bind, and the file is created exclusively, without following a link: a
+/// leftover from a crashed predecessor whose pid this launch reuses, or a link placed at the name,
+/// is replaced rather than truncated or written through. A failed write removes what it created, so
+/// no half-written anchor is left for the cage to be handed.
+fn write_session_ca(path: &Path, ca: &[u8], roots: Option<&Path>) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(path)?;
+    let written = file
+        .write_all(ca)
+        .and_then(|()| match roots.map(std::fs::read) {
+            Some(Ok(roots)) => {
+                file.write_all(b"\n")?;
+                file.write_all(&roots)
+            }
+            _ => Ok(()),
+        });
+    written.inspect_err(|_| {
+        let _ = std::fs::remove_file(path);
+    })
 }
 
 /// A private copy of a sops file's approved bytes, for `sops` to read in place of the project's
@@ -2496,6 +2578,65 @@ mod tests {
         assert!(took < interval, "the guard waited for a follow: {took:?}");
     }
 
+    /// The CA is written as a new file: a link at its name is replaced, not written through, and a
+    /// leftover is replaced, not appended to or partly overwritten.
+    #[test]
+    fn the_session_ca_is_written_fresh_and_owner_only() {
+        let dir = TmpDir::new();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let ca = dir.join("ca-1.pem");
+        std::os::unix::fs::symlink(&victim, &ca).unwrap();
+        let roots = dir.join("roots.pem");
+        std::fs::write(&roots, b"ROOTS").unwrap();
+
+        write_session_ca(&ca, b"MITM", Some(&roots)).unwrap();
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"keep",
+            "written through the link"
+        );
+        let meta = std::fs::symlink_metadata(&ca).unwrap();
+        assert!(meta.file_type().is_file(), "{:?}", meta.file_type());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&ca).unwrap(), b"MITM\nROOTS");
+
+        write_session_ca(&ca, b"NEW", None).unwrap();
+        assert_eq!(
+            std::fs::read(&ca).unwrap(),
+            b"NEW",
+            "a leftover must be replaced whole"
+        );
+    }
+
+    /// A bounded wait tells a thread that returned from one that panicked and one still running,
+    /// and never waits past its bound for the last.
+    #[test]
+    fn a_settled_thread_is_finished_panicked_or_left_running() {
+        let wait = std::time::Duration::from_secs(5);
+        assert_eq!(settle(std::thread::spawn(|| {}), wait), Settled::Finished);
+        assert_eq!(
+            settle(
+                std::thread::spawn(|| panic!("an applier that panics")),
+                wait
+            ),
+            Settled::Panicked
+        );
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let begun = std::time::Instant::now();
+        assert_eq!(
+            settle(
+                std::thread::spawn(move || {
+                    let _ = held.recv();
+                }),
+                std::time::Duration::from_millis(100)
+            ),
+            Settled::Running
+        );
+        assert!(begun.elapsed() < wait, "{:?}", begun.elapsed());
+        drop(release);
+    }
+
     /// Every path this guard owns goes when the launch ends. A path it holds but does not unlink is
     /// a file per session left behind for good: nothing else writes these names, and the runtime
     /// sweep is a backstop for the sessions that end on a signal, not a substitute for the guard.
@@ -3086,6 +3227,69 @@ mod tests {
             unique.len(),
             "each awaited listener must be a distinct address: {patterns:?}"
         );
+    }
+
+    /// A name that would be syntax in the cage's preamble or hosts file gets no listener, whatever
+    /// the grammar a layer away admitted. Built past the grammar, which refuses such a name today.
+    #[test]
+    fn a_host_the_preamble_cannot_hold_gets_no_listener() {
+        let mut policy = tcp_policy(&["tcp://db.internal:5432", "tcp://cache.internal:6379"]);
+        let mut rules = policy.allow_rules().to_vec();
+        let crate::allowlist::RuleKind::Host(host, _) = &mut rules[0].kind else {
+            panic!("a host rule: {:?}", rules[0].kind);
+        };
+        *host = "db.internal & curl evil".to_string();
+        policy = crate::allowlist::EgressPolicy::new(rules, Vec::new());
+
+        let plan = tcp_destinations(&policy);
+        assert_eq!(
+            plan.destinations
+                .iter()
+                .map(|d| d.host.as_str())
+                .collect::<Vec<_>>(),
+            ["cache.internal"],
+            "{:?}",
+            plan.skipped
+        );
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|s| s.contains("db.internal & curl evil")),
+            "{:?}",
+            plan.skipped
+        );
+    }
+
+    /// The cage's own proxy port on its loopback is never handed to a `tcp://` rule. The preamble
+    /// backgrounds the proxy's listener and every destination's together, so a second listener on
+    /// `127.0.0.1:18043` races the proxy's for the address: whichever binds second fails into
+    /// `/dev/null`, and if that is the proxy's, every HTTP request the cage makes is refused.
+    #[test]
+    fn the_proxy_port_on_the_cage_loopback_is_never_a_destination_listener() {
+        for rule in [
+            format!("tcp://127.0.0.1:{CAGE_PROXY_PORT}"),
+            format!("tcp://localhost:{CAGE_PROXY_PORT}"),
+        ] {
+            let plan = tcp_destinations(&tcp_policy(&[rule.as_str()]));
+            assert!(
+                plan.destinations.is_empty(),
+                "{rule} must get no listener: {:?}",
+                plan.destinations
+            );
+            assert!(
+                plan.skipped
+                    .iter()
+                    .any(|s| s.contains(&CAGE_PROXY_PORT.to_string())),
+                "{rule} must be named as skipped: {:?}",
+                plan.skipped
+            );
+        }
+        // The same port on an address of the cage's own is no clash: it gets its listener.
+        let plan = tcp_destinations(&tcp_policy(&[&format!(
+            "tcp://db.internal:{CAGE_PROXY_PORT}"
+        )]));
+        assert_eq!(plan.destinations.len(), 1, "{:?}", plan.skipped);
+        assert_eq!(plan.destinations[0].ports, vec![CAGE_PROXY_PORT]);
     }
 
     /// The preamble carries a listener per port, each speaking CONNECT for the host **as written**.

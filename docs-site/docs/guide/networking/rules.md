@@ -430,7 +430,9 @@ See [`[ssh_agent]`](../configuration/ssh-agent), which is the other half of git-
 `tcp://localhost:<port>` is a special case worth naming, because it is the rule a developer writes
 for a service on their own machine. The cage's `localhost` is its own loopback: a different machine, so the listener is placed **there**, on the port declared, and the connection it forwards goes to
 the host's `localhost`. `-h localhost -p 5432` therefore reaches the service you meant; every other
-port on the cage's loopback is untouched, and still belongs to whatever the cage itself runs.
+port on the cage's loopback is untouched, and still belongs to whatever the cage itself runs. The one
+port that cannot be given is `18043`, where the cage's own proxy listens: `tcp://localhost:18043`
+(or `tcp://127.0.0.1:18043`) gets no listener, and the launch says so.
 
 The mirror image is worth naming, because it is the one place an allowed rule carries nothing: an
 **inspected** rule for such a host (`http://localhost:11434`, `https://127.0.0.1:8443`, or the bare

@@ -43,8 +43,9 @@ host's. `-h localhost -p 5432` reaches the service you meant.
 
 **What gets no listener**, and is reported at launch rather than passed over: a rule naming no single
 port (`tcp://host:*`, or a port range: sbx will not open a thousand listeners on a guess), a
-non-loopback IP literal the cage's network namespace has no way to hold, and a host in the cage's own
-`sbx-*` hostname space. Those rules still govern the proxy; what they lose is the convenience, and
+non-loopback IP literal the cage's network namespace has no way to hold, a host in the cage's own
+`sbx-*` hostname space, and port `18043` on the cage's loopback (`tcp://localhost:18043`), where the
+cage's own proxy listens. Those rules still govern the proxy; what they lose is the convenience, and
 the command has to tunnel itself.
 
 A **port below 1024** gets no listener either (binding one needs a capability the cage does not
