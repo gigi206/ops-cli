@@ -13,7 +13,9 @@
 //!   - a security block (`ssrf-blocked`, `host-mismatch`, `outbound-secret`, `bad-request`, …) —
 //!     auto-allowing a security refusal would turn a convenience into a hole.
 //!
-//! So the reason whitelist is the security boundary of this feature.
+//! So the reason whitelist is the security boundary of this feature. A reason counts only on the
+//! event it was written for: a `deny` on one of the two inspected planes (`https` or `http`), the
+//! only events the proxy records those two reasons on ([`learnable`]).
 //!
 //! Two gates sit beside it.
 //!
@@ -45,22 +47,18 @@
 //!   - [`Granularity::Path`] — a subtree per host and top-level path section: `{*} https://host/v1/*`.
 //!     Each refused path opens its first path segment as a subtree, so `/v1/chat` + `/v2/models` yield
 //!     `/v1/*` **and** `/v2/*` — a predictable one-level section, and never a silent widen to the whole
-//!     host. A refusal for the bare root (`/`, no segments) falls back to the host rule.
+//!     host. A refusal for the bare root (`/`, no segments) falls back to the host rule, with a note.
 //!   - [`Granularity::Exact`] — the exact endpoint per distinct `(host, port, method, path)`:
 //!     `{POST} https://host/v1/chat`. The observed verb is kept; the query string is dropped.
 //!
 //! Nothing is ever dropped silently: a learnable refusal that cannot become a rule (an unusable host,
-//! a candidate the classifier rejects) and a verb-widening (a method-scoped host opened to `{*}`) are
-//! surfaced as [`Synthesis::notes`] for the caller to print.
-
-#![allow(
-    clippy::expect_used,
-    reason = "`host_token` is called on entries the same iterator chain has already filtered to the ones it answers for, so the `None` arm is a filter disagreeing with the function it filters for"
-)]
+//! a path no rule can match on its own, a candidate the classifier rejects) and a widening (a
+//! method-scoped host opened to `{*}`, a bare root opened to the whole host) are surfaced as
+//! [`Synthesis::notes`] for the caller to print.
 
 use std::collections::BTreeSet;
 
-use super::control::{LogEvent, Plane, Proto};
+use super::control::{LogEvent, LogVerdict, Plane, Proto};
 use super::learn::Synthesis;
 use crate::allowlist::{Decision, EgressPolicy, canonical_segments, classify};
 
@@ -115,15 +113,15 @@ pub(crate) fn synthesize(
 ) -> Synthesis {
     let mut notes: Vec<String> = Vec::new();
 
-    // Learnable, not-already-allowed refusals that name a usable host. A refusal we cannot even shape
-    // into a host token is surfaced here, never silently dropped.
-    let mut usable: Vec<&LogEvent> = Vec::new();
+    // Learnable, not-already-allowed refusals, each with the host part of its rule. A refusal we
+    // cannot even shape into a host token is surfaced here, never silently dropped.
+    let mut usable: Vec<(&LogEvent, String)> = Vec::new();
     // Refusals another plane's proxy pushed into this session's ring, collapsed into one note: they
     // are counted rather than listed, because a task loop can produce thousands of them and the
     // operator's question is "did any of my rules come from somewhere else?", not "which".
     let mut foreign = 0usize;
     for e in events {
-        if !LEARNABLE.contains(&e.reason.as_str()) {
+        if !learnable(e) {
             continue;
         }
         if !from_agent(e) {
@@ -141,14 +139,14 @@ pub(crate) fn synthesize(
             ));
             continue;
         }
-        if host_token(&e.host, e.port, e.proto).is_none() {
+        let Some(host) = host_token(&e.host, e.port, e.proto) else {
             notes.push(format!(
                 "skipped an egress refusal for an unusable host `{}:{}`",
                 e.host, e.port
             ));
             continue;
-        }
-        usable.push(e);
+        };
+        usable.push((e, host));
     }
     if foreign > 0 {
         notes.push(format!(
@@ -164,7 +162,7 @@ pub(crate) fn synthesize(
     let mut widened: BTreeSet<String> = BTreeSet::new();
     match gran {
         Granularity::Domain => build_domain(&usable, &mut rules, &mut widened),
-        Granularity::Path => build_path(&usable, &mut rules, &mut widened),
+        Granularity::Path => build_path(&usable, &mut rules, &mut widened, &mut notes),
         Granularity::Exact => build_exact(&usable, &mut rules, &mut notes),
     }
 
@@ -201,18 +199,17 @@ pub(crate) fn synthesize(
 /// collapses to `{*}` and the path is ignored — the widest learn. A `denied-method` that becomes
 /// `{*}` widened a method-scoped host, recorded in `widened`.
 fn build_domain(
-    events: &[&LogEvent],
+    events: &[(&LogEvent, String)],
     rules: &mut BTreeSet<String>,
     widened: &mut BTreeSet<String>,
 ) {
-    for e in events {
-        let host = host_token(&e.host, e.port, e.proto).expect("filtered to usable hosts");
+    for (e, host) in events {
         if is_ws(e) {
             rules.insert(format!("{{WS}} {host}"));
         } else {
             rules.insert(format!("{{*}} {host}"));
             if e.reason == "denied-method" {
-                widened.insert(host);
+                widened.insert(host.clone());
             }
         }
     }
@@ -222,34 +219,52 @@ fn build_domain(
 /// subtree (`/v1/chat` → `host/v1/*`), so divergent sections (`/v1/…` vs `/v2/…`) become separate
 /// one-level subtrees rather than collapsing to the whole host — the predictable middle ground
 /// between the whole-host `domain` and the exact-endpoint `exact`. A refusal for the bare root (no
-/// segments) has no section to scope and falls back to a host rule.
-fn build_path(events: &[&LogEvent], rules: &mut BTreeSet<String>, widened: &mut BTreeSet<String>) {
-    for e in events {
-        let host = host_token(&e.host, e.port, e.proto).expect("filtered to usable hosts");
+/// segments) has no section to scope and falls back to a host rule, which is noted because it opens
+/// more than `path` promises. A section no rule can name on its own ([`written_as_is`]) is skipped
+/// with a note.
+fn build_path(
+    events: &[(&LogEvent, String)],
+    rules: &mut BTreeSet<String>,
+    widened: &mut BTreeSet<String>,
+    notes: &mut Vec<String>,
+) {
+    for (e, host) in events {
         let ws = is_ws(e);
         let verb = if ws { "WS" } else { "*" };
         let segs = canonical_segments(e.path.as_deref().unwrap_or(""));
         match segs.first() {
+            Some(section) if !written_as_is(std::slice::from_ref(section)) => {
+                notes.push(unwritable_path(host, e, "path"));
+                continue;
+            }
             Some(section) => {
                 rules.insert(format!("{{{verb}}} {host}/{section}/*"));
             }
             // A bare-root refusal (no path segments) has no subtree to scope — open the host.
             None => {
                 rules.insert(format!("{{{verb}}} {host}"));
+                notes.push(format!(
+                    "`{host}` was refused at its root, which has no path section, so `path` opened \
+                     the whole host"
+                ));
             }
         }
         if !ws && e.reason == "denied-method" {
-            widened.insert(host);
+            widened.insert(host.clone());
         }
     }
 }
 
 /// The exact endpoint per distinct `(host, port, method, path)`: `{POST} https://host/v1/chat`. The
 /// observed verb is kept and the query string is dropped (an exact rule matches the path, not the
-/// query). A refusal with no usable method cannot become an exact rule and is surfaced.
-fn build_exact(events: &[&LogEvent], rules: &mut BTreeSet<String>, notes: &mut Vec<String>) {
-    for e in events {
-        let host = host_token(&e.host, e.port, e.proto).expect("filtered to usable hosts");
+/// query). A refusal with no usable method, or whose path no rule can name on its own
+/// ([`written_as_is`]), cannot become an exact rule and is surfaced.
+fn build_exact(
+    events: &[(&LogEvent, String)],
+    rules: &mut BTreeSet<String>,
+    notes: &mut Vec<String>,
+) {
+    for (e, host) in events {
         let Some(method) = e.method.as_deref() else {
             notes.push(format!(
                 "skipped `{host}` for `exact` — the refusal carries no method"
@@ -260,6 +275,11 @@ fn build_exact(events: &[&LogEvent], rules: &mut BTreeSet<String>, notes: &mut V
             notes.push(format!(
                 "skipped `{host}` for `exact` — unusable method `{method}`"
             ));
+            continue;
+        }
+        let segs = canonical_segments(e.path.as_deref().unwrap_or("/"));
+        if !written_as_is(&segs) {
+            notes.push(unwritable_path(host, e, "exact"));
             continue;
         }
         let path = exact_path(e.path.as_deref());
@@ -289,6 +309,42 @@ fn already_allowed(policy: &EgressPolicy, e: &LogEvent) -> bool {
     matches!(
         verdict_for(policy, e),
         Decision::AllowedBy(_) | Decision::AllowedDefault
+    )
+}
+
+/// Whether `e` is a refusal one of the [`LEARNABLE`] reasons may be read from: a `deny`, on one of the
+/// two inspected planes.
+///
+/// The reason is not read on its own. Those two reasons are only ever recorded with a `deny`, by the
+/// inspected planes' verdicts, and those planes are the only ones a rule this module writes can
+/// open: an `https://` or `http://` rule never admits a raw splice, and a resolution is not a
+/// request. An event carrying such a reason anywhere else is one this module was not written for,
+/// and turning it into an `https://` rule would open a plane nothing asked for.
+fn learnable(e: &LogEvent) -> bool {
+    LEARNABLE.contains(&e.reason.as_str())
+        && e.verdict == LogVerdict::Deny
+        && matches!(e.proto, Proto::Https | Proto::Http)
+}
+
+/// Whether a rule written with these canonical path segments matches the path they came from and no
+/// other.
+///
+/// The segments are percent-decoded, and a rule's path is decoded again when it is read, so a
+/// decoded `%` re-reads as an escape (`/%2541` yields `/%41`, a rule for `/A`) and a decoded `/`
+/// splits one segment into two. Those are caught by reading the written path back. A decoded `*`
+/// reads back unchanged but is grammar: as the last segment of an exact rule it is the trailing
+/// `/*` that opens a whole subtree, so `/v1/%2A` would have learned every path under `/v1`.
+fn written_as_is(segs: &[String]) -> bool {
+    !segs.iter().any(|s| s.contains('*'))
+        && canonical_segments(&format!("/{}", segs.join("/"))) == segs
+}
+
+/// The note for a refusal whose path [`written_as_is`] turns down at `level`. It quotes the path as
+/// logged rather than the decoded segments, which may hold any byte the cage encoded.
+fn unwritable_path(host: &str, e: &LogEvent, level: &str) -> String {
+    format!(
+        "skipped `{host}` for `{level}` — its path `{}` decodes to one no rule can match on its own",
+        crate::sandbox::sanitize(e.path.as_deref().unwrap_or("/"))
     )
 }
 
@@ -338,15 +394,15 @@ fn is_ws(e: &LogEvent) -> bool {
 /// `https://h:8080`, a rule that names the inspected plane and so can never admit the cleartext
 /// request it was learned from (`explain_clear` opens only on an `http://` rule). The port is omitted
 /// only when it is the scheme's own default — 443 for `https://`, 80 for `http://` — so the shorthand
-/// never silently narrows a non-standard port. `None` for an empty or malformed host — a rule must
-/// name a concrete, sane destination.
+/// never silently narrows a non-standard port. `None` for a host the proxy's planes would never hand
+/// on ([`crate::allowlist::is_request_host`]): the proxy reports only such hosts, already in their
+/// one canonical spelling, so anything else is not a destination a rule could reach.
 fn host_token(host: &str, port: u16, proto: Proto) -> Option<String> {
-    if !host_is_sane(host) {
+    if host.len() > 253 || !crate::allowlist::is_request_host(host) {
         return None;
     }
-    // Only the cleartext plane is `http://`. A splice (`Tcp`) and an unknown transport (`Other`)
-    // never carry a learnable reason, so they read as the inspected plane rather than inventing a
-    // scheme for a refusal this feature cannot learn from anyway.
+    // Only the cleartext plane is `http://`; [`learnable`] has already kept every other plane but
+    // the inspected one out.
     let (scheme, default_port) = match proto {
         Proto::Http => ("http", 80),
         _ => ("https", 443),
@@ -361,17 +417,6 @@ fn host_token(host: &str, port: u16, proto: Proto) -> Option<String> {
     } else {
         format!("{scheme}://{host}:{port}")
     })
-}
-
-/// A conservative host-charset gate, so a malformed log host can never be shaped into a rule string
-/// that the classifier would then have to reject (or worse, mis-parse). The real validation is the
-/// classifier at write time; this just keeps obvious junk out of the candidate list.
-fn host_is_sane(host: &str) -> bool {
-    !host.is_empty()
-        && host.len() <= 253
-        && host.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']' | b'_')
-        })
 }
 
 /// An HTTP verb (or the `WS` pseudo-verb) is uppercase ASCII letters — the same shape the rule
@@ -1336,6 +1381,207 @@ mod tests {
             assert!(
                 rules(&[ev], Granularity::Domain).is_empty(),
                 "a `{reason}` event must never become an allow rule"
+            );
+        }
+    }
+
+    /// Whether `rule` admits a `GET` for `path` on `api.test:443`.
+    fn admits(rule: &str, path: &str) -> bool {
+        let policy =
+            EgressPolicy::new(vec![classify(rule).expect("a learned rule parses")], vec![]);
+        matches!(
+            policy.explain("api.test", 443, path, "GET"),
+            Decision::AllowedBy(_)
+        )
+    }
+
+    /// Every rule `exact` learns admits the request it came from and no other path. A path whose
+    /// decoded segments a rule cannot spell back is skipped with a note quoting the path as logged:
+    /// a decoded `*` as the last segment is the subtree wildcard, and a decoded `%` re-reads as an
+    /// escape naming another path.
+    #[test]
+    fn exact_learns_only_a_rule_that_admits_its_own_request_and_nothing_else() {
+        for path in ["/v1/chat", "/a%2Fb", "/v1/%2A", "/%2541", "/a%2A"] {
+            let out = synthesize(
+                &[ev(
+                    "api.test",
+                    443,
+                    Some("GET"),
+                    Some(path),
+                    "denied-default",
+                )],
+                &empty_policy(),
+                Granularity::Exact,
+            );
+            let shown = (&out.rules, &out.notes);
+            for rule in &out.rules {
+                assert!(admits(rule, path), "{rule} must admit {path}");
+                for other in ["/v1/other", "/v1/chat/x", "/A", "/a/b/c", "/zzz"] {
+                    if canonical_segments(other) != canonical_segments(path) {
+                        assert!(
+                            !admits(rule, other),
+                            "{rule}, learned from {path}, admits {other}"
+                        );
+                    }
+                }
+            }
+            let skipped = out
+                .notes
+                .iter()
+                .any(|n| n.contains("no rule can match on its own") && n.contains(path));
+            assert_eq!(
+                out.rules.is_empty(),
+                skipped,
+                "{path}: a path is learned or skipped with a note, never both or neither: {shown:?}"
+            );
+        }
+        for (path, learned) in [
+            ("/v1/chat", true),
+            ("/a%2Fb", true),
+            ("/v1/%2A", false),
+            ("/%2541", false),
+        ] {
+            let out = synthesize(
+                &[ev(
+                    "api.test",
+                    443,
+                    Some("GET"),
+                    Some(path),
+                    "denied-default",
+                )],
+                &empty_policy(),
+                Granularity::Exact,
+            );
+            let shown = (&out.rules, &out.notes);
+            assert_eq!(!out.rules.is_empty(), learned, "{path}: {shown:?}");
+        }
+    }
+
+    /// `path` skips a section no rule can name on its own, with a note, and still learns a plain one.
+    #[test]
+    fn path_skips_a_section_no_rule_can_name() {
+        for (path, learned) in [("/v1/x", true), ("/%2541/x", false), ("/%2A/x", false)] {
+            let out = synthesize(
+                &[ev(
+                    "api.test",
+                    443,
+                    Some("GET"),
+                    Some(path),
+                    "denied-default",
+                )],
+                &empty_policy(),
+                Granularity::Path,
+            );
+            let shown = (&out.rules, &out.notes);
+            assert_eq!(!out.rules.is_empty(), learned, "{path}: {shown:?}");
+            assert_eq!(
+                out.notes
+                    .iter()
+                    .any(|n| n.contains("no rule can match on its own")),
+                !learned,
+                "{path}: {shown:?}"
+            );
+            for rule in &out.rules {
+                assert!(admits(rule, path), "{rule} must admit {path}");
+            }
+        }
+    }
+
+    /// A refusal at the root has no section, so `path` opens the whole host and says so.
+    #[test]
+    fn path_says_when_a_root_refusal_opened_the_whole_host() {
+        for path in ["/", "/?q=1"] {
+            let out = synthesize(
+                &[ev(
+                    "api.test",
+                    443,
+                    Some("GET"),
+                    Some(path),
+                    "denied-default",
+                )],
+                &empty_policy(),
+                Granularity::Path,
+            );
+            assert_eq!(out.rules, vec!["{*} https://api.test".to_string()]);
+            assert!(
+                out.notes
+                    .iter()
+                    .any(|n| n.contains("opened the whole host")),
+                "{path}: {:?}",
+                out.notes
+            );
+        }
+        let out = synthesize(
+            &[ev(
+                "api.test",
+                443,
+                Some("GET"),
+                Some("/v1/x"),
+                "denied-default",
+            )],
+            &empty_policy(),
+            Granularity::Path,
+        );
+        assert!(
+            !out.notes
+                .iter()
+                .any(|n| n.contains("opened the whole host")),
+            "{:?}",
+            out.notes
+        );
+    }
+
+    /// A learnable reason is read only on a `deny` from an inspected plane.
+    #[test]
+    fn a_learnable_reason_counts_only_on_an_inspected_deny() {
+        let mut allowed = ev("api.test", 443, Some("GET"), Some("/"), "denied-default");
+        allowed.verdict = LogVerdict::Allow;
+        let mut events = vec![allowed];
+        for proto in [Proto::Tcp, Proto::Other, Proto::Dns] {
+            events.push(ev_on(
+                "api.test",
+                443,
+                Some("GET"),
+                Some("/"),
+                "denied-default",
+                proto,
+            ));
+        }
+        let out = synthesize(&events, &empty_policy(), Granularity::Domain);
+        let shown = (&out.rules, &out.notes);
+        assert!(out.rules.is_empty(), "{shown:?}");
+        for proto in [Proto::Https, Proto::Http] {
+            let out = synthesize(
+                &[ev_on(
+                    "api.test",
+                    443,
+                    Some("GET"),
+                    Some("/"),
+                    "denied-default",
+                    proto,
+                )],
+                &empty_policy(),
+                Granularity::Domain,
+            );
+            let shown = (&out.rules, &out.notes);
+            assert_eq!(out.rules.len(), 1, "{proto:?}: {shown:?}");
+        }
+    }
+
+    /// Only a host in the one spelling the proxy reports is shaped into a rule.
+    #[test]
+    fn a_host_the_proxy_would_not_report_is_unusable() {
+        for host in ["API.test", "api.test.", "[::1]", "a:b", "api.123"] {
+            let out = synthesize(
+                &[ev(host, 443, Some("GET"), Some("/"), "denied-default")],
+                &empty_policy(),
+                Granularity::Domain,
+            );
+            let shown = (&out.rules, &out.notes);
+            assert!(out.rules.is_empty(), "{host}: {shown:?}");
+            assert!(
+                out.notes.iter().any(|n| n.contains("unusable host")),
+                "{host}: {shown:?}"
             );
         }
     }

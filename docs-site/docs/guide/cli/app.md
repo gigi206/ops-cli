@@ -79,6 +79,11 @@ The level sets how wide each rule is:
 | `path` | its first path section, e.g. `{*} https://host/v1/*` |
 | `exact` | the one endpoint, e.g. `{POST} https://host/v1/chat` |
 
+A refusal at the root (`/`) has no first section, so `path` opens the whole host for it
+and says so in the run's notes. A path that decodes to something no rule can match on its
+own (an encoded `*`, or an encoded `%` that would read back as another escape) is skipped
+at `path` and `exact`, with a note quoting it.
+
 The rules land in the project config by default (`--local`), or in the app's global
 profile with `-g`, which, for an app defined only inline in a project `sbx.toml`, writes
 a partial `apps/<name>.toml` the inline table then shadows on load; prefer `-g` for an
