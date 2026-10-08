@@ -667,10 +667,12 @@ backends do not, and each stops at a different place:
 | `deb:apt:` | the above, plus the `Packages` index checked against the repository's signed `InRelease`, under a signing key pinned on first use | the index is the one the holder of that key published. The **first** pin is trust on first use and proves nothing on its own; from then on a re-keyed repository, or an index served by someone else, is refused |
 
 **How much a prebuilt may unpack to.** A download's size says nothing about what it expands to, so
-the ceiling is put on the **decompressed** stream: `tarball:` and `deb:` unpack through
-`head -c 8589934592`, and an archive that reaches 8 GiB is truncated, which makes `tar` refuse an
-incomplete archive and fails the build with a message naming the ceiling. Nothing unpacks past it,
-and nothing unpacks halfway.
+the ceiling is put on the **decompressed** stream: `tarball:` and `deb:` count it first, and an
+archive that expands past 8 GiB fails the build with a message naming the ceiling before anything
+is unpacked. Only an archive that fits is then unpacked, so nothing unpacks past the ceiling and
+nothing unpacks halfway. Truncating the stream into `tar` would not be enough: a stream cut where
+one member ends unpacks the members before the cut and exits successfully. The count costs a second
+decompression.
 
 Eight gibibytes is a guardrail rather than an estimate. The heaviest things these backends carry are
 prebuilt Electron desktop apps, and the two largest in the shipped catalogue unpack to 559 MiB and

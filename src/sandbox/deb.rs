@@ -989,7 +989,7 @@ mod tests {
         // `tarball:` backend uses: both expand a compressed stream whose download size bounds
         // nothing.
         assert!(
-            expr.contains("dpkg-deb --fsys-tarfile $src | head -c")
+            expr.contains("{ dpkg-deb --fsys-tarfile $src || true; } | head -c")
                 && expr.contains(&prebuilt::MAX_UNPACKED_BYTES.to_string())
                 && expr.contains("tar -x --no-same-permissions --no-same-owner -C extracted"),
             "the unpack must be bounded:\n{expr}"

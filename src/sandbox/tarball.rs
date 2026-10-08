@@ -525,7 +525,7 @@ mod tests {
         // compressed, so its size says nothing about what it expands to. The ceiling is in the
         // expression rather than implied by one, because the builder is what enforces it.
         assert!(
-            expr.contains("gzip -dc $src | head -c")
+            expr.contains("{ gzip -dc $src || true; } | head -c")
                 && expr.contains(&prebuilt::MAX_UNPACKED_BYTES.to_string()),
             "the unpack must be bounded:\n{expr}"
         );

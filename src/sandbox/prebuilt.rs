@@ -208,9 +208,15 @@ pub(crate) const MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// The `unpackPhase` body that unpacks `producer`'s output under [`MAX_UNPACKED_BYTES`].
 ///
 /// The ceiling is applied to the **decompressed** stream, which is the number that matters: a
-/// bounded download says nothing about what it expands to. `head` truncating the stream makes `tar`
-/// fail on an incomplete archive, so the build stops rather than filling the store — and the branch
-/// is there to say why, because "Unexpected EOF in archive" on its own reads as a corrupt download.
+/// bounded download says nothing about what it expands to. The stream is counted first, through
+/// `head` so the count itself stops one byte past the ceiling, and it is unpacked only when it
+/// fits. Truncating the stream into `tar` instead is not a refusal: measured with GNU tar 1.35, a
+/// stream cut at a member boundary unpacks the members before the cut and exits 0, so the build
+/// would go on with part of the archive. The price is decompressing twice.
+///
+/// The producer's own status is ignored in the count — it is cut off by `head` past the ceiling,
+/// which the builder's `pipefail` would otherwise turn into an unexplained failure — and a stream
+/// that is not a valid archive is caught by the unpack that follows.
 ///
 /// Written once and shared, because the two backends that own their unpack differ only in how they
 /// produce the tar stream: `tarball:` decompresses the download, `deb:` reads the data member out of
@@ -223,13 +229,17 @@ pub(crate) fn bounded_unpack(producer: &str) -> String {
 /// [`bounded_unpack`] with the ceiling as an argument, so a test can drive the truncating branch
 /// without building an eight-gibibyte archive to reach it.
 fn bounded_unpack_to(producer: &str, ceiling: u64) -> String {
-    let max_unpacked_bytes = ceiling;
+    let past = ceiling + 1;
     format!(
         "mkdir extracted\n\
-         if ! {producer} | head -c {max_unpacked_bytes} | tar -x --no-same-permissions \
-         --no-same-owner -C extracted; then\n\
-         \x20 echo \"sbx: the archive did not unpack: it is not a valid tar stream, or it \
-         exceeds the {max_unpacked_bytes}-byte ceiling sbx puts on a prebuilt unpack\" >&2\n\
+         unpacked=$({{ {producer} || true; }} | head -c {past} | wc -c)\n\
+         if [ \"$unpacked\" -gt {ceiling} ]; then\n\
+         \x20 echo \"sbx: the archive unpacks past the {ceiling}-byte ceiling sbx puts on a \
+         prebuilt unpack\" >&2\n\
+         \x20 exit 1\n\
+         fi\n\
+         if ! {producer} | tar -x --no-same-permissions --no-same-owner -C extracted; then\n\
+         \x20 echo \"sbx: the archive did not unpack: it is not a valid tar stream\" >&2\n\
          \x20 exit 1\n\
          fi"
     )
@@ -335,10 +345,33 @@ pub(crate) fn lock_path(layout: &Layout, project_id: &str, lock_file: &str) -> P
 /// line (the locator IS its resolved URL, and the legacy format) takes the key as that URL; a
 /// three-column line carries the separately resolved URL. A corrupt line self-heals by being
 /// dropped; an absent lock is an empty map — the unpinned state.
+///
+/// For a reader that only shows the pins: a lock that cannot be read shows as none. A writer reads
+/// through [`read_pins`] instead.
 pub(crate) fn pins(layout: &Layout, project_id: &str, lock_file: &str) -> BTreeMap<String, Pin> {
+    read_pins(layout, project_id, lock_file).unwrap_or_default()
+}
+
+/// [`pins`] for a caller about to write the lock, or to mint a pin the lock would otherwise hold:
+/// only an absent lock is empty. One that is there and cannot be read is an error, because reading
+/// it as empty would re-pin every package from the network — a second trust-on-first-use, recorded
+/// over the hashes the first one took.
+pub(crate) fn read_pins(
+    layout: &Layout,
+    project_id: &str,
+    lock_file: &str,
+) -> io::Result<BTreeMap<String, Pin>> {
     let mut map = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(lock_path(layout, project_id, lock_file)) else {
-        return map;
+    let path = lock_path(layout, project_id, lock_file);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(map),
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot read the lock {}: {e}", path.display()),
+            ));
+        }
     };
     for line in text.lines() {
         let mut it = line.splitn(3, '\t');
@@ -356,7 +389,7 @@ pub(crate) fn pins(layout: &Layout, project_id: &str, lock_file: &str) -> BTreeM
             );
         }
     }
-    map
+    Ok(map)
 }
 
 /// Write one backend's per-project lock atomically (temp + rename), so a concurrent same-project
@@ -414,7 +447,9 @@ pub(crate) fn pinned_hashes(cwd: &Path, lock_file: &str) -> BTreeMap<String, Str
 /// encoded space (`My%20App.tar.gz` → `My App.tar.gz`) yields an illegal store name (a space) and the
 /// prefetch fails. The name is cosmetic (only labels the fetched store
 /// entry; the returned hash is content-addressed and the generated derivation re-fetches by hash), so
-/// a lossy sanitization is safe; an empty segment falls back to `source`.
+/// a lossy sanitization is safe; an empty segment falls back to `source`. Leading dots are dropped
+/// too, since a store name may not begin with one, and the name is cut to [`PREFETCH_NAME_MAX`]
+/// characters, well inside the store's own limit.
 pub(crate) fn prefetch_name(url: &str) -> String {
     let base = url.rsplit('/').next().unwrap_or("").trim();
     let name: String = base
@@ -427,13 +462,21 @@ pub(crate) fn prefetch_name(url: &str) -> String {
             }
         })
         .collect();
-    let trimmed = name.trim_matches('-');
+    let trimmed: String = name
+        .trim_matches('-')
+        .trim_start_matches('.')
+        .chars()
+        .take(PREFETCH_NAME_MAX)
+        .collect();
     if trimmed.is_empty() {
         "source".to_string()
     } else {
-        trimmed.to_string()
+        trimmed
     }
 }
+
+/// The longest name [`prefetch_name`] hands nix, in characters.
+const PREFETCH_NAME_MAX: usize = 128;
 
 /// Resolve a concrete `https://` URL to its SRI content hash via `nix store prefetch-file`, which
 /// follows redirects (so a `…/releases/latest/download/…` URL resolves to the current asset) and
@@ -1106,7 +1149,7 @@ where
 {
     let project_id = super::binds::project_runtime_id(ctx.project)?;
     let lock_file = lock_file(kind);
-    let mut lock = pins(ctx.layout, project_id.as_str(), &lock_file);
+    let mut lock = read_pins(ctx.layout, project_id.as_str(), &lock_file)?;
     let ((url, hash), minted) = pinned_or_mint(&mut lock, key, mint)?;
     if minted {
         // Written ADDITIVELY, the way `nixhub::provision` persists a freshly-resolved pin and for
@@ -1116,7 +1159,7 @@ where
         // the mint would drop that pin, and the package would silently re-resolve and re-pin on the
         // next launch — a second trust-on-first-use, and a network round-trip on a path documented
         // as offline. Re-reading and merging just this key keeps the other one.
-        let mut disk = pins(ctx.layout, project_id.as_str(), &lock_file);
+        let mut disk = read_pins(ctx.layout, project_id.as_str(), &lock_file)?;
         if let Some(entry) = lock.get(key) {
             disk.insert(key.to_string(), entry.clone());
         }
@@ -1187,7 +1230,7 @@ pub(crate) fn provision_resolve_pinned(
 ) -> io::Result<Option<(PathBuf, PathBuf)>> {
     let project_id = super::binds::project_runtime_id(ctx.project)?;
     let Some(pin) =
-        pins(ctx.layout, project_id.as_str(), &lock_file(kind)).remove(&resolve_key(name))
+        read_pins(ctx.layout, project_id.as_str(), &lock_file(kind))?.remove(&resolve_key(name))
     else {
         return Ok(None);
     };
@@ -1314,7 +1357,7 @@ pub(crate) fn upgrade(
     let system = super::current_system();
     // The lock as it stood before any network work: what each reference is compared against, and
     // what the reconcile at the end treats as this roll's (by then possibly stale) knowledge.
-    let snapshot = pins(layout, project_id, &lock_file);
+    let snapshot = read_pins(layout, project_id, &lock_file)?;
     let mut outcomes = Vec::new();
     // This roll's decisions, applied to the on-disk lock once the resolutions are done.
     let mut resolved_pins: BTreeMap<String, Pin> = BTreeMap::new();
@@ -1421,7 +1464,8 @@ pub(crate) fn upgrade(
     if !mode.applies() {
         return Ok(outcomes);
     }
-    let mut disk = pins(layout, project_id, &lock_file);
+    let mut disk = read_pins(layout, project_id, &lock_file)?;
+    let before = disk.clone();
     for (key, previous) in pruned {
         // Compare and swap, key by key. An entry that changed while this roll resolved was written
         // by a process whose config read is newer than this one's, so its pin outranks this roll's
@@ -1434,7 +1478,10 @@ pub(crate) fn upgrade(
     // over whatever the entry currently holds. Every key this roll decided nothing about — one whose
     // resolution failed, one another process pinned meanwhile — is left exactly as found.
     disk.extend(resolved_pins);
-    write_pins(layout, project_id, &lock_file, &disk)?;
+    // A roll that changed nothing leaves the file, and its modification time, as they were.
+    if disk != before {
+        write_pins(layout, project_id, &lock_file, &disk)?;
+    }
     Ok(outcomes)
 }
 
@@ -1867,6 +1914,116 @@ mod tests {
     }
 
     #[test]
+    fn a_roll_that_changes_nothing_leaves_the_lock_untouched() {
+        let data = TmpDir::new();
+        let project = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let id = super::super::binds::project_runtime_id(project.path()).unwrap();
+        let lock_name = lock_file(&Recording::default());
+        let url = "https://example.com/demo-app.tar.gz";
+        let cfg = resolved(
+            vec![pkg(
+                "demo-app",
+                crate::config::Backend::Tarball(url.to_string()),
+                true,
+            )],
+            vec![],
+        );
+        let pinned = BTreeMap::from([(
+            url.to_string(),
+            Pin {
+                hash: RECORDED_HASH.to_string(),
+                url: url.to_string(),
+            },
+        )]);
+        write_pins(&layout, &id, &lock_name, &pinned).unwrap();
+        let path = lock_path(&layout, &id, &lock_name);
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(old))
+            .expect("age the lock");
+
+        let outcomes = upgrade(
+            &Recording::default(),
+            Path::new("/nonexistent/nix"),
+            &layout,
+            project.path(),
+            &cfg,
+            None,
+            None,
+            None,
+            crate::sandbox::RollMode::Apply,
+        )
+        .expect("the roll runs");
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, Upgrade::Unchanged { .. })),
+            "nothing moved"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).and_then(|m| m.modified()).ok(),
+            Some(old),
+            "a roll that changed nothing does not rewrite the lock"
+        );
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_read_stops_a_writer_rather_than_reading_as_empty() {
+        // Read as empty, every package would be pinned again from the network, over the hashes the
+        // first fetch recorded.
+        let data = TmpDir::new();
+        let project = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let id = super::super::binds::project_runtime_id(project.path()).unwrap();
+        let lock_name = lock_file(&Recording::default());
+        // A file this process may not read, which a rename can still replace: a directory would
+        // fail the final write on its own and prove nothing about the read.
+        let path = lock_path(&layout, &id, &lock_name);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("lock dir");
+        std::fs::write(&path, b"").expect("the lock");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+                .expect("make it unreadable");
+        }
+        if std::fs::read(&path).is_ok() {
+            skip_incapable!("running as root, which reads a mode-000 file");
+            return;
+        }
+        assert!(read_pins(&layout, &id, &lock_name).is_err());
+        assert!(
+            pins(&layout, &id, &lock_name).is_empty(),
+            "a display reader still shows none"
+        );
+        let cfg = resolved(
+            vec![pkg(
+                "demo-app",
+                crate::config::Backend::Tarball("https://example.com/demo-app.tar.gz".to_string()),
+                true,
+            )],
+            vec![],
+        );
+        assert!(
+            upgrade(
+                &Recording::default(),
+                Path::new("/nonexistent/nix"),
+                &layout,
+                project.path(),
+                &cfg,
+                None,
+                None,
+                None,
+                crate::sandbox::RollMode::Apply,
+            )
+            .is_err(),
+            "the roll stops instead of re-pinning"
+        );
+    }
+
+    #[test]
     fn a_resolver_with_no_sandbox_is_reported_failed_rather_than_left_standing() {
         let data = TmpDir::new();
         let project = TmpDir::new();
@@ -2261,6 +2418,14 @@ mod tests {
         );
         // A degenerate URL with no last segment falls back to a fixed safe name.
         assert_eq!(prefetch_name("https://example.com/"), "source");
+        // A store name may not begin with a dot, and an over-long segment is cut.
+        assert_eq!(prefetch_name("https://example.com/.."), "source");
+        assert_eq!(
+            prefetch_name("https://example.com/.hidden.deb"),
+            "hidden.deb"
+        );
+        let long = format!("https://example.com/{}.deb", "a".repeat(300));
+        assert_eq!(prefetch_name(&long).len(), PREFETCH_NAME_MAX);
     }
 
     #[test]
@@ -2498,6 +2663,7 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
             "set -e\nout={}\nmakeWrapper() {{ echo \"WRAPPED $1\"; }}\n{snippet}\n",
             tree.display()
         );
+        // Under the builder's own `set -eo pipefail`, so the count's cut-off producer is covered.
         let out = std::process::Command::new("bash")
             .arg("-c")
             .arg(&script)
@@ -2826,8 +2992,8 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
             "the payload must land in `extracted`"
         );
 
-        // Over it: `head` truncates, `tar` refuses an incomplete archive, and the build stops —
-        // rather than filling the store with whatever the stream kept producing.
+        // Over it: the count stops the build before anything is unpacked, rather than filling the
+        // store with whatever the stream kept producing.
         let cut = run(64);
         assert!(
             !cut.status.success(),
@@ -2839,5 +3005,49 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
             "the failure must say why rather than leave tar's EOF to be read as a bad download: \
              {said}"
         );
+    }
+
+    #[test]
+    fn an_archive_cut_at_a_member_boundary_is_refused_not_half_unpacked() {
+        // GNU tar exits 0 on a stream cut where one member ends and the next would begin, keeping
+        // the members before the cut. A ceiling enforced by truncating into `tar` passed that.
+        let tmp = crate::testutil::TmpDir::new();
+        let payload = tmp.path().join("payload");
+        std::fs::create_dir_all(&payload).expect("payload dir");
+        std::fs::write(payload.join("a"), vec![b'a'; 1000]).expect("first member");
+        std::fs::write(payload.join("b"), vec![b'b'; 3000]).expect("second member");
+        let archive = tmp.path().join("src.tar.gz");
+        let made = std::process::Command::new("tar")
+            .args(["-czf", &archive.to_string_lossy(), "-C"])
+            .arg(&payload)
+            .args(["a", "b"])
+            .status();
+        if !made.map(|s| s.success()).unwrap_or(false) {
+            return; // no host `tar`: the phase is a builder's, not this machine's
+        }
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        // One header and the first member's padded data: exactly where the second header starts.
+        // Under the builder's own `set -eo pipefail`, so the count's cut-off producer is covered.
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -eo pipefail\n{}",
+                bounded_unpack_to("gzip -dc \"$src\"", 512 + 1024)
+            ))
+            .current_dir(&work)
+            .env("src", &archive)
+            .output();
+        let out = out.expect("run the generated unpack phase");
+        assert!(
+            !out.status.success(),
+            "an archive past the ceiling must fail the build even where the cut falls between \
+             members"
+        );
+        assert!(
+            !work.join("extracted/a").exists(),
+            "and nothing of it is unpacked"
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("ceiling"));
     }
 }
