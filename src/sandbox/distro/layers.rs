@@ -79,6 +79,11 @@ use std::rc::Rc;
 /// A directory the unpack makes for a member's path counts as an entry of its own: one member names
 /// as many directories as its path has components, and a path of a few kilobytes is close to two
 /// thousand of them, each an inode and a block the byte ceiling does not see.
+///
+/// Every member read counts, including the ones that create nothing: a whiteout, an opaque marker,
+/// the archive's own `.`, a PAX global header. Each is still work the unpack does, a removal or a
+/// header parsed, and a layer inflates without limit, so a stream of them is bounded by this count
+/// or by nothing but [`super::unpack::TIME_PER_IMAGE`].
 const MAX_UNPACKED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub(super) const MAX_MEMBERS: u64 = 1_000_000;
 
