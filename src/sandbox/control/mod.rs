@@ -1045,6 +1045,11 @@ pub(crate) struct LogSnapshot {
     /// How many captures this session has evicted to stay inside its byte budget, so a reader can be
     /// told its view is partial rather than inferring completeness from a missing body.
     pub(crate) capture_evicted: u64,
+    /// Which incarnation of its pid the session that answered is ([`incarnation`]), as it sent it.
+    /// `None` when it did not: a host without start-time ticks, or a session older than the field.
+    /// A `--follow` compares it across reads, since a later session can take an ended one's pid,
+    /// and with it the socket name, between two polls.
+    pub(crate) incarnation: Option<u64>,
 }
 
 /// A bounded ring of recent egress decisions, newest appended, oldest evicted past `cap`. Shared
@@ -1475,6 +1480,8 @@ impl LogRing {
             // them from the separate capture ring, and only when the reader asked for them).
             captures: Vec::new(),
             capture_evicted: 0,
+            // Named by the control dispatch, which answers for the process this ring lives in.
+            incarnation: None,
         }
     }
 
@@ -2084,6 +2091,10 @@ fn dispatch(
             }
             out.push_str(&format!("head={}\n", snapshot.head));
             out.push_str(&format!("amended={}\n", snapshot.amend_head));
+            // An older reader ignores the unknown line.
+            if let Some(ticks) = incarnation() {
+                out.push_str(&format!("inc={ticks}\n"));
+            }
             // Each event's capture (when one is retained) follows its own `event` line, so a reader
             // attaches it without a second lookup and an older reader ignores the unknown lines.
             let captures = match (want_capture, capture) {
@@ -2914,6 +2925,22 @@ mod tests {
         // this one cannot be, so the reader is owed a different word for a different remedy.
         assert_eq!(fields.get("reason"), Some(&"dns-bypassed"), "{line}");
         assert_eq!(fields.get("proto"), Some(&"tcp"), "{line}");
+    }
+
+    /// A `LOG` answer names the incarnation that served it, so a `--follow` can tell a later session
+    /// under the same pid from the one its cursor belongs to.
+    #[test]
+    fn a_log_answer_names_the_incarnation_that_served_it() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = LogRing::new(LOG_RING_CAP);
+        let flows = FlowRegistry::new();
+        let out = dispatch("LOG", &state, &manual, &log, &flows, None);
+        let named: Vec<&str> = out.lines().filter(|l| l.starts_with("inc=")).collect();
+        match incarnation() {
+            Some(ticks) => assert_eq!(named, [format!("inc={ticks}")], "{out}"),
+            None => assert!(named.is_empty(), "{out}"),
+        }
     }
 
     /// The live log this `RESOLVED` lands in is bounded, so a cage that asks for enough names

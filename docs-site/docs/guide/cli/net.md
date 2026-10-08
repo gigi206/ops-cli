@@ -235,7 +235,7 @@ listing exits 1 ([exit codes](../reference/exit-codes#a-listing-that-could-not-r
 | Flag | What it does |
 |---|---|
 | `-a`, `--app <name>` | the sessions of one app profile, rather than every session of this project |
-| `--host <h>` | only the events whose destination host matches |
+| `--host <h>` | only the events whose destination host is `<h>`, in any case |
 | `--verdict <v>` | only `allow`, `deny`, `blocked`, `error` or `resolved` events. The last is a name the cage asked for rather than a decision, so it is the one value that selects questions instead of answers |
 | `-n <N>` | the last `N` events (the listing is chronological, so this is a tail) |
 | `--all` | also show refusals a [`[network] mute`](../configuration/network) rule suppressed, tagged `muted`; they are counted in `stats` either way |
@@ -243,7 +243,7 @@ listing exits 1 ([exit codes](../reference/exit-codes#a-listing-that-could-not-r
 | `--with-status` | add the upstream HTTP status the server answered, for a completed inspected-`https` request only: an L4 (`tcp://`) splice, a refusal or an `error` shows `-`, having no HTTP response to read. Distinct from the verdict: an allowed request can still get a 404. Under `--follow`, an event whose response has not returned yet prints once without a status and again carrying it, tagged `update`, since a live tail cannot un-print a line |
 | `--with-headers` | the request and response heads that actually crossed (needs `capture`) |
 | `--with-body` | the leading bytes of each body as well (needs `capture = "bodies"`) |
-| `-f`, `--follow` | tail the log instead of printing a snapshot. A session that ends waits for the follow's next read, at most two seconds, so what arrived since the last read still reaches it. A session that stops answering in full is named on standard error, once each time it stops, and asked again from where it was |
+| `-f`, `--follow` | tail the log instead of printing a snapshot. A session that ends waits for the follow's next read, at most two seconds, so what arrived since the last read still reaches it. A session that stops answering in full is named on standard error, once each time it stops, and asked again from where it was. A session that takes the PID of one that ended between two polls shows as that one ending, then is read from the start of its log. A session the opening listing could not read is held to `-n` when a poll first reads it |
 | `-i <secs>` | the poll interval under `--follow` |
 | `--json` | one JSON object per event (NDJSON), for a pipe. Each carries `seq`, the event's number in its session; under `--follow`, each also carries `update`, `true` when it shows an event again |
 

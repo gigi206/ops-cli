@@ -166,10 +166,15 @@ fn collect_logs(
 }
 
 /// Whether one event passes the ongoing `--host`/`--verdict` filters (the `-n` limit is separate —
-/// it caps the initial listing, not the followed stream). Shared by the one-shot listing and the
-/// `--follow` stream so a filter behaves identically in both.
+/// it caps the initial listing, and the first read of a session that listing could not read, not
+/// the followed stream). Shared by the one-shot listing and the
+/// `--follow` stream so a filter behaves identically in both. A host matches whatever its case, as
+/// a DNS name does.
 fn event_passes_filters(e: &sandbox::control::LogEvent, view: &LogView) -> bool {
-    view.host.as_deref().is_none_or(|h| e.host == h) && view.verdict.is_none_or(|v| e.verdict == v)
+    view.host
+        .as_deref()
+        .is_none_or(|h| e.host.eq_ignore_ascii_case(h))
+        && view.verdict.is_none_or(|v| e.verdict == v)
 }
 
 /// The events of one session that pass the `--host`/`--verdict` filters, then the `-n` limit (the
@@ -331,8 +336,9 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
         amendments: view.shows_amendments(),
     };
     // A per-session cursor: the last seq already shown, plus the amendment cursor (for retroactive
-    // status). Seeded from the initial listing so the follow only ever appends genuinely new events.
-    let mut cursor: HashMap<u32, (u64, u64)> = HashMap::new();
+    // status) and the incarnation the session named. Seeded from the initial listing so the follow
+    // only ever appends genuinely new events.
+    let mut cursor: HashMap<u32, (u64, u64, Option<u64>)> = HashMap::new();
     // Per session the listing started, the oldest event it printed: `-n` keeps older ones out of
     // it, and an update of an event this stream never printed is not printed either.
     let mut printed_from: HashMap<u32, u64> = HashMap::new();
@@ -356,8 +362,12 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     // answered: a session that goes on not answering is named once, not on every round.
     warn_unanswered_logs(&swept.unread);
     let mut unanswering = crate::cli::Unanswering::new();
+    // The sessions the listing reached and could not read. Their rings predate the follow like
+    // those it did read, so the first poll that reads one holds it to `-n` as the listing would have.
+    let mut missed: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for (pid, _) in &swept.unread {
         unanswering.stalled(*pid);
+        missed.insert(*pid);
     }
     let sessions = swept.read;
     let has_events = sessions
@@ -385,7 +395,14 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
         seed = render_logs(&sessions, &context, view, pal, false);
     }
     for s in &sessions {
-        cursor.insert(s.pid, (s.snapshot.head, s.snapshot.amend_head));
+        cursor.insert(
+            s.pid,
+            (
+                s.snapshot.head,
+                s.snapshot.amend_head,
+                s.snapshot.incarnation,
+            ),
+        );
         let oldest = filtered_log_events(&s.snapshot.events, view)
             .first()
             .map_or(s.snapshot.head + 1, |e| e.seq);
@@ -422,6 +439,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
         // A session that has gone is forgotten here too, so a later one under its pid that does
         // not answer is named.
         unanswering.retain(|pid| live.contains(pid));
+        missed.retain(|pid| live.contains(pid));
         for pid in ended {
             cursor.remove(&pid);
             printed_from.remove(&pid);
@@ -435,7 +453,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
 
         for pid in pids {
             let entry = cursor.get(&pid).copied();
-            let after = entry.map(|(seq, _)| seq);
+            let after = entry.map(|(seq, _, _)| seq);
             // Request retroactive re-emission only when something amended is actually shown — a
             // status under `--with-status`, or the traffic under `--with-headers`/`--with-body`.
             // Otherwise the completion is invisible and re-showing the line would be pure
@@ -444,7 +462,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
             // and tells it this follow shows amendments.
             let after_amend = view
                 .shows_amendments()
-                .then(|| entry.map_or(0, |(_, amend)| amend));
+                .then(|| entry.map_or(0, |(_, amend, _)| amend));
             let snap = match sandbox::control::read_log(
                 &sandbox::control::control_socket(data_dir, pid),
                 after,
@@ -454,9 +472,12 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                 Some(follow),
             ) {
                 Ok(snap) => snap,
-                // Reached, and the answer did not arrive in full. Its cursor stays where it was, so
-                // what it holds past it is shown when it answers again.
-                Err(e) if sandbox::lens::unanswered(&e) => {
+                // A session that vanished mid-read is noted as ended by the next tick.
+                Err(e) if sandbox::control::session_gone(&e) => continue,
+                // Reached, and its whole answer did not arrive: cut short, refused, answered with
+                // an error, or not in time, the cases the listing names too. Its cursor stays where
+                // it was, so what it holds past it is shown when it answers again.
+                Err(e) => {
                     if unanswering.stalled(pid) {
                         crate::cli::warn_unanswered(
                             "net logs",
@@ -467,9 +488,25 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                     }
                     continue;
                 }
-                Err(_) => continue, // a session that vanished mid-read is handled next tick
             };
             unanswering.answered(&pid);
+            // Another session took the pid of the one this cursor belongs to between two polls: the
+            // earlier one has ended, and the later one is read from the start of its ring on the
+            // next tick, as a session a poll finds. What this read returned is past a cursor that
+            // was never this session's, so none of it is shown.
+            if let (Some((_, _, Some(was))), Some(now)) = (entry, snap.incarnation)
+                && was != now
+            {
+                cursor.remove(&pid);
+                printed_from.remove(&pid);
+                if !view.json {
+                    let _ = writeln!(tick, "  {dim}session {pid} ended{r}");
+                    if last_pid == Some(pid) {
+                        last_pid = None;
+                    }
+                }
+                continue;
+            }
             // A gap between polls (the ring overflowed) — surfaced, never silent.
             if snap.dropped > 0 {
                 if view.json {
@@ -486,13 +523,21 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                     );
                 }
             }
-            let oldest = printed_from.get(&pid).copied().unwrap_or(0);
-            let new: Vec<&sandbox::control::LogEvent> = snap
-                .events
-                .iter()
-                .filter(|e| event_passes_filters(e, view))
-                .filter(|e| !(is_update(e, after) && e.seq < oldest))
-                .collect();
+            let new: Vec<&sandbox::control::LogEvent> = if entry.is_none() && missed.remove(&pid) {
+                // The first read of a session the listing missed: its events as the listing
+                // would have printed them, `-n` included, and its updates from the oldest of them.
+                let new = filtered_log_events(&snap.events, view);
+                let oldest = new.first().map_or(snap.head + 1, |e| e.seq);
+                printed_from.insert(pid, oldest);
+                new
+            } else {
+                let oldest = printed_from.get(&pid).copied().unwrap_or(0);
+                snap.events
+                    .iter()
+                    .filter(|e| event_passes_filters(e, view))
+                    .filter(|e| !(is_update(e, after) && e.seq < oldest))
+                    .collect()
+            };
             if !new.is_empty() {
                 let c = ctx_of(&context, pid);
                 for e in new {
@@ -513,7 +558,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                     tick.push_str(&render_followed(e, pid, update, c.as_ref(), cap, view, pal));
                 }
             }
-            cursor.insert(pid, (snap.head, snap.amend_head));
+            cursor.insert(pid, (snap.head, snap.amend_head, snap.incarnation));
         }
         if flush_stream(&tick).is_err() {
             return ExitCode::SUCCESS; // downstream pipe closed
@@ -987,10 +1032,8 @@ fn capture_json(cap: &sandbox::control::Capture, view: &LogView) -> serde_json::
             continue;
         }
         if part == CapturePart::Injected {
-            let names: Vec<&str> = std::str::from_utf8(&bytes.bytes)
-                .unwrap_or_default()
-                .lines()
-                .collect();
+            let names = String::from_utf8_lossy(&bytes.bytes);
+            let names: Vec<&str> = names.lines().collect();
             obj.insert("injected".into(), serde_json::json!(names));
             continue;
         }

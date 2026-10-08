@@ -3220,7 +3220,7 @@ pub(super) const PAGES: &[Page] = &[
             ),
             (
                 "--host <h>",
-                "only events whose destination host is exactly <h>",
+                "only events whose destination host is <h>, in any case",
             ),
             (
                 "--verdict <v>",
@@ -3279,7 +3279,10 @@ pub(super) const PAGES: &[Page] = &[
             waits for the follow's next read, at most two seconds, before its log goes, so what\n\
             arrived since the last read (often the status and traffic of the last exchange) is\n\
             shown. A session that starts and ends between two polls is never read, and a follow\n\
-            whose next read would come later than that is not waited for.\n\
+            whose next read would come later than that is not waited for. A session that takes\n\
+            the PID of one that ended between two polls shows as that one ending, then is read\n\
+            from the start of its log. A session the opening listing could not read is held to\n\
+            `-n` when a poll first reads it.\n\
             \n\
             Verdicts are a superset of `sbx net stats`: allow, deny, blocked (a security/protocol\n\
             guard), and `error` — a request that was allowed but did not complete (DNS failure, an\n\

@@ -62,6 +62,7 @@ fn a_secret_seen_crossing_a_tunnel_shows_without_asking_and_says_it_was_not_stop
             amend_head: 0,
             captures: Vec::new(),
             capture_evicted: 0,
+            incarnation: None,
         },
     }];
     let out = render_logs(&sessions, &[], &LogView::default(), &pal, false);
@@ -97,6 +98,7 @@ fn a_secret_seen_crossing_a_tunnel_shows_without_asking_and_says_it_was_not_stop
                 amend_head: 0,
                 captures: Vec::new(),
                 capture_evicted: 0,
+                incarnation: None,
             },
         }],
         &[],
@@ -147,6 +149,7 @@ fn asking_for_traffic_from_a_session_that_does_not_capture_says_so() {
             amend_head: 0,
             captures: Vec::new(),
             capture_evicted: 0,
+            incarnation: None,
         },
     }];
     let view = LogView {
@@ -365,6 +368,42 @@ fn capture_json_encodes_bodies_base64_so_binary_survives_the_round_trip() {
     };
     let j = capture_json(&log_capture(1), &heads_only);
     assert!(j.get("res_body").is_none() && j.get("req_body").is_none());
+}
+
+/// An injected header name that is not UTF-8 is still listed in the JSON, the way the human view
+/// lists it: dropped, the list read as no credential added.
+#[test]
+fn capture_json_lists_an_injected_name_that_is_not_utf8() {
+    let view = LogView {
+        with_headers: true,
+        ..LogView::default()
+    };
+    let mut cap = log_capture(1);
+    cap.injected.bytes = b"authorization\nx-\xffkey".to_vec();
+    assert_eq!(
+        capture_json(&cap, &view)["injected"],
+        serde_json::json!(["authorization", "x-\u{fffd}key"])
+    );
+}
+
+/// `--host` matches a host whatever its case, as DNS does: the filter and the request may spell
+/// one name differently.
+#[test]
+fn the_host_filter_ignores_case() {
+    use sandbox::control::LogVerdict;
+    let e = log_event(1, "github.com", None, None, LogVerdict::Allow, "allowed");
+    for host in ["GitHub.com", "github.com", "GITHUB.COM"] {
+        let view = LogView {
+            host: Some(host.into()),
+            ..LogView::default()
+        };
+        assert!(event_passes_filters(&e, &view), "{host}");
+    }
+    let other = LogView {
+        host: Some("gitlab.com".into()),
+        ..LogView::default()
+    };
+    assert!(!event_passes_filters(&e, &other));
 }
 
 #[test]
@@ -779,6 +818,7 @@ fn render_logs_groups_events_by_session_with_verdict_and_reason() {
             amend_head: 0,
             captures: Vec::new(),
             capture_evicted: 0,
+            incarnation: None,
         },
     }];
     let context = vec![(
@@ -864,6 +904,7 @@ fn render_logs_surfaces_ring_eviction_rather_than_truncating_silently() {
         amend_head: 0,
         captures: Vec::new(),
         capture_evicted: 0,
+        incarnation: None,
     };
     assert_eq!(snapshot_evicted(&snapshot), 4000);
     // …a fresh ring (seqs from 1) reports none.
@@ -881,6 +922,7 @@ fn render_logs_surfaces_ring_eviction_rather_than_truncating_silently() {
         amend_head: 0,
         captures: Vec::new(),
         capture_evicted: 0,
+        incarnation: None,
     };
     assert_eq!(snapshot_evicted(&fresh), 0);
 
@@ -906,6 +948,7 @@ fn a_zero_seq_counts_no_eviction() {
         amend_head: 0,
         captures: Vec::new(),
         capture_evicted: 0,
+        incarnation: None,
     };
     assert_eq!(snapshot_evicted(&snapshot), 0);
 }
@@ -933,6 +976,7 @@ fn a_muted_event_is_neither_shown_nor_counted_as_an_eviction() {
         amend_head: 0,
         captures: Vec::new(),
         capture_evicted: 0,
+        incarnation: None,
     };
     assert_eq!(
         snapshot_evicted(&snapshot),

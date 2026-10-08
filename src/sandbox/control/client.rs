@@ -29,8 +29,9 @@ fn connect(socket: &Path, timeout: Duration) -> io::Result<UnixStream> {
 }
 
 /// Whether a connect error means the session is not there: no socket, or one nobody serves any
-/// more. A sweep passes over such a session in silence; any other error is a session it reached.
-fn session_gone(e: &io::Error) -> bool {
+/// more. A sweep, and a `--follow` poll, pass over such a session in silence; any other error is a
+/// session they reached.
+pub(crate) fn session_gone(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
@@ -296,6 +297,7 @@ pub(crate) fn read_log(
     let mut head = 0;
     let mut amend_head = 0;
     let mut capture_evicted = 0;
+    let mut incarnation = None;
     for line in crate::sandbox::reply::answer(BufReader::new(&stream)) {
         let line = line?;
         // Every current server answers `LOG` with its cursors, and an `err` in their place ends the
@@ -315,6 +317,8 @@ pub(crate) fn read_log(
             amend_head = v.parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("capture-evicted=") {
             capture_evicted = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("inc=") {
+            incarnation = v.parse().ok();
         } else if let Some(ev) = parse_event_line(&line) {
             events.push(ev);
         } else if let Some((seq, sighting)) = parse_sighting_line(&line) {
@@ -347,6 +351,7 @@ pub(crate) fn read_log(
         amend_head,
         captures,
         capture_evicted,
+        incarnation,
     })
 }
 

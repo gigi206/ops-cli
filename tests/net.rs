@@ -3321,3 +3321,240 @@ fn an_update_of_an_event_the_follow_never_printed_is_not_printed() {
         .collect();
     assert_eq!(shape, [(2, false), (2, true)], "{}", lines.join("\n"));
 }
+
+/// A stand-in session for a `sbx net logs --follow` run: its pid, its replies in order (`None`
+/// closes a connection without reading it), and whether it appears only once the follow has
+/// started, so a poll rather than the opening listing finds it. One with no replies is a socket a
+/// session left behind: its file stays, and nothing serves it.
+struct FollowStandIn {
+    pid: u32,
+    replies: Vec<Option<String>>,
+    late: bool,
+}
+
+/// Run `sbx net logs --follow` with `extra` against `stand_ins` until each has served its replies
+/// and gone, and return its standard output, its standard error, and each stand-in's commands.
+fn follow_against(
+    extra: &[&str],
+    stand_ins: Vec<FollowStandIn>,
+) -> (String, String, Vec<Vec<String>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let fx = Project::new("net");
+    let egress = fx.data_home.path().join("sbx").join("egress");
+    std::fs::create_dir_all(&egress).unwrap();
+    let serve = |s: FollowStandIn| {
+        let socket = egress.join(format!("control-{}.sock", s.pid));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        if s.replies.is_empty() {
+            drop(listener);
+            return (std::thread::spawn(|| {}), asked);
+        }
+        let seen = Arc::clone(&asked);
+        let server = std::thread::spawn(move || {
+            for reply in s.replies {
+                let (stream, _) = listener.accept().unwrap();
+                let Some(reply) = reply else {
+                    drop(stream);
+                    continue;
+                };
+                let mut cmd = String::new();
+                BufReader::new(&stream).read_line(&mut cmd).unwrap();
+                seen.lock().unwrap().push(cmd.trim_end().to_string());
+                let _ = (&stream).write_all(reply.as_bytes());
+            }
+            std::fs::remove_file(&socket).unwrap();
+        });
+        (server, asked)
+    };
+    let (early, late): (Vec<_>, Vec<_>) = stand_ins.into_iter().partition(|s| !s.late);
+    let mut served: Vec<_> = early.into_iter().map(serve).collect();
+
+    let mut args = vec!["net", "logs", "--follow"];
+    args.extend_from_slice(extra);
+    let mut follower = fx
+        .cmd(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sbx net logs --follow");
+    let err = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&err);
+    let mut stderr = follower.stderr.take().expect("piped stderr");
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stderr.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            sink.lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    });
+    let mut stdout = follower.stdout.take().expect("piped stdout");
+    let out = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        s
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !err.lock().unwrap().contains("following egress") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    served.extend(late.into_iter().map(serve));
+    while !served.iter().all(|(s, _)| s.is_finished()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The poll after the last reply finds the socket gone: by then the reply is written out.
+    std::thread::sleep(Duration::from_millis(1500));
+    let _ = follower.kill();
+    let _ = follower.wait();
+    let stdout = out.join().unwrap();
+    let stderr = err.lock().unwrap().clone();
+    // A stand-in still waiting for a read the follow never made fails the test here rather than
+    // holding it in `accept`.
+    let asked = served
+        .into_iter()
+        .map(|(server, asked)| {
+            let asked = asked.lock().unwrap().clone();
+            assert!(
+                server.is_finished(),
+                "a reply was never asked for: {asked:?}\n{stderr}"
+            );
+            server.join().unwrap();
+            asked
+        })
+        .collect();
+    (stdout, stderr, asked)
+}
+
+/// One `event` line of a stand-in's reply.
+fn follow_event(seq: u32, path: &str) -> String {
+    format!(
+        "event seq={seq} at=1700000000000 port=443 verdict=allow proto=https reason=allowed \
+         method=GET host=api.test path={path}\n"
+    )
+}
+
+/// A session a poll finds that answers with an error is named on standard error, once, as the
+/// opening listing names one: passed over, it read as a session with nothing new.
+#[test]
+fn a_follow_names_a_session_that_answers_with_an_error() {
+    let refused = || Some("err refused\n".to_string());
+    let (_, stderr, asked) = follow_against(
+        &[],
+        vec![FollowStandIn {
+            pid: 55566,
+            replies: vec![refused(), refused(), refused()],
+            late: true,
+        }],
+    );
+    assert_eq!(asked[0].len(), 3, "{:?}", asked[0]);
+    assert_eq!(
+        stderr
+            .matches("session 55566 did not answer in full")
+            .count(),
+        1,
+        "{stderr}"
+    );
+}
+
+/// A socket a session left behind, which refuses every connection, is passed over in silence by
+/// every poll, as the opening listing passes over it: it is a session gone, not one that did not
+/// answer.
+#[test]
+fn a_follow_passes_over_a_socket_left_behind_in_silence() {
+    let quiet = || Some("head=0\namended=0\nok\n".to_string());
+    let (_, stderr, _) = follow_against(
+        &[],
+        vec![
+            FollowStandIn {
+                pid: 55569,
+                replies: Vec::new(),
+                late: true,
+            },
+            FollowStandIn {
+                pid: 55570,
+                replies: vec![quiet(), quiet(), quiet()],
+                late: true,
+            },
+        ],
+    );
+    assert!(!stderr.contains("55569"), "{stderr}");
+}
+
+/// A session whose pid a later one took between two polls is read as ended, and the later one from
+/// the start of its ring: the earlier one's cursor would have hidden the later one's first events.
+#[test]
+fn a_follow_reads_a_session_that_took_an_ended_ones_pid_from_its_start() {
+    let reply = |inc: u32, seq: u32, path: &str| {
+        Some(format!(
+            "inc={inc}\nhead={seq}\namended=0\n{}ok\n",
+            follow_event(seq, path)
+        ))
+    };
+    let (stdout, _, asked) = follow_against(
+        &[],
+        vec![FollowStandIn {
+            pid: 55567,
+            replies: vec![
+                reply(11, 1, "/first"),
+                reply(11, 2, "/more"),
+                reply(22, 1, "/second"),
+                reply(22, 1, "/second"),
+            ],
+            late: false,
+        }],
+    );
+    let asked = &asked[0];
+    assert_eq!(asked.len(), 4, "{asked:?}");
+    assert!(asked[1].contains("after=1"), "{asked:?}");
+    assert!(
+        asked[2].contains("after=2"),
+        "the same session goes on: {asked:?}"
+    );
+    assert!(
+        !asked[3].contains("after="),
+        "read from its start: {asked:?}"
+    );
+    // Ended once when the later session takes its pid, and once more when that one goes.
+    let ended = stdout.find("session 55567 ended").expect("noted as ended");
+    assert!(ended < stdout.find("/second").unwrap(), "{stdout}");
+    assert_eq!(stdout.matches("session 55567 ended").count(), 2, "{stdout}");
+    for path in ["/more", "/second"] {
+        let shown: Vec<&str> = stdout.lines().filter(|l| l.contains(path)).collect();
+        assert_eq!(shown.len(), 1, "{path}: {stdout}");
+        assert!(!shown[0].ends_with("update"), "{path}: {stdout}");
+    }
+}
+
+/// A session the opening listing could not read is held to `-n` when a poll first reads it, like
+/// every session the listing did read: its ring predates the follow.
+#[test]
+fn a_follow_holds_a_session_the_listing_missed_to_its_limit() {
+    let events: String = (1..=3)
+        .map(|seq| follow_event(seq, &format!("/e{seq}")))
+        .collect();
+    let (stdout, _, _) = follow_against(
+        &["-n", "1", "--json"],
+        vec![FollowStandIn {
+            pid: 55568,
+            replies: vec![None, Some(format!("head=3\namended=0\n{events}ok\n"))],
+            late: false,
+        }],
+    );
+    let seqs: Vec<u64> = stdout
+        .lines()
+        .map(|l| {
+            let o: serde_json::Value = serde_json::from_str(l).expect("one object per line");
+            o["seq"].as_u64().unwrap()
+        })
+        .collect();
+    assert_eq!(seqs, [3], "{stdout}");
+}
