@@ -20,17 +20,31 @@ fn sbx() -> Command {
     cmd
 }
 
-/// Count the marker files under a redirected trust store — not the `.approved` record of what
-/// each approved, which sits beside it and goes with it.
+/// Count the marker files under a redirected trust store: the entries named as a marker is, by the
+/// 64 hex digits of a hash. Not the `.approved` record of what each approved, which sits beside it
+/// and goes with it, nor a temporary an atomic write stages beside it, which would stand in for a
+/// marker that was never written.
+///
+/// A store that does not exist holds none. One that cannot be read fails the test instead: read
+/// as empty, it would pass every assertion that nothing was trusted.
 fn marker_count(state_home: &Path) -> usize {
     let trusted = state_home.join("sbx/trusted");
-    match std::fs::read_dir(&trusted) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .filter(|e| !e.file_name().to_string_lossy().ends_with(".approved"))
-            .count(),
-        Err(_) => 0,
-    }
+    let unreadable = |e: std::io::Error| -> ! {
+        panic!("cannot read the trust store {}: {e}", trusted.display())
+    };
+    let entries = match std::fs::read_dir(&trusted) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => unreadable(e),
+    };
+    entries
+        .map(|e| e.unwrap_or_else(|e| unreadable(e)))
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+        .count()
 }
 
 /// Without a terminal and without `--yes`, `sbx trust` shows what it would grant and records
@@ -174,13 +188,18 @@ fn show_reports_untrusted_then_trusted_then_changed() {
 
     assert!(show("before").contains("untrusted"));
 
-    sbx()
+    let trusted = sbx()
         .arg("trust")
         .arg("--yes")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
-        .status()
+        .output()
         .expect("spawn sbx trust");
+    assert!(
+        trusted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
     assert!(show("after trust").contains("is trusted"));
 
     std::fs::write(&cfg, b"network = \"isolated\"\nbinds = [\"/etc/ssh\"]\n").unwrap();
@@ -207,13 +226,18 @@ fn trust_covers_a_sibling_mise_file_and_editing_it_re_arms() {
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
 
-    sbx()
+    let trusted = sbx()
         .arg("trust")
         .arg("--yes")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
-        .status()
+        .output()
         .expect("spawn sbx trust");
+    assert!(
+        trusted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
     assert!(show("after trust").contains("is trusted"));
 
     // Editing only the mise file must re-arm the gate: trust is the single
@@ -240,12 +264,13 @@ fn trust_refuses_a_world_writable_mise_file() {
         .env("XDG_STATE_HOME", state.path())
         .output()
         .expect("spawn sbx trust");
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
         Some(1),
-        "a world-writable mise file must block recording trust"
+        "a world-writable mise file must block recording trust: {stderr}"
     );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("world-writable"));
+    assert!(stderr.contains("world-writable"), "{stderr}");
     assert_eq!(marker_count(state.path()), 0, "nothing trusted");
 }
 
@@ -300,12 +325,13 @@ fn trust_refuses_a_world_writable_config() {
         .env("XDG_STATE_HOME", state.path())
         .output()
         .expect("spawn sbx trust");
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
         Some(1),
-        "a world-writable config must be refused"
+        "a world-writable config must be refused: {stderr}"
     );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("world-writable"));
+    assert!(stderr.contains("world-writable"), "{stderr}");
     assert_eq!(marker_count(state.path()), 0, "nothing trusted");
 }
 
@@ -326,8 +352,9 @@ fn an_unresolvable_store_is_a_hard_failure() {
         .env_remove("HOME")
         .output()
         .expect("spawn sbx trust");
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot locate the trust store"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("cannot locate the trust store"), "{stderr}");
 }
 
 /// A rule write that changes nothing leaves the project trusted, whatever its line endings.
