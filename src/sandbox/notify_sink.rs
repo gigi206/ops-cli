@@ -109,6 +109,14 @@ const THEME_READ_TIMEOUT: Duration = Duration::from_millis(250);
 /// that a daemon merely busy still lands (a live call is a sub-millisecond round trip).
 const DELIVER_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long the delivery thread goes on draining the queue once teardown has asked it to stop.
+///
+/// A refusal fired in a session's last moments is still worth delivering, so the stop flag does
+/// not discard what is queued. But a daemon that answers each call just inside [`DELIVER_DEADLINE`]
+/// would hold a full queue's worth of those windows, so past this the rest is counted as dropped,
+/// which the teardown advisory reports, and the thread ends.
+const TEARDOWN_DRAIN: Duration = Duration::from_secs(15);
+
 /// How often the delivery thread wakes to re-check the stop flag while the queue is empty.
 ///
 /// The channel closing is the normal way the thread ends, but a notifier reached through an `Arc`
@@ -325,13 +333,23 @@ fn toast_is_visible() -> Option<bool> {
     // `uid=` and a mode following the caller's write access, so a binary shipped under `System32`
     // is owned by this user and not world-writable, while one planted beside it is not.
     let powershell = crate::store::find_trusted_on_path("powershell.exe")?;
+    toast_is_visible_through(&powershell, DELIVER_DEADLINE)
+}
+
+/// [`toast_is_visible`] asked of `powershell`, each of its two questions waited for no longer than
+/// `deadline`.
+///
+/// Bounded because the check runs on the delivery thread, which the teardown joins: an interop that
+/// does not answer would hold the session's end with it. An unanswered question is an unknown
+/// session, which is reported as such.
+fn toast_is_visible_through(powershell: &std::path::Path, deadline: Duration) -> Option<bool> {
     let ask = |script: &str| -> Option<u32> {
-        let out = std::process::Command::new(&powershell)
-            .args(["-NoProfile", "-Command", script])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
+        let out = crate::sandbox::resolver::output_within(
+            std::process::Command::new(powershell).args(["-NoProfile", "-Command", script]),
+            deadline,
+            "`powershell.exe`",
+        )
+        .ok()?;
         String::from_utf8_lossy(&out.stdout).trim().parse().ok()
     };
     let interop = ask("(Get-Process -Id $PID).SessionId")?;
@@ -738,9 +756,9 @@ impl DesktopSink {
     /// giving-up branch without waiting the real window out.
     ///
     /// Bounded for the reason the send is, and by the same window: the reconnect runs on the
-    /// delivery thread, which `Drop` joins. `Drop` already reasons about the wait it can inherit as
-    /// two `DELIVER_DEADLINE` windows — a timed-out call, then the retry that follows the
-    /// reconnect — and that arithmetic only holds if the reconnect between them is bounded too. A
+    /// delivery thread, which `Drop` joins. `Drop` reasons about the wait it can inherit as three
+    /// `DELIVER_DEADLINE` windows — a timed-out call, this reconnect, then the retry that follows
+    /// it — and that arithmetic only holds if the reconnect between them is bounded too. A
     /// bus that accepts the connection and never answers `GetServerInformation` is exactly the peer
     /// the send guards against, met one step earlier.
     fn connect_within(
@@ -882,7 +900,7 @@ impl Notifier {
         if !policy.any_enabled() {
             return Notifier::disabled();
         }
-        Notifier::with_sink(policy, needles, origin.label(), None)
+        Notifier::with_sink(policy, needles, origin.label(), None, TEARDOWN_DRAIN)
     }
 
     /// A notifier delivering into `sink` — the seam a test in another module drives to assert what
@@ -894,6 +912,7 @@ impl Notifier {
             Arc::new(RwLock::new(Vec::new())),
             String::new(),
             Some(sink),
+            TEARDOWN_DRAIN,
         )
     }
 
@@ -904,6 +923,7 @@ impl Notifier {
         needles: Needles,
         context: String,
         sink: Option<Box<dyn Sink>>,
+        drain: Duration,
     ) -> Notifier {
         // The label belongs to the delivery thread alone — it is only ever read while composing a
         // summary, which happens nowhere else.
@@ -913,6 +933,7 @@ impl Notifier {
         // teardown on whichever thread calls it.
         let unannounced = Arc::new(AtomicU64::new(0));
         let thread_unannounced = Arc::clone(&unannounced);
+        let thread_dropped = Arc::clone(&dropped);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
@@ -947,9 +968,12 @@ impl Notifier {
             // How much of the coalescer's running total has already been handed to the shared
             // counter. See [`publish_unannounced`] for why the total itself is not what is stored.
             let mut published_unannounced = 0u64;
+            // When the stop flag was first seen with work still queued.
+            let mut stopping_since: Option<std::time::Instant> = None;
             // Ends when the channel closes *or* the stop flag is set and nothing is left queued —
             // whichever comes first. A refusal that fired in a session's last moments is still
-            // delivered, but teardown never waits on a sender some other path is still holding.
+            // delivered, but teardown never waits on a sender some other path is still holding,
+            // nor on a drain longer than `drain`.
             loop {
                 let block = match rx.recv_timeout(STOP_POLL) {
                     Ok(b) => b,
@@ -961,6 +985,16 @@ impl Notifier {
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
                 };
+                if thread_stop.load(Ordering::Relaxed)
+                    && stopping_since
+                        .get_or_insert_with(std::time::Instant::now)
+                        .elapsed()
+                        >= drain
+                {
+                    let left = 1 + rx.try_iter().count() as u64;
+                    thread_dropped.fetch_add(left, Ordering::Relaxed);
+                    break;
+                }
                 let speak = coalescer.decide(policy, &block, std::time::Instant::now());
                 publish_unannounced(
                     &thread_unannounced,
@@ -1119,14 +1153,21 @@ impl Drop for Notifier {
         // The flag bounds the *loop*, which polls it every `STOP_POLL`; the delivery already in
         // flight is bounded at the send, by `DELIVER_DEADLINE`, because that is where the peer is
         // known. Abandoning the thread here instead would drop the announcement the whole path
-        // exists to deliver. So the wait this join can inherit is two windows: a call that times
-        // out is reported as a failed one, which spends the reconnect-once retry before the sink
-        // falls back to stderr. The Windows path costs nothing here — its toast is spawned and
-        // never waited for, and its stderr half has already landed.
+        // exists to deliver. So the wait this join can inherit for the call in flight is three
+        // windows: a call that times out is reported as a failed one, which spends the reconnect —
+        // bounded by the same window — and then the retry before the sink falls back to stderr. The
+        // Windows path costs its session check once, bounded the same way, and otherwise nothing:
+        // its toast is spawned and never waited for, and its stderr half has already landed. What
+        // is still queued behind that call is drained for at most `TEARDOWN_DRAIN`.
         self.stop.store(true, Ordering::Relaxed);
         self.tx = None;
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        if let Some(h) = self.handle.take()
+            && h.join().is_err()
+        {
+            crate::diag::warn(
+                "the notification thread ended in a panic — refusals it had not yet shown were \
+                 not announced (the logs — `sbx net logs`, `sbx proc logs` — are complete)",
+            );
         }
         // A safety net for a path that never called `finish`; `swap` makes the pair idempotent, so
         // whichever runs second reports nothing rather than repeating the advisory.
@@ -1162,6 +1203,80 @@ mod tests {
         assert_eq!(
             bounded_notify_within(std::future::ready(Ok(7)), Duration::from_secs(30)),
             Ok(7)
+        );
+    }
+
+    /// An interop that does not answer the session check leaves the session unknown within the
+    /// bound, rather than holding the delivery thread the teardown joins.
+    #[test]
+    fn an_interop_that_does_not_answer_leaves_the_toast_session_unknown() {
+        let tmp = crate::testutil::TmpDir::new();
+        let hung = tmp.join("powershell.exe");
+        crate::testutil::write_script(&hung, "exec sleep 30");
+        let bound = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        assert_eq!(toast_is_visible_through(&hung, bound), None);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the check waited {:?} on an interop that never answers",
+            started.elapsed()
+        );
+
+        let answering = tmp.join("answering.exe");
+        crate::testutil::write_script(&answering, "echo 1");
+        let answer = (0..50)
+            .find_map(|_| toast_is_visible_through(&answering, Duration::from_secs(30)))
+            .expect("the stand-in answered");
+        assert!(answer, "both questions answered with the same session");
+    }
+
+    /// Once teardown has asked the thread to stop, what is still queued is delivered for at most
+    /// the drain window, and the rest is counted as dropped rather than held against the join.
+    #[test]
+    fn a_slow_desktop_does_not_hold_the_teardown_past_the_drain() {
+        struct Slow(Arc<AtomicU64>);
+        impl Sink for Slow {
+            fn deliver(&mut self, _: &str, _: &str, _: Option<u32>) -> Result<Option<u32>, ()> {
+                std::thread::sleep(Duration::from_millis(100));
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            }
+        }
+        let shown = Arc::new(AtomicU64::new(0));
+        let n = Notifier::with_sink(
+            NotifyPolicy::uniform(NotifyMode::Always),
+            Arc::new(RwLock::new(Vec::new())),
+            String::new(),
+            Some(Box::new(Slow(Arc::clone(&shown)))),
+            Duration::from_millis(300),
+        );
+        for i in 0..40 {
+            n.block(net_block(
+                &format!("h{i}.example.com:443"),
+                "denied-default",
+            ));
+        }
+        let dropped = Arc::clone(&n.dropped);
+        let started = std::time::Instant::now();
+        n.stop.store(true, Ordering::Relaxed);
+        let mut n = n;
+        let handle = n.handle.take().expect("an enabled notifier has a thread");
+        n.tx = None;
+        handle.join().expect("the delivery thread ends");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the drain took {:?} for 40 announcements of 100 ms",
+            started.elapsed()
+        );
+        let shown = shown.load(Ordering::Relaxed);
+        assert!(
+            shown < 40,
+            "every announcement was shown: the drain was not bounded"
+        );
+        assert_eq!(
+            shown + dropped.load(Ordering::Relaxed),
+            40,
+            "what was not shown is counted as dropped"
         );
     }
 
@@ -1293,6 +1408,7 @@ mod tests {
                 Arc::new(RwLock::new(needles)),
                 String::new(),
                 Some(Box::new(rec)),
+                TEARDOWN_DRAIN,
             );
             for b in blocks {
                 n.block(b);
@@ -1520,6 +1636,7 @@ mod tests {
             Arc::new(RwLock::new(Vec::new())),
             String::new(),
             Some(Box::new(rec)),
+            TEARDOWN_DRAIN,
         );
         n.block(net_block("api.example.com:443", "denied-default"));
         // A second sender, alive across the teardown.
@@ -1556,6 +1673,7 @@ mod tests {
                 Arc::new(RwLock::new(Vec::new())),
                 String::new(),
                 Some(Box::new(DeadSink(Arc::clone(&attempts)))),
+                TEARDOWN_DRAIN,
             );
             n.block(net_block("a.example.com:443", "denied-default"));
             n.block(net_block("b.example.com:443", "denied-default"));
