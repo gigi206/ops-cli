@@ -148,8 +148,9 @@ impl Drop for FsWatcher {
     }
 }
 
-/// One-time warning latches: a hit watch-descriptor limit (a subtree left unwatched) and a kernel
-/// event-queue overflow (events dropped before the watcher drained them). Each is surfaced exactly
+/// One-time warning latches: a hit watch-descriptor limit (a subtree left unwatched), a kernel
+/// event-queue overflow (events dropped before the watcher drained them), and a directory that
+/// could not be watched or listed (its subtree left unobserved). Each is surfaced exactly
 /// once, so a persistent condition does not spam the terminal or the detached session log — but is
 /// never hidden (silent truncation would read as "recorded everything").
 struct Warned {
