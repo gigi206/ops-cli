@@ -183,3 +183,13 @@ pub fn parse_detach_pid(stderr: &[u8]) -> Option<u32> {
     let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
 }
+
+/// Whether one of `listing`'s rows carries `pid` as a column of its own. A substring test would
+/// find pid 12 in a listing of pid 123, and read a session as listed, or as still listed, when it
+/// is not.
+pub fn lists_pid(listing: &str, pid: u32) -> bool {
+    let pid = pid.to_string();
+    listing
+        .lines()
+        .any(|row| row.split_whitespace().any(|column| column == pid))
+}

@@ -11,7 +11,7 @@
 mod common;
 use common::fixture::TmpDir;
 use common::procs::{
-    FingerprintCleanup, any_sleeping_for, egress_socket_exists, kill_sleeping_for,
+    FingerprintCleanup, any_sleeping_for, egress_socket_exists, kill_sleeping_for, lists_pid,
     parse_detach_pid, pids_sleeping_for, wait_until,
 };
 
@@ -132,7 +132,6 @@ fn stop_all_with_no_sessions_is_a_no_op_success() {
     );
 }
 
-/// Run `sbx <args>` to completion in `project` with isolated data/state, returning its output.
 #[test]
 fn stop_takes_the_name_the_listing_leads_with() {
     // The defect: `session ls` printed NAME in its first column, `session stop` matched only the
@@ -142,7 +141,7 @@ fn stop_takes_the_name_the_listing_leads_with() {
     let project = TmpDir::prefixed("s", "byname-proj");
     let data = TmpDir::prefixed("s", "byname-data");
     let state = TmpDir::prefixed("s", "byname-state");
-    let _sweep = FingerprintCleanup(vec!["4172"]);
+    let _sweep = FingerprintCleanup(vec!["31344"]);
 
     if !sandbox_probe(project.path(), data.path(), state.path())
         .status
@@ -156,7 +155,7 @@ fn stop_takes_the_name_the_listing_leads_with() {
         project.path(),
         data.path(),
         state.path(),
-        &["run", "--detach", "--", "sleep", "4172"],
+        &["run", "--detach", "--", "sleep", "31344"],
     );
     assert!(
         started.status.success(),
@@ -182,7 +181,7 @@ fn stop_takes_the_name_the_listing_leads_with() {
     let text = String::from_utf8_lossy(&listed.stdout).to_string();
     let name = text
         .lines()
-        .find(|l| l.contains(&pid.to_string()))
+        .find(|l| lists_pid(l, pid))
         .and_then(|l| l.split_whitespace().next())
         .expect("the listing must carry a row for the session it just registered")
         .to_string();
@@ -221,6 +220,7 @@ fn stop_takes_the_name_the_listing_leads_with() {
     );
 }
 
+/// Run `sbx <args>` to completion in `project` with isolated data/state, returning its output.
 fn sbx_run(project: &Path, data: &Path, state: &Path, args: &[&str]) -> std::process::Output {
     sbx()
         .args(args)
@@ -240,16 +240,25 @@ fn sandbox_probe(project: &Path, data: &Path, state: &Path) -> Output {
 
 /// The session record file for `pid`, once it appears under `<data>/sbx/sessions/`. `None` if it
 /// does not show up before the deadline.
+///
+/// A directory not created yet is waited on; any other failure to read it panics with its cause.
+/// Read as "not there", it would turn into the caller's skip for a session that never registered,
+/// and a host fault would pass as a host that cannot sandbox.
 fn wait_for_session(data: &Path, pid: u32, deadline: Instant) -> Option<PathBuf> {
     let dir = data.join("sbx").join("sessions");
     let prefix = format!("{pid}-");
     while Instant::now() < deadline {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                    return Some(entry.path());
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+                    if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                        return Some(entry.path());
+                    }
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("reading {}: {e}", dir.display()),
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -268,6 +277,9 @@ fn stop_tears_down_a_supervised_app_session() {
     let project = TmpDir::prefixed("s", "sup-proj");
     let data = TmpDir::prefixed("s", "sup-data");
     let state = TmpDir::prefixed("s", "sup-state");
+    // Backstop for an assertion that fails before the stop: the supervisor is killed with `agent`,
+    // and the cage is meant to follow it, which is the very property under test.
+    let _sweep = FingerprintCleanup(vec!["31337"]);
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[app.probe]\n\
@@ -348,8 +360,18 @@ fn stop_tears_down_a_supervised_app_session() {
     );
 
     // The supervisor exits (reap its zombie so it is truly gone), and the cage follows it down: no
-    // `sleep 31337` is left orphaned in the host's process table.
-    let _ = agent.0.wait();
+    // `sleep 31337` is left orphaned in the host's process table. The wait is bounded, so a
+    // supervisor that outlives its stop fails the test instead of holding the suite.
+    assert!(
+        wait_until(Instant::now() + Duration::from_secs(20), || {
+            agent
+                .0
+                .try_wait()
+                .expect("waiting on the supervisor")
+                .is_some()
+        }),
+        "the supervisor outlived `sbx session stop`"
+    );
     assert!(
         wait_until(Instant::now() + Duration::from_secs(10), || {
             !any_sleeping_for("31337")
@@ -365,7 +387,7 @@ fn stop_tears_down_a_supervised_app_session() {
         &["session", "ls"],
     );
     assert!(
-        !String::from_utf8_lossy(&ls.stdout).contains(&pid.to_string()),
+        !lists_pid(&String::from_utf8_lossy(&ls.stdout), pid),
         "the stopped session still shows in `sbx session ls`"
     );
 }
@@ -452,7 +474,7 @@ fn stop_all_stops_every_session() {
     let listing = String::from_utf8_lossy(&ls.stdout);
     for pid in &pids {
         assert!(
-            listing.contains(&pid.to_string()),
+            lists_pid(&listing, *pid),
             "session {pid} should be listed before stop:\n{listing}"
         );
     }
@@ -488,7 +510,7 @@ fn stop_all_stops_every_session() {
     let listing = String::from_utf8_lossy(&ls.stdout);
     for pid in &pids {
         assert!(
-            !listing.contains(&pid.to_string()),
+            !lists_pid(&listing, *pid),
             "session {pid} still shows in `sbx session ls` after stop --all:\n{listing}"
         );
     }
@@ -505,33 +527,38 @@ fn stop_all_stops_every_session() {
 /// as a surviving agent by that e2e's liveness assertions, and swept by its `FingerprintCleanup`.
 #[test]
 fn the_fingerprint_sweep_matches_a_whole_argv_and_not_a_substring_of_one() {
-    let mut neighbour = std::process::Command::new("sleep")
-        .arg("131399")
-        .spawn()
-        .expect("spawn the neighbour");
-    let mut ours = std::process::Command::new("sleep")
-        .arg("31399")
-        .spawn()
-        .expect("spawn the fingerprinted process");
+    // Both are killed and reaped however the test ends: a failed assertion that left them would
+    // leave two `sleep`s of over eight hours behind, holding the harness's output pipe.
+    let neighbour = KillOnDrop(
+        Command::new("sleep")
+            .arg("131399")
+            .spawn()
+            .expect("spawn the neighbour"),
+    );
+    let ours = KillOnDrop(
+        Command::new("sleep")
+            .arg("31399")
+            .spawn()
+            .expect("spawn the fingerprinted process"),
+    );
+    let (ours_pid, neighbour_pid) = (ours.0.id() as i32, neighbour.0.id() as i32);
     // Both are up before either is looked for.
-    assert!(wait_until(Instant::now() + Duration::from_secs(5), || {
-        pids_sleeping_for("31399").contains(&(ours.id() as i32))
-    }));
+    assert!(
+        wait_until(Instant::now() + Duration::from_secs(5), || {
+            pids_sleeping_for("31399").contains(&ours_pid)
+        }),
+        "the fingerprinted process was never listed"
+    );
 
     let matched = pids_sleeping_for("31399");
     assert!(
-        matched.contains(&(ours.id() as i32)),
+        matched.contains(&ours_pid),
         "the fingerprinted process must be found: {matched:?}"
     );
     assert!(
-        !matched.contains(&(neighbour.id() as i32)),
+        !matched.contains(&neighbour_pid),
         "a longer number containing the fingerprint is somebody else's process: {matched:?}"
     );
-
-    let _ = ours.kill();
-    let _ = neighbour.kill();
-    let _ = ours.wait();
-    let _ = neighbour.wait();
 }
 
 /// The sweep a teardown runs kills the fingerprinted process and spares a neighbour whose argument
@@ -586,4 +613,15 @@ fn the_fingerprint_kill_ends_the_fingerprinted_process_and_spares_its_neighbour(
             .is_none(),
         "the sweep killed a process whose argument only contains the fingerprint"
     );
+}
+
+/// A session is listed when a row carries its pid as a column, and not when the pid is only part of
+/// a longer number in the listing.
+#[test]
+fn a_pid_is_listed_as_a_column_and_not_as_part_of_another_number() {
+    let listing = "NAME       KIND  MODE      PID   AGE  PROJECT\n\
+                   sbx-proj-1 run   detached  1234  3s   /tmp/p\n";
+    assert!(lists_pid(listing, 1234));
+    assert!(!lists_pid(listing, 123), "123 is only part of 1234");
+    assert!(!lists_pid(listing, 34), "34 is only part of 1234");
 }

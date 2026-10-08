@@ -13,8 +13,8 @@
 mod common;
 use common::fixture::TmpDir;
 use common::procs::{
-    any_sleeping_for, egress_socket_exists, finish_within, kill_sleeping_for, parse_detach_pid,
-    pids_sleeping_for, wait_until,
+    any_sleeping_for, egress_socket_exists, finish_within, kill_sleeping_for, lists_pid,
+    parse_detach_pid, pids_sleeping_for, wait_until,
 };
 
 use std::path::{Path, PathBuf};
@@ -191,7 +191,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
         &["session", "ls"],
     );
     assert!(
-        String::from_utf8_lossy(&ls.stdout).contains(&sup_pid.to_string()),
+        lists_pid(&String::from_utf8_lossy(&ls.stdout), sup_pid),
         "the detached session is not listed by `sbx session ls`:\n{}",
         String::from_utf8_lossy(&ls.stdout)
     );
