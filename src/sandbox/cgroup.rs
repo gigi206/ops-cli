@@ -848,14 +848,20 @@ pub(crate) fn sweep_stale_scopes() {
         if stale.is_empty() {
             return;
         }
-        let _ = std::process::Command::new(systemctl)
-            .args(["--user", "stop", "--no-block"])
-            .args(&stale)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // Bounded: `--no-block` spares the wait for the stop jobs, not the one for the manager to
+        // take the request, and this runs on the launch path.
+        let _ = super::resolver::output_within(
+            std::process::Command::new(systemctl)
+                .args(["--user", "stop", "--no-block"])
+                .args(&stale),
+            SWEEP_DEADLINE,
+            "`systemctl --user stop`",
+        );
     });
 }
+
+/// How long [`sweep_stale_scopes`] waits for the manager to take its stop request.
+const SWEEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long [`expansion_can_be_disabled`] waits for `systemd-run --help`.
 const HELP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
