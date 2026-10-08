@@ -15,6 +15,7 @@ use std::process::{Command, Output};
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 use common::{sbx, stdout_of, walk};
 
 /// The directory holding the test binary, so a driven shell finds `sbx` on its `PATH` —
@@ -26,12 +27,22 @@ fn bin_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// A unique scratch directory for one test, removed by the caller.
-fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("sbx-completion-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("fixture dir");
-    dir
+/// A scratch directory for one test, under the suites' shared fixture root and removed when it
+/// drops — on a failed assertion as well as on success.
+fn scratch(tag: &str) -> TmpDir {
+    TmpDir::prefixed("cmpl", tag)
+}
+
+/// `path` as one word of a shell script: single-quoted, each quote inside closed, escaped and
+/// reopened. The fixture root comes from the environment, so it may hold a blank or a quote, and an
+/// unquoted path in a driven script would then split or run as code.
+fn sh(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+/// A word of a driven command line, quoted the same way.
+fn sh_word(word: &str) -> String {
+    sh(Path::new(word))
 }
 
 /// One line per case for a shell driver: `expected US cursor US words-before-the-cursor`.
@@ -76,7 +87,7 @@ fn the_oracle_reads_the_session_registry_without_reclaiming_it() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(["__complete", "--", "session", "logs", ""])
-        .env("XDG_DATA_HOME", &dir)
+        .env("XDG_DATA_HOME", dir.path())
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("LC_ALL", "C.UTF-8")
         .output()
@@ -87,7 +98,6 @@ fn the_oracle_reads_the_session_registry_without_reclaiming_it() {
         record.exists(),
         "a keystroke reclaimed the session registry: {out:?}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn shell_available(shell: &str) -> bool {
@@ -100,10 +110,10 @@ fn shell_available(shell: &str) -> bool {
 
 /// Run a script through `shell`, with the sbx under test first on `PATH`.
 fn run_shell(shell: &str, script: &str) -> Output {
-    let path = match std::env::var_os("PATH") {
-        Some(p) => format!("{}:{}", bin_dir().display(), p.to_string_lossy()),
-        None => bin_dir().display().to_string(),
-    };
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(bin_dir()).chain(std::env::split_paths(&inherited)))
+            .expect("a PATH entry holds a `:`");
     Command::new(shell)
         .arg("-c")
         .arg(script)
@@ -222,13 +232,12 @@ fn the_bash_script_parses_and_completes() {
         return;
     }
     let script = stdout_of(&sbx(&["completion", "bash"]));
-    let dir = std::env::temp_dir().join(format!("sbx-completion-bash-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("fixture dir");
+    let dir = scratch("bash");
     let path = dir.join("sbx.bash");
     std::fs::write(&path, &script).expect("write script");
 
     // Valid shell first: a syntax error would make every assertion below meaningless.
-    let syntax = run_shell("bash", &format!("bash -n {}", path.display()));
+    let syntax = run_shell("bash", &format!("bash -n {}", sh(&path)));
     assert!(
         syntax.status.success(),
         "the emitted bash script does not parse: {}",
@@ -238,13 +247,13 @@ fn the_bash_script_parses_and_completes() {
     // Then drive the real completion function the way bash does: set the words and the
     // cursor index, call it, and read back what it offered.
     let drive = |words: &[&str], cword: usize| -> Vec<String> {
-        let quoted: Vec<String> = words.iter().map(|w| format!("'{w}'")).collect();
+        let quoted: Vec<String> = words.iter().map(|w| sh_word(w)).collect();
         let out = run_shell(
             "bash",
             &format!(
                 "source {}; COMP_WORDS=({}); COMP_CWORD={cword}; \
                  _sbx_complete; printf '%s\\n' \"${{COMPREPLY[@]}}\"",
-                path.display(),
+                sh(&path),
                 quoted.join(" ")
             ),
         );
@@ -268,8 +277,6 @@ fn the_bash_script_parses_and_completes() {
     assert!(drive(&["sbx", "run", "--det"], 2).contains(&"--detach".to_string()));
     // Three levels deep.
     assert_eq!(drive(&["sbx", "plugins", "store", "rek"], 3), ["rekey"]);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -286,14 +293,14 @@ fn a_path_position_completes_files_in_a_real_bash() {
     std::fs::write(dir.join("spaced name.toml"), b"").expect("a fixture file");
 
     let drive = |words: &[&str], cword: usize| -> Vec<String> {
-        let quoted: Vec<String> = words.iter().map(|w| format!("'{w}'")).collect();
+        let quoted: Vec<String> = words.iter().map(|w| sh_word(w)).collect();
         let out = run_shell(
             "bash",
             &format!(
-                "cd {dir}; source {script}; COMP_WORDS=({words}); COMP_CWORD={cword}; \
+                "cd -- {dir}; source {script}; COMP_WORDS=({words}); COMP_CWORD={cword}; \
                  _sbx_complete; printf '%s\\n' \"${{COMPREPLY[@]}}\"",
-                dir = dir.display(),
-                script = script.display(),
+                dir = sh(dir.path()),
+                script = sh(&script),
                 words = quoted.join(" ")
             ),
         );
@@ -318,8 +325,6 @@ fn a_path_position_completes_files_in_a_real_bash() {
     // Past a `--` the line belongs to the launched command. Answering nothing there would
     // leave `sbx run -- ls <TAB>` completing nothing at all, so the word is the shell's.
     assert_eq!(drive(&["sbx", "run", "--", "ls", "pl"], 4), ["plain.toml"]);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -349,7 +354,7 @@ fn a_path_position_reaches_zshs_own_file_completion() {
         print -r -- "dashdash=$(drive run -- ls pl)"
         print -r -- "verb=$(drive comp)"
         "#,
-        script = script.display()
+        script = sh(&script)
     );
     let out = run_shell("zsh", &driver);
     let stdout = stdout_of(&out);
@@ -371,8 +376,6 @@ fn a_path_position_reaches_zshs_own_file_completion() {
         !stdout.contains("__sbx_files__"),
         "the marker leaked into the menu:\n{stdout}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -382,12 +385,11 @@ fn the_zsh_script_parses_and_registers_itself() {
         return;
     }
     let script = stdout_of(&sbx(&["completion", "zsh"]));
-    let dir = std::env::temp_dir().join(format!("sbx-completion-zsh-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("fixture dir");
+    let dir = scratch("zsh");
     let path = dir.join("_sbx");
     std::fs::write(&path, &script).expect("write script");
 
-    let syntax = run_shell("zsh", &format!("zsh -n {}", path.display()));
+    let syntax = run_shell("zsh", &format!("zsh -n {}", sh(&path)));
     assert!(
         syntax.status.success(),
         "the emitted zsh script does not parse: {}",
@@ -402,8 +404,8 @@ fn the_zsh_script_parses_and_registers_itself() {
         &format!(
             "autoload -U compinit && compinit -u -d {dump}; source {script}; \
              print -r -- \"defined=${{+functions[_sbx]}} bound=${{_comps[sbx]}}\"",
-            dump = dir.join("zcompdump").display(),
-            script = path.display()
+            dump = sh(&dir.join("zcompdump")),
+            script = sh(&path)
         ),
     );
     let stdout = stdout_of(&out);
@@ -416,8 +418,6 @@ fn the_zsh_script_parses_and_registers_itself() {
         stdout.contains("bound=_sbx"),
         "the script must bind _sbx to the sbx command: {stdout}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- exhaustive sweeps over the whole command tree ---------------------------------
@@ -504,8 +504,8 @@ fn every_command_path_completes_in_a_real_bash() {
         echo "CHECKED=$n"
         [ $bad -eq 0 ] && echo SWEEP_OK
         "#,
-        script = script.display(),
-        cases = case_file.display()
+        script = sh(&script),
+        cases = sh(&case_file)
     );
     let out = run_shell("bash", &driver);
     let stdout = stdout_of(&out);
@@ -521,8 +521,6 @@ fn every_command_path_completes_in_a_real_bash() {
         .expect("the driver reports how many cases it ran");
     assert_eq!(checked, paths.len() * 2, "the driver skipped cases");
     assert!(checked > 300, "only {checked} bash cases run");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -562,8 +560,8 @@ fn every_command_path_completes_in_a_real_zsh() {
         print -r -- "CHECKED=$n"
         (( bad == 0 )) && print -r -- SWEEP_OK
         "#,
-        script = script.display(),
-        cases = case_file.display()
+        script = sh(&script),
+        cases = sh(&case_file)
     );
     let out = run_shell("zsh", &driver);
     let stdout = stdout_of(&out);
@@ -579,8 +577,6 @@ fn every_command_path_completes_in_a_real_zsh() {
         .expect("the driver reports how many cases it ran");
     assert_eq!(checked, paths.len() * 2, "the driver skipped cases");
     assert!(checked > 300, "only {checked} zsh cases run");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The oracle never reads a file outside the profiles directory, whatever `--app` spells.
@@ -611,13 +607,23 @@ fn the_oracle_offers_no_rule_from_outside_the_profiles_directory() {
     )
     .unwrap();
 
+    // Both of sbx's homes and the working directory are the fixture's, so nothing the host holds
+    // (a real profile, a project config beside the test run) can answer in the fixture's place.
+    // And the oracle must have answered, in silence: a failed one offers nothing, which would pass
+    // the traversal assertion below for the wrong reason.
     let ask = |app: &str| -> String {
         let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
             .args(["__complete", "--", "net", "unallow", "--app", app, ""])
-            .env("XDG_CONFIG_HOME", &dir)
+            .current_dir(dir.path())
+            .env("XDG_CONFIG_HOME", dir.path())
+            .env("XDG_DATA_HOME", dir.join("data"))
             .env("LC_ALL", "C.UTF-8")
             .output()
             .expect("spawn sbx");
+        assert!(
+            out.status.success() && out.stderr.is_empty(),
+            "the oracle failed for `--app {app}`: {out:?}"
+        );
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
 
@@ -630,6 +636,4 @@ fn the_oracle_offers_no_rule_from_outside_the_profiles_directory() {
         !escaped.contains("outside.example"),
         "a name spelling its way out of the profiles directory was read: {escaped}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
