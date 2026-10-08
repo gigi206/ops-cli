@@ -629,6 +629,20 @@ mod tests {
         assert!(crate::sandbox::CHANNEL_ENV_KEYS.contains(&"DBUS_SESSION_BUS_ADDRESS"));
     }
 
+    /// The guide lists the channels a broker cannot claim, and the list is the code's: a channel
+    /// added to [`crate::sandbox::CHANNEL_ENV_KEYS`] is one the page must name too.
+    #[test]
+    fn every_unclaimable_channel_is_named_in_the_broker_guide() {
+        let guide = include_str!("../../docs-site/docs/guide/plugins/broker.md");
+        for key in crate::sandbox::CHANNEL_ENV_KEYS {
+            assert!(
+                guide.contains(&format!("`{key}`")),
+                "docs-site/docs/guide/plugins/broker.md does not name `{key}`, which a broker \
+                 cannot claim"
+            );
+        }
+    }
+
     #[test]
     fn a_variable_named_in_both_lists_is_reported_against_both() {
         let err = validate(
