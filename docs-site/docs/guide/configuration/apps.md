@@ -251,7 +251,8 @@ warning. A trailing argument for one run belongs after `--`, which keeps the pro
 
 - `cmd` ends in a shell script (`["bash", "-c", "<script>"]`): an option appended there would reach
   the script's positional parameters, not the program it runs;
-- `arg` is missing, or does not start with `-`, or is the bare `--` that ends option parsing;
+- `arg` is missing, or does not start with `-`, or is the bare `--` that ends option parsing, or
+  the lone `-` that names standard input;
 - `toml_key` is not a bare or dotted TOML key;
 - the table has a key other than `arg` and `toml_key`.
 

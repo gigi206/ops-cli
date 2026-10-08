@@ -207,8 +207,9 @@ pub(super) fn validate_tasks_limit(
 /// shell script takes no contract: an option appended after the script becomes one of its
 /// positional parameters, never an option of the program it runs.
 ///
-/// The option must look like one — a leading `-`, and not the bare `--` that ends option parsing
-/// and would turn the summary into an operand. A `toml_key` must be a bare or dotted TOML key: the
+/// The option must look like one — a leading `-`, and neither the bare `--` that ends option
+/// parsing and would turn the summary into an operand, nor the lone `-` that conventionally is one
+/// (standard input). A `toml_key` must be a bare or dotted TOML key: the
 /// program splits `key=value` at its first `=`, so a key is what keeps the text a value of the
 /// setting the profile named, whatever the text holds.
 pub(super) fn validate_contract(
@@ -231,7 +232,7 @@ pub(super) fn validate_contract(
         ));
         return None;
     };
-    if !arg.starts_with('-') || arg == "--" {
+    if !arg.starts_with('-') || arg == "--" || arg == "-" {
         warnings.push(format!(
             "{source}: ignoring `contract` — `arg` must be a command-line option such as \
              `--append-system-prompt-file`, not `{}`",
@@ -649,8 +650,11 @@ pub(super) fn validate_notify(
         },
     };
     // A period is meaningless where nothing ever repeats. Said rather than silently ignored: a
-    // reader who set both is expecting one of them to be doing something.
-    if repeat_after.is_some()
+    // reader who set both is expecting one of them to be doing something. Not said of a period
+    // already refused above, which has its warning, for what is wrong with it.
+    if repeat_after
+        .as_deref()
+        .is_some_and(|raw| parse_duration(raw).is_ok())
         && NotifyEvent::ALL
             .iter()
             .all(|e| policy.mode_for(*e) != NotifyMode::Always)
@@ -1341,7 +1345,9 @@ pub(super) fn validate_open(
             continue;
         }
         // Two keys differing only in case are one scheme once folded, and the router holds one
-        // handler per scheme, so the later spelling takes the slot. It is reported like every
+        // handler per scheme, so the later spelling takes the slot. Later in key order, not in
+        // the file: the table arrives sorted, so `HTTPS` is read before `https` and gives way to
+        // it wherever each was written. It is reported like every
         // other value this table loses: overwritten in silence, the displaced entry left its
         // author believing a click on such a link reaches their program. Both spellings are named,
         // since the folded scheme is what the two have in common and tells their author nothing

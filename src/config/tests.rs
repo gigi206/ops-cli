@@ -4916,6 +4916,27 @@ fn open_argv(argv: &[&str]) -> schema::RawOpen {
     ))
 }
 
+/// Two spellings of one scheme are settled by key order, not by where each was written: the table
+/// arrives sorted, so the lowercase spelling, read last, keeps the slot either way round.
+#[test]
+fn two_spellings_of_one_scheme_are_settled_by_key_order() {
+    for text in [
+        "[open]\nhttps = [\"lower\"]\nHTTPS = [\"upper\"]\n",
+        "[open]\nHTTPS = [\"upper\"]\nhttps = [\"lower\"]\n",
+    ] {
+        let raw: RawConfig = toml::from_str(text).unwrap();
+        let r = resolve_no_plugins(raw, None);
+        assert_eq!(r.open["https"].argv, ["lower"], "{text}");
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("`https` replaces the handler `HTTPS`")),
+            "{:?}",
+            r.warnings
+        );
+    }
+}
+
 #[test]
 fn an_untrusted_project_cannot_declare_a_uri_handler() {
     // The property the whole feature rests on. sbx puts the router first on PATH and freezes the
@@ -13473,6 +13494,18 @@ fn notify_repeat_after_resolves_and_is_flagged_where_it_cannot_bite() {
             .any(|w| w.contains("invalid `repeat_after`"))
     );
 
+    // A malformed one where nothing repeats is named once, for what is wrong with it.
+    let bad_and_moot: RawConfig =
+        toml::from_str("[notify]\nmode = \"once\"\nrepeat_after = \"soon\"").unwrap();
+    let r = resolve_no_plugins(bad_and_moot, None);
+    let about: Vec<&String> = r
+        .warnings
+        .iter()
+        .filter(|w| w.contains("repeat_after"))
+        .collect();
+    assert_eq!(about.len(), 1, "{about:?}");
+    assert!(about[0].contains("invalid `repeat_after`"), "{about:?}");
+
     // Set where nothing ever repeats, it is called out rather than silently ignored.
     let moot: RawConfig =
         toml::from_str("[notify]\nmode = \"once\"\nrepeat_after = \"5m\"").unwrap();
@@ -14320,6 +14353,10 @@ fn a_contract_the_launch_cannot_honour_is_refused_with_its_reason() {
         ),
         (
             "cmd = \"agent\"\ncontract = { arg = \"--\" }",
+            "must be a command-line option",
+        ),
+        (
+            "cmd = \"agent\"\ncontract = { arg = \"-\" }",
             "must be a command-line option",
         ),
         (
