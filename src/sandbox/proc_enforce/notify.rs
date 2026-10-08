@@ -43,6 +43,36 @@ pub(super) fn notif_id_valid_code() -> libc::c_ulong {
     seccomp_ioc(IOC_WRITE, 2, std::mem::size_of::<u64>())
 }
 
+/// Run `call` again for as long as it fails with `EINTR`, and return what it returned last.
+///
+/// The ioctls answered here take the listener's lock with `mutex_lock_interruptible`, whose `EINTR`
+/// is not a restart code and reaches this process whatever `SA_RESTART` says, and the handoff
+/// receive blocks, which the pty relay's `SIGWINCH` and `SIGTERM` handlers interrupt (installed
+/// without `SA_RESTART`, in the process these threads run in). A signal delivered to this thread
+/// while it waits fails the call with `EINTR` without it having done anything, and an interrupted
+/// call read as its answer leaves a notification unanswered, which leaves the cage's thread blocked
+/// for good. A call that did act does not report `EINTR` — an `ADDFD` whose wait was interrupted
+/// after the descriptor went in returns that result — so the repeat cannot act twice.
+fn retrying_eintr(mut call: impl FnMut() -> libc::c_long) -> libc::c_long {
+    loop {
+        let rc = call();
+        if rc >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return rc;
+        }
+    }
+}
+
+/// An ioctl on the listener, repeated across `EINTR` ([`retrying_eintr`]).
+///
+/// # Safety
+///
+/// `arg` must be what the ioctl `code` reads or fills, live for the call.
+unsafe fn listener_ioctl<T>(fd: libc::c_int, code: libc::c_ulong, arg: *const T) -> libc::c_int {
+    // SAFETY: the caller vouches for `arg`; the request is repeated unchanged.
+    retrying_eintr(|| unsafe { libc::ioctl(fd, code as libc::Ioctl, arg) as libc::c_long })
+        as libc::c_int
+}
+
 /// Whether `fd` is a seccomp notification listener at all — asked of the kernel, not assumed.
 ///
 /// The handoff socket is bound read-write into the cage, so whatever connects to it first is who
@@ -60,20 +90,14 @@ pub(super) fn notif_id_valid_code() -> libc::c_ulong {
 pub(super) fn is_notif_listener(fd: libc::c_int) -> bool {
     let id: u64 = 0;
     // SAFETY: passes the address of a live local to the ID_VALID ioctl, which only reads it.
-    let rc = unsafe { libc::ioctl(fd, notif_id_valid_code() as libc::Ioctl, &id as *const u64) };
+    let rc = unsafe { listener_ioctl(fd, notif_id_valid_code(), &id as *const u64) };
     rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
 }
 
 /// Whether a seccomp notification id is still valid (the target has not been reaped).
 pub(super) fn notif_id_valid(notif_fd: libc::c_int, id: u64) -> bool {
     // SAFETY: passes the address of a local u64 to the ID_VALID ioctl, which only reads it.
-    unsafe {
-        libc::ioctl(
-            notif_fd,
-            notif_id_valid_code() as libc::Ioctl,
-            &id as *const u64,
-        ) == 0
-    }
+    unsafe { listener_ioctl(notif_fd, notif_id_valid_code(), &id as *const u64) == 0 }
 }
 
 /// Answer a notification with `CONTINUE` (let the real syscall run).
@@ -140,9 +164,9 @@ pub(super) fn respond_with_fd(
     addfd.newfd_flags = if cloexec { libc::O_CLOEXEC as u32 } else { 0 };
     // SAFETY: addfd is a live, correctly-sized request for the ADDFD ioctl to read.
     let rc = unsafe {
-        libc::ioctl(
+        listener_ioctl(
             notif_fd,
-            libc::SECCOMP_IOCTL_NOTIF_ADDFD as libc::Ioctl,
+            libc::SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
             &addfd as *const libc::seccomp_notif_addfd,
         )
     };
@@ -184,15 +208,42 @@ pub(super) fn notif_of(notif_fd: libc::c_int, id: u64) -> Option<(libc::c_int, u
     (notif_fd >= 0).then_some((notif_fd, id))
 }
 
-/// Send a notification response, ignoring `ENOENT` (the target was reaped while we decided).
+/// Set once a response has been refused for a reason other than its target being gone, so a
+/// session says it once.
+static SEND_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Send a notification response. `ENOENT` is not a failure — the target was reaped while we decided,
+/// and nothing waits for the answer — and any other refusal is said, once per session: the thread
+/// that made the syscall is still waiting for an answer that did not arrive.
 fn send_resp(notif_fd: libc::c_int, resp: &libc::seccomp_notif_resp) {
+    if let Err(e) = try_send_resp(notif_fd, resp)
+        && !SEND_REFUSED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        crate::diag::warn(&format!(
+            "the kernel refused an answer to a cage's syscall ({e}), so the thread that made it is \
+             left waiting"
+        ));
+    }
+}
+
+/// The send itself: `Ok` when the answer was taken or its target is gone, the kernel's error when it
+/// was refused.
+pub(super) fn try_send_resp(
+    notif_fd: libc::c_int,
+    resp: &libc::seccomp_notif_resp,
+) -> io::Result<()> {
     // SAFETY: resp is a live, correctly-sized response for the SEND ioctl to read.
-    unsafe {
-        libc::ioctl(
+    let rc = unsafe {
+        listener_ioctl(
             notif_fd,
-            notif_send_code() as libc::Ioctl,
+            notif_send_code(),
             resp as *const libc::seccomp_notif_resp,
-        );
+        )
+    };
+    match io::Error::last_os_error() {
+        _ if rc >= 0 => Ok(()),
+        e if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        e => Err(e),
     }
 }
 
@@ -301,7 +352,9 @@ pub(super) fn recv_fd_raw(stream: &UnixStream) -> io::Result<libc::c_int> {
     // SAFETY: msg's buffers are live and the control one is aligned for a `cmsghdr` ([`CmsgBuf`]);
     // we read every descriptor the cmsg carries, and close all of them on any refusal.
     unsafe {
-        let n = libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC);
+        let n = retrying_eintr(|| {
+            libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) as libc::c_long
+        });
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -335,11 +388,11 @@ pub(super) fn recv_fd_raw(stream: &UnixStream) -> io::Result<libc::c_int> {
             }
             Err(io::Error::other(why))
         };
-        // `MSG_CTRUNC` is refused rather than trimmed, and the cleanup above is honest about its
-        // limit: the kernel dropped control data that did not fit, so descriptors may have been
-        // closed by it or may not exist at all, and none of them is named by a cmsg this code can
-        // walk. What cannot be seen cannot be closed — but a handoff of this shape is not one this
-        // protocol sends, so the connection has already failed its contract.
+        // `MSG_CTRUNC` is refused rather than trimmed. The kernel installs the descriptors that fit
+        // and names them in the cmsg (`cmsg_len` counts those alone), which is what the cleanup
+        // above closes; the ones that did not fit are never installed, and the kernel drops its
+        // reference to them. A handoff of this shape is not one this protocol sends, so the
+        // connection has already failed its contract.
         if msg.msg_flags & libc::MSG_CTRUNC != 0 {
             return refuse("the handoff message was truncated by the kernel");
         }

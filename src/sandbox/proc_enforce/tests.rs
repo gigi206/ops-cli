@@ -1028,6 +1028,62 @@ fn a_handoff_carrying_one_descriptor_is_accepted() {
     close_owned(fd);
 }
 
+/// A signal delivered while the receive waits does not end the handoff: the receive is asked
+/// again and takes the descriptor that follows. sbx handles signals without `SA_RESTART`, so an
+/// interrupted receive read as a failure refused a handoff that was still coming.
+#[test]
+fn a_signal_during_the_handoff_receive_does_not_refuse_it() {
+    extern "C" fn noop(_: libc::c_int) {}
+    // SAFETY: a no-op handler for a signal this test sends only to the thread it names below.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = noop as *const () as usize;
+        sa.sa_flags = 0;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+    }
+    let (recv, send) = UnixStream::pair().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let receiver = std::thread::spawn(move || {
+        // SAFETY: names the calling thread.
+        tx.send(unsafe { libc::pthread_self() }).unwrap();
+        recv_fd_raw(&recv)
+    });
+    let thread = rx.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // SAFETY: `thread` is the receiver, alive until it has taken the descriptor sent below.
+    assert_eq!(unsafe { libc::pthread_kill(thread, libc::SIGUSR1) }, 0);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !receiver.is_finished(),
+        "the receive ended on the signal: {:?}",
+        receiver.join().unwrap()
+    );
+    let f = std::fs::File::open("/dev/null").unwrap();
+    send_scm_rights(&send, &[fd_of(&f)]);
+    let fd = receiver
+        .join()
+        .unwrap()
+        .expect("the handoff is taken after the signal");
+    close_owned(fd);
+}
+
+/// A response the kernel refuses is reported rather than dropped: a descriptor that is not a
+/// listener answers the send with `ENOTTY`.
+#[test]
+fn a_refused_response_is_an_error() {
+    let (a, _b) = UnixStream::pair().unwrap();
+    // SAFETY: an all-zero response is a valid one; only its refusal is under test.
+    let resp: libc::seccomp_notif_resp = unsafe { std::mem::zeroed() };
+    let err = super::notify::try_send_resp(fd_of_stream(&a), &resp).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ENOTTY), "{err}");
+}
+
+fn fd_of_stream(s: &UnixStream) -> libc::c_int {
+    use std::os::unix::io::AsRawFd as _;
+    s.as_raw_fd()
+}
+
 /// How many descriptors this process holds. The `read_dir` handle is open during the walk, so it is
 /// counted identically on either side of a comparison.
 fn open_fd_count() -> usize {
