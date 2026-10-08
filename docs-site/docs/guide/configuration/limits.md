@@ -117,7 +117,9 @@ the cage and `n` counts the cages that process has stood up. Two numbers, becaus
 name must be free when it is asked for and neither alone is enough: the pid separates two
 concurrent launches, while `n` separates the cages of one launch (its session, its tasks, a
 userland build, a resolve command, a plugin), which follow each other closely enough that the
-previous name is not always released yet. `ps` and `systemd-cgls` show the same name, and
+previous name is not always released yet. A unit systemd never collected keeps its name, and a pid
+is handed out again, so a launcher skips any name still held under its own pid by one that ran
+before it. `ps` and `systemd-cgls` show the same name, and
 [`sbx session ls`](../cli/session) is the same view from sbx's side.
 
 A launch owns more than one unit, because a launch stands up more than one cage. Which ones, and

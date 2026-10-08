@@ -233,11 +233,12 @@ fn delegated_controllers() -> Vec<String> {
 /// with no user manager has no such directory, yields no controller, and degrades as it did before.
 ///
 /// **The limit, written because dropping a gate widens what the others carry.** The caller's own
-/// cgroup no longer stands between a launch and `systemd-run`, so the bus socket [`limiter`] checks
-/// is what now separates the shape this comment used to exclude, a container that bind-mounts the
-/// host's `/sys/fs/cgroup` and `/run/user/<uid>`, from a launch that execs a launcher no manager
-/// will answer. That is the residual [`limiter`] already names for a socket left by a crashed
-/// manager, and it ends the same way: the launch stops at `systemd-run`, which names itself.
+/// cgroup no longer stands between a launch and `systemd-run`, so the manager [`limiter`] dials
+/// ([`manager_answers`]) is what now separates the shape this comment used to exclude, a container that
+/// bind-mounts the host's `/sys/fs/cgroup` and `/run/user/<uid>`, from a launch that execs a
+/// launcher no manager will answer. A socket that takes the connection but belongs to no manager able
+/// to register a scope is the residual, and it ends the launch at `systemd-run`, which names
+/// itself.
 fn controller_source(cgroup_path: &str, uid: u32) -> String {
     delegation_root(cgroup_path, uid)
         .unwrap_or_else(|| format!("/user.slice/user-{uid}.slice/user@{uid}.service"))
@@ -299,25 +300,51 @@ fn limiter(limits: &Limits) -> Result<(PathBuf, Vec<String>), LimiterMiss> {
     };
     // `systemd-run --user` needs a *reachable* user manager, not merely a named
     // runtime dir: a detached, cron, or post-logout context can inherit
-    // `XDG_RUNTIME_DIR` while the session bus is gone. Require the bus socket to
-    // exist so a dead session degrades to no-limits rather than hard-failing the
-    // launch on a `systemd-run` that cannot register a scope — the launch must
-    // never regress where it previously worked. (A stale socket left by a crashed
-    // manager is the residual: rare, and then the failure names `systemd-run`.)
+    // `XDG_RUNTIME_DIR` while the manager is gone. Require it to answer so a dead
+    // session degrades to no-limits rather than hard-failing the launch on a
+    // `systemd-run` that cannot register a scope — the launch must never regress
+    // where it previously worked.
     let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
         return Err(LimiterMiss::NoScope);
     };
-    if !Path::new(&runtime).join("bus").exists() {
+    if !manager_answers(Path::new(&runtime)) {
         return Err(LimiterMiss::NoScope);
     }
     let props = enforceable_properties(&delegated_controllers(), limits);
     if props.is_empty() {
         return Err(LimiterMiss::NoScope);
     }
+    // Asked here rather than where the argv is built, so the launch, its contract and `doctor`
+    // read the same answer: a launcher whose handling of dollars cannot be learned is not one to
+    // hand the cage's arguments to.
+    if expansion_can_be_disabled(&systemd_run).is_none() {
+        return Err(LimiterMiss::Unanswered);
+    }
     Ok((systemd_run, props))
 }
 
-/// Why [`limiter`] produced no launcher, carried back so `doctor` can say which of the three it
+/// How long [`socket_answers`] waits for a socket to take a connection.
+const MANAGER_DIAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether the user manager under the runtime directory `runtime` takes a connection, the way
+/// `systemd-run --user` reaches it: its private socket `systemd/private` first, the session bus
+/// `bus` when that one does not answer.
+fn manager_answers(runtime: &Path) -> bool {
+    socket_answers(&runtime.join("systemd/private")) || socket_answers(&runtime.join("bus"))
+}
+
+/// Whether the socket at `socket` takes a connection.
+///
+/// A socket file is not a listener: a manager that crashed leaves its socket behind, and a path
+/// that is not a socket at all accepts nothing. Either would carry the launch as far as a
+/// `systemd-run` that cannot register the scope, and end it there. A connection is the question the
+/// launcher itself asks, so a refusal here is one it would have met; the wait is bounded, since a
+/// listener whose backlog is full holds a blocking connect for as long as it stays full.
+fn socket_answers(socket: &Path) -> bool {
+    super::broker::connect_unix_within(socket, MANAGER_DIAL).is_ok()
+}
+
+/// Why [`limiter`] produced no launcher, carried back so `doctor` can say which of the four it
 /// was without searching again.
 ///
 /// The report used to re-derive this: it called [`limiter`], then ran the trusted lookup a second
@@ -332,6 +359,9 @@ enum LimiterMiss {
     /// A usable `systemd-run`, but no reachable session to register a transient scope with, or no
     /// delegated controller able to carry any of the asked-for limits.
     NoScope,
+    /// A `systemd-run` that did not answer `--help`, so whether it rewrites the cage's arguments
+    /// is unknown ([`help_offers_expansion`]).
+    Unanswered,
 }
 
 impl LimiterMiss {
@@ -347,6 +377,10 @@ impl LimiterMiss {
                 "no reachable systemd user session or delegated controller; \
                  the cage runs without resource limits"
             }
+            LimiterMiss::Unanswered => {
+                "systemd-run did not answer `--help` in time; \
+                 the cage runs without resource limits"
+            }
         }
     }
 }
@@ -354,6 +388,59 @@ impl LimiterMiss {
 /// How many transient scopes this process has asked for, which is the second half of what makes
 /// each one's unit name unique. See [`scope_prefix`] for the first half and why one is not enough.
 static SCOPE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The slug as a unit name can carry it: as given when it is already in the charset
+/// [`super::naming::sanitize_label`] produces, which every caller hands over, and sanitized here
+/// when it is not, so no slug can break the `--unit=` it is spliced into.
+fn unit_slug(slug: &str) -> std::borrow::Cow<'_, str> {
+    if slug
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        std::borrow::Cow::Borrowed(slug)
+    } else {
+        std::borrow::Cow::Owned(super::naming::sanitize_label(slug))
+    }
+}
+
+/// The cage scopes a launcher that held this process's pid before it left behind, by name.
+///
+/// A scope systemd could not collect (see [`scope_prefix`]) keeps its name for good, and its name
+/// ends on a pid the kernel hands out again. [`sweep_stale_scopes`] reclaims it only once that pid
+/// is dead, and to a launcher that was handed the same pid it reads as its own and live. Read once,
+/// before this process asks for a scope: only this process names scopes after its own pid, so
+/// nothing found later can be another's.
+fn left_under_this_pid() -> &'static std::collections::HashSet<String> {
+    static LEFT: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    LEFT.get_or_init(|| {
+        let pid = std::process::id();
+        cage_scope_dirs()
+            .iter()
+            .filter_map(|dir| dir.file_name()?.to_str().map(str::to_owned))
+            .filter(|name| scope_launcher_pid(name) == Some(pid))
+            .collect()
+    })
+}
+
+/// The next unit name in `seq` for `slug` under `pid` that is not one of `taken`.
+fn free_scope_unit(
+    slug: &str,
+    pid: u32,
+    taken: &std::collections::HashSet<String>,
+    seq: &std::sync::atomic::AtomicU32,
+) -> String {
+    loop {
+        let name = super::naming::scope_unit(
+            slug,
+            seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            pid,
+        );
+        if !taken.contains(&name) {
+            return name;
+        }
+    }
+}
 
 /// The argv `systemd-run` is invoked with, up to and including the `--` that ends it: how a scope is
 /// asked for, separate from whether one is worth asking for.
@@ -391,10 +478,11 @@ fn scope_prefix(systemd_run: &Path, props: &[String], cage_slug: &str) -> Vec<Os
         // for good. Reusing a name is therefore never safe on the strength of `--collect`.
         OsString::from(format!(
             "--unit={}",
-            super::naming::scope_unit(
-                cage_slug,
-                SCOPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            free_scope_unit(
+                &unit_slug(cage_slug),
                 std::process::id(),
+                left_under_this_pid(),
+                &SCOPE_SEQ,
             )
         )),
     ];
@@ -410,7 +498,7 @@ fn scope_prefix(systemd_run: &Path, props: &[String], cage_slug: &str) -> Vec<Os
     // Where the option does not exist the systemd predates it, and that is precisely the era whose
     // behaviour it was kept compatible with — no substitution with `--scope` — so passing the
     // arguments through untouched is right there too.
-    if expansion_can_be_disabled(systemd_run) {
+    if expansion_can_be_disabled(systemd_run) == Some(true) {
         prefix.push(OsString::from("--expand-environment=no"));
     }
     for p in props {
@@ -481,8 +569,8 @@ impl Scope {
     /// limit can be applied on this host (graceful degradation).
     ///
     /// Nothing here is dollar-escaped, and nothing needs to be: every value in the prefix is built from
-    /// a charset that cannot contain a `$` — [`super::naming::cage_slug`] sanitizes to `[a-z0-9-]`, and
-    /// a limit value has already passed [`is_valid_memory_value`] / [`is_valid_tasks_value`], neither of
+    /// a charset that cannot contain a `$` — [`super::naming::cage_slug`] sanitizes to `[a-z0-9-]`,
+    /// [`unit_slug`] holds every slug to that charset, and a limit value has already passed [`is_valid_memory_value`] / [`is_valid_tasks_value`], neither of
     /// which admits one — while the command past `--` is protected by asking the launcher not to
     /// substitute at all.
     fn wrapper(&self, cage_slug: &str) -> Option<(PathBuf, Vec<OsString>)> {
@@ -546,10 +634,12 @@ fn cage_scope_dirs_under(root: &Path) -> Vec<PathBuf> {
             continue;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
+            // The entry's own type, not what it points at: a link is never walked into, so the walk
+            // stays inside the tree it was handed and cannot go round a loop.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
+            let path = entry.path();
             let is_cage_scope = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -608,6 +698,14 @@ fn occupancy(procs: &str, proc_root: &Path) -> Occupancy {
 /// returns true for, so a process that cannot be looked at keeps the cage. More than one init is a
 /// shape no launch makes, and is left alone like every shape this does not claim to understand.
 fn lost_its_monitor(pids: &[&str], proc_root: &Path) -> bool {
+    // Compared as numbers, so the answer does not rest on two files spelling a pid alike.
+    let Some(members) = pids
+        .iter()
+        .map(|p| p.parse::<u32>().ok())
+        .collect::<Option<Vec<u32>>>()
+    else {
+        return false;
+    };
     let mut inits = 0usize;
     for pid in pids {
         let Ok(status) = std::fs::read_to_string(proc_root.join(pid).join("status")) else {
@@ -619,11 +717,11 @@ fn lost_its_monitor(pids: &[&str], proc_root: &Path) -> bool {
         let Some(parent) = status
             .lines()
             .find_map(|line| line.strip_prefix("PPid:"))
-            .map(str::trim)
+            .and_then(|p| p.trim().parse::<u32>().ok())
         else {
             return false;
         };
-        if pids.contains(&parent) {
+        if members.contains(&parent) {
             return false;
         }
         inits += 1;
@@ -669,7 +767,11 @@ fn is_childless_cage_init(pid: &str, proc_root: &Path) -> bool {
         return false;
     };
     let mut read_one = false;
-    for thread in threads.flatten() {
+    for thread in threads {
+        // A thread that cannot be listed is one whose children go unread, so it keeps the cage.
+        let Ok(thread) = thread else {
+            return false;
+        };
         let Ok(children) = std::fs::read_to_string(thread.path().join("children")) else {
             return false;
         };
@@ -759,23 +861,42 @@ pub(crate) fn sweep_stale_scopes() {
     });
 }
 
-/// Whether this `systemd-run` understands `--expand-environment=`, probed once per process.
+/// How long [`expansion_can_be_disabled`] waits for `systemd-run --help`.
+const HELP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long `doctor`'s live scope ([`probe`]) may take before it is reported unverified.
+const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether this `systemd-run` understands `--expand-environment=`, probed once per process, or
+/// `None` when it could not be asked ([`help_offers_expansion`]).
 ///
 /// Asked of the binary rather than derived from a version number, because a version is a second
 /// source of truth that can disagree with the program actually on `PATH` — a backport, a container
 /// image, a `systemd-run` provided by nix. Reasoning about behaviour from a version is what made a
 /// launch depend on a default that is not the same everywhere.
-fn expansion_can_be_disabled(systemd_run: &Path) -> bool {
-    static PROBED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PROBED.get_or_init(|| {
-        std::process::Command::new(systemd_run)
-            .arg("--help")
-            .output()
-            .is_ok_and(|o| {
-                String::from_utf8_lossy(&o.stdout).contains("--expand-environment")
-                    || String::from_utf8_lossy(&o.stderr).contains("--expand-environment")
-            })
-    })
+fn expansion_can_be_disabled(systemd_run: &Path) -> Option<bool> {
+    static PROBED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *PROBED.get_or_init(|| help_offers_expansion(systemd_run, HELP_DEADLINE))
+}
+
+/// What `systemd-run --help` says about `--expand-environment=`, waited for no longer than
+/// `deadline`.
+///
+/// Bounded, because the probe runs on the launch path and a launcher that does not answer its own
+/// `--help` would otherwise hold the launch with it. A launcher that did not answer is `None`, not
+/// an old one: reading it as old would leave the flag off, and a launcher that substitutes then
+/// writes the host's environment into the cage's arguments. [`limiter`] declines to wrap instead.
+fn help_offers_expansion(systemd_run: &Path, deadline: std::time::Duration) -> Option<bool> {
+    let out = super::resolver::output_within(
+        std::process::Command::new(systemd_run).arg("--help"),
+        deadline,
+        "`systemd-run --help`",
+    )
+    .ok()?;
+    Some(
+        String::from_utf8_lossy(&out.stdout).contains("--expand-environment")
+            || String::from_utf8_lossy(&out.stderr).contains("--expand-environment"),
+    )
 }
 
 /// Pure composition of a launch from an optional scope wrapper: with `Some` the
@@ -827,7 +948,7 @@ pub(crate) fn probe(limits: &Limits) -> LimitReport {
     // in `doctor` rather than at a launch.
     let (systemd_run, props) = match limiter(limits) {
         Ok(pair) => pair,
-        // Three ways to arrive here and the note must not collapse them, but the distinction is
+        // Four ways to arrive here and the note must not collapse them, but the distinction is
         // `limiter`'s to make: it already searched, and it already reported any refusal.
         Err(miss) => {
             return LimitReport {
@@ -844,7 +965,11 @@ pub(crate) fn probe(limits: &Limits) -> LimitReport {
         cmd.arg("-p").arg(p);
     }
     cmd.args(["--", "true"]);
-    match cmd.status() {
+    // Bounded, so a manager that never answers is a line in the report rather than a `doctor` that
+    // never returns.
+    match super::resolver::output_within(&mut cmd, PROBE_DEADLINE, "`systemd-run --scope`")
+        .map(|o| o.status)
+    {
         Ok(s) if s.success() => LimitReport {
             properties: props,
             verified: true,
@@ -1637,6 +1762,136 @@ mod tests {
         );
     }
 
+    /// A launcher that answers `--help` is read for the flag; one that does not answer in time is
+    /// `None`, which [`limiter`] declines on, never `false`, which would leave the flag off.
+    #[test]
+    fn an_unanswered_help_is_not_read_as_an_old_launcher() {
+        let tmp = TmpDir::new();
+        let answers = |name: &str, body: &str, deadline: std::time::Duration| {
+            let stand_in = tmp.join(name);
+            crate::testutil::write_script(&stand_in, body);
+            // The first spawn may meet the `ETXTBSY` of a file just written; it is asked again.
+            (0..50)
+                .find_map(|_| {
+                    let started = std::time::Instant::now();
+                    let answer = help_offers_expansion(&stand_in, deadline);
+                    (answer.is_some() || started.elapsed() >= deadline).then_some(answer)
+                })
+                .expect("the stand-in ran")
+        };
+        let long = std::time::Duration::from_secs(30);
+        assert_eq!(
+            answers("new", "echo '  --expand-environment=BOOL'", long),
+            Some(true)
+        );
+        assert_eq!(answers("old", "echo '  --scope'", long), Some(false));
+        assert_eq!(
+            answers(
+                "hung",
+                "exec sleep 30",
+                std::time::Duration::from_millis(300)
+            ),
+            None
+        );
+    }
+
+    /// A link in the tree is not walked into: a scope reached only through one is not this tree's,
+    /// and a link back up would send the walk round for good.
+    #[test]
+    fn the_scope_walk_does_not_follow_a_link() {
+        let tmp = TmpDir::new();
+        let root = tmp.join("user-1000.slice");
+        let mine = root.join("app.slice/sbx-web-0-4711.scope");
+        let elsewhere = tmp.join("elsewhere/sbx-web-0-4712.scope");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&root, root.join("app.slice/up")).unwrap();
+        std::os::unix::fs::symlink(&root, root.join("again")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("elsewhere"), root.join("out")).unwrap();
+        let found = crate::testutil::returns_within(
+            std::time::Duration::from_secs(10),
+            "the scope walk",
+            move || cage_scope_dirs_under(&root),
+        );
+        assert_eq!(found, vec![mine]);
+    }
+
+    /// Two files that spell one pid apart still name one process.
+    #[test]
+    fn a_monitor_is_matched_by_its_number_not_its_spelling() {
+        let tmp = TmpDir::new();
+        fake_proc_with_parent(tmp.path(), "4711", "04712", "4711 1", Some("4713\n"));
+        fake_proc_with_parent(tmp.path(), "4712", "1", "4712", None);
+        assert_eq!(
+            occupancy("4711\n4712\n", tmp.path()),
+            Occupancy::Running,
+            "the init's monitor is in the cgroup"
+        );
+    }
+
+    /// A name that a launcher before this one, handed the same pid, left behind is skipped rather
+    /// than asked for again, which `systemd-run` would refuse.
+    #[test]
+    fn a_name_left_under_this_pid_is_not_asked_for_again() {
+        let seq = std::sync::atomic::AtomicU32::new(0);
+        let taken: std::collections::HashSet<String> =
+            ["sbx-web-0-4711.scope", "sbx-web-1-4711.scope"]
+                .map(String::from)
+                .into();
+        assert_eq!(
+            free_scope_unit("web", 4711, &taken, &seq),
+            "sbx-web-2-4711.scope"
+        );
+        assert_eq!(
+            free_scope_unit("api", 4711, &taken, &seq),
+            "sbx-api-3-4711.scope"
+        );
+    }
+
+    #[test]
+    fn a_slug_outside_the_unit_charset_is_sanitized() {
+        assert!(matches!(
+            unit_slug("web-2"),
+            std::borrow::Cow::Borrowed("web-2")
+        ));
+        assert_eq!(unit_slug("a b/$x"), "a-b-x");
+    }
+
+    /// Only a socket that takes the connection counts: a missing path, a directory, and a socket
+    /// nothing listens on behind it all read as no manager.
+    #[test]
+    fn only_a_listening_socket_answers() {
+        let tmp = TmpDir::new();
+        assert!(!socket_answers(&tmp.join("missing")));
+        std::fs::create_dir(tmp.join("dir")).unwrap();
+        assert!(!socket_answers(&tmp.join("dir")));
+        drop(std::os::unix::net::UnixListener::bind(tmp.join("stale")).unwrap());
+        assert!(
+            tmp.join("stale").exists(),
+            "the socket file outlives its listener"
+        );
+        assert!(!socket_answers(&tmp.join("stale")));
+        let _live = std::os::unix::net::UnixListener::bind(tmp.join("live")).unwrap();
+        assert!(socket_answers(&tmp.join("live")));
+    }
+
+    /// The manager is reached as `systemd-run --user` reaches it: its private socket, or the
+    /// session bus where that one does not answer.
+    #[test]
+    fn the_manager_answers_on_its_private_socket_or_the_bus() {
+        let tmp = TmpDir::new();
+        let runtime = tmp.path();
+        assert!(!manager_answers(runtime));
+        let bus = std::os::unix::net::UnixListener::bind(runtime.join("bus")).unwrap();
+        assert!(manager_answers(runtime), "the bus alone answers");
+        drop(bus);
+        std::fs::remove_file(runtime.join("bus")).unwrap();
+        std::fs::create_dir(runtime.join("systemd")).unwrap();
+        let _private =
+            std::os::unix::net::UnixListener::bind(runtime.join("systemd/private")).unwrap();
+        assert!(manager_answers(runtime), "the private socket alone answers");
+    }
+
     /// The profile properties must produce the intended kernel limits, not merely
     /// parse. Launch a real transient scope carrying them and read the cgroup files
     /// back from inside it. Skips (does not fail) where no systemd user session can
@@ -1783,7 +2038,7 @@ mod tests {
         }
     }
 
-    /// The three ways `limiter` declines are three different things for the reader to do, so the
+    /// The ways `limiter` declines are different things for the reader to do, so the
     /// note must keep them apart — and each must still state the consequence, because a reader who
     /// learns only that something is missing has not been told the cage runs unlimited.
     #[test]
@@ -1792,6 +2047,7 @@ mod tests {
             LimiterMiss::Absent.note(),
             LimiterMiss::Refused.note(),
             LimiterMiss::NoScope.note(),
+            LimiterMiss::Unanswered.note(),
         ];
         const CONSEQUENCE: &str = "the cage runs without resource limits";
         for (i, note) in notes.iter().enumerate() {
@@ -1804,7 +2060,7 @@ mod tests {
                 "a note that is only the consequence names no cause: {note:?}"
             );
             for other in &notes[i + 1..] {
-                assert_ne!(note, other, "two of the three declines read the same");
+                assert_ne!(note, other, "two of the declines read the same");
             }
         }
     }
