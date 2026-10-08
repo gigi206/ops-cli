@@ -1687,6 +1687,213 @@ fn a_creation_that_could_not_be_handed_over_is_taken_away_again() {
     );
 }
 
+/// `O_PATH` with `O_CREAT` makes nothing: the kernel ignores the creation flag and fails the open
+/// of a missing name with `ENOENT`, so the supervisor must not make the file on the cage's behalf.
+#[test]
+fn a_path_only_open_of_a_missing_name_makes_nothing() {
+    let dir = TmpDir::new();
+    let lens = OpenLens::new(
+        crate::open_policy::OpenPolicy::compile(
+            &[r"sk-[A-Za-z0-9]{12,}".to_string()],
+            crate::open_policy::MAX_SCAN_DEFAULT,
+        )
+        .expect("the test pattern compiles")
+        .expect("a non-empty list yields a policy"),
+        std::fs::canonicalize(dir.path()).expect("canonical fixture root"),
+    );
+    let made = dir.join("made.txt");
+    let c = std::ffi::CString::new(made.as_os_str().as_encoded_bytes()).expect("fixture path");
+    // SAFETY: c is a live NUL-terminated path for the duration of the call.
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_PATH | libc::O_CREAT | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    assert!(
+        fd < 0 && !made.exists(),
+        "the kernel's own answer: `O_PATH|O_CREAT` on a missing name fails and makes nothing"
+    );
+
+    let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
+    req.pid = std::process::id();
+    req.data.nr = libc::SYS_openat as libc::c_int;
+    req.data.args[2] = (libc::O_PATH | libc::O_CREAT) as u64;
+    req.data.args[3] = 0o600;
+    assert!(
+        matches!(
+            serve_creation(
+                -1,
+                &req,
+                &lens,
+                libc::AT_FDCWD,
+                made.to_str().expect("utf-8")
+            ),
+            Creation::Declined
+        ),
+        "a creation the kernel would not perform is declined"
+    );
+    assert!(!made.exists(), "and nothing is left under the name");
+}
+
+/// `O_PATH` on a socket succeeds: it opens nothing, so the `ENXIO` an ordinary open meets is not
+/// its answer.
+#[test]
+fn a_path_only_open_of_a_socket_is_not_refused() {
+    let dir = TmpDir::new();
+    let sock_path = dir.join("probe.sock");
+    let _listener = UnixListener::bind(&sock_path).expect("bind the probe socket");
+    let serve = |flags: libc::c_int| {
+        let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
+        req.pid = std::process::id();
+        req.data.nr = libc::SYS_openat as libc::c_int;
+        req.data.args[2] = flags as u64;
+        // No notification descriptor: the `ENXIO` answer is formed without one, and serving a
+        // descriptor needs one, so `false` is the reopen that could not be handed over.
+        serve_open(
+            -1,
+            &req,
+            libc::AT_FDCWD,
+            "probe.sock",
+            Some(o_path_probe(&sock_path)),
+        )
+    };
+    assert!(
+        serve(libc::O_RDONLY),
+        "an ordinary open of a socket is answered `ENXIO`"
+    );
+    assert!(
+        !serve(libc::O_PATH),
+        "an `O_PATH` open of one is not: the kernel hands back a descriptor"
+    );
+}
+
+/// A FIFO read open waits for a writer, as the cage's would — and is released once the caller is
+/// gone, rather than holding its thread and its slot for as long as the supervisor lives.
+#[test]
+fn a_parked_fifo_read_is_released_when_the_caller_is_gone() {
+    let dir = TmpDir::new();
+    let fifo = dir.join("pipe");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo path");
+    // SAFETY: c is a live NUL-terminated path for the duration of the call.
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "make the FIFO"
+    );
+    let wait = |wanted: bool| {
+        let probe = o_path_probe(&fifo);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_for_reading_while(
+                &probe,
+                libc::O_RDONLY | libc::O_CLOEXEC,
+                || wanted,
+            ));
+        });
+        rx
+    };
+
+    let gone = wait(false).recv_timeout(Duration::from_secs(10));
+    assert!(
+        matches!(gone, Ok(Err(_))),
+        "a caller that is gone has its open released, not left waiting on a writer: {gone:?}"
+    );
+
+    let there = wait(true);
+    std::thread::sleep(Duration::from_millis(50));
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo)
+        .expect("a writer joins");
+    let opened = there.recv_timeout(Duration::from_secs(10));
+    let Ok(Ok(fd)) = opened else {
+        panic!("a caller still there is served once a writer arrives: {opened:?}");
+    };
+    // SAFETY: fd is the descriptor the open returned, closed exactly once.
+    unsafe { libc::close(fd) };
+    drop(writer);
+}
+
+/// A FIFO the supervisor may not open for writing cannot be released by becoming its writer, so the
+/// open is left to block as before rather than asking again on every tick.
+#[test]
+fn a_parked_fifo_read_that_cannot_be_released_waits_for_its_writer() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = TmpDir::new();
+    let fifo = dir.join("pipe");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo path");
+    // SAFETY: c is a live NUL-terminated path for the duration of the call.
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o400) },
+        0,
+        "make the FIFO"
+    );
+    let asked = std::sync::Arc::new(AtomicUsize::new(0));
+    let probe = o_path_probe(&fifo);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let counter = std::sync::Arc::clone(&asked);
+    std::thread::spawn(move || {
+        let _ = tx.send(open_for_reading_while(
+            &probe,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                false
+            },
+        ));
+    });
+    std::thread::sleep(Duration::from_millis(1200));
+    std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo)
+        .expect("a writer joins");
+    let opened = rx.recv_timeout(Duration::from_secs(10));
+    let Ok(Ok(fd)) = opened else {
+        panic!("the open completes when its writer arrives: {opened:?}");
+    };
+    // SAFETY: fd is the descriptor the open returned, closed exactly once.
+    unsafe { libc::close(fd) };
+    drop(writer);
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "a refusal that will not change is not asked again"
+    );
+}
+
+/// The undo of a creation removes the name only while it still holds the file made there: a
+/// sibling thread may have renamed that away and put a file of its own in its place.
+#[test]
+fn an_undone_creation_leaves_a_file_put_in_its_place() {
+    use std::os::unix::io::AsRawFd;
+    let dir = TmpDir::new();
+    let parent = std::fs::File::open(dir.path()).expect("open the directory");
+    let name = std::ffi::CString::new("made.txt").expect("name");
+    let made = std::fs::File::create(dir.join("made.txt")).expect("make the file");
+
+    std::fs::rename(dir.join("made.txt"), dir.join("moved.txt")).expect("move it away");
+    std::fs::write(dir.join("made.txt"), b"theirs\n").expect("put another in its place");
+    assert!(
+        !unlink_if_still(parent.as_raw_fd(), &name, &made),
+        "a name that holds another file is not removed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("made.txt")).expect("still there"),
+        "theirs\n"
+    );
+
+    let moved = std::ffi::CString::new("moved.txt").expect("name");
+    assert!(
+        unlink_if_still(parent.as_raw_fd(), &moved, &made),
+        "the name that holds the file made is removed"
+    );
+    assert!(!dir.join("moved.txt").exists());
+}
+
 /// `/proc/<pid>/mem` holds bytes and a policy holds names, and the bridge between them must not
 /// be a lossy one.
 ///

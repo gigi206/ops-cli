@@ -130,11 +130,16 @@ pub(super) fn serve_open(
                 return true;
             }
             Ok(_) => {}
-            // The path no longer resolves from here, which is the race above rather than a link.
-            // Answered `ELOOP` all the same: the cage asked for the stricter walk, and the stricter
-            // of the two answers is the one that cannot serve an inode this call did not establish.
-            Err(_) => {
-                respond_errno(notif_fd, req.id, libc::ELOOP);
+            // The path no longer resolves from here — the race above, when the cage moved it since
+            // the probe. An errno about the file (`ENOENT`, `EACCES`) is then the one the cage's own
+            // walk would meet; anything else is answered `ELOOP`, the stricter of the two. Neither
+            // serves an inode this call did not establish.
+            Err(e) => {
+                let errno = e
+                    .raw_os_error()
+                    .filter(|&e| errno_describes_the_file(e))
+                    .unwrap_or(libc::ELOOP);
+                respond_errno(notif_fd, req.id, errno);
                 return true;
             }
         }
@@ -148,10 +153,15 @@ pub(super) fn serve_open(
     let kind = probe.metadata().map(|m| m.file_type());
     let Ok(kind) = kind else { return false };
 
+    // `O_PATH` opens nothing: it hands back a descriptor naming the inode, whatever its type, and
+    // never waits. So none of the type-specific answers below applies to it, and the reopen carries
+    // the flag as the cage asked.
+    let o_path = flags & libc::O_PATH != 0;
+
     // A socket inode cannot be opened at all: measured, `open` on one returns `ENXIO` whatever the
     // access mode. Answering it here is both the truthful reply and one less door, since no reopen
     // has to be attempted to know it.
-    if kind.is_socket() {
+    if kind.is_socket() && !o_path {
         respond_errno(notif_fd, req.id, libc::ENXIO);
         return true;
     }
@@ -175,15 +185,20 @@ pub(super) fn serve_open(
     // [`errno_describes_the_file`] reports, and success on the read side. Parking such a call
     // instead held a non-blocking probe in `open` until a reader happened to arrive, and then
     // handed over a description with the flag cleared.
-    if kind.is_fifo() && flags & libc::O_ACCMODE != libc::O_RDWR && flags & libc::O_NONBLOCK == 0 {
+    if kind.is_fifo()
+        && !o_path
+        && flags & libc::O_ACCMODE != libc::O_RDWR
+        && flags & libc::O_NONBLOCK == 0
+    {
         return park_open(notif_fd, req.id, probe, reopen, cloexec);
     }
 
     // A character or block device may wait on the hardware behind it (a serial line waiting for
     // carrier). `O_NONBLOCK` is the standard way to open one without hanging on that, and clearing
     // it afterwards restores what the caller asked for on the description it receives.
-    let nonblock_dance =
-        (kind.is_char_device() || kind.is_block_device()) && flags & libc::O_NONBLOCK == 0;
+    let nonblock_dance = (kind.is_char_device() || kind.is_block_device())
+        && !o_path
+        && flags & libc::O_NONBLOCK == 0;
     let attempt = if nonblock_dance {
         reopen | libc::O_NONBLOCK
     } else {
@@ -204,14 +219,12 @@ pub(super) fn serve_open(
         }
         return false;
     }
-    if nonblock_dance {
-        // SAFETY: served is this call's live descriptor; F_SETFL only alters its status flags.
-        unsafe {
-            let cur = libc::fcntl(served, libc::F_GETFL);
-            if cur >= 0 {
-                libc::fcntl(served, libc::F_SETFL, cur & !libc::O_NONBLOCK);
-            }
-        }
+    // A description left non-blocking is not what the caller asked for, so one whose flag cannot
+    // be cleared is not served.
+    if nonblock_dance && !clear_nonblock(served) {
+        // SAFETY: served is this call's own descriptor, closed exactly once.
+        unsafe { libc::close(served) };
+        return false;
     }
     let ok = respond_with_fd(notif_fd, req.id, served, cloexec);
     // SAFETY: served is a fresh owned descriptor; the kernel copied it into the target if it took
@@ -280,7 +293,9 @@ pub(super) fn serve_creation(
         return Creation::Declined;
     };
     let flags = flags as libc::c_int;
-    if flags & libc::O_CREAT == 0 {
+    // The kernel ignores `O_CREAT` under `O_PATH`: measured, such an open of a missing name fails
+    // with `ENOENT` and makes nothing. Declined, so the probe's `ENOENT` is the answer here too.
+    if flags & libc::O_CREAT == 0 || flags & libc::O_PATH != 0 {
         return Creation::Declined;
     }
     // The directory that will hold the name, and the name itself. The separator stays with the
@@ -327,9 +342,8 @@ pub(super) fn serve_creation(
         return Creation::Declined;
     };
     let wanted = mode as libc::c_uint & !umask;
-    // `O_PATH` is dropped because this descriptor is the one the cage receives and has to be usable;
-    // ours is always close-on-exec, and what the cage's copy carries is set on the response.
-    let asked = (flags & !libc::O_PATH) | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
+    // Ours is always close-on-exec; what the cage's copy carries is set on the response.
+    let asked = flags | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
     // SAFETY: parent is a live directory descriptor and cbase a live NUL-terminated name.
     let made = unsafe { libc::openat(parent.as_raw_fd(), cbase.as_ptr(), asked, wanted) };
     if made < 0 {
@@ -344,12 +358,18 @@ pub(super) fn serve_creation(
     // landed narrower than the cage asked. `fchmod` is not umask-governed and settles it exactly.
     // Widening rather than narrowing, and only after `O_EXCL` proved the file is this call's, so the
     // window before it is the narrower mode and never a wider one.
+    // A file left narrower than asked is not handed over: it is undone below like one the kernel
+    // would not take.
+    // SAFETY: made is a fresh owned descriptor; the File takes sole ownership and closes it.
+    let made = unsafe { std::fs::File::from_raw_fd(made) };
     // SAFETY: made is this call's live descriptor, and fchmod only alters its mode bits.
-    unsafe { libc::fchmod(made, wanted as libc::mode_t) };
-    let ok = respond_with_fd(notif_fd, req.id, made, flags & libc::O_CLOEXEC != 0);
-    // SAFETY: made is a fresh owned descriptor; the kernel copied it into the target if it took it
-    // at all, and either way this side is done with it.
-    unsafe { libc::close(made) };
+    let ok = unsafe { libc::fchmod(made.as_raw_fd(), wanted as libc::mode_t) } == 0
+        && respond_with_fd(
+            notif_fd,
+            req.id,
+            made.as_raw_fd(),
+            flags & libc::O_CLOEXEC != 0,
+        );
     if ok {
         return Creation::Served;
     }
@@ -361,10 +381,38 @@ pub(super) fn serve_creation(
     // is then told a name it holds exclusively is taken, which is the one answer it acts on.
     //
     // So the creation is undone and the syscall left to run for real. `O_EXCL` proved the file was
-    // this call's when it was made, and it has been open and empty ever since.
-    // SAFETY: parent is a live directory descriptor and cbase a live NUL-terminated name.
-    unsafe { libc::unlinkat(parent.as_raw_fd(), cbase.as_ptr(), 0) };
-    Creation::Unmade
+    // this call's when it was made, but a sibling thread of the cage may have renamed it away and
+    // put something of its own under the name since, so the name is removed only while it still
+    // holds the inode made here. Otherwise, or when the removal fails, the name is there and the
+    // ordinary decision applies to it.
+    if unlink_if_still(parent.as_raw_fd(), &cbase, &made) {
+        Creation::Unmade
+    } else {
+        Creation::Exists
+    }
+}
+
+/// Remove `name` under `parent` only while it still names the inode `made` holds, reporting whether
+/// it was removed.
+pub(super) fn unlink_if_still(
+    parent: libc::c_int,
+    name: &std::ffi::CStr,
+    made: &std::fs::File,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(ours) = made.metadata() else {
+        return false;
+    };
+    // SAFETY: an all-zero `stat` is a valid buffer for fstatat to fill.
+    let mut there: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: parent is a live directory descriptor, name a live NUL-terminated name, and there a
+    // live buffer of the size fstatat writes.
+    let named =
+        unsafe { libc::fstatat(parent, name.as_ptr(), &mut there, libc::AT_SYMLINK_NOFOLLOW) } == 0;
+    named
+        && (ours.dev(), ours.ino()) == (there.st_dev, there.st_ino)
+        // SAFETY: parent is a live directory descriptor and name a live NUL-terminated name.
+        && unsafe { libc::unlinkat(parent, name.as_ptr(), 0) } == 0
 }
 
 /// Reopen the inode behind `probe` with `flags`, without walking a path.
@@ -378,8 +426,80 @@ fn reopen_probe(probe: &std::fs::File, flags: libc::c_int) -> libc::c_int {
     let Ok(c) = std::ffi::CString::new(by_fd) else {
         return -1;
     };
-    // SAFETY: c is a live NUL-terminated path for the duration of the call.
-    unsafe { libc::open(c.as_ptr(), flags) }
+    // SAFETY: c is a live NUL-terminated path for the duration of the call. The mode is passed
+    // explicitly; it is read only alongside `O_CREAT` or `O_TMPFILE`, which no caller sets.
+    unsafe { libc::open(c.as_ptr(), flags, 0 as libc::c_uint) }
+}
+
+/// Clear `O_NONBLOCK` on `fd`, reporting whether it was cleared.
+fn clear_nonblock(fd: libc::c_int) -> bool {
+    // SAFETY: fd is the caller's live descriptor; F_GETFL/F_SETFL only read and alter its status
+    // flags.
+    unsafe {
+        let cur = libc::fcntl(fd, libc::F_GETFL);
+        cur >= 0 && libc::fcntl(fd, libc::F_SETFL, cur & !libc::O_NONBLOCK) == 0
+    }
+}
+
+/// The errno the last failed call left, for an answer to carry.
+fn last_errno() -> libc::c_int {
+    io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EACCES)
+}
+
+/// Open a FIFO for reading through `probe`, waiting for a writer as the cage's open would — for as
+/// long as `wanted` says the caller is still there.
+///
+/// The read direction has no faithful poll: a non-blocking read open succeeds at once, writer or
+/// not. So the blocking open runs on a thread of its own while this one checks on the caller, and a
+/// caller that is gone has its open released by this side becoming the writer it was waiting for.
+/// Without that, a pipe no writer ever joins holds the thread, and its slot under
+/// [`PARKED_OPEN_CAP`], for as long as the supervisor lives. Another reader waiting on the same
+/// FIFO at that moment is released too, and its first read meets the end of the stream.
+///
+/// A FIFO this process may not open for writing cannot be released that way, and the open is then
+/// left to block as it did before.
+pub(super) fn open_for_reading_while(
+    probe: &std::fs::File,
+    reopen: libc::c_int,
+    wanted: impl Fn() -> bool,
+) -> Result<libc::c_int, libc::c_int> {
+    let open = || match reopen_probe(probe, reopen) {
+        fd if fd >= 0 => Ok(fd),
+        _ => Err(last_errno()),
+    };
+    std::thread::scope(|scope| {
+        let Ok(opener) = std::thread::Builder::new().spawn_scoped(scope, open) else {
+            // No thread to watch from, so the open blocks here as the cage's would have.
+            return open();
+        };
+        let mut releaser = -1;
+        while !opener.is_finished() {
+            if releaser < 0 && !wanted() {
+                releaser = reopen_probe(probe, libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC);
+                // `ENXIO` is the opener not yet inside the open it would release, and is retried;
+                // any other refusal will not change, and the open is left to its writer.
+                if releaser < 0 && last_errno() != libc::ENXIO {
+                    break;
+                }
+            }
+            std::thread::sleep(FIFO_CALLER_CHECK);
+        }
+        let opened = opener.join().unwrap_or(Err(libc::EACCES));
+        if releaser < 0 {
+            return opened;
+        }
+        // SAFETY: releaser, and the descriptor the released open returned, are this call's own,
+        // each closed exactly once.
+        unsafe {
+            libc::close(releaser);
+            if let Ok(fd) = opened {
+                libc::close(fd);
+            }
+        }
+        Err(libc::EACCES)
+    })
 }
 
 /// How many notified opens may be waiting on a blocking reopen at once.
@@ -394,6 +514,10 @@ static PARKED_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 
 /// How often a write-direction FIFO open asks again while it waits for a reader.
 const FIFO_RETRY: Duration = Duration::from_millis(10);
+
+/// How often a parked read-direction FIFO open checks that its caller is still there. Slower than
+/// [`FIFO_RETRY`]: the open itself is blocked and costs nothing, and only its release waits on this.
+const FIFO_CALLER_CHECK: Duration = Duration::from_millis(250);
 
 /// Serve an open whose reopen may block, on a thread of its own.
 ///
@@ -437,46 +561,59 @@ pub(super) fn park_open(
         return false;
     }
     let write_side = reopen & libc::O_ACCMODE == libc::O_WRONLY;
-    std::thread::spawn(move || {
+    let parked = std::thread::Builder::new().spawn(move || {
         let served = if write_side {
             // Faithful *and* bounded: `ENXIO` means no reader yet, and the wait ends either when one
             // arrives or when the notification stops being valid, which is when the caller is gone.
             loop {
                 let fd = reopen_probe(&probe, reopen | libc::O_NONBLOCK);
                 if fd >= 0 {
-                    // SAFETY: fd is this thread's live descriptor; F_SETFL only alters status flags.
-                    unsafe {
-                        let cur = libc::fcntl(fd, libc::F_GETFL);
-                        if cur >= 0 {
-                            libc::fcntl(fd, libc::F_SETFL, cur & !libc::O_NONBLOCK);
-                        }
+                    if clear_nonblock(fd) {
+                        break Ok(fd);
                     }
-                    break fd;
+                    // SAFETY: fd is this thread's own descriptor, closed exactly once.
+                    unsafe { libc::close(fd) };
+                    break Err(libc::EACCES);
                 }
-                if io::Error::last_os_error().raw_os_error() != Some(libc::ENXIO)
-                    || !notif_id_valid(own_fd, id)
-                {
-                    break -1;
+                let e = last_errno();
+                if e != libc::ENXIO || !notif_id_valid(own_fd, id) {
+                    break Err(e);
                 }
                 std::thread::sleep(FIFO_RETRY);
             }
         } else {
-            // The read direction has no faithful poll, so this blocks exactly as the cage would
-            // have. It ends when a writer arrives; a pipe no writer ever joins holds this thread for
-            // as long as the supervisor lives, which is the price of not lying to the caller about
-            // whether its open completed.
-            reopen_probe(&probe, reopen)
+            // Blocks exactly as the cage would have, which is the price of not lying to the caller
+            // about whether its open completed — but only while the caller is there to be lied to.
+            open_for_reading_while(&probe, reopen, || notif_id_valid(own_fd, id))
         };
-        if served >= 0 {
-            respond_with_fd(own_fd, id, served, cloexec);
-            // SAFETY: served is this thread's owned descriptor, closed exactly once.
-            unsafe { libc::close(served) };
-        } else {
-            respond_errno(own_fd, id, libc::EACCES);
+        match served {
+            Ok(fd) => {
+                respond_with_fd(own_fd, id, fd, cloexec);
+                // SAFETY: fd is this thread's owned descriptor, closed exactly once.
+                unsafe { libc::close(fd) };
+            }
+            // An errno about the file is the one the cage would have met; any other is this side's,
+            // and the cage is refused rather than told something about a file that is not so.
+            Err(e) => {
+                let errno = if errno_describes_the_file(e) {
+                    e
+                } else {
+                    libc::EACCES
+                };
+                respond_errno(own_fd, id, errno);
+            }
         }
         // SAFETY: own_fd is this thread's duplicate, closed exactly once.
         unsafe { libc::close(own_fd) };
         PARKED_OPENS.fetch_sub(1, Ordering::SeqCst);
     });
+    // No thread to park on: the same answer as over the cap, for the same reason. The closure, and
+    // the probe with it, was dropped by the failed spawn; the duplicate is closed here.
+    if parked.is_err() {
+        // SAFETY: own_fd is this call's duplicate, never handed to a thread, closed exactly once.
+        unsafe { libc::close(own_fd) };
+        PARKED_OPENS.fetch_sub(1, Ordering::SeqCst);
+        respond_errno(notif_fd, id, libc::EACCES);
+    }
     true
 }
