@@ -12,6 +12,10 @@
 #[macro_use]
 mod common;
 use common::fixture::TmpDir;
+use common::procs::{
+    any_sleeping_for, egress_socket_exists, finish_within, kill_sleeping_for, parse_detach_pid,
+    pids_sleeping_for, wait_until,
+};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -49,92 +53,15 @@ fn sandbox_probe(project: &Path, data: &Path, state: &Path) -> Output {
     sbx_run(project, data, state, &["run", "--", "true"])
 }
 
-/// Whether the fingerprinted agent is alive on the host. Used to see an in-cage process from
-/// outside the cage's pid namespace (the host still sees it).
-fn process_with_arg(needle: &str) -> bool {
-    !pids_sleeping_for(needle).is_empty()
-}
-
-/// The pids of every process whose argv is exactly `sleep <secs>`, for the fingerprint `secs`.
-///
-/// Matched argument by argument against a `/proc/<pid>/cmdline` split on its NULs, never as a
-/// substring of the whole line. A fingerprint here is a bare number, and a substring test against
-/// every command line on the machine matches a port, a pid, a hash prefix or a timestamp that
-/// happens to contain those digits. That is a false positive for the liveness assertions and,
-/// worse, a SIGKILL of an unrelated process of the developer's in [`Cleanup`].
-fn pids_sleeping_for(secs: &str) -> Vec<i32> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    let mut pids = Vec::new();
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let argv: Vec<&[u8]> = bytes.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
-        let [program, arg] = argv[..] else {
-            continue;
-        };
-        if arg == secs.as_bytes()
-            && std::path::Path::new(&String::from_utf8_lossy(program).into_owned())
-                .file_name()
-                .is_some_and(|n| n == "sleep")
-        {
-            pids.push(pid);
-        }
-    }
-    pids
-}
-
-/// Poll `cond` until it is `true` or the deadline passes; returns the final value.
-fn wait_until(deadline: Instant, mut cond: impl FnMut() -> bool) -> bool {
-    while Instant::now() < deadline {
-        if cond() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    cond()
-}
-
-/// Parse the detached session id out of `sbx`'s startup message ("...detached session <pid>...").
-fn parse_detach_pid(stderr: &[u8]) -> Option<u32> {
-    let text = String::from_utf8_lossy(stderr);
-    let after = text.split("detached session ").nth(1)?;
-    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
-}
-
-/// Whether a per-session egress socket exists under `<data>/sbx/egress/` — present only when the
-/// allowlist (supervised) launch path ran, so it confirms a fixture took that path.
-fn egress_socket_exists(data: &Path) -> bool {
-    std::fs::read_dir(data.join("sbx").join("egress"))
-        .map(|d| {
-            d.flatten().any(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|x| x.eq_ignore_ascii_case("sock"))
-            })
-        })
-        .unwrap_or(false)
-}
-
 /// Best-effort teardown so a panicking assertion never leaks a background daemon — which, unlike a
 /// foreground child, is reparented to init and cannot be reaped by the test. On drop it `sbx session stop`s
 /// each known session pid (the clean path, which `--die-with-parent` propagates to the cage) and
 /// then SIGKILLs any host process still carrying a fingerprint, as a backstop.
 ///
-/// The match is on the whole argv, through [`pids_sleeping_for`]. A substring test against every
-/// command line on the machine would sweep far wider than this test's own children: the
-/// fingerprints are bare numbers, so any process of the developer's whose command line happened to
-/// contain those digits was signalled by a test run.
+/// Each stop is bounded and cannot panic, through [`finish_within`]: the drop runs while a failed
+/// assertion unwinds, when a second panic aborts the test binary, and a stop that never returned
+/// would hold the suite. The sweep is [`kill_sleeping_for`], which signals no process but one of
+/// this user's whose whole argv is `sleep <fingerprint>`.
 struct Cleanup {
     data: PathBuf,
     state: PathBuf,
@@ -143,22 +70,23 @@ struct Cleanup {
     fingerprints: Vec<&'static str>,
 }
 
+/// How long the teardown waits on one `sbx session stop` before killing it and moving on to the sweep.
+const STOP_LIMIT: Duration = Duration::from_secs(30);
+
 impl Drop for Cleanup {
     fn drop(&mut self) {
         for pid in &self.pids {
-            let _ = sbx_run(
-                &self.project,
-                &self.data,
-                &self.state,
-                &["session", "stop", "--delay", "0", &pid.to_string()],
+            let _ = finish_within(
+                sbx()
+                    .args(["session", "stop", "--delay", "0", &pid.to_string()])
+                    .current_dir(&self.project)
+                    .env("XDG_DATA_HOME", &self.data)
+                    .env("XDG_STATE_HOME", &self.state),
+                STOP_LIMIT,
             );
         }
         for fp in &self.fingerprints {
-            for pid in pids_sleeping_for(fp) {
-                // SAFETY: a best-effort SIGKILL of a leaked test process whose whole argv is
-                // `sleep <fingerprint>`; a failure (already gone) is ignored.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
+            kill_sleeping_for(fp);
         }
     }
 }
@@ -250,7 +178,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     // The discriminating property: the launch command has already returned, yet the agent runs.
     assert!(
         wait_until(Instant::now() + Duration::from_secs(30), || {
-            process_with_arg("31351")
+            any_sleeping_for("31351")
         }),
         "the detached agent never appeared — `--detach` did not start it in the background"
     );
@@ -282,7 +210,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     );
     assert!(
         wait_until(Instant::now() + Duration::from_secs(10), || {
-            !process_with_arg("31351")
+            !any_sleeping_for("31351")
         }),
         "the supervised cage was orphaned — stopping the supervisor did not tear it down"
     );
@@ -311,7 +239,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
 
     assert!(
         wait_until(Instant::now() + Duration::from_secs(30), || {
-            process_with_arg("31352")
+            any_sleeping_for("31352")
         }),
         "the detached exec-path agent never appeared"
     );
@@ -328,7 +256,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     );
     assert!(
         wait_until(Instant::now() + Duration::from_secs(10), || {
-            !process_with_arg("31352")
+            !any_sleeping_for("31352")
         }),
         "the exec-path cage was orphaned after stop"
     );
@@ -360,7 +288,12 @@ fn a_detached_session_keeps_no_descriptor_of_its_invoker() {
 
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe2` fills the two-element array it is handed.
-    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    assert_eq!(
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "pipe2: {}",
+        std::io::Error::last_os_error()
+    );
     // SAFETY: both ends are fresh descriptors this test owns and closes once, through these.
     let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     let from = write.as_raw_fd();
@@ -401,7 +334,7 @@ fn a_detached_session_keeps_no_descriptor_of_its_invoker() {
     );
     assert!(
         wait_until(Instant::now() + Duration::from_secs(30), || {
-            process_with_arg("31353")
+            any_sleeping_for("31353")
         }),
         "the detached agent never appeared"
     );
@@ -411,11 +344,46 @@ fn a_detached_session_keeps_no_descriptor_of_its_invoker() {
         events: libc::POLLIN,
         revents: 0,
     };
-    // SAFETY: one `pollfd`, over a descriptor this test owns.
-    let ready = unsafe { libc::poll(&mut pfd, 1, 5_000) };
+    let ready = loop {
+        // SAFETY: one `pollfd`, over a descriptor this test owns.
+        let ready = unsafe { libc::poll(&mut pfd, 1, 5_000) };
+        if ready >= 0 {
+            break ready;
+        }
+        let e = std::io::Error::last_os_error();
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::Interrupted,
+            "polling the pipe: {e}"
+        );
+    };
     assert!(
         ready == 1 && pfd.revents & libc::POLLHUP != 0,
         "the running session still holds the invoker's descriptor 9 (poll {ready}, revents {:#x})",
         pfd.revents
     );
+}
+
+/// The teardown's bounded run kills a command that outlives its limit, and returns the status of
+/// one that ends in time. Its fingerprint is its own: the suites run side by side, and a `sleep`
+/// under another test's fingerprint would read as that test's agent.
+#[test]
+fn a_teardown_command_is_killed_at_its_limit() {
+    let started = Instant::now();
+    let hung = finish_within(
+        Command::new("sleep").arg("31354"),
+        Duration::from_millis(300),
+    );
+    assert_eq!(hung, None, "a command past its limit has no status");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the bounded run waited {:?}",
+        started.elapsed()
+    );
+    assert!(
+        pids_sleeping_for("31354").is_empty(),
+        "the command past its limit was left running"
+    );
+    let done = finish_within(&mut Command::new("true"), Duration::from_secs(5));
+    assert!(done.is_some_and(|status| status.success()));
 }

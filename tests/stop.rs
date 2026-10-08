@@ -10,6 +10,10 @@
 #[macro_use]
 mod common;
 use common::fixture::TmpDir;
+use common::procs::{
+    FingerprintCleanup, any_sleeping_for, egress_socket_exists, kill_sleeping_for,
+    parse_detach_pid, pids_sleeping_for, wait_until,
+};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -37,36 +41,6 @@ impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
-    }
-}
-
-/// Parse the detached session id out of `sbx`'s startup message ("...detached session <pid>...").
-fn parse_detach_pid(stderr: &[u8]) -> Option<u32> {
-    let text = String::from_utf8_lossy(stderr);
-    let after = text.split("detached session ").nth(1)?;
-    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
-}
-
-/// Best-effort SIGKILL of any leaked, fingerprinted background process on drop. A detached daemon is
-/// reparented to init and cannot be reaped by the test, so a `KillOnDrop` (which holds a `Child`)
-/// does not cover it — this sweeps by the unique `sleep` argument instead, as a backstop for when an
-/// assertion panics before the stop under test runs.
-///
-/// The match is on the whole argv, through [`pids_sleeping_for`]. It was a substring test against
-/// every command line on the machine, and the fingerprints are bare numbers: any process of the
-/// developer's whose command line happened to contain those digits was signalled by a test run.
-struct FingerprintCleanup(Vec<&'static str>);
-
-impl Drop for FingerprintCleanup {
-    fn drop(&mut self) {
-        for fp in &self.0 {
-            for pid in pids_sleeping_for(fp) {
-                // SAFETY: a best-effort SIGKILL of a leaked test process whose whole argv is
-                // `sleep <fingerprint>`; a failure (already gone) is ignored.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
-        }
     }
 }
 
@@ -282,76 +256,6 @@ fn wait_for_session(data: &Path, pid: u32, deadline: Instant) -> Option<PathBuf>
     None
 }
 
-/// Whether a per-session egress socket exists under `<data>/sbx/egress/` — present only when the
-/// allowlist (supervised) launch path ran, so it confirms the fixture exercises that path.
-fn egress_socket_exists(data: &Path) -> bool {
-    std::fs::read_dir(data.join("sbx").join("egress"))
-        .map(|d| {
-            d.flatten().any(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|x| x.eq_ignore_ascii_case("sock"))
-            })
-        })
-        .unwrap_or(false)
-}
-
-/// Whether any process on the host has `needle` in its argv (`/proc/<pid>/cmdline` is NUL-separated,
-/// which `from_utf8_lossy` keeps intact). Used to detect an orphaned in-cage process from outside
-/// the cage's pid namespace, which the host still sees.
-fn process_with_arg(needle: &str) -> bool {
-    !pids_sleeping_for(needle).is_empty()
-}
-
-/// The pids of every process whose argv is exactly `sleep <secs>`, for the fingerprint `secs`.
-///
-/// Matched argument by argument against a `/proc/<pid>/cmdline` split on its NULs, never as a
-/// substring of the whole line. A fingerprint here is a bare number, and a substring test against
-/// every command line on the machine matches a port, a pid, a hash prefix or a timestamp that
-/// happens to contain those digits. That is a false positive for the liveness assertions and,
-/// worse, a SIGKILL of an unrelated process of the developer's in the cleanup below.
-fn pids_sleeping_for(secs: &str) -> Vec<i32> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    let mut pids = Vec::new();
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let argv: Vec<&[u8]> = bytes.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
-        let [program, arg] = argv[..] else {
-            continue;
-        };
-        if arg == secs.as_bytes()
-            && std::path::Path::new(&String::from_utf8_lossy(program).into_owned())
-                .file_name()
-                .is_some_and(|n| n == "sleep")
-        {
-            pids.push(pid);
-        }
-    }
-    pids
-}
-
-/// Poll `cond` until it is `true` or the deadline passes; returns the final value.
-fn wait_until(deadline: Instant, mut cond: impl FnMut() -> bool) -> bool {
-    while Instant::now() < deadline {
-        if cond() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    cond()
-}
-
 #[test]
 fn stop_tears_down_a_supervised_app_session() {
     // A trusted app with a network allowlist runs supervised: the registered pid is the sbx
@@ -424,7 +328,7 @@ fn stop_tears_down_a_supervised_app_session() {
 
     // Precondition with teeth: the in-cage `sleep` is actually running before we stop.
     if !wait_until(Instant::now() + Duration::from_secs(30), || {
-        process_with_arg("31337")
+        any_sleeping_for("31337")
     }) {
         skip_incapable!("skipping sbx stop supervised e2e: the cage's sleep never started");
         return;
@@ -448,7 +352,7 @@ fn stop_tears_down_a_supervised_app_session() {
     let _ = agent.0.wait();
     assert!(
         wait_until(Instant::now() + Duration::from_secs(10), || {
-            !process_with_arg("31337")
+            !any_sleeping_for("31337")
         }),
         "the cage's `sleep` was orphaned — stopping the supervisor did not tear the cage down"
     );
@@ -533,7 +437,7 @@ fn stop_all_stops_every_session() {
     // Both agents are running before the stop.
     assert!(
         wait_until(Instant::now() + Duration::from_secs(30), || {
-            process_with_arg("31341") && process_with_arg("31342")
+            any_sleeping_for("31341") && any_sleeping_for("31342")
         }),
         "both detached agents should be running before `sbx session stop --all`"
     );
@@ -569,7 +473,7 @@ fn stop_all_stops_every_session() {
     // Neither cage is left running.
     assert!(
         wait_until(Instant::now() + Duration::from_secs(10), || {
-            !process_with_arg("31341") && !process_with_arg("31342")
+            !any_sleeping_for("31341") && !any_sleeping_for("31342")
         }),
         "`sbx session stop --all` left an agent running"
     );
@@ -628,4 +532,58 @@ fn the_fingerprint_sweep_matches_a_whole_argv_and_not_a_substring_of_one() {
     let _ = neighbour.kill();
     let _ = ours.wait();
     let _ = neighbour.wait();
+}
+
+/// The sweep a teardown runs kills the fingerprinted process and spares a neighbour whose argument
+/// only contains the fingerprint's digits. Its fingerprint is its own, for the reason the test above
+/// gives.
+#[test]
+fn the_fingerprint_kill_ends_the_fingerprinted_process_and_spares_its_neighbour() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut neighbour = KillOnDrop(
+        Command::new("sleep")
+            .arg("131398")
+            .spawn()
+            .expect("spawn the neighbour"),
+    );
+    let mut ours = KillOnDrop(
+        Command::new("sleep")
+            .arg("31398")
+            .spawn()
+            .expect("spawn the fingerprinted process"),
+    );
+    let pid = ours.0.id() as i32;
+    assert!(
+        wait_until(Instant::now() + Duration::from_secs(5), || {
+            pids_sleeping_for("31398").contains(&pid)
+        }),
+        "the fingerprinted process was never listed"
+    );
+
+    kill_sleeping_for("31398");
+
+    let mut ended = None;
+    assert!(
+        wait_until(Instant::now() + Duration::from_secs(5), || {
+            ended = ours
+                .0
+                .try_wait()
+                .expect("waiting on the fingerprinted process");
+            ended.is_some()
+        }),
+        "the fingerprinted process outlived the sweep"
+    );
+    assert_eq!(
+        ended.and_then(|status| status.signal()),
+        Some(libc::SIGKILL)
+    );
+    assert!(
+        neighbour
+            .0
+            .try_wait()
+            .expect("waiting on the neighbour")
+            .is_none(),
+        "the sweep killed a process whose argument only contains the fingerprint"
+    );
 }

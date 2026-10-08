@@ -371,6 +371,10 @@ pub mod project;
 /// The pseudo-terminal the interactive suites drive a launch through, in one definition.
 pub mod pty;
 
+/// The host processes an end-to-end launch leaves running, found and ended by fingerprint, in one
+/// definition.
+pub mod procs;
+
 use std::process::{Command, Output};
 
 /// Run the binary under test with `args`.
