@@ -316,7 +316,7 @@ impl PendingState {
     /// [`answer_all_after`](Self::answer_all_after) with nothing to do first: how the requests of a
     /// proxy that is gone are let go, and what the tests of the queue itself call.
     pub(crate) fn answer_all(&self, verdict: Verdict) -> Vec<(String, u16)> {
-        self.answer_all_after(verdict, |_, _| Ok(()))
+        self.answer_all_after(verdict, |_| Ok(()))
             .unwrap_or_default()
     }
 
@@ -325,16 +325,18 @@ impl PendingState {
     /// sequence). A point-in-time drain: a request that parks after the call began is not affected,
     /// save for the one below, and one that timed out meanwhile is not reported.
     ///
-    /// `first` is run on every parked destination before any request is woken, with the queue
-    /// unlocked, for the reasons [`answer_like_after`](Self::answer_like_after) gives. When `first`
-    /// fails, nothing is answered. A request that parked while `first` ran is answered when its
+    /// `first` is run once, on every parked destination together, before any request is woken, with
+    /// the queue unlocked, for the reasons [`answer_like_after`](Self::answer_like_after) gives. One
+    /// call rather than one per destination, so remembering them is one change the proxy confirms or
+    /// does not: a failure part-way would have left the first destinations' rules in force with none
+    /// of their requests answered. When `first` fails, nothing is answered. A request that parked while `first` ran is answered when its
     /// destination is one `first` ran on, as the answer by id answers it: the rule remembered there
     /// decides its retry as it does the others'. Any other stays parked, so none is freed without
     /// the rule that was to decide its retry.
     pub(crate) fn answer_all_after(
         &self,
         verdict: Verdict,
-        mut first: impl FnMut(&str, u16) -> io::Result<()>,
+        first: impl FnOnce(&[(&str, u16)]) -> io::Result<()>,
     ) -> io::Result<Vec<(String, u16)>> {
         let seen: Vec<(u64, String, u16)> = locked(&self.inner)
             .entries
@@ -344,9 +346,13 @@ impl PendingState {
         let mut remembered: Vec<(&str, u16)> = Vec::new();
         for (_, host, port) in &seen {
             if !remembered.contains(&(host.as_str(), *port)) {
-                first(host, *port)?;
                 remembered.push((host, *port));
             }
+        }
+        // An empty queue asks nothing of the proxy, so its drain is the clean `ok` it always was
+        // rather than a push that could wait out `CONFIRM_WAIT` on an older change.
+        if !remembered.is_empty() {
+            first(&remembered)?;
         }
         let answered: Vec<Entry> = {
             let mut inner = locked(&self.inner);
@@ -436,7 +442,28 @@ impl ManualRules {
     /// Remember an answered `host:port` as a manual allow or deny, so re-running that exact request
     /// is decided without re-asking. Deduped — re-answering the same `host:port` does not stack.
     pub(crate) fn remember(&self, verdict: Verdict, host: &str, port: u16) -> io::Result<()> {
-        self.remember_rule(verdict, crate::allowlist::host_port_rule(host, port))
+        self.remember_all(verdict, &[(host, port)])
+    }
+
+    /// [`remember`](Self::remember) for several destinations as one change: the proxy is sent one
+    /// overlay holding them all, and confirms it or does not, so a failure never leaves some of them
+    /// in force and the rest not.
+    pub(crate) fn remember_all(&self, verdict: Verdict, dests: &[(&str, u16)]) -> io::Result<()> {
+        self.change(|inner| {
+            let list = match verdict {
+                Verdict::Allow => &mut inner.allow,
+                Verdict::Deny => &mut inner.deny,
+            };
+            let mut changed = false;
+            for &(host, port) in dests {
+                let rule = crate::allowlist::host_port_rule(host, port);
+                if !list.contains(&rule) {
+                    list.push(rule);
+                    changed = true;
+                }
+            }
+            changed
+        })
     }
 
     /// Add an arbitrary egress `rule` to the overlay as a manual allow or deny — the proactive
@@ -1718,10 +1745,11 @@ pub(crate) fn serve_reports(
     }
 }
 
-/// The accept loop of the control socket: each connection on a thread of its own, answered by
-/// `dispatch`, until `stop` is set. With a `gate`, a connection whose peer runs outside this
-/// process's PID namespace is closed unanswered. A command `dispatch` answers with `None` is closed
-/// unanswered as well.
+/// The accept loop of the control socket: each connection on a thread of its own, at most
+/// [`MAX_CONCURRENT_CONNS`] at once, answered by `dispatch`, until `stop` is set. With a `gate`, a
+/// connection whose peer runs outside this process's PID namespace is closed unanswered, before it
+/// takes a slot. A command `dispatch` answers with `None` is closed unanswered as well, and so is a
+/// connection past the ceiling.
 fn accept_each<F>(
     listener: UnixListener,
     stop: &std::sync::atomic::AtomicBool,
@@ -1732,6 +1760,7 @@ fn accept_each<F>(
     F: Fn(&str) -> Option<String> + Send + Sync + 'static,
 {
     let dispatch = Arc::new(dispatch);
+    let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
     for stream in listener.incoming() {
         // See [`super::proxy::serve`]: the owner sets this and pokes the socket to unpark `accept`.
         if stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1761,12 +1790,24 @@ fn accept_each<F>(
         {
             continue;
         }
+        let Some(slot) = cap.take() else {
+            continue;
+        };
         let dispatch = Arc::clone(&dispatch);
         super::conncap::spawn_conn(who, move || {
+            // Held for the connection's life and given back by its `Drop`, so neither a handler
+            // that panics nor a thread the host refuses takes the slot with it.
+            let _slot = slot;
             let _ = handle(stream, dispatch.as_ref());
         });
     }
 }
+
+/// The most control connections served at once. Each carries one command and is closed once
+/// answered, so a reader holds its slot for the length of one reply; the ceiling is for a peer that
+/// connects and says nothing, which pins a thread for the ten seconds [`handle`] waits. The number
+/// the lenses' control sockets use ([`super::lens`]).
+const MAX_CONCURRENT_CONNS: usize = 8;
 
 /// The largest control command accepted. Most commands are short (`ALLOW <seq>`), but `REMEMBER
 /// ALLOW|DENY <rule>` carries a full egress rule (a long regex or URL rule), so the bound matches the
@@ -1915,7 +1956,11 @@ fn dispatch(
             if target == "*" {
                 // Drain framing mirrors `LIST`: one `answered host=…` line per request, then `ok`.
                 // An empty queue is a clean `ok` (nothing to answer is not an error).
-                let Ok(answered) = state.answer_all_after(verdict, first) else {
+                let remember_all = |dests: &[(&str, u16)]| match remember {
+                    true => manual.remember_all(verdict, dests),
+                    false => Ok(()),
+                };
+                let Ok(answered) = state.answer_all_after(verdict, remember_all) else {
                     return format!("{UNCONFIRMED}\n");
                 };
                 let mut out = String::new();
@@ -2002,17 +2047,29 @@ fn dispatch(
             let mut include_muted = false;
             let mut want_capture = false;
             let mut follow = None;
+            // A cursor that does not parse is refused rather than dropped: dropped, it turned a
+            // follow read into a read of the whole window, and the reader took that for what was
+            // new since its cursor.
             for token in parts {
                 if let Some(v) = token.strip_prefix("after=") {
-                    after = v.parse().ok();
+                    let Ok(seq) = v.parse() else {
+                        return "err bad-request\n".to_string();
+                    };
+                    after = Some(seq);
                 } else if let Some(v) = token.strip_prefix("amended=") {
-                    after_amend = v.parse().ok();
+                    let Ok(seq) = v.parse() else {
+                        return "err bad-request\n".to_string();
+                    };
+                    after_amend = Some(seq);
                 } else if let Some(v) = token.strip_prefix("follow=") {
                     // `sbx net logs --follow` — the reader's process id and poll interval in
                     // milliseconds, so the session can wait for its next read as it ends.
-                    follow = v.split_once(':').and_then(|(reader, ms)| {
+                    let Some(reader_ms) = v.split_once(':').and_then(|(reader, ms)| {
                         Some((reader.parse::<u32>().ok()?, ms.parse::<u64>().ok()?))
-                    });
+                    }) else {
+                        return "err bad-request\n".to_string();
+                    };
+                    follow = Some(reader_ms);
                 } else if token == "all" {
                     // `sbx net logs --all` — fold the muted (`dontaudit`) ring into the view.
                     include_muted = true;
@@ -2089,7 +2146,9 @@ fn report(cmd: &str, log: &LogRing, stats: Option<&super::egress_stats::EgressSt
         // address, so a build resolving one host a thousand times leaves one entry, and what the
         // record answers is "which names did this cage ask for" rather than "how often".
         Some("RESOLVED") => {
-            let Some(host) = parts.next() else {
+            // One name and nothing after it: the tap sends exactly that, so anything more is not a
+            // report it made.
+            let (Some(host), None) = (parts.next(), parts.next()) else {
                 return "err bad-request\n".to_string();
             };
             // The host is cage-chosen text. It arrives already restricted to name bytes by the
@@ -2128,7 +2187,10 @@ fn report(cmd: &str, log: &LogRing, stats: Option<&super::egress_stats::EgressSt
             else {
                 return "err bad-request\n".to_string();
             };
-            let Some(port) = parts.next().and_then(|p| p.parse::<u16>().ok()) else {
+            let (Some(port), None) = (
+                parts.next().and_then(|p| p.parse::<u16>().ok()),
+                parts.next(),
+            ) else {
                 return "err bad-request\n".to_string();
             };
             log.push(
@@ -2229,8 +2291,10 @@ fn format_amend_line(seq: u64, status: u16) -> String {
 ///
 /// The same number [`crate::session::current_start_ticks`] gives the persisted stats file, and for
 /// the same reason: a pid is not an identity. A process cannot change its own start time, so this
-/// is read once and kept; a host whose `/proc` does not answer leaves it `None`, and the two
-/// functions below then behave as this plane did before the field existed.
+/// is read once and kept; a host whose `/proc` does not answer leaves it `None`, so this session
+/// mints only untagged ids, and refuses a tagged one ([`names_incarnation`]). Kept rather than read
+/// again: a later read that succeeded would start tagging ids while earlier untagged ones are in an
+/// operator's scrollback, and refusing a tagged id would then no longer be sound.
 pub(in crate::sandbox) fn incarnation() -> Option<u64> {
     static TICKS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *TICKS.get_or_init(crate::session::current_start_ticks)
@@ -2246,16 +2310,19 @@ fn incarnation_field() -> String {
 }
 
 /// Whether `claimed` names this incarnation.
-///
-/// A host that cannot read its own start time answers `true` to anything: refusing every tagged id
-/// there would make the plane unanswerable on a host where nothing is wrong except that `/proc`
-/// is not readable. That leaves such a host exactly where it was before the tag existed, which is
-/// the fallback this whole field is a strict improvement on.
 fn is_our_incarnation(claimed: &str) -> bool {
-    match incarnation() {
-        Some(ticks) => claimed.parse::<u64>() == Ok(ticks),
-        None => true,
-    }
+    names_incarnation(incarnation(), claimed)
+}
+
+/// [`is_our_incarnation`] against `ours`, the value [`incarnation`] holds.
+///
+/// A session that cannot read its own start time refuses every tagged id, and that costs it
+/// nothing: both places an id is minted for it — its `LIST` and its park notice — read the same
+/// [`incarnation`], which is read once and kept, so it never minted a tagged one. A tagged id that
+/// reaches it was minted by a session that could read its start time, which is another process
+/// holding this pid before it.
+fn names_incarnation(ours: Option<u64>, claimed: &str) -> bool {
+    ours.is_some_and(|ticks| claimed.parse::<u64>() == Ok(ticks))
 }
 
 /// Make `value` safe to occupy one whitespace-split `key=value` token of a control-wire line.
@@ -3370,6 +3437,174 @@ mod tests {
             allow.is_empty() && deny.is_empty(),
             "and the truncation never reached the overlay: {allow:?} {deny:?}"
         );
+    }
+
+    /// A drain remembers its destinations in one call, so the proxy confirms them as one change; a
+    /// call that fails answers nothing and leaves every request parked.
+    #[test]
+    fn a_drain_remembers_every_destination_at_once_or_answers_nothing() {
+        let state = Arc::new(PendingState::new());
+        let a1 = park_next(&state, "dl.test", 443, 0);
+        let a2 = park_next(&state, "dl.test", 443, 1);
+        let b = park_next(&state, "logs.test", 8443, 2);
+
+        let mut calls = Vec::new();
+        let refused = state.answer_all_after(Verdict::Allow, |dests| {
+            calls.push(
+                dests
+                    .iter()
+                    .map(|(h, p)| (h.to_string(), *p))
+                    .collect::<Vec<_>>(),
+            );
+            Err(io::Error::other("not confirmed"))
+        });
+        assert!(refused.is_err());
+        assert_eq!(
+            calls,
+            vec![vec![
+                ("dl.test".to_string(), 443),
+                ("logs.test".to_string(), 8443)
+            ]],
+            "one call, every destination once"
+        );
+        assert_eq!(state.list().len(), 3, "nothing was answered");
+
+        let answered = state.answer_all_after(Verdict::Allow, |_| Ok(())).unwrap();
+        assert_eq!(answered.len(), 3);
+        for parked in [a1, a2, b] {
+            assert_eq!(parked.join().unwrap(), Verdict::Allow);
+        }
+
+        let mut asked = false;
+        let empty = state.answer_all_after(Verdict::Allow, |_| {
+            asked = true;
+            Err(io::Error::other("not confirmed"))
+        });
+        assert!(
+            empty.is_ok_and(|a| a.is_empty()) && !asked,
+            "an empty queue drains clean without asking"
+        );
+
+        // Remembered together, the destinations are one change of the overlay.
+        let manual = ManualRules::new();
+        manual
+            .remember_all(Verdict::Allow, &[("dl.test", 443), ("logs.test", 8443)])
+            .unwrap();
+        assert_eq!(read_locked(&manual.inner).version, 1);
+        assert_eq!(manual.snapshot().0.len(), 2);
+    }
+
+    /// A session that cannot read its own start time minted no tagged id, so one that reaches it
+    /// names another incarnation of its pid and is refused.
+    #[test]
+    fn a_tagged_id_is_ours_only_when_it_names_our_known_start() {
+        assert!(names_incarnation(Some(5), "5"));
+        assert!(!names_incarnation(Some(5), "6"));
+        assert!(!names_incarnation(Some(5), "x"));
+        assert!(!names_incarnation(None, "5"));
+    }
+
+    /// A `LOG` cursor that does not parse is refused, rather than read as no cursor at all, which
+    /// answered a follow read with the whole window.
+    #[test]
+    fn a_log_cursor_that_does_not_parse_is_refused() {
+        let (state, manual, log, flows) = (
+            PendingState::new(),
+            ManualRules::new(),
+            LogRing::new(LOG_RING_CAP),
+            FlowRegistry::new(),
+        );
+        for bad in [
+            "LOG after=x",
+            "LOG amended=",
+            "LOG follow=1",
+            "LOG follow=a:5",
+        ] {
+            assert_eq!(
+                dispatch(bad, &state, &manual, &log, &flows, None),
+                "err bad-request\n",
+                "`{bad}`"
+            );
+        }
+        assert!(
+            dispatch(
+                "LOG after=0 amended=0 follow=1:500",
+                &state,
+                &manual,
+                &log,
+                &flows,
+                None
+            )
+            .starts_with("head=")
+        );
+    }
+
+    /// The tap's reports carry exactly their fields: anything after them is not a report the tap
+    /// made.
+    #[test]
+    fn a_report_with_a_token_past_its_fields_is_refused() {
+        let log = LogRing::new(LOG_RING_CAP);
+        for bad in ["RESOLVED a.test b.test", "BYPASSED 198.18.0.7 443 x"] {
+            assert_eq!(report(bad, &log, None), "err bad-request\n", "`{bad}`");
+        }
+        assert_eq!(report("RESOLVED a.test", &log, None), "ok\n");
+        assert_eq!(report("BYPASSED 198.18.0.7 443", &log, None), "ok\n");
+    }
+
+    /// The control socket serves at most its ceiling at once: past it a connection is closed
+    /// unanswered, and a slot given back is served again.
+    #[test]
+    fn the_control_socket_serves_at_most_its_ceiling_at_once() {
+        use crate::testutil::TmpDir;
+        use std::io::{Read, Write};
+        let data = TmpDir::new();
+        std::fs::create_dir_all(control_dir(data.path())).unwrap();
+        let sock = control_socket(data.path(), 24682);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let served_stop = stop.clone();
+        thread::spawn(move || {
+            let _ = serve(
+                listener,
+                Planes {
+                    state: Arc::new(PendingState::new()),
+                    manual: Arc::new(ManualRules::new()),
+                    log: Arc::new(LogRing::new(LOG_RING_CAP)),
+                    flows: Arc::new(FlowRegistry::new()),
+                    capture: None,
+                },
+                served_stop,
+            );
+        });
+        let ask = |sock: &Path| -> String {
+            let Ok(stream) = UnixStream::connect(sock) else {
+                return String::new();
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let _ = (&stream).write_all(b"LIST\n");
+            let mut reply = String::new();
+            let _ = (&stream).read_to_string(&mut reply);
+            reply
+        };
+        assert_eq!(ask(&sock), "ok\n", "served below the ceiling");
+
+        // Each silent connection holds its slot while the server waits for its command.
+        let silent: Vec<UnixStream> = (0..MAX_CONCURRENT_CONNS)
+            .map(|_| UnixStream::connect(&sock).unwrap())
+            .collect();
+        assert_eq!(ask(&sock), "", "past the ceiling: closed unanswered");
+
+        drop(silent);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut reply = ask(&sock);
+        while reply.is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            reply = ask(&sock);
+        }
+        assert_eq!(reply, "ok\n", "a slot given back is served again");
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[test]

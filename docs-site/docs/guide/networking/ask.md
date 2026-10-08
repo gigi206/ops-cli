@@ -42,7 +42,8 @@ blocks inside the cage while it waits for your live decision.
    [`sbx session ls`](../housekeeping/sessions) shows). The trailing tag names which
    incarnation of that PID parked the request, so a verdict cannot be applied by a
    later session the kernel happened to give the same number: copy the id as the
-   listing prints it. Identical retries of one URL collapse to a single `×N` line, so
+   listing prints it. A session that cannot read its own start time prints ids without
+   the tag, and refuses a tagged one, which can only come from another session. Identical retries of one URL collapse to a single `×N` line, so
    a tool that retries does not flood the list. Add `--json` for scripts, `-a <app>`
    to scope to one app's session(s).
 
@@ -158,7 +159,8 @@ sbx net pending allow --all --session            # …and remember each for its 
 
 `--all` is a **point-in-time** bulk answer: a request that parks *after* the drain
 still waits. It reports per session, so a cross-agent grant is visible. With
-`--session`, a session whose proxy does not confirm the rules is named, nothing is
+`--session`, a session's rules are sent to its proxy as one change, which it confirms
+whole or not at all; a session whose proxy does not confirm them is named, nothing is
 answered there, and the command exits with code 2.
 
 `--all` composes with `--save`, with a deliberate safety rule about scope:

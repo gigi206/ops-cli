@@ -100,7 +100,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The most control connections a lens serves at once. Each carries one command and is closed once
 /// answered, so a reader holds its slot for the length of one reply; the ceiling is for a peer that
 /// connects and says nothing, which pins a thread for [`IO_TIMEOUT`]. The same shape, and the same
-/// number, as the egress report plane's.
+/// number, as the egress control plane's.
 const MAX_CONCURRENT_CONNS: usize = 8;
 
 /// One event a lens records, and how it crosses the wire. The ring stamps the sequence number, so an

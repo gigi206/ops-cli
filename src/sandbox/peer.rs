@@ -338,7 +338,7 @@ mod tests {
                 "control/mod.rs",
                 crate::testutil::production_half(include_str!("control/mod.rs")),
                 "&& !gate.admits(&stream)",
-                "super::conncap::spawn_conn(who",
+                "cap.take()",
             ),
             (
                 "task_control.rs",
