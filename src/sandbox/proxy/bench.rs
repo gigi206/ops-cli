@@ -130,15 +130,18 @@ fn spawn_keepalive_tls_upstream(
 }
 
 /// The `Content-Length` a raw request head declares, if any. Enough parsing for a test upstream:
-/// the proxy forwards exactly one length, having refused anything ambiguous long before here.
+/// the proxy forwards exactly one length, having refused anything ambiguous long before here. The
+/// field name is matched without regard to case and the value with or without blanks around it,
+/// as a server reads them: a length this missed would leave its body to be read as the next head.
 fn declared_length(head: &[u8]) -> Option<usize> {
     String::from_utf8_lossy(head)
         .lines()
         .find_map(|l| {
-            l.strip_prefix("Content-Length: ")
-                .or(l.strip_prefix("content-length: "))
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())
+                .flatten()
         })
-        .and_then(|v| v.trim().parse().ok())
         .filter(|n| *n > 0)
 }
 
@@ -291,6 +294,7 @@ fn one_https_request(
     host: &str,
     port: u16,
     request: &[u8],
+    want: u16,
 ) -> io::Result<usize> {
     one_https_exchange(
         UnixStream::connect(sock_path)?,
@@ -298,20 +302,23 @@ fn one_https_request(
         host,
         port,
         request,
+        want,
     )
 }
 
 /// The client half of one inspected HTTPS request, over whatever transport already reaches the
 /// proxy: `CONNECT`, handshake against the minted leaf, send the request, read the response.
 ///
-/// Returns the number of response bytes read. Split from the socket it rides so the same exchange
-/// can be timed with and without the cage's forwarder in the way.
+/// Returns the number of response bytes read, and fails on a response that is not the `want` status
+/// ([`read_framed_response`]). Split from the socket it rides so the same exchange can be timed with
+/// and without the cage's forwarder in the way.
 fn one_https_exchange<S: Read + Write>(
     mut sock: S,
     client_cfg: Arc<ClientConfig>,
     host: &str,
     port: u16,
     request: &[u8],
+    want: u16,
 ) -> io::Result<usize> {
     write!(sock, "CONNECT {host}:{port} HTTP/1.1\r\n\r\n")?;
     sock.flush()?;
@@ -324,13 +331,13 @@ fn one_https_exchange<S: Read + Write>(
     let conn = ClientConnection::new(client_cfg, name).map_err(io::Error::other)?;
     let mut br = BufReader::new(StreamOwned::new(conn, sock));
     br.get_mut().write_all(request)?;
-    br.get_mut().flush().ok();
-    read_framed_response(&mut br)
+    br.get_mut().flush()?;
+    read_framed_response(&mut br, want)
 }
 
 /// `n` inspected HTTPS requests down **one** tunnel: one `CONNECT` and one interception handshake
 /// for all of them, which is what an ordinary client's connection pool does through a proxy. Returns
-/// the number of response bytes read.
+/// the number of response bytes read; each response must be a `200`.
 ///
 /// Each response is read to the end of its *message* rather than to the end of the stream — a tunnel
 /// that carries another request never reaches one — which is also the only way the figure this
@@ -359,8 +366,8 @@ fn one_https_session(
     let mut total = 0;
     for _ in 0..n {
         br.get_mut().write_all(request)?;
-        br.get_mut().flush().ok();
-        total += read_framed_response(&mut br)?;
+        br.get_mut().flush()?;
+        total += read_framed_response(&mut br, 200)?;
     }
     Ok(total)
 }
@@ -369,16 +376,34 @@ fn one_https_session(
 /// carry another request, so it never reaches an end of stream to read to — except after a `101`:
 /// the connection then belongs to the protocol it switched to, a `101` frames no body, and what
 /// follows its head is the upgraded stream, read to its end.
-fn read_framed_response<R: BufRead>(br: &mut R) -> io::Result<usize> {
+///
+/// A response with a status other than `want`, or one that ends before its framing says it does,
+/// is an error: a figure timed over refusals or truncated bodies would be reported under the label
+/// of the path it never took.
+fn read_framed_response<R: BufRead>(br: &mut R, want: u16) -> io::Result<usize> {
     let (head, complete) = read_response_head(br, HEAD_MAX);
     assert!(!head.is_empty(), "the proxy answered nothing");
-    let framing = if complete && parse_status_code(&head) != Some(101) {
+    let status = parse_status_code(&head);
+    if status != Some(want) {
+        return Err(io::Error::other(format!(
+            "expected a {want}, got {:?}",
+            String::from_utf8_lossy(&head)
+        )));
+    }
+    let framing = if complete && status != Some(101) {
         response_framing(&head, "GET")
     } else {
         BodyFraming::ToEof
     };
     let mut body = Vec::new();
-    FramedBody::new(br, &framing).read_to_end(&mut body)?;
+    let mut reader = FramedBody::new(br, &framing);
+    reader.read_to_end(&mut body)?;
+    if framing != BodyFraming::ToEof && !reader.ended_as_framed() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the response ended before its framing did",
+        ));
+    }
     Ok(head.len() + body.len())
 }
 
@@ -438,12 +463,13 @@ fn spawn_cage_forwarder(uds: &std::path::Path) -> Option<(SocketAddr, KillOnDrop
     None
 }
 
-/// One cleartext (`http://`) request through the proxy: absolute-form, no `CONNECT`, no TLS.
-fn one_http_request(sock_path: &std::path::Path, request: &[u8]) -> io::Result<usize> {
+/// One cleartext (`http://`) request through the proxy: absolute-form, no `CONNECT`, no TLS. The
+/// response must be the `want` status ([`read_framed_response`]).
+fn one_http_request(sock_path: &std::path::Path, request: &[u8], want: u16) -> io::Result<usize> {
     let mut sock = UnixStream::connect(sock_path)?;
     sock.write_all(request)?;
     sock.flush()?;
-    drain(&mut sock)
+    read_framed_response(&mut BufReader::new(sock), want)
 }
 
 /// One direct TLS request to the upstream, bypassing the proxy entirely — the floor a client pays
@@ -459,8 +485,8 @@ fn one_direct_request(
     let conn = ClientConnection::new(cfg, name).map_err(io::Error::other)?;
     let mut tls = StreamOwned::new(conn, sock);
     tls.write_all(request)?;
-    tls.flush().ok();
-    drain(&mut tls)
+    tls.flush()?;
+    read_framed_response(&mut BufReader::new(tls), 200)
 }
 
 /// Read a stream to EOF, counting bytes and holding none of them — a bulk measurement moves more
@@ -472,6 +498,8 @@ fn drain<S: Read>(src: &mut S) -> io::Result<usize> {
         match src.read(&mut buf) {
             Ok(0) => return Ok(total),
             Ok(n) => total += n,
+            // The end of a TLS stream whose peer closed without a `close_notify`, as the test
+            // upstreams here do; the caller holds the count to the length it expects.
             Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(total),
             Err(e) => return Err(e),
         }
@@ -611,8 +639,15 @@ fn held_body_cost() {
             let cfg = client_config(proxy_ca_der);
             let started = Instant::now();
             for _ in 0..REQUESTS {
-                one_https_request(&sock, cfg.clone(), "upstream.test", addr.port(), request)
-                    .unwrap();
+                one_https_request(
+                    &sock,
+                    cfg.clone(),
+                    "upstream.test",
+                    addr.port(),
+                    request,
+                    200,
+                )
+                .unwrap();
             }
             report_rate(&format!("{framing}, {state}"), started.elapsed(), REQUESTS);
         }
@@ -731,7 +766,8 @@ fn websocket_throughput() {
              Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
              Sec-WebSocket-Version: 13\r\n\r\n";
         let started = Instant::now();
-        let read = one_https_request(&path, cfg, "upstream.test", addr.port(), upgrade).unwrap();
+        let read =
+            one_https_request(&path, cfg, "upstream.test", addr.port(), upgrade, 101).unwrap();
         report_rate_bytes(label, started.elapsed(), read);
     }
 }
@@ -796,7 +832,7 @@ fn per_request_cost() {
         );
         let started = Instant::now();
         for _ in 0..REQUESTS {
-            one_http_request(&path, req.as_bytes()).unwrap();
+            one_http_request(&path, req.as_bytes(), 200).unwrap();
         }
         report_rate("cleartext through the proxy", started.elapsed(), REQUESTS);
     }
@@ -827,7 +863,15 @@ fn per_request_cost() {
         let cfg = client_config(proxy_ca_der);
         let started = Instant::now();
         for _ in 0..REQUESTS {
-            one_https_request(&path, cfg.clone(), "upstream.test", addr.port(), request).unwrap();
+            one_https_request(
+                &path,
+                cfg.clone(),
+                "upstream.test",
+                addr.port(),
+                request,
+                200,
+            )
+            .unwrap();
         }
         report_rate(label, started.elapsed(), REQUESTS);
     }
@@ -857,10 +901,26 @@ fn per_request_cost() {
         let cfg = client_config(proxy_ca_der);
         // One warm-up request, so the figure is the steady state rather than the first handshake
         // amortized over the run.
-        one_https_request(&path, cfg.clone(), "upstream.test", addr.port(), request).unwrap();
+        one_https_request(
+            &path,
+            cfg.clone(),
+            "upstream.test",
+            addr.port(),
+            request,
+            200,
+        )
+        .unwrap();
         let started = Instant::now();
         for _ in 0..REQUESTS {
-            one_https_request(&path, cfg.clone(), "upstream.test", addr.port(), request).unwrap();
+            one_https_request(
+                &path,
+                cfg.clone(),
+                "upstream.test",
+                addr.port(),
+                request,
+                200,
+            )
+            .unwrap();
         }
         report_rate(
             "HTTPS through the proxy, upstream reused",
@@ -898,6 +958,7 @@ fn per_request_cost() {
                         "upstream.test",
                         addr.port(),
                         request,
+                        200,
                     )
                     .unwrap();
                 }
@@ -979,7 +1040,8 @@ fn bulk_throughput() {
         let (_dir, path) = serve_on_uds(Arc::new(ctx));
         let cfg = client_config(proxy_ca_der);
         let started = Instant::now();
-        let read = one_https_request(&path, cfg, "upstream.test", addr.port(), request).unwrap();
+        let read =
+            one_https_request(&path, cfg, "upstream.test", addr.port(), request, 200).unwrap();
         let elapsed = started.elapsed();
         assert!(
             read >= BULK_BYTES,
@@ -1020,7 +1082,7 @@ fn bulk_throughput() {
         let conn = ClientConnection::new(cfg, name).unwrap();
         let mut tls = StreamOwned::new(conn, sock);
         tls.write_all(request).unwrap();
-        tls.flush().ok();
+        tls.flush().unwrap();
         let read = drain(&mut tls).unwrap();
         let elapsed = started.elapsed();
         assert!(
@@ -1328,24 +1390,29 @@ fn refusal_cost() {
                 let req = format!(
                     "GET http://{host}/p HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
                 );
-                one_http_request(&sock, req.as_bytes()).unwrap();
+                one_http_request(&sock, req.as_bytes(), 403).unwrap();
             }
             // The counters are kept by the side that applies what the proxy reports, on a thread of
             // its own: what it writes for these refusals belongs to this figure, however late.
             reported.flush();
-            let wrote = bytes_written().saturating_sub(wrote_before);
+            let wrote = bytes_written()
+                .zip(wrote_before)
+                .map(|(after, before)| after.saturating_sub(before));
             elapsed.push(started.elapsed());
             let label = match distinct {
                 true => "a new host each time",
                 false => "the same host each time",
             };
             report_rate(&format!("{n} refusals, {label}"), started.elapsed(), n);
-            println!(
-                "  {:<44} {:>8.1} MiB written, {} B per refusal",
-                "",
-                wrote as f64 / (1024.0 * 1024.0),
-                wrote / n as u64
-            );
+            match wrote {
+                Some(wrote) => println!(
+                    "  {:<44} {:>8.1} MiB written, {} B per refusal",
+                    "",
+                    wrote as f64 / (1024.0 * 1024.0),
+                    wrote / n as u64
+                ),
+                None => println!("  {:<44} bytes written: unavailable (no /proc/self/io)", ""),
+            }
         }
         println!(
             "  {:<44} {:>8.1}x",
@@ -1368,13 +1435,35 @@ fn refusal_cost() {
 /// per refusal whether the stats file was rewritten per decision or not. The process-wide counter
 /// is attributable here because the module's own invocation pins `--test-threads=1`, so no other
 /// measurement is writing while this one runs.
-fn bytes_written() -> u64 {
+///
+/// `None` when the counter cannot be read (a kernel built without I/O accounting has no
+/// `/proc/self/io`), which drops the figure rather than reporting nothing written: a missing
+/// counter is not a result.
+fn bytes_written() -> Option<u64> {
     std::fs::read_to_string("/proc/self/io")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("wchar:"))?
+        .trim()
+        .parse()
         .ok()
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix("wchar:"))
-                .and_then(|v| v.trim().parse().ok())
-        })
-        .unwrap_or(0)
+}
+
+/// The test upstream finds a request's length however its field is spelled, so a body is never
+/// left on a kept-alive connection to be read as the next request's head.
+#[test]
+fn a_declared_length_is_read_whatever_its_case_and_spacing() {
+    for head in [
+        "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n",
+        "POST / HTTP/1.1\r\ncontent-length: 5\r\n\r\n",
+        "POST / HTTP/1.1\r\nCONTENT-LENGTH:5\r\n\r\n",
+        "POST / HTTP/1.1\r\nContent-Length:   5  \r\n\r\n",
+    ] {
+        assert_eq!(declared_length(head.as_bytes()), Some(5), "{head:?}");
+    }
+    assert_eq!(declared_length(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"), None);
+    assert_eq!(
+        declared_length(b"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n"),
+        None
+    );
 }
