@@ -172,8 +172,10 @@ Three more things follow, and all are deliberate:
 - **A `binfmt_misc` handler.** A handler registered for `.jar`, `.py`, a wine binary or a
   foreign-architecture executable makes the kernel run an interpreter that nothing in the file
   names. sbx reads the registered handlers instead of the file, once per launch, and decides the
-  interpreter of every handler whose magic or extension claims the target. A handler enrolled while
-  a cage is already running is not seen by it, which takes a privilege the cage does not have.
+  interpreter of every handler whose magic or extension claims the target. A handler whose match
+  sbx cannot read is taken to claim every target, so its interpreter is decided for all of them. A
+  handler enrolled while a cage is already running is not seen by it, which takes a privilege the
+  cage does not have.
 - **A program run from a descriptor.** An exec can name its target by descriptor rather than by
   path, and the object behind it need not exist on any filesystem: an in-memory file carrying a
   `#!` line runs its interpreter just the same. sbx reads such a target through the descriptor the

@@ -1401,6 +1401,55 @@ fn a_node_permits_a_chain_without_granting_the_shortcut() {
     );
 }
 
+/// A node declared under an unfolded spelling still keys the program `/proc/<pid>/exe` reports,
+/// which the kernel always spells folded.
+#[test]
+fn a_node_spelled_unfolded_is_keyed_folded() {
+    let root = crate::testutil::TmpDir::new();
+    let mut task = task();
+    task.cmd = vec!["/bin/sh".to_string()];
+    task.spawn = Some(vec!["less".to_string()]);
+    task.exec = [(
+        "/nix/store/demo//bin/./less".to_string(),
+        vec!["psql".to_string()],
+    )]
+    .into_iter()
+    .collect();
+    let engine = engine_with_store(root.path(), &["psql", "less"], vec![task.clone()]);
+
+    let policy = engine
+        .spawn_policy(&task, task.spawn.as_ref().unwrap(), &engine.base_env)
+        .expect("a policy");
+    assert_eq!(
+        policy.decide(
+            &["/nix/store/demo/bin/less".to_string()],
+            "/nix/store/demo/bin/psql"
+        ),
+        crate::proc_policy::Verdict::Allow,
+        "the node must govern the caller the kernel names"
+    );
+
+    // A `..` is not folded into a key: past a link it would name another program.
+    let mut task = task.clone();
+    task.exec = [(
+        "/nix/store/demo/x/../bin/less".to_string(),
+        vec!["psql".to_string()],
+    )]
+    .into_iter()
+    .collect();
+    let policy = engine
+        .spawn_policy(&task, task.spawn.as_ref().unwrap(), &engine.base_env)
+        .expect("a policy");
+    assert_eq!(
+        policy.decide(
+            &["/nix/store/demo/bin/less".to_string()],
+            "/nix/store/demo/bin/psql"
+        ),
+        crate::proc_policy::Verdict::Deny,
+        "a key holding `..` matches no caller"
+    );
+}
+
 /// Nested mounts: the innermost is the one the kernel resolves through, so translation must pick
 /// the longest match rather than the first.
 #[test]

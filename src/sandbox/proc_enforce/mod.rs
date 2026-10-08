@@ -632,9 +632,8 @@ fn exec_verdict(
             match exec_head(cx.mounts, pid, dirfd, &path, by_descriptor, notif) {
                 Ok(head) => match crate::proc_policy::shebang_interpreter(&head) {
                     // Not a script -- but a `binfmt_misc` handler may still run an interpreter
-                    // inside this same `execve`, and nothing in the file names it. Asked here
-                    // because the kernel tries the built-in formats first: an exec that ELF or the
-                    // `#!` handler accepts never reaches one of these.
+                    // inside this same `execve`, and nothing in the file names it. ELF binaries are
+                    // asked too: the kernel tries `binfmt_misc` before its built-in formats.
                     crate::proc_policy::ScriptHead::NotScript => {
                         let named =
                             crate::proc_policy::binfmt_interpreters(cx.binfmt, &head, &path);

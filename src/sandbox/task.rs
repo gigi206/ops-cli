@@ -1705,7 +1705,16 @@ impl TaskEngine {
                 }
             };
         }
-        cur.to_string_lossy().into_owned()
+        // Folded like the target a rule meets, so a declaration spelled `//bin/sh` or `/bin/./sh`
+        // still keys the node `/proc/<pid>/exe` names. Not where a `..` remains: folding it past a
+        // component that is a link would key a program other than the one the kernel resolves, and
+        // grant it the node's list, so such a key is left to match nothing.
+        let spelled = cur.to_string_lossy();
+        if spelled.split('/').any(|part| part == "..") {
+            spelled.into_owned()
+        } else {
+            crate::proc_policy::lexical_path(&spelled).into_owned()
+        }
     }
 
     /// Read one cage path as a symlink, or `None` when it is not one.

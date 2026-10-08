@@ -145,6 +145,11 @@ impl ProcRule {
     /// [`ProcPolicy::decide_chain`] — so what is decided is the path the kernel will resolve rather
     /// than the one the cage happened to spell.
     fn matches(&self, path: &str, basename: &str) -> bool {
+        // An empty pattern — `""`, or a `.` that folds to nothing — is the rule that never matches
+        // [`ProcRule::new`] promises, and not one that matches the empty basename of `/`.
+        if self.pattern.is_empty() {
+            return false;
+        }
         let subject = if self.on_path { path } else { basename };
         glob_match(&self.pattern, subject)
     }
@@ -326,7 +331,10 @@ impl ProcPolicy {
             // Only the caller's own node answers. An overlay `allow` is deliberately not folded in
             // here: it arrives from a live control plane, and a per-caller policy is a task's, whose
             // plane has no such channel — while an overlay `deny`, decided above, still cuts.
-            let allowed = caller.last().and_then(|c| graph.callers.get(c.as_str()));
+            // Folded like the target, so the caller's spelling and the node's key meet on one form.
+            let allowed = caller
+                .last()
+                .and_then(|c| graph.callers.get(lexical_path(c).as_ref()));
             return match allowed {
                 Some(rules) if any(rules) => Verdict::Allow,
                 _ => self.unmatched(),
@@ -571,6 +579,10 @@ pub(crate) struct BinfmtRule {
     mask: Vec<u8>,
     /// The trailing name component a file must have, without its dot. Empty for a magic handler.
     extension: String,
+    /// The handler's match could not be read, so it is taken to claim every file it could be asked
+    /// about: its interpreter is then decided for all of them, which can only be stricter than the
+    /// kernel.
+    claims_all: bool,
 }
 
 /// One handler as the kernel prints it under `/proc/sys/fs/binfmt_misc/<name>`.
@@ -579,10 +591,11 @@ pub(crate) struct BinfmtRule {
 /// and either `offset`/`magic` (with an optional `mask`) or `extension <ext>`. `magic` and `mask`
 /// are printed as hex pairs whatever the bytes are, so both are read that way.
 ///
-/// `None` for a handler this walk cannot act on: one the kernel has disabled, one naming no
-/// interpreter, or one whose match this build does not understand -- where reading it as "matches
-/// nothing" is the honest answer, since the alternative is a rule that silently covers less than it
-/// claims.
+/// `None` for a handler that runs nothing: one the kernel has disabled, or one naming no
+/// interpreter. An enabled handler whose match this build cannot read -- an `offset`, `magic` or
+/// `mask` that does not parse -- is kept, and taken to claim every file ([`BinfmtRule::claims_all`]):
+/// read as "matches nothing" it would let the kernel run an interpreter no rule was asked about. So is
+/// one that prints neither a magic nor an extension, whatever offset it names.
 pub(crate) fn parse_binfmt_rule(text: &str) -> Option<BinfmtRule> {
     let unhex = |s: &str| -> Option<Vec<u8>> {
         let s = s.trim();
@@ -601,6 +614,7 @@ pub(crate) fn parse_binfmt_rule(text: &str) -> Option<BinfmtRule> {
         magic: Vec::new(),
         mask: Vec::new(),
         extension: String::new(),
+        claims_all: false,
     };
     let mut enabled = false;
     for line in text.lines() {
@@ -608,9 +622,18 @@ pub(crate) fn parse_binfmt_rule(text: &str) -> Option<BinfmtRule> {
         match line.split_once(' ') {
             _ if line == "enabled" => enabled = true,
             Some(("interpreter", v)) => rule.interpreter = v.trim().to_string(),
-            Some(("offset", v)) => rule.offset = v.trim().parse().ok()?,
-            Some(("magic", v)) => rule.magic = unhex(v)?,
-            Some(("mask", v)) => rule.mask = unhex(v)?,
+            Some(("offset", v)) => match v.trim().parse() {
+                Ok(offset) => rule.offset = offset,
+                Err(_) => rule.claims_all = true,
+            },
+            Some(("magic", v)) => match unhex(v) {
+                Some(magic) => rule.magic = magic,
+                None => rule.claims_all = true,
+            },
+            Some(("mask", v)) => match unhex(v) {
+                Some(mask) => rule.mask = mask,
+                None => rule.claims_all = true,
+            },
             // The kernel prints this one with a leading dot (`extension .jar`) while it matches
             // on the component after the dot, so the dot is dropped here and the field holds the
             // spelling [`binfmt_interpreters`] compares against.
@@ -621,15 +644,17 @@ pub(crate) fn parse_binfmt_rule(text: &str) -> Option<BinfmtRule> {
             _ => {}
         }
     }
-    let matches_something = !rule.magic.is_empty() || !rule.extension.is_empty();
-    (enabled && !rule.interpreter.is_empty() && matches_something).then_some(rule)
+    if rule.magic.is_empty() && rule.extension.is_empty() {
+        rule.claims_all = true;
+    }
+    (enabled && !rule.interpreter.is_empty()).then_some(rule)
 }
 
 /// The interpreter a registered handler would run for this file, if any recognises it.
 ///
-/// Asked only of a file that is **not** a script and not an ordinary executable this kernel would
-/// load itself: `binfmt_misc` is tried after the built-in formats, so an `execve` that ELF or the
-/// `#!` handler accepts never reaches one of these.
+/// Asked of a file that is **not** a script, ELF binaries included: the kernel registers
+/// `binfmt_misc` at the head of its format list (`insert_binfmt`), so a handler claiming an ELF
+/// magic runs its interpreter for a native binary too.
 ///
 /// Every handler that matches is returned rather than the first, because the order the kernel tries
 /// them in is not the order they are read in here, and deciding the union is the answer that cannot
@@ -645,10 +670,18 @@ pub(crate) fn binfmt_interpreters<'a>(
     rules
         .iter()
         .filter(|rule| {
+            if rule.claims_all {
+                return true;
+            }
             if !rule.extension.is_empty() {
                 return extension.is_some_and(|(_, ext)| ext == rule.extension);
             }
-            let Some(window) = head.get(rule.offset..rule.offset + rule.magic.len()) else {
+            // An offset that overflows names a window no head reaches.
+            let Some(window) = rule
+                .offset
+                .checked_add(rule.magic.len())
+                .and_then(|end| head.get(rule.offset..end))
+            else {
                 return false;
             };
             window
@@ -733,39 +766,43 @@ pub(crate) fn lexical_path(path: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(folded)
 }
 
-/// A minimal shell-style glob match over bytes: `*` matches any run (including empty), `?` matches
-/// exactly one character, everything else is literal. Iterative with backtracking (no recursion, so a
-/// pathological pattern cannot blow the stack), O(pattern × text) worst case — the patterns here are
-/// short, operator-authored config, so this is ample.
+/// A minimal shell-style glob match over characters: `*` matches any run (including empty), `?`
+/// matches exactly one character, everything else is literal. Iterative with backtracking (no
+/// recursion, so a pathological pattern cannot blow the stack), O(pattern × text) worst case — the
+/// patterns here are short, operator-authored config, so this is ample.
+///
+/// Walked in place by byte offset, one character decoded at a time, so the match allocates nothing:
+/// it runs once per rule for every notified `execve`.
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
+    let at = |s: &str, i: usize| s[i..].chars().next();
     let (mut pi, mut ti) = (0usize, 0usize);
     // The last `*` seen and the text position to resume from if a later mismatch forces backtracking.
     let mut star: Option<usize> = None;
     let mut resume = 0usize;
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            resume = ti;
-            pi += 1; // try matching `*` as empty first
-        } else if let Some(s) = star {
-            // Mismatch under an open `*`: let it swallow one more text char and retry.
-            pi = s + 1;
-            resume += 1;
-            ti = resume;
-        } else {
-            return false;
+    while let Some(tc) = at(text, ti) {
+        match at(pattern, pi) {
+            Some(pc) if pc == '?' || pc == tc => {
+                pi += pc.len_utf8();
+                ti += tc.len_utf8();
+            }
+            Some('*') => {
+                star = Some(pi);
+                resume = ti;
+                pi += 1; // try matching `*` as empty first
+            }
+            _ => match star {
+                // Mismatch under an open `*`: let it swallow one more text char and retry.
+                Some(s) => {
+                    pi = s + 1;
+                    resume += at(text, resume).map_or(1, char::len_utf8);
+                    ti = resume;
+                }
+                None => return false,
+            },
         }
     }
     // Trailing `*`s in the pattern match the empty remainder.
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
+    pattern[pi..].trim_start_matches('*').is_empty()
 }
 
 #[cfg(test)]
@@ -778,6 +815,46 @@ mod tests {
             &allow.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             &deny.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         )
+    }
+
+    #[test]
+    fn a_question_mark_is_one_character_however_many_bytes_it_takes() {
+        assert!(glob_match("caf?", "café"));
+        assert!(!glob_match("caf??", "café"));
+        assert!(glob_match("*é", "café"));
+        assert!(glob_match("c*f?", "café"));
+        assert!(!glob_match("caf", "café"));
+    }
+
+    #[test]
+    fn an_empty_rule_matches_nothing_not_even_an_empty_basename() {
+        for raw in ["", "."] {
+            let rule = ProcRule::new(raw);
+            for target in ["/", "dir/", ""] {
+                let target = lexical_path(target);
+                assert!(
+                    !rule.matches(&target, basename(&target)),
+                    "{raw:?} matched {target:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_caller_spelled_unfolded_still_reaches_its_node() {
+        let confine = ProcPolicy::confined(CallerGraph {
+            callers: std::collections::BTreeMap::from([(
+                "/usr/bin/make".to_string(),
+                vec![ProcRule::new("cc")],
+            )]),
+        });
+        for caller in ["/usr/bin/make", "/usr//bin/make", "/usr/./bin/../bin/make"] {
+            assert_eq!(
+                confine.decide(&[caller.to_string()], "/usr/bin/cc"),
+                Verdict::Allow,
+                "{caller:?}"
+            );
+        }
     }
 
     #[test]
@@ -1172,10 +1249,41 @@ mod tests {
         // A dot in a directory above the file is not the file's own extension.
         assert!(binfmt_interpreters(&ext, b"PK", "/srv/x.jar/app").is_empty());
 
-        // Not usable, and each for its own reason: switched off, no interpreter, nothing to match.
+        // Not usable, and each for its own reason: switched off, no interpreter.
         assert!(parse_binfmt_rule("disabled\ninterpreter /usr/bin/x\nmagic 00\n").is_none());
         assert!(parse_binfmt_rule("enabled\ninterpreter \nmagic 00\n").is_none());
-        assert!(parse_binfmt_rule("enabled\ninterpreter /usr/bin/x\nflags: \n").is_none());
+    }
+
+    /// A handler whose match cannot be read claims every file, rather than none.
+    #[test]
+    fn a_binfmt_handler_this_build_cannot_read_claims_every_file() {
+        for text in [
+            "enabled\ninterpreter /usr/bin/x\nflags: \n",
+            "enabled\ninterpreter /usr/bin/x\nflags: \noffset 300\n",
+            "enabled\ninterpreter /usr/bin/x\nflags: \noffset -1\nmagic 00\n",
+            "enabled\ninterpreter /usr/bin/x\nflags: \noffset 0\nmagic 0g\n",
+            "enabled\ninterpreter /usr/bin/x\nflags: \noffset 0\nmagic 00\nmask zz\n",
+        ] {
+            let rules = vec![parse_binfmt_rule(text).expect("an enabled handler is kept")];
+            assert_eq!(
+                binfmt_interpreters(&rules, b"\x01\x02", "/tmp/any"),
+                vec!["/usr/bin/x"],
+                "an unreadable match is decided for every file: {text:?}"
+            );
+        }
+    }
+
+    /// An offset the window arithmetic would overflow matches nothing, and does not wrap or panic.
+    #[test]
+    fn a_binfmt_offset_at_the_ceiling_matches_nothing() {
+        let rules = vec![
+            parse_binfmt_rule(&format!(
+                "enabled\ninterpreter /usr/bin/x\nflags: \noffset {}\nmagic 00\n",
+                usize::MAX
+            ))
+            .expect("a magic handler"),
+        ];
+        assert!(binfmt_interpreters(&rules, b"\0\0\0", "/tmp/x").is_empty());
     }
 
     /// Deny beats ask beats allow, which is what lets one syscall be decided under two names.
