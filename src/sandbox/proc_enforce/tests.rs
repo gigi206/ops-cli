@@ -72,6 +72,86 @@ macro_rules! need_host_programs {
     };
 }
 
+/// `path` as one word of a `/bin/sh` script, whatever the fixture root it sits under is called.
+fn sh_word(path: &std::path::Path) -> String {
+    crate::sandbox::launch::shell_quote(path.to_str().expect("utf-8 fixture path"))
+}
+
+/// Close a descriptor this test owns. A number that does not close was closed already or never
+/// opened, which is a defect in the test and fails it.
+fn close_owned(fd: libc::c_int) {
+    // SAFETY: the caller owns `fd` and hands it over here, closed exactly once.
+    let rc = unsafe { libc::close(fd) };
+    assert_eq!(
+        rc,
+        0,
+        "close descriptor {fd}: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// A child killed and reaped when it goes out of scope, so a test that panics while a cage is up
+/// leaves no `sleep` behind.
+///
+/// Its whole process group goes, not the child alone: `bwrap` forks the shell rather than becoming
+/// it, and a `sleep` outliving a killed `bwrap` holds the harness's output pipe for its thirty
+/// seconds. Spawn the child as the leader of its own group ([`CommandExt::process_group`]) so the
+/// group is the cage and nothing else.
+///
+/// [`CommandExt::process_group`]: std::os::unix::process::CommandExt::process_group
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if let Ok(pid) = libc::pid_t::try_from(self.0.id()) {
+            // SAFETY: a signal to a process group this child leads; no memory is touched.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Whether `pid` has exited within a second: its `/proc` entry gone, or left as a zombie for
+/// whoever reaps it now.
+fn gone_within_a_second(pid: u32) -> bool {
+    for _ in 0..40 {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => return true,
+            // The state follows the `)` that closes the command name, which may hold one itself.
+            Ok(stat)
+                if stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with('Z')) =>
+            {
+                return true;
+            }
+            Ok(_) => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+    false
+}
+
+/// The pid a cage writes to `pid_file` once it is up.
+///
+/// `None` when the cage exits without writing it: the host could not stand the cage up, which is
+/// the test's precondition failing and the caller's skip. A cage still running with nothing
+/// written after five seconds is a failure of its own.
+fn cage_pid(cage: &mut Reaped, pid_file: &std::path::Path) -> Option<u32> {
+    for _ in 0..200 {
+        if let Ok(text) = std::fs::read_to_string(pid_file)
+            && let Ok(n) = text.trim().parse::<u32>()
+        {
+            return Some(n);
+        }
+        if matches!(cage.0.try_wait(), Ok(Some(_))) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("the cage is running and never reported its pid");
+}
+
 /// Run `payload` under a supervisor whose content lens carries `patterns`, draining every
 /// notification until the payload exits.
 ///
@@ -149,8 +229,7 @@ fn run_with_open_lens(
             );
         }
     };
-    // SAFETY: notif is this test's owned descriptor, closed exactly once.
-    unsafe { libc::close(notif) };
+    close_owned(notif);
     let out = child
         .wait_with_output()
         .expect("collect the payload output");
@@ -215,7 +294,7 @@ fn an_allowed_open_hands_the_cage_the_inode_that_was_scanned() {
 
     let script = format!(
         "i=0; while [ $i -lt {ROUNDS} ]; do /bin/cat {} 2>/dev/null; i=$((i+1)); done",
-        door.to_str().expect("utf-8 fixture path")
+        sh_word(&door)
     );
     let (_, out) = run_with_open_lens(
         &["/bin/sh", "-c", &script],
@@ -250,36 +329,40 @@ fn a_creat_is_notified_like_the_open_it_is() {
         .into_iter()
         .find(|p| std::path::Path::new(p).exists())
     else {
-        eprintln!("CREAT-LENS: skipped, no python3 on this host");
+        skip_incapable!("CREAT-LENS: skipping, no python3 on this host");
         return;
     };
     const SECRET: &str = "sk-ABC123DEF456GHI789";
     const PATTERN: &str = r"sk-[A-Za-z0-9]{12,}";
 
     let dir = TmpDir::new();
-    let payload = |target: &std::path::Path| {
-        format!(
-            "import ctypes\n\
-             libc=ctypes.CDLL('libc.so.6',use_errno=True)\n\
-             rc=libc.syscall({},b'{}',0o600)\n\
-             print('rc',rc,ctypes.get_errno())\n",
-            libc::SYS_creat,
-            target.to_str().expect("utf-8 fixture path")
-        )
-    };
+    // The target travels in `argv` rather than inside the program text, so no fixture path can
+    // close the literal it would otherwise sit in.
+    let payload = format!(
+        "import ctypes,os,sys\n\
+         libc=ctypes.CDLL('libc.so.6',use_errno=True)\n\
+         rc=libc.syscall({},os.fsencode(sys.argv[1]),0o600)\n\
+         print('rc',rc,ctypes.get_errno())\n",
+        libc::SYS_creat
+    );
 
     // The witness: the same call, on a file the pattern does not match, truncates it. Without this
     // the assertion below would pass on a payload that never issued the syscall at all.
     let plain = dir.join("plain.txt");
     std::fs::write(&plain, "nothing to see here\n").expect("write the plain fixture");
     let (_, out) = run_with_open_lens(
-        &[python, "-c", &payload(&plain)],
+        &[
+            python,
+            "-c",
+            &payload,
+            plain.to_str().expect("utf-8 fixture path"),
+        ],
         &[PATTERN],
         &dir.join("."),
     );
     let after = std::fs::read(&plain).expect("the plain fixture survives the run");
     if !after.is_empty() {
-        eprintln!("CREAT-LENS: skipped, the witness did not truncate: {out}");
+        skip_incapable!("CREAT-LENS: skipping, the witness did not truncate: {out}");
         return;
     }
 
@@ -288,7 +371,12 @@ fn a_creat_is_notified_like_the_open_it_is() {
     let held = format!("API key: {SECRET}\n");
     std::fs::write(&secret, &held).expect("write the secret fixture");
     let (_, out) = run_with_open_lens(
-        &[python, "-c", &payload(&secret)],
+        &[
+            python,
+            "-c",
+            &payload,
+            secret.to_str().expect("utf-8 fixture path"),
+        ],
         &[PATTERN],
         &dir.join("."),
     );
@@ -348,7 +436,7 @@ fn a_non_regular_first_target_no_longer_lets_the_swap_through() {
 
     let script = format!(
         "i=0; while [ $i -lt {ROUNDS} ]; do /bin/cat {} 2>/dev/null; i=$((i+1)); done",
-        door.to_str().expect("utf-8 fixture path")
+        sh_word(&door)
     );
     let (_, out) = run_with_open_lens(
         &["/bin/sh", "-c", &script],
@@ -410,7 +498,7 @@ fn an_absent_first_target_is_answered_rather_than_walked_again() {
 
     let script = format!(
         "i=0; while [ $i -lt {ROUNDS} ]; do /bin/cat {} 2>&1; i=$((i+1)); done",
-        door.to_str().expect("utf-8 fixture path")
+        sh_word(&door)
     );
     let (_, out) = run_with_open_lens(
         &["/bin/sh", "-c", &script],
@@ -485,12 +573,12 @@ fn a_device_and_a_fifo_are_served_without_changing_what_the_cage_gets() {
             // the reader is meant to meet.
             use std::os::unix::io::AsRawFd;
             // SAFETY: w is this thread's live descriptor; F_SETFL only alters status flags.
-            unsafe {
-                let cur = libc::fcntl(w.as_raw_fd(), libc::F_GETFL);
-                if cur >= 0 {
-                    libc::fcntl(w.as_raw_fd(), libc::F_SETFL, cur & !libc::O_NONBLOCK);
-                }
-            }
+            let cur = unsafe { libc::fcntl(w.as_raw_fd(), libc::F_GETFL) };
+            assert!(cur >= 0, "read the writer's status flags");
+            assert!(
+                unsafe { libc::fcntl(w.as_raw_fd(), libc::F_SETFL, cur & !libc::O_NONBLOCK) } >= 0,
+                "clear the writer's O_NONBLOCK"
+            );
             for _ in 0..200 {
                 if w.write_all(b"pipebyte").is_err() {
                     return;
@@ -515,16 +603,16 @@ fn a_device_and_a_fifo_are_served_without_changing_what_the_cage_gets() {
         "/bin/cat /dev/null; \
          /bin/dd if=/dev/urandom bs=4 count=1 of={1} 2>/dev/null; /bin/wc -c < {1}; \
          /bin/dd if={0} bs=8 count=1 of={2} 2>/dev/null; /bin/cat {2}",
-        pipe.to_str().expect("utf-8 fixture path"),
-        dir.join("device.bin").to_str().expect("utf-8 fixture path"),
-        dir.join("fifo.bin").to_str().expect("utf-8 fixture path"),
+        sh_word(&pipe),
+        sh_word(&dir.join("device.bin")),
+        sh_word(&dir.join("fifo.bin")),
     );
     let (code, out) = run_with_open_lens(
         &["/bin/sh", "-c", &script],
         &[r"sk-[A-Za-z0-9]{12,}"],
         &dir.join("."),
     );
-    let _ = writer.join();
+    writer.join().expect("the fifo writer thread");
 
     assert_eq!(code, Some(0), "the payload must run to the end: {out}");
     // The whole output, not a substring of it: a lone `4` is a digit half the diagnostics in
@@ -697,8 +785,8 @@ fn a_made_file_lands_with_the_masks_the_cage_asked_for() {
     let (tight, wide) = (dir.join("tight.txt"), dir.join("wide.txt"));
     let script = format!(
         "umask 077; echo k > {}; umask 000; echo w > {}; echo done",
-        tight.to_str().expect("utf-8 fixture path"),
-        wide.to_str().expect("utf-8 fixture path"),
+        sh_word(&tight),
+        sh_word(&wide),
     );
     let (_, out) = run_with_open_lens(
         &["/bin/sh", "-c", &script],
@@ -895,13 +983,14 @@ fn the_handoff_control_buffer_is_aligned_for_the_header_it_is_read_as() {
 ///
 /// Measured over many rounds rather than one, and the reason is the harness: `/proc/self/fd` counts
 /// the whole process, and cargo runs these tests as threads of one binary, so a neighbour opening a
-/// file between two counts moves the number. A leak of two per round is *systematic* — two hundred
-/// rounds leak four hundred descriptors — while that interference is incidental and bounded by what
+/// file between two counts moves the number. A leak of two per round is *systematic* — four hundred
+/// rounds leak eight hundred descriptors — while that interference is incidental and bounded by what
 /// a handful of concurrent tests hold at once. The band below sits an order of magnitude above the
-/// noise and at half the leak, so neither reading can be mistaken for the other.
+/// noise and at half of what a refusal that kept only **one** of the two would leak, so neither
+/// reading can be mistaken for the other.
 #[test]
 fn a_handoff_carrying_two_descriptors_is_refused_and_leaks_neither() {
-    const ROUNDS: usize = 200;
+    const ROUNDS: usize = 400;
 
     let before = open_fd_count();
     for _ in 0..ROUNDS {
@@ -919,7 +1008,7 @@ fn a_handoff_carrying_two_descriptors_is_refused_and_leaks_neither() {
     let after = open_fd_count();
 
     assert!(
-        after < before + ROUNDS,
+        after < before + ROUNDS / 2,
         "a refusal that returns before closing what the kernel installed leaks exactly what it \
          refuses: {before} descriptors before {ROUNDS} refused handoffs, {after} after"
     );
@@ -936,8 +1025,7 @@ fn a_handoff_carrying_one_descriptor_is_accepted() {
     let fd =
         recv_fd_raw(&recv).expect("a single-descriptor handoff is the shape this protocol uses");
     assert!(fd >= 0, "got {fd}");
-    // SAFETY: `fd` is ours from `recv_fd_raw` and is closed exactly once here.
-    unsafe { libc::close(fd) };
+    close_owned(fd);
 }
 
 /// How many descriptors this process holds. The `read_dir` handle is open during the walk, so it is
@@ -989,6 +1077,7 @@ fn send_scm_rights(sock: &UnixStream, fds: &[libc::c_int]) {
     // for the header plus `payload` bytes, and `fds` holds `fds.len()` initialised `c_int`s.
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        assert!(!cmsg.is_null(), "the control buffer holds no header");
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
         (*cmsg).cmsg_len = libc::CMSG_LEN(payload as u32) as _;
@@ -1257,8 +1346,7 @@ fn an_open_that_asked_not_to_follow_a_link_is_refused_when_the_final_component_i
         "`O_PATH|O_NOFOLLOW` succeeds on a symlink — which is why a failed open can never be \
          the test for one"
     );
-    // SAFETY: on_the_link is this test's own descriptor, closed exactly once.
-    unsafe { libc::close(on_the_link) };
+    close_owned(on_the_link);
 
     let serve = |target: &Path| {
         // The probe the lens holds: opened without `O_NOFOLLOW`, so on the link it names the
@@ -1294,7 +1382,7 @@ fn an_open_that_asked_not_to_follow_a_link_is_refused_when_the_final_component_i
 
 #[test]
 fn a_name_that_is_not_there_yet_is_made_rather_than_reported_absent() {
-    need_host_programs!("/bin/sh");
+    need_host_programs!("/bin/cat", "/bin/sh");
     // The probe that examines a path creates nothing, so a creating open finds its name absent
     // and would be told so. Both halves are asserted: the file has to appear with the bytes the
     // cage wrote, and a file that already carries a secret must still be refused — a lens that
@@ -1307,9 +1395,9 @@ fn a_name_that_is_not_there_yet_is_made_rather_than_reported_absent() {
     let script = format!(
         // The refused read is not last: its own failure is the point, and the exit code
         // asserted below is about the payload reaching its end rather than about that read.
-        "echo neuf > {0}; echo made=$?; cat {0}; cat {1} 2>&1; echo fin",
-        made.to_str().expect("utf-8 fixture path"),
-        secret.to_str().expect("utf-8 fixture path"),
+        "echo neuf > {0}; echo made=$?; /bin/cat {0}; /bin/cat {1} 2>&1; echo fin",
+        sh_word(&made),
+        sh_word(&secret),
     );
     let (code, out) = run_with_open_lens(
         &["/bin/sh", "-c", &script],
@@ -1444,7 +1532,7 @@ fn a_secret_named_from_a_subdirectory_is_still_scanned() {
 
     let script = format!(
         "cd {} && /bin/cat ../carries.txt 2>&1",
-        dir.join("sub").to_str().expect("utf-8 fixture path")
+        sh_word(&dir.join("sub"))
     );
     let (_, out) = run_with_open_lens(
         &["/bin/sh", "-c", &script],
@@ -1811,8 +1899,7 @@ fn a_parked_fifo_read_is_released_when_the_caller_is_gone() {
     let Ok(Ok(fd)) = opened else {
         panic!("a caller still there is served once a writer arrives: {opened:?}");
     };
-    // SAFETY: fd is the descriptor the open returned, closed exactly once.
-    unsafe { libc::close(fd) };
+    close_owned(fd);
     drop(writer);
 }
 
@@ -1855,8 +1942,7 @@ fn a_parked_fifo_read_that_cannot_be_released_waits_for_its_writer() {
     let Ok(Ok(fd)) = opened else {
         panic!("the open completes when its writer arrives: {opened:?}");
     };
-    // SAFETY: fd is the descriptor the open returned, closed exactly once.
-    unsafe { libc::close(fd) };
+    close_owned(fd);
     drop(writer);
     assert_eq!(
         asked.load(Ordering::SeqCst),
@@ -1906,7 +1992,6 @@ fn an_undone_creation_leaves_a_file_put_in_its_place() {
 /// target's.
 #[test]
 fn a_target_named_in_bytes_no_name_can_carry_is_not_read_as_a_name_with_them_replaced() {
-    need_host_programs!("/bin/env");
     let me = std::process::id();
     let good = b"/usr/bin/env\0";
     assert_eq!(
@@ -1952,8 +2037,8 @@ fn an_open_named_in_bytes_no_name_can_carry_is_refused_rather_than_resolved_unde
 
     let script = format!(
         "cd {} && /bin/cat \"$(printf 'secret\\377.txt')\" 2>&1; /bin/cat {}",
-        dir.path().to_str().expect("utf-8 fixture root"),
-        clean.to_str().expect("utf-8 fixture path"),
+        sh_word(dir.path()),
+        sh_word(&clean),
     );
     let (_, out) = run_with_open_lens(
         &["/bin/sh", "-c", &script],
@@ -2227,8 +2312,7 @@ fn the_poll_tells_a_hang_up_apart_from_something_to_read() {
     let one = [7u8; 1];
     // SAFETY: writes one byte from a live local into this test's own descriptor.
     assert_eq!(unsafe { libc::write(write_end, one.as_ptr().cast(), 1) }, 1);
-    // SAFETY: write_end is this test's own descriptor, closed exactly once.
-    unsafe { libc::close(write_end) };
+    close_owned(write_end);
     let both = poll_events(read_end, 0);
     assert_ne!(both & libc::POLLIN, 0, "the byte is still there to be read");
     assert_ne!(
@@ -2248,8 +2332,7 @@ fn the_poll_tells_a_hang_up_apart_from_something_to_read() {
     assert_eq!(hup & libc::POLLIN, 0, "nothing left to read");
     assert_ne!(hup & libc::POLLHUP, 0, "and the hang-up still stands");
 
-    // SAFETY: read_end is this test's own descriptor, closed exactly once.
-    unsafe { libc::close(read_end) };
+    close_owned(read_end);
 }
 
 /// And the rule reaches the cage through the constructor, so a site that reports a refusal
@@ -2263,7 +2346,7 @@ fn a_refusal_never_carries_an_errno_about_the_supervisor() {
 
 #[test]
 fn a_fifo_does_not_wedge_the_supervisor() {
-    need_host_programs!("/bin/sh");
+    need_host_programs!("/bin/cat", "/bin/sh", "/usr/bin/timeout");
     let dir = TmpDir::new();
     let fifo = dir.join("pipe");
     let cfifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo path");
@@ -2278,9 +2361,9 @@ fn a_fifo_does_not_wedge_the_supervisor() {
     // harness's pipe. The supervisor is notified of that same open: if it parked with it, the
     // read that follows would never be decided and this test would hit its deadline.
     let script = format!(
-        "timeout 1 cat {} >/dev/null 2>&1; cat {}",
-        fifo.to_str().expect("utf-8 fixture path"),
-        clean.to_str().expect("utf-8 fixture path")
+        "/usr/bin/timeout 1 /bin/cat {} >/dev/null 2>&1; /bin/cat {}",
+        sh_word(&fifo),
+        sh_word(&clean)
     );
     let (code, out) = run_with_open_lens(
         &["/bin/sh", "-c", &script],
@@ -2448,12 +2531,9 @@ fn a_descriptor_received_over_the_handoff_socket_is_close_on_exec() {
          supervisor spawns, seccomp notification listener included"
     );
 
-    // SAFETY: three live descriptors this test owns, each closed exactly once.
-    unsafe {
-        libc::close(got);
-        libc::close(r);
-        libc::close(w);
-    }
+    close_owned(got);
+    close_owned(r);
+    close_owned(w);
 }
 
 /// Hand one descriptor over a connected stream, the way the shim does — the impostor's half of
@@ -2476,6 +2556,7 @@ fn send_fd(stream: &UnixStream, fd: libc::c_int) {
     // aligned for a `cmsghdr` ([`CmsgBuf`]).
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        assert!(!cmsg.is_null(), "the control buffer holds no header");
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
         (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
@@ -2539,12 +2620,9 @@ fn a_handoff_that_is_not_the_shims_is_refused_without_ending_the_wait() {
     // handoff this test is about, not the decision.
     let _ = child.kill();
     let _ = child.wait();
-    // SAFETY: all three are this test's own descriptors, each closed once.
-    unsafe {
-        libc::close(notif);
-        libc::close(read_end);
-        libc::close(write_end);
-    }
+    close_owned(notif);
+    close_owned(read_end);
+    close_owned(write_end);
 }
 
 /// Lay the embedded shim down as an executable file and return its path. Its callers run
@@ -2734,8 +2812,7 @@ fn serve_under_supervisor(
         }
     }
     let status = child.wait().expect("wait for the shim");
-    // SAFETY: notif is our owned descriptor from recv_fd; closed exactly once.
-    unsafe { libc::close(notif) };
+    close_owned(notif);
     (status.code(), ring)
 }
 
@@ -2821,9 +2898,8 @@ fn a_parked_decision_times_out_while_the_cage_keeps_the_receive_loop_busy() {
     });
     let _ = child.kill();
     let _ = child.wait();
-    // SAFETY: notif is this test's owned descriptor, closed exactly once — the receive loop has
-    // been joined by the scope above.
-    unsafe { libc::close(notif) };
+    // Only now: the receive loop that used it has been joined by the scope above.
+    close_owned(notif);
 
     assert!(
         swept.1,
@@ -2891,8 +2967,7 @@ fn a_parked_exec_is_answered_after_the_supervisors_own_descriptor_is_gone() {
 
     // Supervision ends while the decision is outstanding — the window a control thread answers
     // in. Nothing else holds this number afterwards.
-    // SAFETY: notif is this test's owned descriptor, closed exactly once here.
-    unsafe { libc::close(notif) };
+    close_owned(notif);
     assert!(
         parts.pending.answer(id, true).is_some(),
         "the parked entry must still be there to answer"
@@ -3092,6 +3167,16 @@ fn a_shebang_chain_is_followed_to_the_program_the_kernel_runs() {
     use std::os::unix::fs::PermissionsExt;
     let dir = TmpDir::new();
     let inner = dir.join("b.sh");
+    // The kernel ends a `#!` interpreter at the first blank, and nothing quotes one there.
+    if inner
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .any(u8::is_ascii_whitespace)
+    {
+        skip_incapable!("skipping: a `#!` line cannot name {inner:?}, which holds a blank");
+        return;
+    }
     std::fs::write(&inner, "#!/bin/sh\nexit 7\n").expect("write the inner script");
     let outer = dir.join("a.sh");
     std::fs::write(&outer, format!("#!{}\n", inner.display())).expect("write the outer script");
@@ -3219,12 +3304,12 @@ fn an_interpreter_binfmt_misc_would_run_is_decided() {
 /// so, where the interpreter is not on this host.
 #[test]
 fn a_shebang_run_from_a_descriptor_is_decided_too() {
-    need_host_programs!("/bin/python3", "/bin/sh");
+    need_host_programs!("/bin/sh");
     let Some(python) = ["/usr/bin/python3", "/bin/python3"]
         .into_iter()
         .find(|p| std::path::Path::new(p).exists())
     else {
-        eprintln!("MEMFD-EXEC: skipped, no python3 on this host");
+        skip_incapable!("MEMFD-EXEC: skipping, no python3 on this host");
         return;
     };
     // Two payloads, one per spelling. Each writes a `#!/bin/sh` script into a `memfd` and execs it;
@@ -3243,6 +3328,7 @@ fn a_shebang_run_from_a_descriptor_is_decided_too() {
     );
     let by_path = format!("{common}os.execv(f'/proc/self/fd/{{fd}}',['payload'])\nos._exit(9)\n");
 
+    let mut decided = 0;
     for (spelling, code) in [("AT_EMPTY_PATH", &by_fd), ("/proc/self/fd", &by_path)] {
         // The witness: under a policy denying something else the shell really runs from memory, so
         // a refusal below is the rule rather than the payload failing to pose the question.
@@ -3272,6 +3358,11 @@ fn a_shebang_run_from_a_descriptor_is_decided_too() {
             "the refusal is recorded, and names the interpreter the rule spoke about, for \
              {spelling}: {events:?}"
         );
+        decided += 1;
+    }
+    // Each spelling may be skipped on its own, but a run that decided neither asserted nothing.
+    if decided == 0 {
+        skip_incapable!("MEMFD-EXEC: skipping, neither spelling ran from memory on this host");
     }
 }
 
@@ -3293,24 +3384,26 @@ fn a_target_that_can_be_reached_and_not_read_is_refused() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o111)).expect("chmod");
     let script = path.to_str().expect("utf-8 script path").to_string();
     if std::fs::read(&path).is_ok() {
-        return; // running with a capability that overrides the mode; the case cannot be posed
+        skip_incapable!(
+            "skipping: a capability overrides the mode here, so the case cannot be posed"
+        );
+        return;
     }
 
     // The witness, taken outside the supervisor because that is where the vector lives: the kernel
-    // really does exec this file and really does start `/bin/sh`. The shell's own diagnostic on
-    // stderr and its exit code are what say so -- an `execve` the kernel had refused would return
-    // `EACCES` to the caller instead, and no shell would have run at all.
+    // really does exec this file and really does start `/bin/sh`. That the spawn returns at all
+    // says so -- an `execve` the kernel had refused comes back as the spawn's own error, and no
+    // shell runs. The shell's failure is then its own, worded and numbered as that shell does:
+    // dash exits 2 and bash 126, which is the refusal's code too, so the arms below tell a refusal
+    // from it by the ring and not by the code alone.
     let ran = std::process::Command::new(&path)
         .output()
-        .expect("spawn the unreadable script");
-    assert_eq!(
-        ran.status.code(),
-        Some(2),
-        "the kernel must really start the interpreter here, or this test measures nothing"
-    );
+        .expect("the kernel must really start the interpreter here, or this test measures nothing");
+    let shell_failure = ran.status.code();
     assert!(
-        String::from_utf8_lossy(&ran.stderr).contains("cannot open"),
-        "and the failure must be the shell's own, after it started: {:?}",
+        shell_failure.is_some_and(|c| c != 0 && c != 7) && !ran.stderr.is_empty(),
+        "and the failure must be the shell's own, after it started: {:?} {:?}",
+        ran.status,
         String::from_utf8_lossy(&ran.stderr)
     );
 
@@ -3324,12 +3417,19 @@ fn a_target_that_can_be_reached_and_not_read_is_refused() {
     // execute-only file there would be a refusal no rule asked for.
     let governs_nothing = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
     assert!(governs_nothing.governs_nothing(), "the premise of this arm");
-    let (code, _) = run_under_supervisor(&[&script], &governs_nothing, &ProcOverlay::new());
+    let (code, ring) = run_under_supervisor(&[&script], &governs_nothing, &ProcOverlay::new());
     assert_eq!(
-        code,
-        Some(2),
+        code, shell_failure,
         "with nothing to decide, the unreadable file is left to the kernel and the shell's own \
          failure comes back"
+    );
+    assert!(
+        !ring
+            .snapshot(None)
+            .events
+            .iter()
+            .any(|e| e.verdict == "deny"),
+        "and nothing was refused on the way"
     );
 
     for rules in [vec!["sh".to_string()], vec!["/bin/nonexistent".to_string()]] {
@@ -3364,8 +3464,9 @@ fn a_target_that_can_be_reached_and_not_read_is_refused() {
 /// the loader alone under the denying policy must still be allowed.
 #[test]
 fn a_program_a_loader_is_asked_to_run_is_decided_by_its_own_name() {
-    need_host_programs!("/bin/sh", "/bin/true");
+    need_host_programs!("/usr/bin/sh", "/bin/true");
     let Some(loader) = own_dynamic_loader() else {
+        skip_incapable!("skipping: this test binary maps no dynamic loader to name");
         return;
     };
     let loader = loader.to_str().expect("utf-8 loader path").to_string();
@@ -3477,7 +3578,7 @@ fn an_allowed_execve_runs_the_payload() {
 /// sitting in the first `PATH` entry is unlaunchable.
 #[test]
 fn a_confined_allowlist_still_lets_a_name_lookup_find_its_program() {
-    need_host_programs!("/bin/env", "/bin/true");
+    need_host_programs!("/usr/bin/env", "/usr/bin/true");
     let empty = TmpDir::new();
     std::fs::create_dir_all(empty.join("a")).expect("an empty PATH entry");
     std::fs::create_dir_all(empty.join("b")).expect("another empty PATH entry");
@@ -3529,7 +3630,7 @@ fn a_confined_allowlist_still_lets_a_name_lookup_find_its_program() {
 /// tree. Measured here rather than taken from the kernel's documentation.
 #[test]
 fn a_grandchild_execve_traps_the_same_supervisor() {
-    need_host_programs!("/bin/timeout", "/bin/true");
+    need_host_programs!("/usr/bin/timeout", "/bin/true");
     // `timeout` forks and execs its argument, so the denied target is reached across both — a
     // chain the payload's own exec could not demonstrate on its own.
     let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/true".to_string()]);
@@ -3690,7 +3791,6 @@ const UNREADABLE: (u32, u64) = (1, 0);
 /// and a rule loaded afterwards still reaches it.
 #[test]
 fn a_poisoned_overlay_still_decides_and_still_takes_a_rule() {
-    need_host_programs!("/bin/curl", "/bin/wget");
     let overlay = std::sync::Arc::new(ProcOverlay::new());
     overlay.remember(Verdict::Deny, "curl");
     let base = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
@@ -3825,8 +3925,8 @@ fn bwrap_on_path() -> Option<PathBuf> {
 /// that exists on the host as well. That is the whole fixture the two tests below need -- a name the
 /// cage resolves to one file and this process to another, or to nothing -- and it keeps the rest of
 /// the filesystem shared, so the shim and its handoff socket stay reachable from inside. `{cage}` in
-/// `setup` and in `target` is replaced with that directory; `plant` fills its **host** side first,
-/// before the tmpfs hides it from the cage.
+/// `setup` and in `target` is replaced with that directory, escaped for the single quotes both
+/// write it inside; `plant` fills its **host** side first, before the tmpfs hides it from the cage.
 ///
 /// `None` where the host cannot stand up a namespace at all, which is the caller's skip: with the
 /// target in this process's own namespace the two walks coincide and nothing is measured.
@@ -3854,12 +3954,14 @@ fn run_in_cage(
     let sock_path = dir.join("notif.sock");
     let listener = UnixListener::bind(&sock_path).expect("bind the handoff socket");
 
+    // Inside single quotes, a quote is the one byte to escape: closed, escaped, reopened.
+    let in_quotes = cage.replace('\'', r"'\''");
     let script = format!(
-        "mount -t tmpfs tmpfs '{cage}' || exit 1\n{}\nexec '{}' '{}' -- '{}'\n",
-        setup.replace("{cage}", &cage),
-        shim.display(),
-        sock_path.display(),
-        target.replace("{cage}", &cage),
+        "mount -t tmpfs tmpfs '{in_quotes}' || exit 1\n{}\nexec {} {} -- '{}'\n",
+        setup.replace("{cage}", &in_quotes),
+        sh_word(&shim),
+        sh_word(&sock_path),
+        target.replace("{cage}", &in_quotes),
     );
     let mut cmd = std::process::Command::new(unshare);
     cmd.args(["--user", "--map-root-user", "--mount"])
@@ -3994,8 +4096,10 @@ fn a_head_spelled_under_proc_self_is_read_from_the_cage_and_not_from_the_host() 
 /// while the errno still tells a name the cage really has from one it does not.
 #[test]
 fn a_refusal_asks_about_the_cage_and_not_about_the_host_behind_an_absolute_link() {
-    need_host_programs!("/bin/sh");
+    use std::os::unix::process::CommandExt;
+    need_host_programs!("/usr/bin/sh");
     let Some(bwrap) = bwrap_on_path() else {
+        skip_incapable!("skipping: no `bwrap` on PATH to stand the cage up with");
         return;
     };
     let dir = TmpDir::new();
@@ -4027,26 +4131,26 @@ fn a_refusal_asks_about_the_cage_and_not_about_the_host_behind_an_absolute_link(
             // because a pid guessed from the process tree is a race.
             "ln -s / /tmp/x; echo $$ > /out/pid; exec sleep 30",
         ])
+        .process_group(0)
         .spawn()
     {
-        Ok(child) => child,
-        // A host that cannot stand up a user namespace cannot host a cage at all.
-        Err(_) => return,
-    };
-    let pid_file = dir.join("pid");
-    let mut pid = None;
-    for _ in 0..200 {
-        if let Ok(text) = std::fs::read_to_string(&pid_file)
-            && let Ok(n) = text.trim().parse::<u32>()
-        {
-            pid = Some(n);
-            break;
+        Ok(child) => Reaped(child),
+        Err(e) => {
+            skip_incapable!("skipping: could not start `bwrap`: {e}");
+            return;
         }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    // Every answer is taken before the cage is torn down, so a failing assertion cannot leave a
-    // `sleep` behind.
-    let answers = pid.map(|pid| {
+    };
+    // A host that cannot stand up a user namespace cannot host a cage at all: `bwrap` starts and
+    // exits without ever running the shell.
+    let Some(pid) = cage_pid(&mut cage, &dir.join("pid")) else {
+        skip_incapable!(
+            "skipping: the cage exited before it came up, so this host cannot host one"
+        );
+        return;
+    };
+    // Every answer is taken before the cage is torn down, so the assertions run against a cage
+    // that is already gone; `Reaped` tears it down on a panic too.
+    let answers = {
         [
             ("/usr", refusal_errno(pid, "/usr")),
             (
@@ -4071,11 +4175,13 @@ fn a_refusal_asks_about_the_cage_and_not_about_the_host_behind_an_absolute_link(
                 refusal_errno(pid, "/proc/self/root/no-such-name-in-either"),
             ),
         ]
-    });
-    let _ = cage.kill();
-    let _ = cage.wait();
+    };
+    drop(cage);
+    assert!(
+        gone_within_a_second(pid),
+        "the cage's `sleep` outlived its teardown"
+    );
 
-    let answers = answers.expect("the cage never reported its pid");
     let at = |name: &str| {
         answers
             .iter()
@@ -4136,6 +4242,7 @@ fn a_refusal_asks_about_the_cage_and_not_about_the_host_behind_an_absolute_link(
 /// absent, or the answer would be satisfied by a probe that stopped refusing anything.
 #[test]
 fn an_open_behind_an_absolute_link_is_asked_of_the_cage_before_it_is_refused() {
+    use std::os::unix::process::CommandExt;
     // The fixture is a shell script the cage runs, so a shell is as much a prerequisite here as the
     // namespace is — named rather than assumed, because a userland that has `unshare` and no `sh`
     // would otherwise fail on the payload rather than skip on the host.
@@ -4159,36 +4266,37 @@ fn an_open_behind_an_absolute_link_is_asked_of_the_cage_before_it_is_refused() {
     // The link is the whole fixture: an absolute target is what restarts a walk at the resolver's
     // root. The pid is the cage's own, written where this process can read it, because a pid
     // guessed from the process tree is a race.
+    let cage_word = sh_word(std::path::Path::new(&cage_dir));
     let script = format!(
-        "mount -t tmpfs tmpfs '{cage_dir}' || exit 1\n\
-         mkdir '{cage_dir}/behind'\n\
-         printf 'ordinary content\\n' > '{cage_dir}/behind/file.txt'\n\
-         ln -s '{cage_dir}/behind' '{cage_dir}/x'\n\
-         echo $$ > '{}'\n\
+        "mount -t tmpfs tmpfs {cage_word} || exit 1\n\
+         mkdir {cage_word}/behind\n\
+         printf 'ordinary content\\n' > {cage_word}/behind/file.txt\n\
+         ln -s {cage_word}/behind {cage_word}/x\n\
+         echo $$ > {}\n\
          exec sleep 30\n",
-        pid_file.display()
+        sh_word(&pid_file)
     );
     let mut cage = match std::process::Command::new(unshare)
         .args(["--user", "--map-root-user", "--mount"])
         .arg("sh")
         .arg("-c")
         .arg(&script)
+        .process_group(0)
         .spawn()
     {
-        Ok(child) => child,
-        // A host that cannot stand up a namespace cannot host a cage at all.
-        Err(_) => return,
-    };
-    let mut pid = None;
-    for _ in 0..200 {
-        if let Ok(text) = std::fs::read_to_string(&pid_file)
-            && let Ok(n) = text.trim().parse::<u32>()
-        {
-            pid = Some(n);
-            break;
+        Ok(child) => Reaped(child),
+        Err(e) => {
+            skip_incapable!("skipping: could not start `unshare`: {e}");
+            return;
         }
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    };
+    // A host that cannot stand up a namespace cannot host a cage at all.
+    let Some(pid) = cage_pid(&mut cage, &pid_file) else {
+        skip_incapable!(
+            "skipping: the cage exited before it came up, so this host cannot host one"
+        );
+        return;
+    };
     // A root nothing under test resolves into, so every answer below is about reaching the file and
     // never about its content.
     let lens = OpenLens::new(
@@ -4200,9 +4308,9 @@ fn an_open_behind_an_absolute_link_is_asked_of_the_cage_before_it_is_refused() {
         .expect("a non-empty list yields a policy"),
         std::fs::canonicalize(dir.path()).expect("canonical fixture root"),
     );
-    // Every answer is taken before the cage is torn down, so a failing assertion cannot leave a
-    // `sleep` behind.
-    let answers = pid.map(|pid| {
+    // Every answer is taken before the cage is torn down, so the assertions run against a cage
+    // that is already gone; `Reaped` tears it down on a panic too.
+    let answers = {
         [
             format!("{cage_dir}/behind/file.txt"),
             format!("{cage_dir}/x/file.txt"),
@@ -4217,11 +4325,13 @@ fn an_open_behind_an_absolute_link_is_asked_of_the_cage_before_it_is_refused() {
                 outcome.report.is_some(),
             )
         })
-    });
-    let _ = cage.kill();
-    let _ = cage.wait();
+    };
+    drop(cage);
+    assert!(
+        gone_within_a_second(pid),
+        "the cage's `sleep` outlived its teardown"
+    );
 
-    let answers = answers.expect("the cage never reported its pid");
     let at = |name: &str| {
         answers
             .iter()
@@ -4296,7 +4406,7 @@ fn a_descriptor_the_caller_holds_is_refused_as_something_that_is_there() {
         };
 
         let mut cmd = std::process::Command::new("sleep");
-        cmd.arg("30");
+        cmd.arg("30").process_group(0);
         // SAFETY: the closure runs in the forked child before `execve`, where only
         // async-signal-safe calls are allowed. `open`, `dup2` and `close` are; nothing is
         // allocated and no lock is taken. `dup2` clears close-on-exec on the new descriptor, so it
@@ -4311,10 +4421,14 @@ fn a_descriptor_the_caller_holds_is_refused_as_something_that_is_there() {
                 Ok(())
             });
         }
-        let Ok(mut child) = cmd.spawn() else {
-            return;
+        let child = match cmd.spawn() {
+            Ok(child) => Reaped(child),
+            Err(e) => {
+                skip_incapable!("skipping: could not start `sleep` to hold the descriptor: {e}");
+                return;
+            }
         };
-        let pid = child.id();
+        let pid = child.0.id();
 
         // Waited for through the child's own `/proc` entry rather than through the answer under
         // test: the descriptor is set up between fork and exec, so it appears a moment after
@@ -4334,8 +4448,7 @@ fn a_descriptor_the_caller_holds_is_refused_as_something_that_is_there() {
             refusal_errno(pid, &format!("/proc/self/fd/{held}")),
             refusal_errno(pid, &format!("/proc/self/fd/{never}")),
         );
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(child);
 
         // The precondition again: if either number was opened here while the child ran, this
         // measurement says nothing and another is taken.
