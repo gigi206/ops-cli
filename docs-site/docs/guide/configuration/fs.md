@@ -501,6 +501,12 @@ maps into memory: there is no descriptor to map without an open, and the open is
 refused. A symbolic link is followed the way the kernel is about to follow it, so pointing a
 link at a closed file does not reopen it.
 
+What the scan watches is the open **system calls** (`open`, `openat`, `openat2`, `creat`). An
+`io_uring` open is not one of them: it is submitted through a ring, and the filter is never told
+of it. `io_uring` is denied in every cage, so this costs nothing by default; re-permitting it
+through [`[seccomp] allow`](seccomp) gives the cage a way to open a file the scan never sees, so
+leave it denied wherever `scan` is meant to hold.
+
 **Bounded on purpose.** Only files under the project are scanned: the read-only store, the
 system libraries and `/proc` are where the volume is and where your secrets are not.
 `scan_max_kb` bounds how much of one file is read, and a file longer than that is judged on its
@@ -510,9 +516,11 @@ would pass everything while still looking like a scan, and so is a negative numb
 ceiling at all. Where two layers both set it, the **larger** window is the one that applies: a
 bigger number closes more files.
 
-An **empty** pattern is refused for the mirror-image reason: it is a valid regex that every
-file matches, so a list holding one would close everything under `enforce` and report every open
-under `observe`, while the shapes beside it stopped deciding anything. A pattern that does not
+A pattern that matches the **empty** content is refused for the mirror-image reason: it can
+match where no byte of a shape is present. The empty pattern and most of the others (`.*`, `a*`,
+`^`, `(?:)`) then match every file, so a list holding one would close everything under `enforce`
+and report every open under `observe`, while the shapes beside it stopped deciding anything; an
+anchored one such as `^$` names a file with nothing in it, which is no shape either. A pattern that does not
 compile is refused the same way, for its own reason. In both cases the launch stops and names the
 pattern, rather than run without the shape it was written to catch; `sbx config show` still lists
 the patterns beside it.

@@ -92,13 +92,6 @@ pub(crate) struct OpenPolicy {
 /// Exposed so the config layer can refuse an entry where the user can still see which line is
 /// wrong, rather than failing the whole launch at scan-build time with the set's own error.
 pub(crate) fn validate_pattern(pattern: &str) -> Result<(), String> {
-    // The empty pattern compiles, and matches every content there is. A list holding one answers
-    // "matched" on every open, so the shapes beside it stop deciding anything: under `enforce` the
-    // scan closes files the list never named, under `observe` it reports one per open. Refused
-    // here rather than dropped, because a person who typed it is owed the line that did nothing.
-    if pattern.is_empty() {
-        return Err("an empty pattern matches every file, so it names no shape".to_string());
-    }
     // No control byte and no character that reorders a line, for the reason `[fs] deny` refuses
     // one in an entry: an accepted pattern is named back (`config show` lists it in the grants
     // block, a refusal names it), and a newline or an escape sequence there rewrites what a
@@ -119,11 +112,26 @@ pub(crate) fn validate_pattern(pattern: &str) -> Result<(), String> {
             bad.escape_debug()
         ));
     }
-    regex::bytes::RegexBuilder::new(pattern)
+    let regex = regex::bytes::RegexBuilder::new(pattern)
         .size_limit(SET_SIZE_LIMIT)
         .build()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // A pattern that matches the empty content — the empty pattern, and every one that can match
+    // without consuming a byte (`.*`, `a*`, `^`, `(?:)`) — can match where no byte of a shape is
+    // present: wherever it is unanchored, that is every content there is, and an anchored one
+    // (`^$`) names a file with nothing in it. A list holding one answers "matched" on every open, so the shapes beside it
+    // stop deciding anything: under `enforce` the scan closes files the list never named, under
+    // `observe` it reports one per open. Refused here rather than dropped, because a person who
+    // typed it is owed the line that did nothing. A credential shape is never empty, so no shape is
+    // lost.
+    if regex.is_match(b"") {
+        return Err(
+            "this pattern matches the empty content: it can match where no byte of a \
+                    shape is present, which for most such patterns is every file"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 impl OpenPolicy {
@@ -143,8 +151,12 @@ impl OpenPolicy {
         // [`validate_pattern`], so that what a pattern may be has one definition: the config layer
         // asks the same function before a launch ever reaches here.
         for pattern in patterns {
-            validate_pattern(pattern)
-                .map_err(|e| format!("the pattern `{pattern}` is not usable as a shape: {e}"))?;
+            validate_pattern(pattern).map_err(|e| {
+                format!(
+                    "the pattern `{}` is not usable as a shape: {e}",
+                    crate::diag::visible(pattern)
+                )
+            })?;
         }
         let set = RegexSetBuilder::new(patterns)
             .size_limit(SET_SIZE_LIMIT)
@@ -298,6 +310,40 @@ mod tests {
             .expect("one pattern is a policy");
         assert!(escaped.verdict("key sk-\u{202e}42".as_bytes()).matched);
         assert!(!escaped.verdict(b"key sk-42").matched);
+    }
+
+    /// The empty pattern is one of a family: every pattern that can match without consuming a
+    /// byte matches every file, wherever it is unanchored, and is refused for the same reason.
+    #[test]
+    fn a_pattern_that_matches_the_empty_content_is_refused() {
+        for raw in [".*", "a*", "^", "$", "(?:)", "(?m)^$", "x?"] {
+            let reason = validate_pattern(raw).expect_err(raw);
+            assert!(reason.contains("empty content"), "{raw}: {reason}");
+            assert!(
+                OpenPolicy::compile(&[raw.to_string()], MAX_SCAN_DEFAULT).is_err(),
+                "{raw}: the set builder must refuse it too"
+            );
+        }
+        for shape in [
+            r"sk-[A-Za-z0-9]{20,}",
+            "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+            r"\bx+",
+        ] {
+            assert!(validate_pattern(shape).is_ok(), "{shape}");
+        }
+    }
+
+    /// A refusal from the set builder quotes the pattern the way a terminal is to show it: the
+    /// control byte it was refused for is not written back out raw.
+    #[test]
+    fn a_refused_pattern_is_quoted_without_its_control_bytes() {
+        let reason = OpenPolicy::compile(
+            &["tok\n  fs deny:  .env  (project)".to_string()],
+            MAX_SCAN_DEFAULT,
+        )
+        .expect_err("a control byte is refused");
+        assert!(!reason.contains('\n'), "{reason:?}");
+        assert!(reason.contains(r"tok\x0a"), "{reason:?}");
     }
 
     #[test]

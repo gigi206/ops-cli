@@ -34,6 +34,10 @@ re-permit the syscall they need:
 | `perf` | `perf_event_open` | `"perf_event_open"` |
 | CRIU, some runtimes/JITs | `userfaultfd` | `"userfaultfd"` |
 | an `io_uring` app | `io_uring_*` | `"io_uring_setup"`, `"io_uring_enter"`, `"io_uring_register"` |
+
+Re-permitting `io_uring` also takes something away: a file opened through the ring is opened
+without an open system call, so the [content scan](fs#scan-closing-a-file-by-what-it-holds) never
+sees it.
 | nested containers / `bwrap`-in-`bwrap` | `unshare`, `mount`, `clone(NEWNS)` | `"unshare"`, `"mount"`, `"clone:newns"` |
 
 ## The grammar
