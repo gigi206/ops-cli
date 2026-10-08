@@ -110,12 +110,12 @@ mod tests {
             let production = crate::testutil::production_half(&text);
             let entry = ["distro::store::provision(", "distro::store::refresh("]
                 .iter()
-                .any(|needle| crate::testutil::calls_function(production, needle));
+                .any(|needle| crate::testutil::calls_function(&production, needle));
             if !entry {
                 continue;
             }
             let relative = file.display().to_string().replacen(&root, "", 1);
-            if !crate::testutil::calls_function(production, "distro::failure(") {
+            if !crate::testutil::calls_function(&production, "distro::failure(") {
                 offenders.push(relative.clone());
             }
             callers.push(relative);

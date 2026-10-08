@@ -12644,9 +12644,7 @@ fn neither_inspected_plane_pumps_a_response_body_itself() {
         ("forward.rs", include_str!("forward.rs")),
         ("tunnel.rs", include_str!("tunnel.rs")),
     ] {
-        let production = source
-            .rsplit_once("#[cfg(test)]")
-            .map_or(source, |(before, _)| before);
+        let production = crate::testutil::production_half(source);
         for pump in ["pump_redacting(", "pump_to_eof("] {
             assert_eq!(
                 production.matches(pump).count(),

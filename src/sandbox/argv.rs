@@ -1556,8 +1556,8 @@ mod tests {
             // file's own cut past its test module and offer these fixtures to every guard that
             // reads a production half -- which is exactly what it did.
             let production = crate::testutil::production_half(&text);
-            let names_the_list = crate::testutil::calls_function(production, "to_argv(");
-            let spawns = holds_bwrap_and_spawns(production);
+            let names_the_list = crate::testutil::calls_function(&production, "to_argv(");
+            let spawns = holds_bwrap_and_spawns(&production);
             if !names_the_list && !spawns {
                 continue;
             }
@@ -1565,7 +1565,7 @@ mod tests {
             if DEFINES_THEM.contains(&relative.as_str()) {
                 continue;
             }
-            let calls = |needle: &str| crate::testutil::calls_function(production, needle);
+            let calls = |needle: &str| crate::testutil::calls_function(&production, needle);
             // `compose_with` is `compose` with bubblewrap's setup report asked for, the same
             // compile of the filters behind either name.
             let composes = calls("argv::compose(") || calls("argv::compose_with(");

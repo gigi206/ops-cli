@@ -1551,9 +1551,7 @@ mod tests {
             ("deb", include_str!("deb.rs")),
             ("appimage", include_str!("appimage.rs")),
         ] {
-            let production = source
-                .rsplit_once("#[cfg(test)]")
-                .map_or(source, |(before, _)| before);
+            let production = crate::testutil::production_half(source);
             let fetches: Vec<&str> = production
                 .match_indices("pkgs.fetchurl {")
                 .map(|(at, _)| {

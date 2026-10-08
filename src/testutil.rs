@@ -1,7 +1,8 @@
 //! Test-only helpers shared across the module unit tests.
 
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -16,11 +17,38 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 /// what makes the `unsafe` in [`EnvVar`] sound.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+std::thread_local! {
+    /// How many [`EnvLock`]s this thread holds: what lets [`EnvVar`] check its caller holds one.
+    static ENV_LOCKS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`ENV_LOCK`] held by this thread, as [`env_lock`] hands it out.
+pub(crate) struct EnvLock {
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Drop for EnvLock {
+    fn drop(&mut self) {
+        ENV_LOCKS_HELD.with(|held| held.set(held.get() - 1));
+    }
+}
+
 /// Take [`ENV_LOCK`]. A test that panicked while holding it poisons the mutex, but the
 /// poison flag says nothing about the environment: [`EnvVar`] restores every variable on
 /// the way out of that panic, so the next test takes the lock over a clean environment.
-pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+pub(crate) fn env_lock() -> EnvLock {
+    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ENV_LOCKS_HELD.with(|held| held.set(held.get() + 1));
+    EnvLock { _guard: guard }
+}
+
+/// Refuse to touch the environment from a thread that does not hold [`ENV_LOCK`]: the
+/// `unsafe` in [`EnvVar`] is sound only under it, and a test that forgot it races every other.
+fn assert_env_locked(key: &str) {
+    assert!(
+        ENV_LOCKS_HELD.with(std::cell::Cell::get) > 0,
+        "`{key}` pinned without `env_lock()` held on this thread"
+    );
 }
 
 /// One environment variable pinned for the length of a test and put back exactly as it was
@@ -28,7 +56,8 @@ pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
 /// what every later test in the binary reads, and a test that restores only on success
 /// leaves it set precisely when something went wrong.
 ///
-/// The caller holds [`env_lock`] for a scope that outlives the guard.
+/// The caller holds [`env_lock`] for a scope that outlives the guard, on the thread that makes it;
+/// one made without is refused.
 pub(crate) struct EnvVar {
     key: &'static str,
     prior: Option<OsString>,
@@ -37,6 +66,7 @@ pub(crate) struct EnvVar {
 impl EnvVar {
     /// Pin `key` to `value` until the guard is dropped.
     pub(crate) fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        assert_env_locked(key);
         let guard = Self {
             key,
             prior: std::env::var_os(key),
@@ -50,6 +80,7 @@ impl EnvVar {
     /// Pin `key` to *unset* until the guard is dropped — what a test asserting the absent
     /// case needs, since the variable may be set in the environment the run inherited.
     pub(crate) fn unset(key: &'static str) -> Self {
+        assert_env_locked(key);
         let guard = Self {
             key,
             prior: std::env::var_os(key),
@@ -80,11 +111,20 @@ include!("testroot.rs");
 pub(crate) struct TmpDir(PathBuf);
 
 impl TmpDir {
+    /// A directory no other fixture has, created empty.
+    ///
+    /// Created exclusively, since the name alone does not make it unique: a run that ended
+    /// without its cleanup leaves its directories behind, and a later run handed the same pid
+    /// would otherwise adopt one with whatever it still holds. A directory found under this
+    /// run's own name is such a leftover — every live one of this name is this run's — and is
+    /// removed before the fixture is made afresh.
     pub(crate) fn new() -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("sbx-test-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
+        let root = fixture_root();
+        std::fs::create_dir_all(&root)
+            .unwrap_or_else(|e| panic!("the fixtures' root {}: {e}", root.display()));
+        let d = root.join(format!("sbx-test-{}-{n}", std::process::id()));
+        create_afresh(&d);
         TmpDir(d)
     }
 
@@ -92,8 +132,30 @@ impl TmpDir {
         &self.0
     }
 
+    /// `name` inside the fixture. A name that is absolute, or climbs out with `..`, would land
+    /// outside it, where nothing removes what the test writes, so it is refused.
     pub(crate) fn join(&self, name: &str) -> PathBuf {
+        assert!(
+            Path::new(name)
+                .components()
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir)),
+            "`{name}` is not a path inside the fixture"
+        );
         self.0.join(name)
+    }
+}
+
+/// Create `d` empty, taking out whatever a leftover of the same name holds ([`TmpDir::new`]).
+fn create_afresh(d: &Path) {
+    if let Err(e) = std::fs::create_dir(d) {
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "the fixture {}: {e}",
+            d.display()
+        );
+        force_remove(d);
+        std::fs::create_dir(d).unwrap_or_else(|e| panic!("the fixture {}: {e}", d.display()));
     }
 }
 
@@ -295,7 +357,7 @@ pub(crate) fn run_within(command: &mut std::process::Command, what: &str) -> Ran
     let ended = crate::session::wait_for_exit(pidfd, END_WITHIN);
     crate::session::close_fd(pidfd);
     if !ended {
-        let _ = child.kill();
+        child.kill().expect("the process run is killed");
     }
     let status = child.wait().expect("the process run is reaped");
     let stdout = queued(child.stdout.take().expect("its output"));
@@ -312,16 +374,26 @@ pub(crate) fn run_within(command: &mut std::process::Command, what: &str) -> Ran
 }
 
 /// What is already queued on `pipe`, read without waiting for more.
+///
+/// A descriptor left blocking would make the read wait for the end of a stream another process
+/// may hold, so a failure to switch it is a failed test rather than a read that never returns.
 pub(crate) fn queued(mut pipe: impl std::io::Read + std::os::fd::AsRawFd) -> String {
     let fd = pipe.as_raw_fd();
     // SAFETY: plain integer arguments on a descriptor this process holds.
-    unsafe {
-        libc::fcntl(
-            fd,
-            libc::F_SETFL,
-            libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
-        )
-    };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(
+        flags >= 0,
+        "the pipe's flags: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: as above.
+    let set = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    assert_eq!(
+        set,
+        0,
+        "the pipe made non-blocking: {}",
+        std::io::Error::last_os_error()
+    );
     let mut bytes = Vec::new();
     match pipe.read_to_end(&mut bytes) {
         Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => panic!("a pipe that fails: {e}"),
@@ -340,7 +412,14 @@ pub(crate) fn when_run_alone(body: impl FnOnce(&OsStr) -> std::io::Result<()>) {
         return;
     };
     // SAFETY: plain integer arguments, a flag of the calling process.
-    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        eprintln!(
+            "sbx-alone: not marked as leaving no core: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: as below.
+        unsafe { libc::_exit(2) };
+    }
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&with)));
     let code = match ran.map(|ran| ran.and_then(|()| written(&format!("\n{ENDED_WELL}\n")))) {
         Ok(Ok(())) => 0,
@@ -374,8 +453,14 @@ pub(crate) struct Trickle<'a> {
 }
 
 impl<'a> Trickle<'a> {
-    /// `sizes` and `interrupts` are read in turn, round and round, so neither may be empty.
+    /// `sizes` and `interrupts` are read in turn, round and round, so neither may be empty; and a
+    /// size of 0 would end the stream early, a read that returns nothing being its end.
     pub(crate) fn new(bytes: &'a [u8], sizes: Vec<usize>, interrupts: Vec<bool>) -> Self {
+        assert!(
+            !sizes.is_empty() && !sizes.contains(&0),
+            "sizes {sizes:?}: none, or one that ends the stream"
+        );
+        assert!(!interrupts.is_empty(), "no interrupts to read in turn");
         Trickle {
             bytes,
             sizes,
@@ -408,14 +493,15 @@ impl std::io::Read for Trickle<'_> {
 /// Every `.rs` source under `dir`, sorted, subdirectories included. The walk descends because a
 /// module that outgrew one file keeps its root in `<name>.rs` and everything else in a `<name>/`
 /// beside it: a flat listing would read the root, skip the children, and report the silence as a
-/// pass.
+/// pass. A directory that cannot be listed fails the test for the same reason.
 fn rs_sources_under(dir: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("listing {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|e| panic!("listing {}: {e}", dir.display()))
+                .path();
             if path.is_dir() {
                 walk(&path, out);
             } else if path.extension().is_some_and(|e| e == "rs") {
@@ -435,8 +521,13 @@ fn rs_sources_under(dir: &Path) -> Vec<PathBuf> {
 /// The distinction is what separates a call to `write` from one to `memfd_write`, and it is what a
 /// source-scanning guard needs: a needle matched anywhere inside a longer identifier would put
 /// files in a population that never call the thing at all, and a guard whose population is wrong
-/// reports on the wrong files.
+/// reports on the wrong files. The parenthesis is the needle's own, so it is required of it: a
+/// bare `write` would also match `write_all(`.
 pub(crate) fn calls_function(text: &str, needle: &str) -> bool {
+    assert!(
+        needle.ends_with('('),
+        "`{needle}` is a name without its opening parenthesis"
+    );
     text.match_indices(needle).any(|(i, _)| {
         i == 0
             || !matches!(text.as_bytes()[i - 1],
@@ -458,6 +549,64 @@ pub(crate) fn is_test_only_source(path: &Path) -> bool {
         .is_some_and(|stem| stem == "tests" || stem.ends_with("_tests"))
 }
 
+/// A module declared under `#[cfg(test)]`, as [`gated_modules`] finds it.
+struct GatedModule<'a> {
+    /// The line the attribute is on.
+    attribute: usize,
+    /// The line the `mod` is on.
+    item: usize,
+    name: &'a str,
+    /// Whether its body follows inline (`mod x { … }`) rather than in a file of its own
+    /// (`mod x;`).
+    inline: bool,
+}
+
+/// Every module of `lines` that a `#[cfg(test)]` gates, as rustfmt lays the declaration out: the
+/// attribute alone on its line, any further attributes on lines of their own, then the `mod` under
+/// whatever visibility it has.
+///
+/// Whole lines rather than every place the text spells the attribute, so a mention in a string or
+/// a comment declares nothing.
+fn gated_modules<'a>(lines: &[&'a str]) -> Vec<GatedModule<'a>> {
+    let mut out = Vec::new();
+    for (attribute, line) in lines.iter().enumerate() {
+        if line.trim() != "#[cfg(test)]" {
+            continue;
+        }
+        let Some(item) = (attribute + 1..lines.len()).find(|&i| !lines[i].trim().starts_with("#["))
+        else {
+            continue;
+        };
+        let decl = lines[item].trim();
+        let decl = match decl.strip_prefix("pub(") {
+            Some(rest) => rest.split_once(')').map_or(decl, |(_, rest)| rest),
+            None => decl.strip_prefix("pub ").unwrap_or(decl),
+        };
+        let Some(rest) = decl.trim_start().strip_prefix("mod ") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let name_len = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let (name, after) = rest.split_at(name_len);
+        let inline = match after.trim() {
+            ";" => false,
+            "{" => true,
+            _ => continue,
+        };
+        if !name.is_empty() {
+            out.push(GatedModule {
+                attribute,
+                item,
+                name,
+                inline,
+            });
+        }
+    }
+    out
+}
+
 /// Every source the crate compiles **only under `cfg(test)`**, because the module that declares it
 /// says so.
 ///
@@ -466,13 +615,12 @@ pub(crate) fn is_test_only_source(path: &Path) -> bool {
 /// its own and is named like production code — `catalogue_freshness.rs`, `bench.rs` — so a guard
 /// reading it as production reports a site no shipped binary contains, and the author who reads the
 /// failure has nothing to fix. The declaration is the only place that fact is written, so it is
-/// where this reads it.
+/// where this reads it, whatever attributes or visibility stand between the two.
 pub(crate) fn test_only_sources() -> std::collections::BTreeSet<PathBuf> {
     let mut out = std::collections::BTreeSet::new();
     for file in crate_sources() {
-        let Ok(text) = std::fs::read_to_string(&file) else {
-            continue;
-        };
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", file.display()));
         // The directory this file's own modules live in: beside it for a `mod.rs` or the crate
         // root, in a subdirectory named after it otherwise.
         let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -484,25 +632,13 @@ pub(crate) fn test_only_sources() -> std::collections::BTreeSet<PathBuf> {
         } else {
             parent.join(stem)
         };
-        for (i, _) in text.match_indices("#[cfg(test)]") {
-            let rest = text[i + "#[cfg(test)]".len()..].trim_start();
-            let rest = rest.strip_prefix("pub(crate)").unwrap_or(rest).trim_start();
-            let rest = rest.strip_prefix("pub").unwrap_or(rest).trim_start();
-            let Some(rest) = rest.strip_prefix("mod ") else {
-                continue;
-            };
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            // A `mod x { … }` written inline carries its own `#[cfg(test)]` into the file this
-            // walk already reads; only the `mod x;` form names a second file.
-            if name.is_empty() || !rest[name.len()..].trim_start().starts_with(';') {
-                continue;
-            }
+        let lines: Vec<&str> = text.lines().collect();
+        // A `mod x { … }` written inline carries its own `#[cfg(test)]` into the file this walk
+        // already reads; only the `mod x;` form names a second file.
+        for module in gated_modules(&lines).iter().filter(|m| !m.inline) {
             for candidate in [
-                dir.join(format!("{name}.rs")),
-                dir.join(&name).join("mod.rs"),
+                dir.join(format!("{}.rs", module.name)),
+                dir.join(module.name).join("mod.rs"),
             ] {
                 if candidate.is_file() {
                     out.insert(candidate);
@@ -513,16 +649,142 @@ pub(crate) fn test_only_sources() -> std::collections::BTreeSet<PathBuf> {
     out
 }
 
-/// The production half of a source file: everything before its **last** `#[cfg(test)]`, or the
-/// whole text when it declares no test module.
+/// The production half of a source file: the text with every test module written inline in it
+/// taken out, from its `#[cfg(test)]` to the line of the brace that closes it.
 ///
-/// Cut at the last rather than the first, because a file may declare several test modules — and
-/// several declare theirs near the top, where splitting on the first leaves a handful of lines and
-/// a guard that passes having read nothing. It also keeps a guard's own needles, spelled in its own
-/// test module, out of the population it measures.
-pub(crate) fn production_half(text: &str) -> &str {
-    text.rsplit_once("#[cfg(test)]")
-        .map_or(text, |(before, _)| before)
+/// Taken out where they stand rather than cut at, because neither end of a file is reliably the
+/// boundary: production code may follow a test module, a `#[cfg(test)]` on a single item may stand
+/// above production code, and a test module may gate an item of its own, which a cut at the last
+/// attribute would take for the boundary and so read the whole module as production. Every other
+/// gated item — a `use`, a helper `fn` — is short and stays in, so a guard errs toward reading too
+/// much rather than missing a site. A guard's own needles, spelled in its test module, are out of
+/// the population it measures.
+pub(crate) fn production_half(text: &str) -> Cow<'_, str> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let starts: Vec<usize> = lines
+        .iter()
+        .scan(0, |at, line| {
+            let start = *at;
+            *at += line.len();
+            Some(start)
+        })
+        .collect();
+    let mut cuts = Vec::new();
+    for module in gated_modules(&lines).iter().filter(|m| m.inline) {
+        // A module inside one already taken out goes with it.
+        if cuts.last().is_some_and(|&(_, end)| module.attribute <= end) {
+            continue;
+        }
+        let open = starts[module.item] + lines[module.item].rfind('{').unwrap_or(0);
+        let close = closing_brace(text.as_bytes(), open)
+            .map_or(lines.len(), |at| starts.partition_point(|&s| s <= at) - 1);
+        cuts.push((module.attribute, close));
+    }
+    if cuts.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    for (start, end) in cuts {
+        out.extend(lines[from..start].iter().copied());
+        from = end + 1;
+    }
+    if from < lines.len() {
+        out.extend(lines[from..].iter().copied());
+    }
+    Cow::Owned(out)
+}
+
+/// Where the brace that `text[open]` opens is closed, counting only the braces that are code: a
+/// brace inside a string, a raw string, a character literal or a comment — a fixture's JSON, a
+/// shell function a test runs — opens nothing.
+fn closing_brace(text: &[u8], open: usize) -> Option<usize> {
+    let ident = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < text.len() {
+        let next = text.get(i + 1).copied();
+        match text[i] {
+            b'/' if next == Some(b'/') => {
+                i = text[i..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(text.len(), |n| i + n);
+            }
+            b'/' if next == Some(b'*') => {
+                // Block comments nest.
+                let mut nested = 0usize;
+                while i < text.len() {
+                    if text[i..].starts_with(b"/*") {
+                        nested += 1;
+                        i += 2;
+                    } else if text[i..].starts_with(b"*/") {
+                        nested -= 1;
+                        i += 2;
+                        if nested == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            b'"' => {
+                i += 1;
+                while i < text.len() && text[i] != b'"' {
+                    i += if text[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'r' if matches!(next, Some(b'"' | b'#'))
+                && (i == 0
+                    || !ident(text[i - 1])
+                    || (text[i - 1] == b'b' && (i < 2 || !ident(text[i - 2])))) =>
+            {
+                let hashes = text[i + 1..].iter().take_while(|&&b| b == b'#').count();
+                // `r#name` is a raw identifier, not a string.
+                if text.get(i + 1 + hashes) == Some(&b'"') {
+                    let mut end = vec![b'"'];
+                    end.extend(std::iter::repeat_n(b'#', hashes));
+                    let body = i + 2 + hashes;
+                    i = text[body..]
+                        .windows(end.len())
+                        .position(|w| w == end.as_slice())
+                        .map_or(text.len(), |n| body + n + end.len() - 1);
+                }
+            }
+            b'\'' => {
+                // A character literal, or a lifetime, which has no closing quote.
+                let width = match next {
+                    Some(b'\\') => text[i + 3..]
+                        .iter()
+                        .position(|&b| b == b'\'')
+                        .map(|n| n + 3),
+                    Some(b) => {
+                        let len = match b {
+                            0xf0.. => 4,
+                            0xe0.. => 3,
+                            0xc0.. => 2,
+                            _ => 1,
+                        };
+                        (text.get(i + 1 + len) == Some(&b'\'')).then_some(len + 1)
+                    }
+                    None => None,
+                };
+                i += width.unwrap_or(0);
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Every `.rs` source under `src/cli`, sorted, subdirectories included.
@@ -544,18 +806,23 @@ pub(crate) fn crate_sources() -> Vec<PathBuf> {
 
 /// A sorted `(relative path, size)` fingerprint of a tree — sensitive to any
 /// addition, removal, or size change, enough to assert a store never moved.
+///
+/// A symlink is recorded as itself, by the length of what it points at, and not followed: what
+/// it points at may lie outside the tree, or be the tree again. Anything that cannot be read fails
+/// the test, since a fingerprint that skipped it would match its own earlier blind spot.
 pub(crate) fn fingerprint(root: &Path) -> Vec<(PathBuf, u64)> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = path.symlink_metadata() else {
-                continue;
-            };
+        let entries =
+            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("listing {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|e| panic!("listing {}: {e}", dir.display()))
+                .path();
+            let meta = path
+                .symlink_metadata()
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
             let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
             if meta.is_dir() {
                 out.push((rel, 0));
@@ -1453,4 +1720,164 @@ fn the_cage_suites_are_the_same_list_in_the_task_and_the_workflow() {
         "only {} suites were read — has the list moved?",
         task.len()
     );
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn a_variable_is_pinned_only_under_the_lock() {
+        const KEY: &str = "SBX_TEST_PINNED_UNDER_THE_LOCK";
+        let unlocked = std::thread::spawn(|| {
+            std::panic::catch_unwind(|| EnvVar::set(KEY, "x")).is_err()
+                && std::panic::catch_unwind(|| EnvVar::unset(KEY)).is_err()
+        });
+        assert!(
+            unlocked.join().unwrap(),
+            "a variable was pinned without the lock"
+        );
+        let _lock = env_lock();
+        let _pinned = EnvVar::set(KEY, "x");
+        assert_eq!(std::env::var(KEY).as_deref(), Ok("x"));
+    }
+
+    #[test]
+    fn a_leftover_under_the_fixtures_name_is_emptied_before_it_is_used() {
+        let base = TmpDir::new();
+        let d = base.join("sbx-test-1-0");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/stale"), b"from a dead run").unwrap();
+        create_afresh(&d);
+        assert_eq!(
+            std::fs::read_dir(&d).unwrap().count(),
+            0,
+            "the leftover kept its contents"
+        );
+    }
+
+    #[test]
+    fn a_name_that_leaves_the_fixture_is_refused() {
+        let base = TmpDir::new();
+        assert_eq!(base.join("a/./b"), base.path().join("a/./b"));
+        for name in ["../escape", "a/../../escape", "/etc/passwd"] {
+            let refused =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| base.join(name)));
+            assert!(refused.is_err(), "`{name}` was joined");
+        }
+    }
+
+    #[test]
+    fn a_needle_without_its_parenthesis_is_refused() {
+        assert!(calls_function("x = memfd::write(fd)", "memfd::write("));
+        assert!(!calls_function("x = my_write(fd)", "write("));
+        let refused = std::panic::catch_unwind(|| calls_function("write_all(b)", "write"));
+        assert!(refused.is_err(), "a bare name was taken as a needle");
+    }
+
+    #[test]
+    fn a_trickle_refuses_a_size_that_would_end_the_stream_early() {
+        use std::io::Read as _;
+        let mut out = Vec::new();
+        Trickle::new(b"abcdef", vec![2, 1], vec![true, false])
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, b"abcdef");
+        for (sizes, interrupts) in [
+            (vec![1, 0], vec![false]),
+            (vec![], vec![false]),
+            (vec![1], vec![]),
+        ] {
+            let refused = std::panic::catch_unwind(|| Trickle::new(b"ab", sizes, interrupts));
+            assert!(refused.is_err(), "an unreadable rotation was taken");
+        }
+    }
+
+    #[test]
+    fn a_tree_that_cannot_be_listed_fails_the_fingerprint() {
+        let base = TmpDir::new();
+        std::fs::write(base.join("f"), b"four").unwrap();
+        assert_eq!(fingerprint(base.path()), vec![(PathBuf::from("f"), 4)]);
+        let missing = base.join("missing");
+        assert!(std::panic::catch_unwind(|| fingerprint(&missing)).is_err());
+    }
+
+    /// The three shapes a cut at the last `#[cfg(test)]` reads wrong: a mention of the attribute in
+    /// text, production code after the test module, and a test module that gates an item of its
+    /// own.
+    #[test]
+    fn the_production_half_takes_out_test_modules_where_they_stand() {
+        let quoted = "fn a() {}\nconst S: &str = \"#[cfg(test)]\";\nfn b() {}\n";
+        assert_eq!(production_half(quoted), quoted);
+        assert!(matches!(production_half(quoted), Cow::Borrowed(_)));
+
+        let after = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nfn b() {}\n";
+        assert_eq!(production_half(after), "fn a() {}\nfn b() {}\n");
+
+        let nested = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n    #[cfg(test)]\n    \
+                      fn u() {}\n    #[cfg(test)]\n    mod inner {\n    }\n}\n";
+        assert_eq!(production_half(nested), "fn a() {}\n");
+
+        let gated_items = "#[cfg(test)]\nuse x::y;\nfn a() {}\n#[cfg(test)]\n#[allow(dead_code)]\n\
+                           pub(super) mod t {\n    fn t() {}\n}\n";
+        assert_eq!(
+            production_half(gated_items),
+            "#[cfg(test)]\nuse x::y;\nfn a() {}\n"
+        );
+    }
+
+    /// A brace inside a string, a character, or a comment opens nothing: a test module holding one
+    /// still ends at its own closing brace, and the production code after it is kept.
+    #[test]
+    fn the_production_half_counts_only_the_braces_that_are_code() {
+        let tail = "fn after() {}\n";
+        let text = [
+            "fn before() {}\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    const SHELL: &str = r#\"\n",
+            "run() {\n",
+            "}\n",
+            "\"#;\n",
+            "    const QUOTE: &str = \"\\\"}\";\n",
+            "    const BRACE: char = '}';\n",
+            "    const PAIR: [char; 2] = ['\\'','}'];\n",
+            "    // }\n",
+            "    /* /* */ } */\n",
+            "    fn held<'a>(r#type: &'a str) -> &'a str { r#type }\n",
+            "    const QUOTED: &str = r#\"a \"}\" b\"#;\n",
+            "    const BYTES: &[u8] = br#\"a \"}\" b\"#;\n",
+            "    fn raw(r#fn: u8) {}\n",
+            "}\n",
+            tail,
+        ]
+        .concat();
+        assert_eq!(production_half(&text), ["fn before() {}\n", tail].concat());
+    }
+
+    /// `src/main.rs` declares `testskip` with `#[macro_use]` between the gate and the `mod`.
+    #[test]
+    fn a_test_only_module_is_found_past_attributes_and_visibility() {
+        let lines = [
+            "#[cfg(test)]",
+            "#[macro_use]",
+            "mod skip;",
+            "#[cfg(test)]",
+            "pub(in crate::x) mod helpers;",
+            "#[cfg(test)]",
+            "mod inline {",
+            "}",
+            "// #[cfg(test)] mod quoted;",
+        ];
+        let found: Vec<(&str, bool)> = gated_modules(&lines)
+            .iter()
+            .map(|m| (m.name, m.inline))
+            .collect();
+        assert_eq!(
+            found,
+            [("skip", false), ("helpers", false), ("inline", true)]
+        );
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(test_only_sources().contains(&root.join("src/testskip.rs")));
+    }
 }

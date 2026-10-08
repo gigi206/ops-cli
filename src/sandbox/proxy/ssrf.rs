@@ -382,9 +382,7 @@ mod tests {
             ("proxy/cleartext.rs", include_str!("cleartext.rs")),
             ("proxy/splice.rs", include_str!("splice.rs")),
         ] {
-            let production = source
-                .rsplit_once("#[cfg(test)]")
-                .map_or(source, |(before, _)| before);
+            let production = crate::testutil::production_half(source);
             assert_eq!(
                 production.matches("TcpStream::connect(").count(),
                 0,

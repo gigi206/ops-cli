@@ -605,12 +605,12 @@ fn no_production_code_applies_a_layer_outside_the_unpacks_process() {
         let text = std::fs::read_to_string(&file).unwrap_or_default();
         let production = crate::testutil::production_half(&text);
         let relative = file.display().to_string().replacen(&root, "", 1);
-        if crate::testutil::calls_function(production, "layers::apply(") {
+        if crate::testutil::calls_function(&production, "layers::apply(") {
             appliers.push(relative.clone());
         }
         if relative == "src/sandbox/distro/store.rs" {
             store_goes_through_the_cage =
-                crate::testutil::calls_function(production, "unpack::apply(");
+                crate::testutil::calls_function(&production, "unpack::apply(");
         }
     }
     assert_eq!(

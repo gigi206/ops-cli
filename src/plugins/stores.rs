@@ -1423,9 +1423,7 @@ mod tests {
     #[test]
     fn every_repo_pubkey_reader_is_named_in_its_doc() {
         let source = include_str!("stores.rs");
-        let production = source
-            .rsplit_once("#[cfg(test)]")
-            .map_or(source, |(before, _)| before);
+        let production = crate::testutil::production_half(source);
         let calls = production.matches("read_repo_pubkey(").count() - 1; // minus the definition
         assert_eq!(
             calls, 4,

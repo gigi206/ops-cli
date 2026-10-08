@@ -394,9 +394,7 @@ fn no_raw_diagnostic_names_an_identifier_it_cannot_style() {
         ("launch/session.rs", include_str!("session.rs")),
         ("launch/detach.rs", include_str!("detach.rs")),
     ] {
-        let production = source
-            .rsplit_once("#[cfg(test)]")
-            .map_or(source, |(before, _)| before);
+        let production = crate::testutil::production_half(source);
         let lines: Vec<&str> = production.lines().collect();
         for (i, line) in lines.iter().enumerate() {
             if !line.trim_start().starts_with("errln!(") {
@@ -810,7 +808,7 @@ fn nothing_on_the_launch_path_maps_the_cage_to_root() {
     let text = std::fs::read_to_string("src/sandbox/launch/build.rs").expect("the launch path");
     let production = crate::testutil::production_half(&text);
     assert!(
-        !crate::testutil::calls_function(production, ".as_root("),
+        !crate::testutil::calls_function(&production, ".as_root("),
         "this file now maps a cage to uid 0; `holder_plan` is called with a hard-coded \
              `false` and would silently give that cage the holder. Thread the real value in."
     );
