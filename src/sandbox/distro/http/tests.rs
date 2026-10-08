@@ -48,23 +48,34 @@ fn a_control_byte_in_a_request_part_is_refused_before_a_byte_is_written() {
         target: target.to_string(),
     };
 
-    for (u, hs) in [
-        (url("r.test", "/v2/\nGET /other HTTP/1.1"), vec![]),
-        (url("r.test\nX-Injected: 1", "/v2/"), vec![]),
-        (
-            url("r.test", "/v2/"),
-            vec![("Authorization", "Bearer a\nX-Injected: 1")],
-        ),
-        (url("r.test", "/v2/"), vec![("X-A\nX-B", "v")]),
-    ] {
-        let w = wire();
-        let seen = std::rc::Rc::clone(&w.written);
-        let err = send(w, &u, &hs, "GET").expect_err("a control byte must be refused");
-        assert!(err.to_string().contains("control character"), "{err}");
-        assert!(
-            seen.borrow().is_empty(),
-            "the refusal lands before a byte reaches the wire"
-        );
+    // Every control character, C0, DEL and C1 alike, in each of the four parts a request is
+    // composed from.
+    for c in ["\n", "\r", "\0", "\x1f", "\x7f", "\t", "\u{85}"] {
+        let target = format!("/v2/{c}GET /other HTTP/1.1");
+        let host = format!("r.test{c}X-Injected: 1");
+        let value = format!("Bearer a{c}X-Injected: 1");
+        let name = format!("X-A{c}X-B");
+        for (u, hs) in [
+            (url("r.test", &target), vec![]),
+            (url(&host, "/v2/"), vec![]),
+            (
+                url("r.test", "/v2/"),
+                vec![("Authorization", value.as_str())],
+            ),
+            (url("r.test", "/v2/"), vec![(name.as_str(), "v")]),
+        ] {
+            let w = wire();
+            let seen = std::rc::Rc::clone(&w.written);
+            let err = send(w, &u, &hs, "GET").expect_err("a control byte must be refused");
+            assert!(
+                err.to_string().contains("control character"),
+                "{c:?}: {err}"
+            );
+            assert!(
+                seen.borrow().is_empty(),
+                "the refusal lands before a byte reaches the wire"
+            );
+        }
     }
 
     // Witness: the ordinary shape still composes, and the header rides where it belongs.
@@ -77,7 +88,7 @@ fn a_control_byte_in_a_request_part_is_refused_before_a_byte_is_written() {
         "GET",
     )
     .expect("an ordinary request composes");
-    let text = String::from_utf8(seen.borrow().clone()).unwrap();
+    let text = String::from_utf8(seen.borrow().clone()).expect("the request is ASCII");
     assert!(
         text.starts_with("GET /v2/library/debian/manifests/10 HTTP/1.1\r\n"),
         "{text}"
@@ -99,7 +110,7 @@ fn the_host_header_carries_the_port_when_it_is_not_the_default() {
         let w = wire();
         let seen = std::rc::Rc::clone(&w.written);
         send(w, u, &[], "GET").expect("an ordinary request composes");
-        String::from_utf8(seen.borrow().clone()).unwrap()
+        String::from_utf8(seen.borrow().clone()).expect("the request is ASCII")
     };
 
     let text = sent(&parse_url("https://localhost:5000/v2/x/manifests/1").unwrap());
@@ -173,16 +184,19 @@ fn a_redirect_out_of_tls_is_refused_rather_than_followed() {
 
 #[test]
 fn an_absolute_https_redirect_is_followed_and_a_rooted_one_is_resolved() {
-    let target = redirect_target(
-        302,
-        &headers(&[("location", "https://cdn.example.com/blob?sig=1")]),
-        "https://registry-1.docker.io/v2/x/blobs/sha256:0",
-    )
-    .unwrap();
-    assert_eq!(
-        target.as_deref(),
-        Some("https://cdn.example.com/blob?sig=1")
-    );
+    for status in [301u16, 302, 303, 307, 308] {
+        let target = redirect_target(
+            status,
+            &headers(&[("location", "https://cdn.example.com/blob?sig=1")]),
+            "https://registry-1.docker.io/v2/x/blobs/sha256:0",
+        )
+        .unwrap();
+        assert_eq!(
+            target.as_deref(),
+            Some("https://cdn.example.com/blob?sig=1"),
+            "{status} is a redirect"
+        );
+    }
 
     // A rooted relative target resolves against the current origin, port included.
     let target = redirect_target(
@@ -216,7 +230,7 @@ fn a_redirect_that_names_nowhere_is_an_error_not_a_body() {
 
 #[test]
 fn a_status_that_is_not_a_redirect_yields_no_target() {
-    for status in [200u16, 201, 401, 404, 500] {
+    for status in [200u16, 201, 300, 304, 305, 306, 401, 404, 500] {
         assert!(
             redirect_target(
                 status,
@@ -396,10 +410,13 @@ fn a_blob_and_a_document_are_read_to_one_chunked_grammar() {
         let mut sink = Vec::new();
         let streamed = stream_body(&mut &wire[..], chunked, &mut sink, 1024).map(|_| sink);
         let held = wire::read_chunked_body(&mut &wire[..], 1024);
-        (streamed.ok(), held.ok())
+        (streamed, held)
     };
-    let whole = Some(b"abc".to_vec());
-    assert_eq!(both(b"3\r\nabc\r\n0\r\n\r\n"), (whole.clone(), whole));
+    let (streamed, held) = both(b"3\r\nabc\r\n0\r\n\r\n");
+    assert_eq!(
+        (streamed.ok(), held.ok()),
+        (Some(b"abc".to_vec()), Some(b"abc".to_vec()))
+    );
     for wire in [
         &b"+3\r\nabc\r\n0\r\n\r\n"[..],
         " 3\r\nabc\r\n0\r\n\r\n".as_bytes(),
@@ -409,12 +426,16 @@ fn a_blob_and_a_document_are_read_to_one_chunked_grammar() {
         b"3\r\nabc\r\n0\r\n",
         b"3\r\nabc\r\n0\r\nx: y",
     ] {
-        assert_eq!(
-            both(wire),
-            (None, None),
-            "{:?}",
-            String::from_utf8_lossy(wire)
+        // Both refuse it for its framing, not one of them for some other cause.
+        let shown = String::from_utf8_lossy(wire);
+        let (streamed, held) = both(wire);
+        let streamed = streamed.expect_err(&shown);
+        let held = held.expect_err(&shown);
+        assert!(
+            streamed.to_string().contains("malformed chunked"),
+            "{shown:?}: {streamed}"
         );
+        assert_eq!(held.kind(), io::ErrorKind::InvalidData, "{shown:?}: {held}");
     }
 }
 
