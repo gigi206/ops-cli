@@ -260,11 +260,11 @@ pub(super) fn validate_task(
     // control, each with a different unmatched default.
     for field in ["allow", "deny"] {
         let declared = if field == "allow" {
-            &raw.allow
+            raw.allow.is_some()
         } else {
-            &raw.deny
+            raw.deny.is_some()
         };
-        if !declared.is_empty() {
+        if declared {
             return Err(format!(
                 "`{field}` is not a task control — what a task's command may run beside itself is \
                  declared by `spawn`, and what else bounds a task is its fixed `cmd`, the `params` \
@@ -1409,6 +1409,26 @@ mod tests {
         }
     }
 
+    /// A node's `spawn` written with the wrong type is dropped by the layer's recovery, and what is
+    /// left is a node that declares nothing — which refuses the task. The drop narrows: nothing
+    /// that node would have granted runs.
+    #[test]
+    fn a_mistyped_node_spawn_refuses_the_task_rather_than_widening_it() {
+        let text = "[task.t]\ncmd = [\"make\"]\nspawn = [\"git\"]\n[task.t.exec.git]\nspawn = 5\n";
+        let mut dropped = Vec::new();
+        let cfg = crate::config::schema::parse_layer(text.as_bytes(), &mut dropped)
+            .expect("the layer loads");
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        let raw = cfg
+            .task
+            .expect("the task section")
+            .tasks
+            .remove("t")
+            .expect("the task");
+        let err = validate(raw).expect_err("a node with nothing declared refuses the task");
+        assert!(err.contains("declares nothing"), "{err}");
+    }
+
     #[test]
     fn an_exec_policy_on_a_task_is_refused_rather_than_ignored() {
         // Unknown keys are ignored by design, so a security-shaped key sbx does not honour has to be
@@ -1416,9 +1436,12 @@ mod tests {
         for (label, apply) in [
             (
                 "allow",
-                (|r: &mut RawTask| r.allow = vec!["/bin/sh".into()]) as fn(&mut RawTask),
+                (|r: &mut RawTask| r.allow = Some(crate::config::schema::RawIgnored))
+                    as fn(&mut RawTask),
             ),
-            ("deny", |r: &mut RawTask| r.deny = vec!["curl".into()]),
+            ("deny", |r: &mut RawTask| {
+                r.deny = Some(crate::config::schema::RawIgnored)
+            }),
         ] {
             let mut raw = raw_task();
             apply(&mut raw);

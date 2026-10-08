@@ -54,7 +54,7 @@ See also: [Declared operations](../tasks/) · [`sbx task`](../cli/task) · [`[se
 | `unmask` | the [`[fs] deny`](fs#opening-a-path-for-one-operation) paths **this** task may read, and it alone |
 
 `allow` and `deny` are **not** task controls, and a declaration carrying either is refused
-rather than ignored: they are `[proc]`'s key names, and a task's command is bounded by
+rather than ignored, whatever the value (an empty list and a mistyped one included): they are `[proc]`'s key names, and a task's command is bounded by
 something else entirely, its fixed `cmd`, its `params` patterns, `spawn` for what it may run
 beside itself, and a cage with no network unless `network` declares one. Two spellings of one
 control, each with a different unmatched default, is the outcome the refusal avoids.

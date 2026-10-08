@@ -1781,11 +1781,15 @@ pub(crate) struct RawTask {
     /// Present only so a task declaring them is **refused** rather than parsing into silence. Since
     /// unknown keys are ignored by design, a key shaped like a control has to exist here to be
     /// rejected at all.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) allow: Vec<String>,
+    ///
+    /// Any shape is taken ([`RawIgnored`]), for the reason that type gives: as a list of strings,
+    /// `deny = "curl"` was a type error, and recovery dropped the key with a notice — so the task
+    /// that a correctly typed `deny` refuses ran instead, with nothing restricting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) allow: Option<RawIgnored>,
     /// Refused for the same reason as `allow`, and present for the same reason.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) deny: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) deny: Option<RawIgnored>,
     /// The egress this task's cage gets, as allowlist entries. Empty (the default) means an empty
     /// network namespace with no proxy at all. A task's rules are its own: they are served by a
     /// per-invocation proxy, never by the session's, so a task credential is unreachable from the
@@ -2401,8 +2405,12 @@ fn locate_type_error<T: serde::de::DeserializeOwned>(
             // The two are told apart by emptying the table: if the document parses without its
             // children, the children were the mistake and the correct ones among them would be
             // collateral; if it still does not, the table itself is.
+            // Last first: removing an element of an array of tables renumbers the ones after it.
             let mut emptied = doc.clone();
-            let cleared = keys.iter().all(|key| remove_at(&mut emptied, &path, key));
+            let cleared = keys
+                .iter()
+                .rev()
+                .all(|key| remove_at(&mut emptied, &path, key));
             if cleared && budget.parse::<T>(&emptied)?.is_ok() {
                 return None;
             }
@@ -2419,55 +2427,125 @@ fn locate_type_error<T: serde::de::DeserializeOwned>(
     Some((path, line))
 }
 
-/// A located path as a TOML reader would write it: the steps joined with `.`, and a step carrying a
-/// `.` of its own quoted, so `[secret."api.github.com"]` reads as the one key it is rather than as
-/// three nested tables.
+/// A located path as a TOML reader would write it: each key spelled as TOML spells it — bare where
+/// it can be, quoted and escaped where it cannot, so `[secret."api.github.com"]` reads as the one key
+/// it is rather than as three nested tables, and a key holding a quote stays one key — joined with
+/// `.`. An element of an array of tables is written after its key as `[n]`.
 fn render_path(path: &[String]) -> String {
-    path.iter()
-        .map(|step| {
-            if step.contains('.') {
-                format!("\"{step}\"")
-            } else {
-                step.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-/// The keys of the table at `path`, or `None` when the path does not lead to one.
-fn keys_at(doc: &toml_edit::DocumentMut, path: &[String]) -> Option<Vec<String>> {
-    let mut table = doc.as_table() as &dyn toml_edit::TableLike;
+    let mut out = String::new();
     for step in path {
-        table = table.get(step)?.as_table_like()?;
+        if element_index(step).is_some() {
+            out.push_str(step);
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(&toml_edit::Key::new(step.as_str()).display_repr());
     }
-    Some(table.iter().map(|(k, _)| k.to_string()).collect())
+    out
 }
 
-/// Remove `key` from the table at `path`. False when the path or the key is not there.
-fn remove_at(doc: &mut toml_edit::DocumentMut, path: &[String], key: &str) -> bool {
-    let mut table = doc.as_table_mut() as &mut dyn toml_edit::TableLike;
-    for step in path {
-        match table
-            .get_mut(step)
-            .and_then(|item| item.as_table_like_mut())
-        {
-            Some(next) => table = next,
-            None => return false,
+/// The index a path step names, when it names an element of an array of tables (`[n]`).
+///
+/// Spelled with brackets so that the step can be told apart from a key named by digits, which is
+/// what a table may hold: which of the two a step means is decided by the item it is taken from.
+fn element_index(step: &str) -> Option<usize> {
+    step.strip_prefix('[')?.strip_suffix(']')?.parse().ok()
+}
+
+/// One place on a path through a document: a table, or an array of tables whose elements are
+/// addressed by [`element_index`].
+enum Node<'a> {
+    Table(&'a dyn toml_edit::TableLike),
+    Tables(&'a toml_edit::ArrayOfTables),
+}
+
+impl<'a> Node<'a> {
+    /// The node `step` leads to from here, or `None` when it leads to a value or nowhere.
+    fn step(self, step: &str) -> Option<Node<'a>> {
+        match self {
+            Node::Table(table) => node_of(table.get(step)?),
+            Node::Tables(tables) => Some(Node::Table(tables.get(element_index(step)?)?)),
         }
     }
-    table.remove(key).is_some()
+}
+
+/// The node `item` is, when it is a table or an array of tables.
+fn node_of(item: &toml_edit::Item) -> Option<Node<'_>> {
+    match item {
+        toml_edit::Item::ArrayOfTables(tables) => Some(Node::Tables(tables)),
+        other => other.as_table_like().map(Node::Table),
+    }
+}
+
+/// The keys of the table at `path`, or `None` when the path does not lead to one. An array of
+/// tables answers with its elements, as `[n]` steps.
+///
+/// Descending into the array is what keeps one mistyped element from costing its siblings: in
+/// `[[secret."host"]]`, the search used to stop at the host, and the removal then took every
+/// credential declared for it, where the same mistake in a single `[secret."host"]` costs one field.
+fn keys_at(doc: &toml_edit::DocumentMut, path: &[String]) -> Option<Vec<String>> {
+    let mut node = Node::Table(doc.as_table());
+    for step in path {
+        node = node.step(step)?;
+    }
+    Some(match node {
+        Node::Table(table) => table.iter().map(|(k, _)| k.to_string()).collect(),
+        Node::Tables(tables) => (0..tables.len()).map(|i| format!("[{i}]")).collect(),
+    })
+}
+
+/// Remove `key` from the table at `path`, or the element `key` names from the array of tables
+/// there. False when the path or the key is not there.
+fn remove_at(doc: &mut toml_edit::DocumentMut, path: &[String], key: &str) -> bool {
+    remove_in_table(doc.as_table_mut(), path, key)
+}
+
+/// [`remove_at`] from `table` down: `path` is what is left of the way to the key.
+fn remove_in_table(table: &mut dyn toml_edit::TableLike, path: &[String], key: &str) -> bool {
+    match path.split_first() {
+        None => table.remove(key).is_some(),
+        Some((step, rest)) => table
+            .get_mut(step)
+            .is_some_and(|item| remove_in_item(item, rest, key)),
+    }
+}
+
+/// [`remove_at`] from `item` down, which may be an array of tables addressed by [`element_index`].
+fn remove_in_item(item: &mut toml_edit::Item, path: &[String], key: &str) -> bool {
+    match item {
+        toml_edit::Item::ArrayOfTables(tables) => match path.split_first() {
+            None => match element_index(key) {
+                Some(i) if i < tables.len() => {
+                    tables.remove(i);
+                    true
+                }
+                _ => false,
+            },
+            Some((step, rest)) => element_index(step)
+                .and_then(|i| tables.get_mut(i))
+                .is_some_and(|table| remove_in_table(table, rest, key)),
+        },
+        other => other
+            .as_table_like_mut()
+            .is_some_and(|table| remove_in_table(table, path, key)),
+    }
 }
 
 /// The 1-based line `path` is written on, read from a span-preserving parse of the same text.
 fn line_of(text: &str, path: &[String]) -> Option<usize> {
     let doc = toml_edit::Document::parse(text).ok()?;
-    let mut item = doc.as_item();
-    for step in path {
-        item = item.as_table_like()?.get(step)?;
+    let (last, parents) = path.split_last()?;
+    let mut node = Node::Table(doc.as_table());
+    for step in parents {
+        node = node.step(step)?;
     }
-    let start = item.span()?.start;
-    Some(text.get(..start)?.matches('\n').count() + 1)
+    let span = match node {
+        Node::Table(table) => table.get(last)?.span()?,
+        Node::Tables(tables) => tables.get(element_index(last)?)?.span()?,
+    };
+    Some(text.get(..span.start)?.matches('\n').count() + 1)
 }
 
 /// Append the located key to a parse error, when one can be found within `budget`.
@@ -2981,6 +3059,115 @@ allow = \"github.com\"
         assert!(dropped[0].contains("proc.allow"), "{dropped:?}");
     }
 
+    /// A task's `allow` and `deny` reach the task's refusal whatever their shape. As a list of
+    /// strings, `deny = "curl"` was a type error: recovery dropped the key with a notice, and the
+    /// task that a correctly typed `deny` refuses ran instead.
+    #[test]
+    fn a_tasks_exec_policy_key_of_any_shape_is_kept_for_its_refusal() {
+        for value in ["\"curl\"", "5", "{}", "[]", "[\"curl\"]"] {
+            for key in ["allow", "deny"] {
+                let text = format!(
+                    "[env]\nKEEPME = \"yes\"\n[task.t]\ncmd = [\"make\"]\n{key} = {value}\n"
+                );
+                let mut dropped = Vec::new();
+                let cfg = parse_layer(text.as_bytes(), &mut dropped).expect("the layer loads");
+                assert!(
+                    dropped.is_empty(),
+                    "`{key} = {value}` was dropped: {dropped:?}"
+                );
+                let task = &cfg.task.as_ref().expect("the task section").tasks["t"];
+                let kept = if key == "allow" {
+                    task.allow.is_some()
+                } else {
+                    task.deny.is_some()
+                };
+                assert!(kept, "`{key} = {value}` must reach the task's refusal");
+                assert_eq!(cfg.env.get("KEEPME").map(String::as_str), Some("yes"));
+            }
+        }
+    }
+
+    /// A key that TOML must quote is named the way TOML quotes it, so the path in a notice reads
+    /// back as the keys it names: a quote inside a key used to close the quoting around it.
+    #[test]
+    fn a_dropped_path_quotes_a_key_the_way_toml_does() {
+        let text = "[env]\nA = \"1\"\n[secret.\"a\\\"b.c\"]\nfrom = 5\n";
+        let mut dropped = Vec::new();
+        parse_layer(text.as_bytes(), &mut dropped).expect("the layer loads");
+        assert_eq!(
+            dropped,
+            ["ignoring `secret.'a\"b.c'.from` (line 4): it is not the type this field takes"]
+        );
+        assert_eq!(
+            render_path(&["plain".into(), "api.github.com".into()]),
+            "plain.\"api.github.com\""
+        );
+    }
+
+    /// One mistyped element of an array of tables costs that element's field, not its siblings.
+    /// The search stopped at the array's key, and the removal took every credential declared for
+    /// the host, where the same mistake in a single `[secret."host"]` costs one field.
+    #[test]
+    fn a_mistyped_element_of_an_array_of_tables_spares_its_siblings() {
+        let text = "\
+[env]
+A = \"1\"
+[[secret.\"h.example\"]]
+key = \"a\"
+header = \"X-A\"
+type = \"raw\"
+[[secret.\"h.example\"]]
+key = 5
+header = \"X-B\"
+type = \"raw\"
+";
+        let mut dropped = Vec::new();
+        let cfg = parse_layer(text.as_bytes(), &mut dropped).expect("the layer loads");
+        assert_eq!(
+            dropped,
+            [
+                "ignoring `secret.\"h.example\"[1].key` (line 8): it is not the type this field takes"
+            ]
+        );
+        let hosts = &cfg.secret.as_ref().expect("the secret section").hosts;
+        let Some(RawHostSecrets::Many(entries)) = hosts.get("h.example") else {
+            panic!("both entries survive as an array: {hosts:?}");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].key.as_deref(),
+            Some("a"),
+            "the sound sibling is kept whole"
+        );
+        assert_eq!(
+            entries[1].header.as_deref(),
+            Some("X-B"),
+            "and so is the rest of its own element"
+        );
+        assert_eq!(entries[1].key, None);
+    }
+
+    /// Two mistyped elements of one array of tables cost the file, as two mistakes anywhere do. The
+    /// test that tells them apart from a mis-shaped array empties it, last element first: removing
+    /// the first renumbers the rest, and a forward walk then found no `[1]` to remove, read the
+    /// array as the mistake and dropped every credential of the host.
+    #[test]
+    fn two_mistyped_elements_of_an_array_of_tables_cost_the_file() {
+        let text = "\
+[env]
+A = \"1\"
+[[secret.\"h.example\"]]
+key = 5
+header = \"X-A\"
+[[secret.\"h.example\"]]
+key = 6
+header = \"X-B\"
+";
+        let mut dropped = Vec::new();
+        assert!(parse_layer(text.as_bytes(), &mut dropped).is_err());
+        assert!(dropped.is_empty(), "{dropped:?}");
+    }
+
     /// A mistyped restriction costs the file, not the restriction. Recovery drops the value at fault
     /// and keeps the rest, which for a `deny` list, a `scan` or a task's `spawn` is the permissive
     /// direction, and for a posture leaves the layer below in force: `proc.deny = ["sh", 5]`
@@ -3005,6 +3192,8 @@ allow = \"github.com\"
                 "network.deny",
             ),
             ("[ssh_agent]\nconfirm = \"yes\"\n", "ssh_agent.confirm"),
+            ("[fs]\ngit_writable = \"no\"\n", "fs.git_writable"),
+            ("[task.defaults]\nnonce = \"yes\"\n", "task.defaults.nonce"),
             (
                 "[task.t]\ncmd = [\"make\"]\nspawn = [\"git\", 5]\n",
                 "task.t.spawn",
@@ -3365,12 +3554,13 @@ mod layer_properties {
             ["proc"]
                 | ["proc", "mode" | "deny"]
                 | ["fs"]
-                | ["fs", "deny" | "readonly" | "scan"]
+                | ["fs", "deny" | "readonly" | "scan" | "git_writable"]
                 | ["network"]
                 | ["network", "mode" | "deny" | "websocket_secret"]
                 | ["gui" | "gpu" | "audio" | "dbus" | "allow_insecure_http"]
                 | ["ssh_agent", "confirm"]
                 | ["task", _, "spawn"]
+                | ["task", "defaults", "nonce"]
         )
     }
 
