@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::cagepath::{caller_proc_path, open_target_path, proc_self_behind_a_link};
+use super::cagepath::{cage_spelling, caller_proc_path, open_target_path, proc_self_behind_a_link};
 use super::notify::{notif_of, respond_continue, respond_errno};
 use super::open_serve::{Creation, serve_creation, serve_open};
 use super::report::Undecidable;
@@ -655,8 +655,8 @@ fn probe_from_the_cage_root(pid: u32, path: &str) -> Option<std::fs::File> {
     }
     // `self` and `thread-self` are answered with whoever performs the lookup, so they are named
     // outright here as they are everywhere else a cage's spelling is walked from outside it.
-    let named = caller_proc_path(pid, path);
-    let fd = probe_in_cage_root(pid, Path::new(named.as_deref().unwrap_or(path))).ok()?;
+    let named = cage_spelling(pid, path)?;
+    let fd = probe_in_cage_root(pid, Path::new(named.as_ref())).ok()?;
     // SAFETY: fd is a fresh owned descriptor; the File takes sole ownership and closes it.
     Some(unsafe { std::fs::File::from_raw_fd(fd) })
 }

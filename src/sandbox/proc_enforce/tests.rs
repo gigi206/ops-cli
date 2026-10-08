@@ -558,6 +558,15 @@ fn self_and_thread_self_are_rewritten_to_the_caller_and_nothing_else_is() {
         Some(format!("/proc/{tgid}").as_str()),
         "the directory itself is named too, not only what is under it"
     );
+    // The kernel walks a doubled slash or a `.` component to the same entry, so the cage reaches its
+    // own `/proc` entry through these spellings too.
+    for spelled in ["/proc//self/maps", "/proc/./self/maps", "//proc/self/maps"] {
+        assert_eq!(
+            caller_proc_path(me, spelled).as_deref(),
+            Some(format!("/proc/{tgid}/maps").as_str()),
+            "`{spelled}` names the caller's thread group"
+        );
+    }
     // The prefix has to end where the component does, or a neighbouring name is captured with
     // it and the caller's own entry is served for a file that was never theirs.
     for untouched in [
@@ -638,12 +647,36 @@ fn the_dev_links_arrive_at_the_callers_own_entry() {
 }
 
 #[test]
+fn a_chain_of_links_is_followed_as_far_as_the_kernel_would() {
+    // The cage's own open follows a chain up to the kernel's limit, so a chain shorter than that
+    // which ends at `self` has to end there here too.
+    let me = std::process::id();
+    let dir = TmpDir::new();
+    let mut previous = std::path::PathBuf::from("/dev/stdout");
+    for hop in 0..20 {
+        let link = dir.join(&format!("hop{hop}"));
+        std::os::unix::fs::symlink(&previous, &link).expect("plant a hop");
+        previous = link;
+    }
+    assert_eq!(
+        proc_self_behind_a_link(me, libc::AT_FDCWD, previous.to_str().expect("utf-8")).as_deref(),
+        Some("/proc/self/fd/1"),
+        "twenty hops are within what the kernel follows"
+    );
+}
+
+#[test]
 fn the_umask_line_is_read_as_the_octal_it_is_written_in() {
     // `status` writes the mask in octal without a prefix, so reading it as decimal turns `0022`
     // into eighteen — a mask that clears bits nobody asked to clear, silently.
     assert_eq!(umask_of("Name:\tsh\nUmask:\t0022\nTgid:\t1\n"), Some(0o022));
     assert_eq!(umask_of("Umask:\t0077\n"), Some(0o077));
     assert_eq!(umask_of("Umask:\t0000\n"), Some(0));
+    assert_eq!(
+        umask_of("Umask:\t01000\n"),
+        None,
+        "a value outside the permission bits is not a mask the kernel writes"
+    );
     assert_eq!(
         umask_of("Name:\tsh\nTgid:\t1\n"),
         None,

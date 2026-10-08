@@ -172,7 +172,7 @@ pub(crate) use open_lens::open_probe;
 pub(crate) use overlay::ProcOverlay;
 pub(crate) use pending::PendingExec;
 
-use cagepath::{caller_proc_path, names_caller_descriptor, open_target_path};
+use cagepath::{cage_spelling, caller_proc_path, names_caller_descriptor, open_target_path};
 use notify::{
     notif_id_valid, notif_of, notif_recv_code, poll_events, poll_readable, recv_fd,
     respond_continue, respond_errno,
@@ -847,8 +847,10 @@ fn reached_in_cage(pid: u32, path: &str) -> bool {
     }
     // `self` names whoever resolves it, and that is this process rather than the cage's task, so it
     // is spelled out first -- the same rewrite the read of an exec target and a refusal both make.
-    let named = caller_proc_path(pid, path);
-    match probe_in_cage_root(pid, Path::new(named.as_deref().unwrap_or(path))) {
+    let Some(named) = cage_spelling(pid, path) else {
+        return false;
+    };
+    match probe_in_cage_root(pid, Path::new(named.as_ref())) {
         Ok(fd) => {
             // SAFETY: fd is this call's own descriptor, returned by the probe and closed once.
             // Nothing is read through it -- the question was whether it could be opened at all.
@@ -1517,9 +1519,11 @@ fn refusal_errno(pid: u32, path: &str) -> libc::c_int {
     if path.ends_with(" (deleted)") {
         return libc::EPERM;
     }
-    let named = caller_proc_path(pid, path);
-    let path = named.as_deref().unwrap_or(path);
-    match probe_in_cage_root(pid, Path::new(path)) {
+    // A caller whose ids cannot be read leaves nothing to ask about, which takes the stricter answer.
+    let Some(path) = cage_spelling(pid, path) else {
+        return libc::EPERM;
+    };
+    match probe_in_cage_root(pid, Path::new(path.as_ref())) {
         Ok(fd) => {
             // SAFETY: fd is this call's own descriptor, returned by the probe and closed once.
             // Nothing is read through it -- the question was whether it could be opened at all.

@@ -4,6 +4,7 @@
 //! rewrite; the `/dev/stdout`-class link chase; and the two `/proc/<pid>/status` parsers those
 //! need. One question answered in one place, touching neither policy nor the content lens.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 /// Replace the shortest prefix of `path` that is a symlink with what it points at.
@@ -41,10 +42,11 @@ pub(super) fn splice_first_link(pid: u32, dirfd: libc::c_int, path: &str) -> Opt
 /// act on them, and a kernel asked to follow them resolves `self` against whoever is asking — this
 /// process. The links are therefore read here rather than followed.
 ///
-/// The hop count only has to outlast what a `/dev` entry uses; the kernel gives up at forty.
+/// The hop count is the kernel's own (`MAXSYMLINKS`), so a chain the cage's open would follow to
+/// the end is followed to the end here too.
 pub(super) fn proc_self_behind_a_link(pid: u32, dirfd: libc::c_int, path: &str) -> Option<String> {
     let mut here = splice_first_link(pid, dirfd, path)?;
-    for _ in 0..8 {
+    for _ in 0..40 {
         if caller_proc_path(pid, &here).is_some() {
             return Some(here);
         }
@@ -70,6 +72,7 @@ pub(super) fn caller_umask(pid: u32) -> Option<u32> {
 /// The `Umask` line of a `status` file, read as the octal it is written in.
 ///
 /// Apart from the read so the parse can be pinned on a literal, like [`innermost_ids`] next door.
+/// A value outside the permission bits is no umask the kernel writes, and answers nothing.
 pub(super) fn umask_of(status: &str) -> Option<u32> {
     u32::from_str_radix(
         status
@@ -79,6 +82,7 @@ pub(super) fn umask_of(status: &str) -> Option<u32> {
         8,
     )
     .ok()
+    .filter(|mask| *mask <= 0o777)
 }
 
 /// The innermost `NStgid`/`NSpid` a `status` file carries.
@@ -123,18 +127,54 @@ pub(super) fn caller_proc_path(pid: u32, path: &str) -> Option<String> {
     })
 }
 
+/// `path` as a walk from outside the cage has to spell it: [`caller_proc_path`]'s rewrite where it
+/// names `self` or `thread-self`, and the path itself otherwise.
+///
+/// `None` where it names one of them but the caller's ids cannot be read. Left as written, such a
+/// path would be resolved against whoever walks it — the supervisor — so it names nothing instead.
+pub(super) fn cage_spelling(pid: u32, path: &str) -> Option<Cow<'_, str>> {
+    if own_entry_rest(path).is_none() {
+        return Some(Cow::Borrowed(path));
+    }
+    caller_proc_path(pid, path).map(Cow::Owned)
+}
+
 /// What follows the `/proc/self` or `/proc/thread-self` a path leads with, and which of the two it
 /// was — `None` where it leads with neither.
 ///
 /// Split out because two questions are asked of the same prefix: which entry the path means, and
 /// whether what it names inside that entry is the caller's own descriptor table.
+///
+/// The prefix is read component by component, so `/proc//self` and `/proc/./self` — which the
+/// kernel walks to the same entry — are recognised too. What follows the entry is returned as
+/// written, for the kernel to walk.
 fn own_entry_rest(path: &str) -> Option<(&str, bool)> {
-    let (rest, thread) = match path.strip_prefix("/proc/self") {
-        Some(rest) => (rest, false),
-        None => (path.strip_prefix("/proc/thread-self")?, true),
-    };
-    // `/proc/selfish` is not `/proc/self`.
-    (rest.is_empty() || rest.starts_with('/')).then_some((rest, thread))
+    if !path.starts_with('/') {
+        return None;
+    }
+    let (first, after) = next_component(path);
+    if first != "proc" {
+        return None;
+    }
+    // Whole components, so `/proc/selfish` is not `/proc/self`.
+    let (entry, rest) = next_component(after);
+    match entry {
+        "self" => Some((rest, false)),
+        "thread-self" => Some((rest, true)),
+        _ => None,
+    }
+}
+
+/// The first component of `path` and what follows it, past any empty or `.` components ahead of it.
+fn next_component(mut path: &str) -> (&str, &str) {
+    loop {
+        path = path.trim_start_matches('/');
+        match path.strip_prefix('.') {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => path = rest,
+            _ => break,
+        }
+    }
+    path.split_at(path.find('/').unwrap_or(path.len()))
 }
 
 /// Whether `path` names a descriptor in the caller's **own** table: `/proc/self/fd/<n>`, or the
@@ -165,6 +205,9 @@ pub(super) fn names_caller_descriptor(path: &str) -> bool {
 /// Concatenated rather than [`PathBuf::push`]ed, because pushing an absolute path *replaces* the
 /// prefix — which would silently turn a cage path into the supervisor's own view of it.
 ///
+/// A path naming `self` for a caller whose ids cannot be read ([`cage_spelling`]) yields an empty
+/// path, which opens nothing.
+///
 /// Pure construction: whether the result resolves, and to what, is what the caller's `open` finds
 /// out. Like [`super::target::read_exec_path`], nothing here closes the TOCTOU window on an
 /// *allow* — the path can be re-pointed after it is read, which is why only a refusal is sound
@@ -174,8 +217,9 @@ pub(super) fn open_target_path(pid: u32, dirfd: libc::c_int, path: &str) -> Path
         // `self` and `thread-self` mean the caller, and mean it only to whoever resolves them; a
         // walk from here would resolve them to this process, which is in neither of the cage's
         // namespaces. Named outright instead, so the walk reaches the caller's own entry.
-        let named = caller_proc_path(pid, path);
-        let path = named.as_deref().unwrap_or(path);
+        let Some(path) = cage_spelling(pid, path) else {
+            return PathBuf::new();
+        };
         return PathBuf::from(format!("/proc/{pid}/root{path}"));
     }
     let base = if dirfd == libc::AT_FDCWD {

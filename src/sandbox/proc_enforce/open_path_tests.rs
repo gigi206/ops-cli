@@ -210,6 +210,23 @@ fn an_absolute_path_is_read_through_the_targets_own_root() {
 }
 
 #[test]
+fn a_self_path_for_a_caller_whose_ids_cannot_be_read_names_nothing() {
+    // Left as written, `/proc/self` would be resolved against whoever walks it — the supervisor —
+    // and a host `/proc` would hand over the supervisor's own entry.
+    assert_eq!(cage_spelling(u32::MAX, "/proc/self/environ"), None);
+    assert_eq!(
+        open_target_path(u32::MAX, libc::AT_FDCWD, "/proc/self/environ"),
+        PathBuf::new(),
+        "a path that names nothing opens nothing"
+    );
+    assert_eq!(
+        cage_spelling(u32::MAX, "/etc/passwd").as_deref(),
+        Some("/etc/passwd"),
+        "a path that does not name `self` needs no ids"
+    );
+}
+
+#[test]
 fn a_relative_path_follows_the_descriptor_it_was_opened_against() {
     assert_eq!(
         open_target_path(42, libc::AT_FDCWD, "secrets/prod.key"),
