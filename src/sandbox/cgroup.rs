@@ -233,11 +233,11 @@ fn delegated_controllers() -> Vec<String> {
 /// with no user manager has no such directory, yields no controller, and degrades as it did before.
 ///
 /// **The limit, written because dropping a gate widens what the others carry.** The caller's own
-/// cgroup no longer stands between a launch and `systemd-run`, so the manager [`limiter`] dials
-/// ([`manager_answers`]) is what now separates the shape this comment used to exclude, a container that
+/// cgroup no longer stands between a launch and `systemd-run`, so the manager socket [`limiter`]
+/// looks for ([`manager_answers`]) is what now separates the shape this comment used to exclude, a container that
 /// bind-mounts the host's `/sys/fs/cgroup` and `/run/user/<uid>`, from a launch that execs a
-/// launcher no manager will answer. A socket that takes the connection but belongs to no manager able
-/// to register a scope is the residual, and it ends the launch at `systemd-run`, which names
+/// launcher no manager will answer. A socket that belongs to no manager able to register a scope is
+/// the residual, and it ends the launch at `systemd-run`, which names
 /// itself.
 fn controller_source(cgroup_path: &str, uid: u32) -> String {
     delegation_root(cgroup_path, uid)
@@ -323,29 +323,21 @@ fn limiter(limits: &Limits) -> Result<(PathBuf, Vec<String>), LimiterMiss> {
     Ok((systemd_run, props))
 }
 
-/// How long [`socket_answers`] waits for a socket to take a connection.
-const MANAGER_DIAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Whether the user manager under the runtime directory `runtime` takes a connection on its private
-/// socket, `systemd/private`, which is where `systemd-run --user` reaches it.
+/// Whether the user manager under the runtime directory `runtime` has its private socket,
+/// `systemd/private`, which is where `systemd-run --user` reaches it.
 ///
 /// The session bus beside it is not a way in. Measured on systemd 259: with `systemd/private`
 /// missing and `bus` answering, `systemd-run --user --scope` fails ("Failed to connect to user scope
 /// bus via local transport") without trying the bus, so a launch let through on the bus alone
 /// would stop there.
-fn manager_answers(runtime: &Path) -> bool {
-    socket_answers(&runtime.join("systemd/private"))
-}
-
-/// Whether the socket at `socket` takes a connection.
 ///
-/// A socket file is not a listener: a manager that crashed leaves its socket behind, and a path
-/// that is not a socket at all accepts nothing. Either would carry the launch as far as a
-/// `systemd-run` that cannot register the scope, and end it there. A connection is the question the
-/// launcher itself asks, so a refusal here is one it would have met; the wait is bounded, since a
-/// listener whose backlog is full holds a blocking connect for as long as it stays full.
-fn socket_answers(socket: &Path) -> bool {
-    super::broker::connect_unix_within(socket, MANAGER_DIAL).is_ok()
+/// The socket is looked at, not dialled: a connection closed before the manager's handshake ends is
+/// one the manager writes to its journal as failed, once per launch. A socket a crashed manager left
+/// behind is the residual, and it ends the launch at `systemd-run`, which names itself.
+fn manager_answers(runtime: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt as _;
+    std::fs::symlink_metadata(runtime.join("systemd/private"))
+        .is_ok_and(|meta| meta.file_type().is_socket())
 }
 
 /// Why [`limiter`] produced no launcher, carried back so `doctor` can say which of the four it
@@ -1873,40 +1865,30 @@ mod tests {
         assert_eq!(unit_slug("a b/$x"), "a-b-x");
     }
 
-    /// Only a socket that takes the connection counts: a missing path, a directory, and a socket
-    /// nothing listens on behind it all read as no manager.
-    #[test]
-    fn only_a_listening_socket_answers() {
-        let tmp = TmpDir::new();
-        assert!(!socket_answers(&tmp.join("missing")));
-        std::fs::create_dir(tmp.join("dir")).unwrap();
-        assert!(!socket_answers(&tmp.join("dir")));
-        drop(std::os::unix::net::UnixListener::bind(tmp.join("stale")).unwrap());
-        assert!(
-            tmp.join("stale").exists(),
-            "the socket file outlives its listener"
-        );
-        assert!(!socket_answers(&tmp.join("stale")));
-        let _live = std::os::unix::net::UnixListener::bind(tmp.join("live")).unwrap();
-        assert!(socket_answers(&tmp.join("live")));
-    }
-
     /// The manager is reached as `systemd-run --user` reaches it, on its private socket: the
-    /// session bus answering beside it is not enough.
+    /// session bus beside it is not enough, and neither is a path that is not a socket.
     #[test]
-    fn the_manager_answers_on_its_private_socket_and_not_the_bus() {
+    fn the_manager_is_its_private_socket_and_not_the_bus() {
         let tmp = TmpDir::new();
         let runtime = tmp.path();
         assert!(!manager_answers(runtime));
         let _bus = std::os::unix::net::UnixListener::bind(runtime.join("bus")).unwrap();
         assert!(
             !manager_answers(runtime),
-            "the bus alone does not answer for the manager"
+            "the bus alone does not stand for the manager"
         );
-        std::fs::create_dir(runtime.join("systemd")).unwrap();
+        std::fs::create_dir_all(runtime.join("systemd/private")).unwrap();
+        assert!(
+            !manager_answers(runtime),
+            "a directory is not the manager's socket"
+        );
+        std::fs::remove_dir(runtime.join("systemd/private")).unwrap();
         let _private =
             std::os::unix::net::UnixListener::bind(runtime.join("systemd/private")).unwrap();
-        assert!(manager_answers(runtime), "the private socket answers");
+        assert!(
+            manager_answers(runtime),
+            "the private socket stands for the manager"
+        );
     }
 
     /// A refused live scope quotes what `systemd-run` said, on one line.
