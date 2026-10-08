@@ -322,6 +322,12 @@ impl SandboxSpec {
     /// unconditionally at argv time. The terminal session defaults to the
     /// non-interactive [`TerminalPolicy::NewSession`]; an interactive launcher
     /// opts into a private pty via [`SandboxSpec::with_private_tty`].
+    ///
+    /// The mount destinations are checked where the cage is composed instead
+    /// ([`SandboxSpec::unsound_destination`]), since mounts are still laid after this. Bubblewrap
+    /// refuses the rest before the command runs: a variable name that is empty or carries `=`, a
+    /// workdir the cage does not have, and an empty program. A NUL in the environment is refused
+    /// where the environment is written ([`super::argv::compose`]).
     pub(crate) fn new(
         workdir: PathBuf,
         mounts: Vec<Mount>,
@@ -426,6 +432,41 @@ impl SandboxSpec {
     pub(crate) fn with_held_sources(mut self, sources: Vec<HeldSource>) -> Self {
         self.held_sources = sources;
         self
+    }
+
+    /// The first mount destination that is relative, empty, or climbs above `/`, if any.
+    ///
+    /// Bubblewrap joins a destination onto the root it is building without resolving it, so a `..`
+    /// that climbs past that root (`/../tmp`, `../tmp`) lays the mount outside the cage and leaves
+    /// the path inside it as it was, and an empty one mounts over the whole root. Neither fails:
+    /// a tmpfs meant to hide a directory leaves it visible, and the cage runs. So
+    /// [`super::argv::compose`] refuses the spec instead, whatever laid the mount.
+    ///
+    /// A `..` that stays below `/` is kept: a base read from the environment can carry one
+    /// (`XDG_RUNTIME_DIR=/run/user/../user/1000`), and the mount lands where it names.
+    pub(crate) fn unsound_destination(&self) -> Option<&Path> {
+        self.mounts.iter().map(Mount::dest).find(|dest| {
+            let mut parts = dest.components();
+            if parts.next() != Some(std::path::Component::RootDir) {
+                return true;
+            }
+            let mut depth = 0usize;
+            !parts.all(|part| match part {
+                std::path::Component::Normal(_) => {
+                    depth += 1;
+                    true
+                }
+                std::path::Component::ParentDir => match depth.checked_sub(1) {
+                    Some(up) => {
+                        depth = up;
+                        true
+                    }
+                    None => false,
+                },
+                std::path::Component::CurDir => true,
+                std::path::Component::RootDir | std::path::Component::Prefix(_) => false,
+            })
+        })
     }
 
     /// For each mount, the held source bwrap mounts there from its descriptor, if any.

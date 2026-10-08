@@ -76,6 +76,16 @@ pub(crate) fn compose_with(
     spec: &SandboxSpec,
     status: Option<&File>,
 ) -> io::Result<CageCommand> {
+    if let Some(dest) = spec.unsound_destination() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to launch: the mount destination `{}` is relative, empty or climbs \
+                 above `/`, so the cage would not have it where it is named",
+                crate::diag::visible(&dest.to_string_lossy())
+            ),
+        ));
+    }
     let mut argv = to_argv(spec);
     // Each held bind source a mount takes travels as a copy of its descriptor, owned by the command
     // like the others, so the spec keeps its own and can be composed again; the list names the copy.
@@ -1050,6 +1060,41 @@ mod tests {
     /// one declared, which for a credential is worse than not running at all. Checked here rather
     /// than at config load because this is the single choke point every source passes through: a
     /// project's `[env]`, a resolver plugin's `allow_env` pass-through, and a resolved credential.
+    /// A mount destination that is relative, empty or climbs above `/` refuses the launch:
+    /// bubblewrap would lay it outside the cage's root, or over all of it, and run the cage anyway.
+    #[test]
+    fn a_mount_destination_that_climbs_or_is_relative_refuses_the_launch() {
+        for dest in ["/../tmp", "/tmp/../../etc", "../tmp", "tmp", ""] {
+            let mounted = spec(
+                vec![Mount::Tmpfs {
+                    dest: PathBuf::from(dest),
+                }],
+                Vec::new(),
+                NetPolicy::Shared,
+            );
+            let e = compose(Path::new("/bwrap"), &mounted).expect_err(dest);
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{dest:?}");
+            assert!(e.to_string().contains("mount destination"), "{e}");
+        }
+        // A doubled or trailing separator, a `.`, and a `..` that stays below `/` are kept.
+        for dest in [
+            "/",
+            "/tmp",
+            "/home//user/",
+            "/a/./b",
+            "/run/user/../user/1000",
+        ] {
+            let mounted = spec(
+                vec![Mount::Tmpfs {
+                    dest: PathBuf::from(dest),
+                }],
+                Vec::new(),
+                NetPolicy::Shared,
+            );
+            assert!(compose(Path::new("/bwrap"), &mounted).is_ok(), "{dest:?}");
+        }
+    }
+
     #[test]
     fn a_nul_in_the_environment_refuses_the_launch_rather_than_adding_bwrap_arguments() {
         let injected = "a\0--bind\0/home\0/home".to_string();
