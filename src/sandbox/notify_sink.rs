@@ -113,8 +113,9 @@ const DELIVER_DEADLINE: Duration = Duration::from_secs(5);
 ///
 /// A refusal fired in a session's last moments is still worth delivering, so the stop flag does
 /// not discard what is queued. But a daemon that answers each call just inside [`DELIVER_DEADLINE`]
-/// would hold a full queue's worth of those windows, so past this the rest is counted as dropped,
-/// which the teardown advisory reports, and the thread ends.
+/// would hold a full queue's worth of those windows, so once this has passed the rest is counted as
+/// dropped, which the teardown advisory reports, and the thread ends. The window is checked before
+/// each delivery, so the one under way when it runs out still completes.
 const TEARDOWN_DRAIN: Duration = Duration::from_secs(15);
 
 /// How often the delivery thread wakes to re-check the stop flag while the queue is empty.
@@ -1158,7 +1159,8 @@ impl Drop for Notifier {
         // bounded by the same window — and then the retry before the sink falls back to stderr. The
         // Windows path costs its session check once, bounded the same way, and otherwise nothing:
         // its toast is spawned and never waited for, and its stderr half has already landed. What
-        // is still queued behind that call is drained for at most `TEARDOWN_DRAIN`.
+        // is still queued behind that call is drained for `TEARDOWN_DRAIN`, plus the delivery under
+        // way when it runs out.
         self.stop.store(true, Ordering::Relaxed);
         self.tx = None;
         if let Some(h) = self.handle.take()
@@ -1214,12 +1216,20 @@ mod tests {
         let hung = tmp.join("powershell.exe");
         crate::testutil::write_script(&hung, "exec sleep 30");
         let bound = Duration::from_millis(300);
-        let started = std::time::Instant::now();
-        assert_eq!(toast_is_visible_through(&hung, bound), None);
+        // An attempt that met the `ETXTBSY` of a file just written answers at once without having
+        // waited, so only one that waited the bound out counts.
+        let waited = (0..50)
+            .find_map(|_| {
+                let started = std::time::Instant::now();
+                let answer = toast_is_visible_through(&hung, bound);
+                (started.elapsed() >= bound).then_some((answer, started.elapsed()))
+            })
+            .expect("the stand-in ran");
+        assert_eq!(waited.0, None);
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            waited.1 < Duration::from_secs(10),
             "the check waited {:?} on an interop that never answers",
-            started.elapsed()
+            waited.1
         );
 
         let answering = tmp.join("answering.exe");
