@@ -78,6 +78,11 @@ reason behind it; left alone, enough silent connections would fill the broker's 
 ceiling and leave the cage's own `ssh` with nothing to reach. Your agent is contacted only once
 a request has actually arrived, so such a connection never touches it at all.
 
+When your agent itself fails (it cannot be reached, or it stops answering mid-request), the cage
+is answered with a refusal and the failure is recorded, so a channel that stops working says why
+in `sbx ssh-agent logs`. A signature is recorded only when your agent actually returned one: an
+answer that is neither a signature nor a refusal reaches the cage as a refusal.
+
 Admission is re-derived from your agent on **every** request, so a key you `ssh-add -d`
 mid-session stops working immediately, and one you add mid-session is picked up without
 relaunching, provided the grant names it *and* the broker is running. If nothing matched

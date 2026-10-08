@@ -70,6 +70,9 @@ const IDENTITIES_ANSWER: u8 = 12;
 /// what admission is decided on.
 const SIGN_REQUEST: u8 = 13;
 
+/// The reply to [`SIGN_REQUEST`] that carries a signature. The only reply recorded as one.
+const SIGN_RESPONSE: u8 = 14;
+
 /// A named, open-ended extension request. Allowed for exactly one name ([`SESSION_BIND`]).
 const EXTENSION: u8 = 27;
 
@@ -155,11 +158,14 @@ impl Filter {
     }
 
     /// Whether this key may be seen and used by the cage.
+    ///
+    /// An empty entry admits nothing. The config drops one before it gets here, but compared as a
+    /// comment it would equal every key that has none, which is a grant of keys no entry names.
     pub(crate) fn admits(&self, id: &Identity) -> bool {
         let fingerprint = id.fingerprint();
-        self.allow
-            .iter()
-            .any(|entry| entry == &fingerprint || entry.as_str() == id.comment)
+        self.allow.iter().any(|entry| {
+            !entry.is_empty() && (entry == &fingerprint || entry.as_str() == id.comment)
+        })
     }
 }
 
@@ -555,15 +561,35 @@ fn respond<S: Read + Write>(
             let reply = exchange(host, request)?;
             // The host agent has the last word — a key loaded with `ssh-add -c` or `-h` can still
             // refuse here, and the record must say what happened rather than what was asked.
-            if reply.first() == Some(&FAILURE) {
-                conn.ring.push(
-                    AgentKind::Refuse,
-                    &format!("your agent declined to sign with {label}{toward}"),
-                );
-            } else {
-                conn.ring.push(AgentKind::Sign, &format!("{label}{toward}"));
+            match reply.first() {
+                Some(&SIGN_RESPONSE) => {
+                    conn.ring.push(AgentKind::Sign, &format!("{label}{toward}"));
+                    Ok(reply)
+                }
+                Some(&FAILURE) => {
+                    conn.ring.push(
+                        AgentKind::Refuse,
+                        &format!("your agent declined to sign with {label}{toward}"),
+                    );
+                    Ok(reply)
+                }
+                // Neither a signature nor a refusal. Recorded as a signature it would claim one the
+                // record cannot vouch for, and relayed it would hand the cage bytes no client can
+                // use; the cage is answered the refusal a client knows how to read.
+                other => {
+                    conn.ring.push(
+                        AgentKind::Refuse,
+                        &format!(
+                            "your agent returned no signature for {label}{toward} (it answered \
+                             with {})",
+                            other.map_or("an empty message".to_string(), |k| format!(
+                                "a message of type {k}"
+                            ))
+                        ),
+                    );
+                    Ok(refused)
+                }
             }
-            Ok(reply)
         }
         // The single allowed extension. It can only narrow what the host agent will sign, so
         // forwarding it costs nothing and preserves the destination constraints a key was loaded
@@ -708,10 +734,33 @@ fn serve_conn(
     // whole session and is idle between signatures. The budget goes with it — it bounded the first
     // message, and a session idle between signatures is the ordinary case rather than a fault.
     cage.set_read_timeout(None)?;
-    let mut host = UnixStream::connect(host_sock)?;
+    // A failure on the host side is recorded and answered, not only returned: the caller drops the
+    // error, and the cage would read a bare hang-up from a channel that stopped working with
+    // nothing in `sbx ssh-agent logs` to say why. The cage gets the refusal a client understands,
+    // and the connection ends, since an agent that failed once has no stream left to resume.
+    let host_failed = |cage: &mut UnixStream, e: io::Error| {
+        ring.push(
+            AgentKind::Refuse,
+            &format!("a request your own agent could not be asked ({e})"),
+        );
+        let _ = write_message(cage, &[FAILURE]);
+    };
+    let mut host = match UnixStream::connect(host_sock) {
+        Ok(host) => host,
+        Err(e) => {
+            host_failed(&mut cage, e);
+            return Ok(());
+        }
+    };
     let mut conn = Conn::new(filter, ring).with_confirm(confirm);
     loop {
-        let reply = respond(&request, &mut host, &mut conn)?;
+        let reply = match respond(&request, &mut host, &mut conn) {
+            Ok(reply) => reply,
+            Err(e) => {
+                host_failed(&mut cage, e);
+                return Ok(());
+            }
+        };
         write_message(&mut cage, &reply)?;
         request = match read_message(&mut cage) {
             Ok(r) => r,
@@ -1841,6 +1890,92 @@ mod tests {
             events[0].detail.contains("your agent declined"),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn a_reply_that_is_neither_a_signature_nor_a_refusal_is_not_recorded_as_a_signature() {
+        // The record of a signature is the audit trail of what the cage did with the key; one the
+        // agent did not return must not be filed there, nor its bytes handed to the cage.
+        let filter = Filter::new(&["work-key".into()]);
+        let ring = AgentRing::new(16);
+        let mut host = FakeAgent::new(vec![answer(&[id(b"blob-one", "work-key")]), vec![28, 1]]);
+
+        let reply = respond(
+            &sign_request(b"blob-one"),
+            &mut host,
+            &mut Conn::new(&filter, &ring),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reply,
+            vec![FAILURE],
+            "the cage is answered a refusal it can read"
+        );
+        let events = ring.snapshot(None).events;
+        assert_eq!(events[0].kind, AgentKind::Refuse, "{events:?}");
+        assert!(
+            events[0]
+                .detail
+                .contains("returned no signature for work-key")
+                && events[0].detail.contains("type 28"),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_entry_admits_no_key_without_a_comment() {
+        // Compared as a comment, an empty entry equals every key that has none.
+        let bare = id(b"blob-one", "");
+        assert!(!Filter::new(&[String::new()]).admits(&bare));
+        // The witness: the same key is admitted by an entry that names it.
+        assert!(Filter::new(&[bare.fingerprint()]).admits(&bare));
+    }
+
+    /// A host agent that cannot be reached, or stops answering, is recorded and answered.
+    ///
+    /// The error used to end the connection with nothing said: the caller drops it, so the cage read
+    /// a bare hang-up and `sbx ssh-agent logs` held no line about a channel that had stopped working.
+    #[test]
+    fn a_host_agent_that_fails_is_recorded_and_the_cage_is_answered() {
+        let dir = crate::testutil::TmpDir::new();
+        // An agent that accepts and hangs up at once: reached, then silent mid-exchange.
+        let mute = dir.join("mute.sock");
+        let listener = UnixListener::bind(&mute).expect("bind the mute agent");
+        let hangs_up = std::thread::spawn(move || {
+            if let Ok((conn, _)) = listener.accept() {
+                drop(conn);
+            }
+        });
+        for (host, case) in [(dir.join("absent.sock"), "unreachable"), (mute, "silent")] {
+            let (cage, mut held) = UnixStream::pair().expect("a socket pair");
+            write_message(&mut held, &[REQUEST_IDENTITIES]).expect("ask for the identities");
+            let ring = AgentRing::new(16);
+            serve_conn(
+                cage,
+                &host,
+                &Filter::default(),
+                &ring,
+                None,
+                std::time::Duration::from_secs(5),
+            )
+            .expect("a failed host ends the connection cleanly");
+            assert_eq!(
+                read_message(&mut held).expect("the cage is answered"),
+                vec![FAILURE],
+                "{case}: the cage reads a refusal, not a hang-up"
+            );
+            let events = ring.snapshot(None).events;
+            assert!(
+                events.len() == 1
+                    && events[0].kind == AgentKind::Refuse
+                    && events[0]
+                        .detail
+                        .contains("your own agent could not be asked"),
+                "{case}: the record says the agent failed: {events:?}"
+            );
+        }
+        let _ = hangs_up.join();
     }
 
     /// A refusal is recorded in words a human can act on, and never in words the cage chose: an
