@@ -264,7 +264,7 @@ fn up(args: Vec<OsString>) -> ExitCode {
     // in which case `up` was only a manual nudge and there is nothing to suggest.
     let adopted = default_dir()
         .ok()
-        .and_then(|d| storage::read_pointer(&d).ok().flatten())
+        .and_then(|d| followed_image(&d))
         .as_deref()
         == Some(image.as_path());
     if !adopted {
@@ -291,15 +291,8 @@ fn down(args: Vec<OsString>) -> ExitCode {
     let mounted = storage::state(&image)
         .ok()
         .and_then(|s| s.mount_point().map(Path::to_path_buf));
-    if let Some(mp) = mounted.as_deref() {
-        let live = live_sessions_under(mp);
-        if live > 0 {
-            return fail(format!(
-                "{live} session(s) are still running from {} — stop them first \
-                 (`sbx session ls`, `sbx session stop --all`)",
-                mp.display()
-            ));
-        }
+    if let Some(refusal) = mounted.as_deref().and_then(refuse_live) {
+        return fail(refusal);
     }
     if let Err(e) = storage::down(&image) {
         return fail(e);
@@ -309,7 +302,7 @@ fn down(args: Vec<OsString>) -> ExitCode {
     // Unmounting a volume sbx is set to follow is temporary by design: the next command
     // mounts it again. Saying so beats leaving the user to wonder why it came back.
     if let Ok(dir) = default_dir()
-        && storage::read_pointer(&dir).ok().flatten().as_deref() == Some(image.as_path())
+        && followed_image(&dir).as_deref() == Some(image.as_path())
     {
         let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
         outln!(
@@ -343,27 +336,8 @@ fn use_volume(args: Vec<OsString>) -> ExitCode {
         return fail(e);
     }
 
-    // sbx may already follow another volume, in which case the data is in that volume and not in
-    // `dir`, so the subtree check below sees nothing to lose. Repointing hides the adopted
-    // volume's store just as silently, and `unuse` then returns to the plain directory rather
-    // than to it — the pointer has to be read before it is overwritten.
-    match storage::read_pointer(&dir) {
-        Ok(Some(current)) if current == image => {}
-        Ok(Some(current)) if !opts.force => {
-            return fail(format!(
-                "sbx already uses {} — adopting another volume would leave its store, projects \
-                 and app homes behind, not move them.\n\
-                 \x20      `sbx storage unuse` first if you meant to switch, or pass --force.",
-                current.display()
-            ));
-        }
-        Ok(_) => {}
-        Err(e) if !opts.force => {
-            return fail(format!(
-                "cannot read the volume pointer ({e}) — refusing to adopt over it"
-            ));
-        }
-        Err(_) => {}
+    if let Some(refusal) = use_refusal(&dir, &image, opts.force) {
+        return fail(refusal);
     }
 
     // Mount before adopting: a pointer at a volume that will not mount would leave every
@@ -372,21 +346,6 @@ fn use_volume(args: Vec<OsString>) -> ExitCode {
         Ok(p) => p,
         Err(e) => return fail(e),
     };
-
-    // Adopting does not move anything. Data already in the default directory would simply
-    // stop being visible, which for a store of tens of gigabytes is not a mistake to make
-    // quietly.
-    let occupied = occupied_subtrees(&dir);
-    if !occupied.is_empty() && !opts.force {
-        return fail(format!(
-            "{} already holds {} — adopting the volume would leave that behind, not move it.\n\
-             \x20      Copy it into {} while no sandbox is running, then re-run; or pass \
-             --force to adopt an empty volume anyway.",
-            dir.display(),
-            occupied.join(", "),
-            mount_point.display()
-        ));
-    }
 
     if let Err(e) = storage::write_pointer(&dir, &image) {
         return fail(format!("cannot record the volume: {e}"));
@@ -400,6 +359,64 @@ fn use_volume(args: Vec<OsString>) -> ExitCode {
     );
     outln!("it is mounted automatically from now on — no environment variable needed.");
     ExitCode::SUCCESS
+}
+
+/// Why `sbx storage use` must not adopt `image` for the data directory `dir`, or `None` when it
+/// may. Everything here is decided before the volume is mounted, so a refusal leaves nothing
+/// behind it — no volume mounted for an adoption that never happened.
+fn use_refusal(dir: &Path, image: &Path, force: bool) -> Option<String> {
+    // sbx may already follow another volume, in which case the data is in that volume and not in
+    // `dir`, so the subtree check below sees nothing to lose. Repointing hides the adopted
+    // volume's store just as silently, and `unuse` then returns to the plain directory rather
+    // than to it — the pointer has to be read before it is overwritten.
+    let current = match storage::read_pointer(dir) {
+        Ok(Some(current)) if current == image => Some(current),
+        Ok(Some(current)) if !force => {
+            return Some(format!(
+                "sbx already uses {} — adopting another volume would leave its store, projects \
+                 and app homes behind, not move them.\n\
+                 \x20      `sbx storage unuse` first if you meant to switch, or pass --force.",
+                current.display()
+            ));
+        }
+        Ok(current) => current,
+        Err(e) if !force => {
+            return Some(format!(
+                "cannot read the volume pointer ({e}) — refusing to adopt over it"
+            ));
+        }
+        Err(_) => None,
+    };
+
+    // Adopting does not move anything. Data already in the default directory would simply
+    // stop being visible, which for a store of tens of gigabytes is not a mistake to make
+    // quietly. Asked before anything is mounted, since the answer does not depend on the volume
+    // and a refusal should leave nothing behind it.
+    let occupied = occupied_subtrees(dir);
+    if !occupied.is_empty() && !force {
+        return Some(format!(
+            "{} already holds {} — adopting the volume would leave that behind, not move it.\n\
+             \x20      `sbx storage migrate` copies it into the volume and switches over; or pass \
+             --force to adopt an empty volume anyway.",
+            dir.display(),
+            occupied.join(", ")
+        ));
+    }
+
+    // A sandbox running from the data directory sbx follows now keeps its records there: once
+    // the pointer names another one, `sbx session ls` and `sbx session stop` no longer see it.
+    // `--force` waives the data checks above, not this one. Re-adopting the volume already
+    // followed switches nothing, so it is not asked then.
+    if current.as_deref() != Some(image) {
+        let mut followed = vec![dir.to_path_buf()];
+        if let Some(current) = current
+            && let Ok(storage::State::Mounted { mount_point, .. }) = storage::state(&current)
+        {
+            followed.push(mount_point);
+        }
+        return followed.iter().find_map(|d| refuse_live(d));
+    }
+    None
 }
 
 /// `sbx storage migrate`: copy the existing data directory into the volume, then start using
@@ -448,11 +465,8 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
 
     // A sandbox writing into the source while it is copied would put an inconsistent store in
     // the volume — and the copy would then be checked against a moving original.
-    let live = live_sessions_under(&dir);
-    if live > 0 {
-        return fail(format!(
-            "{live} session(s) are running — stop them first (`sbx session stop --all`)"
-        ));
+    if let Some(refusal) = refuse_live(&dir) {
+        return fail(refusal);
     }
     if let Err(e) = ensure_mountable(&image) {
         return fail(e);
@@ -496,10 +510,15 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
     }
 
     // Fail before starting rather than half-way: the volume compresses and shares blocks, so
-    // needing the full apparent size is a deliberate over-estimate.
-    if let Some(free) = storage::free_bytes(&mount_point)
-        && free < before.bytes
-    {
+    // needing the full apparent size is a deliberate over-estimate. A figure that cannot be read
+    // is no reason to start either, for the same reason.
+    let Some(free) = storage::free_bytes(&mount_point) else {
+        return fail(format!(
+            "cannot read the free space on {} — refusing to start a copy that could fail half-way",
+            shown_path(&mount_point)
+        ));
+    };
+    if free < before.bytes {
         return fail(format!(
             "the volume has {} free but the data is {} — grow the volume, or run \
                  `sbx gc --all --prune` first",
@@ -543,6 +562,19 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
         ));
     }
     outln!("  {}copy verified{}", pal.ok, pal.reset);
+
+    // Asked again at the last moment: the copy is long, and a sandbox started from the data
+    // directory while it ran keeps its records and writes there. Switched over, it would be out
+    // of `sbx session ls`'s sight, writing into a tree about to be set aside. Nothing has changed
+    // yet, so the volume is swept exactly as after a failed copy.
+    if let Some(refusal) = refuse_live(&dir) {
+        let swept = volume_was_empty && clear_tree(&mount_point).is_ok();
+        return fail(format!(
+            "{refusal}\n       nothing was switched over; {} is untouched and still in use{}",
+            dir.display(),
+            volume_after_failed_copy(swept)
+        ));
+    }
 
     // The switch. A single atomic write: before it the old directory is authoritative, after
     // it the volume is, and there is no moment in between.
@@ -664,25 +696,65 @@ fn clear_tree(root: &Path) -> std::io::Result<()> {
 
 /// Move the migrated subtrees out of the data directory into a dated sibling, leaving the
 /// pointer behind. Renames within one filesystem, so it is instant whatever the size.
+///
+/// The sibling is created fresh, never adopted: a name already taken — a second migration in the
+/// same second, or anything else at that path, a symlink included — moves on to the next suffix
+/// rather than merging into it. Each rename is atomic, so an interruption leaves every entry either
+/// in `dir` or in the sibling; an error says where the sibling is, since part of the data is there.
 fn set_aside(dir: &Path, skip: &[&str]) -> std::io::Result<Option<PathBuf>> {
-    use std::os::unix::fs::DirBuilderExt as _;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let old = dir.with_file_name(format!(
+    set_aside_stamped(dir, skip, stamp)
+}
+
+/// [`set_aside`] under the timestamp `stamp`, which its name carries.
+fn set_aside_stamped(dir: &Path, skip: &[&str], stamp: u64) -> std::io::Result<Option<PathBuf>> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let base = format!(
         "{}.old-{stamp}",
         dir.file_name().unwrap_or_default().to_string_lossy()
-    ));
+    );
     // Owner-only: what lands here is the *whole* previous store — every profile, every bundle,
     // every runtime tree the migration left behind — under a name derived from a timestamp, and it
     // is created in the data directory's parent rather than inside a tree sbx already keeps
     // owner-only. At the umask it would be the one readable copy of everything the migration was
     // asked to move.
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&old)?;
+    let mut attempt = 0u32;
+    let old = loop {
+        let name = match attempt {
+            0 => base.clone(),
+            n => format!("{base}-{n}"),
+        };
+        let candidate = dir.with_file_name(name);
+        match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
+            Ok(()) => break candidate,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 100 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    match move_entries(dir, &old, skip) {
+        Ok(true) => Ok(Some(old)),
+        Ok(false) => {
+            let _ = std::fs::remove_dir(&old);
+            Ok(None)
+        }
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!(
+                "{e} — what was moved before it is in {}, the rest is still in {}",
+                old.display(),
+                dir.display()
+            ),
+        )),
+    }
+}
+
+/// Rename every entry of `dir` but those in `skip` into `to`; whether any was moved.
+fn move_entries(dir: &Path, to: &Path, skip: &[&str]) -> std::io::Result<bool> {
     let mut moved = false;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -690,14 +762,10 @@ fn set_aside(dir: &Path, skip: &[&str]) -> std::io::Result<Option<PathBuf>> {
         if skip.contains(&name.to_string_lossy().as_ref()) {
             continue;
         }
-        std::fs::rename(entry.path(), old.join(&name))?;
+        std::fs::rename(entry.path(), to.join(&name))?;
         moved = true;
     }
-    if !moved {
-        let _ = std::fs::remove_dir(&old);
-        return Ok(None);
-    }
-    Ok(Some(old))
+    Ok(moved)
 }
 
 /// `sbx storage unuse`: go back to the ordinary data directory. The volume and everything in
@@ -733,17 +801,59 @@ fn unuse_volume(args: Vec<OsString>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// How many live sandboxes are running from the volume.
+/// How many live sandboxes are running from the data directory `data_dir` — a volume's mount
+/// point or the plain directory.
 ///
-/// The registry lives *inside* a data directory, so the volume's own `sessions/` is the
-/// authoritative answer for sandboxes started from it — a registry anywhere else describes a
-/// different data directory entirely. Records are liveness-validated on read, so a crashed
-/// sandbox never keeps a volume hostage; only a genuinely running one does.
-fn live_sessions_under(mount_point: &Path) -> usize {
-    session::Registry::at(mount_point)
+/// The registry lives *inside* a data directory, so its own `sessions/` is the authoritative
+/// answer for sandboxes started from it — a registry anywhere else describes a different data
+/// directory entirely. Records are liveness-validated on read, so a crashed sandbox never keeps a
+/// volume hostage; only a genuinely running one does.
+///
+/// A registry that cannot be read is an `Err`, not zero: every caller is a guard in front of an
+/// unmount, a copy or a switch, and reading "unknown" as "none" is how a running sandbox would
+/// have its store pulled out from under it.
+fn live_sessions_under(data_dir: &Path) -> Result<usize, String> {
+    session::Registry::at(data_dir)
         .list()
         .map(|v| v.len())
-        .unwrap_or(0)
+        .map_err(|e| {
+            format!(
+                "cannot read the session registry under {} ({e}) — refusing, since a running \
+                 sandbox could not be ruled out",
+                data_dir.display()
+            )
+        })
+}
+
+/// The refusal [`live_sessions_under`] leads to: `None` when nothing runs from `data_dir`, else
+/// the message naming what does, or why that could not be told.
+fn refuse_live(data_dir: &Path) -> Option<String> {
+    match live_sessions_under(data_dir) {
+        Ok(0) => None,
+        Ok(live) => Some(format!(
+            "{live} session(s) are still running from {} — stop them first \
+             (`sbx session ls`, `sbx session stop --all`)",
+            data_dir.display()
+        )),
+        Err(e) => Some(e),
+    }
+}
+
+/// The image the volume pointer names, for a command that only reports. An unreadable pointer is
+/// said on stderr rather than shown as no pointer: every launch refuses on it, so a report that
+/// read it as "not adopted" would contradict what sbx does next.
+fn followed_image(dir: &Path) -> Option<PathBuf> {
+    match storage::read_pointer(dir) {
+        Ok(image) => image,
+        Err(e) => {
+            diag::warn(&format!(
+                "cannot read the volume pointer in {} ({e}) — whether sbx follows this volume is \
+                 unknown, and launches refuse until it can be read",
+                dir.display()
+            ));
+            None
+        }
+    }
 }
 
 /// Describe what sbx's data directory is *currently* backed by, independent of the image being
@@ -755,7 +865,7 @@ fn active_backing_kind(adopted: Option<&Path>) -> String {
     {
         let fs = storage::fs_kind(&mount_point)
             .map(|k| k.name())
-            .unwrap_or_else(|| "btrfs".to_string());
+            .unwrap_or_else(|| "unknown".to_string());
         return format!("volume ({fs})");
     }
     let fs = default_dir()
@@ -826,9 +936,7 @@ fn status(args: Vec<OsString>) -> ExitCode {
 
     // Read from the pointer rather than from the live layout: `status` must say what sbx
     // will do next time, which stands even when the volume happens to be unmounted now.
-    let adopted = default_dir()
-        .ok()
-        .and_then(|d| storage::read_pointer(&d).ok().flatten());
+    let adopted = default_dir().ok().and_then(|d| followed_image(&d));
     let is_adopted = adopted.as_deref() == Some(image.as_path());
     let mut view = StatusView {
         kind: active_backing_kind(adopted.as_deref()),
@@ -1200,7 +1308,8 @@ fn propose(default_dir: &Path, pre: &storage::Preflight) {
         Err(e) => {
             diag::error(&format!("sbx: could not set up the volume: {e}"));
             diag::hint(
-                "     continuing on the plain data directory; `sbx storage init` retries it.",
+                "     continuing on the plain data directory; `sbx storage init` then `sbx storage \
+                 use` adopts one later, or `sbx storage migrate` once it holds data.",
             );
         }
     }
@@ -1218,8 +1327,16 @@ fn read_yes() -> bool {
 }
 
 /// Adopt a fresh volume for an empty data directory: create the image if it is not there, mount
-/// it, and record the pointer. The empty precondition is the caller's, so nothing is stranded.
+/// it, and record the pointer.
+///
+/// The caller found the directory empty, but before a question that waits on the user for as long
+/// as they take; a launch in another terminal may have filled it since. So the emptiness and the
+/// absence of a running sandbox are asked again before anything is created, and once more right
+/// before the pointer is written, which is the step that would strand what is there.
 fn adopt_empty(default_dir: &Path) -> Result<PathBuf, String> {
+    if let Some(refusal) = adopt_refusal(default_dir) {
+        return Err(refusal);
+    }
     let image = image_path(None)?;
     if matches!(
         storage::state(&image).map_err(|e| e.to_string())?,
@@ -1238,8 +1355,26 @@ fn adopt_empty(default_dir: &Path) -> Result<PathBuf, String> {
         )?;
     }
     let mount_point = storage::ensure_mounted(&image)?;
+    if let Some(refusal) = adopt_refusal(default_dir) {
+        return Err(refusal);
+    }
     storage::write_pointer(default_dir, &image).map_err(|e| e.to_string())?;
     Ok(mount_point)
+}
+
+/// Why [`adopt_empty`] must not write the pointer for `default_dir` after all: it holds data now,
+/// or a sandbox runs from it (or that cannot be told).
+fn adopt_refusal(default_dir: &Path) -> Option<String> {
+    let occupied = occupied_subtrees(default_dir);
+    if !occupied.is_empty() {
+        return Some(format!(
+            "{} now holds {} — adopting the volume would leave that behind; \
+             `sbx storage migrate` moves it",
+            default_dir.display(),
+            occupied.join(", ")
+        ));
+    }
+    refuse_live(default_dir)
 }
 
 #[cfg(test)]
@@ -1294,6 +1429,127 @@ mod tests {
 
         // A directory that cannot be read is not "empty": not knowing must mean not sweeping.
         assert!(!volume_is_empty(&vol.join("absent")));
+    }
+
+    /// A registry that cannot be read is a refusal of its own, never "no session running": every
+    /// caller guards an unmount, a copy or a switch.
+    #[test]
+    fn an_unreadable_session_registry_refuses_rather_than_counting_zero() {
+        let tmp = crate::testutil::TmpDir::new();
+        assert_eq!(
+            live_sessions_under(tmp.path()),
+            Ok(0),
+            "no registry yet is none"
+        );
+        assert_eq!(refuse_live(tmp.path()), None);
+
+        std::fs::write(tmp.path().join("sessions"), b"").unwrap();
+        let err = live_sessions_under(tmp.path()).expect_err("a registry that is a file");
+        assert!(err.contains("cannot read the session registry"), "{err}");
+        assert_eq!(refuse_live(tmp.path()), Some(err));
+    }
+
+    /// `use` decides before anything is mounted: data it would strand sends the reader to
+    /// `migrate`, a registry it cannot read refuses even under `--force`, and re-adopting the
+    /// volume already followed asks nothing, since nothing switches.
+    #[test]
+    fn use_refuses_before_anything_is_mounted() {
+        let tmp = crate::testutil::TmpDir::new();
+        let dir = tmp.path().join("sbx");
+        std::fs::create_dir(&dir).unwrap();
+        let image = Path::new("/vol/sbx-storage.btrfs");
+        assert_eq!(
+            use_refusal(&dir, image, false),
+            None,
+            "an empty directory adopts"
+        );
+
+        std::fs::create_dir(dir.join("store")).unwrap();
+        let refusal = use_refusal(&dir, image, false).expect("a store would be stranded");
+        assert!(refusal.contains("`sbx storage migrate`"), "{refusal}");
+        assert_eq!(
+            use_refusal(&dir, image, true),
+            None,
+            "--force waives the data check"
+        );
+
+        std::fs::write(dir.join("sessions"), b"").unwrap();
+        let refusal = use_refusal(&dir, image, true).expect("--force does not waive this one");
+        assert!(refusal.contains("session registry"), "{refusal}");
+
+        storage::write_pointer(&dir, image).unwrap();
+        assert_eq!(
+            use_refusal(&dir, image, true),
+            None,
+            "re-adopting the followed volume switches nothing"
+        );
+        let other = Path::new("/vol/other.btrfs");
+        let refusal = use_refusal(&dir, other, false).expect("another volume is followed");
+        assert!(refusal.contains("already uses"), "{refusal}");
+    }
+
+    /// The first-launch adoption asks again after its question, which waited on the user while
+    /// another launch could fill the directory.
+    #[test]
+    fn the_first_launch_adoption_asks_again_before_the_pointer() {
+        let tmp = crate::testutil::TmpDir::new();
+        assert_eq!(adopt_refusal(tmp.path()), None);
+        std::fs::create_dir(tmp.path().join("projects")).unwrap();
+        let refusal = adopt_refusal(tmp.path()).expect("a directory filled since the question");
+        assert!(refusal.contains("now holds projects"), "{refusal}");
+        std::fs::remove_dir(tmp.path().join("projects")).unwrap();
+        std::fs::write(tmp.path().join("sessions"), b"").unwrap();
+        assert!(adopt_refusal(tmp.path()).is_some_and(|r| r.contains("session registry")));
+    }
+
+    /// The set-aside sibling is created fresh: a name already taken, by a symlink here, moves on
+    /// to the next suffix and what the link points at receives nothing.
+    #[test]
+    fn the_set_aside_sibling_is_never_an_existing_one() {
+        let tmp = crate::testutil::TmpDir::new();
+        let dir = tmp.path().join("sbx");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::create_dir(dir.join("store")).unwrap();
+        std::fs::write(dir.join(storage::POINTER), b"image = \"/x\"\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, tmp.path().join("sbx.old-7")).unwrap();
+
+        let old = set_aside_stamped(&dir, &[storage::POINTER], 7)
+            .unwrap()
+            .expect("the store was moved");
+        assert_eq!(old, tmp.path().join("sbx.old-7-1"));
+        assert!(old.join("store").is_dir());
+        assert!(dir.join(storage::POINTER).is_file(), "the pointer stays");
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// A set-aside that fails part-way says where the part already moved went.
+    #[test]
+    fn a_failed_set_aside_names_both_halves() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // A rename out of a read-only directory is the failure provoked here, and root renames
+        // regardless of the mode.
+        if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!(
+                "skipping the set-aside failure test: running as root, which a read-only directory \
+                 does not stop"
+            );
+            return;
+        }
+        let tmp = crate::testutil::TmpDir::new();
+        let dir = tmp.path().join("sbx");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(dir.join("store")).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let err = set_aside_stamped(&dir, &[], 9).expect_err("nothing can leave a read-only dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let text = err.to_string();
+        assert!(
+            text.contains(&tmp.path().join("sbx.old-9").display().to_string())
+                && text.contains(&format!("still in {}", dir.display())),
+            "{text}"
+        );
     }
 
     #[test]

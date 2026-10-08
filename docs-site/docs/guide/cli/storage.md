@@ -87,7 +87,8 @@ What it offers depends on what is already there:
 
 - **A fresh install (empty data directory)**: a yes/no question. *Yes* creates and mounts a
   volume on the spot (instant, nothing to copy) and uses it from that launch on. *No* keeps the
-  plain directory.
+  plain directory. The directory is checked again after you answer, so a launch from another
+  terminal that filled it in the meantime makes *yes* stop short of adopting.
 - **An existing data directory**, a single, non-blocking line pointing at `sbx storage migrate`,
   never an inline copy: migrating is slow and can fail its own checks, and it should not hijack
   the command you actually ran.
@@ -144,9 +145,15 @@ Adopting a volume does not move what is already in the data directory: it hides 
 $ sbx storage use
 sbx storage: /home/you/.local/share/sbx already holds store, projects, apps — adopting the
 volume would leave that behind, not move it.
-       Copy it into /run/media/you/sbx-storage while no sandbox is running, then re-run; or
-       pass --force to adopt an empty volume anyway.
+       `sbx storage migrate` copies it into the volume and switches over; or pass --force to
+       adopt an empty volume anyway.
 ```
+
+The check runs before the volume is mounted, so a refusal leaves nothing mounted behind it.
+`use` also refuses while a sandbox is running from the data directory sbx follows now: once the
+pointer names another one, [`sbx session ls`](session) and `sbx session stop` no longer see that
+sandbox. `--force` does not waive this check, and neither does a session registry that cannot be
+read, which counts as a refusal rather than as "nothing running".
 
 It refuses for the same reason when sbx **already follows another volume**. The data directory
 then holds only the pointer, so the check above finds nothing at risk; the store, projects and app
@@ -240,7 +247,11 @@ sbx storage — /home/you/.local/share/sbx-storage.btrfs
 
 **type** says what the data directory is backed by right now: `volume (<fs>)` for an sbx-managed
 encapsulated volume, or `local (<fs>)` when it sits directly on a host filesystem (the same line
-[`sbx doctor`](doctor) leads with).
+[`sbx doctor`](doctor) leads with). A filesystem that cannot be identified reads `unknown`.
+
+`status`, `up` and `down` warn on stderr when the volume pointer (`storage.toml`) exists but cannot
+be read, rather than reporting the volume as not adopted: every launch refuses on such a pointer,
+so whether sbx follows the volume is then unknown.
 
 **on host** is what the volume costs, against the logical ceiling it was created with. **inside**
 is the filesystem's own view: what its data occupies, and how much of the ceiling it has carved
@@ -285,7 +296,7 @@ unmounted and detached
 ```
 
 `down` **refuses while a sandbox is still running** from the volume, since its store lives
-there. Stop them first with [`sbx session stop --all`](session). While the volume is
+there, and when the session registry cannot be read to tell. Stop them first with [`sbx session stop --all`](session). While the volume is
 adopted, `down` is temporary, the next sbx command mounts it again. Use `sbx storage unuse`
 to stop using it for good.
 
@@ -345,7 +356,11 @@ sbx storage migrate               # copy, verify, then switch over
 
 `migrate` keeps the original authoritative for the whole copy and sets it aside under a
 dated name rather than deleting it, so an interruption before the switch leaves the
-installation exactly as it was. Migrating into a volume that already holds a data
+installation exactly as it was. It asks again for running sandboxes once the copy is verified,
+right before the switch, since one may have started during a long copy; if one has, nothing is
+switched and the volume is cleared as after a failed copy. A volume whose free space cannot be
+read is refused before the copy starts, rather than risking a copy that fails half-way. The
+dated name is always a new directory: should it be taken, a `-1`, `-2`… suffix follows. Migrating into a volume that already holds a data
 directory (`store`, `projects`, `apps`) is refused, unless `--force` overrides it.
 
 Living with it:

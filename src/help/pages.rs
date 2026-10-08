@@ -2084,7 +2084,8 @@ pub(super) const PAGES: &[Page] = &[
             ),
             (
                 "--force",
-                "with `use`/`migrate`, proceed although a directory holds data",
+                "with `use`/`migrate`, proceed although a directory holds data (never while a \
+                 sandbox runs)",
             ),
             (
                 "--image <path>",
@@ -2135,8 +2136,11 @@ pub(super) const PAGES: &[Page] = &[
             does move them — it copies everything into the volume, checks the copy against the\n\
             original, and only then switches over, setting the old directory aside under a dated\n\
             name rather than deleting it. The original stays authoritative for the whole copy, so\n\
-            an interruption before the switch leaves the installation exactly as it was. `down` refuses while a sandbox is still\n\
-            running from the volume.\n\
+            an interruption before the switch leaves the installation exactly as it was; it asks\n\
+            again for a running sandbox right before the switch, and refuses a volume whose free\n\
+            space it cannot read. `use`, `migrate` and `down` refuse while a sandbox is still\n\
+            running from the data directory they would switch away from or unmount, and when the\n\
+            session registry cannot be read to tell; `--force` does not waive that.\n\
             \n\
             If a volume sbx is set to use cannot be mounted, sbx stops rather than carrying on\n\
             with an empty directory — the mount point exists only while mounted and lives on a\n\
