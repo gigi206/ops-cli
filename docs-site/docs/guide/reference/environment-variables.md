@@ -149,6 +149,8 @@ a base shared with every application:
   relative path would resolve against whatever directory sbx was launched from, so falling
   back quietly would put your projects and apps somewhere you never look. Unset or empty
   reads as absent, so clearing the variable restores the default.
+- The **filesystem root** is refused as well (`/`, and spellings of it such as `/.`): sbx
+  tightens its data directory to owner-only, so it must name a directory below `/`.
 
 It also has a **length limit, 74 bytes**, and a longer path is refused with that figure in
 the message. Egress filtering, the D-Bus filter, port forwarding and exec enforcement each

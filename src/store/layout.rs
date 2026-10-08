@@ -235,23 +235,30 @@ impl Layout {
 ///
 /// `None` when there is no pointer — the ordinary case, and the one that must stay free.
 ///
-/// Resolved once per process: the answer cannot change under us, and a single launch asks for
-/// the layout dozens of times. Only the mount is memoised, so nothing is cached before a
-/// pointer is found.
+/// Resolved once per process for a given directory: a single launch asks for the layout dozens
+/// of times, and a mount that failed is not attempted again within the command. Keyed by the
+/// directory, so a process whose environment names another one resolves that one afresh rather
+/// than being answered for the first.
 fn follow_volume(default_dir: &Path) -> Option<Result<PathBuf, String>> {
-    static RESOLVED: std::sync::OnceLock<Option<Result<PathBuf, String>>> =
-        std::sync::OnceLock::new();
-    RESOLVED
-        .get_or_init(|| match crate::storage::read_pointer(default_dir) {
-            Ok(None) => None,
-            Ok(Some(image)) => Some(crate::storage::ensure_mounted(&image)),
-            // A pointer that cannot be read is not an absent one. Answering `None` here would send
-            // the layout to the default directory and provision a fresh, empty store there while
-            // the adopted volume still holds everything — so the failure travels as this
-            // resolution's own, which every caller already renders.
-            Err(e) => Some(Err(format!("cannot read the volume pointer: {e}"))),
-        })
-        .clone()
+    type Resolved = Option<(PathBuf, Option<Result<PathBuf, String>>)>;
+    static RESOLVED: std::sync::Mutex<Resolved> = std::sync::Mutex::new(None);
+    let mut resolved = crate::sandbox::locks::locked(&RESOLVED);
+    if let Some((dir, answer)) = resolved.as_ref()
+        && dir == default_dir
+    {
+        return answer.clone();
+    }
+    let answer = match crate::storage::read_pointer(default_dir) {
+        Ok(None) => None,
+        Ok(Some(image)) => Some(crate::storage::ensure_mounted(&image)),
+        // A pointer that cannot be read is not an absent one. Answering `None` here would send
+        // the layout to the default directory and provision a fresh, empty store there while
+        // the adopted volume still holds everything — so the failure travels as this
+        // resolution's own, which every caller already renders.
+        Err(e) => Some(Err(format!("cannot read the volume pointer: {e}"))),
+    };
+    *resolved = Some((default_dir.to_path_buf(), answer.clone()));
+    answer
 }
 
 /// Follow a volume pointer **only as far as reading it**: the mount point when the volume is
@@ -415,6 +422,19 @@ fn check_data_dir_override(value: &OsStr) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!(
             "SBX_DATA_DIR must be an absolute path (got {})",
+            path.display()
+        ));
+    }
+    // sbx tightens its data directory to owner-only, so the filesystem root is no directory to
+    // hand it. Read lexically, so `/.` and `/a/..` are the root too.
+    let depth = path.components().fold(0usize, |depth, part| match part {
+        std::path::Component::Normal(_) => depth + 1,
+        std::path::Component::ParentDir => depth.saturating_sub(1),
+        _ => depth,
+    });
+    if depth == 0 {
+        return Err(format!(
+            "SBX_DATA_DIR must name a directory below `/` (got {})",
             path.display()
         ));
     }
@@ -770,6 +790,33 @@ mod tests {
             "a forward socket at the cap overruns sun_path: {}",
             forward.as_os_str().len()
         );
+    }
+
+    #[test]
+    fn the_filesystem_root_is_no_data_dir_override() {
+        // sbx tightens its data directory to owner-only, which on `/` would close the machine.
+        for root in ["/", "/.", "/a/..", "//"] {
+            let why = check_data_dir_override(OsStr::new(root)).unwrap_err();
+            assert!(why.contains("below `/`"), "`{root}`: {why}");
+            assert!(refusal_from(Some(OsStr::new(root)), None, None), "`{root}`");
+        }
+        assert!(check_data_dir_override(OsStr::new("/a")).is_ok());
+    }
+
+    #[test]
+    fn a_volume_pointer_is_resolved_for_the_directory_asked_about() {
+        // The answer is kept per directory: one resolved first must not answer for another.
+        let dir = TmpDir::new();
+        let (plain, pointed) = (dir.join("plain"), dir.join("pointed"));
+        std::fs::create_dir_all(&plain).expect("plain dir");
+        // A pointer that cannot be read: a directory where the file belongs.
+        std::fs::create_dir_all(pointed.join(crate::storage::POINTER)).expect("pointer dir");
+        assert_eq!(follow_volume(&plain), None);
+        assert!(
+            matches!(follow_volume(&pointed), Some(Err(_))),
+            "the second directory's own pointer is read"
+        );
+        assert_eq!(follow_volume(&plain), None);
     }
 
     #[test]
