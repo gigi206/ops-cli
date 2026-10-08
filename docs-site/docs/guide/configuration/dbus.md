@@ -71,7 +71,9 @@ The app probes *that* portal and gets three things:
 - **Notifications**, a host-side relay bridges `org.freedesktop.Notifications` on the private bus to
   the host notifications daemon, so the app's desktop notifications work end to end (including
   click-to-focus and dismiss). The relay writes the application name itself, drops an icon or hint
-  that names a host file for the daemon to open, cuts the text to a ceiling, and refuses the two
+  that names a host file for the daemon to open, replaces the launch's credentials in every string
+  the app sent with their placeholders, folds the name, the title and the button labels to one
+  line, cuts the text to a ceiling, and refuses the two
   ways of asking that a toast stay on screen until it is clicked away (`urgency = critical` and an
   expiry of `0`, both of which sbx declines for its own toasts as well). It runs in `sbx` itself,
   outside the cage's memory limit, so it serves one call at a time and refuses outright a call

@@ -420,6 +420,11 @@ pub(super) fn pump_tcp_uds(client: TcpStream, uds: UnixStream) -> io::Result<()>
 ///
 /// A missing socket keeps its old meaning — the cage forwarder may simply not have bound it yet,
 /// and the caller drops that connection for the client to retry.
+///
+/// The connect itself waits at most [`DIAL_DEADLINE`]. A listener whose backlog is full puts a
+/// stream connect to sleep until it drains, and one at a name the cage chose may never drain: the
+/// cage can bind it, fill it and stop accepting, which held the dialing host thread — and a
+/// teardown joining it — for good.
 pub(crate) fn dial_cage_socket(sock: &Path) -> io::Result<UnixStream> {
     // Opened by the syscall rather than through `OpenOptions::custom_flags`, which cannot carry
     // `O_PATH` on the target this binary ships as. `OpenOptions` masks the custom flags with
@@ -461,8 +466,18 @@ pub(crate) fn dial_cage_socket(sock: &Path) -> io::Result<UnixStream> {
             ),
         ));
     }
-    UnixStream::connect(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+    let stream = super::broker::connect_unix_within(
+        Path::new(&format!("/proc/self/fd/{}", pinned.as_raw_fd())),
+        DIAL_DEADLINE,
+    )?;
+    // The bound was for the connect alone: what is written afterwards blocks as before.
+    stream.set_write_timeout(None)?;
+    Ok(stream)
 }
+
+/// The longest [`dial_cage_socket`] waits for the cage's listener to take a connection. A listener
+/// that accepts at all takes one far sooner; past this the cage is not serving the name.
+const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Wrap `cmd` so the cage starts the in-cage forwarders before running it: a static bash that
 /// backgrounds one `socat UNIX-LISTEN → TCP-CONNECT` per declared port (stdio detached so it

@@ -1623,7 +1623,7 @@ fn connect_host(
 /// listener that stopped accepting never lets happen. The kernel bounds that sleep by the
 /// connecting socket's *send* timeout, then fails with `EAGAIN`, so the socket is made here, given
 /// that timeout, and only then connected.
-fn connect_unix_within(
+pub(in crate::sandbox) fn connect_unix_within(
     path: &std::path::Path,
     budget: std::time::Duration,
 ) -> io::Result<std::os::unix::net::UnixStream> {

@@ -527,7 +527,11 @@ struct OwnedIds(Mutex<HashSet<u32>>);
 impl OwnedIds {
     /// Record an id the host daemon just returned for one of this cage's `Notify` calls.
     fn record(&self, id: u32) {
-        locked(&self.0).insert(id);
+        // `0` is the sentinel no notification has: a daemon answering it is kept out of the set,
+        // where nothing could ever rule it gone.
+        if id != 0 {
+            locked(&self.0).insert(id);
+        }
     }
 
     /// Rule on a host `NotificationClosed` for `id`: whether it named one of this cage's own
@@ -574,6 +578,10 @@ const RELAYED_BY: &str = "sandboxed";
 /// puts an avatar or a cover on its own notification.
 const HOST_PATH_HINTS: &[&str] = &["image-path", "image_path", "sound-file"];
 
+/// The in-band pixel hints, which carry an image as `(iiibiiay)` and cross whole: the one structured
+/// value a relayed hint may have.
+const PIXEL_HINTS: &[&str] = &["image-data", "image_data", "icon_data"];
+
 /// Hints that name an **installed host application** for the daemon to render the toast as, dropped
 /// from every relayed call.
 ///
@@ -600,13 +608,27 @@ const URGENCY_CRITICAL: u8 = 2;
 
 /// The hints of a relayed call with `urgency` held to what sbx allows its own toasts.
 ///
-/// Only the one hint is touched, and only downwards: `low` and `normal` cross unchanged, and a
-/// value of any other type is left alone because it is not an urgency the daemon will read. The
-/// hint is dropped rather than rewritten when it asks for `critical`, which lands the toast on the
-/// daemon's own default, the same place sbx's announcements sit.
+/// Only the one hint is touched, and only downwards: `low` and `normal` cross unchanged. The
+/// specification types it a byte, but a daemon may read any number there, so the hint crosses only
+/// as an integer below `critical`, of whatever width; anything else — `critical` or above, a double,
+/// a string — is dropped rather than rewritten, which lands the toast on the daemon's own default,
+/// the same place sbx's announcements sit.
 fn capped_urgency(mut hints: HashMap<String, OwnedValue>) -> HashMap<String, OwnedValue> {
-    let asked: Option<u8> = hints.get("urgency").and_then(|v| v.downcast_ref().ok());
-    if asked.is_some_and(|u| u >= URGENCY_CRITICAL) {
+    use zbus::zvariant::Value;
+    let below_critical = |v: &OwnedValue| {
+        let level = match &**v {
+            Value::U8(n) => i128::from(*n),
+            Value::I16(n) => i128::from(*n),
+            Value::U16(n) => i128::from(*n),
+            Value::I32(n) => i128::from(*n),
+            Value::U32(n) => i128::from(*n),
+            Value::I64(n) => i128::from(*n),
+            Value::U64(n) => i128::from(*n),
+            _ => return false,
+        };
+        level < i128::from(URGENCY_CRITICAL)
+    };
+    if hints.get("urgency").is_some_and(|v| !below_critical(v)) {
         hints.remove("urgency");
     }
     hints
@@ -642,8 +664,9 @@ fn relayed_app_name(app_name: &str) -> String {
 /// icon; a bare name is kept, since resolving it against the user's own theme reaches nothing the
 /// cage chose. See [`HOST_PATH_HINTS`] for the hints that carry the same thing by another route.
 fn relayed_app_icon(app_icon: &str) -> &str {
-    // A path and a URI both carry a separator; a theme name never does.
-    if app_icon.contains('/') {
+    // A path carries a separator and a URI a scheme's colon — `file:notes` names a file relative
+    // to the daemon's own directory with neither a slash nor a root. A theme name carries none.
+    if app_icon.contains(['/', '\\', ':']) {
         return "";
     }
     app_icon
@@ -672,6 +695,18 @@ const APP_IDENTITY_MAX: usize = 128;
 /// action rather than one fewer. A list the cage sent odd stays as the cage sent it — that is its
 /// own malformed input and not something a ceiling should quietly repair.
 const ACTIONS_MAX: usize = 32;
+
+/// A body with every control character but the line break and the tab replaced by a space: it may
+/// run to several lines, and no escape or carriage return of the cage's reaches the daemon.
+fn without_controls(body: &str) -> String {
+    body.chars()
+        .map(|c| match c {
+            '\n' | '\t' => c,
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect()
+}
 
 /// Cut `s` to at most `max` characters, on a character boundary.
 ///
@@ -726,6 +761,45 @@ impl Served {
         .0
     }
 
+    /// The hints that cross, by the type of their value: a string, redacted like the summary; a
+    /// number or a boolean, which carries no text; and the in-band pixel hints ([`PIXEL_HINTS`]),
+    /// whose structure holds an image and not words. Anything else — an array, a dictionary, a
+    /// variant wrapping a string, an object path — is dropped: each is a place a credential could
+    /// ride past a redaction that reads strings alone, and no hint of the specification is one.
+    fn redacted_hints(&self, hints: HashMap<String, OwnedValue>) -> HashMap<String, OwnedValue> {
+        use zbus::zvariant::Value;
+        hints
+            .into_iter()
+            .filter_map(|(name, value)| {
+                if PIXEL_HINTS.contains(&name.as_str()) {
+                    return Some((name, value));
+                }
+                match &*value {
+                    Value::Str(text) => {
+                        let clean = self.redacted(text.to_string());
+                        if clean == text.as_str() {
+                            return Some((name, value));
+                        }
+                        // A value that cannot be rebuilt is dropped rather than forwarded with
+                        // the credential still in it.
+                        let owned = Value::from(clean).try_to_owned().ok()?;
+                        Some((name, owned))
+                    }
+                    Value::U8(_)
+                    | Value::Bool(_)
+                    | Value::I16(_)
+                    | Value::U16(_)
+                    | Value::I32(_)
+                    | Value::U32(_)
+                    | Value::I64(_)
+                    | Value::U64(_)
+                    | Value::F64(_) => Some((name, value)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn notify(
         &self,
@@ -753,19 +827,31 @@ impl Served {
             let hint = hint.as_str();
             !HOST_PATH_HINTS.contains(&hint) && !HOST_IDENTITY_HINTS.contains(&hint)
         });
-        relayed_hints = capped_urgency(relayed_hints);
+        relayed_hints = self.redacted_hints(capped_urgency(relayed_hints));
+        // Every string the cage chose is redacted, the identity fields and the hints' values
+        // included. The one-line fields are folded to one line, so none can forge a second line in
+        // the daemon's rendering or its journal; the body keeps its line breaks.
+        let app_name = diag::one_line(&self.redacted(app_name));
+        let app_icon = self.redacted(app_icon);
         let id = self
             .host
             .notify(NotifyCall {
                 app_name: bounded(relayed_app_name(&app_name), APP_IDENTITY_MAX),
                 replaces_id,
                 app_icon: bounded(relayed_app_icon(&app_icon).to_string(), APP_IDENTITY_MAX),
-                summary: bounded(self.redacted(summary), SUMMARY_MAX),
-                body: bounded(self.redacted(body), BODY_MAX),
+                summary: bounded(diag::one_line(&self.redacted(summary)), SUMMARY_MAX),
+                body: bounded(without_controls(&self.redacted(body)), BODY_MAX),
                 actions: actions
                     .into_iter()
                     .take(ACTIONS_MAX)
-                    .map(|a| bounded(self.redacted(a), SUMMARY_MAX))
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let a = self.redacted(a);
+                        // `(id, label)` pairs: the id is echoed back to the app in
+                        // `ActionInvoked` and must cross as it was sent; the label is shown.
+                        let a = if i % 2 == 1 { diag::one_line(&a) } else { a };
+                        bounded(a, SUMMARY_MAX)
+                    })
                     .collect(),
                 hints: relayed_hints,
                 expire_timeout: relayed_expire_timeout(expire_timeout),
@@ -1087,6 +1173,12 @@ impl NotifyRelay {
                     }
                 }
             })
+            .inspect_err(|e| {
+                diag::warn(&format!(
+                    "`dbus = true`: the notifications relay could not start ({e}) — the app runs \
+                     without desktop notifications"
+                ));
+            })
             .ok();
         NotifyRelay { shutdown, handle }
     }
@@ -1173,6 +1265,25 @@ async fn completes_within(
 /// the same clean return. `host_bus` is the address of the bus the host daemon is on, `None` for
 /// the session bus the supervisor was given.
 async fn run(
+    private_socket: PathBuf,
+    host_bus: Option<String>,
+    shutdown: async_channel::Receiver<()>,
+    needles: crate::sandbox::notify_sink::Needles,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The whole of it races the shutdown, the connecting included. The private bus's socket is in a
+    // directory the cage writes, so what answers the handshake there may be a socket the cage put
+    // at the name and that never answers; awaited outside the race, the teardown's `join` would
+    // wait on it for good. Dropping the relay future drops both connections with it, so the
+    // ordering `Drop` guarantees still holds.
+    let closed = shutdown.clone();
+    futures_util::select! {
+        done = relay(private_socket, host_bus, shutdown, needles).fuse() => done,
+        _ = closed.recv().fuse() => Ok(()),
+    }
+}
+
+/// [`run`] without the outer race: everything from the socket wait to the end of the pump.
+async fn relay(
     private_socket: PathBuf,
     host_bus: Option<String>,
     shutdown: async_channel::Receiver<()>,
@@ -1680,6 +1791,184 @@ mod tests {
         );
     }
 
+    /// The identity fields and the hints' string values are the cage's text too, and travel to the
+    /// same daemon as the summary.
+    #[test]
+    fn a_credential_in_the_identity_fields_or_a_hint_does_not_reach_the_host_daemon() {
+        let host = FakeHost::default();
+        let with_secret = served_with_needle(&host, "gh_token", "ghp-abcdefghij");
+        let string = |s: &str| zbus::zvariant::Value::from(s).try_to_owned().unwrap();
+        let wrapped =
+            zbus::zvariant::Value::Value(Box::new(zbus::zvariant::Value::from("ghp-abcdefghij")))
+                .try_to_owned()
+                .unwrap();
+        let listed = zbus::zvariant::Value::from(vec!["ghp-abcdefghij"])
+            .try_to_owned()
+            .unwrap();
+        let hints = HashMap::from([
+            ("category".to_string(), string("im ghp-abcdefghij")),
+            ("x-plain".to_string(), string("nothing here")),
+            ("x-wrapped".to_string(), wrapped),
+            ("x-listed".to_string(), listed),
+            ("transient".to_string(), OwnedValue::from(true)),
+        ]);
+        notify_as(
+            &with_secret,
+            "app ghp-abcdefghij",
+            0,
+            "icon-ghp-abcdefghij",
+            hints,
+        );
+        let calls = locked(&host.calls);
+        let call = calls.first().expect("one forwarded call");
+        assert!(!call.app_name.contains("ghp-"), "{}", call.app_name);
+        assert!(call.app_name.contains("${gh_token}"), "{}", call.app_name);
+        assert_eq!(call.app_icon, "icon-${gh_token}");
+        let hint = |name: &str| call.hints[name].downcast_ref::<&str>().unwrap().to_string();
+        assert_eq!(hint("category"), "im ${gh_token}");
+        assert_eq!(hint("x-plain"), "nothing here");
+        assert!(
+            !call.hints.contains_key("x-wrapped") && !call.hints.contains_key("x-listed"),
+            "a string inside a variant or an array does not cross: {:?}",
+            call.hints.keys().collect::<Vec<_>>()
+        );
+        assert!(call.hints.contains_key("transient"), "a boolean crosses");
+    }
+
+    /// The one-line fields cannot forge a second line, and the body keeps its own line breaks
+    /// while losing every other control character. An action's id crosses as sent, since the app
+    /// matches `ActionInvoked` on it.
+    #[test]
+    fn a_relayed_notification_keeps_its_one_line_fields_to_one_line() {
+        let host = FakeHost::default();
+        async_io::block_on(served(&host).notify(
+            "app\nFAKE".to_string(),
+            0,
+            String::new(),
+            "first\nsecond\u{1b}[31m\u{202e}".to_string(),
+            "line one\nline two\r\u{1b}".to_string(),
+            vec!["id\n1".to_string(), "la\nbel".to_string()],
+            HashMap::new(),
+            -1,
+        ))
+        .expect("the recording host accepts the call");
+        let calls = locked(&host.calls);
+        let call = calls.first().expect("one forwarded call");
+        assert!(!call.app_name.contains('\n'), "{:?}", call.app_name);
+        assert_eq!(call.summary, "first second [31m");
+        assert_eq!(call.body, "line one\nline two  ");
+        assert_eq!(
+            call.actions,
+            vec!["id\n1".to_string(), "la bel".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_critical_urgency_is_capped_whatever_integer_carries_it() {
+        let urgency = |v: OwnedValue| {
+            capped_urgency(HashMap::from([("urgency".to_string(), v)])).contains_key("urgency")
+        };
+        assert!(!urgency(OwnedValue::from(2u8)));
+        assert!(!urgency(OwnedValue::from(2i32)));
+        assert!(!urgency(OwnedValue::from(7u32)));
+        assert!(!urgency(OwnedValue::from(2i64)));
+        assert!(urgency(OwnedValue::from(1u8)), "normal crosses");
+        assert!(
+            urgency(OwnedValue::from(1i32)),
+            "normal crosses in any width"
+        );
+        assert!(urgency(OwnedValue::from(0u16)), "low crosses");
+        assert!(
+            !urgency(OwnedValue::from(2.0f64)),
+            "a double is no urgency to trust"
+        );
+        assert!(
+            !urgency(
+                zbus::zvariant::Value::from("critical")
+                    .try_to_owned()
+                    .unwrap()
+            ),
+            "nor is a string"
+        );
+    }
+
+    #[test]
+    fn an_icon_shaped_like_a_relative_uri_or_a_windows_path_is_dropped() {
+        assert_eq!(relayed_app_icon("file:notes"), "");
+        assert_eq!(relayed_app_icon("http:host"), "");
+        assert_eq!(relayed_app_icon("C:\\x"), "");
+        assert_eq!(relayed_app_icon("..\\x"), "");
+        assert_eq!(relayed_app_icon("/etc/x"), "");
+        assert_eq!(relayed_app_icon("firefox"), "firefox");
+        assert_eq!(relayed_app_icon("dialog-information"), "dialog-information");
+    }
+
+    #[test]
+    fn a_daemon_answering_zero_leaves_nothing_in_the_set() {
+        let ids = OwnedIds::default();
+        ids.record(0);
+        assert!(locked(&ids.0).is_empty());
+        ids.record(7);
+        assert!(ids.owns(7));
+    }
+
+    /// A socket at the private bus's name that never serves the relay does not hold the teardown:
+    /// the cage can put one there. Both ways it can fail to serve are taken — a listener that
+    /// takes the connection and never answers the handshake, and one whose backlog is full, so the
+    /// connect itself waits.
+    #[test]
+    fn a_private_bus_that_never_answers_does_not_hold_the_teardown() {
+        for backlog_full in [false, true] {
+            let dir = crate::testutil::TmpDir::new();
+            let (host, sock) = (dir.join("host"), dir.join("bus"));
+            let Some(_host_bus) = test_bus(&host) else {
+                skip_incapable!("skipping: no dbus-daemon on PATH");
+                return;
+            };
+            let host_address = address_of(&host);
+            let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let _daemon = fake_daemon(&host_address, &seen, false);
+            let _silent = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let mut _queued = Vec::new();
+            if backlog_full {
+                loop {
+                    match crate::sandbox::broker::connect_unix_within(
+                        &sock,
+                        Duration::from_millis(50),
+                    ) {
+                        Ok(queued) => _queued.push(queued),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => panic!("filling the backlog: {e}"),
+                    }
+                }
+            }
+            let relay = NotifyRelay::start_on(sock, Some(host_address), Default::default());
+            // Long enough for the relay to have dialed and to be waiting on the bus.
+            std::thread::sleep(Duration::from_millis(500));
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            let started = Instant::now();
+            std::thread::spawn(move || {
+                drop(relay);
+                let _ = tx.send(());
+            });
+            // A handshake that never comes is cut by the shutdown at once; a connect that waits
+            // gives up within the dial's own five-second bound. Without either, never.
+            assert!(
+                rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "the teardown waited on a private bus that never answers (backlog full: \
+                 {backlog_full})"
+            );
+            if !backlog_full {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "a handshake that never comes held the teardown for {:?}",
+                    started.elapsed()
+                );
+            }
+        }
+    }
+
     /// One `Notify` as the caged app makes it, answered with the id the relay returns to the cage.
     fn notify(served: &Served, replaces_id: u32) -> u32 {
         notify_as(served, "caged-app", replaces_id, "", HashMap::new())
@@ -2030,7 +2319,7 @@ mod tests {
         // Critical is dropped; normal crosses untouched, so the cap is a ceiling and not a purge.
         notify_as(&served, "Slack", 0, "", urgency(2));
         notify_as(&served, "Slack", 0, "", urgency(1));
-        // A value of another type is not an urgency the daemon reads, and is left alone.
+        // A value of another type is no urgency to trust a daemon's reading of, and is dropped.
         let mut typed = HashMap::new();
         typed.insert("urgency".to_string(), hint("critical"));
         notify_as(&served, "Slack", 0, "", typed);
@@ -2046,8 +2335,8 @@ mod tests {
             "a normal urgency is an ordinary notification and still crosses"
         );
         assert!(
-            calls[2].hints.contains_key("urgency"),
-            "a hint of another type is not the urgency the cap is about"
+            !calls[2].hints.contains_key("urgency"),
+            "an urgency of another type crosses only if a daemon could not read it as critical"
         );
         drop(calls);
 
