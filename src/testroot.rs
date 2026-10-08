@@ -148,16 +148,25 @@ fn force_remove(path: &std::path::Path) {
 
 /// [`force_remove`], descending at most `depth` more levels.
 fn force_remove_within(path: &std::path::Path, depth: u32) {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let Ok(dir) = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY)
-        .open(path)
-    else {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::PermissionsExt;
+    // Through `libc::open` rather than `OpenOptions::custom_flags`, which masks `O_PATH` away under
+    // musl (it folds the flag into `O_ACCMODE`), the target the binary ships as.
+    let fd = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_or(-1, |c| {
+        // SAFETY: `c` is a live NUL-terminated path for the duration of the call.
+        unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        }
+    });
+    if fd < 0 {
         let _ = std::fs::remove_file(path);
         return;
-    };
+    }
+    // SAFETY: `fd` was just returned by open(2), and nothing else holds it.
+    let dir = unsafe { OwnedFd::from_raw_fd(fd) };
     if let Some(depth) = depth.checked_sub(1) {
         let held = std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
         // Through the descriptor's own entry, which acts on the inode it holds: `fchmod` refuses
