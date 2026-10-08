@@ -190,6 +190,13 @@ Honest limits:
 - inotify reports a completed write-and-close, not each in-progress write, and if the project tree is
   very large the kernel's watch limit (`fs.inotify.max_user_watches`) can be reached: either is
   surfaced with a one-time warning rather than hidden.
+- inotify needs read access to a directory to watch it, and the directory's owner, the agent
+  included, can take that away and still write in it. Such a directory is not watched, and that is
+  surfaced with a one-time warning naming the first one met. So is an observer that stops for good
+  while the session runs.
+- A directory is reached without following a link on any part of its path, so a link the agent
+  plants in the project, even one swapped in for a directory a moment after it appeared, is never
+  watched or walked through: the feed stays within the project tree.
 - The filtered trees are an **observation blind spot**, not just noise: because the cage runs an
   untrusted agent, anything it writes under `.git`, `node_modules`, `target`, or `.venv` is not shown.
   They are filtered because they would flood the feed and slow the launch. The cage is still the

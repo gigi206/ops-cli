@@ -20,7 +20,8 @@
 //!   the watch is added on its `IN_CREATE`. A file created in that directory *before* the watch lands
 //!   is caught by rescanning the new directory's contents (emitting synthetic creates); a race a plain
 //!   `IN_CREATE`-then-`add_watch` would miss. A watch-descriptor exhaustion or a kernel queue overflow
-//!   is surfaced with a one-time warning rather than hidden.
+//!   is surfaced with a one-time warning rather than hidden, and so is a directory that cannot be
+//!   watched at all (inotify needs read access, which the directory's owner can take away).
 //! - The filtered trees are an **exploitable blind spot**, not just noise: since the cage runs an
 //!   untrusted agent, anything it writes under `./.git`, `./node_modules`, `./target`, or `./.venv`
 //!   is not reported at all. This is a deliberate cost/coverage trade for v1 (those trees would flood
@@ -36,7 +37,8 @@
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
 use std::io;
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,16 +73,10 @@ pub(crate) const IGNORED_COMPONENTS: &[&str] = &[".git", "node_modules", "target
 /// (`IN_CREATE`/`IN_MOVED_TO`), a delete (`IN_DELETE`), and a move-out (`IN_MOVED_FROM`); the `*_SELF`
 /// masks let the watcher drop a directory that was itself removed.
 ///
-/// `IN_DONT_FOLLOW` is the security-relevant bit: without it the kernel resolves the path through a
-/// final-component symlink (`IN_ONLYDIR` only demands that the *resolved* target be a directory), and
-/// the watcher hands `inotify_add_watch` a path it re-resolves after the fact — the directory named by
-/// an `IN_CREATE|IN_ISDIR` event is looked up again when the poll loop gets to it, up to a poll period
-/// later. The cage owns the project tree, so in that window it can replace the new directory with a
-/// link to anywhere on the host; the flag makes that `add_watch` fail instead of pulling the watch set
-/// out of the project, spending the host-wide `fs.inotify.max_user_watches` budget on the cage's
-/// behalf, and reporting host paths under a project-relative name. The failure is `ENOTDIR`, not
-/// `ELOOP`: with `IN_ONLYDIR` also set the walk stops at the un-followed link and then fails the
-/// "must be a directory" check.
+/// There is no `IN_DONT_FOLLOW`: a watch is installed through `/proc/self/fd/<n>` ([`add_watch`]),
+/// a link the kernel has to follow to reach the directory the descriptor holds. What keeps the watch
+/// set inside the project is that descriptor, opened without following a link on any component
+/// ([`Watcher::add_tree`]); the flag only ever covered the final one.
 const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_CREATE
     | libc::IN_DELETE
@@ -89,7 +85,6 @@ const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_DELETE_SELF
     | libc::IN_MOVE_SELF
     | libc::IN_ONLYDIR
-    | libc::IN_DONT_FOLLOW
     | libc::IN_EXCL_UNLINK;
 
 /// A running filesystem-write observer. The thread drains inotify events and pushes each observed
@@ -107,21 +102,25 @@ impl FsWatcher {
     /// here, before the caller launches the cage: inotify only reports events under an already-installed
     /// watch, so a watch added later (from the background thread) would miss a write the cage makes in
     /// the gap. Only the event loop runs in the spawned thread. Fails (so the caller can degrade the fs
-    /// lens without disturbing exec observation) only when the inotify instance itself cannot be created.
+    /// lens without disturbing exec observation) when the inotify instance cannot be created, or when
+    /// the root cannot be resolved: an observer with no root to watch would record nothing while
+    /// reading as one that ran.
     ///
-    /// The root is canonicalised here rather than assumed canonical: every watch this module installs
-    /// refuses to resolve a symlinked final component (see [`WATCH_MASK`]), so a caller handing in a
-    /// path whose last component is a link would otherwise get an observer that watches nothing at
-    /// all. Reported paths are unaffected — each is stripped of this same prefix.
+    /// The root is canonicalised here rather than assumed canonical: every directory below it is
+    /// reached without following a link (see [`Watcher::add_tree`]), the root included, so a caller
+    /// handing in a path whose last component is a link would otherwise get an observer that watches
+    /// nothing at all. Reported paths are unaffected — each is stripped of this same prefix.
     pub(crate) fn start(root: &Path, ring: Arc<FsRing>) -> io::Result<FsWatcher> {
         // SAFETY: `inotify_init1` with valid flags returns a new fd or -1.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: a fresh descriptor the call returned, owned here and closed once, on drop.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let mut watcher = Watcher {
             fd,
-            root: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+            root: root.canonicalize()?,
             wd_paths: HashMap::new(),
             ring,
             warned: Warned::new(),
@@ -156,6 +155,7 @@ impl Drop for FsWatcher {
 struct Warned {
     limit: AtomicBool,
     overflow: AtomicBool,
+    unwatched: AtomicBool,
 }
 
 impl Warned {
@@ -163,6 +163,7 @@ impl Warned {
         Warned {
             limit: AtomicBool::new(false),
             overflow: AtomicBool::new(false),
+            unwatched: AtomicBool::new(false),
         }
     }
 
@@ -173,6 +174,20 @@ impl Warned {
                  `sbx fs logs` may miss writes there (raise `fs.inotify.max_user_watches` to watch a \
                  larger tree)",
             );
+        }
+    }
+
+    /// A directory left unwatched, or unlisted, for a reason other than the two the walk passes over
+    /// in silence (see [`Watcher::add_tree`]): typically one whose owner took away the read access
+    /// inotify needs, which the agent can do to a directory of its own and then write under it.
+    fn warn_unwatched_once(&self, rel: &Path, e: &io::Error) {
+        if !self.unwatched.swap(true, Ordering::Relaxed) {
+            crate::diag::warn(&format!(
+                "a directory of the project tree could not be watched (`{}`: {e}) — `sbx fs logs` \
+                 misses writes under it, and under any other directory this warning is not repeated \
+                 for",
+                crate::diag::visible(&rel.to_string_lossy())
+            ));
         }
     }
 
@@ -200,13 +215,23 @@ fn is_ignored_path(rel: &Path) -> bool {
     })
 }
 
-/// Install a watch on a directory, returning its watch descriptor. A path carrying an interior NUL
-/// (impossible for a real path) fails closed.
-fn add_watch(fd: libc::c_int, dir: &Path) -> io::Result<i32> {
-    let c = CString::new(dir.as_os_str().as_bytes())
+/// The path through which the kernel reaches the very file `fd` holds, whatever is now at the path
+/// it was opened by.
+fn through(fd: BorrowedFd<'_>) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+}
+
+/// Install a watch on the directory `dir` holds, returning its watch descriptor.
+///
+/// It takes a descriptor rather than a path because `inotify_add_watch` takes only a path, which the
+/// kernel resolves again at the call: a path checked a moment earlier can by then lead elsewhere
+/// through any of its components. The descriptor's own `/proc/self/fd` link leads to the directory
+/// it was opened on, and nowhere else.
+fn add_watch(inotify: BorrowedFd<'_>, dir: BorrowedFd<'_>) -> io::Result<i32> {
+    let c = CString::new(through(dir).into_os_string().into_vec())
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    // SAFETY: `fd` is our inotify instance and `c` a valid NUL-terminated path.
-    let wd = unsafe { libc::inotify_add_watch(fd, c.as_ptr(), WATCH_MASK) };
+    // SAFETY: `inotify` is a live inotify instance and `c` a valid NUL-terminated path.
+    let wd = unsafe { libc::inotify_add_watch(inotify.as_raw_fd(), c.as_ptr(), WATCH_MASK) };
     if wd < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -223,7 +248,7 @@ fn add_watch(fd: libc::c_int, dir: &Path) -> io::Result<i32> {
 /// the `#[allow(clippy::too_many_arguments)]` the event handler used to need, and all five already
 /// moved into the watch thread together.
 struct Watcher {
-    fd: libc::c_int,
+    fd: OwnedFd,
     root: PathBuf,
     wd_paths: HashMap<i32, PathBuf>,
     ring: Arc<FsRing>,
@@ -245,16 +270,41 @@ impl Watcher {
     /// `false` so the pre-existing project is not replayed as writes. On a watch-descriptor exhaustion the
     /// walk stops and warns once; the directories already watched keep working.
     ///
-    /// A symlink is never traversed, by two mechanisms that have to hold together: an entry's type is read
-    /// without following it (so a link to a directory is not recursed into), and [`WATCH_MASK`] carries
-    /// `IN_DONT_FOLLOW` (so a path whose final component turned into a link between its discovery and this
-    /// walk is refused instead of resolved). The second is what covers the re-resolution window, and it
-    /// also guards the enumeration: a failed `add_watch` `continue`s before the `read_dir` below, which
-    /// *would* follow the link. The pairing is why the two are not independent choices.
+    /// A symlink is never traversed. Each directory is held by a descriptor opened one component at a
+    /// time from the root with every link refused ([`super::cagedir::hold_beneath`]), and the watch
+    /// and the listing both go through that descriptor. The cage owns the project tree, so between
+    /// the event that named a directory and this walk it can turn the directory, or any directory
+    /// above it, into a link to anywhere on the host; the path would then be resolved through it,
+    /// pulling the watch set out of the project, spending the host-wide
+    /// `fs.inotify.max_user_watches` budget on the cage's behalf, and reporting host paths under a
+    /// project-relative name. A directory the walk refuses is skipped without being enumerated.
+    ///
+    /// Two failures are passed over in silence: a directory that is gone (`NotFound`, the ordinary
+    /// race with a removal) and one that is a link or not a directory (`InvalidData`, the refusal
+    /// the walk returns for either), whose appearance the parent's watch has already reported and
+    /// below which there is nothing of the project. Anything else leaves a part of the tree
+    /// unobserved, and is warned about once.
     fn add_tree(&mut self, start: &Path, emit: bool) {
         let mut stack = vec![start.to_path_buf()];
         while let Some(dir) = stack.pop() {
-            match add_watch(self.fd, &dir) {
+            let Ok(rel) = dir.strip_prefix(&self.root) else {
+                continue;
+            };
+            let silent = |e: &io::Error| {
+                matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+                )
+            };
+            let held = match super::cagedir::hold_beneath(&self.root, rel) {
+                Ok(held) => held,
+                Err(e) if silent(&e) => continue,
+                Err(e) => {
+                    self.warned.warn_unwatched_once(rel, &e);
+                    continue;
+                }
+            };
+            match add_watch(self.fd.as_fd(), held.as_fd()) {
                 Ok(wd) => {
                     self.wd_paths.insert(wd, dir.clone());
                 }
@@ -262,24 +312,46 @@ impl Watcher {
                     self.warned.warn_limit_once();
                     return;
                 }
-                // The directory vanished between discovery and the watch, was replaced by a symlink
-                // (refused by `IN_DONT_FOLLOW`), or is otherwise unwatchable: skip it — without
-                // enumerating it, which is what keeps the walk inside the project — and keep watching
-                // the rest.
-                Err(_) => continue,
+                Err(e) if silent(&e) => continue,
+                Err(e) => {
+                    self.warned.warn_unwatched_once(rel, &e);
+                    continue;
+                }
             }
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
+            // Listed through the descriptor too, which stays open for the loop: an entry whose type
+            // `d_type` leaves unknown is looked at under that same path.
+            let entries = match std::fs::read_dir(through(held.as_fd())) {
+                Ok(entries) => entries,
+                Err(e) if silent(&e) => continue,
+                Err(e) => {
+                    self.warned.warn_unwatched_once(rel, &e);
+                    continue;
+                }
             };
-            for entry in entries.flatten() {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        self.warned.warn_unwatched_once(rel, &e);
+                        break;
+                    }
+                };
                 let name = entry.file_name();
                 if is_ignored_name(&name) {
                     continue;
                 }
-                let path = entry.path();
+                let path = dir.join(&name);
                 // `file_type` does not traverse a symlink, so a symlink to a directory is not recursed
                 // into — the watch set stays within the real project tree.
-                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let is_dir = match entry.file_type() {
+                    Ok(t) => t.is_dir(),
+                    Err(e) => {
+                        if !silent(&e) {
+                            self.warned.warn_unwatched_once(&rel.join(&name), &e);
+                        }
+                        false
+                    }
+                };
                 if emit && let Ok(rel) = path.strip_prefix(&self.root) {
                     push_rel(&self.ring, rel, FsKind::Create);
                 }
@@ -359,42 +431,113 @@ impl Watcher {
     }
 
     /// The background event loop: poll the inotify fd (with a short timeout so a stop is honoured
-    /// promptly), drain and handle every pending event, and repeat until stopped. Closes the fd on exit
-    /// (which removes all watches).
+    /// promptly), drain and handle every pending event, and repeat until stopped. The fd closes with
+    /// the watcher (which removes all watches), on a panic as on a return.
+    ///
+    /// A failure that ends the loop is warned about: the session goes on, and `sbx fs logs` would
+    /// otherwise read as a record of everything written after it.
     fn event_loop(&mut self, stop: &AtomicBool) {
         let mut buf = vec![0u8; 16 * 1024];
-        while !stop.load(Ordering::Relaxed) {
+        let stopped = 'watch: loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             let mut pfd = libc::pollfd {
-                fd: self.fd,
+                fd: self.fd.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             };
             // SAFETY: one valid pollfd, waited up to 250 ms so the stop flag is re-checked promptly.
             let r = unsafe { libc::poll(&mut pfd, 1, 250) };
-            if r <= 0 {
-                continue; // timeout or EINTR — loop back and re-check the stop flag
-            }
-            if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                break; // the inotify fd is unusable — end the loop
-            }
-            if pfd.revents & libc::POLLIN == 0 {
-                continue;
+            match after_poll(r, io::Error::last_os_error(), pfd.revents) {
+                Polled::Again => continue,
+                Polled::Stop(cause) => break cause,
+                Polled::Drain => {}
             }
             // Drain every buffered event before polling again.
             loop {
                 // SAFETY: read into our owned buffer; the fd is non-blocking, so an empty queue returns
-                // EAGAIN (n < 0) and ends the drain.
+                // EAGAIN and ends the drain.
                 let n = unsafe {
-                    libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                    libc::read(
+                        self.fd.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
                 };
-                if n <= 0 {
-                    break;
+                match after_read(n, io::Error::last_os_error()) {
+                    Read::Events(n) => self.parse_buffer(&buf[..n]),
+                    Read::Again => {}
+                    Read::Drained => break,
+                    Read::Stop(cause) => break 'watch cause,
                 }
-                self.parse_buffer(&buf[..n as usize]);
             }
-        }
-        // SAFETY: closing our own inotify fd; removes every watch with it.
-        unsafe { libc::close(self.fd) };
+        };
+        crate::diag::warn(&format!(
+            "filesystem observation stopped ({stopped}) — `sbx fs logs` records no write made after \
+             this"
+        ));
+    }
+}
+
+/// What the event loop does after a `poll`.
+#[derive(Debug, PartialEq, Eq)]
+enum Polled {
+    /// Nothing to read, a timeout, or a signal: check the stop flag and poll again.
+    Again,
+    /// Events are waiting.
+    Drain,
+    /// The descriptor cannot be polled any more; the cause, for the warning.
+    Stop(String),
+}
+
+/// Decide on a `poll` that returned `r`, with `err` the errno it left and `revents` what it reported
+/// for the inotify descriptor. Pure, so each branch is tested without an instance.
+fn after_poll(r: libc::c_int, err: io::Error, revents: libc::c_short) -> Polled {
+    if r < 0 {
+        return match err.kind() {
+            io::ErrorKind::Interrupted => Polled::Again,
+            _ => Polled::Stop(format!("polling the inotify descriptor failed: {err}")),
+        };
+    }
+    if r == 0 {
+        return Polled::Again;
+    }
+    if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return Polled::Stop(format!(
+            "the inotify descriptor became unusable (poll events {revents:#x})"
+        ));
+    }
+    if revents & libc::POLLIN == 0 {
+        return Polled::Again;
+    }
+    Polled::Drain
+}
+
+/// What the drain does after a `read`.
+#[derive(Debug, PartialEq, Eq)]
+enum Read {
+    /// That many bytes of events to handle.
+    Events(usize),
+    /// Interrupted by a signal: read again.
+    Again,
+    /// The queue is empty: poll again.
+    Drained,
+    /// The descriptor cannot be read any more; the cause, for the warning.
+    Stop(String),
+}
+
+/// Decide on a `read` that returned `n`, with `err` the errno it left. inotify hands back whole
+/// events or fails, so a zero-length read is a failure too. Pure, as [`after_poll`] is.
+fn after_read(n: isize, err: io::Error) -> Read {
+    match usize::try_from(n) {
+        Ok(0) => Read::Stop("reading the inotify descriptor returned nothing".to_string()),
+        Ok(n) => Read::Events(n),
+        Err(_) => match err.kind() {
+            io::ErrorKind::WouldBlock => Read::Drained,
+            io::ErrorKind::Interrupted => Read::Again,
+            _ => Read::Stop(format!("reading the inotify descriptor failed: {err}")),
+        },
     }
 }
 
@@ -569,53 +712,143 @@ mod tests {
         );
     }
 
+    /// A watcher over `root` with no watch installed yet, for a test to drive `add_tree` by hand.
+    fn bare_watcher(root: &Path, ring: &Arc<FsRing>) -> Watcher {
+        // SAFETY: `inotify_init1` with valid flags returns a new fd or -1.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0, "an inotify instance could be created");
+        Watcher {
+            // SAFETY: the descriptor just returned, owned here and closed once, on drop.
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            root: root.to_path_buf(),
+            wd_paths: HashMap::new(),
+            ring: ring.clone(),
+            warned: Warned::new(),
+        }
+    }
+
+    /// The escape this pins: the watcher reaches a directory by its path up to a poll period after
+    /// the kernel reported it, so the cage can swap that directory, or one above it, for a link in
+    /// between. Neither the watch nor the listing may then follow the link: nothing is recorded,
+    /// and nothing behind it is reported as a project-relative change.
     #[test]
-    fn a_directory_replaced_by_a_symlink_is_neither_watched_nor_walked_through() {
-        // The escape this pins: the watcher re-resolves a directory's *path* when it installs the
-        // watch, up to a poll period after the kernel reported the create, so the cage can swap that
-        // directory for a link in between. `IN_DONT_FOLLOW` is what makes the `add_watch` fail rather
-        // than watch the link's target, and because the failure arm `continue`s before `read_dir`, the
-        // same flag also stops the enumeration that would walk the target and report its contents as
-        // project-relative creates. Without the flag `inotify_add_watch` resolves the link and both
-        // halves succeed, so every assertion below is reached only by the fixed code.
+    fn a_link_anywhere_on_a_directorys_path_is_neither_watched_nor_walked_through() {
         let project = TmpDir::new();
         let root = project.path().canonicalize().unwrap();
         let elsewhere = TmpDir::new();
         let outside = elsewhere.path().canonicalize().unwrap();
-        std::fs::create_dir(outside.join("host-only")).unwrap();
-        let link = root.join("late");
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        std::fs::create_dir_all(outside.join("b").join("host-only")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("a")).unwrap();
 
-        // SAFETY: `inotify_init1` with valid flags returns a new fd or -1.
-        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        assert!(fd >= 0, "an inotify instance could be created");
+        // The final component is the link, then a component above the directory named is.
+        for start in [root.join("a"), root.join("a").join("b")] {
+            let ring = Arc::new(FsRing::new(100));
+            let mut watcher = bare_watcher(&root, &ring);
+            watcher.add_tree(&start, true);
+            assert!(
+                watcher.wd_paths.is_empty(),
+                "{}: no watch is recorded for a path that leaves the project tree",
+                start.display()
+            );
+            assert!(
+                ring.snapshot(None).events.is_empty(),
+                "{}: nothing behind the link is reported",
+                start.display()
+            );
+            assert!(
+                !watcher.warned.unwatched.load(Ordering::Relaxed),
+                "a link is passed over in silence: the parent's watch reported it"
+            );
+        }
+    }
 
-        let err = add_watch(fd, &link).expect_err("a watch is never installed through a symlink");
-        assert_ne!(
-            err.raw_os_error(),
-            Some(libc::ENOSPC),
-            "the refusal is a per-path skip, not the watch-descriptor exhaustion that ends the walk"
-        );
-
+    /// A directory that appears after start is rescanned, and what was already in it is reported
+    /// under its project-relative path.
+    #[test]
+    fn a_rescanned_directory_reports_what_it_already_held() {
+        let project = TmpDir::new();
+        let root = project.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("late").join("deeper")).unwrap();
+        std::fs::write(root.join("late").join("f.txt"), b"z").unwrap();
         let ring = Arc::new(FsRing::new(100));
-        let mut watcher = Watcher {
-            fd,
-            root: root.clone(),
-            wd_paths: HashMap::new(),
-            ring: ring.clone(),
-            warned: Warned::new(),
-        };
-        watcher.add_tree(&link, true);
-        assert!(
-            watcher.wd_paths.is_empty(),
-            "no watch descriptor is recorded for a path that leaves the project tree"
-        );
-        assert!(
-            ring.snapshot(None).events.is_empty(),
-            "nothing behind the link is reported as a project-relative change"
-        );
+        let mut watcher = bare_watcher(&root, &ring);
+        watcher.add_tree(&root.join("late"), true);
 
-        // SAFETY: closing the inotify fd this test opened; it removes any watch with it.
-        unsafe { libc::close(fd) };
+        let mut seen: Vec<String> = ring
+            .snapshot(None)
+            .events
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
+        seen.sort();
+        assert_eq!(seen, ["late/deeper", "late/f.txt"]);
+        let mut watched: Vec<&PathBuf> = watcher.wd_paths.values().collect();
+        watched.sort();
+        assert_eq!(
+            watched,
+            [&root.join("late"), &root.join("late").join("deeper")]
+        );
+    }
+
+    /// inotify needs read access to a directory, which its owner can take away and still write in
+    /// it: such a directory cannot be watched, and that is said rather than passed over.
+    #[test]
+    fn a_directory_that_cannot_be_watched_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: `geteuid` reads this process's credentials and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!("running as root, which reads a directory whatever its mode");
+            return;
+        }
+        let project = TmpDir::new();
+        let root = project.path().canonicalize().unwrap();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o333)).unwrap();
+        let ring = Arc::new(FsRing::new(100));
+        let mut watcher = bare_watcher(&root, &ring);
+        watcher.walk_root(false);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(watcher.wd_paths.values().any(|p| *p == root));
+        assert!(!watcher.wd_paths.values().any(|p| *p == locked));
+        assert!(
+            watcher.warned.unwatched.load(Ordering::Relaxed),
+            "the directory left unwatched is warned about"
+        );
+    }
+
+    /// An observer with no root to watch is refused rather than started watching nothing.
+    #[test]
+    fn a_root_that_cannot_be_resolved_is_refused() {
+        let project = TmpDir::new();
+        let ring = Arc::new(FsRing::new(100));
+        assert!(FsWatcher::start(&project.path().join("absent"), ring).is_err());
+    }
+
+    #[test]
+    fn a_signal_retries_and_any_other_failure_stops_the_loop() {
+        let errno = io::Error::from_raw_os_error;
+        let quiet = || errno(0);
+        assert_eq!(after_poll(-1, errno(libc::EINTR), 0), Polled::Again);
+        assert!(matches!(
+            after_poll(-1, errno(libc::ENOMEM), 0),
+            Polled::Stop(_)
+        ));
+        assert_eq!(after_poll(0, quiet(), 0), Polled::Again);
+        for bad in [libc::POLLERR, libc::POLLHUP, libc::POLLNVAL] {
+            assert!(matches!(
+                after_poll(1, quiet(), bad | libc::POLLIN),
+                Polled::Stop(_)
+            ));
+        }
+        assert_eq!(after_poll(1, quiet(), libc::POLLIN), Polled::Drain);
+        assert_eq!(after_poll(1, quiet(), libc::POLLPRI), Polled::Again);
+
+        assert_eq!(after_read(32, quiet()), Read::Events(32));
+        assert_eq!(after_read(-1, errno(libc::EAGAIN)), Read::Drained);
+        assert_eq!(after_read(-1, errno(libc::EINTR)), Read::Again);
+        assert!(matches!(after_read(-1, errno(libc::EBADF)), Read::Stop(_)));
+        assert!(matches!(after_read(0, quiet()), Read::Stop(_)));
     }
 }
