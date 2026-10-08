@@ -5301,6 +5301,27 @@ fn a_write_to_a_profile_is_held_to_how_the_loader_reads_one() {
         String::from_utf8_lossy(&shown.stderr)
     );
     assert!(set(&["home_scope", "project"]).status.success());
+
+    // The same file reached by another spelling is the same profile: through `..`, through a link
+    // to the profiles directory, and as a bare name from inside it.
+    let apps = fx.config_home.path().join("sbx/apps");
+    let linked = fx.scratch().join("linked-apps");
+    std::os::unix::fs::symlink(&apps, &linked).unwrap();
+    let dotted = apps.join("../apps/demo.toml");
+    let through_link = linked.join("demo.toml");
+    for (dir, file) in [
+        (fx.scratch(), dotted.to_str().unwrap()),
+        (fx.scratch(), through_link.to_str().unwrap()),
+        (apps.as_path(), "demo.toml"),
+    ] {
+        let out = fx.run_in(dir, &["config", "set", "contract", "bogus", "-c", file]);
+        assert!(
+            !out.status.success(),
+            "`-c {file}` from {} must be refused:\n{}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 /// A parent that ignores `SIGCHLD` hands that disposition down through `execve`, and under it the

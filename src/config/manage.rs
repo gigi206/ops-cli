@@ -569,9 +569,11 @@ pub(crate) fn remove(path: &Path, key: &str, entry: &str) -> Result<Written<bool
         .iter()
         .position(|v| v.as_str().is_some_and(|s| s == entry) || render_value(v) == entry)
     else {
+        // `before`, not the document: `list_at` may have materialized an empty list that was never
+        // written, and what is attested to must be the file as it stands.
         return Ok(Written {
             outcome: false,
-            text: doc.to_string(),
+            text: before,
         });
     };
     remove_entry(list, idx);
@@ -622,7 +624,11 @@ fn rule_list_verb(key: &str) -> Option<String> {
         ("network.", &["allow", "deny", "mute"][..]),
         ("proc.", &["allow", "deny"][..]),
     ] {
-        if let Some(tail) = key.rsplit_once(table).map(|(_, tail)| tail)
+        // The table name must be a whole segment: `anetwork.allow` names no `[network]` list.
+        if let Some(tail) = key
+            .rsplit_once(table)
+            .filter(|(head, _)| head.is_empty() || head.ends_with('.'))
+            .map(|(_, tail)| tail)
             && let Some(verb) = verbs.iter().find(|v| **v == tail)
         {
             let namespace = table.trim_end_matches('.');
@@ -927,8 +933,21 @@ fn validate_layer(before: &str, doc: &DocumentMut, profile: bool) -> Result<(), 
 
 /// Whether `path` is an app profile: a file of the profiles directory, the one place the loader
 /// reads profiles from ([`super::load::profiles_dir`]).
+///
+/// Asked of the directory the file is in, not of how the path spells it: `apps/../apps/x.toml`, a
+/// link to the profiles directory and a bare `x.toml` written from inside it all name a profile
+/// the loader reads as one, and each used to be held to a config layer's rules instead. A directory
+/// that cannot be resolved (it does not exist yet) is compared as spelled.
 fn is_profile(path: &Path) -> bool {
-    super::load::profiles_dir().is_some_and(|dir| path.parent() == Some(dir.as_path()))
+    let Some(dir) = super::load::profiles_dir() else {
+        return false;
+    };
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let resolved = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    resolved(parent) == resolved(&dir)
 }
 
 /// The half of [`validate_layer`] for a profile, which the loader reads as one app, whole or not at
@@ -1260,6 +1279,7 @@ pub(crate) fn add_egress_rule(
     }
 
     let mut doc = read_or_empty(path)?;
+    let before = doc.to_string();
     let parent = layer_parent(&mut doc, app)?;
     let case = match parent.get("network") {
         None => NetCase::Absent,
@@ -1349,7 +1369,15 @@ pub(crate) fn add_egress_rule(
         }
     };
 
-    let text = commit_rule(path, &doc, &outcome)?;
+    if matches!(outcome, AddOutcome::Added { .. })
+        && let Err(detail) = admit_rule_edit(path, &before, &doc)
+    {
+        return Err(ManageError::InvalidValue(
+            format!("[network] {}", list.key()),
+            detail,
+        ));
+    }
+    let text = commit_rule(path, &doc, &before, &outcome)?;
     Ok(Written { outcome, text })
 }
 
@@ -1377,6 +1405,7 @@ pub(crate) fn add_proc_rule(
     }
 
     let mut doc = read_or_empty(path)?;
+    let before = doc.to_string();
     let parent = layer_parent(&mut doc, app)?;
     let case = match parent.get("proc") {
         None => ProcCase::Absent,
@@ -1439,7 +1468,15 @@ pub(crate) fn add_proc_rule(
         }
     };
 
-    let text = commit_rule(path, &doc, &outcome)?;
+    if matches!(outcome, AddOutcome::Added { .. })
+        && let Err(detail) = admit_rule_edit(path, &before, &doc)
+    {
+        return Err(ManageError::InvalidValue(
+            format!("[proc] {}", list.key()),
+            detail,
+        ));
+    }
+    let text = commit_rule(path, &doc, &before, &outcome)?;
     Ok(Written { outcome, text })
 }
 
@@ -1455,12 +1492,33 @@ pub(crate) fn add_proc_rule(
 fn commit_rule(
     path: &Path,
     doc: &DocumentMut,
+    before: &str,
     outcome: &AddOutcome,
 ) -> Result<String, ManageError> {
     match outcome {
-        AddOutcome::AlreadyPresent => Ok(doc.to_string()),
+        AddOutcome::AlreadyPresent => Ok(before.to_string()),
         AddOutcome::Added { .. } => write_doc(path, doc),
     }
+}
+
+/// [`validate_layer`] for a verb that adds one rule (`sbx net allow`, `sbx proc deny`, a learned
+/// list), judged on what the write adds.
+///
+/// Every such verb admits its rule against the resolver's grammar before it gets here, so this is
+/// the gate `set` and `add` already pass through, held at the function that writes rather than
+/// left to each caller. It refuses only a write that takes a file the gate accepts to one it does
+/// not: a file already carrying an entry the gate refuses — written by hand, and dropped at load
+/// with a warning of its own — keeps taking rules, as it did before this gate, rather than having
+/// a learning session's whole result refused over an entry nobody touched.
+fn admit_rule_edit(path: &Path, before: &str, doc: &DocumentMut) -> Result<(), String> {
+    let profile = is_profile(path);
+    let accepted_before = before
+        .parse::<DocumentMut>()
+        .is_ok_and(|was| validate_layer(before, &was, profile).is_ok());
+    if !accepted_before {
+        return Ok(());
+    }
+    validate_layer(before, doc, profile)
 }
 
 /// What a `--proc-learn` write did: the rules it added, how many were already there, and the mode it
@@ -1506,6 +1564,7 @@ pub(crate) fn add_learned_proc_rules(
     rules: &[String],
 ) -> Result<Written<LearnedProcWrite>, ManageError> {
     let mut doc = read_or_empty(path)?;
+    let before = doc.to_string();
     let parent = layer_parent(&mut doc, app)?;
     let previous_mode = match parent.get("proc") {
         None => None,
@@ -1557,11 +1616,16 @@ pub(crate) fn add_learned_proc_rules(
         previous_mode,
     };
     // Written only when something changed, for the reason `commit_rule` states: attesting to a
-    // document that was never written records a hash of bytes the file does not hold.
+    // document that was never written records a hash of bytes the file does not hold. That is
+    // `before` rather than the document, which the promotion above re-shapes even when it adds
+    // nothing (an inline `proc = { … }` becomes a `[proc]` table).
     let text = if outcome.wrote_anything() {
+        admit_rule_edit(path, &before, &doc).map_err(|detail| {
+            ManageError::InvalidValue(format!("[proc] {}", ProcList::Allow.key()), detail)
+        })?;
         write_doc(path, &doc)?
     } else {
-        doc.to_string()
+        before
     };
     Ok(Written { outcome, text })
 }
@@ -1710,7 +1774,7 @@ pub(crate) fn add_fs_mask(
             detail,
         ));
     }
-    let text = commit_rule(path, &doc, &outcome)?;
+    let text = commit_rule(path, &doc, &before, &outcome)?;
     Ok(Written { outcome, text })
 }
 
@@ -1740,9 +1804,8 @@ fn remove_rule_from(
     key: &str,
     rule: &str,
 ) -> Result<RemoveOutcome, ManageError> {
-    if !path.exists() {
-        return Ok(RemoveOutcome::NotPresent);
-    }
+    // An absent file reads as an empty document, which holds nothing to remove; any other failure
+    // to read it is reported rather than taken for an absence.
     let mut doc = read_or_empty(path)?;
     // Navigate to the table's parent WITHOUT creating anything (the add paths create the
     // `[app.<name>]` scaffolding; removal must not).
@@ -1950,27 +2013,55 @@ fn split_key(key: &str) -> Result<Vec<String>, ManageError> {
     // `secret.'api.example.com'.from` down the very path described above, splitting it into
     // `secret`, `'api`, `example`, `com'`, `from` and writing a table the schema accepts while the
     // credential the user named stays undeclared.
+    //
+    // A quote opens a segment and closes it, as in TOML, and nowhere else: `network"."allow` used to
+    // read as the one key `network.allow` at the root, a key nothing reads, written and reported
+    // as set while the `[network]` list it spells stayed as it was. TOML has no such key, so it is
+    // refused, as is a segment that goes on past its closing quote.
+    let bad = || ManageError::BadKey(key.to_string());
     let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    for c in key.chars() {
-        match (c, quote) {
-            // The closing half of the pair that opened this segment.
-            (c, Some(open)) if c == open => quote = None,
-            // Inside a quoted segment the other quote character, and a dot, are ordinary text.
-            (c, Some(_)) => current.push(c),
-            ('"' | '\'', None) => quote = Some(c),
-            ('.', None) => segments.push(std::mem::take(&mut current)),
-            (c, None) => current.push(c),
+    let mut chars = key.chars().peekable();
+    loop {
+        let mut current = String::new();
+        match chars.peek().copied() {
+            Some(open @ ('"' | '\'')) => {
+                chars.next();
+                loop {
+                    match chars.next() {
+                        Some(c) if c == open => break,
+                        Some(c) => current.push(c),
+                        // An unbalanced quote would otherwise swallow the rest of the key.
+                        None => return Err(bad()),
+                    }
+                }
+                segments.push(current);
+                match chars.next() {
+                    None => break,
+                    Some('.') => {}
+                    Some(_) => return Err(bad()),
+                }
+            }
+            _ => {
+                let mut ended = true;
+                for c in chars.by_ref() {
+                    match c {
+                        '.' => {
+                            ended = false;
+                            break;
+                        }
+                        '"' | '\'' => return Err(bad()),
+                        c => current.push(c),
+                    }
+                }
+                segments.push(current);
+                if ended {
+                    break;
+                }
+            }
         }
     }
-    if quote.is_some() {
-        // An unbalanced quote would otherwise swallow the rest of the key into one segment.
-        return Err(ManageError::BadKey(key.to_string()));
-    }
-    segments.push(current);
     if segments.iter().any(String::is_empty) {
-        return Err(ManageError::BadKey(key.to_string()));
+        return Err(bad());
     }
     Ok(segments)
 }
@@ -4431,5 +4522,100 @@ mod tests {
             ino,
             "a real addition still rewrites the file"
         );
+    }
+
+    /// A rule verb is held to the gate `set` and `add` pass through, on what it adds: a rule the
+    /// resolver would drop is refused without writing, while a file already carrying such an entry
+    /// keeps taking good rules.
+    #[test]
+    fn a_rule_verb_refuses_what_the_gate_refuses_and_only_what_it_adds() {
+        let tmp = crate::testutil::TmpDir::new();
+        let clean =
+            "[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n\n[proc]\nmode = \"enforce\"\n";
+        let p = doc_at(tmp.path(), clean);
+        let err = add_egress_rule(&p, None, EgressList::Allow, "*", Inherited::Nothing)
+            .expect_err("a catch-all allow is refused");
+        assert!(matches!(err, ManageError::InvalidValue(..)), "{err}");
+        let err = add_proc_rule(&p, None, ProcList::Deny, "a\nb")
+            .expect_err("a rule with a line break is refused");
+        assert!(matches!(err, ManageError::InvalidValue(..)), "{err}");
+        let err = add_learned_proc_rules(&p, None, &["".to_string()])
+            .expect_err("an empty learned rule is refused");
+        assert!(matches!(err, ManageError::InvalidValue(..)), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            clean,
+            "nothing was written"
+        );
+
+        let tainted = "[network]\nmode = \"deny\"\nallow = [\"*\"]\n";
+        let p = doc_at(tmp.path(), tainted);
+        add_egress_rule(&p, None, EgressList::Allow, "crates.io", Inherited::Nothing)
+            .expect("a good rule still lands beside an entry written by hand");
+    }
+
+    /// A no-op hands back the file as it stands, which is what a caller attests to, never a
+    /// document the verb re-shaped on the way to deciding it had nothing to do.
+    #[test]
+    fn a_no_op_attests_to_the_file_as_it_stands() {
+        let tmp = crate::testutil::TmpDir::new();
+        let body = "[env]\nA = \"1\"\n";
+        let p = doc_at(tmp.path(), body);
+        let written = remove(&p, "fs.deny", "/etc").unwrap();
+        assert!(!written.outcome);
+        assert_eq!(written.text, body, "no materialized empty list");
+
+        let body = "proc = { mode = \"ask\", allow = [\"git\"] }\n";
+        let p = doc_at(tmp.path(), body);
+        let written = add_learned_proc_rules(&p, None, &["git".to_string()]).unwrap();
+        assert!(!written.outcome.wrote_anything());
+        assert_eq!(written.text, body, "no promotion to a `[proc]` table");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), body);
+    }
+
+    #[test]
+    fn a_rule_list_is_named_only_by_a_whole_table_segment() {
+        assert_eq!(
+            rule_list_verb("network.allow").as_deref(),
+            Some("net allow")
+        );
+        assert_eq!(
+            rule_list_verb("app.x.proc.deny").as_deref(),
+            Some("proc deny")
+        );
+        assert_eq!(rule_list_verb("anetwork.allow"), None);
+        assert_eq!(rule_list_verb("app.myproc.deny"), None);
+    }
+
+    #[test]
+    fn a_quote_opens_and_closes_a_whole_segment_and_nothing_else() {
+        assert_eq!(
+            split_key(r#"secret."api.example.com".from"#).unwrap(),
+            ["secret", "api.example.com", "from"]
+        );
+        assert_eq!(split_key("a.'b.c'").unwrap(), ["a", "b.c"]);
+        for bad in [
+            r#"network"."allow"#,
+            r#"a"b""#,
+            r#""a"b.c"#,
+            "a.",
+            ".a",
+            r#""a"#,
+        ] {
+            assert!(split_key(bad).is_err(), "`{bad}` is not a key TOML writes");
+        }
+    }
+
+    /// Removing from a file that is a dangling link finds nothing to remove, as it did when the
+    /// absence was asked of the path first.
+    #[test]
+    fn removing_from_a_dangling_link_finds_nothing() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join(".sbx.toml");
+        std::os::unix::fs::symlink(tmp.path().join("missing"), &p).unwrap();
+        assert!(matches!(
+            remove_egress_rule(&p, None, EgressList::Allow, "github.com").unwrap(),
+            RemoveOutcome::NotPresent
+        ));
     }
 }
