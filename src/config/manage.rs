@@ -463,16 +463,16 @@ pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<Written<SetOutcom
     // right and behaves wrong.
     if let Some(array) = parsed_array(val) {
         let created = put_value(&mut doc, key, array)?;
-        return match validate_layer(&before, &doc, is_profile(path)) {
+        return match validate_layer(&before, &doc, super::load::is_profile_file(path)) {
             Ok(()) => commit(path, &doc, &before, created),
             Err(detail) => Err(ManageError::InvalidValue(key.to_string(), detail)),
         };
     }
     let created = put_value(&mut doc, key, scalar_value(val))?;
-    if validate_layer(&before, &doc, is_profile(path)).is_err() {
+    if validate_layer(&before, &doc, super::load::is_profile_file(path)).is_err() {
         // The natural type broke the layer — write the value as a string instead.
         put_value(&mut doc, key, Value::from(val))?;
-        if let Err(detail) = validate_layer(&before, &doc, is_profile(path)) {
+        if let Err(detail) = validate_layer(&before, &doc, super::load::is_profile_file(path)) {
             return Err(ManageError::InvalidValue(key.to_string(), detail));
         }
     }
@@ -537,14 +537,14 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<Written<bool>, 
     // way in at all. The guess is validated below and retried as a string, so an over-eager one
     // (a host that looks like a number) is never committed.
     append_entry(list, scalar_value(entry));
-    if validate_layer(&before, &doc, is_profile(path)).is_err() {
+    if validate_layer(&before, &doc, super::load::is_profile_file(path)).is_err() {
         // Replace the slot rather than take it out and append again: it already carries the decor
         // [`append_entry`] gave it, and a second append would move the trailing comment a second
         // time. `Array::replace` keeps the existing element's decor, which is exactly that slot's.
         let list = list_at(&mut doc, key)?;
         let last = list.len() - 1;
         list.replace(last, entry);
-        if let Err(detail) = validate_layer(&before, &doc, is_profile(path)) {
+        if let Err(detail) = validate_layer(&before, &doc, super::load::is_profile_file(path)) {
             return Err(ManageError::InvalidValue(key.to_string(), detail));
         }
     }
@@ -577,7 +577,7 @@ pub(crate) fn remove(path: &Path, key: &str, entry: &str) -> Result<Written<bool
         });
     };
     remove_entry(list, idx);
-    match validate_layer(&before, &doc, is_profile(path)) {
+    match validate_layer(&before, &doc, super::load::is_profile_file(path)) {
         Ok(()) => {
             let text = write_doc(path, &doc)?;
             Ok(Written {
@@ -931,25 +931,6 @@ fn validate_layer(before: &str, doc: &DocumentMut, profile: bool) -> Result<(), 
     Ok(())
 }
 
-/// Whether `path` is an app profile: a file of the profiles directory, the one place the loader
-/// reads profiles from ([`super::load::profiles_dir`]).
-///
-/// Asked of the directory the file is in, not of how the path spells it: `apps/../apps/x.toml`, a
-/// link to the profiles directory and a bare `x.toml` written from inside it all name a profile
-/// the loader reads as one, and each used to be held to a config layer's rules instead. A directory
-/// that cannot be resolved (it does not exist yet) is compared as spelled.
-fn is_profile(path: &Path) -> bool {
-    let Some(dir) = super::load::profiles_dir() else {
-        return false;
-    };
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let resolved = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    resolved(parent) == resolved(&dir)
-}
-
 /// The half of [`validate_layer`] for a profile, which the loader reads as one app, whole or not at
 /// all ([`super::schema::parse_app`]), where the rest of this check reads a config layer. A field
 /// only an app has (`cmd`, `contract`, `use`) means nothing to that reading, so a value of the
@@ -1220,7 +1201,7 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<Written<bool>, ManageError
             text: doc.to_string(),
         });
     }
-    if let Err(detail) = validate_layer(&before, &doc, is_profile(path)) {
+    if let Err(detail) = validate_layer(&before, &doc, super::load::is_profile_file(path)) {
         return Err(ManageError::InvalidValue(key.to_string(), detail));
     }
     let text = write_doc(path, &doc)?;
@@ -1511,7 +1492,7 @@ fn commit_rule(
 /// with a warning of its own — keeps taking rules, as it did before this gate, rather than having
 /// a learning session's whole result refused over an entry nobody touched.
 fn admit_rule_edit(path: &Path, before: &str, doc: &DocumentMut) -> Result<(), String> {
-    let profile = is_profile(path);
+    let profile = super::load::is_profile_file(path);
     let accepted_before = before
         .parse::<DocumentMut>()
         .is_ok_and(|was| validate_layer(before, &was, profile).is_ok());
@@ -1716,10 +1697,10 @@ pub(crate) fn remove_proc_rule(
 /// egress path does the same. A mask only ever takes access away, so there is no state in which
 /// writing one is a no-op the writer did not ask for, and no posture to refuse.
 ///
-/// The edit is still validated before it commits, on [`validate_layer`]'s own terms: those siblings
-/// admit their rule against the resolver's grammar first, and a mask this one committed that
-/// [`super::apply_fs`] then dropped would be reported as written over a path that stays open to the
-/// cage.
+/// The edit is validated before it commits, on [`validate_layer`]'s own terms: a mask this one
+/// committed that [`super::apply_fs`] then dropped would be reported as written over a path that
+/// stays open to the cage. Its siblings pass the same gate on what they add ([`admit_rule_edit`]);
+/// a mask has no caller that admits it first, so it is held to the whole of it.
 pub(crate) fn add_fs_mask(
     path: &Path,
     app: Option<&str>,
@@ -1768,7 +1749,7 @@ pub(crate) fn add_fs_mask(
         Some(_) => return Err(ManageError::MalformedFs("not a table".into())),
     };
 
-    if let Err(detail) = validate_layer(&before, &doc, is_profile(path)) {
+    if let Err(detail) = validate_layer(&before, &doc, super::load::is_profile_file(path)) {
         return Err(ManageError::InvalidValue(
             format!("[fs] {}", list.key()),
             detail,

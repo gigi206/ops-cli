@@ -910,6 +910,21 @@ pub(crate) fn profiles_dir() -> Option<PathBuf> {
     global_path().and_then(|p| p.parent().map(|d| d.join(PROFILES_DIR)))
 }
 
+/// Whether `path` names a file of [`profiles_dir`], asked of the directory it resolves to rather
+/// than of how it is spelled: `apps/../apps/x.toml`, a link to the directory and a bare `x.toml`
+/// given from inside it are each a profile the loader reads as one. Both sides are resolved as far
+/// as they exist ([`crate::trust::canonicalize_existing_prefix`]), so a profile about to be written
+/// into a directory not made yet is still recognised as one.
+pub(crate) fn is_profile_file(path: &Path) -> bool {
+    match (profiles_dir(), path.parent()) {
+        (Some(dir), Some(parent)) => {
+            crate::trust::canonicalize_existing_prefix(&dir)
+                == crate::trust::canonicalize_existing_prefix(parent)
+        }
+        _ => false,
+    }
+}
+
 /// The profile file for app `name` (`…/sbx/apps/<name>.toml`), or `None` when no config base
 /// resolves **or** `name` is not one an app may carry. The counterpart of [`profiles_dir`] for a
 /// single app — the target an app-scoped global write (`sbx net allow -a <name> --save -g`,

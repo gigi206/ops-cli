@@ -89,12 +89,7 @@ fn trusted_by_location(path: &Path) -> bool {
     {
         return true;
     }
-    match (crate::config::profiles_dir(), path.parent()) {
-        (Some(dir), Some(parent)) => dir
-            .canonicalize()
-            .is_ok_and(|dir| dir == trust::canonicalize_existing_prefix(parent)),
-        _ => false,
-    }
+    crate::config::is_profile_file(path)
 }
 
 /// `sbx trust`'s parsed arguments.
