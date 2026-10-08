@@ -17,11 +17,6 @@
 //! pin for a tool from nixhub metadata (pure) — with the one impure step, the metadata
 //! GET, isolated in [`resolve`].
 
-#![allow(
-    clippy::expect_used,
-    reason = "`stdout`/`stderr` are taken from a child this function spawned with `Stdio::piped()` for both, and nothing takes them first"
-)]
-
 use super::packages::Provisioned;
 use crate::store::{self, Layout};
 use std::collections::{BTreeMap, HashSet};
@@ -192,15 +187,16 @@ fn version_of(spec: &toml::Value) -> Option<String> {
 
 /// Extract `(tool, version)` pairs from a `.tool-versions` file: one tool per
 /// non-comment line, `<tool> <version> [more...]`, the first version taken. Blank lines
-/// and `#` comments are skipped. A line naming only a tool yields an empty request rather than
-/// being dropped, for the reason given on [`parse_toml_tools`].
+/// and `#` comments are skipped, a comment trailing a line included, as mise reads them. A line
+/// naming only a tool yields an empty request rather than being dropped, for the reason given on
+/// [`parse_toml_tools`].
 fn parse_tool_versions(bytes: &[u8]) -> Vec<(String, String)> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Vec::new();
     };
     text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.split('#').next().unwrap_or_default().trim())
+        .filter(|l| !l.is_empty())
         .filter_map(|l| {
             let mut parts = l.split_whitespace();
             let tool = parts.next()?;
@@ -261,6 +257,10 @@ pub(crate) fn provision(
     // Reconcile the tool roots *before* the empty-declaration return below. Dropping the last
     // `nix:` tool empties the declaration this reconciles against, so it is precisely the shape a
     // return placed above here would skip — and the one that leaves a root behind for good.
+    //
+    // After the trust gate, not before it: an untrusted declaration is one the cage may have
+    // written, and acting on it would let the cage unroot the project's tools. Its roots stay until
+    // the project is trusted again, when this runs.
     //
     // The id is read best-effort, on the ground [`prune_tool_roots`] already states for a removal
     // that fails: a project whose directory cannot be canonicalised has no root tree to reconcile,
@@ -466,9 +466,8 @@ pub(crate) fn upgrade_tools(
 
     for tool in &declared.nix {
         let existing = lock.get(&tool.pkg, &tool.version, system);
-        // An exact concrete request already resolved to itself is frozen — skip the query.
         if let Some(pin) = &existing
-            && pin.version == tool.version
+            && is_frozen(&tool.version, pin)
         {
             outcomes.push(ToolUpgrade::Unchanged {
                 pkg: tool.pkg.clone(),
@@ -479,26 +478,8 @@ pub(crate) fn upgrade_tools(
         }
         match resolve(nix, layout, tool, system, true) {
             Ok(pin) => {
-                let outcome = match &existing {
-                    None => ToolUpgrade::Pinned {
-                        pkg: tool.pkg.clone(),
-                        request: tool.version.clone(),
-                        version: pin.version.clone(),
-                    },
-                    Some(old) if old.commit == pin.commit => ToolUpgrade::Unchanged {
-                        pkg: tool.pkg.clone(),
-                        request: tool.version.clone(),
-                        version: pin.version.clone(),
-                    },
-                    Some(old) => ToolUpgrade::Rolled {
-                        pkg: tool.pkg.clone(),
-                        request: tool.version.clone(),
-                        from: old.version.clone(),
-                        to: pin.version.clone(),
-                    },
-                };
+                outcomes.push(roll_outcome(tool, existing.as_ref(), &pin));
                 lock.insert(&tool.pkg, &tool.version, system, &pin);
-                outcomes.push(outcome);
             }
             Err(e) => outcomes.push(ToolUpgrade::Failed {
                 pkg: tool.pkg.clone(),
@@ -546,6 +527,36 @@ pub(crate) fn upgrade_tools(
         lock.write(&lock_path)?;
     }
     Ok(outcomes)
+}
+
+/// Whether `request` is an exact version already resolved to itself, which can never roll, so its
+/// query is skipped. An alias is never frozen, even when a release happens to carry its name.
+fn is_frozen(request: &str, pin: &Pin) -> bool {
+    !matches!(request, "" | "latest" | "stable") && pin.version == request
+}
+
+/// What re-resolving `tool` to `pin` did to the entry it had, `existing`. A pin is unchanged only
+/// when all of it is: one commit can carry several releases, so a request that moves to another
+/// attribute or version at the same commit has rolled.
+fn roll_outcome(tool: &NixTool, existing: Option<&Pin>, pin: &Pin) -> ToolUpgrade {
+    match existing {
+        None => ToolUpgrade::Pinned {
+            pkg: tool.pkg.clone(),
+            request: tool.version.clone(),
+            version: pin.version.clone(),
+        },
+        Some(old) if old == pin => ToolUpgrade::Unchanged {
+            pkg: tool.pkg.clone(),
+            request: tool.version.clone(),
+            version: pin.version.clone(),
+        },
+        Some(old) => ToolUpgrade::Rolled {
+            pkg: tool.pkg.clone(),
+            request: tool.version.clone(),
+            from: old.version.clone(),
+            to: pin.version.clone(),
+        },
+    }
 }
 
 /// A per-project cache of `(pkg, version, system) -> Pin`: a tool is resolved against
@@ -735,38 +746,30 @@ fn fetch_url_bytes(nix: &Path, layout: &Layout, url: &str, fresh: bool) -> io::R
     // address space at the speed of the writer. These bodies are remote and their size is the
     // endpoint's choice: a nixhub answer, a GitHub release document, an apt index. The ceiling is
     // the one `resolver` already derives for an answer sbx reads off a pipe, for the same reason —
-    // a deadline stops an endpoint that answers *forever*, not one that answers fast.
+    // the deadline ([`FETCH_DEADLINE`]) stops an endpoint that answers slowly, not one that answers
+    // fast and without end.
     //
     // What this does NOT bound, and the honest limit of it: `fetchurl` has already written the body
     // into sbx's nix store (disk) and `readFile` has already materialised it as a nix string (nix's
     // RSS) before the first byte reaches this pipe. Bounding those means asking nix for the store
     // path and stat'ing it instead of reading the contents, which is a different expression and a
     // change to every caller's shape.
-    let mut child = cmd
+    let child = cmd
         .args(["eval", "--impure", "--raw", "--expr", &expr])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
-    // stderr is drained on its own thread. Two pipes need two readers: nix filling stderr while sbx
-    // reads stdout would block on a pipe nobody drains, and sbx would block on the one it drains.
-    let mut err_pipe = child.stderr.take().expect("stderr is piped");
-    let err_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut err_pipe, &mut buf);
-        buf
-    });
-    let mut body = Vec::new();
-    {
-        use std::io::Read;
-        let mut pipe = child.stdout.take().expect("stdout is piped");
-        // One byte past the ceiling, so a body sitting exactly on it is still served and only one
-        // that crosses it is refused.
-        pipe.by_ref()
-            .take(MAX_METADATA_BYTES as u64 + 1)
-            .read_to_end(&mut body)?;
-    }
-    let status = child.wait()?;
-    let stderr = err_reader.join().unwrap_or_default();
+    let Some(Answered {
+        status,
+        body,
+        stderr,
+    }) = read_bounded(child, MAX_METADATA_BYTES, FETCH_DEADLINE)?
+    else {
+        return Err(io::Error::other(format!(
+            "fetching {url} failed: no answer within {} seconds",
+            FETCH_DEADLINE.as_secs()
+        )));
+    };
     if !status.success() {
         return Err(io::Error::other(format!(
             "fetching {url} failed: {}",
@@ -780,6 +783,99 @@ fn fetch_url_bytes(nix: &Path, layout: &Layout, url: &str, fresh: bool) -> io::R
         )));
     }
     Ok(body)
+}
+
+/// How long one metadata fetch may take before it is abandoned. A size bound stops an endpoint that
+/// answers quickly and without end; this stops one that answers slowly, or not at all.
+const FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What a child read by [`read_bounded`] produced.
+struct Answered {
+    status: std::process::ExitStatus,
+    /// At most one byte past the limit, so a body over it is told apart from one sitting on it.
+    body: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Read `child`'s stdout up to one byte past `limit`, and its stderr, and wait for it — all within
+/// `deadline`. `None` when the deadline passed, in which case the child has been killed and reaped.
+///
+/// stderr is drained on its own thread. Two pipes need two readers: the child filling stderr while
+/// stdout is read would block on a pipe nobody drains, and this side would block on the one it
+/// drains. Reading stdout is bounded rather than through `output()`, which buffers the whole of it
+/// at the speed of the writer.
+///
+/// Only the child is signalled: a descendant still holding its pipes would keep the read open. The
+/// fetch this serves is one process — `nix eval` downloads on threads of its own, and forks nothing.
+fn read_bounded(
+    mut child: std::process::Child,
+    limit: usize,
+    deadline: std::time::Duration,
+) -> io::Result<Option<Answered>> {
+    use std::io::Read;
+    let started = std::time::Instant::now();
+    let (Some(mut out_pipe), Some(mut err_pipe)) = (child.stdout.take(), child.stderr.take())
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other("the child's output is not piped"));
+    };
+    let err_reader = std::thread::Builder::new().spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err_pipe.read_to_end(&mut buf);
+        buf
+    });
+    // The read blocks, so a watchdog kills the child when the deadline passes first. It is told the
+    // read is over and joined before anything reaps the child, so the pid it may signal is still
+    // the child's. Without a thread to watch from, the read is left unbounded in time.
+    let pid = child.id() as libc::pid_t;
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::Builder::new().spawn(move || {
+        let expired = matches!(
+            finished.recv_timeout(deadline),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        if expired {
+            // SAFETY: pid is a child of this process that has not been reaped yet (see above).
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        expired
+    });
+    let mut body = Vec::new();
+    let read = out_pipe
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut body);
+    // Closed before the wait, so a child still writing past the limit meets `EPIPE` and exits.
+    drop(out_pipe);
+    let _ = done.send(());
+    let mut expired = watchdog.is_ok_and(|w| w.join().unwrap_or(false));
+    // A child that closed stdout may still be running. The rest of the deadline bounds the wait
+    // too, polled on this thread so the kill and the reap cannot be told apart by a reused pid.
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if expired || started.elapsed() >= deadline {
+            expired = true;
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let stderr = err_reader
+        .ok()
+        .and_then(|r| r.join().ok())
+        .unwrap_or_default();
+    if expired {
+        return Ok(None);
+    }
+    read?;
+    Ok(Some(Answered {
+        status,
+        body,
+        stderr,
+    }))
 }
 
 /// The most sbx will read from one metadata fetch. Derived from the ceiling `resolver` already
@@ -885,9 +981,12 @@ fn platform_for<'a>(release: &'a serde_json::Value, system: &str) -> Option<&'a 
 
 /// A nixhub/nixpkgs package name: non-empty and built only from characters a real
 /// package name uses, so a declared value cannot smuggle URL- or shell-significant
-/// characters into the metadata fetch.
+/// characters into the metadata fetch. Never `.` or `..`, which as a path component — the
+/// tool's out-link is named after it — mean a directory rather than a name in one.
 pub(crate) fn is_valid_pkg(s: &str) -> bool {
     !s.is_empty()
+        && s != "."
+        && s != ".."
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))
 }
@@ -1010,6 +1109,35 @@ mod tests {
             "the root of the last dropped tool must be unpinned, not left to pin its closure \
              against every `sbx gc`"
         );
+    }
+
+    /// An untrusted declaration is one the cage may have written, so it unroots nothing: emptied by
+    /// the cage, it would otherwise unpin every tool the project had.
+    #[test]
+    fn an_untrusted_declaration_unpins_nothing() {
+        use crate::store::Layout;
+        use crate::testutil::TmpDir;
+
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let project = TmpDir::new();
+        let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+        let roots = tool_roots_dir(&layout, &id);
+        let target = data.join("store-path");
+        std::fs::create_dir_all(&roots).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, roots.join("dropped")).unwrap();
+
+        provision(
+            Path::new("/nonexistent/nix"),
+            &layout,
+            project.path(),
+            &files(&[("mise.toml", "[tools]\n")]),
+            false,
+            &current_system(),
+        )
+        .expect("an untrusted project provisions nothing and fails nothing");
+        assert!(roots.join("dropped").exists());
     }
 
     fn files(entries: &[(&str, &str)]) -> Vec<(String, Vec<u8>)> {
@@ -1139,6 +1267,134 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_comment_is_not_read_as_a_version() {
+        // mise cuts a `.tool-versions` line at `#`, with or without a space before it.
+        assert_eq!(
+            parse_tool_versions(b"nodejs # pinned for ci\nlua 5.4.6#x\n  # indented\n"),
+            vec![
+                ("nodejs".to_string(), String::new()),
+                ("lua".to_string(), "5.4.6".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_release_named_like_an_alias_does_not_freeze_it() {
+        let pin = |version: &str| Pin {
+            commit: "a".repeat(40),
+            attr: "nodejs".into(),
+            version: version.into(),
+        };
+        assert!(
+            is_frozen("20.11.0", &pin("20.11.0")),
+            "an exact pin never rolls"
+        );
+        assert!(!is_frozen("20", &pin("20.11.0")), "a prefix rolls");
+        for alias in ["latest", "stable", ""] {
+            assert!(!is_frozen(alias, &pin(alias)), "`{alias}` keeps rolling");
+        }
+    }
+
+    #[test]
+    fn a_move_at_the_same_commit_is_a_roll() {
+        // One nixpkgs commit carries several releases, so the commit alone does not say the pin
+        // stayed put.
+        let tool = NixTool {
+            pkg: "python3".into(),
+            version: "3".into(),
+        };
+        let old = Pin {
+            commit: "a".repeat(40),
+            attr: "python311".into(),
+            version: "3.11.9".into(),
+        };
+        let new = Pin {
+            attr: "python312".into(),
+            version: "3.12.4".into(),
+            ..old.clone()
+        };
+        assert!(matches!(
+            roll_outcome(&tool, Some(&old), &new),
+            ToolUpgrade::Rolled { .. }
+        ));
+        assert!(matches!(
+            roll_outcome(&tool, Some(&old), &old),
+            ToolUpgrade::Unchanged { .. }
+        ));
+        assert!(matches!(
+            roll_outcome(&tool, None, &old),
+            ToolUpgrade::Pinned { .. }
+        ));
+    }
+
+    #[test]
+    fn a_fetch_that_does_not_answer_in_time_is_abandoned() {
+        let spawn = |script: &str| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn /bin/sh")
+        };
+        // `exec`, so the child is one process like the `nix eval` this serves: a descendant holding
+        // the pipe would outlive the signal.
+        let started = std::time::Instant::now();
+        let late = read_bounded(
+            spawn("exec sleep 30"),
+            16,
+            std::time::Duration::from_millis(200),
+        )
+        .expect("the read itself does not fail");
+        assert!(late.is_none(), "a child past the deadline answers nothing");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "and is not waited for: {:?}",
+            started.elapsed()
+        );
+
+        // A child that closes its output and keeps running is bounded by the same deadline.
+        let started = std::time::Instant::now();
+        let lingering = read_bounded(
+            spawn("exec >&- 2>&-; exec sleep 30"),
+            16,
+            std::time::Duration::from_millis(200),
+        )
+        .expect("the read itself does not fail");
+        assert!(
+            lingering.is_none(),
+            "a child still running past the deadline answers nothing"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "and is not waited for: {:?}",
+            started.elapsed()
+        );
+
+        let answered = read_bounded(
+            spawn("printf hello; printf oops >&2"),
+            16,
+            std::time::Duration::from_secs(30),
+        )
+        .expect("read")
+        .expect("answered in time");
+        assert!(answered.status.success());
+        assert_eq!(
+            (&answered.body[..], &answered.stderr[..]),
+            (&b"hello"[..], &b"oops"[..])
+        );
+
+        let endless = read_bounded(spawn("yes"), 16, std::time::Duration::from_secs(30))
+            .expect("read")
+            .expect("ends once the reader stops");
+        assert_eq!(
+            endless.body.len(),
+            17,
+            "one byte past the limit, and no more"
+        );
+    }
+
+    #[test]
     fn highest_precedence_file_wins_for_a_repeated_token() {
         // files are highest-precedence first; the first declaration of a token wins
         let f = files(&[
@@ -1247,7 +1503,7 @@ mod tests {
     #[test]
     fn validators_reject_injection_and_malformed_values() {
         assert!(is_valid_pkg("nodejs") && is_valid_pkg("python3") && is_valid_pkg("gcc-unwrapped"));
-        for bad in ["", "a b", "a\"b", "a$b", "a/b", "a;b"] {
+        for bad in ["", "a b", "a\"b", "a$b", "a/b", "a;b", ".", ".."] {
             assert!(!is_valid_pkg(bad), "{bad} should be rejected");
         }
         assert!(
