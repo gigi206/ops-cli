@@ -83,6 +83,7 @@ use cage::{NotStarted, SetupReport, exec, register, run_supervised, supervise, t
 use detach::launch_detached;
 use session::{launch_display_name, render_gui_stop_hint};
 
+pub(crate) use build::{RUNTIME_DIR_ENV, WAYLAND_DISPLAY_ENV};
 pub(crate) use detach::{SessionHeader, detach_log_path, parse_session_header};
 pub(crate) use reclaim::{gc, superseded_reclaimable_hint};
 pub(crate) use roll::{RollMode, upgrade_mise_packages, upgrade_provision_steps};

@@ -222,3 +222,17 @@ pub(crate) use tarball::{
     TarballUpgrade, pinned_hashes as tarball_pinned_hashes, upgrade_project as upgrade_tarball,
     withheld as withheld_tarball_packages,
 };
+
+/// The cage variables sbx sets itself to point a client at a channel it stands up: the ssh-agent
+/// socket, the audio socket, the session bus, and the Wayland socket with the directory it is
+/// found in. Each is taken from the module that sets it, so the list and the launch cannot drift
+/// apart. A broker plugin's `cage_env` may not claim one ([`crate::plugins`]): it would put its own
+/// socket where sbx's channel belongs, and the client would never know it was talking to something
+/// else.
+pub(crate) const CHANNEL_ENV_KEYS: &[&str] = &[
+    sshagent::AUTH_SOCK_ENV,
+    audio::SERVER_ENV,
+    portal::BUS_ADDRESS_ENV,
+    launch::WAYLAND_DISPLAY_ENV,
+    launch::RUNTIME_DIR_ENV,
+];

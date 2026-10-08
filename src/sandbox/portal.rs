@@ -183,6 +183,10 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
     })
 }
 
+/// The variable that points the cage's clients at its session bus. Named because a broker plugin's
+/// manifest may not claim it ([`super::CHANNEL_ENV_KEYS`]).
+pub(crate) const BUS_ADDRESS_ENV: &str = "DBUS_SESSION_BUS_ADDRESS";
+
 /// The cage environment pointing a D-Bus/portal client at the private bus and the GTK backend:
 /// the bus address, the keyfile GSettings backend (no dconf daemon in the cage), the settings
 /// portal opt-in, the portal directory carrying the GTK backend's `gtk.portal`, and the config
@@ -200,7 +204,7 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
 pub(crate) fn env(gtk_root: &Path) -> Vec<(String, String)> {
     vec![
         (
-            "DBUS_SESSION_BUS_ADDRESS".to_string(),
+            BUS_ADDRESS_ENV.to_string(),
             format!("unix:path={CAGE_SOCK}"),
         ),
         ("GSETTINGS_BACKEND".to_string(), "keyfile".to_string()),

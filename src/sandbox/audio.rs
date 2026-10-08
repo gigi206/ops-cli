@@ -316,6 +316,10 @@ pub(crate) fn no_socket_warning(candidates: &[PathBuf]) -> String {
     )
 }
 
+/// The variable that points a client at the cage's audio socket. Named because a broker plugin's
+/// manifest may not claim it ([`super::CHANNEL_ENV_KEYS`]).
+pub(crate) const SERVER_ENV: &str = "PULSE_SERVER";
+
 /// The audio env: always point clients at the bound socket (`PULSE_SERVER`); and, when the userspace
 /// was provisioned, add the client libraries to the loader path (`LD_LIBRARY_PATH`) and point ALSA at
 /// its base config (`ALSA_CONFIG_DIR`) and the pulse plugin (`ALSA_PLUGIN_DIR`). Pure over the layer
@@ -350,7 +354,7 @@ pub(crate) fn env(
     foreign_lib_paths: &[PathBuf],
     base_loader: &Path,
 ) -> Vec<(String, String)> {
-    let mut env = vec![("PULSE_SERVER".to_string(), format!("unix:{CAGE_SOCK}"))];
+    let mut env = vec![(SERVER_ENV.to_string(), format!("unix:{CAGE_SOCK}"))];
     if let Some(l) = layer {
         // LD_LIBRARY_PATH = the provisioned audio client libraries, then the base C++ runtime
         // (`NIX_LD_LIBRARY_PATH`'s directories without glibc's, see above). A voice speech-to-text

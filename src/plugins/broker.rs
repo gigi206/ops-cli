@@ -60,12 +60,18 @@ pub(crate) const DEFAULT_HOST_DEADLINE: std::time::Duration = std::time::Duratio
 /// the way [`MAX_FRAME_CEILING`] bounds what one can read.
 pub(crate) const MAX_HOST_DEADLINE_SECS: i64 = 600;
 
+/// The longest `socket_name` a manifest may declare. A socket path must fit the 108 bytes of a
+/// `sockaddr_un`, terminator included, so a longer name leaves no room for any directory to bind
+/// it in.
+const MAX_SOCKET_NAME: usize = 100;
+
 /// Cage variables sbx sets itself, to point a client at a channel it stands up. A broker
-/// plugin's `cage_env` may not claim one: it would put its own socket where another broker's
+/// plugin's `cage_env` may not claim one: it would put its own socket where sbx's channel
 /// belongs, and the client would never know it was talking to something else.
 ///
-/// Each entry is taken from where sbx sets it, so the two cannot drift apart silently.
-const SBX_OWNED_CAGE_ENV: &[&str] = &[crate::sandbox::sshagent::AUTH_SOCK_ENV];
+/// The list is [`crate::sandbox::CHANNEL_ENV_KEYS`], whose entries are taken from where sbx sets
+/// each one, so the two cannot drift apart silently.
+const SBX_OWNED_CAGE_ENV: &[&str] = crate::sandbox::CHANNEL_ENV_KEYS;
 
 /// How a stream of bytes is cut into the messages a plugin decides one at a time.
 ///
@@ -157,8 +163,10 @@ pub(crate) struct BrokerSpec {
     /// the home directory: `GPG_AGENT_INFO` has named nothing since GnuPG 2.1, so a broker that
     /// could only be pointed at by a variable could not fence an agent at all.
     ///
-    /// Only a Unix target has an address to stand at, so this and a `tcp://` socket are refused
-    /// together rather than one silently ignoring the other.
+    /// Only a Unix target has an address to stand at. The target is the config's to name, so the
+    /// pairing cannot be judged here: a launch whose config names a `tcp://` socket for such a
+    /// broker warns and stands no broker up, rather than one declaration silently ignoring the
+    /// other.
     pub(crate) at_host_path: bool,
     /// How the byte stream is cut into messages.
     pub(crate) framing: Framing,
@@ -322,25 +330,31 @@ pub(super) fn validate(
                 .to_string(),
         );
     }
-    let socket_name = match raw.socket_name {
-        None => format!("{name}.sock"),
-        Some(named) => {
-            // A name, never a path: a separator or a `.`/`..` component would let a manifest place
-            // its socket somewhere sbx did not choose.
-            if named.is_empty()
-                || named.contains('/')
-                || named == "."
-                || named == ".."
-                || named.contains('\0')
-            {
-                return Err(format!(
-                    "`socket_name` is `{named}`, which is not a plain file name — the directory is \
-                     sbx's to choose"
-                ));
-            }
-            named
-        }
-    };
+    // A name, never a path: a separator or a `.`/`..` component would let a manifest place its
+    // socket somewhere sbx did not choose. Held to the default too, which is built from the
+    // plugin's name: that name was checked when the plugin was installed, and this does not rest on
+    // the installed manifest never having been edited since.
+    let socket_name = raw.socket_name.unwrap_or_else(|| format!("{name}.sock"));
+    if socket_name.is_empty()
+        || socket_name.contains('/')
+        || socket_name == "."
+        || socket_name == ".."
+        || socket_name.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "`socket_name` is `{}`, which is not a plain file name — the directory is sbx's to \
+             choose",
+            socket_name.escape_debug()
+        ));
+    }
+    // The whole socket path has to fit a `sockaddr_un`, and the directory takes some of it: a name
+    // this long can never be bound, so it is refused here rather than at every launch.
+    if socket_name.len() > MAX_SOCKET_NAME {
+        return Err(format!(
+            "`socket_name` is {} bytes, above the {MAX_SOCKET_NAME} a socket path leaves for it",
+            socket_name.len()
+        ));
+    }
     let all_env: Vec<&String> = raw.cage_env.iter().chain(raw.cage_env_dir.iter()).collect();
     for (i, key) in all_env.iter().enumerate() {
         if !is_valid_env_key(key) {
@@ -364,13 +378,14 @@ pub(super) fn validate(
         // answering the ssh-agent protocol in place of the broker that was actually granted.
         if SBX_OWNED_CAGE_ENV.contains(&key.as_str()) {
             return Err(format!(
-                "`cage_env` names `{key}`, which sbx sets itself to point the cage at another \
-                 broker — a plugin cannot stand in for one the config granted"
+                "`cage_env` names `{key}`, which sbx sets itself to point the cage at a channel \
+                 of its own — a plugin cannot stand in for one the config granted"
             ));
         }
         if all_env[..i].contains(key) {
             return Err(format!(
-                "`cage_env` names `{key}` twice — one variable, one declaration"
+                "`{key}` is named twice across `cage_env` and `cage_env_dir` — one variable, one \
+                 declaration"
             ));
         }
     }
@@ -386,7 +401,7 @@ pub(super) fn validate(
             "`max_frame` must be a positive number of bytes, not {max_frame}"
         ));
     }
-    let max_frame = max_frame as usize;
+    let max_frame = usize::try_from(max_frame).unwrap_or(usize::MAX);
     if max_frame > MAX_FRAME_CEILING {
         return Err(format!(
             "`max_frame` is {max_frame}, above the {MAX_FRAME_CEILING}-byte ceiling sbx reads \
@@ -409,6 +424,16 @@ pub(super) fn validate(
                     "`deny_frame` is {} bytes, above this broker's own `max_frame` of {max_frame}",
                     bytes.len()
                 ));
+            }
+            // The frame is a body, which the relay frames for the wire; a line-framed body holding
+            // a newline is one the writer refuses, so the refusal would close the connection rather
+            // than answer.
+            if framing == Framing::Line && bytes.contains(&i64::from(b'\n')) {
+                return Err(
+                    "`deny_frame` holds a newline, which a line-framed protocol reads as the end of \
+                     the message"
+                        .to_string(),
+                );
             }
             let mut frame = Vec::with_capacity(bytes.len());
             for b in bytes {
@@ -470,7 +495,20 @@ pub(super) fn validate(
 /// The grants this type refuses whatever a manifest declares, checked against the already-parsed
 /// `[sandbox]` table so the refusal names the field rather than the consequence.
 pub(super) fn check_sandbox(grant: &super::SandboxGrant) -> Result<(), String> {
-    if grant.network {
+    // Every field named, so a grant added to `SandboxGrant` stops this from compiling until someone
+    // decides whether this type may hold it: a check that lists only what it refuses would let the
+    // new grant through unexamined.
+    let super::SandboxGrant {
+        programs: _,
+        allow_paths: _,
+        allow_env: _,
+        mask_paths: _,
+        allow_env_paths: _,
+        network,
+        state,
+        brokers,
+    } = grant;
+    if *network {
         return Err(
             "a broker plugin may not declare `network` — sbx opens the connection to the host \
              resource for it, so network reach here is an exfiltration path for the very \
@@ -478,14 +516,14 @@ pub(super) fn check_sandbox(grant: &super::SandboxGrant) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if grant.state {
+    if *state {
         return Err(
             "a broker plugin may not declare `state` — a broker holds nothing across runs, and a \
              writable directory would be surface without a use"
                 .to_string(),
         );
     }
-    if !grant.brokers.is_empty() {
+    if !brokers.is_empty() {
         return Err(
             "a broker plugin may not declare `brokers` — a broker fenced by another broker is a \
              chain, and what the outer one admits would depend on a plugin rather than on the \
@@ -535,6 +573,96 @@ mod tests {
         assert_eq!(spec.max_frame, 4096);
         assert_eq!(spec.deny_frame, Some(vec![5]));
         assert!(spec.inspect_replies);
+    }
+
+    /// The socket's name is held to the same rule whether the manifest wrote it or sbx built it from
+    /// the plugin's name, and it must leave room for a directory in a socket path.
+    #[test]
+    fn a_socket_name_that_is_not_a_short_plain_file_name_is_refused() {
+        assert!(validate(raw(), "../escape", valid_key, reserved).is_err());
+        for named in ["a\nb", "x/y", "..", &"s".repeat(MAX_SOCKET_NAME + 1)] {
+            let err = validate(
+                RawBroker {
+                    socket_name: Some(named.to_string()),
+                    ..raw()
+                },
+                "fake",
+                valid_key,
+                reserved,
+            );
+            assert!(
+                err.is_err(),
+                "`{}` was taken as a socket name",
+                named.escape_debug()
+            );
+        }
+        let spec = validate(
+            RawBroker {
+                socket_name: Some("S.gpg-agent".to_string()),
+                ..raw()
+            },
+            "fake",
+            valid_key,
+            reserved,
+        )
+        .expect("a plain name");
+        assert_eq!(spec.socket_name, "S.gpg-agent");
+    }
+
+    /// Every variable sbx sets to point the cage at a channel of its own is one a broker cannot
+    /// claim, the session bus and the Wayland socket as much as the ssh-agent's.
+    #[test]
+    fn a_channel_sbx_points_the_cage_at_cannot_be_claimed() {
+        for key in crate::sandbox::CHANNEL_ENV_KEYS {
+            let err = validate(
+                RawBroker {
+                    cage_env: vec![key.to_string()],
+                    ..raw()
+                },
+                "fake",
+                valid_key,
+                reserved,
+            )
+            .expect_err(key);
+            assert!(err.contains(key), "{err}");
+        }
+        assert!(crate::sandbox::CHANNEL_ENV_KEYS.contains(&"DBUS_SESSION_BUS_ADDRESS"));
+    }
+
+    #[test]
+    fn a_variable_named_in_both_lists_is_reported_against_both() {
+        let err = validate(
+            RawBroker {
+                cage_env: vec!["SOCK".to_string()],
+                cage_env_dir: vec!["SOCK".to_string()],
+                ..raw()
+            },
+            "fake",
+            valid_key,
+            reserved,
+        )
+        .expect_err("a duplicate");
+        assert!(err.contains("`cage_env` and `cage_env_dir`"), "{err}");
+    }
+
+    /// A refusal is a body the relay frames; under line framing one holding a newline is a body the
+    /// writer refuses, so it is refused when the manifest is read.
+    #[test]
+    fn a_line_framed_refusal_cannot_hold_a_newline() {
+        let with = |framing: &str| {
+            validate(
+                RawBroker {
+                    framing: Some(framing.to_string()),
+                    deny_frame: Some(b"ERR 1\nOK".iter().map(|&b| i64::from(b)).collect()),
+                    ..raw()
+                },
+                "fake",
+                valid_key,
+                reserved,
+            )
+        };
+        assert!(with("line").is_err());
+        assert!(with("length-u32-be").is_ok());
     }
 
     #[test]

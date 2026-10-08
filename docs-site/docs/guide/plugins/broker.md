@@ -57,10 +57,14 @@ launch:
   it fences: the one the config named, still never one the manifest chose.
 - **`cage_env` passes the reserved-key barrier** an untrusted project's `[env]`
   meets. A broker points a client at its socket; names like `LD_PRELOAD` or `PATH`
-  load code in the cage instead. `SSH_AUTH_SOCK` is refused too (sbx sets it for its
-  own ssh-agent fence), every name must be valid, and each named once.
-  `socket_name` defaults to `<plugin>.sock`: a file name only, never a path
-  (empty, `/`, `.`, `..` and NUL refused).
+  load code in the cage instead. The variables sbx sets itself to point the cage at
+  a channel of its own are refused too (`SSH_AUTH_SOCK`, `PULSE_SERVER`,
+  `DBUS_SESSION_BUS_ADDRESS`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`): a broker that
+  took one would stand in for that channel. Every name must be valid, and each named
+  once across `cage_env` and `cage_env_dir`.
+  `socket_name` defaults to `<plugin>.sock`: a file name only, never a path (empty,
+  `/`, `.`, `..` and control characters refused, the default included), and at most
+  100 bytes, so a socket path can still hold a directory.
 - **`framing` is a closed set** implemented in `sbx`: `length-u32-be` (a four-byte
   big-endian length, then the body, which carries the protocol's own type byte),
 - **`framing` is a closed set** implemented in `sbx`: `length-u32-be` (a four-byte
@@ -96,7 +100,8 @@ launch:
 refusal is the same whatever was refused, and a protocol whose refusal must echo a
 request id has none. The refusal that always works is closing the connection.
 When present it must be non-empty, fit within `max_frame`, and hold bytes (`0-255`)
-only.
+only. It is the message body, framed by sbx for the wire, so under `line` framing it
+may not hold a newline.
 
 :::note What a broker plugin does not reach
 A broker plugin is given no `scheme`, so nothing a secret's `from` names routes to it,

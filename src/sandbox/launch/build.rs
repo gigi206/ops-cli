@@ -3418,6 +3418,12 @@ fn net_policy(network: &crate::config::NetworkPolicy) -> NetPolicy {
     }
 }
 
+/// The variables that point a GUI cage's clients at the Wayland socket. Named because a broker
+/// plugin's manifest may not claim them ([`crate::sandbox::CHANNEL_ENV_KEYS`]).
+pub(crate) const WAYLAND_DISPLAY_ENV: &str = "WAYLAND_DISPLAY";
+/// See [`WAYLAND_DISPLAY_ENV`].
+pub(crate) const RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
+
 /// Resolve the host's Wayland compositor socket and the cage environment that points a
 /// graphical app at it, from the host `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`. Pure: the impure
 /// existence check and the bind are the caller's, so the path/env computation is unit-tested.
@@ -3437,18 +3443,18 @@ fn resolve_wayland_hole(
     if display.is_empty() {
         return Err("WAYLAND_DISPLAY is empty".to_string());
     }
-    let mut env = vec![("WAYLAND_DISPLAY".to_string(), display.to_string())];
+    let mut env = vec![(WAYLAND_DISPLAY_ENV.to_string(), display.to_string())];
     if Path::new(display).is_absolute() {
         // An absolute display is the socket path itself; XDG_RUNTIME_DIR is not needed to
         // locate it, but pass it through when set (some clients still read it).
         if let Some(dir) = runtime_dir {
-            env.push(("XDG_RUNTIME_DIR".to_string(), dir.to_string()));
+            env.push((RUNTIME_DIR_ENV.to_string(), dir.to_string()));
         }
         Ok((PathBuf::from(display), env))
     } else {
         let dir =
             runtime_dir.ok_or("XDG_RUNTIME_DIR is unset (needed to locate the Wayland socket)")?;
-        env.push(("XDG_RUNTIME_DIR".to_string(), dir.to_string()));
+        env.push((RUNTIME_DIR_ENV.to_string(), dir.to_string()));
         Ok((Path::new(dir).join(display), env))
     }
 }

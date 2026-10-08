@@ -313,7 +313,20 @@ fn is_header_name(name: &str) -> bool {
 /// three fields: what a refusal has to carry is the *argument*, and the argument differs for every
 /// one of them. A shared function would keep the three `if`s and lose the three reasons.
 pub(super) fn check_sandbox(grant: &super::SandboxGrant) -> Result<(), String> {
-    if grant.network {
+    // Every field named, so a grant added to `SandboxGrant` stops this from compiling until someone
+    // decides whether this type may hold it: a check that lists only what it refuses would let the
+    // new grant through unexamined.
+    let super::SandboxGrant {
+        programs: _,
+        allow_paths: _,
+        allow_env: _,
+        mask_paths: _,
+        allow_env_paths: _,
+        network,
+        state,
+        brokers,
+    } = grant;
+    if *network {
         return Err(
             "a signer plugin may not declare `network` — it is shown a credential's requests and, \
              where it reads one, the credential itself, so network reach here is an exfiltration \
@@ -321,7 +334,7 @@ pub(super) fn check_sandbox(grant: &super::SandboxGrant) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if grant.state {
+    if *state {
         return Err(
             "a signer plugin may not declare `state` — a signature is derived per request and \
              kept by nobody, and a writable directory would be somewhere a credential could come \
@@ -329,7 +342,7 @@ pub(super) fn check_sandbox(grant: &super::SandboxGrant) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if !grant.brokers.is_empty() {
+    if !brokers.is_empty() {
         return Err(
             "a signer plugin may not declare `brokers` — a broker fences a cage's access to a host \
              resource, and a signer has no cage and reaches no resource: sbx hands it a request \
