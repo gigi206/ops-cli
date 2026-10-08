@@ -44,12 +44,25 @@ fn fixture_root() -> std::path::PathBuf {
 
 /// The root itself, with no sweep — what [`fixture_root`] resolves and what the sweep is handed.
 fn fixture_root_path() -> std::path::PathBuf {
-    if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
+    fixture_root_from(|key| std::env::var_os(key))
+}
+
+/// [`fixture_root_path`] with the environment handed in, so the reading of each variable can be
+/// pinned without setting one under the tests that are creating fixtures from it.
+///
+/// An empty variable reads as unset, the way the `${VAR:-…}` of `mise run clean-fixtures` reads
+/// it, and a relative `XDG_CACHE_HOME` is ignored, as the XDG base-directory specification says.
+/// Either one taken as written would put the root, and the sweep, somewhere that depends on the
+/// directory a test binary happens to start in.
+fn fixture_root_from(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> std::path::PathBuf {
+    let set = |key: &str| var(key).filter(|value| !value.is_empty());
+    if let Some(dir) = set("SBX_TEST_TMPDIR") {
         return std::path::PathBuf::from(dir);
     }
-    let mut d = std::env::var_os("XDG_CACHE_HOME")
+    let mut d = set("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| set("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
         .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
     d.push("sbx/test-tmp");
     d
@@ -60,7 +73,9 @@ fn fixture_root_path() -> std::path::PathBuf {
 /// Both spellings end the same way — `<tag>-<pid>-<n>` and `sbx-test-<pid>-<n>` — and a tag may
 /// itself carry dashes and digits, so the shape is read from the end: the last two segments must
 /// both be numbers, and the pid is the one before the counter. That is what keeps the sweep off
-/// `isolated-config` and off anything else a developer parked under the root.
+/// `isolated-config`, and off any name that does not end in two numbers. A directory parked under
+/// the root whose name does — `backup-2024-06` — reads as a fixture of pid 2024 and goes once no
+/// such process runs: the root belongs to the suites, and is no place to keep anything.
 fn fixture_owner_pid(name: &str) -> Option<u32> {
     let (rest, counter) = name.rsplit_once('-')?;
     counter.parse::<u32>().ok()?;
@@ -70,11 +85,13 @@ fn fixture_owner_pid(name: &str) -> Option<u32> {
 /// Remove the fixture trees left by runs that are gone, under `root`, deciding liveness from
 /// `proc_root`.
 ///
-/// A pid reads live when its `/proc` entry is there, and a live pid keeps its fixture. Every way
-/// that answer can be wrong keeps a tree that could have gone: an entry that belongs to another
-/// user, or to a process that has reused the pid, still reads live. That is the direction this has
-/// to fail in, since the alternative is deleting the fixtures of a run in progress — and there is
-/// always one, because a suite's own binaries run alongside each other.
+/// A pid reads live unless its `/proc` entry is definitely absent, and a live pid keeps its
+/// fixture. Every way that answer can be wrong keeps a tree that could have gone: an entry that
+/// belongs to another user, to a process that has reused the pid, or whose lookup fails with
+/// anything but `ENOENT`, still reads live — and a `proc_root` that is no `/proc`, because
+/// it has no `self`, decides nothing and takes nothing. That is the direction this has to fail in,
+/// since the alternative is deleting the fixtures of a run in progress — and there is always one,
+/// because a suite's own binaries run alongside each other.
 ///
 /// There is deliberately no age fallback for the reused-pid case. It defers a reclaim rather than
 /// losing one: this runs afresh at the start of every test binary, so the tree goes as soon as any
@@ -83,41 +100,74 @@ fn fixture_owner_pid(name: &str) -> Option<u32> {
 ///
 /// Silent, like the scope sweep: a test binary's output belongs to its tests.
 fn sweep_in(root: &std::path::Path, proc_root: &std::path::Path) {
+    if std::fs::symlink_metadata(proc_root.join("self")).is_err() {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(fixture_owner_pid)
-        else {
+        let Some(pid) = entry.file_name().to_str().and_then(fixture_owner_pid) else {
             continue;
         };
-        if proc_root.join(pid.to_string()).exists() {
+        if !run_is_gone(proc_root, pid) {
             continue;
         }
         force_remove(&entry.path());
     }
 }
 
+/// Whether `pid` has no entry under `proc_root` — definitely none, not merely none that reads.
+///
+/// `exists` answers false on any error, so an entry this process may not look at would read as a
+/// run that is gone. Only `ENOENT` says so here.
+fn run_is_gone(proc_root: &std::path::Path, pid: u32) -> bool {
+    matches!(
+        std::fs::symlink_metadata(proc_root.join(pid.to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// How many directory levels [`force_remove`] descends. Far past any tree a fixture holds, and
+/// short enough that the recursion cannot run a test thread out of stack whatever lies below.
+const REMOVE_DEPTH: u32 = 256;
+
 /// Remove a tree that may contain read-only directories — a provisioned nix store makes its
 /// directories `0555`, so a plain `remove_dir_all` cannot delete their contents. Add write to each
 /// directory on the way down, then remove. Best effort: cleanup never fails a test.
+///
+/// A symlink is unlinked, never followed, including one swapped in for a directory while the walk
+/// is under way: each entry is opened `O_PATH | O_NOFOLLOW | O_DIRECTORY`, and what does not open
+/// that way is unlinked as a file. A directory is made writable and listed through
+/// `/proc/self/fd/<n>`, which names the inode the handle holds rather than a path a link could be
+/// planted on, and its entries are reached through that same name. Below [`REMOVE_DEPTH`] levels
+/// the tree is left in place.
 fn force_remove(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
+    force_remove_within(path, REMOVE_DEPTH);
+}
+
+/// [`force_remove`], descending at most `depth` more levels.
+fn force_remove_within(path: &std::path::Path, depth: u32) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let Ok(dir) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)
+    else {
+        let _ = std::fs::remove_file(path);
         return;
     };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
+    if let Some(depth) = depth.checked_sub(1) {
+        let held = std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+        // Through the descriptor's own entry, which acts on the inode it holds: `fchmod` refuses
+        // an `O_PATH` handle, and the handle is `O_PATH` so a `0000` directory still opens.
+        let _ = std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o700));
+        if let Ok(entries) = std::fs::read_dir(&held) {
             for entry in entries.flatten() {
-                force_remove(&entry.path());
+                force_remove_within(&held.join(entry.file_name()), depth);
             }
         }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
     }
+    let _ = std::fs::remove_dir(path);
 }

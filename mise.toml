@@ -214,8 +214,10 @@ description = "Remove the fixture trees under the test root whose run is gone"
 # `chmod -R u+w` before the removal: a provisioned nix store makes its directories `0555`, and a
 # bare `rm -rf` walks into them and silently leaves most of the tree behind.
 run = """
+case "${XDG_CACHE_HOME:-}" in /*) ;; *) XDG_CACHE_HOME= ;; esac
 root="${SBX_TEST_TMPDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sbx/test-tmp}"
 [ -d "$root" ] || { echo "no fixture root at $root"; exit 0; }
+[ -e /proc/self ] || { echo "no /proc to tell a live run from a dead one: nothing removed"; exit 0; }
 freed=0
 for dir in "$root"/*; do
   [ -d "$dir" ] || continue

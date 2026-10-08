@@ -742,7 +742,7 @@ mod fixture_root_tests {
         for pid in live {
             std::fs::create_dir_all(proc.join(pid.to_string())).unwrap();
         }
-        std::fs::create_dir_all(&proc).unwrap();
+        std::fs::create_dir_all(proc.join("self")).unwrap();
         proc
     }
 
@@ -800,6 +800,129 @@ mod fixture_root_tests {
         assert!(
             mine.exists(),
             "the sweep took the fixture of the running process"
+        );
+    }
+
+    #[test]
+    fn a_proc_root_with_no_self_takes_nothing() {
+        // No `/proc` mounted reads every pid as gone; the sweep decides nothing from that.
+        let tmp = TmpDir::new();
+        let root = tmp.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let dead = fixture_like(&root, "r-gpu-data-4711-3");
+        let proc = tmp.join("not-proc");
+        std::fs::create_dir_all(&proc).unwrap();
+
+        super::sweep_in(&root, &proc);
+
+        assert!(dead.exists(), "a fixture was taken on no evidence");
+    }
+
+    #[test]
+    fn a_pid_entry_that_cannot_be_read_reads_live() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new();
+        let proc = fake_proc(tmp.path(), &[]);
+        assert!(
+            super::run_is_gone(&proc, 4711),
+            "an absent entry reads as gone"
+        );
+        // A directory this process may not search answers `EACCES`, never `ENOENT`. Root searches
+        // it regardless.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        std::fs::set_permissions(&proc, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let gone = super::run_is_gone(&proc, 4711);
+        std::fs::set_permissions(&proc, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            !gone,
+            "an entry that could not be read was taken for a dead run"
+        );
+    }
+
+    #[test]
+    fn the_removal_unlinks_a_symlink_and_leaves_what_it_names() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new();
+        let outside = tmp.join("outside");
+        let kept = outside.join("ro");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("payload"), b"x").unwrap();
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let tree = tmp.join("tree");
+        std::fs::create_dir_all(tree.join("inner/sealed")).unwrap();
+        std::fs::write(tree.join("inner/sealed/file"), b"x").unwrap();
+        std::fs::set_permissions(
+            tree.join("inner/sealed"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("inner/link")).unwrap();
+
+        super::force_remove(&tree);
+
+        assert!(!tree.exists(), "the tree was left");
+        assert!(
+            kept.join("payload").exists(),
+            "the removal followed the link"
+        );
+        let mode = std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            mode, 0o555,
+            "the removal changed the mode of what the link names"
+        );
+    }
+
+    #[test]
+    fn the_removal_stops_at_its_depth() {
+        let tmp = TmpDir::new();
+        let tree = tmp.join("tree");
+        std::fs::create_dir_all(tree.join("a/b")).unwrap();
+        std::fs::write(tree.join("a/top"), b"x").unwrap();
+
+        super::force_remove_within(&tree, 1);
+
+        assert!(
+            tree.join("a/b").exists(),
+            "the removal went below its depth"
+        );
+        super::force_remove(&tree);
+        assert!(!tree.exists(), "a shallow tree was left");
+    }
+
+    #[test]
+    fn an_empty_or_relative_variable_does_not_place_the_root() {
+        use std::ffi::OsString;
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| OsString::from(v))
+            }
+        };
+        let home = Path::new("/home/u/.cache/sbx/test-tmp");
+        assert_eq!(
+            super::fixture_root_from(env(&[("SBX_TEST_TMPDIR", "/t"), ("HOME", "/home/u")])),
+            Path::new("/t")
+        );
+        assert_eq!(
+            super::fixture_root_from(env(&[("SBX_TEST_TMPDIR", ""), ("HOME", "/home/u")])),
+            home
+        );
+        assert_eq!(
+            super::fixture_root_from(env(&[("XDG_CACHE_HOME", "cache"), ("HOME", "/home/u")])),
+            home
+        );
+        assert_eq!(
+            super::fixture_root_from(env(&[("XDG_CACHE_HOME", ""), ("HOME", "/home/u")])),
+            home
+        );
+        assert_eq!(
+            super::fixture_root_from(env(&[("XDG_CACHE_HOME", "/c"), ("HOME", "/home/u")])),
+            Path::new("/c/sbx/test-tmp")
         );
     }
 
