@@ -294,7 +294,23 @@ pub(crate) fn pairs_for(
                 // the fact its scheme was written to cover.
                 let body = match signed.body_digest {
                     None => None,
-                    Some(_) => match req.body {
+                    Some(want) => match req.body {
+                        // There is one body and it is digested once, with the algorithm of the
+                        // first matched plugin that asked ([`CredentialSet::wants_body_digest`]). A
+                        // second plugin asking by another algorithm would be handed a digest it did
+                        // not ask for, so it is refused instead.
+                        Some(crate::sandbox::signer::BodyFacts::Held { algorithm, .. })
+                            if *algorithm != want.name() =>
+                        {
+                            return Err(SignRefusal {
+                                signer: signed.name.clone(),
+                                why: format!(
+                                    "another plugin signing this request had its body digested \
+                                     by {algorithm}, and this plugin's manifest asks for {}",
+                                    want.name()
+                                ),
+                            });
+                        }
                         Some(facts) => Some(facts),
                         None => {
                             return Err(SignRefusal {
@@ -639,6 +655,15 @@ impl CredentialSet {
 /// block the refresh for as long as the body runs. Swapping an `Arc` costs a refcount either way,
 /// and a reader keeps a coherent set for the whole exchange even if a refresh lands mid-flight.
 pub(crate) struct Credentials {
+    /// The live set. Taken through [`crate::sandbox::locks`], recovering from a panic that poisoned
+    /// it, which is live policy rather than a record and so owes its own argument here. The set is
+    /// replaced whole, by swapping the `Arc` as the last statement of each writer, so a holder that
+    /// panics leaves the previous set intact: never one half-built. What a writer touches before
+    /// that swap is [`Self::generation`], which only moves forward and at worst builds a pool key
+    /// nothing will match, and [`Self::masking`], which at worst holds one more value than it would
+    /// have. Both err on the safe side. The alternative, an empty set handed to every reader after
+    /// the panic, applies no credential and blinds the outbound tripwire and the response masking
+    /// for the rest of the session without a word.
     current: std::sync::RwLock<std::sync::Arc<CredentialSet>>,
     /// How many times this launch's declared set has been replaced. Not a version of the values and
     /// never derived from them: it is a counter, so nothing about a credential can be read back out
@@ -724,20 +749,10 @@ impl Credentials {
     }
 
     /// The set to use for one exchange. Take it once and keep it: re-reading mid-exchange could
-    /// inject one credential and scan for another.
-    ///
-    /// A poisoned lock falls back to an empty set rather than panicking, which fails *closed* for
-    /// injection (no credential is applied) and open for redaction (nothing is scanned) — the same
-    /// asymmetry the tripwires already carry, and unreachable in practice since no code panics
-    /// while holding this lock.
+    /// inject one credential and scan for another. A lock a panic poisoned still yields the set in
+    /// force, for the reason given at [`Self::current`].
     pub(crate) fn snapshot(&self) -> std::sync::Arc<CredentialSet> {
-        match self.current.read() {
-            Ok(set) => set.clone(),
-            Err(_) => std::sync::Arc::new(CredentialSet {
-                injections: Vec::new(),
-                needles: Vec::new(),
-            }),
-        }
+        crate::sandbox::locks::read_locked(&self.current).clone()
     }
 
     /// The needle set a traffic capture is masked with: every value this state has carried, not
@@ -766,9 +781,7 @@ impl Credentials {
     /// Install a newly resolved state. Exchanges already in flight keep the snapshot they took, so
     /// a refresh never changes what a running request injects halfway through.
     pub(crate) fn replace(&self, set: CredentialSet) {
-        let Ok(mut current) = self.current.write() else {
-            return;
-        };
+        let mut current = crate::sandbox::locks::write_locked(&self.current);
         // Counted under the same lock that installs the set, so a pool key read after this cannot
         // see the new values under the old generation. It only ever moves forward, and a reader that
         // saw the previous number simply keeps its own parked connections to itself.
@@ -819,7 +832,7 @@ impl Credentials {
     /// Only the injections are authoritative for what gets *sent*: this never adds an injection, so
     /// observing can change what is scanned but never what the cage authenticates as.
     pub(crate) fn observe(&self, header: &str, value: &str, dest: &str) -> bool {
-        let credential = credential_in(value);
+        let credential = credential_in(header, value);
         // The higher of the two floors. `OBSERVE_MIN_LEN` is not itself configurable: it states a
         // *relation* — an inferred credential is held to a stricter floor than a declared one — and
         // that relation is what breaks the moment a launch raises `[redact] min_len` above it. Take
@@ -841,9 +854,7 @@ impl Credentials {
                 return false;
             }
         }
-        let Ok(mut current) = self.current.write() else {
-            return false;
-        };
+        let mut current = crate::sandbox::locks::write_locked(&self.current);
         // Re-checked under the write lock: two threads can reach the check above with the same new
         // credential, and a duplicate needle would scan the same bytes twice for the same result.
         if current.needles.iter().any(|n| n.as_bytes() == bytes) {
@@ -1032,9 +1043,10 @@ const OBSERVE_MIN_LEN: usize = 16;
 const OBSERVE_MAX: usize = 8;
 
 /// The credential inside an auth header value: the token, with a `Bearer`/`Basic`/`Token` scheme
-/// prefix removed however the client cased it. The bare token is what matters, since that is the
-/// spelling that would appear if it leaked somewhere other than this header.
-fn credential_in(value: &str) -> &str {
+/// prefix removed however the client cased it, and, in `Authorization`, any other one-word scheme
+/// before a one-word credential (`ApiKey`, `SSWS`). The bare token is what matters, since that is
+/// the spelling that would appear if it leaked somewhere other than this header.
+fn credential_in<'a>(header: &str, value: &'a str) -> &'a str {
     let value = value.trim();
     // Case-insensitively, because RFC 9110 makes the auth scheme case-insensitive and clients do use
     // the other spellings (`BEARER`, `bEaReR` from a hand-rolled header). Listing a couple of casings
@@ -1052,7 +1064,30 @@ fn credential_in(value: &str) -> &str {
             return value[scheme.len()..].trim();
         }
     }
+    // `Authorization` is `<scheme> <credentials>` (RFC 9110 §11.4), whatever the scheme is called,
+    // so a scheme word left on the needle hides the bare token wherever it leaks without it. Only
+    // where the credentials are one word: `Digest` and the signed schemes carry parameters, with
+    // spaces between them, and are kept whole. The other headers hold the value itself, and a
+    // first word there is part of it.
+    if header.eq_ignore_ascii_case("authorization")
+        && let Some((scheme, rest)) = value.split_once(' ')
+        && is_auth_scheme(scheme)
+        && let rest = rest.trim()
+        && !rest.is_empty()
+        && !rest.contains(char::is_whitespace)
+    {
+        return rest;
+    }
     value
+}
+
+/// Whether `word` can be an auth scheme: an RFC 9110 token, the characters a header field name is
+/// made of.
+fn is_auth_scheme(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
 /// How a credential is re-resolved, host-side, when the upstream says the one being injected is no
@@ -1197,10 +1232,24 @@ impl CredentialRefresh {
         let (injections, needles) = match (self.refresher)(&current.injections) {
             Ok(resolved) => resolved,
             // A source that errors is broken rather than stale; retrying on a timer would only
-            // repeat it. Stop, and let the launch's own error path be what the user sees.
-            Err(_) => return self.stop(),
+            // repeat it. Stop, and say so: every request after this one meets the refusal that
+            // brought it here, and without this line nothing says why it is no longer retried.
+            Err(e) => {
+                crate::diag::warn(&given_up(
+                    "re-resolving the injected credentials after an upstream refusal failed",
+                    &e,
+                    &current.needles,
+                ));
+                return self.stop();
+            }
         };
         if same_values(&current.injections, &injections) {
+            // The commonest way this ends — a static credential that was revoked — and as final as
+            // the others, so it is said once, without any value.
+            crate::diag::warn(
+                "re-resolving the injected credentials after an upstream refusal returned the \
+                 value that was refused — none is re-resolved again this session",
+            );
             return self.stop();
         }
         // Published before the set is replaced, so there is no instant in which the value in use is
@@ -1219,9 +1268,27 @@ impl CredentialRefresh {
             injections,
             needles,
         };
-        let (Ok(handed), Ok(_)) = (set.encode(), set.encode().and_then(CredentialSet::decode))
-        else {
-            return self.stop();
+        let handed = match set
+            .encode()
+            .and_then(|handed| set.encode().and_then(CredentialSet::decode).map(|_| handed))
+        {
+            Ok(handed) => handed,
+            Err(e) => {
+                // Redacted against the values just resolved as well as the ones in force: the
+                // error is about the new set.
+                let both: Vec<SecretNeedle> = current
+                    .needles
+                    .iter()
+                    .chain(&set.needles)
+                    .cloned()
+                    .collect();
+                crate::diag::warn(&given_up(
+                    "the re-resolved credentials cannot be handed to the proxy",
+                    &e,
+                    &both,
+                ));
+                return self.stop();
+            }
         };
         let replaced = replaced_plugins(&current, &set);
         self.credentials.replace(set);
@@ -1258,6 +1325,21 @@ impl CredentialRefresh {
         self.retire_after = after;
         self
     }
+}
+
+/// The warning a re-resolution that gave up for good leaves: `what` happened, the error, and what
+/// that means for the rest of the session. The error can quote what a resolver plugin answered, so
+/// it is redacted against the needles in force before it reaches the terminal.
+fn given_up(what: &str, why: &std::io::Error, needles: &[SecretNeedle]) -> String {
+    let (why, _) = crate::sandbox::redact::redact_string(
+        &why.to_string(),
+        needles,
+        &crate::sandbox::redact::Placeholder::Plain,
+    );
+    format!(
+        "{what} ({why}) — the credentials in force stay, and none is re-resolved again this \
+         session"
+    )
 }
 
 /// The running signer plugins `old` holds and `new` does not: the ones a re-resolution replaced.
@@ -2191,17 +2273,17 @@ mod tests {
             "Bearer tok-0123456789abcdef",
         ] {
             assert_eq!(
-                credential_in(value),
+                credential_in("authorization", value),
                 "tok-0123456789abcdef",
                 "`{value}` carries the bare token"
             );
         }
         assert_eq!(
-            credential_in("BASIC dXNlcjpwYXNzd29yZA=="),
+            credential_in("authorization", "BASIC dXNlcjpwYXNzd29yZA=="),
             "dXNlcjpwYXNzd29yZA==",
         );
         assert_eq!(
-            credential_in("TOKEN tok-0123456789abcdef"),
+            credential_in("authorization", "TOKEN tok-0123456789abcdef"),
             "tok-0123456789abcdef"
         );
 
@@ -2209,16 +2291,19 @@ mod tests {
         // credential in its own right and must be kept whole, or the needle would be a suffix of the
         // secret and the masking would leave the first bytes of it on the wire.
         assert_eq!(
-            credential_in("bearerish-0123456789abcdef"),
+            credential_in("authorization", "bearerish-0123456789abcdef"),
             "bearerish-0123456789abcdef"
         );
         assert_eq!(
-            credential_in("opaque-token-0123456789"),
+            credential_in("authorization", "opaque-token-0123456789"),
             "opaque-token-0123456789"
         );
         // A non-ASCII value whose seventh byte falls inside a character: `None` from `get`, never a
         // panicked proxy thread.
-        assert_eq!(credential_in("abcdef\u{e9}ghij"), "abcdef\u{e9}ghij");
+        assert_eq!(
+            credential_in("authorization", "abcdef\u{e9}ghij"),
+            "abcdef\u{e9}ghij"
+        );
     }
 
     // The needle holds a secret to scan the wire for; its `Debug` reports only the byte length, never
@@ -2734,6 +2819,156 @@ mod tests {
             std::io::Read::read(&mut &old_plugin, &mut byte).unwrap(),
             0,
             "and goes once its time is up"
+        );
+    }
+
+    /// A panic that poisoned the live set's lock leaves the set in force: it is still handed to
+    /// every exchange, still learns a credential the cage sends, and a re-resolution still replaces
+    /// it. Before, the first two answered with an empty set — no credential applied, the tripwire
+    /// and the masking blind — and the third returned without installing anything.
+    #[test]
+    fn a_poisoned_live_set_is_still_read_learned_into_and_replaced() {
+        let creds = Arc::new(default_creds(
+            vec![injection("Bearer declared-value-v1")],
+            vec![SecretNeedle::named(
+                "declared",
+                b"declared-value-v1".to_vec(),
+            )],
+        ));
+        let poisoner = Arc::clone(&creds);
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner.current.write();
+            panic!("a writer gives up mid-flight");
+        })
+        .join();
+        assert!(
+            panicked.is_err(),
+            "the fixture must actually poison the lock"
+        );
+        assert!(
+            creds.current.read().is_err(),
+            "…and the standard take must see it poisoned"
+        );
+
+        let set = creds.snapshot();
+        assert_eq!(set.injections.len(), 1, "the injection is still applied");
+        assert_eq!(set.needles.len(), 1, "the needle is still scanned for");
+
+        assert!(
+            creds.observe(
+                "authorization",
+                "Bearer learned-0123456789abcdef",
+                "api.example.com"
+            ),
+            "a credential the cage sends is still learned"
+        );
+        assert_eq!(creds.snapshot().needles.len(), 2);
+
+        let before = creds.generation();
+        creds.replace(CredentialSet {
+            injections: vec![injection("Bearer declared-value-v2")],
+            needles: vec![SecretNeedle::named(
+                "declared",
+                b"declared-value-v2".to_vec(),
+            )],
+        });
+        assert_eq!(
+            creds.generation(),
+            before + 1,
+            "the replacement was installed"
+        );
+        assert!(
+            creds
+                .snapshot()
+                .needles
+                .iter()
+                .any(|n| n.as_bytes() == b"declared-value-v2"),
+            "the new value is the one in force"
+        );
+    }
+
+    /// In `Authorization`, any one-word scheme before a one-word credential comes off the needle,
+    /// whatever the scheme is called. A scheme with parameters, a value with no scheme, and a scheme
+    /// word in a header that holds the value itself are kept whole.
+    #[test]
+    fn any_one_word_authorization_scheme_comes_off_the_needle() {
+        for (value, bare) in [
+            ("SSWS 00Abc-0123456789abcdef", "00Abc-0123456789abcdef"),
+            ("ApiKey key-0123456789abcdef", "key-0123456789abcdef"),
+            ("Splunk  tok-0123456789abcdef ", "tok-0123456789abcdef"),
+        ] {
+            assert_eq!(credential_in("Authorization", value), bare, "{value}");
+        }
+        for whole in [
+            "Digest username=\"a\", response=\"0123456789abcdef\"",
+            "AWS4-HMAC-SHA256 Credential=AKID/20261008/x, Signature=0123456789abcdef",
+            "opaque-0123456789abcdef",
+        ] {
+            assert_eq!(credential_in("authorization", whole), whole.trim());
+        }
+        assert_eq!(
+            credential_in("x-api-key", "SSWS 00Abc-0123456789abcdef"),
+            "SSWS 00Abc-0123456789abcdef",
+            "outside `Authorization` the first word is part of the value"
+        );
+    }
+
+    /// A signer whose manifest asks for its body digest by one algorithm is refused when the body
+    /// was digested by another, rather than handed a digest it did not ask for.
+    #[test]
+    fn a_signer_handed_a_digest_by_another_algorithm_is_refused() {
+        let (process, _plugin) = stand_in();
+        let mut injection = signed_by(&process, "the-key");
+        let Form::Signed(signed) = &mut injection.form else {
+            unreachable!("signed_by builds a signed injection");
+        };
+        signed.body_digest = Some(crate::plugins::signer::BodyDigest::Sha256);
+        let creds = CredentialSet {
+            injections: vec![injection],
+            needles: Vec::new(),
+        };
+        let body = crate::sandbox::signer::BodyFacts::Held {
+            bytes: 3,
+            algorithm: "md5",
+            digest: "x".to_string(),
+        };
+        let headers: Vec<(String, String)> = Vec::new();
+        let Err(refusal) = pairs_for(
+            &creds,
+            &[0],
+            &RequestFacts {
+                method: "POST",
+                host: "signed.test",
+                port: 443,
+                target: "/",
+                headers: &headers,
+                body: Some(&body),
+            },
+            None,
+        ) else {
+            panic!("a digest by another algorithm must be refused");
+        };
+        assert!(
+            refusal.why.contains("md5") && refusal.why.contains("sha256"),
+            "the refusal names both algorithms: {}",
+            refusal.why
+        );
+    }
+
+    /// The warning a re-resolution that gave up leaves is redacted against the needles in force:
+    /// a resolver plugin's error can quote the value it was handed.
+    #[test]
+    fn a_given_up_warning_quotes_no_credential() {
+        let needles = vec![SecretNeedle::named(
+            "declared",
+            b"declared-value-v1".to_vec(),
+        )];
+        let why = std::io::Error::other("the plugin said: declared-value-v1 is expired");
+        let line = given_up("re-resolving failed", &why, &needles);
+        assert!(!line.contains("declared-value-v1"), "{line}");
+        assert!(
+            line.contains("re-resolving failed") && line.contains("expired"),
+            "{line}"
         );
     }
 }

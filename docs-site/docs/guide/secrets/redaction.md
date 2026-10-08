@@ -235,7 +235,8 @@ Five bounds keep this narrow:
 - only five headers are watched (`authorization`, `x-api-key`, `api-key`,
   `x-auth-token`, `x-goog-api-key`): a short explicit list, never a heuristic that
   could sweep in a correlation id. The token is the value past a `Bearer` / `Basic` /
-  `Token` prefix, however cased, trimmed: the bare spelling is what leaks;
+  `Token` prefix, however cased, trimmed, and in `authorization` past any other one-word
+  scheme before a one-word credential (`ApiKey`, `SSWS`): the bare spelling is what leaks;
 - the tripwire is scoped to **other** destinations, so an app re-sending its own
   session token to its own service is not refused for holding it, where that service is
   the acquiring host and whatever `shared_credential` groups with it;

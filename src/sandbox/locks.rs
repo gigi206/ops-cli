@@ -23,7 +23,7 @@
 //! rather than these helpers, and keep it: `proxy/pool.rs` and the resolution cache in `proxy/dns.rs`. Named rather than
 //! linked because both are private to the proxy, so a doc link from here would resolve to nothing.
 //!
-//! Four sites recover on neither argument, and each says so where it lives, because a lock that
+//! Five sites recover on neither argument, and each says so where it lives, because a lock that
 //! guards a decision rather than data owes that argument in full at its own definition and does not
 //! inherit one from here. `ProcOverlay` in `sandbox/proc_enforce/overlay.rs` and `ManualRules` in
 //! `sandbox/control` are the live `--session` exec and egress rule overlays: **live policy**, which
@@ -36,7 +36,10 @@
 //! the table of name lookups in flight in `proxy/dns.rs`, beside the cache that degrades: it guards
 //! coordination rather than a reusable result, its mutations are single calls, and a table that
 //! refused to hand itself out would leave every caller of every name waiting for an answer that
-//! cannot arrive.
+//! cannot arrive. The fifth is the live credential set in `proxy/inject.rs` (`Credentials`): it is
+//! replaced whole by swapping an `Arc`, so an unwind leaves the previous set intact, and the panic's
+//! alternative, an empty set, would apply no credential and blind the outbound tripwire and the
+//! response masking for the rest of the session.
 //!
 //! The line between the two cases above is what the data is *for*, not what type it has. A record whose reader
 //! would act on it as if nothing had happened is the case to look at twice: recovery must not turn
