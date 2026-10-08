@@ -51,14 +51,16 @@ pub(crate) const DERIVED_PREFIX: &str = "derived:sha256:";
 /// different userland rather than mutating this one, and a base that moved does the same — which is
 /// the answer to "if I change `run`, does it rebuild?" and to the same question about the base.
 ///
-/// The commands are separated by a byte none of them can carry, so two lists cannot hash alike by
-/// running into each other: `["a", "bc"]` and `["ab", "c"]` are different userlands.
+/// Each command is hashed behind its length, so two lists cannot hash alike by running into each
+/// other: `["a", "bc"]` and `["ab", "c"]` are different userlands. A separator byte cannot promise
+/// that, because a command may carry any byte a TOML string can: `["a\0bc"]` hashed like
+/// `["a", "bc"]` behind a NUL separator, and launched on the tree those two commands built.
 fn derived_key(base_digest: &str, run: &[String]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(base_digest.as_bytes());
     for command in run {
-        hasher.update([0u8]);
+        hasher.update((command.len() as u64).to_le_bytes());
         hasher.update(command.as_bytes());
     }
     format!(
@@ -130,7 +132,7 @@ pub(crate) fn provision(
         // A digest names the image itself, so there is nothing to resolve and nothing a registry
         // could answer differently.
         Reference::Digest(digest) => digest.clone(),
-        Reference::Tag(_) => match locked_base(layout, lock_path, locator) {
+        Reference::Tag(_) => match locked_base(layout, lock_path, locator)? {
             Some(digest) => digest,
             None => registry::resolve(&image, credential.as_ref())?.digest,
         },
@@ -255,15 +257,21 @@ pub(crate) fn refresh(
     // Read across sources rather than scoped to this locator: the question is what this roll
     // supersedes, and a lock recording another image answers it.
     let previous = crate::store::read_lock_lines(lock_path).and_then(|(_, key)| key);
-    let previous_base = previous.as_deref().and_then(|key| {
-        if key.starts_with(DERIVED_PREFIX) {
-            std::fs::read_to_string(image_dir(layout, key).join(BASE_FILE))
-                .ok()
-                .and_then(|b| reference::valid_digest(b.trim()).map(str::to_string))
-        } else {
-            reference::valid_digest(key).map(str::to_string)
-        }
-    });
+    // Only reported, so a base that cannot be read is said and left out rather than failing the
+    // roll: what the roll writes does not depend on it.
+    let previous_base = previous
+        .as_deref()
+        .and_then(|key| match recorded_base(layout, key) {
+            Ok(base) => base,
+            Err(e) => {
+                crate::diag::note(&format!(
+                    "the image lock `{}` recorded a tree whose base cannot be read ({e}), so this \
+                     roll does not say which base it replaces",
+                    lock_path.display()
+                ));
+                None
+            }
+        });
     let base = match &image.reference {
         Reference::Digest(digest) => digest.clone(),
         Reference::Tag(_) => registry::resolve(&image, credential.as_ref())?.digest,
@@ -293,11 +301,49 @@ pub(crate) fn refresh(
 /// to name a directory.
 fn locked_key(lock_path: &Path, locator: &str) -> Option<String> {
     let (source, key) = crate::store::read_lock_lines(lock_path)?;
-    (source == locator).then_some(key).flatten().filter(|k| {
-        reference::valid_digest(k).is_some()
-            || k.strip_prefix(DERIVED_PREFIX)
-                .is_some_and(|hex| reference::valid_digest(&format!("sha256:{hex}")).is_some())
-    })
+    (source == locator)
+        .then_some(key)
+        .flatten()
+        .filter(|k| valid_key(k))
+}
+
+/// Whether `key` is in one of the two forms that name a tree: a registry digest, or a derived key.
+///
+/// A key is read from a lock, which is a file on disk, and goes on to name a directory under the
+/// distribution store ([`image_dir`]), so anything else — a `/`, a `..` — is not a key at all.
+fn valid_key(key: &str) -> bool {
+    // `DERIVED_PREFIX` is `derived:` ahead of the digest grammar's own `sha256:`, so what follows
+    // `derived:` is held to that grammar whole.
+    reference::valid_digest(key).is_some()
+        || (key.starts_with(DERIVED_PREFIX)
+            && key
+                .strip_prefix("derived:")
+                .and_then(reference::valid_digest)
+                .is_some())
+}
+
+/// The base digest behind `key`: the key itself when it is a registry digest, and the [`BASE_FILE`]
+/// of the tree it names when it is derived.
+///
+/// `Ok(None)` for a key in neither form, and for a derived tree that is gone or predates the file,
+/// which callers read as "re-resolve". A file that is there and cannot be read is an error naming
+/// it: read as absent, it sent every launch back to the registry without a word.
+fn recorded_base(layout: &Layout, key: &str) -> io::Result<Option<String>> {
+    if !valid_key(key) {
+        return Ok(None);
+    }
+    if !key.starts_with(DERIVED_PREFIX) {
+        return Ok(Some(key.to_string()));
+    }
+    let path = image_dir(layout, key).join(BASE_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(recorded) => Ok(reference::valid_digest(recorded.trim()).map(str::to_string)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("cannot read `{}`: {e}", path.display()),
+        )),
+    }
 }
 
 /// The **base** digest this lock stands for: the key itself when the image is taken as published,
@@ -306,14 +352,12 @@ fn locked_key(lock_path: &Path, locator: &str) -> Option<String> {
 /// The indirection is what a derived key costs: it is a hash of the base digest, so the lock alone
 /// cannot say which base it stands for. A tree that is gone, or one from before this file existed,
 /// yields `None` and the launch re-resolves — the same safe failure a lock recording another image
-/// gets.
-fn locked_base(layout: &Layout, lock_path: &Path, locator: &str) -> Option<String> {
-    let key = locked_key(lock_path, locator)?;
-    if !key.starts_with(DERIVED_PREFIX) {
-        return Some(key);
+/// gets. A `base` file that is there and cannot be read is an error ([`recorded_base`]).
+fn locked_base(layout: &Layout, lock_path: &Path, locator: &str) -> io::Result<Option<String>> {
+    match locked_key(lock_path, locator) {
+        Some(key) => recorded_base(layout, &key),
+        None => Ok(None),
     }
-    let recorded = std::fs::read_to_string(image_dir(layout, &key).join(BASE_FILE)).ok()?;
-    reference::valid_digest(recorded.trim()).map(str::to_string)
 }
 
 /// What separates a staging directory's name from the pid that owns it.
@@ -465,15 +509,32 @@ fn sync_filesystem_of(path: &Path) -> io::Result<()> {
 /// image's own read-only tree (`Can't make symlink at …: Read-only file system`). So an image
 /// missing one leaves a cage without it, and the failure would surface much later as an exec error
 /// naming a path nobody declared. Refusing here names the image and every path it lacks.
+///
+/// A path is missing when looking it up says it is not there (`ENOENT`, or `ENOTDIR` for a parent
+/// that is a file). Any other failure is not an answer about the image, and is reported as itself
+/// rather than as a path the image lacks.
 fn check_supplied(rootfs: &Path, locator: &str) -> io::Result<()> {
-    let missing: Vec<&str> = crate::sandbox::binds::DISTRO_SUPPLIED
-        .iter()
-        .copied()
-        .filter(|p| {
-            let path = rootfs.join(p.trim_start_matches('/'));
-            path.symlink_metadata().is_err()
-        })
-        .collect();
+    let mut missing: Vec<&str> = Vec::new();
+    for p in crate::sandbox::binds::DISTRO_SUPPLIED.iter().copied() {
+        let path = rootfs.join(p.trim_start_matches('/'));
+        match path.symlink_metadata() {
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                missing.push(p)
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("cannot look up `{p}` in the image `{locator}`: {e}"),
+                ));
+            }
+        }
+    }
     if missing.is_empty() {
         return Ok(());
     }

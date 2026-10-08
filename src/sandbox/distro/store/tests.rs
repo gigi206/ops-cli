@@ -246,3 +246,132 @@ fn a_dry_run_reports_the_new_digest_and_leaves_the_lock() {
     assert_eq!(rolled, dry, "the roll locks what the dry run reported");
     assert_eq!(locked_key(&lock, &locator).as_deref(), Some(new));
 }
+
+/// Two `run` lists name two userlands, whatever bytes their commands carry: a command is hashed
+/// behind its length, so one holding a NUL does not run into the next.
+#[test]
+fn two_run_lists_never_share_a_key() {
+    let base = format!("sha256:{}", "1".repeat(64));
+    let key = |run: &[&str]| {
+        derived_key(
+            &base,
+            &run.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+        )
+    };
+    for (one, other) in [
+        (&["a\0bc"][..], &["a", "bc"][..]),
+        (&["a", "bc"][..], &["ab", "c"][..]),
+        (&["a", "\0bc"][..], &["a\0", "bc"][..]),
+        (&[""][..], &[][..]),
+    ] {
+        assert_ne!(key(one), key(other), "{one:?} and {other:?}");
+    }
+    assert!(
+        valid_key(&key(&["a"])),
+        "a derived key is one a lock is read back as"
+    );
+}
+
+/// A key read from a lock names a tree under the store and nothing else: one that climbs out of it
+/// through a tree that is really there is not read, and no `base` outside the store is reported.
+#[test]
+fn a_roll_reads_no_base_outside_the_store() {
+    let tmp = crate::testutil::TmpDir::new();
+    let layout = layout_under(&tmp.join("data"));
+    let hex = "3".repeat(64);
+    let planted = format!("sha256:{}", "1".repeat(64));
+    std::fs::create_dir_all(layout.distro_dir().join(format!("derived-sha256-{hex}"))).unwrap();
+    std::fs::create_dir_all(tmp.join("outside")).unwrap();
+    std::fs::write(tmp.join("outside").join(BASE_FILE), &planted).unwrap();
+    let lock = tmp.join("distro.lock");
+    let escaping = format!("derived:sha256:{hex}/../../../outside");
+    crate::store::write_lock(&lock, "oci:x/y:1", &escaping).unwrap();
+    assert!(!valid_key(&escaping));
+
+    let new = format!("sha256:{}", "2".repeat(64));
+    let rolled = refresh(
+        &layout,
+        &format!("oci:docker.io/library/debian@{new}"),
+        &[],
+        &lock,
+        None,
+        crate::sandbox::RollMode::DryRun,
+    )
+    .unwrap();
+    assert_eq!(rolled.previous.as_deref(), Some(escaping.as_str()));
+    assert_eq!(rolled.previous_base, None);
+}
+
+/// A derived tree's `base` that is gone means "re-resolve"; one that is there and cannot be read
+/// stops a launch naming it, and a roll, which only reports it, leaves it out.
+#[test]
+fn an_unreadable_base_is_an_error_and_a_missing_one_is_not() {
+    let tmp = crate::testutil::TmpDir::new();
+    let layout = layout_under(&tmp.join("data"));
+    let key = format!("derived:sha256:{}", "4".repeat(64));
+    let tree = image_dir(&layout, &key);
+    std::fs::create_dir_all(&tree).unwrap();
+    let lock = tmp.join("distro.lock");
+    let locator = "oci:docker.io/library/debian:12";
+    crate::store::write_lock(&lock, locator, &key).unwrap();
+
+    assert_eq!(locked_base(&layout, &lock, locator).unwrap(), None);
+
+    let base = format!("sha256:{}", "5".repeat(64));
+    std::fs::write(tree.join(BASE_FILE), &base).unwrap();
+    assert_eq!(locked_base(&layout, &lock, locator).unwrap(), Some(base));
+
+    std::fs::remove_file(tree.join(BASE_FILE)).unwrap();
+    std::fs::create_dir(tree.join(BASE_FILE)).unwrap();
+    let err = locked_base(&layout, &lock, locator).expect_err("a directory is not a base");
+    assert!(err.to_string().contains(BASE_FILE), "{err}");
+
+    let new = format!("sha256:{}", "6".repeat(64));
+    let rolled = refresh(
+        &layout,
+        &format!("oci:docker.io/library/debian@{new}"),
+        &[],
+        &lock,
+        None,
+        crate::sandbox::RollMode::DryRun,
+    )
+    .expect("a roll does not fail on what it only reports");
+    assert_eq!(rolled.previous_base, None);
+}
+
+/// A lookup that fails for any reason but absence is not a path the image lacks: a loop is
+/// reported as the failure it is, while a parent that is a file is an absent path.
+#[test]
+fn a_lookup_that_fails_is_not_a_missing_path() {
+    let tmp = crate::testutil::TmpDir::new();
+    let tree = |name: &str| {
+        let rootfs = tmp.join(name).join("rootfs");
+        for dir in ["bin", "usr/bin", "etc"] {
+            std::fs::create_dir_all(rootfs.join(dir)).unwrap();
+        }
+        for file in [
+            "bin/sh",
+            "bin/bash",
+            "usr/bin/env",
+            "usr/bin/ldd",
+            "etc/localtime",
+        ] {
+            std::fs::write(rootfs.join(file), "").unwrap();
+        }
+        rootfs
+    };
+
+    let looping = tree("loop");
+    std::os::unix::fs::symlink("lib64", looping.join("lib64")).unwrap();
+    let err = check_supplied(&looping, "oci:x/y:1").expect_err("a loop is not an answer");
+    let message = err.to_string();
+    assert!(
+        message.contains("/lib64/ld-linux-x86-64.so.2") && !message.contains("does not carry"),
+        "{message}"
+    );
+
+    let file = tree("file");
+    std::fs::write(file.join("lib64"), "").unwrap();
+    let err = check_supplied(&file, "oci:x/y:1").expect_err("no loader under a file");
+    assert!(err.to_string().contains("does not carry"), "{err}");
+}
