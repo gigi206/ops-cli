@@ -61,7 +61,9 @@ brokers     = []                   # broker plugins whose fenced socket replaces
   The grant is a boolean, never a path. `sbx` picks the location, one per
   plugin, keeps it owner-only, and tells the plugin where it landed through
   **`SBX_PLUGIN_STATE`**. A plugin cannot name the directory, cannot reach
-  another plugin's, and nothing in the agent's cage ever sees any of them.
+  another plugin's, and nothing in the agent's cage ever sees any of them. A
+  directory already at that location is used only if it is a real directory
+  owned by you and closed to group and other; otherwise the plugin does not run.
 
   `allow_paths` is held to the other half of that: no entry may name sbx's own
   control plane, which is the data directory (the store caches, the installed

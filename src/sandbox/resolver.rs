@@ -131,6 +131,31 @@ fn state_dir_of(dir: &Path) -> Option<PathBuf> {
     ))
 }
 
+/// Whether `dir` is a state directory sbx may bind writable: a real directory, not a link to one,
+/// owned by this user and closed to everyone else.
+///
+/// Asked after the create, which accepts a path that is already there — a directory left with wider
+/// permissions, or a symlink sending the bind somewhere else. The `0o700` the create asks for holds
+/// only for a directory it made.
+fn check_state_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
+    if !meta.file_type().is_dir() {
+        return Err("it is not a directory".to_string());
+    }
+    // SAFETY: `geteuid` reads this process's own effective uid and touches no memory.
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return Err(format!("it is owned by uid {}", meta.uid()));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "its mode is {mode:o}, open to group or other (`chmod 700` it if it is yours)"
+        ));
+    }
+    Ok(())
+}
+
 /// A plugin's caged process and the socket that is both its stdin and its stdout.
 pub(super) struct CagedPlugin {
     /// The bwrap child. The caller owns killing and reaping it — that is what its own `Drop` is for.
@@ -237,9 +262,16 @@ pub(super) fn cage_spec_for(plan: &CagePlan<'_>) -> io::Result<SandboxSpec> {
     // The private state directory has to exist before bwrap binds it, and owner-only from the
     // start: it will hold a refresh token, and a directory created world-readable and tightened
     // afterwards is readable in between.
-    if plan.grant.state
-        && let Some(dir) = state_dir_of(plan.dir)
-    {
+    if plan.grant.state {
+        // A plugin told `SBX_PLUGIN_STATE` must find it bound, so a directory with no place for
+        // its state is refused here rather than run without one.
+        let dir = state_dir_of(plan.dir).ok_or_else(|| {
+            io::Error::other(format!(
+                "the `{}` plugin declares state, and {} has no place for it",
+                plan.called,
+                plan.dir.display()
+            ))
+        })?;
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -252,6 +284,16 @@ pub(super) fn cage_spec_for(plan: &CagePlan<'_>) -> io::Result<SandboxSpec> {
                     dir.display()
                 ))
             })?;
+        check_state_dir(&dir).map_err(|why| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing the state directory of the `{}` plugin at {}: {why}",
+                    plan.called,
+                    dir.display()
+                ),
+            )
+        })?;
     }
 
     let plugin = plan;
@@ -871,11 +913,9 @@ fn resolve_env_paths(keys: &[String]) -> Vec<(String, String)> {
 fn resolve_programs(plugin: &CagePlan<'_>) -> io::Result<Vec<Program>> {
     // The installed directory's name, which is the key provisioned out-links are filed under and
     // the token `sbx plugins rm` takes — neither of them the manifest `name` the remedy also cites.
-    let dir_name = plugin
-        .dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    // `None` for a directory name that is not UTF-8, which no `sbx plugins install` produces: such a
+    // plugin has no provisioned programs to find, and the remedy names its path instead.
+    let dir_name = plugin.dir.file_name().and_then(|n| n.to_str());
     let mut out = Vec::with_capacity(plugin.grant.programs.len());
     for name in &plugin.grant.programs {
         if let Some(path) = locate_program(name) {
@@ -886,8 +926,9 @@ fn resolve_programs(plugin: &CagePlan<'_>) -> io::Result<Vec<Program>> {
             });
             continue;
         }
-        if let Some(path) = crate::store::Layout::from_env()
-            .and_then(|l| crate::plugins::programs::provisioned(&l, dir_name, name))
+        if let Some(path) = dir_name
+            .zip(crate::store::Layout::from_env())
+            .and_then(|(dir_name, l)| crate::plugins::programs::provisioned(&l, dir_name, name))
         {
             out.push(Program {
                 name: name.clone(),
@@ -907,8 +948,10 @@ fn resolve_programs(plugin: &CagePlan<'_>) -> io::Result<Vec<Program>> {
                 "the `{}` plugin needs the program `{name}`, which is not on sbx's PATH and has \
                  not been provisioned — install it (or add its directory to PATH), or name it in \
                  `[plugin.{}] programs` as `{name} = \"nix:<attribute>\"` and build it with \
-                 `sbx plugins rm {dir_name}`, then install the plugin again",
-                plugin.called, plugin.configured_as
+                 `sbx plugins rm {}`, then install the plugin again",
+                plugin.called,
+                plugin.configured_as,
+                dir_name.map_or_else(|| plugin.dir.display().to_string(), str::to_string),
             ),
         ));
     }
@@ -1136,7 +1179,29 @@ fn nix_closure(program: &Path, layout: Option<&crate::store::Layout>) -> io::Res
     }
     let text = String::from_utf8(out.stdout)
         .map_err(|_| io::Error::other("`nix-store --query --requisites` produced non-UTF-8"))?;
-    Ok(text.lines().map(PathBuf::from).collect())
+    store_requisites(&text)
+}
+
+/// The store paths `nix-store --query --requisites` printed, one per line.
+///
+/// Each line becomes a bind, so each has to be what a requisite is: one entry directly under
+/// `/nix/store`. Anything else is refused rather than bound — trusting the binary is not a reason
+/// to bind whatever its output happens to say.
+fn store_requisites(text: &str) -> io::Result<Vec<PathBuf>> {
+    text.lines()
+        .map(|line| match line.strip_prefix(NIX_STORE) {
+            Some(entry) if is_store_entry(entry) => Ok(PathBuf::from(line)),
+            _ => Err(io::Error::other(format!(
+                "`nix-store --query --requisites` named `{line}`, which is not a store path"
+            ))),
+        })
+        .collect()
+}
+
+/// Whether `entry` names one item directly under the store: a single component that is neither
+/// empty nor `.`/`..`.
+fn is_store_entry(entry: &str) -> bool {
+    !entry.is_empty() && !entry.contains('/') && entry != "." && entry != ".."
 }
 
 /// Whether the cage will hold what a binary at this path needs to *load*, not merely the file.
@@ -1165,13 +1230,18 @@ pub(crate) fn locate_program(name: &str) -> Option<PathBuf> {
     let euid = unsafe { libc::geteuid() };
     let mut usable = Vec::new();
     for cand in crate::pathfind::find_all_on_path(name) {
+        // Canonicalized first: binding the *symlink* would bind a dangling name, since a nix
+        // profile's `bin/x` points into `/nix/store`, which the cage does not have. A candidate
+        // that does not canonicalize is skipped rather than bound as the link, and the verdict is
+        // taken on the path that will be bound rather than on the name it was reached by.
+        let Ok(cand) = std::fs::canonicalize(&cand) else {
+            continue;
+        };
         let Ok(meta) = std::fs::metadata(&cand) else {
             continue;
         };
         match crate::store::host_exec_verdict(meta.uid(), meta.mode(), euid) {
-            // Canonicalized: binding the *symlink* would bind a dangling name, since a nix
-            // profile's `bin/x` points into `/nix/store`, which the cage does not have.
-            Ok(()) => usable.push(std::fs::canonicalize(&cand).unwrap_or(cand)),
+            Ok(()) => usable.push(cand),
             Err(why) => crate::diag::warn(&format!(
                 "ignoring {} for the program `{name}` ({why})",
                 cand.display()
@@ -1374,7 +1444,8 @@ fn cage_spec(
     env.push(("HOME".to_string(), CAGE_HOME.to_string()));
     // Where the private state landed, for a plugin that asked for it. Named rather than assumed, so
     // a plugin never hardcodes the path and sbx stays free to move it.
-    if plugin.grant.state {
+    // Only where the directory is bound above, so the variable never names a path the cage lacks.
+    if plugin.grant.state && state_dir_of(plugin.dir).is_some() {
         env.push(("SBX_PLUGIN_STATE".to_string(), CAGE_STATE.to_string()));
     }
     // The programs directory leads the cage's `PATH` when the manifest declares any, so a
@@ -2567,6 +2638,105 @@ printf 'run-%s' "$n""#,
     ///
     /// Driven through [`resolve_programs`] rather than a whole launch, so the wording is held on
     /// every host and not only on one where a cage can be built.
+    #[test]
+    fn a_requisite_outside_the_store_is_refused_rather_than_bound() {
+        assert_eq!(
+            store_requisites("/nix/store/aaa-x\n/nix/store/bbb-y\n").unwrap(),
+            vec![
+                PathBuf::from("/nix/store/aaa-x"),
+                PathBuf::from("/nix/store/bbb-y")
+            ]
+        );
+        for bad in [
+            "/etc",
+            "/nix/store/",
+            "/nix/store/..",
+            "/nix/store/aaa-x/../../../etc",
+            "nix/store/aaa-x",
+            "/nix/storefront/aaa",
+        ] {
+            assert!(
+                store_requisites(&format!("/nix/store/aaa-x\n{bad}\n")).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_state_directory_is_bound_only_when_it_is_ours_and_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new();
+        let good = tmp.join("good");
+        std::fs::create_dir(&good).unwrap();
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(check_state_dir(&good), Ok(()));
+
+        let open = tmp.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            check_state_dir(&open).is_err(),
+            "a 0755 directory was accepted"
+        );
+
+        let link = tmp.join("link");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        assert!(check_state_dir(&link).is_err(), "a symlink was accepted");
+
+        // Closed like a good directory, so only its type can refuse it.
+        let file = tmp.join("file");
+        std::fs::write(&file, b"").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(check_state_dir(&file).is_err(), "a file was accepted");
+    }
+
+    /// The check is wired into the launch: a state directory left open is refused before any cage.
+    #[test]
+    fn a_plugin_whose_state_directory_is_open_does_not_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(bwrap) = sandbox_prereqs() else {
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        let (_root, p) = installed_resolver(
+            "printf ok",
+            SandboxGrant {
+                state: true,
+                ..SandboxGrant::default()
+            },
+        );
+        let state = state_dir(&p).expect("a state directory");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = run(&bwrap, &p, "test://x", &[]).expect_err("an open state directory ran");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// A plugin directory whose name is not UTF-8 is named by its path in the remedy, rather than
+    /// by an empty token `sbx plugins rm` could not take.
+    #[test]
+    fn the_missing_program_refusal_names_a_non_utf8_directory_by_its_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = TmpDir::new();
+        let dir = tmp.path().join(std::ffi::OsStr::from_bytes(b"p\xff"));
+        std::fs::create_dir(&dir).unwrap();
+        let plugin = plugin_in(
+            &dir,
+            SandboxGrant {
+                programs: vec!["sbx-no-such-program".to_string()],
+                ..SandboxGrant::default()
+            },
+        );
+        let Err(err) = resolve_programs(&plan_for(&plugin, "test://x")) else {
+            panic!("a program that is on neither PATH nor the store must fail closed");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("sbx plugins rm {}", dir.display())),
+            "{msg}"
+        );
+    }
+
     #[test]
     fn the_missing_program_refusal_names_the_remove_then_install_sequence() {
         let dir = TmpDir::new();
