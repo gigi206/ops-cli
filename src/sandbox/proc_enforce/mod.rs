@@ -132,7 +132,10 @@
 //! `execve` on it succeeds and the interpreter starts — with the payload spelled in the
 //! interpreter's own argument (`#!/usr/bin/perl -esystem(…)`) the script is never needed at all, so
 //! taking the path's verdict alone there would run a denied interpreter behind a file the cage made
-//! unreadable on purpose. The cost is that an execute-only file does not run under an exec policy.
+//! unreadable on purpose. The cost is that an execute-only file does not run under an exec policy,
+//! and neither does a name the cage reaches and this supervisor cannot even ask about -- a link
+//! with an absolute target spelled under `/proc/self/root`, which crosses a magic link the cage's
+//! scoped lookup refuses.
 //! And the line read is the line of that moment: a `deny` formed on it holds, while an allow is as
 //! TOCTOU-racy as every other `CONTINUE` below.
 //!
@@ -750,8 +753,8 @@ fn exec_verdict(
                 // own `execve` resolves that very link against the *cage's* root and runs what it
                 // finds there, `#!` line and all. So the cage is asked before an absence is
                 // believed, with the walk a refusal's errno is chosen by, and a target the cage
-                // holds falls through to the refusing arm below rather than running with its head
-                // unread.
+                // holds -- or one that walk cannot answer about -- falls through to the refusing
+                // arm below rather than running with its head unread.
                 Err(libc::ENOENT) | Err(libc::ENOTDIR) if !reached_in_cage(pid, &path) => {}
                 // Reached and not read, which is the one arm that must refuse. Measured: a script
                 // in mode `0111` cannot be read by a same-uid supervisor, yet `execve` on it
