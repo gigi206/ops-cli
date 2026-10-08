@@ -145,7 +145,9 @@ that far:
   `execve` whose path is the loader's, so a `deny = "curl"` matched on that path alone would not
   fire. sbx reads the loader's own argument list and decides the program it names too, taking the
   stricter of the two answers. Options that consume the next word (`--library-path`, `--preload`)
-  are stepped over rather than mistaken for the program.
+  are stepped over rather than mistaken for the program. The loader is recognised by its name
+  (`ld-*.so*`, `ld.so*`), so a copy or a link under another name is a program no rule names, the
+  same limit [Honest scope](#honest-scope) states for any other renamed program.
 - **A `#!` line.** `./deploy.sh` starting with `#!/bin/sh` is a single `execve` as well: the kernel
   reads the line and runs `/bin/sh` inside that same call, with no second syscall to notify. sbx
   reads the first 256 bytes of the target, the amount the kernel itself reads, and decides the
