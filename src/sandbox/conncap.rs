@@ -90,14 +90,37 @@ fn spawn_with<F>(builder: std::thread::Builder, who: &str, work: F) -> bool
 where
     F: FnOnce() + Send + 'static,
 {
+    let spawned = spawn_joinable(builder, who, work).is_some();
+    if !spawned {
+        std::thread::sleep(BACKOFF);
+    }
+    spawned
+}
+
+/// A connection's thread its caller goes on to join, or `None` once the refusal is reported, in
+/// the words [`spawn_conn`] reports it with.
+///
+/// For a thread started from inside a connection rather than from an accept loop, which has no
+/// loop to pause: the raw tunnel's second direction ([`super::proxy`]'s splice). The bare
+/// `std::thread::spawn` panicked there under the same host condition, ending the connection with a
+/// panic message, relayed to the launch's standard error, rather than a line saying what the host
+/// refused.
+pub(super) fn spawn_joinable<F, T>(
+    builder: std::thread::Builder,
+    who: &str,
+    work: F,
+) -> Option<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
     match builder.spawn(work) {
-        Ok(_) => true,
+        Ok(handle) => Some(handle),
         Err(e) => {
             crate::diag::error(&format!(
                 "sbx: {who}: could not start a connection thread: {e}"
             ));
-            std::thread::sleep(BACKOFF);
-            false
+            None
         }
     }
 }

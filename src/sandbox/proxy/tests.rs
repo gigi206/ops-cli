@@ -1,5 +1,5 @@
 use super::ca::CertResolver;
-use super::splice::{SpliceGuard, splice_copy};
+use super::splice::{SpliceGuard, splice_copy, splice_copy_with};
 use super::*;
 use crate::allowlist::{DefaultAction, EgressPolicy, classify};
 use crate::sandbox::deadline::READ_DEADLINE_PASSED;
@@ -12654,4 +12654,110 @@ fn neither_inspected_plane_pumps_a_response_body_itself() {
             );
         }
     }
+}
+
+/// A tunnel whose second direction the host will not give a thread is ended, not left half-copied,
+/// and the refusal does not panic the connection's thread: the call returns an error and the
+/// client reads the end of the stream.
+#[test]
+fn a_tunnel_refused_its_second_thread_ends_without_a_panic() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let upstream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut test_end, cage_end) = UnixStream::pair().unwrap();
+    test_end
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    // A stack larger than any address space, refused the way `RLIMIT_NPROC` refuses a thread (see
+    // `conncap`'s own test of the same seam). Run aside, so a tunnel that started anyway, and now
+    // waits on an upstream that never speaks, fails this test rather than hanging it.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let ended = splice_copy_with(
+            std::thread::Builder::new().stack_size(usize::MAX / 8),
+            cage_end,
+            upstream,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let _ = done_tx.send(ended.is_err());
+    });
+    let ended = done_rx.recv_timeout(Duration::from_secs(10));
+    drop(listener);
+    assert_eq!(
+        ended,
+        Ok(true),
+        "a tunnel without its second direction ends, as an error"
+    );
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        test_end
+            .read(&mut buf)
+            .expect("the end of the stream, not a timeout"),
+        0
+    );
+}
+
+/// The allow a raw splice is recorded under is the decision and the dial, not the client's receipt
+/// of its `200`: a client gone before the `200` reaches it still leaves the allow in the log.
+#[test]
+fn a_splice_whose_client_left_before_its_200_is_still_logged_as_allowed() {
+    let echo = spawn_raw_echo();
+    let log = Arc::new(crate::sandbox::control::LogRing::new(
+        crate::sandbox::control::LOG_RING_CAP,
+    ));
+    // The resolver the supervisor asks before it dials waits for the client to be gone, so the
+    // `200` is written to a closed socket every time.
+    let (gone_tx, gone_rx) = std::sync::mpsc::channel::<()>();
+    let gone_rx = std::sync::Mutex::new(gone_rx);
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            policy(&[&format!("tcp://splice.test:{}", echo.port())]),
+        )
+        .unwrap()
+        .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None))
+        .with_resolver(Box::new(move |_h| {
+            let _ = gone_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+            Ok(vec!["127.0.0.1".parse().unwrap()])
+        })),
+    );
+    let dir = TmpDir::new();
+    let path = dir.join("proxy.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let served = Arc::clone(&ctx);
+    thread::spawn(move || {
+        let _ = serve(
+            listener,
+            served,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+    });
+    let mut sock = UnixStream::connect(&path).unwrap();
+    write!(sock, "CONNECT splice.test:{} HTTP/1.1\r\n\r\n", echo.port()).unwrap();
+    sock.flush().unwrap();
+    drop(sock);
+    gone_tx.send(()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let allowed = loop {
+        if let Some(events) = &ctx.events {
+            events.flush();
+        }
+        let allowed = log.snapshot(None, None, true).events.into_iter().any(|e| {
+            e.host == "splice.test"
+                && e.verdict == crate::sandbox::control::LogVerdict::Allow
+                && e.proto == crate::sandbox::control::Proto::Tcp
+        });
+        if allowed || Instant::now() > deadline {
+            break allowed;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        allowed,
+        "the splice was decided and dialed, so its allow is logged"
+    );
 }

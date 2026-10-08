@@ -95,8 +95,9 @@ pub(super) fn splice_l4(
         }
     };
 
-    // Accept the tunnel — from here every byte is raw and uninspected.
-    write_all_str(&mut client, "HTTP/1.1 200 Connection established\r\n\r\n")?;
+    // Recorded once the upstream is open and before the client is told: the allow is what was
+    // decided and dialed, and a client gone before its `200` arrived left a connection made on its
+    // behalf that the log would otherwise never show.
     ctx.outcome(
         crate::sandbox::control::Proto::Tcp,
         connect_host,
@@ -106,6 +107,8 @@ pub(super) fn splice_l4(
         StatKind::Allow,
         "allowed",
     );
+    // Accept the tunnel — from here every byte is raw and uninspected.
+    write_all_str(&mut client, "HTTP/1.1 200 Connection established\r\n\r\n")?;
     // Register the raw tunnel for `sbx net live` for its whole lifetime: `splice_copy` joins both
     // directions before returning, so this guard (dropped after it) stays registered until the tunnel
     // fully closes. A splice is uninspected, so the byte counters reflect raw ciphertext volume.
@@ -113,13 +116,37 @@ pub(super) fn splice_l4(
     splice_copy(client, upstream, flow.up.clone(), flow.down.clone())
 }
 
-/// Splice a raw TCP tunnel: copy bytes both directions between the cage `client` and the `upstream`
-/// until either side closes, then tear both down so neither copy thread can hang. The per-connection
-/// read/write timeouts are cleared first, so an idle long-lived tunnel (an interactive SSH session,
-/// say) is not killed mid-session. One direction runs in a spawned thread, the other in this thread;
-/// when the first ends, both sockets are shut down fully so the other's blocked read returns and the
-/// join always completes (no leaked host thread on a half-open or stalled peer).
+/// Splice a raw TCP tunnel: copy bytes both directions between the cage `client` and the
+/// `upstream`. The per-connection read/write timeouts are cleared first, so an idle long-lived
+/// tunnel (an interactive SSH session, say) is not killed mid-session.
+///
+/// The two directions do not end alike, and each way costs something:
+///
+/// * **client → upstream** runs in a spawned thread. When the client stops sending, the upstream's
+///   write half is closed and nothing else: the upstream sees end of input and may still answer,
+///   which is what a half-close is for. Until it answers or closes, this thread's own copy stays in
+///   its read, and the tunnel holds its thread and its splice slot for as long as the upstream is
+///   silent.
+/// * **upstream → client** runs in this thread and decides. When it ends, both sockets are shut
+///   down fully so the spawned copy's blocked read returns and the join always completes. The cost
+///   is a client still sending to an upstream that half-closed: what it sends after that is cut,
+///   the rule [`crate::sandbox::forward`]'s bridge follows for the same reason.
 pub(super) fn splice_copy(
+    client: UnixStream,
+    upstream: TcpStream,
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
+) -> io::Result<()> {
+    splice_copy_with(std::thread::Builder::new(), client, upstream, up, down)
+}
+
+/// [`splice_copy`], with the builder of the second direction's thread passed in, so a test can ask
+/// for one the host is certain to refuse.
+///
+/// A refused thread ends the tunnel: the `200` is already sent, so there is no refusal left to
+/// write, and both sockets are shut down rather than left to a copy in one direction only.
+pub(super) fn splice_copy_with(
+    builder: std::thread::Builder,
     client: UnixStream,
     upstream: TcpStream,
     up: Arc<AtomicU64>,
@@ -142,13 +169,21 @@ pub(super) fn splice_copy(
     let up_shut = upstream.try_clone()?;
     let mut up_wr = upstream;
 
-    let t = std::thread::spawn(move || {
+    let copy_up = move || {
         // Count client→upstream bytes (`up`). The counting writer is temporary, so `up_wr` is free to
         // shut down after the copy. On a raw splice these are ciphertext bytes (the tunnel is opaque).
         let _ = io::copy(&mut client_rd, &mut CountingWriter::new(&mut up_wr, up));
         // client → upstream finished: half-close the upstream's write so it observes EOF.
         let _ = up_wr.shutdown(std::net::Shutdown::Write);
-    });
+    };
+    let spawned = crate::sandbox::conncap::spawn_joinable(builder, "egress proxy tunnel", copy_up);
+    let Some(t) = spawned else {
+        let _ = client_shut.shutdown(std::net::Shutdown::Both);
+        let _ = up_shut.shutdown(std::net::Shutdown::Both);
+        return Err(io::Error::other(
+            "no thread for the tunnel's client-to-upstream direction",
+        ));
+    };
     // Count upstream→client bytes (`down`) through the counting reader (temporary, so `up_rd` remains
     // usable — though it is not needed after this copy).
     let _ = io::copy(&mut CountingReader::new(&mut up_rd, down), &mut client_wr);
