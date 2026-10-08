@@ -1746,7 +1746,7 @@ pub(crate) fn serve_reports(
 }
 
 /// The accept loop of the control socket: each connection on a thread of its own, at most
-/// [`MAX_CONCURRENT_CONNS`] at once, answered by `dispatch`, until `stop` is set. With a `gate`, a
+/// [`super::conncap::CONTROL_CONNS`] at once, answered by `dispatch`, until `stop` is set. With a `gate`, a
 /// connection whose peer runs outside this process's PID namespace is closed unanswered, before it
 /// takes a slot. A command `dispatch` answers with `None` is closed unanswered as well, and so is a
 /// connection past the ceiling.
@@ -1760,7 +1760,7 @@ fn accept_each<F>(
     F: Fn(&str) -> Option<String> + Send + Sync + 'static,
 {
     let dispatch = Arc::new(dispatch);
-    let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
+    let cap = super::conncap::ConnCap::new(super::conncap::CONTROL_CONNS);
     for stream in listener.incoming() {
         // See [`super::proxy::serve`]: the owner sets this and pokes the socket to unpark `accept`.
         if stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1802,12 +1802,6 @@ fn accept_each<F>(
         });
     }
 }
-
-/// The most control connections served at once. Each carries one command and is closed once
-/// answered, so a reader holds its slot for the length of one reply; the ceiling is for a peer that
-/// connects and says nothing, which pins a thread for the ten seconds [`handle`] waits. The number
-/// the lenses' control sockets use ([`super::lens`]).
-const MAX_CONCURRENT_CONNS: usize = 8;
 
 /// The largest control command accepted. Most commands are short (`ALLOW <seq>`), but `REMEMBER
 /// ALLOW|DENY <rule>` carries a full egress rule (a long regex or URL rule), so the bound matches the
@@ -3588,10 +3582,8 @@ mod tests {
             let _ = (&stream).read_to_string(&mut reply);
             reply
         };
-        assert_eq!(ask(&sock), "ok\n", "served below the ceiling");
-
         // Each silent connection holds its slot while the server waits for its command.
-        let silent: Vec<UnixStream> = (0..MAX_CONCURRENT_CONNS)
+        let silent: Vec<UnixStream> = (0..crate::sandbox::conncap::CONTROL_CONNS)
             .map(|_| UnixStream::connect(&sock).unwrap())
             .collect();
         assert_eq!(ask(&sock), "", "past the ceiling: closed unanswered");

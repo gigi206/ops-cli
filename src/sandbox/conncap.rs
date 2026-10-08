@@ -151,6 +151,12 @@ impl Drop for ConnSlot {
 /// How often a loop records the connections it refuses at its ceiling while they keep coming.
 pub(super) const REFUSALS_EVERY: Duration = Duration::from_secs(10);
 
+/// The most connections a host-side control socket serves at once — each lens's and the egress
+/// plane's. Each carries one command and is closed once answered, so a reader holds its slot for
+/// the length of one reply; the ceiling is for a peer that connects and says nothing, which pins a
+/// thread for the ten seconds its handler waits on the command.
+pub(super) const CONTROL_CONNS: usize = 8;
+
 /// When a loop records a connection refused at its ceiling: the first of a run, then at most one
 /// line per [`REFUSALS_EVERY`] carrying how many it covers, and whatever is left unsaid when a
 /// connection is next served.

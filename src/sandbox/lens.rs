@@ -97,12 +97,6 @@ const LINE_MAX: u64 = 8 * 1024;
 /// belt-and-braces against one that is stuck rather than hostile.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The most control connections a lens serves at once. Each carries one command and is closed once
-/// answered, so a reader holds its slot for the length of one reply; the ceiling is for a peer that
-/// connects and says nothing, which pins a thread for [`IO_TIMEOUT`]. The same shape, and the same
-/// number, as the egress control plane's.
-const MAX_CONCURRENT_CONNS: usize = 8;
-
 /// One event a lens records, and how it crosses the wire. The ring stamps the sequence number, so an
 /// event only has to hand it back: that is what a `--follow` cursor is compared against, and what an
 /// eviction gap is measured in.
@@ -302,7 +296,7 @@ pub(crate) fn dispatch_log<E: Event>(cmd: &str, ring: &Ring<E>) -> String {
 // ── The server (the supervisor holding the ring) ──────────────────────────────────────────────
 
 /// Serve a lens's control socket: one short-lived thread per connection, at most
-/// [`MAX_CONCURRENT_CONNS`] at once, each handling exactly one command through `dispatch`. A
+/// [`super::conncap::CONTROL_CONNS`] at once, each handling exactly one command through `dispatch`. A
 /// per-connection error is that connection's problem, never the server's — a reader that hangs up
 /// mid-reply must not stop the next one being answered.
 pub(crate) fn serve<F>(listener: UnixListener, dispatch: F) -> io::Result<()>
@@ -310,7 +304,7 @@ where
     F: Fn(&str) -> String + Send + Sync + 'static,
 {
     let dispatch = Arc::new(dispatch);
-    let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
+    let cap = super::conncap::ConnCap::new(super::conncap::CONTROL_CONNS);
     let mut gate = super::peer::PeerGate::new("lens control");
     for stream in listener.incoming() {
         let stream = match stream {
@@ -1288,7 +1282,7 @@ mod tests {
         assert_eq!(snap.events[0].tail, "second");
     }
 
-    /// Past [`MAX_CONCURRENT_CONNS`] a connection is closed unanswered rather than given a thread,
+    /// Past [`super::conncap::CONTROL_CONNS`] a connection is closed unanswered rather than given a thread,
     /// and a slot given back serves the next reader. Without the ceiling, peers that connect and say
     /// nothing pin one thread each for [`IO_TIMEOUT`], with nothing bounding how many.
     #[test]
@@ -1312,7 +1306,7 @@ mod tests {
 
         // Silent, so each holds its slot in `read_line` until `IO_TIMEOUT`. The loop accepts in
         // order, so these take every slot before the next connection is accepted.
-        let mut held: Vec<UnixStream> = (0..MAX_CONCURRENT_CONNS)
+        let mut held: Vec<UnixStream> = (0..crate::sandbox::conncap::CONTROL_CONNS)
             .map(|_| UnixStream::connect(&socket).expect("connect"))
             .collect();
         assert_eq!(ask(), "", "a connection past the ceiling was answered");
