@@ -368,6 +368,9 @@ pub mod fixture;
 /// The project-under-test harness the host-side verb suites drive, in one definition.
 pub mod project;
 
+/// The pseudo-terminal the interactive suites drive a launch through, in one definition.
+pub mod pty;
+
 use std::process::{Command, Output};
 
 /// Run the binary under test with `args`.

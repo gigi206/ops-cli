@@ -4700,48 +4700,17 @@ fn bwrap_refusing_the_learning_cage(dir: &Path) -> Option<PathBuf> {
 /// The command's exit is what ends the drain, not the terminal's last copy closing: a process the
 /// command left behind, or one another test spawned while a copy was open, may hold a copy longer.
 fn on_a_terminal(mut command: Command, limit: std::time::Duration) -> (Option<i32>, String) {
-    use std::os::fd::FromRawFd;
-    use std::process::Stdio;
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    // SAFETY: `openpty` fills the two descriptors it is handed and is given no name, settings or
-    // size to read.
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty failed");
-    // `openpty` opens both ends without close-on-exec, and the suite runs its tests side by side:
-    // a launch another test spawned while they were open would carry a copy through its exec.
-    for fd in [master, slave] {
-        // SAFETY: `fcntl` on a descriptor `openpty` just returned, with an integer argument.
-        let set = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        assert_ne!(set, -1, "cannot make the terminal close-on-exec");
-    }
-    // One close-on-exec copy of the slave per stream. The spawn moves each onto 0, 1 or 2, which
-    // clears the flag for the child alone.
-    let copy = || {
-        // SAFETY: duplicates the slave this function holds, with an integer argument.
-        let fd = unsafe { libc::fcntl(slave, libc::F_DUPFD_CLOEXEC, 0) };
-        assert_ne!(fd, -1, "cannot copy the terminal");
-        // SAFETY: the copy was just made here, and the Stdio takes it over.
-        unsafe { Stdio::from_raw_fd(fd) }
-    };
+    let mut pty = common::pty::Pty::open(None);
     let mut child = command
-        .stdin(copy())
-        .stdout(copy())
-        .stderr(copy())
+        .stdin(pty.stdio())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio())
         .spawn()
         .expect("spawn sbx on a terminal");
     // The command keeps the three copies it was handed for as long as it lives: they go with it.
     drop(command);
-    // SAFETY: closes this process's own copy of the slave.
-    unsafe { libc::close(slave) };
+    pty.release_slave();
+    let master = pty.master();
 
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
@@ -4770,8 +4739,7 @@ fn on_a_terminal(mut command: Command, limit: std::time::Duration) -> (Option<i3
             exited = child.try_wait().expect("poll sbx");
         }
     }
-    // SAFETY: the master this function opened, closed once.
-    unsafe { libc::close(master) };
+    drop(pty);
     // Every copy closed: the command has exited or is about to. Neither, and the limit passed.
     let ended = exited.is_some() || let_go;
     if !ended {
@@ -9388,7 +9356,6 @@ fn process_tree_report(root: u32) -> String {
 /// Skips (never fails) where the host cannot sandbox or the cage does not come up.
 #[test]
 fn sbx_attach_joins_the_live_cage_with_the_confinement_reapplied() {
-    use std::os::fd::FromRawFd;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
@@ -9455,30 +9422,19 @@ fn sbx_attach_joins_the_live_cage_with_the_confinement_reapplied() {
 
     // Drive `sbx session attach` through a pty (it needs a real terminal on stdin), exactly like the
     // interactive `sbx run` supervisor test.
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty failed");
-
-    // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
-    let mut attach = sbx()
-        .args(["session", "attach", &session_pid.to_string()])
-        .current_dir(project.path())
-        .env("XDG_DATA_HOME", data.path())
-        .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .spawn()
-        .expect("spawn sbx session attach");
-    unsafe { libc::close(slave) };
+    let mut pty = common::pty::Pty::open(None);
+    let attach = common::pty::Reaped(
+        sbx()
+            .args(["session", "attach", &session_pid.to_string()])
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .stdin(pty.stdio())
+            .stdout(pty.stdio())
+            .stderr(pty.stdio())
+            .spawn()
+            .expect("spawn sbx session attach"),
+    );
+    pty.release_slave();
 
     // Read the agent's live marker; assemble the confinement triple from /proc (so it cannot come
     // from the echoed command); then leave. `awk` and `cat` are in the cage's base toolset.
@@ -9491,30 +9447,13 @@ fn sbx_attach_joins_the_live_cage_with_the_confinement_reapplied() {
     // prompt is `common::shell_prompt_seen`, in one definition, because its last character is not
     // the same on every host.
     let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    let mut sent = false;
     let read_deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < read_deadline {
-        let mut pfd = libc::pollfd {
-            fd: master,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut pfd, 1, 500) } > 0 {
-            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
-            if n <= 0 {
-                break; // EIO/EOF: the attach session ended
-            }
-            out.extend_from_slice(&buf[..n as usize]);
-        }
-        if !sent && common::shell_prompt_seen(&out) {
-            unsafe { libc::write(master, script.as_ptr().cast(), script.len()) };
-            sent = true;
-        }
+    if pty.read_until(&mut out, read_deadline, common::shell_prompt_seen) {
+        pty.send(script);
+        pty.read_until(&mut out, read_deadline, |_| false);
     }
-    unsafe { libc::close(master) };
-    let _ = attach.kill();
-    let _ = attach.wait();
+    drop(pty);
+    drop(attach);
     let _ = agent.kill();
     let _ = agent.wait();
 
@@ -9685,7 +9624,6 @@ fn sbx_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
 /// shell escaped the cage's pid namespace). Skips where the host cannot sandbox.
 #[test]
 fn ending_a_session_kills_a_shell_attached_to_it() {
-    use std::os::fd::FromRawFd;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
@@ -9721,53 +9659,30 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
     }
 
     // Attach a shell under a pty.
-    let attach_under_pty = || -> (std::process::Child, libc::c_int) {
-        let mut master: libc::c_int = -1;
-        let mut slave: libc::c_int = -1;
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        };
-        assert_eq!(rc, 0, "openpty failed");
-        // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
+    let attach_under_pty = || -> (std::process::Child, common::pty::Pty) {
+        let mut pty = common::pty::Pty::open(None);
         let attach = sbx()
             .args(["session", "attach", &session_pid.to_string()])
             .current_dir(project.path())
             .env("XDG_DATA_HOME", data.path())
-            .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-            .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-            .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+            .stdin(pty.stdio())
+            .stdout(pty.stdio())
+            .stderr(pty.stdio())
             .spawn()
             .expect("spawn sbx session attach");
-        unsafe { libc::close(slave) };
-        (attach, master)
+        pty.release_slave();
+        (attach, pty)
     };
-    let (mut attach, mut master) = attach_under_pty();
+    let (mut attach, mut pty) = attach_under_pty();
 
     // Confirm the attached shell is really live before killing the session — a runtime-assembled
     // sentinel (`ALIVE-42` from shell arithmetic) that can never come from the echoed command text.
     let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
     let mut sent = false;
     let confirm_deadline = Instant::now() + Duration::from_secs(30);
     let mut confirmed = false;
     while Instant::now() < confirm_deadline && !confirmed {
-        let mut pfd = libc::pollfd {
-            fd: master,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut pfd, 1, 500) } > 0 {
-            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
-            if n > 0 {
-                out.extend_from_slice(&buf[..n as usize]);
-            }
-        }
+        pty.read_into(&mut out, 500);
         // `attach` refuses a session whose agent it cannot enter yet, one caught between its fork
         // and its exec, whose environment cannot be read. That refusal is the "not yet" this loop
         // waits out: attach again. Any other exit is the failure it looks for.
@@ -9775,22 +9690,21 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
             if !String::from_utf8_lossy(&out).contains("has no live process to enter") {
                 break;
             }
-            unsafe { libc::close(master) };
+            drop(pty);
             std::thread::sleep(Duration::from_millis(250));
-            (attach, master) = attach_under_pty();
+            (attach, pty) = attach_under_pty();
             out.clear();
             sent = false;
             continue;
         }
         if !sent && common::shell_prompt_seen(&out) {
-            let cmd = b"echo ALIVE-$((6 * 7))\n";
-            unsafe { libc::write(master, cmd.as_ptr().cast(), cmd.len()) };
+            pty.send(b"echo ALIVE-$((6 * 7))\n");
             sent = true;
         }
         confirmed = String::from_utf8_lossy(&out).contains("ALIVE-42");
     }
     if !confirmed {
-        unsafe { libc::close(master) };
+        drop(pty);
         let _ = attach.kill();
         let _ = attach.wait();
         let _ = agent.kill();
@@ -9830,14 +9744,8 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
     let mut attach_exited = false;
     while Instant::now() < kill_deadline {
         // Drain the pty so the relay never blocks on a full master while we wait.
-        let mut pfd = libc::pollfd {
-            fd: master,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut pfd, 1, 100) } > 0 {
-            let _ = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
-        }
+        let mut drained = Vec::new();
+        pty.read_into(&mut drained, 100);
         if matches!(attach.try_wait(), Ok(Some(_))) {
             attach_exited = true;
             break;
@@ -9853,7 +9761,7 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
             process_tree_report(attach.id())
         )
     });
-    unsafe { libc::close(master) };
+    drop(pty);
     // Reap both children on every path (a survivor is force-killed first), so the test leaves no
     // process behind whether it passes or fails.
     if !attach_exited {

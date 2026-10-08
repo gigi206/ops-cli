@@ -12,8 +12,8 @@
 #[macro_use]
 mod common;
 use common::fixture::TmpDir;
+use common::pty::{Pty, Reaped};
 
-use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -40,11 +40,48 @@ fn sandbox_probe(project: &Path, data: &Path) -> Output {
         .expect("spawn sbx run")
 }
 
+/// The terminal's end is reported when its own process ends, though another process was started
+/// while it was open: that one holds no copy of either end ([`common::pty`]). A copy it held would
+/// keep the session open past its end, and a test reading to that end would wait out its deadline.
+#[test]
+fn a_terminal_session_ends_with_its_process_though_another_was_started_meanwhile() {
+    let mut pty = Pty::open(None);
+    let _bystander = Reaped(
+        Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a bystander"),
+    );
+    let _child = Reaped(
+        Command::new("/bin/sh")
+            .args(["-c", "printf ready"])
+            .stdin(pty.stdio())
+            .stdout(pty.stdio())
+            .stderr(pty.stdio())
+            .spawn()
+            .expect("spawn the terminal's process"),
+    );
+    pty.release_slave();
+    let mut out = Vec::new();
+    let started = Instant::now();
+    while pty.read_into(&mut out, 300) {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the session outlived its process: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+    assert!(out.ends_with(b"ready"), "{}", String::from_utf8_lossy(&out));
+}
+
 #[test]
 fn an_interactive_run_with_no_command_gives_the_sandbox_a_controlling_terminal() {
     let project = TmpDir::prefixed("sh", "proj");
     let data = TmpDir::prefixed("sh", "data");
-    std::fs::write(project.path().join("MARKER"), b"x").unwrap();
+    std::fs::write(project.path().join("MARKER"), b"x").expect("write the project's marker");
 
     probe_or_skip!(
         "interactive sbx run smoke",
@@ -53,31 +90,19 @@ fn an_interactive_run_with_no_command_gives_the_sandbox_a_controlling_terminal()
 
     // A no-command `sbx run` opens an interactive shell when stdin is a terminal; give it a
     // pty and drive it through the master end.
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty failed");
-
-    // SAFETY: each Stdio owns its own dup of the slave; the child inherits them
-    // as stdin/out/err.
-    let mut child = sbx()
-        .arg("run")
-        .current_dir(project.path())
-        .env("XDG_DATA_HOME", data.path())
-        .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .spawn()
-        .expect("spawn sbx run");
-    unsafe { libc::close(slave) };
+    let mut pty = Pty::open(None);
+    let _child = Reaped(
+        sbx()
+            .arg("run")
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .stdin(pty.stdio())
+            .stdout(pty.stdio())
+            .stderr(pty.stdio())
+            .spawn()
+            .expect("spawn sbx run"),
+    );
+    pty.release_slave();
 
     // The script. `( : < /dev/tty )` succeeds only when the shell has a
     // controlling terminal — the whole point of the pty supervisor.
@@ -95,33 +120,17 @@ fn an_interactive_run_with_no_command_gives_the_sandbox_a_controlling_terminal()
     // stale type-ahead), so a real user — and this test — types only once the
     // shell is ready. Readiness is the shared prompt predicate, which accepts both
     // characters bash renders `\$` as: the cage keeps the invoking uid, so a root
-    // invoker sees the rc's prompt end in `#` where anyone else sees `$`. Read
-    // until the master closes (child exited -> EIO on Linux) or a deadline.
+    // invoker sees the rc's prompt end in `#` where anyone else sees `$`. Then read
+    // until the script's `exit` ends the session (the master reads EIO) or a deadline.
     let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    let mut sent = false;
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        let mut pfd = libc::pollfd {
-            fd: master,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut pfd, 1, 500) } > 0 {
-            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
-            if n <= 0 {
-                break; // EIO/EOF: session over
-            }
-            out.extend_from_slice(&buf[..n as usize]);
-        }
-        if !sent && common::shell_prompt_seen(&out) {
-            unsafe { libc::write(master, script.as_ptr().cast(), script.len()) };
-            sent = true;
-        }
-    }
-    unsafe { libc::close(master) };
-    let _ = child.kill();
-    let _ = child.wait();
+    assert!(
+        pty.read_until(&mut out, deadline, common::shell_prompt_seen),
+        "never reached the shell prompt to type the script:\n{}",
+        String::from_utf8_lossy(&out)
+    );
+    pty.send(script);
+    pty.read_until(&mut out, deadline, |_| false);
 
     let text = String::from_utf8_lossy(&out);
     assert!(text.contains("sandbox"), "no synthetic identity:\n{text}");
@@ -151,68 +160,40 @@ fn an_interactive_observed_run_records_events_for_proc_logs() {
         sandbox_probe(project.path(), data.path())
     );
 
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty failed");
-
-    // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
-    let mut child = sbx()
-        .arg("run")
-        .arg("--observe")
-        .current_dir(project.path())
-        .env("XDG_DATA_HOME", data.path())
-        .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .spawn()
-        .expect("spawn sbx run --observe");
-    unsafe { libc::close(slave) };
+    let mut pty = Pty::open(None);
+    let child = Reaped(
+        sbx()
+            .arg("run")
+            .arg("--observe")
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .stdin(pty.stdio())
+            .stdout(pty.stdio())
+            .stderr(pty.stdio())
+            .spawn()
+            .expect("spawn sbx run --observe"),
+    );
+    pty.release_slave();
     // The observer roots on, and the control socket is keyed by, this sbx supervisor's pid — the same
     // one `sbx proc logs` resolves the session by.
-    let pid = child.id();
+    let pid = child.0.id();
 
-    // Wait for the shell prompt, then spawn a long-lived, recognizable child inside the cage.
+    // Wait for the shell prompt, then spawn a recognizable child inside the cage.
     let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    let mut sent = false;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        let mut pfd = libc::pollfd {
-            fd: master,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut pfd, 1, 300) } > 0 {
-            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
-            if n <= 0 {
-                break; // EIO/EOF: session over
-            }
-            out.extend_from_slice(&buf[..n as usize]);
-        }
-        if !sent && common::shell_prompt_seen(&out) {
-            unsafe { libc::write(master, b"sleep 20\n".as_ptr().cast(), 9) };
-            sent = true;
-            break;
-        }
-    }
     assert!(
-        sent,
+        pty.read_until(
+            &mut out,
+            Instant::now() + Duration::from_secs(30),
+            common::shell_prompt_seen
+        ),
         "never reached the shell prompt to spawn a child:\n{}",
         String::from_utf8_lossy(&out)
     );
+    pty.send(b"sleep 20\n");
 
     // Read the ring back from THIS process: the socket must be populated even with no inline feed —
-    // the whole point of the interactive path (its terminal belongs to the agent). Poll while `sleep`
-    // is still running.
+    // the whole point of the interactive path (its terminal belongs to the agent). The feed records
+    // the `sleep`'s exec, which stays in it whether or not the `sleep` is still running.
     let logs_deadline = Instant::now() + Duration::from_secs(20);
     let mut ok = false;
     let mut last = String::new();
@@ -232,10 +213,9 @@ fn an_interactive_observed_run_records_events_for_proc_logs() {
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    unsafe { libc::write(master, b"exit\n".as_ptr().cast(), 5) };
-    unsafe { libc::close(master) };
-    let _ = child.kill();
-    let _ = child.wait();
+    pty.send(b"exit\n");
+    drop(pty);
+    drop(child);
 
     assert!(
         ok,
@@ -264,7 +244,7 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
         project.path().join(".sbx.toml"),
         b"[app.term]\ncmd = [\"bash\", \"--norc\", \"-i\"]\n",
     )
-    .unwrap();
+    .expect("write the app's config");
 
     probe_or_skip!(
         "sbx app resize smoke",
@@ -272,21 +252,7 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     );
 
     // An outer pty sized 24x80. sbx runs on the slave; the test drives the master.
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    ws.ws_row = 24;
-    ws.ws_col = 80;
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            &ws,
-        )
-    };
-    assert_eq!(rc, 0, "openpty failed");
+    let mut pty = Pty::open(Some((24, 80)));
 
     // Make sbx itself own the *outer* pty as its controlling terminal, faithfully reproducing
     // production: in a real run sbx holds the launching terminal (Warp's), so resizing that
@@ -294,7 +260,6 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     // forked sbx (after its stdio is set to the slave, before exec): `setsid` starts a fresh
     // session, then `ioctl(TIOCSCTTY)` claims fd 0's terminal as sbx's ctty. The cage's inner child
     // later gets its own private ctty via `login_tty`, leaving sbx the outer pty's foreground group.
-    // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
     let mut command = sbx();
     command
         .arg("app")
@@ -302,23 +267,24 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
         .arg("term")
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
-        .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) });
-    // SAFETY: `setsid` and `ioctl(TIOCSCTTY)` are async-signal-safe; fd 0 is the inherited slave.
+        .stdin(pty.stdio())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio());
+    // SAFETY: `setsid` and `ioctl(TIOCSCTTY)` are async-signal-safe. The spawn has moved the slave
+    // onto the standard streams before `pre_exec` runs, so standard input is the slave.
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
-    let mut child = command.spawn().expect("spawn sbx app term");
-    unsafe { libc::close(slave) };
+    let child = Reaped(command.spawn().expect("spawn sbx app term"));
+    pty.release_slave();
 
     // Arm the resize trap, confirm the controlling terminal, and print the initial size. The
     // markers `$Y`/`$W` expand only when the branch runs (see the echo note above).
@@ -328,7 +294,6 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
                   stty size\n";
 
     let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
     let mut sent_setup = false;
     let mut resized = false;
     // Alternates the resized row so each re-issue is a genuine size *change* (see the post-resize
@@ -344,23 +309,14 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     let mut last_probe = Instant::now();
 
     while Instant::now() < deadline {
-        let mut pfd = libc::pollfd {
-            fd: master,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut pfd, 1, 300) } > 0 {
-            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
-            if n <= 0 {
-                break; // EIO/EOF: session over
-            }
-            out.extend_from_slice(&buf[..n as usize]);
+        if !pty.read_into(&mut out, 300) {
+            break; // EIO/EOF: session over
         }
         let text = String::from_utf8_lossy(&out);
 
         // Once the shell prompt appears, send the setup block.
         if !sent_setup && common::shell_prompt_seen(&out) {
-            unsafe { libc::write(master, setup.as_ptr().cast(), setup.len()) };
+            pty.send(setup);
             sent_setup = true;
             continue;
         }
@@ -370,10 +326,7 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
         // SIGWINCH to sbx naturally — the exact production trigger of dragging Warp to fullscreen,
         // not a simulated signal. No explicit `kill`.
         if sent_setup && !resized && text.contains("CTTY=YES") && text.contains("24 80") {
-            let mut big: libc::winsize = unsafe { std::mem::zeroed() };
-            big.ws_row = 50;
-            big.ws_col = 200;
-            unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &big) };
+            pty.resize(50, 200);
             resized = true;
             last_probe = Instant::now();
         }
@@ -392,22 +345,18 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
             if last_probe.elapsed() >= Duration::from_millis(300) {
                 if text.contains("50 200") {
                     toggle = !toggle;
-                    let mut sz: libc::winsize = unsafe { std::mem::zeroed() };
-                    sz.ws_row = if toggle { 51 } else { 50 };
-                    sz.ws_col = 200;
-                    unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &sz) };
+                    pty.resize(if toggle { 51 } else { 50 }, 200);
                 } else {
-                    unsafe { libc::write(master, b"stty size\n".as_ptr().cast(), 10) };
+                    pty.send(b"stty size\n");
                 }
                 last_probe = Instant::now();
             }
         }
     }
 
-    unsafe { libc::write(master, b"exit\n".as_ptr().cast(), 5) };
-    unsafe { libc::close(master) };
-    let _ = child.kill();
-    let _ = child.wait();
+    pty.send(b"exit\n");
+    drop(pty);
+    drop(child);
 
     let text = String::from_utf8_lossy(&out);
     assert!(

@@ -8,8 +8,8 @@
 #[macro_use]
 mod common;
 use common::fixture::TmpDir;
+use common::pty::{Pty, Reaped};
 
-use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -89,63 +89,34 @@ fn wait_for_session(data: &Path, pid: u32, deadline: Instant) -> Option<PathBuf>
 /// Drive an interactive `sbx session attach <pid>` through a pty: wait for the shell's prompt, send
 /// `script`, and read until the session ends or the deadline. Returns the captured output.
 fn drive_attach(pid: u32, data: &Path, script: &[u8]) -> String {
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty failed");
-
-    // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdio.
-    let mut child = sbx()
-        .arg("session")
-        .arg("attach")
-        .arg(pid.to_string())
-        .env("XDG_DATA_HOME", data)
-        .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .spawn()
-        .expect("spawn sbx session attach");
-    unsafe { libc::close(slave) };
+    let mut pty = Pty::open(None);
+    let _child = Reaped(
+        sbx()
+            .arg("session")
+            .arg("attach")
+            .arg(pid.to_string())
+            .env("XDG_DATA_HOME", data)
+            .stdin(pty.stdio())
+            .stdout(pty.stdio())
+            .stderr(pty.stdio())
+            .spawn()
+            .expect("spawn sbx session attach"),
+    );
+    pty.release_slave();
 
     let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    let mut sent = false;
     // Generous: the setns join into a live cage plus the in-cage shell startup can be slow under
     // heavy parallel load (the whole test suite). It is not what made this test flaky — a run that
     // never sent its script had seen the whole prompt and not recognised it, which is what
     // `common::shell_prompt_seen` now answers in one place.
     let deadline = Instant::now() + Duration::from_secs(120);
-    while Instant::now() < deadline {
-        let mut pfd = libc::pollfd {
-            fd: master,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut pfd, 1, 500) } > 0 {
-            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
-            if n <= 0 {
-                break; // EIO/EOF: session over
-            }
-            out.extend_from_slice(&buf[..n as usize]);
-        }
-        // Readiness is "a prompt appeared": see `common::shell_prompt_seen` for why the last
-        // character is `$` or `#` and never only one of the two.
-        if !sent && common::shell_prompt_seen(&out) {
-            unsafe { libc::write(master, script.as_ptr().cast(), script.len()) };
-            sent = true;
-        }
+    // Readiness is "a prompt appeared": see `common::shell_prompt_seen` for why the last
+    // character is `$` or `#` and never only one of the two. An attach refused before any shell
+    // started prints no prompt, and what it printed is handed back for the caller to read.
+    if pty.read_until(&mut out, deadline, common::shell_prompt_seen) {
+        pty.send(script);
+        pty.read_until(&mut out, deadline, |_| false);
     }
-    unsafe { libc::close(master) };
-    let _ = child.kill();
-    let _ = child.wait();
     String::from_utf8_lossy(&out).into_owned()
 }
 
