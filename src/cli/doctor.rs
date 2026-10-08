@@ -482,9 +482,13 @@ fn report_resource_limits(rep: &mut Report<'_>, limits: &sandbox::cgroup::Limits
 /// something missing rather than as the ordinary case.
 fn report_distro(rep: &mut Report<'_>, layout: &store::Layout) {
     use crate::sandbox::distro::store::{DERIVED_PREFIX, DISTRO_LOCK};
-    let Some((locator, Some(key))) = store::read_lock_lines(&layout.data_dir().join(DISTRO_LOCK))
-    else {
-        return;
+    let (locator, key) = match store::read_lock_lines(&layout.data_dir().join(DISTRO_LOCK)) {
+        Ok(Some((locator, Some(key)))) => (locator, key),
+        Ok(_) => return,
+        Err(e) => {
+            rep.check("warn", "distro", &e.to_string());
+            return;
+        }
     };
     // The store names a tree's directory after its key with *every* colon replaced, so a derived
     // userland's `derived:sha256:<hex>` becomes `derived-sha256-<hex>`. Replacing only the first

@@ -1373,7 +1373,7 @@ pub(crate) fn effective_lock_target(
     match (cfg.nixpkgs_project.as_deref(), app) {
         (Some(source), _) => {
             let id = binds::project_runtime_id(cwd)?;
-            Ok(crate::store::LockTarget::project(layout, &id, source))
+            crate::store::LockTarget::project(layout, &id, source)
         }
         (None, Some(name)) => {
             crate::store::LockTarget::app(layout, name, cfg.nixpkgs_global.as_deref())

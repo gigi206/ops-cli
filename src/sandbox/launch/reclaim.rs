@@ -210,8 +210,17 @@ pub(in crate::sandbox) fn shared_store_gc(
 
     // Read the live revisions *after* acquiring the lock, so the snapshot reflects every lock
     // written before the exclusive acquire settled (no read-then-lock gap).
-    let live_base = crate::store::live_base_revisions(layout);
-    let live_mise = crate::store::live_mise_revisions(layout);
+    // A revision a lock pins and the set leaves out is one the collection frees from under a
+    // running app, so a lock that cannot be read stops it.
+    let live = crate::store::live_base_revisions(layout)
+        .and_then(|base| Ok((base, crate::store::live_mise_revisions(layout)?)));
+    let (live_base, live_mise) = match live {
+        Ok(live) => live,
+        Err(e) => {
+            crate::diag::error(&format!("sbx gc: {e}; skipping the shared-store gc."));
+            return;
+        }
+    };
 
     let stale = crate::sandbox::gc::prune_shared_gcroots(
         &layout.data_dir().join("gcroots"),
@@ -499,7 +508,19 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     // already holds it, and re-deciding the channel here would have to know which app this is — a
     // fact the sweep has no reason to carry, and would get wrong the day it went stale.
     let base_rev = crate::store::revision_of(&prep.nixpkgs);
-    let mise_revs = crate::store::live_mise_revisions(&prep.layout);
+    // Both live sets are read before either is used: a lock that cannot be read leaves a revision
+    // out of them, and the sweep would take its builds, so it prunes nothing then.
+    let live = crate::store::live_mise_revisions(&prep.layout)
+        .and_then(|mise| Ok((mise, crate::store::live_base_revisions(&prep.layout)?)));
+    let (mise_revs, base_revs) = match live {
+        Ok(live) => live,
+        Err(e) => {
+            crate::diag::warn(&format!(
+                "sbx gc: {e}, so no superseded build is pruned from this project's store"
+            ));
+            Default::default()
+        }
+    };
     // Prune only when the base *and* mise out-links for the current revisions are present: those two
     // families root the irreducible userland (mise on its own revision, not the base one), so without
     // them the keep-set could omit a current core build and the sweep would delete it. A missing
@@ -519,7 +540,6 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
         // Every live base revision, not this project's alone: an app installed here may sit on a
         // revision of its own, and a keep-set built from one would let the sweep take that app's
         // base out from under it.
-        let base_revs = crate::store::live_base_revisions(&prep.layout);
         let keep =
             crate::sandbox::gc::project_keep_roots(&data_gcroots, &id, &base_revs, &mise_revs);
         crate::sandbox::gc::prune_superseded_roots(&store_dir, &keep, prune).len()
@@ -630,7 +650,10 @@ pub(crate) fn superseded_reclaimable_hint(
         return;
     };
     let data_gcroots = layout.data_dir().join("gcroots");
-    let mise_revs = crate::store::live_mise_revisions(layout);
+    // A report: a lock that cannot be read leaves the count unknown rather than low.
+    let Ok(mise_revs) = crate::store::live_mise_revisions(layout) else {
+        return;
+    };
     if !data_gcroots.join("base").join(&rev).is_dir()
         || !mise_revs
             .iter()
@@ -640,7 +663,9 @@ pub(crate) fn superseded_reclaimable_hint(
     }
     let store_dir = crate::sandbox::projectstore::store_dir_for(layout, &id);
     // The whole live set, for the reason the pruning path above states.
-    let base_revs = crate::store::live_base_revisions(layout);
+    let Ok(base_revs) = crate::store::live_base_revisions(layout) else {
+        return;
+    };
     let keep = crate::sandbox::gc::project_keep_roots(&data_gcroots, &id, &base_revs, &mise_revs);
     let n = crate::sandbox::gc::prune_superseded_roots(&store_dir, &keep, false).len();
     if n > 0 {

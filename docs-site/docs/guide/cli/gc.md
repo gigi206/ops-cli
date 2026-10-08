@@ -48,6 +48,16 @@ an empty one. So `sbx gc` fails closed, differently per scope, and says which on
 The verbs that only report are not gated: [`sbx projects`](projects) still lists every
 tree, with the state `unknown` in place of a `live`/`idle` finding nothing established.
 
+## When a channel lock cannot be read
+
+What the collections keep is every revision a channel lock pins: the global one, the mise
+engine's, each project's and each app's. A lock that is there and cannot be read, or that
+names no revision, would leave its revision out of that set, so `sbx gc` fails closed on it
+and names the file on stderr: `--all` skips the shared-store collection, and `--prune`
+removes no superseded build from this project's store. A distribution lock is read the same
+way: while one cannot be read, `--all` frees no unpacked distribution tree, and still sweeps
+the stagings an interrupted unpack left, which no lock names.
+
 ## A launch and `sbx gc` at the same time
 
 A launch of a project and `sbx gc` on it take turns on its store. A collection that ran

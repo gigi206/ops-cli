@@ -155,14 +155,14 @@ impl LockTarget {
 
     /// A trusted project's pin, in its per-project lock — so the project's tools (and
     /// base) are reproducible independent of the rolling global channel.
-    pub(crate) fn project(layout: &Layout, project_id: &str, source: &str) -> Self {
-        Self {
+    pub(crate) fn project(layout: &Layout, project_id: &str, source: &str) -> io::Result<Self> {
+        Ok(Self {
             source: source.to_string(),
-            lock_path: project_lock_path(layout, project_id),
+            lock_path: project_lock_path(layout, project_id)?,
             origin: Origin::ProjectPin,
             seed_from: None,
             scope: Scope::Project,
-        }
+        })
     }
 
     /// One app's own target: the **global** channel source, pinned in a lock beside that app's
@@ -212,7 +212,7 @@ impl LockTarget {
     /// or it records a different source (which a launch would re-resolve). So a stale
     /// lock never displays as current. Pure file read: no nix, no network.
     pub(crate) fn locked_revision(&self) -> Option<String> {
-        read_lock(&self.lock_path).and_then(|(s, r)| (s == self.source).then_some(r))
+        shown_lock(&self.lock_path).and_then(|(s, r)| (s == self.source).then_some(r))
     }
 
     /// The revision recorded here before a roll, **whatever source recorded it**.
@@ -223,7 +223,7 @@ impl LockTarget {
     /// Switching a pin repoints the store exactly as rolling one forward does, so a caller asking
     /// what a roll invalidated must see both. Pure file read: no nix, no network.
     pub(crate) fn previously_locked(&self) -> Option<String> {
-        read_lock(&self.lock_path).map(|(_, rev)| rev)
+        shown_lock(&self.lock_path).map(|(_, rev)| rev)
     }
 
     /// Resolve to a pinned `github:NixOS/nixpkgs/<rev>`, reusing the lock when its
@@ -304,19 +304,34 @@ fn app_lock_path(layout: &Layout, name: &str) -> io::Result<PathBuf> {
 }
 
 /// A project's own lock, under its runtime tree, pinning a trusted pin's revision.
-fn project_lock_path(layout: &Layout, project_id: &str) -> PathBuf {
-    layout
+///
+/// Refuses an id that is not a single path component, as [`app_lock_path`] refuses a name: the id
+/// sbx derives is a hash, and this is the sink, where one that traversed would write a lock outside
+/// sbx's data directory.
+fn project_lock_path(layout: &Layout, project_id: &str) -> io::Result<PathBuf> {
+    let mut parts = Path::new(project_id).components();
+    let single = matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(c)), None) if c == project_id
+    );
+    if !single {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("`{project_id}` is not a usable project id, so it cannot key a channel lock"),
+        ));
+    }
+    Ok(layout
         .data_dir()
         .join("projects")
         .join(project_id)
-        .join(NIXPKGS_LOCK)
+        .join(NIXPKGS_LOCK))
 }
 
 /// The global channel's recorded `(source, revision)`, read straight from the shared
 /// lock — what `sbx doctor` shows as the host-level channel state, independent of any
 /// project. `None` when nothing has been resolved yet. Pure file read.
 pub(crate) fn read_global_lock(layout: &Layout) -> Option<(String, String)> {
-    read_lock(&global_lock_path(layout))
+    shown_lock(&global_lock_path(layout))
 }
 
 /// The base-channel revisions a shared-store gc must keep: the global channel's, the pin of
@@ -331,40 +346,83 @@ pub(crate) fn read_global_lock(layout: &Layout) -> Option<(String, String)> {
 /// on its own sits on a revision no other lock records, and collecting it would leave that app's
 /// home holding store paths that are gone — the failure a per-app lock exists to make *less*
 /// frequent, recreated by the mechanism itself.
-pub(crate) fn live_base_revisions(layout: &Layout) -> BTreeSet<String> {
+///
+/// An error when a directory, an entry or a lock cannot be read, or a lock does not name a
+/// revision ([`kept_revision`]): a set missing a revision some lock pins is one the collector would
+/// free from under a running app, so the caller collects nothing rather than act on part of it.
+pub(crate) fn live_base_revisions(layout: &Layout) -> io::Result<BTreeSet<String>> {
     let mut revs = BTreeSet::new();
-    if let Some((_, rev)) = read_global_lock(layout) {
-        revs.insert(rev);
-    }
+    revs.extend(kept_revision(&global_lock_path(layout))?);
     for dir in ["projects", "apps"] {
-        if let Ok(entries) = std::fs::read_dir(layout.data_dir().join(dir)) {
-            for entry in entries.flatten() {
-                if let Some((_, rev)) = read_lock(&entry.path().join(NIXPKGS_LOCK)) {
-                    revs.insert(rev);
-                }
-            }
+        let dir = layout.data_dir().join(dir);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(lock_error(&dir, e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| lock_error(&dir, e))?;
+            revs.extend(kept_revision(&entry.path().join(NIXPKGS_LOCK))?);
         }
     }
-    revs
+    Ok(revs)
 }
 
 /// The mise engine revisions a shared-store gc must keep: the engine lock's, or — when the engine
 /// lock has not been written yet (an install still running its engine seeded from the global
 /// channel) — the global channel's. This mirrors [`resolve_engine_ref`]'s seed-from-global
 /// fallback, so the engine a launch is actually running is never collected. Pure file reads.
-pub(crate) fn live_mise_revisions(layout: &Layout) -> BTreeSet<String> {
-    let mut revs = BTreeSet::new();
-    match read_lock(&engine_lock_path(layout)) {
-        Some((_, rev)) => {
-            revs.insert(rev);
-        }
-        None => {
-            if let Some((_, rev)) = read_global_lock(layout) {
-                revs.insert(rev);
-            }
-        }
+///
+/// Only an engine lock that does not exist falls back to the global one. One that cannot be read,
+/// or does not name a revision, is an error ([`kept_revision`]): the engine a launch runs is the
+/// one that lock pins, which the global channel's revision does not say.
+pub(crate) fn live_mise_revisions(layout: &Layout) -> io::Result<BTreeSet<String>> {
+    let rev = match kept_revision(&engine_lock_path(layout))? {
+        Some(rev) => Some(rev),
+        None => kept_revision(&global_lock_path(layout))?,
+    };
+    Ok(rev.into_iter().collect())
+}
+
+/// The revision a lock pins, for a set the collector keeps: `None` when there is no lock, an error
+/// when one cannot be read or does not name a revision. [`read_lock`] reads a lock it cannot make
+/// sense of as absent, so that a launch resolves again; a keep-set cannot, since it cannot tell
+/// which revision that lock was keeping.
+fn kept_revision(lock_path: &Path) -> io::Result<Option<String>> {
+    if let Some((_, rev)) = read_lock(lock_path)? {
+        return Ok(Some(rev));
     }
-    revs
+    match std::fs::symlink_metadata(lock_path) {
+        // No lock, or an entry beside the trees that is not a directory and so holds none.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(lock_error(lock_path, e)),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} does not name a revision, so which one it keeps is unknown",
+                lock_path.display()
+            ),
+        )),
+    }
+}
+
+/// A lock, or the directory holding locks, that could not be read, named.
+fn lock_error(path: &Path, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("cannot read {}: {e}", path.display()))
+}
+
+/// [`read_lock`] for a display: what a lock records, or `None` when it records nothing usable or
+/// cannot be read. A report says what it can see; the launch that reads the same lock is what
+/// fails on one it cannot read.
+fn shown_lock(lock_path: &Path) -> Option<(String, String)> {
+    read_lock(lock_path).ok().flatten()
 }
 
 /// Resolve the mise engine reference. The engine's lock is seeded from the global channel lock on
@@ -491,13 +549,13 @@ fn resolve_ref(
     seed_from: Option<&Path>,
 ) -> io::Result<String> {
     ensure(layout)?;
-    if let Some((locked_source, locked_rev)) = read_lock(lock_path)
+    if let Some((locked_source, locked_rev)) = read_lock(lock_path)?
         && locked_source == source
     {
         return Ok(flake_ref(source, &locked_rev));
     }
     if let Some(seed) = seed_from
-        && let Some((seed_source, seed_rev)) = read_lock(seed)
+        && let Some((seed_source, seed_rev)) = read_lock(seed)?
         && seed_source == source
     {
         write_lock(lock_path, source, &seed_rev)?;
@@ -525,7 +583,7 @@ fn refresh_ref(nix: &Path, layout: &Layout, source: &str, lock_path: &Path) -> i
 /// records for it now, with the lock left as it is.
 fn peek_ref(nix: &Path, layout: &Layout, source: &str, lock_path: &Path) -> io::Result<Upgrade> {
     ensure(layout)?;
-    let previous = read_lock(lock_path).and_then(|(s, r)| (s == source).then_some(r));
+    let previous = read_lock(lock_path)?.and_then(|(s, r)| (s == source).then_some(r));
     let revision = resolve_source_rev(nix, layout, source, true)?;
     Ok(Upgrade {
         source: source.to_string(),
@@ -568,14 +626,15 @@ fn resolve_source_rev(
 /// Read a source-aware lock as `(source, revision)`. The format is two lines —
 /// `<source>\n<rev>` — but a legacy single-line lock holding only a 40-hex revision
 /// is read as the default channel's pin, so an existing lock keeps working. `None`
-/// when the file is absent or its revision is malformed, so resolution re-runs rather
-/// than trusting a corrupt revision.
-fn read_lock(lock_path: &Path) -> Option<(String, String)> {
-    match read_lock_lines(lock_path)? {
-        (source, Some(rev)) => valid_revision(&rev).map(|rev| (source, rev)),
+/// when the file is absent or malformed, so resolution re-runs rather than trusting a
+/// corrupt revision; an error when it is there and cannot be read ([`read_lock_lines`]).
+fn read_lock(lock_path: &Path) -> io::Result<Option<(String, String)>> {
+    Ok(match read_lock_lines(lock_path)? {
+        None => None,
+        Some((source, Some(rev))) => valid_revision(&rev).map(|rev| (source, rev)),
         // a legacy single-line lock is a bare revision on the default channel
-        (only, None) => valid_revision(&only).map(|rev| (DEFAULT_SOURCE.to_string(), rev)),
-    }
+        Some((only, None)) => valid_revision(&only).map(|rev| (DEFAULT_SOURCE.to_string(), rev)),
+    })
 }
 
 /// The lines a lock file carries, trimmed and **unvalidated**: the first is the source, the second
@@ -586,12 +645,35 @@ fn read_lock(lock_path: &Path) -> Option<(String, String)> {
 /// a `sha256:` image digest for a distribution root filesystem — so the shape is defined once and
 /// each caller holds its own second line to its own grammar. Reading a digest through
 /// [`read_lock`] would reject every valid one.
-pub(crate) fn read_lock_lines(lock_path: &Path) -> Option<(String, Option<String>)> {
-    let contents = std::fs::read_to_string(lock_path).ok()?;
+///
+/// `None` when there is no lock, and for one that is not this shape: an empty first line, or
+/// anything after the second, which [`write_lock`] never writes. An error when the lock is there
+/// and cannot be read, named: read as absent, it would be resolved again and overwritten, or left
+/// out of what the collector keeps.
+pub(crate) fn read_lock_lines(lock_path: &Path) -> io::Result<Option<(String, Option<String>)>> {
+    let bytes = match std::fs::read(lock_path) {
+        Ok(bytes) => bytes,
+        // Nothing at the path, or a file where a directory on the way to it would be.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(lock_error(lock_path, e)),
+    };
+    let Ok(contents) = String::from_utf8(bytes) else {
+        return Ok(None);
+    };
     let mut lines = contents.lines();
-    let first = lines.next()?.trim().to_string();
+    let Some(first) = lines.next().map(|l| l.trim().to_string()) else {
+        return Ok(None);
+    };
     let second = lines.next().map(|l| l.trim().to_string());
-    (!first.is_empty()).then_some((first, second))
+    let rest = lines.any(|l| !l.trim().is_empty());
+    Ok((!first.is_empty() && !rest).then_some((first, second)))
 }
 
 /// Write a source-aware lock as `<source>\n<rev>`, creating the parent directory
@@ -1080,7 +1162,7 @@ mod tests {
         // a non-pinned project (no lock) contributes nothing — it rides the global rev
         std::fs::create_dir_all(layout.data_dir().join("projects").join("p2")).unwrap();
 
-        let live = live_base_revisions(&layout);
+        let live = live_base_revisions(&layout).unwrap();
         assert!(live.contains(REV), "the global rev must be live");
         assert!(live.contains(REV_B), "a pinned project's rev must be live");
         assert_eq!(
@@ -1100,15 +1182,142 @@ mod tests {
 
         // no engine lock yet → the engine runs on the global rev, which must be kept
         assert!(
-            live_mise_revisions(&layout).contains(REV),
+            live_mise_revisions(&layout).unwrap().contains(REV),
             "an absent engine lock must fall back to the global rev"
         );
 
         // once the engine lock exists it is the sole authority
         write_lock(&engine_lock_path(&layout), "nixos-unstable", ENGINE_REV).unwrap();
         assert_eq!(
-            live_mise_revisions(&layout),
+            live_mise_revisions(&layout).unwrap(),
             BTreeSet::from([ENGINE_REV.to_string()])
+        );
+    }
+
+    /// A keep-set the collector acts on is whole or it is an error: a lock that cannot be read, or
+    /// does not name a revision, stops it rather than leave out the revision that lock keeps. A
+    /// project without a lock, and an entry beside the trees that is not a directory, keep nothing
+    /// and stop nothing.
+    #[test]
+    fn a_live_set_is_an_error_when_a_lock_in_it_cannot_be_read() {
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("sbx"));
+        let projects = layout.data_dir().join("projects");
+        std::fs::create_dir_all(projects.join("unpinned")).unwrap();
+        std::fs::write(projects.join("stray"), b"not a tree\n").unwrap();
+        write_lock(&layout.data_dir().join(NIXPKGS_LOCK), "nixos-unstable", REV).unwrap();
+        assert_eq!(
+            live_base_revisions(&layout).unwrap(),
+            BTreeSet::from([REV.to_string()])
+        );
+
+        let pinned = projects.join("pinned");
+        std::fs::create_dir_all(&pinned).unwrap();
+        let lock = pinned.join(NIXPKGS_LOCK);
+        std::fs::write(&lock, b"nixos-23.11\nnot-a-revision\n").unwrap();
+        let err = live_base_revisions(&layout).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            err.to_string().contains(&lock.display().to_string()),
+            "{err}"
+        );
+
+        // Unreadable states are staged as a directory where a file is read, or a file where a
+        // directory is listed: both fail for every uid, where a stripped mode is ignored by root.
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        let err = live_base_revisions(&layout).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::IsADirectory, "{err}");
+        assert!(
+            err.to_string().contains(&lock.display().to_string()),
+            "{err}"
+        );
+
+        std::fs::rename(&projects, base.join("projects.aside")).unwrap();
+        std::fs::write(&projects, b"").unwrap();
+        let err = live_base_revisions(&layout).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotADirectory, "{err}");
+        assert!(
+            err.to_string().contains(&projects.display().to_string()),
+            "{err}"
+        );
+    }
+
+    /// Only an engine lock that is not there falls back to the global one: one that is there and
+    /// names no revision pins an engine the global revision says nothing about.
+    #[test]
+    fn a_malformed_engine_lock_is_an_error_not_the_global_revision() {
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("sbx"));
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        write_lock(&layout.data_dir().join(NIXPKGS_LOCK), "nixos-unstable", REV).unwrap();
+        std::fs::write(engine_lock_path(&layout), b"nixos-unstable\ntruncated\n").unwrap();
+        let err = live_mise_revisions(&layout).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+    }
+
+    /// A lock is two lines. One that cannot be read is an error naming it, not an absent lock to
+    /// resolve again and overwrite; one carrying more than two lines is not a lock sbx wrote.
+    #[test]
+    fn a_lock_that_cannot_be_read_is_an_error_and_one_with_more_lines_is_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("sbx"));
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        let lock = layout.data_dir().join(NIXPKGS_LOCK);
+        assert_eq!(read_lock_lines(&lock).unwrap(), None);
+
+        std::fs::write(&lock, format!("nixos-unstable\n{REV}\nappended\n")).unwrap();
+        assert_eq!(read_lock_lines(&lock).unwrap(), None);
+        std::fs::write(&lock, format!("nixos-unstable\n{REV}\n\n")).unwrap();
+        assert_eq!(
+            read_lock_lines(&lock).unwrap(),
+            Some(("nixos-unstable".to_string(), Some(REV.to_string())))
+        );
+
+        // A directory where the lock is read fails for every uid.
+        let blocked = base.join("blocked.lock");
+        std::fs::create_dir(&blocked).unwrap();
+        let err = read_lock_lines(&blocked).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::IsADirectory, "{err}");
+        assert!(
+            err.to_string().contains(&blocked.display().to_string()),
+            "{err}"
+        );
+
+        // A lock this process may not read, which a resolution would otherwise rename a new one
+        // over. Root reads it regardless.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let resolved =
+            LockTarget::global(&layout, Some(REV)).resolve(Path::new(BOGUS_NIX), &layout);
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(resolved.is_err(), "{resolved:?}");
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            format!("nixos-unstable\n{REV}\n\n"),
+            "the lock it could not read is left as it was"
+        );
+    }
+
+    /// A project lock is keyed by one path component. The id sbx derives is a hash; anything that
+    /// would name a path elsewhere is refused at the sink.
+    #[test]
+    fn a_project_lock_refuses_an_id_that_is_not_one_component() {
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("sbx"));
+        for id in ["", ".", "..", "../outside", "/abs", "a/b", "a/"] {
+            let err = project_lock_path(&layout, id).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{id:?}");
+        }
+        assert_eq!(
+            project_lock_path(&layout, "abcdef0123456789").unwrap(),
+            layout
+                .data_dir()
+                .join("projects/abcdef0123456789")
+                .join(NIXPKGS_LOCK)
         );
     }
 
@@ -1123,7 +1332,7 @@ mod tests {
         write_lock(&lock, "nixos-unstable", REV).unwrap();
 
         assert_eq!(
-            read_lock(&lock),
+            read_lock(&lock).unwrap(),
             Some(("nixos-unstable".to_string(), REV.to_string()))
         );
         let temps: Vec<_> = std::fs::read_dir(&dir)
@@ -1140,21 +1349,21 @@ mod tests {
         let two_line = base.join("two.lock");
         std::fs::write(&two_line, format!("nixos-23.11\n{REV}\n")).unwrap();
         assert_eq!(
-            read_lock(&two_line),
+            read_lock(&two_line).unwrap(),
             Some(("nixos-23.11".to_string(), REV.to_string()))
         );
         // a legacy single-line lock is read as a bare revision on the default source
         let legacy = base.join("legacy.lock");
         std::fs::write(&legacy, format!("{REV}\n")).unwrap();
         assert_eq!(
-            read_lock(&legacy),
+            read_lock(&legacy).unwrap(),
             Some((DEFAULT_SOURCE.to_string(), REV.to_string()))
         );
         // a malformed revision is not trusted
         let bad = base.join("bad.lock");
         std::fs::write(&bad, "nixos-23.11\nnot-a-rev\n").unwrap();
-        assert_eq!(read_lock(&bad), None);
-        assert_eq!(read_lock(&base.join("absent.lock")), None);
+        assert_eq!(read_lock(&bad).unwrap(), None);
+        assert_eq!(read_lock(&base.join("absent.lock")).unwrap(), None);
     }
 
     #[test]
@@ -1190,7 +1399,7 @@ mod tests {
             .expect("rev pins directly");
         assert_eq!(got, format!("{NIXPKGS_FLAKE_PREFIX}{REV}"));
         assert_eq!(
-            read_lock(&layout.data_dir().join(NIXPKGS_LOCK)),
+            read_lock(&layout.data_dir().join(NIXPKGS_LOCK)).unwrap(),
             Some((REV.to_string(), REV.to_string()))
         );
     }
@@ -1209,7 +1418,7 @@ mod tests {
         assert_eq!(over.origin(), Origin::Global);
         assert_eq!(over.lock_path, PathBuf::from("/data/sbx/nixpkgs.lock"));
 
-        let proj = LockTarget::project(&layout, "abc", "nixos-23.11");
+        let proj = LockTarget::project(&layout, "abc", "nixos-23.11").unwrap();
         assert_eq!(proj.source(), "nixos-23.11");
         assert_eq!(proj.origin(), Origin::ProjectPin);
         assert_eq!(
@@ -1243,11 +1452,15 @@ mod tests {
 
         // a revision source pins without nix, into the project's own lock
         let got = LockTarget::project(&layout, "abc", REV)
+            .unwrap()
             .resolve(Path::new(BOGUS_NIX), &layout)
             .expect("pinned");
         assert_eq!(got, format!("{NIXPKGS_FLAKE_PREFIX}{REV}"));
-        let lock = project_lock_path(&layout, "abc");
-        assert_eq!(read_lock(&lock), Some((REV.to_string(), REV.to_string())));
+        let lock = project_lock_path(&layout, "abc").unwrap();
+        assert_eq!(
+            read_lock(&lock).unwrap(),
+            Some((REV.to_string(), REV.to_string()))
+        );
     }
 
     #[test]
@@ -1298,7 +1511,7 @@ mod tests {
         // a failed upgrade is non-destructive: the prior lock is left intact, never
         // truncated, so the next launch still resolves the known-good revision
         assert_eq!(
-            read_lock(&global_lock_path(&layout)),
+            read_lock(&global_lock_path(&layout)).unwrap(),
             Some(("nixos-unstable".to_string(), REV.to_string()))
         );
     }
@@ -1369,7 +1582,7 @@ mod tests {
         assert_eq!(got, format!("{NIXPKGS_FLAKE_PREFIX}{REV}"));
         // it recorded the seed in the engine's own lock, so later launches reuse it
         assert_eq!(
-            read_lock(&engine_lock_path(&layout)),
+            read_lock(&engine_lock_path(&layout)).unwrap(),
             Some(("nixos-unstable".to_string(), REV.to_string()))
         );
         // a second resolution now reuses the engine lock directly (still no nix)
@@ -1415,7 +1628,7 @@ mod tests {
         );
         // Recorded beside that app's state, which is what `sbx app rm --purge` removes.
         assert_eq!(
-            read_lock(&layout.data_dir().join("apps/demo-app").join(NIXPKGS_LOCK)),
+            read_lock(&layout.data_dir().join("apps/demo-app").join(NIXPKGS_LOCK)).unwrap(),
             Some(("nixos-unstable".to_string(), REV.to_string()))
         );
 
@@ -1483,7 +1696,7 @@ mod tests {
             ),
             (
                 "a project pin",
-                LockTarget::project(&layout, "abcdef0123456789", "nixos-24.11"),
+                LockTarget::project(&layout, "abcdef0123456789", "nixos-24.11").unwrap(),
                 "2222222222222222222222222222222222222222",
             ),
             (
@@ -1495,7 +1708,7 @@ mod tests {
         for (_, target, rev) in &cases {
             write_lock(&target.lock_path, target.source(), rev).unwrap();
         }
-        let live = live_base_revisions(&layout);
+        let live = live_base_revisions(&layout).unwrap();
         for (what, _, rev) in &cases {
             assert!(
                 live.contains(*rev),
@@ -1508,7 +1721,7 @@ mod tests {
         let engine_rev = "4444444444444444444444444444444444444444";
         write_lock(&engine.lock_path, engine.source(), engine_rev).unwrap();
         assert!(
-            live_mise_revisions(&layout).contains(engine_rev),
+            live_mise_revisions(&layout).unwrap().contains(engine_rev),
             "the engine writes a lock its own keep-set does not read"
         );
     }
@@ -1538,7 +1751,7 @@ mod tests {
         )
         .unwrap();
 
-        let live = live_base_revisions(&layout);
+        let live = live_base_revisions(&layout).unwrap();
         assert!(live.contains(REV), "the global channel's revision");
         assert!(live.contains(project_rev), "a project's pin");
         assert!(live.contains(app_rev), "an app's own pin");

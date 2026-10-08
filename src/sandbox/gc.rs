@@ -2143,7 +2143,9 @@ fn runtime_entry_pid(name: &str, prefixes: &[&str]) -> Option<u32> {
 /// touching it, and reclaimed then — otherwise nothing would ever reclaim it at all.
 ///
 /// Best-effort throughout: an unreadable directory is skipped and a failed removal is not an error,
-/// because this is housekeeping and never a reason to fail the caller. A removal that failed is
+/// because this is housekeeping and never a reason to fail the caller. A distribution lock that
+/// cannot be read is the exception that frees less, not more: no published tree is freed then
+/// ([`locked_distro_digests`]), and the warning says why. A removal that failed is
 /// left out of the returned vector instead, on the rule [`prune_rev_dirs`] states — these bytes are
 /// the freed total `sbx gc` prints, and a tree still on the disk must not be counted into it.
 pub(crate) fn sweep_distro_trees(
@@ -2155,7 +2157,18 @@ pub(crate) fn sweep_distro_trees(
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let locked = locked_distro_digests(data_dir);
+    // A published tree is freed only against a complete set of what the locks name. One that
+    // cannot be read leaves the published trees where they are; the stagings below are swept on
+    // their own rule, which no lock enters.
+    let locked = match locked_distro_digests(data_dir) {
+        Ok(locked) => Some(locked),
+        Err(e) => {
+            crate::diag::warn(&format!(
+                "sbx gc: {e}, so no unpacked distribution tree is freed"
+            ));
+            None
+        }
+    };
     let mut freed: Vec<(String, u64)> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -2199,6 +2212,9 @@ pub(crate) fn sweep_distro_trees(
             continue;
         }
         let held = sweep_distro_roots(&path.join(distro_store::ROOTS_DIR), live_projects, prune);
+        let Some(locked) = &locked else {
+            continue;
+        };
         if held || locked.contains(&name) {
             continue;
         }
@@ -2224,23 +2240,56 @@ pub(crate) fn sweep_distro_trees(
 /// Every digest a distribution lock records: the shared one, and each project's. Read across
 /// sources rather than scoped to a locator, because the question is which trees are still spoken
 /// for, not which one a given configuration would choose today.
-fn locked_distro_digests(data_dir: &Path) -> std::collections::BTreeSet<String> {
+///
+/// An error when the projects directory, an entry of it or a lock cannot be read, or a lock is
+/// there and records no key: the tree that lock names would be missing from the set, and freed.
+/// No lock, and an entry that is not a directory, record nothing.
+fn locked_distro_digests(data_dir: &Path) -> io::Result<BTreeSet<String>> {
     use crate::sandbox::distro::store::DISTRO_LOCK;
-    let mut out = std::collections::BTreeSet::new();
-    let mut take = |path: PathBuf| {
-        if let Some((_, Some(key))) = crate::store::read_lock_lines(&path) {
+    let mut out = BTreeSet::new();
+    let mut take = |path: PathBuf| -> io::Result<()> {
+        if let Some((_, Some(key))) = crate::store::read_lock_lines(&path)? {
             // The same mapping the store uses to name the directory, so a lock and a tree agree
             // whichever spelling the key carries.
             out.insert(key.replace(':', "-"));
+            return Ok(());
+        }
+        match std::fs::symlink_metadata(&path) {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(io::Error::new(
+                e.kind(),
+                format!("cannot read {}: {e}", path.display()),
+            )),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} records no image, so which tree it keeps is unknown",
+                    path.display()
+                ),
+            )),
         }
     };
-    take(data_dir.join(DISTRO_LOCK));
-    if let Ok(projects) = std::fs::read_dir(data_dir.join("projects")) {
-        for project in projects.flatten() {
-            take(project.path().join(DISTRO_LOCK));
+    take(data_dir.join(DISTRO_LOCK))?;
+    let projects = data_dir.join("projects");
+    let unlisted =
+        |e: io::Error| io::Error::new(e.kind(), format!("cannot read {}: {e}", projects.display()));
+    match std::fs::read_dir(&projects) {
+        Ok(entries) => {
+            for project in entries {
+                take(project.map_err(unlisted)?.path().join(DISTRO_LOCK))?;
+            }
         }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(unlisted(e)),
     }
-    out
+    Ok(out)
 }
 
 /// Whether any marker in `roots` belongs to a project with a live session, removing the ones that
@@ -4759,6 +4808,42 @@ mod tests {
         assert!(freed[0].0.contains(&"c".repeat(64)), "{freed:?}");
         assert!(kept.is_dir() && by_project.is_dir(), "a locked tree stays");
         assert!(!orphan.exists(), "an unlocked, unheld tree goes");
+    }
+
+    /// A lock that cannot be read, or that is not the shape sbx writes, says nothing about which
+    /// tree it keeps, so no published tree is freed while one is there. An entry beside the
+    /// projects that is not a directory holds no lock, and stops nothing.
+    #[test]
+    fn no_distribution_tree_is_freed_while_a_lock_cannot_be_read() {
+        let data = TmpDir::new();
+        let kept = distro_tree(data.path(), "a", &[]);
+        let orphan = distro_tree(data.path(), "c", &[]);
+        std::fs::create_dir_all(data.path().join("projects")).unwrap();
+        std::fs::write(data.path().join("projects/stray"), b"").unwrap();
+        let lock = data.path().join("projects/deadbeef/distro.lock");
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+
+        // Two lines and something after them: not a lock sbx wrote.
+        std::fs::write(
+            &lock,
+            format!("oci:x.io/a/b:1\nsha256:{}\nappended\n", "a".repeat(64)),
+        )
+        .unwrap();
+        assert!(sweep_distro_trees(data.path(), &BTreeSet::new(), true).is_empty());
+        assert!(kept.is_dir() && orphan.is_dir());
+
+        // A directory where the lock would be: a read that fails for every uid.
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        assert!(sweep_distro_trees(data.path(), &BTreeSet::new(), true).is_empty());
+        assert!(kept.is_dir() && orphan.is_dir());
+
+        // Once the lock reads, what it names stays and the rest goes.
+        std::fs::remove_dir(&lock).unwrap();
+        distro_lock_at(&lock, "oci:x.io/a/b:1", "a");
+        let freed = sweep_distro_trees(data.path(), &BTreeSet::new(), true);
+        assert_eq!(freed.len(), 1, "{freed:?}");
+        assert!(kept.is_dir() && !orphan.exists());
     }
 
     #[test]

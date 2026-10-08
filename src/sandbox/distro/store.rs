@@ -127,7 +127,7 @@ pub(crate) fn provision(
     })?;
 
     // What the lock said before anything else happens, compared again before it is written.
-    let read = crate::store::read_lock_lines(lock_path);
+    let read = crate::store::read_lock_lines(lock_path)?;
     let digest = match &image.reference {
         // A digest names the image itself, so there is nothing to resolve and nothing a registry
         // could answer differently.
@@ -189,7 +189,7 @@ fn pin_unless_moved(
     key: &str,
     read: &LockRead,
 ) -> io::Result<bool> {
-    let now = crate::store::read_lock_lines(lock_path);
+    let now = crate::store::read_lock_lines(lock_path)?;
     if now == Some((locator.to_string(), Some(key.to_string()))) {
         return Ok(true);
     }
@@ -256,7 +256,7 @@ pub(crate) fn refresh(
         .ok_or_else(|| io::Error::other(format!("`{locator}` is not a usable image locator")))?;
     // Read across sources rather than scoped to this locator: the question is what this roll
     // supersedes, and a lock recording another image answers it.
-    let previous = crate::store::read_lock_lines(lock_path).and_then(|(_, key)| key);
+    let previous = crate::store::read_lock_lines(lock_path)?.and_then(|(_, key)| key);
     // Only reported, so a base that cannot be read is said and left out rather than failing the
     // roll: what the roll writes does not depend on it.
     let previous_base = previous
@@ -299,12 +299,14 @@ pub(crate) fn refresh(
 /// the same rule [`crate::store::LockTarget::locked_revision`] applies to a channel. Held to the
 /// digest grammar here rather than trusted, because a lock is a file on disk and this value goes on
 /// to name a directory.
-fn locked_key(lock_path: &Path, locator: &str) -> Option<String> {
-    let (source, key) = crate::store::read_lock_lines(lock_path)?;
-    (source == locator)
+fn locked_key(lock_path: &Path, locator: &str) -> io::Result<Option<String>> {
+    let Some((source, key)) = crate::store::read_lock_lines(lock_path)? else {
+        return Ok(None);
+    };
+    Ok((source == locator)
         .then_some(key)
         .flatten()
-        .filter(|k| valid_key(k))
+        .filter(|k| valid_key(k)))
 }
 
 /// Whether `key` is in one of the two forms that name a tree: a registry digest, or a derived key.
@@ -354,7 +356,7 @@ fn recorded_base(layout: &Layout, key: &str) -> io::Result<Option<String>> {
 /// yields `None` and the launch re-resolves — the same safe failure a lock recording another image
 /// gets. A `base` file that is there and cannot be read is an error ([`recorded_base`]).
 fn locked_base(layout: &Layout, lock_path: &Path, locator: &str) -> io::Result<Option<String>> {
-    match locked_key(lock_path, locator) {
+    match locked_key(lock_path, locator)? {
         Some(key) => recorded_base(layout, &key),
         None => Ok(None),
     }

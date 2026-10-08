@@ -701,7 +701,7 @@ fn first_pin_of_a_launch(
     if let Some(locator) = cfg.distro.as_deref() {
         let pinned = distro_lock_path(cwd, layout, cfg)
             .ok()
-            .and_then(|lock| crate::store::read_lock_lines(&lock))
+            .and_then(|lock| crate::store::read_lock_lines(&lock).ok().flatten())
             .is_some_and(|(source, key)| source == locator && key.is_some());
         if !pinned {
             return Some("the distribution image");

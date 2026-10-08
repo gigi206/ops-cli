@@ -29,13 +29,21 @@ fn a_lock_answers_for_the_image_that_wrote_it_and_no_other() {
     crate::store::write_lock(&lock, "oci:docker.io/library/debian:10", digest).unwrap();
 
     assert_eq!(
-        locked_key(&lock, "oci:docker.io/library/debian:10").as_deref(),
+        locked_key(&lock, "oci:docker.io/library/debian:10")
+            .unwrap()
+            .as_deref(),
         Some(digest)
     );
     // A lock left by another image is not this one's pin, however recent it is.
-    assert_eq!(locked_key(&lock, "oci:docker.io/library/debian:11"), None);
+    assert_eq!(
+        locked_key(&lock, "oci:docker.io/library/debian:11").unwrap(),
+        None
+    );
     // And no lock at all is not a pin either.
-    assert_eq!(locked_key(&tmp.join("absent.lock"), "oci:x/y:z"), None);
+    assert_eq!(
+        locked_key(&tmp.join("absent.lock"), "oci:x/y:z").unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -53,7 +61,7 @@ fn a_lock_holding_something_that_is_not_a_digest_is_not_read_as_one() {
         let lock = tmp.join("distro.lock");
         crate::store::write_lock(&lock, locator, bad).unwrap();
         assert_eq!(
-            locked_key(&lock, locator),
+            locked_key(&lock, locator).unwrap(),
             None,
             "`{bad}` must not be read as a digest"
         );
@@ -141,7 +149,9 @@ fn a_provisioned_image_lands_with_its_lock_and_its_mountpoints() {
     }
 
     // The pin, and the tree named by it.
-    let (source, digest) = crate::store::read_lock_lines(&lock).expect("a lock was written");
+    let (source, digest) = crate::store::read_lock_lines(&lock)
+        .unwrap()
+        .expect("a lock was written");
     assert_eq!(source, locator);
     let digest = digest.expect("the lock records a digest");
     assert!(reference::valid_digest(&digest).is_some(), "{digest}");
@@ -182,24 +192,24 @@ fn a_launch_leaves_a_lock_that_moved_while_it_provisioned() {
 
     // Nothing pinned before, nothing since: the launch pins what it provisioned.
     assert!(pin_unless_moved(&lock, locator, &older, &None).unwrap());
-    let read = crate::store::read_lock_lines(&lock);
+    let read = crate::store::read_lock_lines(&lock).unwrap();
     assert_eq!(read, Some((locator.to_string(), Some(older.clone()))));
 
     // An upgrade rolls the image while the launch provisions what it read.
     crate::store::write_lock(&lock, locator, &newer).unwrap();
     assert!(!pin_unless_moved(&lock, locator, &older, &read).unwrap());
     assert_eq!(
-        crate::store::read_lock_lines(&lock),
+        crate::store::read_lock_lines(&lock).unwrap(),
         Some((locator.to_string(), Some(newer.clone()))),
         "the newer pin stands"
     );
 
     // Unmoved since the read: the launch writes what it resolved, a re-pin included.
-    let read = crate::store::read_lock_lines(&lock);
+    let read = crate::store::read_lock_lines(&lock).unwrap();
     let newest = format!("sha256:{}", "c".repeat(64));
     assert!(pin_unless_moved(&lock, locator, &newest, &read).unwrap());
     assert_eq!(
-        crate::store::read_lock_lines(&lock),
+        crate::store::read_lock_lines(&lock).unwrap(),
         Some((locator.to_string(), Some(newest)))
     );
 }
@@ -244,7 +254,7 @@ fn a_dry_run_reports_the_new_digest_and_leaves_the_lock() {
     )
     .unwrap();
     assert_eq!(rolled, dry, "the roll locks what the dry run reported");
-    assert_eq!(locked_key(&lock, &locator).as_deref(), Some(new));
+    assert_eq!(locked_key(&lock, &locator).unwrap().as_deref(), Some(new));
 }
 
 /// Two `run` lists name two userlands, whatever bytes their commands carry: a command is hashed
