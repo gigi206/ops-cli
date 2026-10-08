@@ -189,6 +189,11 @@ A registry that answers with a `Basic` challenge instead of pointing at a token 
 a self-hosted one often does, gets the credential on the request itself. That is the only
 other place it goes.
 
+A redirect is followed only to an `https://` URL written plainly: one that carries user
+information (`user@host`), an unbracketed IPv6 address, a space, a non-ASCII character or a
+control byte is refused before any connection is made for it, and the refusal quotes it with
+its control bytes made visible.
+
 `sbx config show` names the *source* (`env REGISTRY_TOKEN`), never the value, so the output
 stays something you can paste into a bug report.
 

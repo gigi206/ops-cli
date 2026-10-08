@@ -417,3 +417,102 @@ fn a_blob_and_a_document_are_read_to_one_chunked_grammar() {
         );
     }
 }
+
+/// The URL shapes a registry has no reason to send are refused rather than read as something else,
+/// a fragment never reaches the server, and a bracketed IPv6 address keeps its colons out of the
+/// port.
+#[test]
+fn a_url_is_read_the_one_way_rfc_3986_writes_it() {
+    let u = parse_url("https://r.test/v2/x/blobs/sha256:ab#fragment").unwrap();
+    assert_eq!(u.target, "/v2/x/blobs/sha256:ab", "the fragment stays here");
+    let u = parse_url("https://r.test?x=1").unwrap();
+    assert_eq!((u.host.as_str(), u.target.as_str()), ("r.test", "/?x=1"));
+
+    let u = parse_url("https://[::1]:5000/v2/").unwrap();
+    assert_eq!(
+        (u.host.as_str(), u.port, u.authority.as_str()),
+        ("::1", 5000, "[::1]:5000")
+    );
+    let u = parse_url("https://[::1]/v2/").unwrap();
+    assert_eq!((u.port, u.authority.as_str()), (443, "[::1]"));
+
+    for bad in [
+        "https://user@r.test/v2/",
+        "https://user:pass@r.test/v2/",
+        "https://:443/v2/",
+        "https://::1/v2/",
+        "https://[::1/v2/",
+        "https://[::1]x/v2/",
+        "https://[evil.test]/v2/",
+    ] {
+        assert!(parse_url(bad).is_err(), "`{bad}` must not parse");
+    }
+}
+
+/// A request target or host with a space or a non-ASCII character is refused before a byte is
+/// written, and before any connection is made for it.
+#[test]
+fn a_space_or_a_non_ascii_character_in_the_request_line_is_refused() {
+    let url = |host: &str, target: &str| Url {
+        host: host.to_string(),
+        port: 443,
+        authority: host.to_string(),
+        target: target.to_string(),
+    };
+    for u in [
+        url("r.test", "/a b"),
+        url("r.test", "/é"),
+        url("r test", "/"),
+    ] {
+        let w = Wire {
+            written: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            response: std::io::Cursor::new(Vec::new()),
+        };
+        let seen = std::rc::Rc::clone(&w.written);
+        let err = send(w, &u, &[], "GET").expect_err("refused");
+        assert!(err.to_string().contains("space or a non-ASCII"), "{err}");
+        assert!(seen.borrow().is_empty());
+    }
+    // Before connecting: the name below resolves nowhere, so an error about it would mean the
+    // request was refused only once a connection had been tried.
+    let Err(err) = get("https://unreachable.invalid/a b", &[]) else {
+        panic!("refused");
+    };
+    assert!(err.to_string().contains("space or a non-ASCII"), "{err}");
+}
+
+/// A response header line with no colon makes the head malformed, rather than being passed over.
+#[test]
+fn a_header_line_without_a_colon_is_a_malformed_head() {
+    let w = Wire {
+        written: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        response: std::io::Cursor::new(
+            b"HTTP/1.1 200 OK\r\nX-No-Colon-Here\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ),
+    };
+    let u = parse_url("https://r.test/v2/").unwrap();
+    let Err(err) = send(w, &u, &[], "GET") else {
+        panic!("a malformed head is refused");
+    };
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+}
+
+/// A refusal quotes the registry's text with its control bytes made visible: a `Location` reaches
+/// the terminal through the error, and must not paint it.
+#[test]
+fn a_refused_location_is_quoted_without_its_control_bytes() {
+    let err = redirect_target(
+        302,
+        &headers(&[("Location", "ftp://a.test/\u{1b}[2J")]),
+        "https://r.test/v2/",
+    )
+    .expect_err("only https is followed");
+    let text = err.to_string();
+    assert!(!text.contains('\u{1b}') && text.contains("\\x1b"), "{text}");
+
+    let Err(err) = parse_url("https://a.test\u{1b}[2J:x/") else {
+        panic!("a bad port is refused");
+    };
+    let text = err.to_string();
+    assert!(!text.contains('\u{1b}') && text.contains("\\x1b"), "{text}");
+}

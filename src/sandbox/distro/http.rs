@@ -96,36 +96,83 @@ struct Url {
 /// Parse an absolute `https://` URL. Anything else, `http://` included, is refused here: this
 /// client exists to fetch what a registry names, and a registry that names a plaintext hop is
 /// answering a question nobody asked.
+///
+/// A `Location` is the registry's text, so what this refuses is said with [`crate::diag::visible`],
+/// and the shapes a registry has no reason to send are refused rather than read some other way: a
+/// user-information part (`user@host`), an empty host, a bare IPv6 address (it must be bracketed,
+/// `[::1]:5000`, or its colons read as a port), and brackets around anything but one. A fragment never reaches the server, as RFC 3986
+/// §3.5 has it.
 fn parse_url(url: &str) -> io::Result<Url> {
+    let shown = || crate::diag::visible(url);
     let rest = url.strip_prefix("https://").ok_or_else(|| {
         io::Error::other(format!(
-            "refusing a non-https URL: {url} (a registry hop that is not TLS is not followed)"
+            "refusing a non-https URL: {} (a registry hop that is not TLS is not followed)",
+            shown()
         ))
     })?;
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    if authority.is_empty() {
-        return Err(io::Error::other(format!("no host in URL: {url}")));
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, mut target) = rest.split_at(end);
+    if let Some(fragment) = target.find('#') {
+        target = &target[..fragment];
     }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (
-            h,
-            p.parse::<u16>()
-                .map_err(|_| io::Error::other(format!("bad port in URL: {url}")))?,
-        ),
-        None => (authority, 443),
+    if authority.contains('@') {
+        return Err(io::Error::other(format!(
+            "refusing a URL with user information in it: {}",
+            shown()
+        )));
+    }
+    let bad_port = || io::Error::other(format!("bad port in URL: {}", shown()));
+    let (host, port, bracketed) = match authority.strip_prefix('[') {
+        Some(inner) => {
+            let (host, after) = inner
+                .split_once(']')
+                .ok_or_else(|| io::Error::other(format!("unclosed `[` in URL: {}", shown())))?;
+            let port = match after {
+                "" => 443,
+                _ => after
+                    .strip_prefix(':')
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .ok_or_else(bad_port)?,
+            };
+            (host, port, true)
+        }
+        None => match authority.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().map_err(|_| bad_port())?, false),
+            None => (authority, 443, false),
+        },
+    };
+    if host.is_empty() {
+        return Err(io::Error::other(format!("no host in URL: {}", shown())));
+    }
+    if bracketed && host.parse::<std::net::Ipv6Addr>().is_err() {
+        return Err(io::Error::other(format!(
+            "only an IPv6 address goes between brackets in a URL: {}",
+            shown()
+        )));
+    }
+    if !bracketed && host.contains(':') {
+        return Err(io::Error::other(format!(
+            "an IPv6 address in a URL must be bracketed: {}",
+            shown()
+        )));
+    }
+    let named = match bracketed {
+        true => format!("[{host}]"),
+        false => host.to_string(),
     };
     Ok(Url {
         host: host.to_string(),
         port,
         authority: if port == 443 {
-            host.to_string()
+            named
         } else {
-            format!("{host}:{port}")
+            format!("{named}:{port}")
         },
-        target: path.to_string(),
+        target: match target {
+            "" => "/".to_string(),
+            query if query.starts_with('?') => format!("/{query}"),
+            path => path.to_string(),
+        },
     })
 }
 
@@ -174,26 +221,19 @@ fn connect(url: &Url) -> io::Result<rustls::StreamOwned<rustls::ClientConnection
     Ok(rustls::StreamOwned::new(conn, sock))
 }
 
-/// A response head and the reader positioned at the body: the status, the headers, whatever of the
-/// body the head-reader already consumed, and the stream the rest comes from.
-type Head<S> = (u16, Vec<(String, String)>, Vec<u8>, BufReader<S>);
-
-/// Write a `GET` request, then read the response head and hand back the reader positioned at the
-/// body. Split from [`get`] so the streaming caller ([`get_to_writer`]) reads the body itself
-/// rather than through a buffer sized for a document.
-fn send<S: Read + Write>(
-    stream: S,
-    url: &Url,
-    headers: &[(&str, &str)],
-    method: &str,
-) -> io::Result<Head<S>> {
-    // Every variable part of this request is checked for a control byte before a single one is
-    // written. The host and target come from a `Location` a registry chose, and a header value
-    // from the token its auth challenge handed back; the response-head reader splits on `\r\n`, so
-    // a bare `\n` in a header value survives into these strings intact. Written into a request
-    // line or a header, it ends the line and whatever follows it is a request of the registry's
-    // composing. Refused rather than escaped: nothing sbx fetches names a control byte, so there
-    // is no legitimate value to preserve.
+/// Refuse a request that cannot be written as it was meant, before any connection is made for it.
+///
+/// Every variable part is checked for a control byte. The host and target come from a `Location` a
+/// registry chose, and a header value from the token its auth challenge handed back; the
+/// response-head reader splits on `\r\n`, so a bare `\n` in a header value survives into these
+/// strings intact. Written into a request line or a header, it ends the line and whatever follows
+/// it is a request of the registry's composing. Refused rather than escaped: nothing sbx fetches
+/// names a control byte, so there is no legitimate value to preserve.
+///
+/// The target and the host are held to more: a space splits the request line into other fields,
+/// and neither has a non-ASCII form on the wire, where it is percent-encoded. A header value may
+/// carry a space, so it is held to the control rule alone.
+fn check_request(url: &Url, headers: &[(&str, &str)]) -> io::Result<()> {
     for (what, value) in [
         ("the request target", url.target.as_str()),
         ("the host", url.authority.as_str()),
@@ -211,6 +251,34 @@ fn send<S: Read + Write>(
             )));
         }
     }
+    for (what, value) in [
+        ("the request target", url.target.as_str()),
+        ("the host", url.authority.as_str()),
+    ] {
+        if value.contains(' ') || !value.is_ascii() {
+            return Err(io::Error::other(format!(
+                "{what} carries a space or a non-ASCII character ({value:?}): refusing to compose \
+                 a request from it"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A response head and the reader positioned at the body: the status, the headers, whatever of the
+/// body the head-reader already consumed, and the stream the rest comes from.
+type Head<S> = (u16, Vec<(String, String)>, Vec<u8>, BufReader<S>);
+
+/// Write a `GET` request, then read the response head and hand back the reader positioned at the
+/// body. Split from [`get`] so the streaming caller ([`get_to_writer`]) reads the body itself
+/// rather than through a buffer sized for a document.
+fn send<S: Read + Write>(
+    stream: S,
+    url: &Url,
+    headers: &[(&str, &str)],
+    method: &str,
+) -> io::Result<Head<S>> {
+    check_request(url, headers)?;
     let mut request = format!(
         "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: sbx\r\nAccept-Encoding: identity\r\n\
          Connection: close\r\n",
@@ -243,11 +311,21 @@ fn send<S: Read + Write>(
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(|| io::Error::other(format!("unreadable status line from {}", url.host)))?;
+    // A line with no colon is no header. Passed over, it left the list this reads its `Location` and
+    // its challenge from saying less than the head the framing is read from.
     let headers = lines
         .filter(|l| !l.is_empty())
-        .filter_map(|l| l.split_once(':'))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect();
+        .map(|l| {
+            l.split_once(':')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("a malformed header line from {}", url.host),
+                    )
+                })
+        })
+        .collect::<io::Result<_>>()?;
     Ok((status, headers, head, reader))
 }
 
@@ -278,6 +356,7 @@ fn request(url: &str, headers: &[(&str, &str)], method: &str) -> io::Result<Resp
     let mut redirected = false;
     for _ in 0..=MAX_REDIRECTS {
         let parsed = parse_url(&current)?;
+        check_request(&parsed, carry)?;
         let stream = connect(&parsed)?;
         let (status, headers, head, mut reader) = send(stream, &parsed, carry, method)?;
         if let Some(location) = redirect_target(status, &headers, &current)? {
@@ -325,6 +404,7 @@ pub(super) fn get_to_writer<W: Write>(
     let mut carry = headers;
     for _ in 0..=MAX_REDIRECTS {
         let parsed = parse_url(&current)?;
+        check_request(&parsed, carry)?;
         let stream = connect(&parsed)?;
         let (status, headers, head, mut reader) = send(stream, &parsed, carry, "GET")?;
         if let Some(location) = redirect_target(status, &headers, &current)? {
@@ -359,13 +439,20 @@ fn redirect_target(
         .iter()
         .find(|(k, _)| wire::header_name_eq(k, "location"))
         .map(|(_, v)| v.as_str())
-        .ok_or_else(|| io::Error::other(format!("{current} answered {status} with no Location")))?;
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "{} answered {status} with no Location",
+                crate::diag::visible(current)
+            ))
+        })?;
     if location.starts_with("https://") {
         return Ok(Some(location.to_string()));
     }
     if location.contains("://") {
         return Err(io::Error::other(format!(
-            "refusing a redirect from {current} to {location}: only https is followed"
+            "refusing a redirect from {} to {}: only https is followed",
+            crate::diag::visible(current),
+            crate::diag::visible(location)
         )));
     }
     let origin = parse_url(current)?;
@@ -374,7 +461,9 @@ fn redirect_target(
         Ok(Some(format!("{base}{location}")))
     } else {
         Err(io::Error::other(format!(
-            "refusing a relative redirect from {current} to {location}"
+            "refusing a relative redirect from {} to {}",
+            crate::diag::visible(current),
+            crate::diag::visible(location)
         )))
     }
 }
