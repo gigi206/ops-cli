@@ -1176,6 +1176,39 @@ fn each_open_form_states_the_path_walk_it_asked_for() {
     }
 }
 
+/// An `accept` that fails for want of a resource waits for the shim; one that cannot succeed ends
+/// the wait.
+///
+/// Giving up on the first kind drops the listener with the shim's descriptor still queued, and the
+/// cage's filter then answers every `execve` with `ENOSYS`. The second kind fails identically on
+/// every attempt, so waiting it out would spin until `stop`.
+#[test]
+fn an_accept_that_runs_out_of_a_resource_is_retried_and_no_other_is() {
+    for errno in [
+        libc::EMFILE,
+        libc::ENFILE,
+        libc::ENOBUFS,
+        libc::ENOMEM,
+        libc::ECONNABORTED,
+        libc::EPROTO,
+    ] {
+        assert!(
+            accept_error_is_transient(Some(errno)),
+            "errno {errno} passes, so the wait for the shim goes on"
+        );
+    }
+    for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EOPNOTSUPP] {
+        assert!(
+            !accept_error_is_transient(Some(errno)),
+            "errno {errno} fails the same way every time, so the wait ends"
+        );
+    }
+    assert!(
+        !accept_error_is_transient(None),
+        "an error with no errno is not one known to pass"
+    );
+}
+
 /// A connection that says nothing must not park the handoff loop for the session.
 ///
 /// The socket is reachable from inside the cage, `recv_fd` has no deadline, and an accepted socket
@@ -3213,6 +3246,108 @@ fn a_shebang_chain_is_followed_to_the_program_the_kernel_runs() {
     );
 }
 
+/// A `#!` chain longer than the kernel follows is refused with the kernel's own errno and reason.
+///
+/// Past [`SHEBANG_HOPS`] interpreters the kernel answers `ELOOP`, so nothing would run either way;
+/// what the refusal owes is to say so. It was filed as a file whose first bytes could not be read,
+/// which sends the reader to look for a permission problem in a chain that was simply too long.
+///
+/// The witness is the same chain one link shorter, which runs to completion under the same policy.
+#[test]
+fn a_shebang_chain_past_the_kernels_limit_is_refused_as_too_deep() {
+    need_host_programs!("/bin/sh");
+    use std::os::unix::fs::PermissionsExt;
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+    impl crate::sandbox::notify_sink::Sink for Recorder {
+        fn deliver(
+            &mut self,
+            _summary: &str,
+            body: &str,
+            _replaces: Option<u32>,
+        ) -> Result<Option<u32>, ()> {
+            self.0.lock().expect("recorder lock").push(body.to_string());
+            Ok(None)
+        }
+    }
+    let dir = TmpDir::new();
+    if dir
+        .path()
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .any(u8::is_ascii_whitespace)
+    {
+        skip_incapable!(
+            "skipping: a `#!` line cannot name a path under {:?}, which holds a blank",
+            dir.path()
+        );
+        return;
+    }
+    // `links` interpreters behind the first script: each names the next, and the last is the shell.
+    let chain = |links: usize| -> String {
+        let at = |i: usize| dir.join(&format!("c{links}-{i}"));
+        std::fs::write(at(links), "#!/bin/sh\nexit 7\n").expect("write the last script");
+        for i in (0..links).rev() {
+            std::fs::write(at(i), format!("#!{}\n", at(i + 1).display())).expect("write a link");
+        }
+        for i in 0..=links {
+            std::fs::set_permissions(at(i), std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        at(0).to_str().expect("utf-8 script path").to_string()
+    };
+    let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/nonexistent".to_string()]);
+
+    // Four scripts and the shell: five interpreters, the most the kernel follows.
+    let (code, _) = run_under_supervisor(&[&chain(4)], &policy, &ProcOverlay::new());
+    assert_eq!(code, Some(7), "a chain at the kernel's limit must run");
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let notifier = crate::sandbox::notify_sink::Notifier::recording(
+        crate::notify::NotifyPolicy::uniform(crate::notify::NotifyMode::Always),
+        Box::new(Recorder(Arc::clone(&seen))),
+    );
+    let (code, ring) = run_under_supervisor_notified(
+        &[&chain(5)],
+        &policy,
+        &ProcOverlay::new(),
+        1,
+        None,
+        &notifier,
+    );
+    // The shim's own code for an errno other than `EPERM`: the cage was answered `ELOOP`.
+    assert_eq!(
+        code,
+        Some(127),
+        "a chain past the limit is answered with the kernel's errno"
+    );
+    assert!(
+        ring.snapshot(None)
+            .events
+            .iter()
+            .any(|e| e.verdict == "deny"),
+        "and the refusal is recorded"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let announced = loop {
+        let now = seen.lock().expect("recorder lock").clone();
+        if !now.is_empty() || std::time::Instant::now() >= deadline {
+            break now;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let body = announced
+        .first()
+        .unwrap_or_else(|| panic!("the refusal announced nothing: {announced:?}"));
+    assert!(
+        body.contains("more than 5 interpreters"),
+        "the announcement names the depth as the reason: {body:?}"
+    );
+    assert!(
+        !body.contains("could not be read"),
+        "and not an unreadable file: {body:?}"
+    );
+}
+
 /// An interpreter `binfmt_misc` would run is decided, though no byte of the file names it.
 ///
 /// A registered handler makes the kernel run an interpreter inside the `execve` that named the
@@ -4073,6 +4208,54 @@ fn a_head_spelled_under_proc_self_is_read_from_the_cage_and_not_from_the_host() 
         code,
         Some(7),
         "the interpreter the cage's own file names must be the one the rule is put to"
+    );
+    let events = ring.snapshot(None).events;
+    assert!(
+        events.iter().any(|e| e.verdict == "deny"),
+        "and the refusal is recorded: {events:?}"
+    );
+}
+
+/// A name the cage spells under `/proc/self/root` and the supervisor cannot ask about is refused.
+///
+/// Behind that prefix, a link with an absolute target sends this process's own walk to the host's
+/// root, where nothing is found; the question then put to the cage is a scoped lookup, which
+/// refuses the magic link the prefix crosses (`EXDEV`). Neither is an absence, yet that answer was
+/// read as one, so the `#!` line went unread and the shell it names ran under a rule denying it.
+///
+/// The host side holds nothing at the name, which is what separates this from the decoy test above:
+/// there the walk finds a file, here only the cage does. The witness arm runs the script under a
+/// policy with no rule, so the refusal below is the rule and not the spelling failing. The cost is
+/// the one an execute-only file already pays: under any rule at all this spelling does not run,
+/// because what its `#!` line says cannot be established.
+#[test]
+fn a_name_reached_through_proc_self_root_that_the_cage_cannot_be_asked_about_is_refused() {
+    need_host_programs!("/bin/sh");
+    let setup = "printf '#!/bin/sh\\nexit 7\\n' > '{cage}/payload'\n\
+                 chmod 755 '{cage}/payload'\n\
+                 ln -s '{cage}/payload' '{cage}/l'\n";
+    let target = "/proc/self/root{cage}/l";
+
+    // A policy with nothing on it, which reads no head: any rule would refuse this spelling, for
+    // the reason the second arm states, so it is the one shape the witness can run under.
+    let nothing = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
+    let Some((code, _)) = run_in_cage(setup, target, &nothing, |_| {}) else {
+        skip_incapable!("skipping the `/proc/self` walk: need `unshare` and a usable userns");
+        return;
+    };
+    assert_eq!(
+        code,
+        Some(7),
+        "the cage's own script must really run through this spelling, or nothing is measured"
+    );
+
+    let denied = ProcPolicy::new(ProcMode::Enforce, &[], &["sh".to_string()]);
+    let (code, ring) =
+        run_in_cage(setup, target, &denied, |_| {}).expect("the cage stood up a moment ago");
+    assert_ne!(
+        code,
+        Some(7),
+        "a denied interpreter must not run because the supervisor could not ask about its script"
     );
     let events = ring.snapshot(None).events;
     assert!(

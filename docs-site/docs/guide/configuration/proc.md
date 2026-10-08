@@ -152,7 +152,8 @@ that far:
   interpreter too. So `deny = "sh"` stops a shell script, not only a shell typed at a prompt. Nor
   does the kernel stop at one line: an interpreter that is itself a script hands the exec on again
   inside the same call, so sbx follows the chain to the kernel's own limit and decides every link:
-  a script naming a script naming `/bin/sh` is still stopped by `deny = "sh"`.
+  a script naming a script naming `/bin/sh` is still stopped by `deny = "sh"`. A chain longer than
+  that limit is refused with the `ELOOP` the kernel itself would answer.
 
 In both shapes the interpreter's **arguments** are not decided, only the program: `#!/usr/bin/env
 python3` is decided as `/usr/bin/env`, and `ld.so /bin/grep curl` is not refused by a rule about
@@ -167,8 +168,10 @@ Three more things follow, and all are deliberate:
   could not be established, the answer is a refusal. The same holds for a target the cage reaches
   and sbx cannot: a symlink inside the cage whose target starts with `/` is resolved against the
   cage's root by the kernel and against the host's by a supervisor following it, so sbx asks the
-  cage whether the name is there and refuses the ones that are. The cost: an execute-only file does
-  not run under an exec policy, however it is spelled.
+  cage whether the name is there and refuses the ones that are. A name the cage cannot be asked
+  about is refused too: one spelled under `/proc/self/root` crosses a link the confined lookup will
+  not follow. The cost: an execute-only file does not run under an exec policy, however it is
+  spelled, and neither does a script reached through `/proc/self/root` and an absolute symlink.
 - **A `binfmt_misc` handler.** A handler registered for `.jar`, `.py`, a wine binary or a
   foreign-architecture executable makes the kernel run an interpreter that nothing in the file
   names. sbx reads the registered handlers instead of the file, once per launch, and decides the

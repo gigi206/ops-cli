@@ -705,7 +705,7 @@ fn exec_verdict(
                                             verdict: Verdict::Deny,
                                             shown: shebang_chain(&path, &chain),
                                             probed: path,
-                                            because: Because::UnreadableShebang,
+                                            because: Because::ShebangTooDeep,
                                         };
                                     }
                                     chain.push(next);
@@ -840,6 +840,13 @@ fn decide_target(cx: &Deciding<'_>, caller: &[String], pid: u32, target: &str) -
 /// directory this process does not have, and a name the kernel marked `(deleted)`, which is what a
 /// descriptor's own `/proc` link reads for an object no link is left to -- there is nothing there
 /// for any walk to reach, and the object is the caller's own already.
+///
+/// `true` for an answer that is neither a find nor an absence. A scoped lookup refuses a magic link
+/// with `EXDEV`, and that is exactly the walk a name spelled under `/proc/self/root` needs: the
+/// cage's kernel follows it to the cage's root and runs what it finds there, while this question
+/// cannot be put at all. Counting it as absent let a link with an absolute target, reached through
+/// that prefix, run its `#!` line undecided. `ENOSYS` stays an absence: a kernel without `openat2`
+/// can ask nothing, and refusing on it would refuse every miss of every `PATH` walk.
 fn reached_in_cage(pid: u32, path: &str) -> bool {
     if !path.starts_with('/') || path.ends_with(" (deleted)") {
         return false;
@@ -856,7 +863,8 @@ fn reached_in_cage(pid: u32, path: &str) -> bool {
             unsafe { libc::close(fd) };
             true
         }
-        Err(_) => false,
+        Err(libc::ENOENT | libc::ENOTDIR | libc::ENOSYS) => false,
+        Err(_) => true,
     }
 }
 
@@ -914,6 +922,10 @@ enum Because {
     /// The target is a script, or is a file this supervisor could reach and not read, so the
     /// interpreter the kernel would run inside the same syscall could not be named.
     UnreadableShebang,
+    /// The `#!` chain goes on past [`SHEBANG_HOPS`] interpreters. The kernel refuses such an
+    /// `execve` with `ELOOP`, and the refusal answers with that errno so the cage reads the
+    /// kernel's own reason.
+    ShebangTooDeep,
 }
 
 /// The final component of an already-folded path, for the loader test.
@@ -1195,9 +1207,17 @@ fn handoff_speaks(fd: libc::c_int, stop: &AtomicBool) -> bool {
 /// `stop` was never read again, and the shim's own handoff was never accepted, so exec supervision
 /// ended and every launch failed closed. It is a denial of supervision rather than an escape, but
 /// it costs one connection and no privilege. [`HANDOFF_SILENCE`] bounds it.
+///
+/// Nor, last, does an `accept` that fails for want of a resource. The shim's connection is already
+/// queued when this process is out of descriptors or memory, and giving up then drops the listener
+/// with the shim's descriptor still in its backlog: the cage's filter loses its only reader and every
+/// `execve` behind it fails with `ENOSYS`, a launch that dies of an error naming nothing sbx did.
+/// Such a failure is waited out instead ([`accept_error_is_transient`]); any other ends the wait,
+/// and both are said out loud.
 fn accept_handoff(listener: &UnixListener, stop: &AtomicBool) -> Option<libc::c_int> {
     use std::os::unix::io::AsRawFd;
     let mut announced = false;
+    let mut starved = false;
     while !stop.load(Ordering::Relaxed) {
         if !poll_readable(listener.as_raw_fd(), 250) {
             continue;
@@ -1231,10 +1251,49 @@ fn accept_handoff(listener: &UnixListener, stop: &AtomicBool) -> Option<libc::c_
                 }
             },
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(_) => return None,
+            Err(e) if accept_error_is_transient(e.raw_os_error()) => {
+                if !starved {
+                    starved = true;
+                    crate::diag::warn(&format!(
+                        "exec supervision: accepting the shim's handoff failed ({e}); retrying"
+                    ));
+                }
+                // The pending connection keeps the listener readable, so the poll above would
+                // return at once and this arm would spin; the pause is the poll's own slice.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                continue;
+            }
+            Err(e) => {
+                crate::diag::warn(&format!(
+                    "exec supervision: the handoff socket cannot accept ({e}), so the shim's \
+                     descriptor is never received and the command does not run"
+                ));
+                return None;
+            }
         }
     }
     None
+}
+
+/// Whether an `accept` on the handoff socket failed for a reason that passes, so the wait for the
+/// shim goes on.
+///
+/// Resource exhaustion, and the two errors `accept(2)` reports for a connection that went away
+/// while queued. `EINTR` is absent because the standard library retries it inside `accept`, and
+/// `EAGAIN` because the caller answers it before asking. Everything else -- a descriptor that is
+/// not a listening socket, or not a descriptor at all -- fails the same way on every attempt.
+fn accept_error_is_transient(errno: Option<libc::c_int>) -> bool {
+    matches!(
+        errno,
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::ECONNABORTED
+                | libc::EPROTO
+        )
+    )
 }
 
 /// The receive loop: for each notified `execve`, read the target path, decide, and respond — a `deny`
@@ -1363,7 +1422,10 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
             respond_continue(notif_fd, req.id);
         }
         Verdict::Deny => {
-            let errno = refusal_errno(req.pid, probed);
+            let errno = match because {
+                Because::ShebangTooDeep => libc::ELOOP,
+                _ => refusal_errno(req.pid, probed),
+            };
             // A name lookup is one `execve` per `PATH` entry, so a program found in the fourth
             // directory leaves three refusals behind it — of files that were never there. Recorded
             // apart from a refusal of something real, because they are the same event a cage with
@@ -1397,6 +1459,11 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
                              decided — and a file this sandbox can reach without reading runs its \
                              interpreter all the same, so it was refused rather than run"
                             .to_string(),
+                        Because::ShebangTooDeep => format!(
+                            "this file's `#!` chain names more than {SHEBANG_HOPS} interpreters \
+                             in turn, which the kernel refuses to follow, so it was refused \
+                             without the last of them being named"
+                        ),
                         Because::Policy if by.is_empty() => {
                             "the exec policy does not allow this program to run".to_string()
                         }
