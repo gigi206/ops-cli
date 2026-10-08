@@ -111,6 +111,21 @@ fn place_executable(target: &Path, bytes: &[u8]) -> io::Result<()> {
     crate::sandbox::atomicfile::write_atomic_mode(target, bytes, Some(0o755))
 }
 
+/// Whether `target` still looks like what [`place_executable`] left there: a regular file of
+/// `len` bytes, executable by everyone the placement made it executable for.
+///
+/// Asked beside the marker on every fast path, because the marker vouches for a placement and not
+/// for what became of it: a binary truncated or made non-executable after its marker was stamped
+/// would be skipped over on every later launch and fail at `execve` each time. The content is not
+/// re-hashed — tens of megabytes per launch is the cost the marker exists to avoid — so a rewrite
+/// of the same length goes unnoticed, which is the limit the owner-only engine directory carries.
+fn placed_intact(target: &Path, len: usize) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(target).is_ok_and(|m| {
+        m.is_file() && m.len() == len as u64 && m.permissions().mode() & 0o111 == 0o111
+    })
+}
+
 /// Materialize the embedded exec shim into the owned engine directory and return its path.
 ///
 /// Unlike the engines' best-effort placement, a failure here is returned rather than swallowed:
@@ -128,7 +143,9 @@ pub(crate) fn ensure_proc_shim(layout: &Layout) -> io::Result<PathBuf> {
     let shim = dir.join(PROC_SHIM_NAME);
     let marker = dir.join(".proc-shim.sha256");
     let sha = proc_shim_blob::PROC_SHIM_SHA256;
-    if shim.is_file() && std::fs::read_to_string(&marker).ok().as_deref() == Some(sha) {
+    if placed_intact(&shim, proc_shim_blob::PROC_SHIM_BIN.len())
+        && std::fs::read_to_string(&marker).ok().as_deref() == Some(sha)
+    {
         return Ok(shim);
     }
     std::fs::DirBuilder::new()
@@ -205,8 +222,10 @@ fn ensure_owned_engine(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()>
     // sibling, AND the marker. Checking the sibling too means an interrupted symlink
     // replacement re-materializes rather than stranding `nix-store` forever behind a
     // marker that still matches.
-    if nix.is_file()
-        && store_link.exists()
+    // The sibling is asked for its target and not for its existence: a regular file or a link to
+    // anywhere else at that name would pass an existence test, and the marker would keep it there.
+    if placed_intact(&nix, bytes.len())
+        && std::fs::read_link(&store_link).is_ok_and(|t| t == Path::new("nix"))
         && std::fs::read_to_string(&marker).ok().as_deref() == Some(sha256)
     {
         return Ok(());
@@ -219,10 +238,18 @@ fn ensure_owned_engine(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()>
     // Place the sibling atomically too: a unique temp link renamed over `nix-store` leaves
     // no window where it is absent (a concurrent first launch would otherwise see a removed
     // link); a lost race simply discards an identical link.
-    let tmp_link = dir.join(format!(".nix-store.tmp.{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp_link);
+    // Named like every other temp in the directory, sequence number included, so two threads of
+    // one process never share it; removed when the rename fails, so no failure leaves it behind.
+    let tmp_link = dir.join(format!(
+        ".nix-store.tmp.{}.{}",
+        std::process::id(),
+        crate::sandbox::atomicfile::unique()
+    ));
     std::os::unix::fs::symlink("nix", &tmp_link)?;
-    std::fs::rename(&tmp_link, &store_link)?;
+    if let Err(e) = std::fs::rename(&tmp_link, &store_link) {
+        let _ = std::fs::remove_file(&tmp_link);
+        return Err(e);
+    }
     // Stamp the version last: an interrupted run leaves a stale/absent marker and
     // re-materializes next time rather than trusting a half-written engine.
     crate::sandbox::atomicfile::write_atomic(&marker, sha256.as_bytes())?;
@@ -262,6 +289,11 @@ pub(crate) enum EngineMiss {
         env: &'static str,
         /// The path it named.
         path: PathBuf,
+        /// The command sbx refused **beside** that path, when the override itself was sound: every
+        /// engine command is taken from beside a resolved override, and a sibling that is present
+        /// and fails the trust check is refused like the override would have been. `None` when
+        /// the refused binary is the one the variable names.
+        sibling: Option<PathBuf>,
     },
 }
 
@@ -271,8 +303,21 @@ impl EngineMiss {
     pub(crate) fn clause(&self, what: &str) -> String {
         match self {
             EngineMiss::NotFound => format!("{what} not found"),
-            EngineMiss::Refused { env, path } => format!(
+            EngineMiss::Refused {
+                env,
+                path,
+                sibling: None,
+            } => format!(
                 "{what} refused: {env} names {}, which sbx will not run",
+                path.display()
+            ),
+            EngineMiss::Refused {
+                env,
+                path,
+                sibling: Some(sibling),
+            } => format!(
+                "{what} refused: {} sits beside the {} that {env} names, and sbx will not run it",
+                sibling.display(),
                 path.display()
             ),
         }
@@ -296,6 +341,7 @@ fn refuse_override(env: &'static str, path: &Path) -> EngineMiss {
     EngineMiss::Refused {
         env,
         path: path.to_path_buf(),
+        sibling: None,
     }
 }
 
@@ -411,7 +457,20 @@ fn engine_probe(path: &Path) -> EngineProbe {
     use std::os::unix::fs::MetadataExt;
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
-        Err(_) => return EngineProbe::Absent,
+        // Nothing at the name, or a component of it that is not a directory: either way no binary
+        // is there, which is what lets a stale override yield to the next tier.
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ENOTDIR) =>
+        {
+            return EngineProbe::Absent;
+        }
+        // Anything else is a binary this probe could not look at, which is not an absence: read
+        // as one, an override behind a directory sbx may not search was replaced by the next tier
+        // in silence, the substitution an override is refused to prevent.
+        Err(e) => {
+            errln!("sbx: engine binary {} cannot be read: {e}", path.display());
+            return EngineProbe::Untrusted;
+        }
     };
     // SAFETY: `geteuid` reads process-owned state and takes no pointer; it supplies the identity
     // `host_exec_verdict` compares the engine binary's owner to.
@@ -458,7 +517,14 @@ fn pick_engine_bin(
                 let bin = engine_sibling(nix, name);
                 return match probe(bin.as_path()) {
                     EngineProbe::Trusted => Ok(bin),
-                    _ => Err(EngineMiss::NotFound),
+                    EngineProbe::Absent => Err(EngineMiss::NotFound),
+                    // Present and refused, which "not found" would misreport: the engine the
+                    // variable names is installed, and the remedy is this file's permissions.
+                    EngineProbe::Untrusted => Err(EngineMiss::Refused {
+                        env: ENGINE_OVERRIDE_ENV,
+                        path: nix.to_path_buf(),
+                        sibling: Some(bin),
+                    }),
                 };
             }
         }
@@ -623,7 +689,9 @@ fn ensure_owned_bwrap(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()> 
     use std::os::unix::fs::DirBuilderExt;
     let bwrap = dir.join("bwrap");
     let marker = dir.join(".bwrap.sha256");
-    if bwrap.is_file() && std::fs::read_to_string(&marker).ok().as_deref() == Some(sha256) {
+    if placed_intact(&bwrap, bytes.len())
+        && std::fs::read_to_string(&marker).ok().as_deref() == Some(sha256)
+    {
         return Ok(());
     }
     std::fs::DirBuilder::new()
@@ -748,13 +816,14 @@ mod tests {
         }
     }
 
-    /// Whether `dir` holds no entry named like a temp of the placement (`prefix` and anything after
-    /// it): the temp's name carries a sequence number now, so the old exact name proves nothing.
-    fn no_temp_left(dir: &Path, prefix: &str) -> bool {
+    /// Whether `dir` holds no entry named like a temp of a placement. Every temp here carries
+    /// `.tmp.` — the binary's and the multi-call link's alike — so one fragment covers both, where a
+    /// per-binary prefix missed the link's.
+    fn no_temp_left(dir: &Path) -> bool {
         std::fs::read_dir(dir)
             .unwrap()
             .flatten()
-            .all(|e| !e.file_name().to_string_lossy().starts_with(prefix))
+            .all(|e| !e.file_name().to_string_lossy().contains(".tmp."))
     }
     use std::os::unix::fs::PermissionsExt;
 
@@ -816,6 +885,7 @@ mod tests {
         let refused = EngineMiss::Refused {
             env: ENGINE_OVERRIDE_ENV,
             path: PathBuf::from("/over/nix"),
+            sibling: None,
         };
         assert_eq!(
             refused.clause("nix (the store engine)"),
@@ -864,6 +934,36 @@ mod tests {
             ),
             Err(EngineMiss::NotFound),
             "an authoritative override with no sibling is a miss, not a refusal"
+        );
+
+        // A sibling that is there and fails the trust check is a refusal, named as the file beside
+        // the override, and never reported as missing.
+        let sibling_untrusted = |p: &Path| {
+            if p == Path::new("/over/nix") {
+                EngineProbe::Trusted
+            } else {
+                EngineProbe::Untrusted
+            }
+        };
+        let refused = pick_engine_bin(
+            "nix-store",
+            Some(over),
+            Some(owned),
+            &sibling_untrusted,
+            &on_path,
+        );
+        assert_eq!(
+            refused,
+            Err(EngineMiss::Refused {
+                env: ENGINE_OVERRIDE_ENV,
+                path: PathBuf::from("/over/nix"),
+                sibling: Some(PathBuf::from("/over/nix-store")),
+            })
+        );
+        assert_eq!(
+            refused.unwrap_err().clause("nix-store"),
+            "nix-store refused: /over/nix-store sits beside the /over/nix that SBX_NIX_BIN names, \
+             and sbx will not run it"
         );
 
         // An override whose `nix` is absent is treated as unset: the next tier (here
@@ -922,7 +1022,8 @@ mod tests {
             pick_engine_bin("nix", Some(over), Some(owned), &over_untrusted, &on_path),
             Err(EngineMiss::Refused {
                 env: ENGINE_OVERRIDE_ENV,
-                path: over.to_path_buf()
+                path: over.to_path_buf(),
+                sibling: None,
             })
         );
 
@@ -1110,10 +1211,110 @@ mod tests {
         // the version marker records the embedded hash
         assert_eq!(std::fs::read_to_string(dir.join(".sha256")).unwrap(), sha);
         // no temp artifact is left behind
-        assert!(
-            no_temp_left(&dir, ".nix.tmp."),
-            "a temp of the engine was left"
+        assert!(no_temp_left(&dir), "a temp of the engine was left");
+    }
+
+    /// A binary the probe cannot look at is not an absent one.
+    ///
+    /// Read as absent, an override behind a directory sbx may not search yielded to the next tier
+    /// in silence, which is the substitution a present override is refused to prevent. A name with
+    /// nothing there, or behind a component that is not a directory, still reads as absent: that
+    /// is what lets a stale override fall through.
+    #[test]
+    fn an_engine_the_probe_cannot_read_is_untrusted_and_a_missing_one_is_absent() {
+        let base = TmpDir::new();
+        assert_eq!(engine_probe(&base.join("nix")), EngineProbe::Absent);
+        let file = base.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(engine_probe(&file.join("nix")), EngineProbe::Absent);
+
+        // SAFETY: `geteuid` reads process-owned state through no pointer.
+        if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!("skipping the unreadable arm: root searches a mode-0 directory");
+            return;
+        }
+        let shut = base.join("shut");
+        std::fs::create_dir(&shut).unwrap();
+        std::fs::write(shut.join("nix"), b"x").unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probed = engine_probe(&shut.join("nix"));
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(probed, EngineProbe::Untrusted);
+    }
+
+    /// The fast path skips a placement only while it still looks like one: a binary of another
+    /// length, one that lost its execute bits, or a multi-call sibling that no longer points at
+    /// `nix` is laid down again under a marker that still matches.
+    #[test]
+    fn a_placement_damaged_under_a_matching_marker_is_laid_down_again() {
+        let base = TmpDir::new();
+        let dir = base.join("engine");
+        ensure_owned_engine(&dir, b"v1-bytes", "hash-v1").expect("first materialize");
+        let nix = dir.join("nix");
+
+        std::fs::write(&nix, b"short").unwrap();
+        ensure_owned_engine(&dir, b"v1-bytes", "hash-v1").expect("re-call");
+        assert_eq!(
+            std::fs::read(&nix).unwrap(),
+            b"v1-bytes",
+            "a length change is repaired"
         );
+
+        std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o644)).unwrap();
+        ensure_owned_engine(&dir, b"v1-bytes", "hash-v1").expect("re-call");
+        assert_eq!(
+            std::fs::metadata(&nix).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "lost execute bits are repaired"
+        );
+
+        let link = dir.join("nix-store");
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, b"not a link").unwrap();
+        ensure_owned_engine(&dir, b"v1-bytes", "hash-v1").expect("re-call");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from("nix"),
+            "a sibling that is not the link to `nix` is replaced"
+        );
+
+        let bwrap_dir = base.join("bwrap-engine");
+        ensure_owned_bwrap(&bwrap_dir, b"bwrap-v1", "b1").expect("first materialize");
+        let bwrap = bwrap_dir.join("bwrap");
+        std::fs::set_permissions(&bwrap, std::fs::Permissions::from_mode(0o644)).unwrap();
+        ensure_owned_bwrap(&bwrap_dir, b"bwrap-v1", "b1").expect("re-call");
+        assert_eq!(
+            std::fs::metadata(&bwrap).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the bundled bwrap is held to the same test"
+        );
+    }
+
+    /// The exec shim is held to the same test as the engines: it is what a launch binds into the
+    /// cage, and a copy that lost its execute bits under a matching marker refused every
+    /// enforcing launch after it.
+    #[test]
+    fn a_shim_damaged_under_a_matching_marker_is_laid_down_again() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let shim = ensure_proc_shim(&layout).expect("place the shim");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        ensure_proc_shim(&layout).expect("re-call");
+        assert_eq!(
+            std::fs::metadata(&shim).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    /// A multi-call link that cannot be renamed into place leaves no temp behind.
+    #[test]
+    fn a_failed_sibling_rename_leaves_no_temp() {
+        let base = TmpDir::new();
+        let dir = base.join("engine");
+        // A non-empty directory at the sibling's name: no rename replaces it.
+        std::fs::create_dir_all(dir.join("nix-store/held")).unwrap();
+        assert!(ensure_owned_engine(&dir, b"v1-bytes", "hash-v1").is_err());
+        assert!(no_temp_left(&dir), "the temp link was left behind");
     }
 
     #[test]
@@ -1124,7 +1325,8 @@ mod tests {
 
         // Overwrite the placed binary, then call again at the SAME hash: the marker matches
         // and the sibling is present, so nothing is rewritten and our sentinel survives —
-        // proving the cheap skip path.
+        // proving the cheap skip path. The sentinel is the placed length on purpose: the fast
+        // path also compares lengths, and a sentinel of another length would be repaired.
         std::fs::write(dir.join("nix"), b"sentinel").unwrap();
         ensure_owned_engine(&dir, b"v1-bytes", "hash-v1").expect("idempotent re-call");
         assert_eq!(std::fs::read(dir.join("nix")).unwrap(), b"sentinel");
@@ -1239,14 +1441,16 @@ mod tests {
             pick_bwrap(false, Some(over), Some(owned), &over_untrusted, &host),
             Err(EngineMiss::Refused {
                 env: BWRAP_OVERRIDE_ENV,
-                path: over.to_path_buf()
+                path: over.to_path_buf(),
+                sibling: None,
             })
         );
         assert_eq!(
             pick_bwrap(true, Some(over), Some(owned), &over_untrusted, &host),
             Err(EngineMiss::Refused {
                 env: BWRAP_OVERRIDE_ENV,
-                path: over.to_path_buf()
+                path: over.to_path_buf(),
+                sibling: None,
             })
         );
 
@@ -1319,15 +1523,13 @@ mod tests {
             !dir.join(".sha256").exists(),
             "bwrap must not write nix's marker"
         );
-        assert!(
-            no_temp_left(&dir, ".bwrap.tmp."),
-            "a temp of bwrap was left"
-        );
+        assert!(no_temp_left(&dir), "a temp of bwrap was left");
 
-        // Idempotent at the same hash: a sentinel overwrite survives a re-call.
-        std::fs::write(&bwrap, b"sentinel").unwrap();
+        // Idempotent at the same hash: a sentinel overwrite survives a re-call. Of the placed
+        // length on purpose, since the fast path also compares lengths.
+        std::fs::write(&bwrap, b"sentinel-of-length").unwrap();
         ensure_owned_bwrap(&dir, b"static-bwrap-bytes", "bw-hash").expect("idempotent re-call");
-        assert_eq!(std::fs::read(&bwrap).unwrap(), b"sentinel");
+        assert_eq!(std::fs::read(&bwrap).unwrap(), b"sentinel-of-length");
         // A new hash re-materializes.
         ensure_owned_bwrap(&dir, b"v2-bwrap", "bw-hash-2").expect("re-materialize on change");
         assert_eq!(std::fs::read(&bwrap).unwrap(), b"v2-bwrap");

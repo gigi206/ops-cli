@@ -100,8 +100,10 @@ regular file, owned by you or by root, and not world-writable. A binary that is 
 and fails that gate is **refused** rather than skipped, because sbx will not silently
 drive the same store with a different engine. The launch stops, and `sbx doctor` reports
 that engine as `refused: SBX_NIX_BIN=<path>` rather than as missing; the remedy is the
-file's ownership or permissions, or unsetting the variable. A path that does not exist at
-all is treated as unset, and the next source applies. See
+file's ownership or permissions, or unsetting the variable. The same holds for a binary
+sbx cannot even look at (behind a directory it may not search), and for a sibling command
+such as `nix-store` beside an accepted `SBX_NIX_BIN`. A path that does not exist at all is
+treated as unset, and the next source applies. See
 [Provisioning](../concepts/provisioning).
 
 Two more are read **at build time**, not at run time, and only when the matching

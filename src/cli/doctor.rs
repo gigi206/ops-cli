@@ -202,7 +202,7 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
             rep.check("fail", "bubblewrap", "not found");
             remediation.push("install bubblewrap (the sandbox engine)");
         }
-        Err(store::EngineMiss::Refused { env, path }) => {
+        Err(store::EngineMiss::Refused { env, path, .. }) => {
             rep.check(
                 "fail",
                 "bubblewrap",
@@ -262,7 +262,7 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
         // Not "not found", and not an install hint: the engine is installed — sbx declined to run
         // the one the override names. Telling this user to install nix would send them after a
         // package they already have.
-        Err(store::EngineMiss::Refused { env, path }) => {
+        Err(store::EngineMiss::Refused { env, path, .. }) => {
             rep.check("fail", "nix", &format!("refused: {env}={}", path.display()));
             remediation.push(NIX_OVERRIDE_REMEDIATION);
         }
