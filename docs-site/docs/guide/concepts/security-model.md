@@ -165,8 +165,13 @@ which serve each session's records, `sbx net` and `sbx proc` decisions and
 `sbx task status` and `stop`, close a connection from any process outside `sbx`'s
 own PID namespace, and every cage has a PID namespace of its own. The `sbx` command
 run from another PID namespace, such as from outside a container a session runs in,
-is refused the same way. The check needs Linux 5.5 or later; on an older kernel those
-sockets refuse every connection. The sockets a cage is meant to reach, its brokers
+is refused the same way. The check runs from the other end too, as a second barrier:
+`sbx net`, reading or answering a session's egress control socket, refuses one whose
+server runs outside its own PID namespace. A cage sees `sbx`'s directories read-only
+at most, so it cannot put a socket where a session's belongs; were it ever able to,
+that socket would neither receive the verdicts and rules sent to it nor have its
+answers believed. The check needs Linux 5.5 or later; on an
+older kernel those sockets refuse every connection. The sockets a cage is meant to reach, its brokers
 and its task socket, take no such check. The capture tap, whose own peer runs in a
 cage, reports on no socket at all: it is handed one end of a socket pair, which has
 no name to find, and the session reads the other end. A cage that can see the

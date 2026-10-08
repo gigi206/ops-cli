@@ -16,11 +16,33 @@ pub(crate) fn control_socket(data_dir: &Path, pid: u32) -> PathBuf {
     control_dir(data_dir).join(format!("control-{pid}.sock"))
 }
 
+/// Connect to a session's control socket, with `timeout` on reads and writes, refusing one whose
+/// server runs outside this PID namespace ([`crate::sandbox::peer`]): every verb below either acts on
+/// the session or reports what it answers, and a socket a cage could put in the egress directory,
+/// should a view of it ever be writable, would otherwise receive the first and write the second.
+fn connect(socket: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    let stream = UnixStream::connect(socket)?;
+    super::super::peer::check_server(&stream)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    Ok(stream)
+}
+
+/// Whether a connect error means the session is not there: no socket, or one nobody serves any
+/// more. A sweep passes over such a session in silence; any other error is a session it reached.
+fn session_gone(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
+}
+
 /// What a sweep across every session's control socket got: the answers that arrived whole, and the
 /// sessions that were reached and did not answer in full, each with why
 /// ([`crate::sandbox::reply::unanswered`]: cut short, refused before the command was read, or not
-/// given in time). A session whose socket could not be connected to is gone, or never stood this
-/// plane up, and is in neither list.
+/// given in time; or refused by this side, a server outside this PID namespace, an `err` answer).
+/// A session whose socket could not be connected to is gone, or never stood this plane up, and is
+/// in neither list.
 ///
 /// The second list is what keeps a listing honest. Left out silently, a session that did not answer
 /// read exactly like one holding nothing, and a listing across sessions said "nothing" at exit 0.
@@ -41,8 +63,8 @@ fn sweep<T>(data_dir: &Path, read: impl Fn(u32, &Path) -> io::Result<T>) -> Swep
     for pid in session_pids(data_dir) {
         match read(pid, &control_socket(data_dir, pid)) {
             Ok(answer) => swept.read.push(answer),
-            Err(e) if crate::sandbox::reply::unanswered(&e) => swept.unread.push((pid, e)),
-            Err(_) => {}
+            Err(e) if session_gone(&e) => {}
+            Err(e) => swept.unread.push((pid, e)),
         }
     }
     swept
@@ -123,18 +145,25 @@ pub(crate) fn session_pids(data_dir: &Path) -> Vec<u32> {
     };
     let mut pids: Vec<u32> = entries
         .flatten()
+        .filter(|e| {
+            use std::os::unix::fs::FileTypeExt as _;
+            e.file_type().is_ok_and(|t| t.is_socket())
+        })
         .filter_map(|e| pid_from_socket(&e.file_name().to_string_lossy()))
         .collect();
     pids.sort_unstable();
     pids
 }
 
-/// Extract the pid from a `control-<pid>.sock` filename.
+/// Extract the pid from a `control-<pid>.sock` filename, written the one way [`control_socket`]
+/// writes it: decimal digits with no sign and no leading zero. Any other spelling of the same number
+/// names a file that is not that session's socket, and would list the session twice.
 fn pid_from_socket(name: &str) -> Option<u32> {
-    name.strip_prefix("control-")?
-        .strip_suffix(".sock")?
-        .parse()
-        .ok()
+    let digits = name.strip_prefix("control-")?.strip_suffix(".sock")?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) || digits.starts_with('0') {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Query one session's control socket for its pending rows (`LIST`), and the incarnation it
@@ -145,9 +174,7 @@ fn pid_from_socket(name: &str) -> Option<u32> {
 /// instead of a terminator it no longer recognises. Every line of one answer carries the same
 /// value; the first one seen is the session's.
 fn query(socket: &Path, timeout: Duration) -> io::Result<(Vec<PendingRow>, Option<u64>)> {
-    let stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    let stream = connect(socket, timeout)?;
     (&stream).write_all(b"LIST\n")?;
     (&stream).flush()?;
     let mut rows = Vec::new();
@@ -237,9 +264,7 @@ pub(crate) fn read_log(
     with_capture: bool,
     follow: Option<Follow>,
 ) -> io::Result<LogSnapshot> {
-    let stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let stream = connect(socket, Duration::from_secs(10))?;
     let mut cmd = String::from("LOG");
     if let Some(seq) = after {
         cmd.push_str(&format!(" after={seq}"));
@@ -273,6 +298,15 @@ pub(crate) fn read_log(
     let mut capture_evicted = 0;
     for line in crate::sandbox::reply::answer(BufReader::new(&stream)) {
         let line = line?;
+        // Every current server answers `LOG` with its cursors, and an `err` in their place ends the
+        // answer before any: read as a whole one, it would hand a follow a `head` of 0 and move its
+        // cursor back to the start of the ring.
+        if line.starts_with("err ") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the session answered `{}`", crate::sandbox::sanitize(&line)),
+            ));
+        }
         if let Some(v) = line.strip_prefix("dropped=") {
             dropped = v.parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("head=") {
@@ -380,11 +414,9 @@ pub(crate) struct SessionFlows {
 /// Query one session's control socket for the tunnels open right now (`FLOWS`). A session whose
 /// socket is gone (a dead/stale launch) fails the connect and the caller skips it.
 pub(crate) fn read_flows(socket: &Path) -> io::Result<Vec<FlowSnapshot>> {
-    let stream = UnixStream::connect(socket)?;
     // A short timeout: `sbx net live` polls every session sequentially on a ~1s redraw, so a single
     // stuck session must not freeze the whole frame for long (a dead one is skipped on the connect).
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let stream = connect(socket, Duration::from_secs(2))?;
     (&stream).write_all(b"FLOWS\n")?;
     (&stream).flush()?;
     let mut flows = Vec::new();
@@ -669,9 +701,7 @@ pub(crate) fn answer_request(
     verdict: Verdict,
     remember: bool,
 ) -> io::Result<AnswerOutcome> {
-    let stream = UnixStream::connect(control_socket(data_dir, pid))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let stream = connect(&control_socket(data_dir, pid), Duration::from_secs(10))?;
     let verb = match verdict {
         Verdict::Allow => "ALLOW",
         Verdict::Deny => "DENY",
@@ -725,9 +755,7 @@ pub(crate) fn drain_session(
     verdict: Verdict,
     remember: bool,
 ) -> io::Result<DrainOutcome> {
-    let stream = UnixStream::connect(control_socket(data_dir, pid))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let stream = connect(&control_socket(data_dir, pid), Duration::from_secs(10))?;
     let verb = match verdict {
         Verdict::Allow => "ALLOW",
         Verdict::Deny => "DENY",
@@ -815,10 +843,19 @@ pub(crate) fn inject_mute(data_dir: &Path, pid: u32, rule: &str) -> io::Result<I
 /// Send one `REMEMBER <verb> <rule>` to a session's control socket and read its one-line reply.
 /// Shared by [`inject_rule`] (ALLOW/DENY) and [`inject_mute`] (MUTE) so the connection handling and
 /// the reply parsing cannot drift.
+///
+/// A rule carrying a control character is refused before anything is sent: the server reads one
+/// line, so a newline would end the command early and load the part of the rule before it as a rule
+/// of its own. The rule grammar every caller admits rules through refuses them already; this keeps
+/// the wire from depending on that.
 fn send_remember(data_dir: &Path, pid: u32, verb: &str, rule: &str) -> io::Result<InjectOutcome> {
-    let stream = UnixStream::connect(control_socket(data_dir, pid))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    if rule.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a rule must not contain control characters",
+        ));
+    }
+    let stream = connect(&control_socket(data_dir, pid), Duration::from_secs(10))?;
     (&stream).write_all(format!("REMEMBER {verb} {rule}\n").as_bytes())?;
     (&stream).flush()?;
     let mut response = String::new();
@@ -833,9 +870,7 @@ fn send_remember(data_dir: &Path, pid: u32, verb: &str, rule: &str) -> io::Resul
 /// Query a session's live manual rules (`RULES`) — the runtime rules added by `--session` answers.
 /// A connect error (the session is gone) propagates so the caller can skip it.
 pub(crate) fn query_manual(data_dir: &Path, pid: u32) -> io::Result<Vec<ManualRuleRow>> {
-    let stream = UnixStream::connect(control_socket(data_dir, pid))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let stream = connect(&control_socket(data_dir, pid), Duration::from_secs(10))?;
     (&stream).write_all(b"RULES\n")?;
     (&stream).flush()?;
     let mut rules = Vec::new();
@@ -968,6 +1003,123 @@ mod tests {
         assert_eq!(pid_from_socket("control-4321.sock"), Some(4321));
         assert_eq!(pid_from_socket("proxy-4321.sock"), None);
         assert_eq!(pid_from_socket("control-.sock"), None);
+        // Only the spelling `control_socket` writes: another one of the same number is not that
+        // session's socket, and would list it twice.
+        for other in ["control-+4321.sock", "control-04321.sock", "control-0.sock"] {
+            assert_eq!(pid_from_socket(other), None, "{other}");
+        }
+    }
+
+    /// Only sockets are sessions: a file that merely carries the name is passed over.
+    #[test]
+    fn only_a_socket_is_listed_as_a_session() {
+        let data = crate::testutil::TmpDir::new();
+        std::fs::create_dir(control_dir(data.path())).unwrap();
+        std::fs::write(control_socket(data.path(), 7), b"").unwrap();
+        let _listener = UnixListener::bind(control_socket(data.path(), 9)).unwrap();
+        assert_eq!(session_pids(data.path()), vec![9]);
+    }
+
+    /// A `LOG` answered with an `err` line is an error, never an empty log whose `head` of 0 would
+    /// move a follow's cursor back; and a sweep reports it rather than passing over the session.
+    #[test]
+    fn a_log_answered_with_an_error_is_reported_and_not_read_as_empty() {
+        let data = crate::testutil::TmpDir::new();
+        std::fs::create_dir(control_dir(data.path())).unwrap();
+        let listener = UnixListener::bind(control_socket(data.path(), 5)).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            (&stream).write_all(b"err bad-request\n").unwrap();
+        });
+        let swept = log_all(data.path(), false, false, None);
+        server.join().unwrap();
+        assert!(swept.read.is_empty());
+        let [(pid, e)] = swept.unread.as_slice() else {
+            panic!("the session is reported: {:?}", swept.unread);
+        };
+        assert_eq!(*pid, 5);
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+    }
+
+    /// A rule is refused before it reaches the wire when it carries a control character, so a
+    /// newline cannot end the command and load what precedes it as a rule.
+    #[test]
+    fn a_rule_with_a_control_character_never_reaches_the_socket() {
+        let data = crate::testutil::TmpDir::new();
+        // No socket at all: a rule that got as far as connecting would fail with `NotFound`.
+        let Err(err) = inject_rule(data.path(), 1, Verdict::Allow, "a.test\nREMEMBER ALLOW *")
+        else {
+            panic!("a rule carrying a newline is refused");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    /// A control socket served from another PID namespace — a cage that put one, or a symlink to
+    /// one, where a session's belongs — is refused before anything is written to it.
+    #[test]
+    fn a_control_socket_served_from_another_pid_namespace_is_refused() {
+        const SERVE: &str = "import socket,sys\n\
+            s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(4)\n\
+            while True:\n    c,_=s.accept(); c.sendall(b'ok\\n'); c.close()\n";
+        let data = crate::testutil::TmpDir::new();
+        let socket = data.path().join("control-1.sock");
+        let child = std::process::Command::new("unshare")
+            .args([
+                "-Urp",
+                "--kill-child",
+                "--mount-proc",
+                "python3",
+                "-I",
+                "-c",
+                SERVE,
+            ])
+            .arg(&socket)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(child) = child else {
+            skip_incapable!("skipping the foreign-namespace server test: `unshare` cannot run");
+            return;
+        };
+        /// `unshare --kill-child` takes the listener down with it.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Reap(child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() && Instant::now() < deadline {
+            if child.0.try_wait().is_ok_and(|s| s.is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !socket.exists() {
+            skip_incapable!(
+                "skipping the foreign-namespace server test: no listener came up under `unshare \
+                 -Urp` (no user namespaces, or no python3)"
+            );
+            return;
+        }
+        let Err(err) = connect(&socket, Duration::from_secs(2)) else {
+            panic!("a server outside this PID namespace is refused");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(
+            err.to_string().contains("outside this PID namespace"),
+            "{err}"
+        );
+
+        // The same check admits a server in this namespace.
+        let own = data.path().join("control-2.sock");
+        let _listener = UnixListener::bind(&own).unwrap();
+        assert!(connect(&own, Duration::from_secs(2)).is_ok());
     }
 
     #[test]

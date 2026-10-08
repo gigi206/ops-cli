@@ -115,6 +115,38 @@ impl PeerGate {
     }
 }
 
+/// The same check from the other end: whether the server a host-side client has just connected to
+/// runs in this process's PID namespace, as the supervisor that bound the socket does.
+///
+/// A socket's peer, seen from the connecting side, is the process that listens on it. The launcher
+/// shows a cage sbx's directories read-only at most, so a cage cannot put a socket of its own, or a
+/// symlink to one, where the client looks for a session's. This is the second barrier behind that
+/// one, for a view that would ever let it: the client would otherwise hand such a socket the
+/// verdicts and rules it sends, and believe what it answers, and the server's own check is no help
+/// there, since the cage would run that server. The rule is the server's: a client and a supervisor
+/// the server would admit share one namespace, so nothing that works today is refused.
+///
+/// A server that has exited reads as a connection refused, which callers already take for a session
+/// that is gone; anything short of knowing the server is in this namespace refuses with the reason.
+pub(super) fn check_server(stream: &UnixStream) -> io::Result<()> {
+    match verdict(stream, true) {
+        Verdict::Admit => Ok(()),
+        Verdict::Gone => Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "the control socket's server has exited",
+        )),
+        Verdict::Outside => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the control socket is served from outside this PID namespace, as a cage would serve \
+             it",
+        )),
+        Verdict::Unnamed(why) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("the PID namespace of the control socket's server could not be read ({why})"),
+        )),
+    }
+}
+
 /// Name the peer of `stream` and compare its depth with this process's own, both read the same way
 /// from the same `/proc`. `peer_pidfd` is false only in the test that runs the pre-6.5 path.
 fn verdict(stream: &UnixStream, peer_pidfd: bool) -> Verdict {
