@@ -200,42 +200,62 @@ pub(crate) fn flock_at(
     exclusive: bool,
     waiting: Option<&dyn Fn(&Path)>,
 ) -> io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
+    if let Some(waiting) = waiting {
+        if let Some(file) = try_flock_at(path, exclusive)? {
+            return Ok(file);
+        }
+        waiting(path);
+    }
+    let file = open_lock_file(path)?;
+    // SAFETY: `flock` on a valid owned fd; it blocks until the lock is granted and returns 0 on
+    // success. The fd lives in the returned file, so the lock is held until the file is dropped.
+    if unsafe { libc::flock(file.as_raw_fd(), lock_op(exclusive)) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// [`flock_at`] without the wait: the lock held, or `None` when another open of the file holds it.
+/// For a claim that refuses rather than queues.
+pub(crate) fn try_flock_at(path: &Path, exclusive: bool) -> io::Result<Option<fs::File>> {
+    use std::os::unix::io::AsRawFd;
+    let file = open_lock_file(path)?;
+    // SAFETY: `flock` on a valid owned fd; with `LOCK_NB` it returns at once, 0 when granted.
+    if unsafe { libc::flock(file.as_raw_fd(), lock_op(exclusive) | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let busy = io::Error::last_os_error();
+    match busy.raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Ok(None),
+        _ => Err(busy),
+    }
+}
+
+/// The lock file at `path`, created owner-only with its parent if absent.
+fn open_lock_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
         DirBuilder::new()
             .recursive(true)
             .mode(DIR_MODE)
             .create(parent)?;
     }
-    let file = fs::OpenOptions::new()
+    fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .mode(0o600)
-        .open(path)?;
-    let op = if exclusive {
+        .open(path)
+}
+
+/// The `flock` operation for a shared or an exclusive hold.
+fn lock_op(exclusive: bool) -> libc::c_int {
+    if exclusive {
         libc::LOCK_EX
     } else {
         libc::LOCK_SH
-    };
-    if let Some(waiting) = waiting {
-        // SAFETY: `flock` on a valid owned fd; with `LOCK_NB` it returns at once, 0 when granted.
-        if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
-            return Ok(file);
-        }
-        let busy = io::Error::last_os_error();
-        if busy.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(busy);
-        }
-        waiting(path);
     }
-    // SAFETY: `flock` on a valid owned fd; it blocks until the lock is granted and returns 0 on
-    // success. The fd lives in the returned file, so the lock is held until the file is dropped.
-    if unsafe { libc::flock(file.as_raw_fd(), op) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(file)
 }
 
 /// Take the shared-store gc lock **shared** — for a seed's read of the shared store. Many seeds may
