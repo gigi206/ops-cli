@@ -2720,6 +2720,35 @@ fn a_mount_that_would_hide_the_distributions_own_directory_is_refused() {
     );
 }
 
+/// A destination that is not an absolute path from the cage's root, or that climbs with `..`, is
+/// refused before anything is decided or created for it: every rule that places a mount reads a
+/// destination's ancestors and its first component, and for `srv/data` those would have named
+/// `/data`, a directory created in the shared tree for a path nobody wrote.
+#[test]
+fn a_destination_that_is_not_an_absolute_cage_path_is_refused() {
+    let tmp = crate::testutil::TmpDir::new();
+    let rootfs = image_like(tmp.path());
+    for dest in ["srv/data", "/srv/../etc/data"] {
+        let bind = ExtraBind {
+            src: PathBuf::from("/host/data"),
+            dest: PathBuf::from(dest),
+            writable: false,
+        };
+        let err =
+            crate::sandbox::binds::distro_writable(&rootfs, Path::new("/home/u/proj"), &[bind])
+                .expect_err("a destination the rules cannot read is refused");
+        assert!(
+            err.to_string()
+                .contains("is not a path a mount can be given"),
+            "{dest}: {err}"
+        );
+    }
+    assert!(
+        !rootfs.join("data").exists(),
+        "nothing was created in the tree for them"
+    );
+}
+
 /// The host's runtime directory under an image whose `/run` is populated: the one directory the
 /// image lacks, `/run/user`, is created and covered, so a brokered socket, the Wayland socket or the
 /// ssh agent can land below it. The uid is never written into the shared tree, and nothing of the
