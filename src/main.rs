@@ -1919,7 +1919,19 @@ fn probe_userns() -> Userns {
             -1 => Userns::Unsupported,
             pid => {
                 let mut status: libc::c_int = 0;
-                if libc::waitpid(pid, &mut status, 0) == -1 || !libc::WIFEXITED(status) {
+                // A signal caught while the child is being reaped interrupts the wait without
+                // ending it. Asked again rather than read as an unsupported namespace, which
+                // would also leave the child unreaped.
+                let reaped = loop {
+                    let reaped = libc::waitpid(pid, &mut status, 0);
+                    if reaped == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                    {
+                        continue;
+                    }
+                    break reaped;
+                };
+                if reaped == -1 || !libc::WIFEXITED(status) {
                     return Userns::Unsupported;
                 }
                 classify_probe_exit(libc::WEXITSTATUS(status))
