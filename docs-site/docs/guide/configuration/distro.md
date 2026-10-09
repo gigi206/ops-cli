@@ -221,6 +221,13 @@ the image's own read-only tree, which the kernel refuses. So a missing one would
 cage without it, and the failure would surface much later as an exec error naming a path
 nobody declared. The launch stops instead, and names every path the image lacks.
 
+Each path is looked up as the cage will see it: a symbolic link in the image, `/lib64` pointing
+at `/usr/lib64` for instance, is followed inside the image, never on your host, so the host's own
+loader cannot make an image without one pass, and a link to a directory your host lacks does not
+make a valid image fail. The last component may itself be a link, wherever it points. This needs
+a kernel that resolves a path beneath a root (`openat2`, Linux 5.6); on an older one the image is
+refused with that reason.
+
 The criterion is a glibc userland that ships `bash`: `debian:10-slim` satisfies it, and a
 bare `alpine` does not, shipping neither `bash` nor a glibc loader. An image of your own
 that adds what is missing is the answer there, and the refusal names exactly what to add.

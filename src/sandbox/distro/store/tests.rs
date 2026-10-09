@@ -385,3 +385,55 @@ fn a_lookup_that_fails_is_not_a_missing_path() {
     let err = check_supplied(&file, "oci:x/y:1").expect_err("no loader under a file");
     assert!(err.to_string().contains("does not carry"), "{err}");
 }
+
+/// What an image supplies is looked up as the cage will see it: a link in the image reads an
+/// absolute target as the image's own path, never the host's. Looked up on the host, an image with
+/// no loader passed through the host's `/usr/lib64` (on a host that carries one, as most do), and a
+/// valid image whose `lib64` names `/opt/l64` was refused on a host without that directory.
+#[test]
+fn an_images_links_are_followed_inside_the_image_not_on_the_host() {
+    let tmp = crate::testutil::TmpDir::new();
+    let image = |name: &str| {
+        let rootfs = tmp.join(name).join("rootfs");
+        for dir in ["bin", "usr/bin", "etc"] {
+            std::fs::create_dir_all(rootfs.join(dir)).unwrap();
+        }
+        for file in [
+            "bin/sh",
+            "bin/bash",
+            "usr/bin/env",
+            "usr/bin/ldd",
+            "etc/localtime",
+        ] {
+            std::fs::write(rootfs.join(file), "").unwrap();
+        }
+        rootfs
+    };
+
+    let borrowed = image("borrowed");
+    std::os::unix::fs::symlink("/usr/lib64", borrowed.join("lib64")).unwrap();
+    let err =
+        check_supplied(&borrowed, "oci:x/y:1").expect_err("the host's loader is not the image's");
+    assert!(
+        err.to_string()
+            .contains("does not carry /lib64/ld-linux-x86-64.so.2"),
+        "{err}"
+    );
+
+    let elsewhere = image("elsewhere");
+    std::fs::create_dir_all(elsewhere.join("opt/l64")).unwrap();
+    std::fs::write(elsewhere.join("opt/l64/ld-linux-x86-64.so.2"), "").unwrap();
+    std::os::unix::fs::symlink("/opt/l64", elsewhere.join("lib64")).unwrap();
+    check_supplied(&elsewhere, "oci:x/y:1").expect("the loader the image's own link names");
+
+    let debian = image("debian");
+    std::fs::create_dir_all(debian.join("lib64")).unwrap();
+    std::fs::create_dir_all(debian.join("lib/x86_64-linux-gnu")).unwrap();
+    std::fs::write(debian.join("lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"), "").unwrap();
+    std::os::unix::fs::symlink(
+        "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        debian.join("lib64/ld-linux-x86-64.so.2"),
+    )
+    .unwrap();
+    check_supplied(&debian, "oci:x/y:1").expect("a loader that is an absolute link in the image");
+}
