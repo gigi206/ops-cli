@@ -749,16 +749,29 @@ pub(super) fn serve_tunneled_request(
         // like a dead connection), and a healthy connection reaches the relay untouched. Only the
         // attempt that survives is counted on the flow.
         loop {
-            match upstream.write_all(req) {
+            // The flush is part of the write: a parked connection that fails it is as gone as one
+            // that fails the write, and is retried below like it.
+            match upstream.write_all(req).and_then(|()| upstream.flush()) {
                 Ok(()) => {
-                    upstream.flush().ok();
                     begin_response_stream(&upstream.sock);
                     if !from_pool || upstream_spoke(&upstream.sock) {
                         break;
                     }
                 }
-                // A fresh connection that will not take the request is a real error and stays one.
-                Err(e) if !from_pool => return Err(e),
+                // A fresh connection that will not take the request closed under it: refused with
+                // the reason the relay gives the same event, rather than dropped with no status and
+                // no line beside the allow already recorded.
+                Err(_) if !from_pool => {
+                    return Turn::closing(NoFinalHead::UpstreamClosed.refuse(
+                        br.get_mut(),
+                        ctx,
+                        crate::sandbox::control::Proto::Https,
+                        connect_host,
+                        port,
+                        &imethod,
+                        &itarget,
+                    ));
+                }
                 // A parked one that will not is the same event as one that takes the request and
                 // then answers nothing: the far side is gone. It surfaces here rather than at the
                 // peek when the close arrived as a reset instead of a clean shutdown, and letting
@@ -813,7 +826,17 @@ pub(super) fn serve_tunneled_request(
         // A body the proxy does not hold: forwarded straight from the client, on its own connection.
         let reserialized =
             reserialize_request(&inner, &injected, None, keep_alive, masks_reflection);
-        upstream.write_all(&reserialized)?;
+        if upstream.write_all(&reserialized).is_err() {
+            return Turn::closing(NoFinalHead::UpstreamClosed.refuse(
+                br.get_mut(),
+                ctx,
+                crate::sandbox::control::Proto::Https,
+                connect_host,
+                port,
+                &imethod,
+                &itarget,
+            ));
+        }
         flow.up
             .fetch_add(reserialized.len() as u64, Ordering::Relaxed);
         // If the client announced `Expect: 100-continue` it withholds the body until it sees a 100.
@@ -827,6 +850,9 @@ pub(super) fn serve_tunneled_request(
             let _ = client.flush();
         }
         // The body is teed as it is relayed — a pass-through, so the forwarded stream is unchanged.
+        // A failure here may be either side's, a client that stopped sending or an upstream that
+        // stopped taking, so it stays the dropped connection rather than a refusal blaming the
+        // upstream.
         copy_exact(
             &mut tee_request_body(&mut br, capture.as_ref()),
             &mut upstream,
@@ -834,7 +860,17 @@ pub(super) fn serve_tunneled_request(
         )?;
         // Count the forwarded body (`copy_exact` moved exactly `body_len` bytes upstream).
         flow.up.fetch_add(body_len, Ordering::Relaxed);
-        upstream.flush().ok();
+        if upstream.flush().is_err() {
+            return Turn::closing(NoFinalHead::UpstreamClosed.refuse(
+                br.get_mut(),
+                ctx,
+                crate::sandbox::control::Proto::Https,
+                connect_host,
+                port,
+                &imethod,
+                &itarget,
+            ));
+        }
         // The request is permitted and fully forwarded; the response may now idle between bursts (a
         // streamed completion), so lift the upstream read timeout for the relay below.
         begin_response_stream(&upstream.sock);
@@ -892,21 +928,15 @@ pub(super) fn serve_tunneled_request(
     // between the pool's probe and the write. Which cause it was, and the words for it, come from
     // the relay ([`NoFinalHead`]).
     if let Some(why) = no_final {
-        ctx.push_log(
+        return Turn::closing(why.refuse(
+            br.get_mut(),
+            ctx,
             crate::sandbox::control::Proto::Https,
             connect_host,
             port,
-            Some(&imethod),
-            Some(&itarget),
-            crate::sandbox::control::LogVerdict::Error,
-            why.tag(),
-        );
-        return respond_refusal_tls(
-            &mut br,
-            "502 Bad Gateway",
-            why.tag(),
-            &why.sentence(connect_host),
-        );
+            &imethod,
+            &itarget,
+        ));
     }
     // Record only a FINAL status (>= 200). Any interim 1xx was relayed and read past above, so what
     // is left is the request's real outcome; a head cut short parses to nothing and simply leaves
