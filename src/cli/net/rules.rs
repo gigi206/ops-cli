@@ -569,9 +569,7 @@ fn net_inject_session(
     };
 
     let context = pending_session_context(&data_dir);
-    let mut loaded: Vec<u32> = Vec::new();
-    let mut refused: Vec<u32> = Vec::new();
-    let mut unconfirmed: Vec<u32> = Vec::new();
+    let mut report = LoadReport::default();
     for pid in sandbox::control::session_pids(&data_dir) {
         if !in_scope(pid, &project_pids, &app_pids) {
             continue;
@@ -591,18 +589,24 @@ fn net_inject_session(
             }
         };
         match injected {
-            Ok(sandbox::control::InjectOutcome::Loaded) => loaded.push(pid),
-            Ok(sandbox::control::InjectOutcome::Refused) => refused.push(pid),
-            Ok(sandbox::control::InjectOutcome::Unconfirmed) => unconfirmed.push(pid),
-            // A dead/stale socket (the session went away) — skip it.
-            Err(_) => {}
+            Ok(sandbox::control::InjectOutcome::Loaded) => report.loaded.push(pid),
+            Ok(sandbox::control::InjectOutcome::Refused) => report.refused.push(pid),
+            Ok(sandbox::control::InjectOutcome::Unconfirmed) => report.unconfirmed.push(pid),
+            // The session ended between the directory read and the load.
+            Err(e) if sandbox::control::session_gone(&e) => {}
+            // Reached or not, it did not say whether it took the rule: named, so a load that may not
+            // be in force there does not read as one that reached nothing.
+            Err(e) => report.unread.push((pid, e)),
         }
     }
     // What was loaded is the answer, on stdout; what was not is said on stderr, as the `[proc]` load
     // and a config write say it, so a script reading stdout never takes a shortfall for a load.
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    out!("{}", render_inject(verb, rule, &loaded, &context, &pal));
-    let (errors, hint) = inject_shortfall(verb, rule, all, app, &loaded, &refused, &unconfirmed);
+    out!(
+        "{}",
+        render_inject(verb, rule, &report.loaded, &context, &pal)
+    );
+    let (errors, hint) = inject_shortfall(verb, rule, all, app, &report);
     for error in &errors {
         diag::error(error);
     }
@@ -610,8 +614,26 @@ fn net_inject_session(
         diag::hint(&hint);
     }
     // A session in scope that does not hold the rule, or a load that reached none, is not a success
-    // a script may go on from.
-    crate::session_load_code(loaded.len(), refused.len(), unconfirmed.len())
+    // a script may go on from. One that could not be asked is in the state an unconfirmed one is in:
+    // whether the rule decides its requests is not known, and running the load again settles it.
+    crate::session_load_code(
+        report.loaded.len(),
+        report.refused.len(),
+        report.unconfirmed.len() + report.unread.len(),
+    )
+}
+
+/// How the sessions in scope answered one `--session` rule load, each pid in one list.
+#[derive(Default)]
+struct LoadReport {
+    /// Took the rule: their proxy decides requests by it.
+    loaded: Vec<u32>,
+    /// Refused it: an older server, or a rule it could not classify.
+    refused: Vec<u32>,
+    /// Kept it, and their proxy did not confirm it decides requests.
+    unconfirmed: Vec<u32>,
+    /// Could not be asked, each with why: whether they hold the rule is not known.
+    unread: Vec<(u32, std::io::Error)>,
 }
 
 /// Render what a `--session` rule load loaded: the live sessions that took the rule, with their
@@ -659,20 +681,24 @@ fn render_inject(
     o
 }
 
-/// What a `--session` rule load did not apply, as the errors and the hint stderr carries: the
-/// sessions an older server refused it in, the ones that kept it without their proxy confirming it
-/// decides requests, and, when no session in scope took it at all, that fact and the config write
-/// that persists the rule instead. The hint carries the `--app <name>` scope when one was given, so
+/// What a `--session` rule load did not apply ([`LoadReport`]), as the errors and the hint stderr
+/// carries: the sessions an older server refused it in, the ones that kept it without their proxy
+/// confirming it decides requests, the ones that could not be asked, each with why, and, when no
+/// session in scope took it at all, that fact and the config write that persists the rule instead. The hint carries the `--app <name>` scope when one was given, so
 /// it can be pasted as it is.
 fn inject_shortfall(
     verb: &str,
     rule: &str,
     all: bool,
     app: Option<&str>,
-    loaded: &[u32],
-    refused: &[u32],
-    unconfirmed: &[u32],
+    report: &LoadReport,
 ) -> (Vec<String>, Option<String>) {
+    let LoadReport {
+        loaded,
+        refused,
+        unconfirmed,
+        unread,
+    } = report;
     let pids = |pids: &[u32]| {
         pids.iter()
             .map(u32::to_string)
@@ -693,11 +719,17 @@ fn inject_shortfall(
             pids(unconfirmed)
         ));
     }
+    for (pid, e) in unread {
+        errors.push(format!(
+            "sbx: session {pid} could not be asked to load the rule ({e}), so whether it holds it \
+             is not known — run the command again once it answers."
+        ));
+    }
     if !loaded.is_empty() {
         return (errors, None);
     }
     // Nothing took the rule: no session with egress filtering is running in scope.
-    if refused.is_empty() && unconfirmed.is_empty() {
+    if refused.is_empty() && unconfirmed.is_empty() && unread.is_empty() {
         let scope = match (app, all) {
             (Some(a), _) => format!("app `{a}`"),
             (None, true) => "any session".to_string(),
@@ -756,6 +788,21 @@ fn persist_egress_removal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A [`LoadReport`] of the four lists.
+    fn report<const N: usize>(
+        loaded: &[u32],
+        refused: &[u32],
+        unconfirmed: &[u32],
+        unread: [(u32, std::io::Error); N],
+    ) -> LoadReport {
+        LoadReport {
+            loaded: loaded.to_vec(),
+            refused: refused.to_vec(),
+            unconfirmed: unconfirmed.to_vec(),
+            unread: unread.into(),
+        }
+    }
 
     /// A session gone between the registry read and the query is passed over in silence; one that
     /// could not be asked for another reason is named and makes the listing incomplete, rather than
@@ -849,18 +896,24 @@ mod tests {
     fn a_session_load_says_on_stderr_what_it_did_not_apply() {
         // Loaded everywhere: nothing to say on stderr.
         assert_eq!(
-            inject_shortfall("allow", "a.test", false, None, &[7], &[], &[]),
+            inject_shortfall("allow", "a.test", false, None, &report(&[7], &[], &[], [])),
             (Vec::new(), None)
         );
         // Loaded in one, refused and unconfirmed in others: both named, no hint.
-        let (errors, hint) = inject_shortfall("deny", "a.test", true, None, &[7], &[8], &[9]);
+        let (errors, hint) =
+            inject_shortfall("deny", "a.test", true, None, &report(&[7], &[8], &[9], []));
         assert_eq!(errors.len(), 2, "{errors:?}");
         assert!(errors[0].starts_with("sbx: session(s) 8 refused the rule"));
         assert!(errors[1].starts_with("sbx: session(s) 9 kept the rule"));
         assert_eq!(hint, None);
         // Reached none: the scope it looked in, then the config write that persists the rule.
-        let (errors, hint) =
-            inject_shortfall("mute", "a.test", false, Some("agent"), &[], &[], &[]);
+        let (errors, hint) = inject_shortfall(
+            "mute",
+            "a.test",
+            false,
+            Some("agent"),
+            &report(&[], &[], &[], []),
+        );
         assert_eq!(
             errors,
             [
@@ -875,7 +928,8 @@ mod tests {
             )
         );
         // Refused everywhere it reached: the refusal stands for "no session", the hint still follows.
-        let (errors, hint) = inject_shortfall("allow", "a.test", false, None, &[], &[8], &[]);
+        let (errors, hint) =
+            inject_shortfall("allow", "a.test", false, None, &report(&[], &[8], &[], []));
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(hint.is_some());
         // Stdout carries the load alone, and nothing when none took the rule.
@@ -915,6 +969,56 @@ mod tests {
             }
             assert_eq!(code, ExitCode::FAILURE, "sessions answering {replies:?}");
         }
+    }
+
+    /// A session in scope that could not be asked to load the rule is named on stderr and exits 2,
+    /// and the load does not say no session was reachable: whether the rule decides that session's
+    /// requests is not known. The session is a socket nobody may connect to, an error that is not a
+    /// session gone.
+    #[test]
+    fn a_session_that_could_not_be_asked_to_load_a_rule_is_named_and_exits_2() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let _data_var = EnvVar::set("SBX_DATA_DIR", data.path());
+        let egress = data.path().join("egress");
+        std::fs::create_dir_all(&egress).expect("create the control directory");
+        let socket = egress.join("control-424260.sock");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("bind the stand-in socket");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000))
+            .expect("close the socket to every connect");
+
+        let code = net_inject_session(
+            config::manage::EgressList::Deny,
+            "api.test",
+            true,
+            None,
+            data.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
+
+        let unread = [(
+            424_260,
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path too long"),
+        )];
+        let (errors, hint) = inject_shortfall(
+            "deny",
+            "api.test",
+            true,
+            None,
+            &report(&[], &[], &[], unread),
+        );
+        assert_eq!(
+            errors,
+            [
+                "sbx: session 424260 could not be asked to load the rule (path too long), so \
+                 whether it holds it is not known — run the command again once it answers."
+            ]
+        );
+        assert!(hint.is_some());
     }
 
     #[test]
