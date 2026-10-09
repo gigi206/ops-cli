@@ -873,6 +873,28 @@ fn write_exec_event(
 mod tests {
     use super::*;
 
+    /// `sbx proc rules` takes every session it lists from the registry, `--all` included, so a
+    /// registry that cannot be read fails the listing rather than showing no rules. Against a
+    /// registry that does not exist yet the same listing succeeds with nothing to show.
+    #[test]
+    fn the_rules_listing_fails_on_an_unreadable_registry() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        let _env = env_lock();
+        let data = TmpDir::new();
+        let _dir = EnvVar::set("SBX_DATA_DIR", data.path());
+        assert!(
+            crate::store::Layout::from_env().is_some(),
+            "the data directory is one sbx accepts"
+        );
+        let all = [OsString::from("--all")];
+        assert!(
+            proc_rules(&all) == ExitCode::SUCCESS,
+            "no sessions, no rules"
+        );
+        std::fs::write(data.join("sessions"), b"not a directory").unwrap();
+        assert!(proc_rules(&all) == ExitCode::FAILURE);
+    }
+
     #[test]
     fn parse_proc_live_args_defaults_id_and_flags() {
         let osv = |xs: &[&str]| xs.iter().map(OsString::from).collect::<Vec<_>>();
