@@ -719,11 +719,24 @@ pub(crate) fn rm_apply(targeted: bool, bulk: bool, dry_run: bool, yes: bool) -> 
     Some(targeted && !bulk)
 }
 
-/// Whether `sbx projects rm <id>` must refuse `id` because it is the tree of the current working
-/// directory — deleting the store and home you are standing in — unless `--force` overrides it.
-/// `current` is [`crate::current_project_id`]; `None` (cwd unresolvable) never guards.
-fn rm_refuses_current(id: &str, current: Option<&str>, force: bool) -> bool {
-    !force && current == Some(id)
+/// Why `sbx projects rm <id>` refuses `id` as the tree of the current working directory — deleting
+/// the store and home you are standing in — unless `--force` overrides it, or `None` when it does
+/// not. `current` is [`crate::current_project_identity`]: a working directory that cannot be
+/// resolved is a current project that cannot be ruled out, so it refuses too, naming why.
+fn rm_refuses_current(id: &str, current: &Result<String, String>, force: bool) -> Option<String> {
+    if force {
+        return None;
+    }
+    match current {
+        Ok(current) if current == id => Some(format!(
+            "sbx projects rm: `{id}` is the current project — refusing without `--force`."
+        )),
+        Ok(_) => None,
+        Err(why) => Some(format!(
+            "sbx projects rm: cannot tell whether `{id}` is the current project ({why}) — \
+             refusing without `--force`."
+        )),
+    }
 }
 
 /// Remove named project trees and/or sweep the dead/markerless ones — `sbx projects rm`. Each named
@@ -777,7 +790,7 @@ pub(crate) fn projects_rm(
             std::collections::BTreeSet::new()
         }
     };
-    let current = crate::current_project_id();
+    let current = crate::current_project_identity();
     let projects_dir = layout.data_dir().join("projects");
     // Probed once for every id named, before any removal: what each gives back is sized first.
     let reclaim = super::gc::Reclaim::for_layout(&layout);
@@ -795,10 +808,8 @@ pub(crate) fn projects_rm(
         }
         // Guard the tree you are standing in: an idle current project is not `Live`, so naming its
         // exact id would delete the store and home of this very directory. `--force` is the opt-in.
-        if rm_refuses_current(id, current.as_deref(), force) {
-            crate::diag::error(&format!(
-                "sbx projects rm: `{id}` is the current project — refusing without `--force`."
-            ));
+        if let Some(refusal) = rm_refuses_current(id, &current, force) {
+            crate::diag::error(&refusal);
             had_error = true;
             continue;
         }
@@ -910,12 +921,21 @@ mod projects_rm_tests {
 
     #[test]
     fn the_current_project_tree_is_refused_unless_forced() {
+        let here = |id: &str| Ok::<String, String>(id.to_string());
         // The id matches the cwd's tree: refuse without --force, allow with it.
-        assert!(rm_refuses_current("abc", Some("abc"), false));
-        assert!(!rm_refuses_current("abc", Some("abc"), true));
-        // A different tree, or an unresolvable cwd, never guards.
-        assert!(!rm_refuses_current("abc", Some("def"), false));
-        assert!(!rm_refuses_current("abc", None, false));
+        assert!(rm_refuses_current("abc", &here("abc"), false).is_some());
+        assert!(rm_refuses_current("abc", &here("abc"), true).is_none());
+        // A different tree never guards.
+        assert!(rm_refuses_current("abc", &here("def"), false).is_none());
+        // An unresolvable cwd is a current project that cannot be ruled out: refused, naming why,
+        // unless forced.
+        let unknown = Err("`/gone` cannot be resolved: No such file or directory".to_string());
+        let refusal = rm_refuses_current("abc", &unknown, false).expect("refused");
+        assert!(
+            refusal.contains("/gone") && refusal.contains("--force"),
+            "{refusal}"
+        );
+        assert!(rm_refuses_current("abc", &unknown, true).is_none());
     }
 }
 
