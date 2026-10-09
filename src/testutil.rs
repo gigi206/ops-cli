@@ -1572,15 +1572,20 @@ fn every_fixture_root_is_the_shared_one() {
 /// one's. And every process running the suite writes that one absolute path at the same moment.
 ///
 /// The rule is narrow, and worth stating as exactly what it is: **no line of code joins or pushes a
-/// literal component beginning with `..`**. A traversal assembled any other way — through
+/// literal whose first component is `..`**, and a file named `...toml`, which begins with the same
+/// two dots and leaves nothing, is not one. A traversal assembled any other way — through
 /// [`Path::parent`], a `format!`, or a `PathBuf` built up piece by piece — walks past this sweep
 /// untouched. Prose may still name the shape; a comment describing a traversal is not one.
 #[test]
 fn nothing_joins_a_path_that_traverses_out_of_the_one_it_is_joined_to() {
     // Assembled at runtime, so this file does not match its own needles.
-    let (join, push) = (format!(".join(\"{}", ".."), format!(".push(\"{}", ".."));
+    // `..` as the literal's first component: followed by a separator or by the literal's end.
+    let needles: Vec<String> = [".join(\"", ".push(\""]
+        .iter()
+        .flat_map(|call| ["/", "\""].map(|end| format!("{call}{}{end}", "..")))
+        .collect();
     let offends = |line: &str| {
-        !line.trim_start().starts_with("//") && (line.contains(&join) || line.contains(&push))
+        !line.trim_start().starts_with("//") && needles.iter().any(|n| line.contains(n.as_str()))
     };
 
     // The predicate answers both ways before it is trusted on the tree: one that recognised nothing,
@@ -1603,6 +1608,11 @@ fn nothing_joins_a_path_that_traverses_out_of_the_one_it_is_joined_to() {
         "the sweep sees only one of the two spellings"
     );
     assert!(!offends(&prose), "prose naming the shape is not the shape");
+    let dotted_name = format!("let f = dir.join(\"{}.toml\");", "..");
+    assert!(
+        !offends(&dotted_name),
+        "a file name that begins with two dots is not a traversal"
+    );
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let (mut traversing, mut files) = (Vec::new(), 0);
