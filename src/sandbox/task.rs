@@ -2037,22 +2037,36 @@ struct OutputClaim {
 
 impl OutputClaim {
     /// What the directory holds now, in bytes — reported so a caller learns an artifact was produced
-    /// without having to go and look.
+    /// without having to go and look. A link is counted as nothing and never followed: neither
+    /// `DirEntry::file_type` nor `DirEntry::metadata` traverses one. What is counted is what could
+    /// be read: an entry the command made unreadable, or nested deeper than a path can name, is
+    /// passed over, so the figure is a floor and can be 0 beside artifacts that exist — entries the
+    /// agent, reading the same tree as the same user, could not read either. Read by path, which
+    /// holds while no cage writes the tree: it is called once the command has ended, under the
+    /// invocation's claim on the directory.
+    ///
+    /// Walked with a list of directories still to read rather than by recursion: the tree is the
+    /// task's command's to shape, and a recursion as deep as it nests ran on the thread of the
+    /// invocation, a detached one's carrying the default 2 MiB stack, where an overflow aborts the
+    /// session's whole process.
     fn size(&self) -> u64 {
-        fn walk(dir: &Path) -> u64 {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return 0;
+        let mut total = 0u64;
+        let mut pending = vec![self.dir.clone()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
             };
-            entries
-                .flatten()
-                .map(|e| match e.file_type() {
-                    Ok(t) if t.is_dir() => walk(&e.path()),
-                    Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
-                    _ => 0,
-                })
-                .sum()
+            for e in entries.flatten() {
+                match e.file_type() {
+                    Ok(t) if t.is_dir() => pending.push(e.path()),
+                    Ok(t) if t.is_file() => {
+                        total = total.saturating_add(e.metadata().map(|m| m.len()).unwrap_or(0));
+                    }
+                    _ => {}
+                }
+            }
         }
-        walk(&self.dir)
+        total
     }
 }
 
