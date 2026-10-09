@@ -881,6 +881,14 @@ pub(crate) fn query_manual(data_dir: &Path, pid: u32) -> io::Result<Vec<ManualRu
     let mut rules = Vec::new();
     for line in crate::sandbox::reply::answer(BufReader::new(&stream)) {
         let line = line?;
+        // An `err` ends the answer before any rule: read as a whole one, it would list a session
+        // that refused as one holding no rule.
+        if line.starts_with("err ") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the session answered `{}`", crate::sandbox::sanitize(&line)),
+            ));
+        }
         // The rule text is everything after the kind prefix — taken as the whole remainder, so a
         // rule carrying whitespace (a `re:` regex loaded with `--session`) round-trips intact.
         if let Some(rule) = line.strip_prefix("manual allow ") {
@@ -1045,6 +1053,25 @@ mod tests {
             panic!("the session is reported: {:?}", swept.unread);
         };
         assert_eq!(*pid, 5);
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+    }
+
+    /// A session that answers `RULES` with an error is reported, not listed as holding no rule.
+    #[test]
+    fn live_rules_answered_with_an_error_are_reported_and_not_read_as_none() {
+        let data = crate::testutil::TmpDir::new();
+        std::fs::create_dir(control_dir(data.path())).unwrap();
+        let listener = UnixListener::bind(control_socket(data.path(), 6)).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            (&stream).write_all(b"err unknown command\n").unwrap();
+        });
+        let Err(e) = query_manual(data.path(), 6) else {
+            panic!("an error answer must not read as a list");
+        };
+        server.join().unwrap();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
     }
 
