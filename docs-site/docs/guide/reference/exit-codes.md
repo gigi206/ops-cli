@@ -80,7 +80,8 @@ A `--session` rule load is not a name either. `sbx net allow|deny|mute --session
 allow|deny --session` load a rule into the live sessions in scope, and exit 1 when that reached
 none or a session refused the rule, since the rule is then not in force where it was meant to
 be. A session whose proxy kept an egress rule without confirming it exits 2, as the
-[`sbx net pending`](../cli/net#sbx-net-pending) answers do.
+[`sbx net pending`](../cli/net#sbx-net-pending) answers do, and so does one that could not be
+asked whether it took the rule.
 
 A view given no session id reads the session of the project it runs in: `sbx logs`, `sbx proc
 ls|live|logs`, `sbx fs logs` and `sbx ssh-agent logs`. When that project has no session to
