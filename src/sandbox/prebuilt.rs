@@ -1159,6 +1159,12 @@ where
         // the mint would drop that pin, and the package would silently re-resolve and re-pin on the
         // next launch — a second trust-on-first-use, and a network round-trip on a path documented
         // as offline. Re-reading and merging just this key keeps the other one.
+        // Under the lock's writer guard, so another writer cannot land between this re-read and
+        // the write below.
+        let _writing = crate::store::hold_lock_for_write(
+            &lock_path(ctx.layout, project_id.as_str(), &lock_file),
+            &crate::store::waiting_for_writer("the package lock"),
+        )?;
         let mut disk = read_pins(ctx.layout, project_id.as_str(), &lock_file)?;
         if let Some(entry) = lock.get(key) {
             disk.insert(key.to_string(), entry.clone());
@@ -1464,6 +1470,12 @@ pub(crate) fn upgrade(
     if !mode.applies() {
         return Ok(outcomes);
     }
+    // Under the lock's writer guard: the compare and swap below holds against a writer that has
+    // finished, and the guard against one that would write between this re-read and the write.
+    let _writing = crate::store::hold_lock_for_write(
+        &lock_path(layout, project_id, &lock_file),
+        &crate::store::waiting_for_writer("the package lock"),
+    )?;
     let mut disk = read_pins(layout, project_id, &lock_file)?;
     let before = disk.clone();
     for (key, previous) in pruned {
