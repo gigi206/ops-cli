@@ -532,13 +532,20 @@ fn sync_filesystem_of(path: &Path) -> io::Result<()> {
 /// names `/opt/…` was refused on a host without that directory. A kernel without `openat2` cannot
 /// resolve this way, and the check refuses rather than resolving on the host.
 fn check_supplied(rootfs: &Path, locator: &str) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::fd::FromRawFd as _;
     const DIR: libc::c_int = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    let root: std::os::fd::OwnedFd = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
-        .open(rootfs)?
-        .into();
+    // Opened by the syscall rather than through `OpenOptions::custom_flags`, which masks `O_PATH`
+    // out on musl, the target this binary ships as ([`crate::sandbox::forward::dial_cage_socket`]
+    // says how).
+    let c_root = std::ffi::CString::new(rootfs.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the image path holds a NUL"))?;
+    // SAFETY: `open` reads the NUL-terminated path and returns a fresh descriptor or -1.
+    let root = unsafe { libc::open(c_root.as_ptr(), DIR) };
+    if root < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor `open` returned above, owned from here on.
+    let root = unsafe { std::os::fd::OwnedFd::from_raw_fd(root) };
     let mut missing: Vec<&str> = Vec::new();
     for p in crate::sandbox::binds::DISTRO_SUPPLIED.iter().copied() {
         let relative = Path::new(p.trim_start_matches('/'));
