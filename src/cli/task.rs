@@ -323,6 +323,15 @@ fn key_values(fields: &[String]) -> BTreeMap<&str, &str> {
     fields.iter().filter_map(|f| f.split_once('=')).collect()
 }
 
+/// The operation a `secrets` row belongs to: its `task=` field, read among the fields between the
+/// variable's name and the trailing description. The description is free text the operator wrote
+/// and may itself read `task=<name>`, so it is never searched.
+fn secret_row_task(row: &str) -> Option<String> {
+    let fields: Vec<String> = row.split('\t').skip(1).map(str::to_string).collect();
+    let (head, _description) = split_fields(&fields);
+    head.get("task").map(|task| task.to_string())
+}
+
 /// The DELIVERY cell and the description of one `secrets` row, from its fields and trailing text.
 ///
 /// A variable the environment carries always comes with its `encode` field, and an injection never
@@ -617,7 +626,7 @@ fn task_secrets(args: &[OsString]) -> ExitCode {
         None => all,
         Some(name) => all
             .iter()
-            .filter(|(_, r)| r.split('\t').any(|f| f == format!("task={name}")))
+            .filter(|(_, r)| secret_row_task(r).as_deref() == Some(name.as_str()))
             .cloned()
             .collect(),
     };
@@ -1889,6 +1898,20 @@ mod tests {
             Some(ExitCode::from(2)),
             "a session gone declares nothing, so the name is refused"
         );
+    }
+
+    /// A row belongs to the operation its `task=` field names, never to one its description spells.
+    #[test]
+    fn a_secrets_row_belongs_to_its_task_field_not_its_description() {
+        assert_eq!(
+            secret_row_task("TOKEN\ttask=build\tencode=raw\ttask=deploy"),
+            Some("build".to_string())
+        );
+        assert_eq!(
+            secret_row_task("api\ttask=deploy\twire-injected for api.test"),
+            Some("deploy".to_string())
+        );
+        assert_eq!(secret_row_task("TOKEN\tencode=raw\ttask=deploy"), None);
     }
 
     /// An injection is told from a variable by the field only a variable carries, so a description
