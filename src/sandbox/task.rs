@@ -1678,10 +1678,19 @@ impl TaskEngine {
     /// The **longest** matching mount wins: a cage nests them (the tool pool sits under a directory
     /// the skeleton also maps), and the innermost is the one whose source the kernel will actually
     /// resolve through.
+    ///
+    /// A path whose part below the mount is anything but plain names has no counterpart either. The
+    /// paths asked about include the targets of links read from the project, which the agent writes,
+    /// and a `..` there joined onto the mount's source named a host file outside the mount — probed
+    /// and read for its first line — where the cage resolves that `..` in its own tree instead.
     fn host_path(&self, incage: &Path, task: &TaskSpec) -> Option<PathBuf> {
         let mut best: Option<(usize, PathBuf)> = None;
         let mut consider = |src: &Path, dest: &Path| {
-            if let Ok(rest) = incage.strip_prefix(dest) {
+            if let Ok(rest) = incage.strip_prefix(dest)
+                && rest
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
                 let depth = dest.components().count();
                 if best.as_ref().is_none_or(|(d, _)| depth > *d) {
                     best = Some((depth, src.join(rest)));
