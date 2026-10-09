@@ -107,8 +107,12 @@ fn kernel_has_dummy() -> bool {
 /// brace. The pid is complete once the first namespace id follows it, and a holder that closed the
 /// pipe then left bwrap's next write facing no reader. bwrap runs with `SIGPIPE` at its default, so
 /// it died of the signal and the cage with it, before running anything — on a loaded host only,
-/// where the holder won that race. A stand-in for bwrap makes the race certain: it runs the
-/// real one, then writes its report in the same pieces with a pause after the first namespace id.
+/// where the holder won that race. A stand-in for bwrap makes the race certain: it becomes the
+/// real one, while a copy of it left behind writes bwrap's report in the same pieces with a pause
+/// after the first namespace id. The stand-in `exec`s bwrap rather than starting it, so the process
+/// the report names is a child of the process the holder started, as the holder checks it is. The
+/// copy ignores `SIGPIPE` and records each piece it could not write, the pipe having no reader:
+/// that write is the one that killed bwrap, and a recorded piece is the failure.
 #[test]
 fn the_holder_waits_for_the_whole_bwrap_report() {
     let Some(bwrap) = common::bwrap_on_path() else {
@@ -117,27 +121,29 @@ fn the_holder_waits_for_the_whole_bwrap_report() {
     };
     let dir = TmpDir::new("netns-report");
     let report = dir.join("report");
+    let unread = dir.join("unread");
     let slow = dir.join("slow-bwrap");
     let script = format!(
         r#"#!/bin/bash
 [ "$1" = --info-fd ] && [ "$3" = --block-fd ] || exit 99
 info=$2; block=$4; shift 4
-"{bwrap}" --info-fd 9 --block-fd "$block" "$@" 9>"{report}" &
-bw=$!
+(
+trap '' PIPE
 until grep -q '}}' "{report}" 2>/dev/null; do sleep 0.01; done
 whole=$(cat "{report}")
 pid_part=${{whole%%,*}}
 rest=${{whole#"$pid_part"}}
 tail_ns=${{rest#,}}; first_ns=",${{tail_ns%%,*}}"
-printf '%s' "$pid_part" >&"$info"
-printf '%s' "$first_ns" >&"$info"
+printf '%s' "$pid_part" >&"$info" || echo first >>"{unread}"
+printf '%s' "$first_ns" >&"$info" || echo second >>"{unread}"
 sleep 1
-printf '%s\n' "${{rest#"$first_ns"}}" >&"$info"
-eval "exec $info>&-"
-wait $bw
+printf '%s\n' "${{rest#"$first_ns"}}" >&"$info" || echo rest >>"{unread}"
+) &
+exec "{bwrap}" --info-fd 9 --block-fd "$block" "$@" 9>"{report}" {{info}}>&-
 "#,
         bwrap = bwrap.display(),
         report = report.display(),
+        unread = unread.display(),
     );
     std::fs::write(&slow, script).expect("write the stand-in");
     {
@@ -165,6 +171,11 @@ wait $bw
         out.status.success(),
         "bwrap must outlive the end of its own report, not die of SIGPIPE ({}): {stderr}",
         out.status
+    );
+    assert_eq!(
+        std::fs::read_to_string(&unread).unwrap_or_default(),
+        "",
+        "the holder closed the report before its end, so these pieces met no reader"
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
