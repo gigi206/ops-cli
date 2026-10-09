@@ -323,6 +323,21 @@ fn key_values(fields: &[String]) -> BTreeMap<&str, &str> {
     fields.iter().filter_map(|f| f.split_once('=')).collect()
 }
 
+/// The DELIVERY cell and the description of one `secrets` row, from its fields and trailing text.
+///
+/// A variable the environment carries always comes with its `encode` field, and an injection never
+/// does, so that field tells the two apart. The trailing text cannot: for a variable it is the
+/// description the operator wrote, which may begin with the words an injection's note does.
+fn secret_delivery(fields: &BTreeMap<&str, &str>, tail: String) -> (String, String) {
+    if let Some(encode) = fields.get("encode") {
+        return (format!("env ({encode})"), tail);
+    }
+    match tail.strip_prefix("wire-injected for ") {
+        Some(to) => (format!("wire -> {to}"), String::new()),
+        None => ("env (raw)".to_string(), tail),
+    }
+}
+
 /// `sbx task list [<operation>] [--session <id>]`: the operations on offer, with their parameters
 /// and ceilings — across every session that offers any, unless one is named.
 ///
@@ -634,13 +649,7 @@ fn task_secrets(args: &[OsString]) -> ExitCode {
             // may itself contain `=`, so the row is split by position rather than parsed.
             let rest: Vec<String> = fields.map(str::to_string).collect();
             let (map, tail) = split_fields(&rest);
-            let (delivery, description) = match tail.strip_prefix("wire-injected for ") {
-                Some(to) => (format!("wire -> {to}"), String::new()),
-                None => (
-                    format!("env ({})", map.get("encode").copied().unwrap_or("raw")),
-                    tail,
-                ),
-            };
+            let (delivery, description) = secret_delivery(&map, tail);
             vec![
                 name,
                 map.get("task").copied().unwrap_or(NONE).to_string(),
@@ -1879,6 +1888,33 @@ mod tests {
             refuse_undeclared(&[answered(), plane(gone, 9)], "status", "deploy"),
             Some(ExitCode::from(2)),
             "a session gone declares nothing, so the name is refused"
+        );
+    }
+
+    /// An injection is told from a variable by the field only a variable carries, so a description
+    /// that begins with an injection's words stays the variable's description.
+    #[test]
+    fn a_secrets_row_is_classified_by_its_fields_not_its_description() {
+        let row = |fields: &[&str]| fields.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        let delivery = |fields: &[&str]| {
+            let fields = row(fields);
+            let (map, tail) = split_fields(&fields);
+            secret_delivery(&map, tail)
+        };
+        assert_eq!(
+            delivery(&["task=deploy", "encode=raw", "wire-injected for api.test"]),
+            (
+                "env (raw)".to_string(),
+                "wire-injected for api.test".to_string()
+            )
+        );
+        assert_eq!(
+            delivery(&["task=deploy", "wire-injected for api.test/v1"]),
+            ("wire -> api.test/v1".to_string(), String::new())
+        );
+        assert_eq!(
+            delivery(&["task=deploy", "encode=base64", "the deploy key"]),
+            ("env (base64)".to_string(), "the deploy key".to_string())
         );
     }
 
