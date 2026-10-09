@@ -372,9 +372,13 @@ fn task_list(args: &[OsString]) -> ExitCode {
     // Said, and the listing still exits 0: what it lists, the declared operations, was read whole,
     // and only the count beside them is missing.
     for (plane, e) in &unread {
+        let how = if sandbox::lens::unanswered(e) {
+            "did not answer in full"
+        } else {
+            "could not be read"
+        };
         diag::warn(&format!(
-            "task ls: session {} did not answer in full ({e}), so its running invocations are \
-             not counted",
+            "task ls: session {} {how} ({e}), so its running invocations are not counted",
             plane.describe()
         ));
     }
@@ -432,11 +436,13 @@ fn running_now(planes: &[Plane]) -> (RunningCounts, Vec<(&Plane, std::io::Error)
         let Some(host) = &plane.host else { continue };
         let rows = match sandbox::task_control::read_status(host) {
             Ok(rows) => rows,
-            Err(e) if sandbox::lens::unanswered(&e) => {
+            // Gone between the listing and the read: there is nothing running there.
+            Err(e) if sandbox::control::session_gone(&e) => continue,
+            // Reached or not, it said nothing about what runs there, so it is handed back.
+            Err(e) => {
                 unread.push((plane, e));
                 continue;
             }
-            Err(_) => continue,
         };
         for row in rows {
             if let Some(task) = key_values(&row.fields).get("task") {
@@ -1800,7 +1806,7 @@ mod tests {
 
     /// A session whose host socket is reached and refuses the reader, closing before it reads the
     /// command as the peer check does, is handed back as unread rather than counted as running
-    /// nothing; one whose socket is gone is neither, as before.
+    /// nothing, and so is one that could not be asked at all; one whose socket is gone is neither.
     #[test]
     fn a_session_that_refuses_the_status_read_is_not_counted_as_idle() {
         let dir = crate::testutil::TmpDir::new();
@@ -1813,7 +1819,14 @@ mod tests {
             host: Some(host),
             session: Some((pid, PathBuf::from("/work/api"))),
         };
-        let planes = [plane(refusing, 4242), plane(dir.join("gone.sock"), 4343)];
+        // A socket path too long to connect to: neither gone nor short of an answer, and still
+        // nothing said about what runs there.
+        let unaskable = dir.join(&"d".repeat(120)).join("host.sock");
+        let planes = [
+            plane(refusing, 4242),
+            plane(dir.join("gone.sock"), 4343),
+            plane(unaskable, 4444),
+        ];
         let (counts, unread) = running_now(&planes);
         server.join().expect("the refusing server");
         assert!(counts.is_empty());
@@ -1821,7 +1834,11 @@ mod tests {
             .iter()
             .map(|(p, _)| p.session.as_ref().map(|(pid, _)| *pid))
             .collect();
-        assert_eq!(unread, [Some(4242)], "only the refusing session is unread");
+        assert_eq!(
+            unread,
+            [Some(4242), Some(4444)],
+            "the refusing and the unaskable sessions are unread, the gone one is not"
+        );
     }
 
     fn row(name: &str, fields: &[&str]) -> client::TaskRow {
