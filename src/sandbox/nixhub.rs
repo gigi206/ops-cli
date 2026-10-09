@@ -306,6 +306,12 @@ pub(crate) fn provision(
                 // discard the pins resolved so far (the old whole-loop write-at-the-end lost them),
                 // and a concurrent `sbx upgrade mise` that rolled a *different* entry is merged in
                 // rather than clobbered by a stale whole-lock rewrite.
+                // Under the lock's writer guard, so a roll's write cannot land between the re-read
+                // and this write.
+                let _writing = store::hold_lock_for_write(
+                    &lock_path,
+                    &crate::store::waiting_for_writer("the tools lock"),
+                )?;
                 let mut disk = ResolutionLock::read(&lock_path);
                 disk.insert(&tool.pkg, &tool.version, system, &pin);
                 disk.write(&lock_path)?;
@@ -463,6 +469,9 @@ pub(crate) fn upgrade_tools(
         .join(TOOLS_LOCK);
     let mut lock = ResolutionLock::read(&lock_path);
     let mut outcomes = Vec::new();
+    // What this roll decided, to apply to the lock as it reads at the end: the resolutions above
+    // reach the network, and a launch may pin another tool meanwhile.
+    let mut rolled: Vec<(String, String, Pin)> = Vec::new();
 
     for tool in &declared.nix {
         let existing = lock.get(&tool.pkg, &tool.version, system);
@@ -480,6 +489,7 @@ pub(crate) fn upgrade_tools(
             Ok(pin) => {
                 outcomes.push(roll_outcome(tool, existing.as_ref(), &pin));
                 lock.insert(&tool.pkg, &tool.version, system, &pin);
+                rolled.push((tool.pkg.clone(), tool.version.clone(), pin));
             }
             Err(e) => outcomes.push(ToolUpgrade::Failed {
                 pkg: tool.pkg.clone(),
@@ -505,9 +515,13 @@ pub(crate) fn upgrade_tools(
         })
         .cloned()
         .collect();
-    for (pkg, request, sys) in stale {
-        lock.entries.remove(&(pkg.clone(), request.clone(), sys));
-        outcomes.push(ToolUpgrade::Pruned { pkg, request });
+    for (pkg, request, sys) in &stale {
+        lock.entries
+            .remove(&(pkg.clone(), request.clone(), sys.clone()));
+        outcomes.push(ToolUpgrade::Pruned {
+            pkg: pkg.clone(),
+            request: request.clone(),
+        });
     }
 
     for tool in declared.non_nix {
@@ -524,7 +538,21 @@ pub(crate) fn upgrade_tools(
     }
 
     if mode.applies() {
-        lock.write(&lock_path)?;
+        // Re-read under the writer guard and apply only what this roll decided: a pin a launch
+        // added while the resolutions ran is kept, where writing the snapshot taken before them
+        // dropped it, and the next launch went back to the network for it.
+        let _writing = store::hold_lock_for_write(
+            &lock_path,
+            &crate::store::waiting_for_writer("the tools lock"),
+        )?;
+        let mut disk = ResolutionLock::read(&lock_path);
+        for (pkg, request, sys) in stale {
+            disk.entries.remove(&(pkg, request, sys));
+        }
+        for (pkg, request, pin) in &rolled {
+            disk.insert(pkg, request, system, pin);
+        }
+        disk.write(&lock_path)?;
     }
     Ok(outcomes)
 }
@@ -1839,6 +1867,74 @@ mod resolve_tests {
         assert!(
             after.get("newtool", "latest", &system).is_none(),
             "a tool that never resolved is not written to the lock"
+        );
+    }
+
+    /// A roll writes what it decided onto the lock as it reads at the end, under the writer guard: a
+    /// pin a launch wrote while the roll resolved survives, and the roll's pruning still lands. The
+    /// resolution is made to take a second by a stand-in `nix` that sleeps, then fails.
+    #[test]
+    fn a_roll_keeps_a_pin_a_launch_wrote_while_it_resolved() {
+        use crate::testutil::TmpDir;
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let project = TmpDir::new();
+        let bin = TmpDir::new();
+        let slow_nix = bin.path().join("nix");
+        crate::testutil::write_script(&slow_nix, "sleep 1; exit 1");
+        let system = current_system();
+        let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+        let lock_path = layout
+            .data_dir()
+            .join("projects")
+            .join(&id)
+            .join(TOOLS_LOCK);
+        let pin = |v: &str| Pin {
+            commit: "a".repeat(40),
+            attr: "x".to_string(),
+            version: v.to_string(),
+        };
+        let mut seed = ResolutionLock::read(Path::new("/nonexistent-seed"));
+        seed.insert("ripgrep", "latest", &system, &pin("14.1.0"));
+        seed.insert("oldtool", "1.0", &system, &pin("1.0"));
+        seed.write(&lock_path).expect("seed the lock");
+        let mise_files = vec![(
+            ".mise.toml".to_string(),
+            b"[tools]\n\"nix:ripgrep\" = \"latest\"\n".to_vec(),
+        )];
+
+        let roll = {
+            let (layout, project, system) =
+                (layout.clone(), project.path().to_path_buf(), system.clone());
+            std::thread::spawn(move || {
+                upgrade_tools(
+                    &slow_nix,
+                    &layout,
+                    &project,
+                    &mise_files,
+                    &system,
+                    crate::sandbox::RollMode::Apply,
+                )
+            })
+        };
+        // While the roll resolves, a launch pins a tool of its own, the way `provision` does.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        {
+            let _writing = store::hold_lock_for_write(&lock_path, &|_| {}).expect("the guard");
+            let mut theirs = ResolutionLock::read(&lock_path);
+            theirs.insert("jq", "1.7.1", &system, &pin("1.7.1"));
+            theirs.write(&lock_path).expect("the launch's write");
+        }
+        roll.join().unwrap().expect("the roll");
+
+        let after = ResolutionLock::read(&lock_path);
+        assert!(
+            after.get("jq", "1.7.1", &system).is_some(),
+            "the launch's pin survives the roll"
+        );
+        assert!(
+            after.get("oldtool", "1.0", &system).is_none(),
+            "the roll's pruning still lands"
         );
     }
 }
