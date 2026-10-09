@@ -363,7 +363,18 @@ fn collect_from(cli: &CliOverrides, ambient: &AmbientOverrides) -> Result<Overri
         }
         None => RawConfig::default(),
     };
-    // Tier 1 — the environment's typed fragments.
+    // Tier 1 — the environment's typed fragments. Two `SBX_LIMIT_*` names that differ only in case
+    // name one limit, and when they set it to different values, which of them the environment lists
+    // last is an order nobody chose: the pair is refused, naming the limit, rather than settled by
+    // it. The same value twice settles nothing and passes, and a repeated `--limit` is settled by
+    // the order it was typed in.
+    if let Some(key) = conflicting_limit(&ambient.limits) {
+        return Err(format!(
+            "{}: `{}` is set to different values by variables whose names differ only in case",
+            ENV_LABELS.limit,
+            crate::diag::visible(key)
+        ));
+    }
     let t1 = build_typed_fragment(
         ambient.net.as_deref(),
         &ambient.fs,
@@ -1411,6 +1422,16 @@ fn parse_bind(spec: &str, label: &str) -> Result<RawBind, String> {
     } else {
         RawBind::Path(path.to_string())
     })
+}
+
+/// The first limit `limits` sets to two different values, when one does. The keys are lowercased
+/// as they are read, so two entries for one key came from names that differ only in case.
+fn conflicting_limit(limits: &[(String, String)]) -> Option<&str> {
+    limits
+        .iter()
+        .enumerate()
+        .find(|(i, (key, value))| limits[..*i].iter().any(|(k, v)| k == key && v != value))
+        .map(|(_, (key, _))| key.as_str())
 }
 
 /// Set one cgroup limit on the fragment's `[limits]` table. The key must name a limit field; the
@@ -2551,6 +2572,41 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("empty bind path"), "{err}");
+    }
+
+    /// Two `SBX_LIMIT_*` variables whose names differ only in case set one limit, and when their
+    /// values differ, which one the environment lists last is an order nobody chose: the pair is
+    /// refused, naming the limit. The same value twice is no conflict, nor are two limits, and a
+    /// `--limit` repeated on the command line is settled by the order it was typed in.
+    #[test]
+    fn a_limit_the_environment_sets_to_two_values_is_refused() {
+        let pair = |a: (&str, &str), b: (&str, &str)| AmbientOverrides {
+            limits: vec![
+                (a.0.to_string(), a.1.to_string()),
+                (b.0.to_string(), b.1.to_string()),
+            ],
+            ..Default::default()
+        };
+        let err = ambient(pair(("memory_max", "1G"), ("memory_max", "2G"))).unwrap_err();
+        assert!(
+            err.starts_with("SBX_LIMIT_*: `memory_max`") && err.contains("differ only in case"),
+            "{err}"
+        );
+        let ov = ambient(pair(("memory_max", "1G"), ("memory_max", "1G"))).unwrap();
+        assert_eq!(
+            ov.raw.limits.and_then(|l| l.memory_max),
+            Some(RawLimit::Text("1G".into()))
+        );
+        assert!(ambient(pair(("memory_max", "1G"), ("tasks_max", "64"))).is_ok());
+        let ov = collect_cli(Cli {
+            limits: &["tasks_max=1", "tasks_max=2"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            ov.raw.limits.and_then(|l| l.tasks_max),
+            Some(RawLimit::Number(2))
+        );
     }
 
     #[test]
