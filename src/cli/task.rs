@@ -1768,18 +1768,43 @@ fn empty_or_unknown(planes: &[Plane], verb: &str, operation: &str, empty: &str) 
 
 /// Refuse `operation` through [`no_match`] when the planes declare operations and none of them is
 /// it. `None` lets the caller give its own answer: the operation is declared and simply not there
-/// right now, or no plane could list what it declares, which is not a "no" either.
+/// right now.
+///
+/// A plane that could not list what it declares may declare `operation`, so while one did not, a
+/// name the others lack is not refused as one nothing declares: each such plane is named and the
+/// answer is a failure (1), since whether the name is declared is not known. Left out silently, it
+/// took its declarations with it, and a name only it declared was refused as a typo. A session gone
+/// since it was resolved declares nothing any more and is passed over.
 fn refuse_undeclared(planes: &[Plane], verb: &str, operation: &str) -> Option<ExitCode> {
-    let mut known: Vec<String> = planes
-        .iter()
-        .filter_map(|p| client::list(&p.inventory).ok())
-        .flatten()
-        .map(|r| r.name)
-        .collect();
+    let mut known: Vec<String> = Vec::new();
+    let mut unread: Vec<(&Plane, std::io::Error)> = Vec::new();
+    for plane in planes {
+        match client::list(&plane.inventory) {
+            Ok(rows) => known.extend(rows.into_iter().map(|r| r.name)),
+            Err(e) if sandbox::control::session_gone(&e) => {}
+            Err(e) => unread.push((plane, e)),
+        }
+    }
+    if known.iter().any(|n| n == operation) {
+        return None;
+    }
+    if !unread.is_empty() {
+        for (plane, e) in &unread {
+            // In a cage there is no session to name, only the one plane it reaches.
+            let which = match &plane.session {
+                Some((pid, _)) => format!("session {pid}"),
+                None => "the task plane".to_string(),
+            };
+            diag::warn(&format!(
+                "task {verb}: {which} could not list what it declares ({e}), so whether it \
+                 declares `{operation}` is not known"
+            ));
+        }
+        return Some(ExitCode::FAILURE);
+    }
     known.sort();
     known.dedup();
-    (!known.is_empty() && !known.iter().any(|n| n == operation))
-        .then(|| no_match(verb, operation, &known))
+    (!known.is_empty()).then(|| no_match(verb, operation, &known))
 }
 
 /// Split a `KEY=VALUE` argument. A missing `=` is an error rather than an empty value: a parameter a
@@ -1809,6 +1834,53 @@ fn unreachable_plane(e: &std::io::Error) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plane that could not list what it declares keeps a name the others lack from being refused
+    /// as one nothing declares, and the answer is a failure; a name a plane that answered declares
+    /// is still found, and a session gone since it was resolved is passed over.
+    #[test]
+    fn a_plane_that_could_not_list_its_operations_is_not_read_as_declaring_none() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let dir = crate::testutil::TmpDir::new();
+        let plane = |inventory: PathBuf, pid: u32| Plane {
+            socket: inventory.clone(),
+            inventory,
+            host: None,
+            session: Some((pid, PathBuf::from("/work/api"))),
+        };
+        // A plane that declares `build`, for as many reads as are asked of it.
+        let declaring = dir.join("declaring.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&declaring).expect("bind");
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut cmd = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut cmd);
+                let _ = (&stream).write_all(b"task build\tcompile it\nok\n");
+            }
+        });
+        // A socket path too long to connect to: not gone, and nothing said about what it declares.
+        let closed = dir.join(&"d".repeat(120)).join("inventory.sock");
+        let gone = dir.join("gone.sock");
+
+        let answered = || plane(declaring.clone(), 7);
+        let unread = || plane(closed.clone(), 8);
+
+        assert_eq!(
+            refuse_undeclared(&[answered(), unread()], "status", "deploy"),
+            Some(ExitCode::FAILURE),
+            "a name the unread plane may declare is not refused as undeclared"
+        );
+        assert_eq!(
+            refuse_undeclared(&[answered(), unread()], "status", "build"),
+            None
+        );
+        assert_eq!(
+            refuse_undeclared(&[answered(), plane(gone, 9)], "status", "deploy"),
+            Some(ExitCode::from(2)),
+            "a session gone declares nothing, so the name is refused"
+        );
+    }
 
     /// A command's exit code is returned as it is, and one no process returns is a failure: the
     /// `-1` the client reads for an `exit` field it could not parse is never clamped into a success.
