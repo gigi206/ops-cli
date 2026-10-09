@@ -2353,3 +2353,20 @@ fn a_request_naming_no_declared_task_costs_neither_a_slot_nor_a_log_line_each() 
         entries[0].refused
     );
 }
+
+/// A session that answers `STATUS` with an error is reported, not counted as running nothing.
+#[test]
+fn a_status_answered_with_an_error_is_reported_and_not_read_as_idle() {
+    let dir = TmpDir::new();
+    let socket = dir.join("host.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        (&stream).write_all(b"err unknown command\n").unwrap();
+    });
+    let e = read_status(&socket).unwrap_err();
+    server.join().unwrap();
+    assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+}

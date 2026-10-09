@@ -1613,7 +1613,16 @@ pub(crate) struct StatusRow {
 
 /// What a session is running right now.
 pub(crate) fn read_status(socket: &Path) -> io::Result<Vec<StatusRow>> {
-    Ok(read_host(socket, "STATUS")?
+    let lines = read_host(socket, "STATUS")?;
+    // An `err` ends the answer before any row: read as a whole one, it would count a session that
+    // refused as one running nothing.
+    if let Some(err) = lines.iter().find(|l| l.starts_with("err ")) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the session answered `{}`", super::sanitize(err)),
+        ));
+    }
+    Ok(lines
         .iter()
         .filter_map(|line| {
             let rest = line.strip_prefix("running ")?;
