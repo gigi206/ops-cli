@@ -1935,3 +1935,16 @@ fn a_credentials_variants_are_all_named_after_the_variable() {
     assert_eq!(out, b"plain=${PGPASSWORD} b64=${PGPASSWORD}");
     assert_eq!(hits, 2);
 }
+
+/// A nonce comes only from bytes the system's randomness wrote: when it could not write them the
+/// draw is an error, which refuses the invocation, never a constant a command could print.
+#[test]
+fn no_randomness_refuses_the_nonce_rather_than_inventing_one() {
+    assert!(nonce_from(|_| false).is_err());
+    let drawn = nonce_from(|bytes| {
+        bytes.copy_from_slice(&[0x0a, 0xbc, 0xff]);
+        true
+    })
+    .expect("bytes were written");
+    assert_eq!(drawn, "0abcff");
+}
