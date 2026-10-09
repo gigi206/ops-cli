@@ -151,6 +151,16 @@ pub(crate) fn start(
     // keys them and keeps the last), so by the time a list reaches here every cage port is already
     // distinct and there is nothing left to collapse.
     ports.sort_unstable_by_key(|f| (f.cage, f.host));
+    // Port 0 is no port: bound on the host it hands out an ephemeral one, the substitute this
+    // module refuses to pick, and on the cage side it names no service. Resolution drops such an
+    // entry with a warning (`parse_forward_entry`); refused here as well, since a `ForwardPort` can
+    // be built without passing through it.
+    if let Some(zero) = ports.iter().find(|f| f.host == 0 || f.cage == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("`forward` entry `{zero}` names port 0, which is not a port"),
+        ));
+    }
     // Two forwards claiming one host port cannot both be bound, and the bind error alone would
     // blame the host ("already in use — another login, or a host service on :9200") for what is
     // sbx's own configuration double-booking a port. Caught here, ahead of the bind, so the message
@@ -796,6 +806,33 @@ mod tests {
                 .count(),
             0,
             "the refused launch leaves nothing behind"
+        );
+    }
+
+    /// A forward that names port 0 on either side is refused before anything is bound or made:
+    /// bound on the host, 0 would hand out an ephemeral substitute.
+    #[test]
+    fn a_forward_naming_port_zero_is_refused_before_anything_is_bound() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        for fwd in [
+            ForwardPort::same(0),
+            ForwardPort {
+                host: 0,
+                cage: 9119,
+            },
+            ForwardPort {
+                host: 9119,
+                cage: 0,
+            },
+        ] {
+            let e = start(&layout, vec![fwd]).err().expect("port 0 is refused");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+            assert!(e.to_string().contains("port 0"), "{e}");
+        }
+        assert!(
+            !layout.data_dir().join("forward").exists(),
+            "nothing is made for a refused forward"
         );
     }
 
