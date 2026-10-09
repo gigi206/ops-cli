@@ -54,14 +54,15 @@ use std::path::{Component, Path, PathBuf};
 /// Re-resolving from the path — which is what this did — left a window between a component's check
 /// and the resolution that walked through it, and the cage owns every directory below the anchor.
 ///
-/// What remains open is the **path this returns**. A caller holds a name, not a descriptor, and the
-/// cage may exchange a component before the caller uses it. [`hold_under`] closes that window for
-/// what goes through its descriptor, and the project store's seed and the mise plugin
-/// registration ([`super::miseplugin::register`]) write that way. The callers that keep the path
-/// give it to a mount or to `nix`, which open by name, or create a mountpoint in an image tree no
-/// cage is running on. For them the window this removes is the one inside the walk, and the case
-/// that needs no race at all, a symlink left behind for the next launch to find, is removed with
-/// it.
+/// What remains open is the **path this returns**. A caller holds a name, not a descriptor, and
+/// the cage may exchange a component before the caller uses it. [`hold_under`] closes that
+/// window for what goes through its descriptor, and the project store's seed and the mise
+/// plugin registration ([`super::miseplugin::register`]) write that way, as does the creation
+/// of a distribution image's mountpoints when the tree is unpacked. The callers that keep the
+/// path give it to a mount or to `nix`, which open by name, or create a mountpoint in an image
+/// tree no cage can write: one is bound read-only into every cage that runs on it. For them the
+/// window this removes is the one inside the walk, and the case that needs no race at all, a
+/// symlink left behind for the next launch to find, is removed with it.
 pub(crate) fn ensure_under(root: &Path, rel: &str, mode: u32) -> io::Result<PathBuf> {
     walk(root, Path::new(rel), Some(mode), libc::O_PATH).map(|(at, _)| at)
 }
