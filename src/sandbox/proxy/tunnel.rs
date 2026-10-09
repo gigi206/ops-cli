@@ -659,7 +659,10 @@ pub(super) fn serve_tunneled_request(
     //    while it was parked cost a second attempt instead of an empty response. Branching on the
     //    same binding is what keeps the two in step — a request that took a parked connection and
     //    then could not be sent again would drop the client's connection instead of retrying.
-    let forwarded: Option<Vec<u8>> = if !replayable {
+    // The serialized head and the body, kept apart and written one after the other. Joined, the
+    // copy of a held body lived beside the body itself until the join was done, outside the
+    // reservation that bounds what the proxy holds: up to twice `BodyLimits::total` at once.
+    let forwarded: Option<(Vec<u8>, Vec<u8>)> = if !replayable {
         // A body streaming straight from the client: gone once written, which is why such a request
         // never took a parked connection.
         None
@@ -674,15 +677,14 @@ pub(super) fn serve_tunneled_request(
         if let Some(c) = &capture {
             c.set_request_body(&body);
         }
-        let mut req = reserialize_request(
+        let head = reserialize_request(
             &inner,
             &injected,
             Some(body.len() as u64),
             keep_alive,
             masks_reflection,
         );
-        req.extend_from_slice(&body);
-        Some(req)
+        Some((head, body))
     } else if chunked {
         // A `Transfer-Encoding: chunked` request: de-chunk the body into a bounded buffer and
         // forward a clean `Content-Length`-framed request (the `Transfer-Encoding` header is
@@ -721,27 +723,23 @@ pub(super) fn serve_tunneled_request(
         if let Some(c) = &capture {
             c.set_request_body(&body);
         }
-        let mut req = reserialize_request(
+        let head = reserialize_request(
             &inner,
             &injected,
             Some(body.len() as u64),
             keep_alive,
             masks_reflection,
         );
-        req.extend_from_slice(&body);
-        Some(req)
+        Some((head, body))
     } else {
         // Replayable, neither held nor chunked: a request with no body at all.
-        Some(reserialize_request(
-            &inner,
-            &injected,
-            None,
-            keep_alive,
-            masks_reflection,
+        Some((
+            reserialize_request(&inner, &injected, None, keep_alive, masks_reflection),
+            Vec::new(),
         ))
     };
 
-    if let Some(req) = &forwarded {
+    if let Some((head, body)) = &forwarded {
         // Exactly one retry, and only for a connection that came from the pool: after it, the
         // connection is fresh and the loop condition ends it. The check is a peek, so an upstream
         // that is simply slow to answer — a completion that thinks before its first token — is
@@ -751,7 +749,11 @@ pub(super) fn serve_tunneled_request(
         loop {
             // The flush is part of the write: a parked connection that fails it is as gone as one
             // that fails the write, and is retried below like it.
-            match upstream.write_all(req).and_then(|()| upstream.flush()) {
+            match upstream
+                .write_all(head)
+                .and_then(|()| upstream.write_all(body))
+                .and_then(|()| upstream.flush())
+            {
                 Ok(()) => {
                     begin_response_stream(&upstream.sock);
                     if !from_pool || upstream_spoke(&upstream.sock) {
@@ -821,7 +823,8 @@ pub(super) fn serve_tunneled_request(
             from_pool = false;
         }
         // Count client→upstream (`up`) — the forwarded head plus any body that rode with it.
-        flow.up.fetch_add(req.len() as u64, Ordering::Relaxed);
+        flow.up
+            .fetch_add((head.len() + body.len()) as u64, Ordering::Relaxed);
     } else {
         // A body the proxy does not hold: forwarded straight from the client, on its own connection.
         let reserialized =
