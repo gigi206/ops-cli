@@ -844,8 +844,18 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     }
     base.forward = union_forward_opt(base.forward, forward);
     base.fs = union_fs_opt(base.fs, fs);
-    base.seccomp = union_allow_opt(base.seccomp, seccomp, |s| &mut s.allow);
-    base.devices = union_allow_opt(base.devices, devices, |d| &mut d.allow);
+    base.seccomp = union_allow_opt(
+        base.seccomp,
+        seccomp,
+        |s| &mut s.allow,
+        |RawSeccomp { allow, rest: _ }| allow,
+    );
+    base.devices = union_allow_opt(
+        base.devices,
+        devices,
+        |d| &mut d.allow,
+        |RawDevices { allow, rest: _ }| allow,
+    );
     base.ssh_agent = union_ssh_agent_opt(base.ssh_agent, ssh_agent);
     base.app.extend(app);
     base.bundle.extend(bundle);
@@ -908,24 +918,23 @@ fn union_fs_opt(base: Option<RawFs>, higher: Option<RawFs>) -> Option<RawFs> {
 /// the tiers rather than clobbering a blob's list. `None` means "this tier set none". The downstream
 /// `apply_*` dedups (devices) or is idempotent (seccomp), so a plain append is enough.
 ///
-/// It returns the *base* table with the higher tier's entries copied in, so every field of the
-/// higher table other than `allow` is discarded. That is exact only where `allow` is the whole
-/// table: `RawSeccomp` and `RawDevices` carry nothing else but the unknown-key bag, which
-/// `warn_unknown_keys` has already reported per blob by the time this runs. A table with a field of
-/// its own must not come through here — `[ssh_agent]` has [`union_ssh_agent_opt`], which
-/// destructures it exhaustively so the next field added is a compile error rather than a silent
-/// drop.
+/// It returns the *base* table with the higher tier's entries copied in, and `entries` is how the
+/// caller takes the higher table apart: an exhaustive pattern, as [`union_fs_opt`] writes inline,
+/// so a field added to `RawSeccomp` or `RawDevices` is a compile error at the call rather than a
+/// silent drop. Their only other field is the unknown-key bag, which `warn_unknown_keys` has
+/// already reported per blob by the time this runs. A table with a field of its own has its own
+/// union — `[ssh_agent]` has [`union_ssh_agent_opt`], for `confirm`.
 fn union_allow_opt<T>(
     base: Option<T>,
     higher: Option<T>,
-    allow: impl Fn(&mut T) -> &mut Vec<String>,
+    allow: impl FnOnce(&mut T) -> &mut Vec<String>,
+    entries: impl FnOnce(T) -> Vec<String>,
 ) -> Option<T> {
     match (base, higher) {
         (b, None) => b,
         (None, h) => h,
-        (Some(mut b), Some(mut h)) => {
-            let extra = std::mem::take(allow(&mut h));
-            allow(&mut b).extend(extra);
+        (Some(mut b), Some(h)) => {
+            allow(&mut b).extend(entries(h));
             Some(b)
         }
     }
@@ -1015,10 +1024,13 @@ fn union_secret(
         (b, None) => b,
         (None, h) => h,
         (Some(mut b), Some(h)) => {
-            if h.defaults.is_some() {
-                b.defaults = h.defaults;
+            // Destructured whole, as `union_fs_opt` is, so a field added to the section is a
+            // compile error here rather than a value one tier carries and the union drops.
+            let schema::RawSecretSection { defaults, hosts } = h;
+            if defaults.is_some() {
+                b.defaults = defaults;
             }
-            b.hosts.extend(h.hosts);
+            b.hosts.extend(hosts);
             Some(b)
         }
     }
@@ -1031,15 +1043,24 @@ fn union_limits(base: Option<RawLimits>, higher: Option<RawLimits>) -> Option<Ra
         (b, None) => b,
         (None, h) => h,
         (Some(mut b), Some(h)) => {
-            if h.memory_high.is_some() {
-                b.memory_high = h.memory_high;
+            // Destructured whole, as `union_fs_opt` is, so a limit added to the table is a compile
+            // error here rather than a value one tier sets and the union drops.
+            let RawLimits {
+                memory_high,
+                memory_max,
+                tasks_max,
+                rest,
+            } = h;
+            if memory_high.is_some() {
+                b.memory_high = memory_high;
             }
-            if h.memory_max.is_some() {
-                b.memory_max = h.memory_max;
+            if memory_max.is_some() {
+                b.memory_max = memory_max;
             }
-            if h.tasks_max.is_some() {
-                b.tasks_max = h.tasks_max;
+            if tasks_max.is_some() {
+                b.tasks_max = tasks_max;
             }
+            b.rest.extend(rest);
             Some(b)
         }
     }
