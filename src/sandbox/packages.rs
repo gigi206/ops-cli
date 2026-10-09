@@ -505,6 +505,29 @@ mod tests {
         assert!(fresh_release_tokens(&pkgs, &[]).is_empty());
     }
 
+    /// An exemption names a package the way mise matches one: by its key, without the token's
+    /// options or version, since an entry written as the whole token matches no tool. Two tokens
+    /// that differ only there are one entry, and a key that would still carry the list's own
+    /// separator is left out rather than cut in two.
+    #[test]
+    fn an_exemption_names_the_key_mise_matches_not_the_whole_token() {
+        let pkgs = [
+            mise_package(
+                "rg",
+                "ubi:BurntSushi/ripgrep[exe=rg,matching=musl]@14",
+                TrustState::Trusted,
+            ),
+            mise_package("rg2", "ubi:BurntSushi/ripgrep@15", TrustState::Trusted),
+            mise_package("scoped", "npm:@example/tool@1.2", TrustState::Trusted),
+            mise_package("odd", "npm:a,b", TrustState::Trusted),
+        ];
+        let named = ["rg", "rg2", "scoped", "odd"].map(String::from);
+        assert_eq!(
+            fresh_release_tokens(&pkgs, &named),
+            ["ubi:BurntSushi/ripgrep", "npm:@example/tool"]
+        );
+    }
+
     #[test]
     fn admit_keeps_trusted_packages_and_withholds_the_rest_by_state() {
         let pkgs = [
