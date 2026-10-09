@@ -929,6 +929,8 @@ impl TaskEngine {
         cage_env.extend(proxy_env);
         proxy_binds.extend(proc_binds);
 
+        // Whatever `build_spec` writes for this invocation goes when it ends, however it ends.
+        let _files = self.invocation_files(invocation);
         let spec = self
             .build_spec(
                 argv,
@@ -1070,6 +1072,24 @@ impl TaskEngine {
         super::egress::wrap_command(&self.forwarder.socat, &self.forwarder.shell, argv, tcp)
     }
 
+    /// The file `build_spec` writes of `kind` for invocation `invocation`, under `<data>/egress`:
+    /// `<kind>-<pid>.t<invocation>`. The pid leads up to the first `.`, which is how `sbx gc` reads
+    /// a dead session's entries before it sweeps them.
+    fn invocation_file(&self, kind: &str, invocation: u64) -> PathBuf {
+        self.layout
+            .data_dir()
+            .join("egress")
+            .join(format!("{kind}-{}.t{invocation}", std::process::id()))
+    }
+
+    /// The files `build_spec` may write for `invocation`, removed when the guard drops.
+    fn invocation_files(&self, invocation: u64) -> InvocationFiles {
+        InvocationFiles(vec![
+            self.invocation_file("hosts", invocation),
+            self.invocation_file("sshcfg", invocation),
+        ])
+    }
+
     /// Assemble the cage for one invocation: the structural skeleton, the project read-only, a fresh
     /// tmpfs home, an empty network namespace.
     fn build_spec(
@@ -1132,13 +1152,9 @@ impl TaskEngine {
         // A task's `network` is its own, so its `/etc/hosts` must be too: the one inherited from the
         // agent cage maps the *agent's* destinations. Written per invocation and bound over the
         // inherited mount, so a task's command resolves the hosts this task declared and nothing
-        // else. Swept with the invocation's other runtime files.
+        // else. Removed when the invocation ends ([`InvocationFiles`]).
         if !tcp.destinations.is_empty() {
-            let hosts = self
-                .layout
-                .data_dir()
-                .join("egress")
-                .join(format!("hosts-{}.t{invocation}", std::process::id()));
+            let hosts = self.invocation_file("hosts", invocation);
             let body = super::binds::hosts_contents(
                 &super::naming::cage_hostname(&format!("{}-task{invocation}", self.slug)),
                 &tcp.destinations,
@@ -1159,15 +1175,11 @@ impl TaskEngine {
         // Likewise for a destination on a privileged port, which no cage can listen on: this task's
         // own ssh config, bound over whatever the agent cage carried, so `ssh`/`scp` in a declared
         // command reaches the destination *this task* declared through its own proxy — and nothing
-        // else. Written per invocation and swept with the invocation's other runtime files.
+        // else. Written per invocation and removed when it ends ([`InvocationFiles`]).
         if let Some(body) =
             super::egress::ssh_config_contents(&self.forwarder.socat, &tcp.connect_only)
         {
-            let ssh_config = self
-                .layout
-                .data_dir()
-                .join("egress")
-                .join(format!("sshcfg-{}.t{invocation}", std::process::id()));
+            let ssh_config = self.invocation_file("sshcfg", invocation);
             std::fs::write(&ssh_config, body).map_err(|e| {
                 format!(
                     "cannot write {}, the ssh config this task's cage reaches a privileged port \
@@ -2066,6 +2078,20 @@ pub(crate) fn output_root_for(
         .join("projects")
         .join(super::binds::project_runtime_id(project)?)
         .join(TASK_OUT_TREE))
+}
+
+/// The per-invocation files `build_spec` writes — a networked task's hosts file and ssh config —
+/// removed when the invocation ends, a failed one included. They used to stay until `sbx gc` swept
+/// them after the session's end, one pair per networked invocation for as long as the session ran.
+struct InvocationFiles(Vec<PathBuf>);
+
+impl Drop for InvocationFiles {
+    fn drop(&mut self) {
+        // A file not written for this invocation is not there, which is what is wanted.
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// One invocation's hold on its task's output directory, released when the invocation ends —
