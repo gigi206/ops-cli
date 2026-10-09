@@ -100,9 +100,10 @@ in this project. That is the same direction as the line above (the artifact is m
 the agent), but it is worth stating on its own: `output` is a channel to the agent, and what a task
 leaves there is chosen with that in mind. A file the agent must not read does not belong in `{out}`.
 
-**It is emptied when the invocation claims it.** A predictable path is only honest if what sits there
-is *this* invocation's work; otherwise a caller reads the previous artifact and cannot tell. If you
-want to keep an artifact, copy it out. For the same reason, a second invocation of the same task is
+**It is emptied just before the command starts.** A predictable path is only honest if what sits
+there is *this* invocation's work; otherwise a caller reads the previous artifact and cannot tell. An
+invocation refused or failing before its command starts, on a credential that does not resolve for
+instance, leaves the previous artifact in place. If you want to keep an artifact, copy it out. For the same reason, a second invocation of the same task is
 **refused** while the first still holds the directory, whether it comes from the same session or from
 another session of the same project: two would interleave in one place.
 
