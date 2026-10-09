@@ -888,15 +888,62 @@ fn egress_dir_or_fail() -> Result<PathBuf, ExitCode> {
     })
 }
 
-/// The human context of the ask-mode control sockets, cross-referenced from the session registry:
-/// `(pid, project root, display label)` per live session. Best-effort — a session not in the
-/// registry (a race, or one that failed to register) simply lists without context, and a `--save`
-/// for it falls back to the cwd. The registry is keyed by the same pid the control socket filename
-/// carries, so the two line up.
-fn pending_session_context(data_dir: &Path) -> Vec<(u32, PathBuf, String)> {
+/// The live sessions the registry holds, read without pruning, for a command that only asks — or
+/// the sentence [`live_sessions`] uses for a registry that cannot be read. A missing registry is no
+/// sessions, not an error ([`session::Registry::live`]).
+fn asked_sessions(data_dir: &Path) -> Result<Vec<session::Session>, String> {
     session::Registry::at(data_dir)
         .live()
-        .unwrap_or_default()
+        .map_err(|e| format!("cannot read the session registry: {e}"))
+}
+
+/// The live sessions for a command that only shows them or narrows a listing by them. A registry
+/// that cannot be read is said as a warning, once per data directory however many of the helpers
+/// below one command calls, and then answers as no sessions: every reader here labels or filters by
+/// what a record says, so the empty answer leaves a listing unlabelled or narrowed to nothing, and
+/// the warning is what tells that apart from a machine with no sessions. A reader whose answer
+/// would choose where a write lands, or whether a live rule load counts as done, asks
+/// [`asked_sessions`] and refuses instead.
+fn sessions_or_warn(data_dir: &Path) -> Vec<session::Session> {
+    asked_sessions(data_dir).unwrap_or_else(|why| {
+        say_unread_registry(data_dir, &why);
+        Vec::new()
+    })
+}
+
+/// Warn that the registry under `data_dir` could not be read, the first time this process meets
+/// it. Keyed by the directory rather than said once outright, so a command that reads the registry
+/// through two or three helpers says it once, and a second data directory still gets its own line.
+fn say_unread_registry(data_dir: &Path, why: &str) {
+    static SAID: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let first = SAID
+        .lock()
+        .map(|mut said| said.insert(data_dir.to_path_buf()))
+        .unwrap_or(true);
+    if first {
+        diag::warn(&format!(
+            "{why} — no session's project or app is known, so a session is listed without them \
+             and a filter by either selects none"
+        ));
+    }
+}
+
+/// The pids of the live sessions in `sessions` that run as app `name` (an `sbx app <name>` session).
+fn pids_of_app(sessions: &[session::Session], name: &str) -> std::collections::HashSet<u32> {
+    sessions
+        .iter()
+        .filter(|s| s.app() == Some(name))
+        .map(|s| s.pid)
+        .collect()
+}
+
+/// The human context of the ask-mode control sockets, cross-referenced from the session registry:
+/// `(pid, project root, display label)` per live session. Best-effort — a session not in the
+/// registry (a race, or one that failed to register) simply lists without context. The registry is
+/// keyed by the same pid the control socket filename carries, so the two line up.
+fn pending_session_context(data_dir: &Path) -> Vec<(u32, PathBuf, String)> {
+    sessions_or_warn(data_dir)
         .into_iter()
         .map(|s| {
             let label = s.label();
@@ -910,25 +957,18 @@ fn pending_session_context(data_dir: &Path) -> Vec<(u32, PathBuf, String)> {
 /// plain shell) has no known app, so under a filter it is excluded: scoping to an app shows only
 /// sessions the registry confirms are that app.
 fn session_pids_for_app(data_dir: &Path, name: &str) -> std::collections::HashSet<u32> {
-    session::Registry::at(data_dir)
-        .live()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|s| s.app() == Some(name))
-        .map(|s| s.pid)
-        .collect()
+    pids_of_app(&sessions_or_warn(data_dir), name)
 }
 
-/// The app a session pid runs as (`sbx app <name>`), from the registry — or `None` if the session is
-/// a plain project shell, or is not in the registry. The basis for validating that a `<pid>.<seq>` id
-/// the user scoped with `--app` really belongs to that app.
-fn session_app_of(data_dir: &Path, pid: u32) -> Option<String> {
-    session::Registry::at(data_dir)
-        .live()
-        .unwrap_or_default()
+/// The app a session pid runs as (`sbx app <name>`), from the registry — `Ok(None)` if the session
+/// is a plain project shell, or is not in the registry. The basis for validating that a
+/// `<pid>.<seq>` id the user scoped with `--app` really belongs to that app; `Err` when the registry
+/// could not be read, so the caller decides whether the check may be waived.
+fn session_app_of(data_dir: &Path, pid: u32) -> Result<Option<String>, String> {
+    Ok(asked_sessions(data_dir)?
         .into_iter()
         .find(|s| s.pid == pid)
-        .and_then(|s| s.app().map(str::to_string))
+        .and_then(|s| s.app().map(str::to_string)))
 }
 
 /// The live-session pids running in `project` (a canonical project root), from the registry — the
@@ -937,7 +977,7 @@ fn session_app_of(data_dir: &Path, pid: u32) -> Option<String> {
 /// [`sandbox::project_identity`]), so a session and its project never disagree. A session not in the
 /// registry has no known project, so under a filter it is excluded.
 fn session_pids_for_project(data_dir: &Path, project: &Path) -> std::collections::HashSet<u32> {
-    let live = session::Registry::at(data_dir).live().unwrap_or_default();
+    let live = sessions_or_warn(data_dir);
     sessions_of_project(&live, project)
         .into_iter()
         .map(|s| s.pid)
@@ -962,7 +1002,7 @@ fn session_scope_pids(
     app: Option<&str>,
     cwd: &Path,
 ) -> Result<(ScopeFilter, ScopeFilter), ExitCode> {
-    let project_pids = if all {
+    let project = if all {
         None
     } else {
         let canonical = sandbox::project_identity(cwd)
@@ -973,9 +1013,27 @@ fn session_scope_pids(
                 ));
                 ExitCode::FAILURE
             })?;
-        Some(session_pids_for_project(data_dir, &canonical))
+        Some(canonical)
     };
-    let app_pids = app.map(|name| session_pids_for_app(data_dir, name));
+    // Read once for both filters, and only when one is active: `--all` without `-a` reaches every
+    // session and needs no record. A registry that cannot be read leaves the scope unknown, and a
+    // load into an unknown scope is refused here rather than counted as one that reached nothing.
+    if project.is_none() && app.is_none() {
+        return Ok((None, None));
+    }
+    let live = asked_sessions(data_dir).map_err(|why| {
+        diag::error(&format!(
+            "sbx: {why} — which sessions are in scope is not known, so nothing was loaded"
+        ));
+        ExitCode::FAILURE
+    })?;
+    let project_pids = project.map(|canonical| {
+        sessions_of_project(&live, &canonical)
+            .into_iter()
+            .map(|s| s.pid)
+            .collect()
+    });
+    let app_pids = app.map(|name| pids_of_app(&live, name));
     Ok((project_pids, app_pids))
 }
 
@@ -2254,6 +2312,45 @@ mod tests {
             session_pids_for_project(data.path(), &elsewhere).is_empty(),
             "a different project must select no session"
         );
+    }
+
+    /// A registry that cannot be read leaves the scope of a `--session` load unknown, and the load
+    /// is refused rather than counted as one that reached no session. `--all` without `-a` needs no
+    /// record and goes ahead. The by-id app check reports the failure instead of waiving it, so its
+    /// caller can refuse a save the answer would otherwise write into a guessed config.
+    ///
+    /// A `sessions` entry that is a plain file is the unreadable registry: reading it as a
+    /// directory fails with an error that is not `NotFound`, which is the one failure the registry
+    /// reads as "no sessions yet".
+    #[test]
+    fn a_registry_that_cannot_be_read_refuses_a_scoped_load_instead_of_reaching_none() {
+        use crate::testutil::TmpDir;
+        let data = TmpDir::new();
+        std::fs::write(data.join("sessions"), b"not a directory").unwrap();
+        let proj = TmpDir::new();
+
+        assert!(
+            session_scope_pids(data.path(), false, None, proj.path()) == Err(ExitCode::FAILURE),
+            "the project's sessions are not known, so the load is refused"
+        );
+        assert!(
+            session_scope_pids(data.path(), true, Some("demo-app"), proj.path())
+                == Err(ExitCode::FAILURE),
+            "nor are the app's"
+        );
+        assert!(
+            matches!(
+                session_scope_pids(data.path(), true, None, proj.path()),
+                Ok((None, None))
+            ),
+            "`--all` without `-a` reaches every session and reads no record"
+        );
+        let why = session_app_of(data.path(), std::process::id())
+            .expect_err("the app check cannot be made");
+        assert!(why.contains("cannot read the session registry"), "{why}");
+        // A listing narrows to nothing, after the warning, rather than failing.
+        assert!(session_pids_for_project(data.path(), proj.path()).is_empty());
+        assert!(session_pids_for_app(data.path(), "demo-app").is_empty());
     }
 
     /// `sbx proc ls`, `sbx proc live` and `sbx proc logs` are one family, so "no id" has to mean the

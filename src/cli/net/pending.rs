@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use crate::{config, diag, help, sandbox, style};
 use crate::{
-    config_cwd, egress_dir_or_fail, egress_write_target, in_scope, interval_seconds,
-    pending_session_context, persist_egress_rule, precheck_local_save, session_app_of,
-    session_pids_for_app, session_pids_for_project, split_scope,
+    asked_sessions, config_cwd, egress_dir_or_fail, egress_write_target, in_scope,
+    interval_seconds, pending_session_context, persist_egress_rule, precheck_local_save,
+    say_unread_registry, session, session_app_of, session_pids_for_app, session_pids_for_project,
+    split_scope,
 };
+use crate::{config, diag, help, sandbox, style};
 
 use super::{write_session_header, write_unanswered};
 
@@ -462,6 +463,65 @@ fn drain_sessions(
     drain
 }
 
+/// Check `--app <name>` on an answer by id against the app the registry records for the session
+/// (`recorded`, from [`session_app_of`]).
+///
+/// The id already names the exact session, so this is a consistency check, not a filter: a session
+/// the registry knows as a *different* app is refused (exit 2), since with `--save` the rule would
+/// land in the wrong app's config. A session the registry does not know, or a plain shell, is given
+/// the benefit of the doubt — the id is authoritative. A registry that could not be read is that
+/// doubt too, and `Ok(Some(why))` hands the caller the reason to warn with — except under `--save`,
+/// where the name decides which config the rule is written to: there the check that could not be
+/// made refuses (exit 1) before anything is answered.
+fn app_assertion(
+    recorded: Result<Option<String>, String>,
+    id: &str,
+    name: &str,
+    save: bool,
+) -> Result<Option<String>, (u8, String)> {
+    match recorded {
+        Ok(Some(actual)) if actual != name => Err((
+            2,
+            format!("sbx: {id} is a session of app `{actual}`, not `{name}`"),
+        )),
+        Ok(_) => Ok(None),
+        Err(why) if save => Err((
+            1,
+            format!(
+                "sbx: {why} — whether {id} is a session of app `{name}` is not known, so nothing \
+                 was answered or saved"
+            ),
+        )),
+        Err(why) => Ok(Some(why)),
+    }
+}
+
+/// The directory a `--save` of the answer to session `pid`'s request is resolved against.
+///
+/// A `--local` save belongs in the project the agent runs in, which may not be where the user is
+/// standing, so it is the answered session's project as the registry records it, and the cwd only
+/// for a session the registry does not know. A registry that could not be read is not that: it
+/// leaves the project unknown rather than absent, and falling back to the cwd would write the rule
+/// into whatever project the user stands in, so a local save is refused with the reason. A global or
+/// `-c` save names its file without a base, and goes ahead.
+fn save_base(
+    sessions: Result<Vec<session::Session>, String>,
+    pid: u32,
+    scope: &config::manage::Scope,
+    cwd: Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    let recorded = match sessions {
+        Ok(live) => live.into_iter().find(|s| s.pid == pid).map(|s| s.project),
+        Err(why) if matches!(scope, config::manage::Scope::Local) => {
+            return Err(format!(
+                "{why}, so the project session {pid} runs in is not known"
+            ));
+        }
+        Err(_) => None,
+    };
+    Ok(recorded.or(cwd).unwrap_or_else(|| PathBuf::from(".")))
+}
+
 /// `sbx net pending allow|deny <id> [--save --local|--global|--app <name>]`: answer one parked
 /// request live. The unblock is the primary action; `--save` additionally persists a matching rule
 /// (the request's host) through the shared writer so the same host is pre-decided next launch — a
@@ -583,19 +643,16 @@ pub(super) fn net_pending_answer(
         Ok(d) => d,
         Err(code) => return code,
     };
-    // `--app <name>` on the by-id path asserts the id belongs to that app. The id already names the
-    // exact session, so this is a consistency check, not a filter: if the registry knows this session
-    // as a *different* app, the assertion is wrong → flag it (and, with `--save`, the save would land
-    // in the wrong app's config). An unregistered session or a plain shell (no known app) is given the
-    // benefit of the doubt — the id is authoritative.
-    if let Some(name) = parsed.app.as_deref()
-        && let Some(actual) = session_app_of(&data_dir, pid)
-        && actual != name
-    {
-        diag::error(&format!(
-            "sbx: {id} is a session of app `{actual}`, not `{name}`"
-        ));
-        return ExitCode::from(2);
+    // `--app <name>` on the by-id path asserts the id belongs to that app; see [`app_assertion`].
+    if let Some(name) = parsed.app.as_deref() {
+        match app_assertion(session_app_of(&data_dir, pid), id, name, save) {
+            Ok(None) => {}
+            Ok(Some(why)) => say_unread_registry(&data_dir, &why),
+            Err((code, message)) => {
+                diag::error(&message);
+                return ExitCode::from(code);
+            }
+        }
     }
     // With `--save`, the port has to be read **before** the answer: the parked row carries it and is
     // gone from the queue the moment the answer lands, while the reply names only the host. A rule
@@ -643,15 +700,20 @@ pub(super) fn net_pending_answer(
             sandbox::control::Verdict::Allow => EgressList::Allow,
             sandbox::control::Verdict::Deny => EgressList::Deny,
         };
-        // Resolve a `--local` save against the *answered session's* project (from the registry), not
-        // the cwd — the rule belongs in the project the agent runs in, which may not be where the
-        // user is standing. Fall back to the cwd if the session is not in the registry.
-        let base = pending_session_context(&data_dir)
-            .into_iter()
-            .find(|(p, _, _)| *p == pid)
-            .map(|(_, project, _)| project)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let base = match save_base(
+            asked_sessions(&data_dir),
+            pid,
+            &parsed.scope,
+            std::env::current_dir().ok(),
+        ) {
+            Ok(base) => base,
+            Err(why) => {
+                // The answer stuck, so this is the save failure the line below reports, not an
+                // error that would read as the answer undone.
+                diag::warn(&format!("answered, but could not save the rule: {why}"));
+                return ExitCode::FAILURE;
+            }
+        };
         let rule = egress_rule_for(&host, port);
         match persist_egress_rule(list, &rule, &parsed.scope, parsed.app.as_deref(), &base) {
             Ok(message) => outln!(
@@ -1093,6 +1155,83 @@ fn net_pending_drain_and_save(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--app <name>` on an answer by id: a session the registry knows as another app is refused,
+    /// one it does not know is given the benefit of the doubt, and an unreadable registry is that
+    /// doubt only when nothing is saved. With `--save` the name picks the config the rule is
+    /// written to, so the check that could not be made refuses before anything is answered.
+    #[test]
+    fn an_app_check_the_registry_cannot_make_refuses_only_a_save() {
+        let unread = || Err("cannot read the session registry: Not a directory".to_string());
+        assert!(app_assertion(Ok(Some("demo".into())), "1.1", "demo", true) == Ok(None));
+        assert!(app_assertion(Ok(None), "1.1", "demo", true) == Ok(None));
+        assert!(matches!(
+            app_assertion(Ok(Some("other".into())), "1.1", "demo", false),
+            Err((2, m)) if m.contains("`other`, not `demo`")
+        ));
+        assert!(matches!(
+            app_assertion(unread(), "1.1", "demo", false),
+            Ok(Some(why)) if why.contains("session registry")
+        ));
+        assert!(matches!(
+            app_assertion(unread(), "1.1", "demo", true),
+            Err((1, m)) if m.contains("session registry") && m.contains("nothing was answered")
+        ));
+    }
+
+    /// A `--local` save of an answer lands in the project the answered session runs in, and in the
+    /// cwd only for a session the registry does not know. An unreadable registry leaves that
+    /// project unknown, so the local save is refused instead of written into the cwd's project; a
+    /// global or `-c` save names its own file and goes ahead.
+    #[test]
+    fn a_local_save_is_refused_when_the_registry_cannot_say_where_the_session_runs() {
+        use config::manage::Scope;
+        let project = PathBuf::from("/home/u/agent-project");
+        let cwd = Some(PathBuf::from("/home/u/elsewhere"));
+        let me = std::process::id();
+        let recorded = || {
+            Ok(vec![
+                session::Session::current(
+                    project.clone(),
+                    session::Kind::Run,
+                    session::SessionRuntime::Project,
+                )
+                .expect("read this process's session identity"),
+            ])
+        };
+        let unread = || Err("cannot read the session registry: Not a directory".to_string());
+
+        assert_eq!(
+            save_base(recorded(), me, &Scope::Local, cwd.clone()),
+            Ok(project.clone()),
+            "the session's own project, not where the user stands"
+        );
+        assert_eq!(
+            save_base(recorded(), me + 1, &Scope::Local, cwd.clone()),
+            Ok(PathBuf::from("/home/u/elsewhere")),
+            "a session the registry does not know falls back to the cwd"
+        );
+        let refused = save_base(unread(), me, &Scope::Local, cwd.clone())
+            .expect_err("an unknown project is not the cwd's");
+        assert!(
+            refused.contains("session registry") && refused.contains(&me.to_string()),
+            "{refused}"
+        );
+        assert!(
+            save_base(unread(), me, &Scope::Global, cwd.clone()).is_ok(),
+            "a global save needs no project"
+        );
+        assert!(
+            save_base(
+                unread(),
+                me,
+                &Scope::File(PathBuf::from("/tmp/x.toml")),
+                cwd
+            )
+            .is_ok(),
+            "nor does a `-c` one"
+        );
+    }
 
     /// The `watch` frame names a session reached that did not answer in full, under its own header,
     /// and does not say nothing is parked while one is: left out, it read like a session with
