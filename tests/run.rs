@@ -2241,13 +2241,24 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
         state.path(),
         &["task", "run", "fetch", "--session", &pid.to_string()],
     );
-    let task_feed = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &["logs", &pid.to_string(), "--feed", "signer"],
-    );
-    let task_feed = String::from_utf8_lossy(&task_feed.stdout).into_owned();
+    // Polled as the feed above is: the proxy hands its record to an events thread, which writes it
+    // after the response has gone back to the operation.
+    let want = "sign      demo-feed: GET postman-echo.com/get?a=1&via=task";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut task_feed = String::new();
+    while std::time::Instant::now() < deadline {
+        let out = sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["logs", &pid.to_string(), "--feed", "signer"],
+        );
+        task_feed = String::from_utf8_lossy(&out.stdout).into_owned();
+        if task_feed.contains(want) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
     let _ = sbx_in(
         project.path(),
         data.path(),
@@ -2261,7 +2272,7 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
         String::from_utf8_lossy(&ran.stderr)
     );
     assert!(
-        task_feed.contains("sign      demo-feed: GET postman-echo.com/get?a=1&via=task"),
+        task_feed.contains(want),
         "an operation's own proxy records into the session's feed, not into one nobody can \
          read:\n{task_feed}"
     );
