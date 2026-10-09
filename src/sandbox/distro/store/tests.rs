@@ -437,3 +437,78 @@ fn an_images_links_are_followed_inside_the_image_not_on_the_host() {
     .unwrap();
     check_supplied(&debian, "oci:x/y:1").expect("a loader that is an absolute link in the image");
 }
+
+/// A roll writing the image lock while a launch compares and pins cannot land between the two: the
+/// launch waits for the roll's writer guard, then reads what the roll wrote and leaves it, rather
+/// than putting back the digest it provisioned. Each side opens the guard itself, as two processes
+/// would: two opens of one file contend for a `flock` even within one process.
+#[test]
+fn a_roll_cannot_land_between_a_launchs_comparison_and_its_pin() {
+    let tmp = crate::testutil::TmpDir::new();
+    let lock = tmp.join("distro.lock");
+    let locator = "oci:example.com/x/y:1";
+    let digest = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+    crate::store::write_lock(&lock, locator, &digest('a')).unwrap();
+    let read = crate::store::read_lock_lines(&lock).unwrap();
+
+    let roll = crate::store::hold_lock_for_write(&lock, &|_| {}).unwrap();
+    let launch = {
+        let (lock, key) = (lock.clone(), digest('c'));
+        std::thread::spawn(move || super::pin_unless_moved(&lock, locator, &key, &read))
+    };
+    // Long enough for a launch with no guard to have compared and pinned already.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    crate::store::write_lock(&lock, locator, &digest('b')).unwrap();
+    drop(roll);
+
+    let pinned = launch.join().unwrap().unwrap();
+    assert!(!pinned, "the launch sees the roll and does not pin");
+    assert_eq!(
+        crate::store::read_lock_lines(&lock).unwrap(),
+        Some((locator.to_string(), Some(digest('b')))),
+        "the roll's digest stands"
+    );
+}
+
+/// A roll takes the same writer guard for its write, so a launch comparing and pinning holds it
+/// back: the roll writes only once the guard is let go. A locator carrying its digest resolves to
+/// itself, so this needs no registry.
+#[test]
+fn a_roll_waits_for_the_writer_guard_before_it_writes() {
+    let tmp = crate::testutil::TmpDir::new();
+    let layout = layout_under(&tmp.join("data"));
+    let lock = tmp.join("distro.lock");
+    let old = format!("sha256:{}", "1".repeat(64));
+    let new = format!("sha256:{}", "2".repeat(64));
+    let locator = format!("oci:docker.io/library/debian@{new}");
+    crate::store::write_lock(&lock, "oci:docker.io/library/debian:10", &old).unwrap();
+    let seeded = std::fs::read(&lock).unwrap();
+
+    let launch = crate::store::hold_lock_for_write(&lock, &|_| {}).unwrap();
+    let roll = {
+        let (lock, locator) = (lock.clone(), locator.clone());
+        std::thread::spawn(move || {
+            refresh(
+                &layout,
+                &locator,
+                &[],
+                &lock,
+                None,
+                crate::sandbox::RollMode::Apply,
+            )
+        })
+    };
+    // Long enough for a roll with no guard to have written already.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        std::fs::read(&lock).unwrap(),
+        seeded,
+        "the roll waits for the guard"
+    );
+    drop(launch);
+    roll.join().unwrap().unwrap();
+    assert_eq!(
+        locked_key(&lock, &locator).unwrap().as_deref(),
+        Some(new.as_str())
+    );
+}
