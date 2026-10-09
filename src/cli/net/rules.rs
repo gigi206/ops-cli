@@ -755,9 +755,15 @@ fn inject_shortfall(
              rule into."
         ));
     }
-    let app_flag = app.map(|a| format!(" --app {a}")).unwrap_or_default();
+    // Each word as a shell reads it back, so the command can be pasted: a `*.example.com` or a
+    // `re:` pattern with a space in it would otherwise be expanded or split by the shell.
+    let word = config::view::shell_word;
+    let app_flag = app
+        .map(|a| format!(" --app {}", word(a)))
+        .unwrap_or_default();
     let hint = format!(
-        "     to pre-decide it for the next launch, persist it: sbx net {verb} {rule}{app_flag}"
+        "     to pre-decide it for the next launch, persist it: sbx net {verb} {}{app_flag}",
+        word(rule)
     );
     (errors, Some(hint))
 }
@@ -941,6 +947,13 @@ mod tests {
             Some(
                 "     to pre-decide it for the next launch, persist it: sbx net mute a.test --app agent"
             )
+        );
+        // A rule the shell would expand or split is quoted, so the hint can be pasted as it is.
+        let (_, hint) =
+            inject_shortfall("allow", "*.a.test", false, None, &report(&[], &[], &[], []));
+        assert_eq!(
+            hint.as_deref(),
+            Some("     to pre-decide it for the next launch, persist it: sbx net allow '*.a.test'")
         );
         // Refused everywhere it reached: the refusal stands for "no session", the hint still follows.
         let (errors, hint) =
