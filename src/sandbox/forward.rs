@@ -369,7 +369,8 @@ fn spawn_accept_with(
 /// so the loop polls the `shutdown` flag and returns when the guard signals teardown (dropping the
 /// listener, freeing the port). The in-cage socket may not exist yet when the host accepts (the cage
 /// forwarder binds it after the cage starts); a connect then fails and the connection is dropped —
-/// the browser retries, and a dev server is up long before the user curls.
+/// the browser retries, and a dev server is up long before the user curls. Any other connection
+/// that could not be bridged is said on stderr ([`bridge_failure`]).
 ///
 /// The ceiling and the accept-error policy are [`super::conncap`]'s, not this loop's own: the slot
 /// is taken by the operation that tests it ([`super::conncap::ConnCap::take`]), and an accept that
@@ -378,6 +379,10 @@ fn spawn_accept_with(
 /// that had stopped accepting read as an idle port for the rest of the session.
 fn accept_loop(listener: TcpListener, sock: PathBuf, shutdown: Arc<AtomicBool>) {
     let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or_default();
+    // Shared by this listener's connections, each on its own thread, so a run of failures is said
+    // once per interval rather than once per connection.
+    let failures = Arc::new(std::sync::Mutex::new(super::conncap::Refusals::new()));
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
@@ -430,11 +435,55 @@ fn accept_loop(listener: TcpListener, sock: PathBuf, shutdown: Arc<AtomicBool>) 
         // another thread.
         let Some(slot) = cap.take() else { continue };
         let sock = sock.clone();
+        let failures = Arc::clone(&failures);
         super::conncap::spawn_conn("forward", move || {
             let _slot = slot;
-            let _ = bridge(stream, &sock);
+            let bridged = bridge(stream, &sock);
+            if let Some(line) = bridge_failure(&failures, port, bridged, std::time::Instant::now())
+            {
+                crate::diag::error(&line);
+            }
         });
     }
+}
+
+/// Whether a connection that could not be bridged is let go in silence: only when the in-cage
+/// forwarder has not bound its socket yet (`NotFound`), the ordinary state of a cage still starting,
+/// which a client's retry outlives.
+///
+/// Anything else is said, because each is a forward that answers TCP and carries nothing: a socket
+/// left by a forwarder that has died (`ConnectionRefused`), something else the cage put at the name,
+/// a forwarder that took no connection within the dial's deadline, or a host out of descriptors to
+/// copy with. Dropped with the rest, the forward read as up while every byte sent to it was lost.
+fn goes_unsaid(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound
+}
+
+/// What to say about one connection on host `port` that [`bridge`] ended with `bridged` at `now`,
+/// under `failures`, the listener's count. A failure [`goes_unsaid`] or not is let go; any other
+/// is said when a line is due, the line covering every failure since the last one. A connection
+/// bridged says what a run of failures left unsaid, if any, so the end of a run is not lost.
+fn bridge_failure(
+    failures: &std::sync::Mutex<super::conncap::Refusals>,
+    port: u16,
+    bridged: io::Result<()>,
+    now: std::time::Instant,
+) -> Option<String> {
+    let mut count = failures
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (n, why) = match bridged {
+        Ok(()) => (count.served()?, String::new()),
+        Err(e) if goes_unsaid(&e) => return None,
+        Err(e) => (count.refused(now)?, format!(" ({e})")),
+    };
+    let which = match n {
+        1 => "a connection".to_string(),
+        n => format!("{n} connections, counted since the last such line,"),
+    };
+    Some(format!(
+        "sbx: forward :{port}: {which} could not be bridged into the cage{why}"
+    ))
 }
 
 /// Pump one TCP connection to the in-cage forwarder's Unix socket, both ways.
@@ -631,6 +680,61 @@ mod tests {
     use std::io::{Read, Write};
     use std::time::Duration;
 
+    /// A connection made before the in-cage forwarder has bound its socket goes unsaid, since the
+    /// client's retry outlives it; one that meets a dead forwarder's socket, something else at the
+    /// name, or a forwarder that never takes it is said, being a forward that carries nothing.
+    #[test]
+    fn only_a_forwarder_not_bound_yet_goes_unsaid() {
+        let kind = |k| io::Error::new(k, "x");
+        assert!(goes_unsaid(&kind(io::ErrorKind::NotFound)));
+        for k in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Other,
+        ] {
+            assert!(!goes_unsaid(&kind(k)), "{k:?}");
+        }
+    }
+
+    /// A connection that could not be bridged is said once per interval for a listener, the line
+    /// counting the failures it covers; one bridged, or one the forwarder was not bound for yet,
+    /// is not.
+    #[test]
+    fn a_run_of_bridge_failures_is_said_once_per_interval() {
+        let failures = std::sync::Mutex::new(super::super::conncap::Refusals::new());
+        let refused = || Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+        let t0 = std::time::Instant::now();
+        assert_eq!(bridge_failure(&failures, 9119, Ok(()), t0), None);
+        assert_eq!(
+            bridge_failure(
+                &failures,
+                9119,
+                Err(io::Error::from(io::ErrorKind::NotFound)),
+                t0
+            ),
+            None
+        );
+        let first = bridge_failure(&failures, 9119, refused(), t0).expect("the first is said");
+        assert!(
+            first.starts_with(
+                "sbx: forward :9119: a connection could not be bridged into the cage ("
+            ),
+            "{first}"
+        );
+        assert_eq!(bridge_failure(&failures, 9119, refused(), t0), None);
+        let later = t0 + super::super::conncap::REFUSALS_EVERY;
+        let line = bridge_failure(&failures, 9119, refused(), later).expect("the next interval");
+        assert!(line.contains(": 2 connections, counted since"), "{line}");
+        // A failure counted and not yet said is said by the next connection bridged.
+        assert_eq!(bridge_failure(&failures, 9119, refused(), later), None);
+        assert_eq!(
+            bridge_failure(&failures, 9119, Ok(()), later).as_deref(),
+            Some("sbx: forward :9119: a connection could not be bridged into the cage")
+        );
+        assert_eq!(bridge_failure(&failures, 9119, Ok(()), later), None);
+    }
+
     /// An accept loop the host refuses a thread for is an error, so the launch fails through its
     /// guard rather than panicking with a port bound and nothing serving it.
     #[test]
@@ -809,8 +913,8 @@ mod tests {
         );
     }
 
-    /// A forward that names port 0 on either side is refused before anything is bound or made:
-    /// bound on the host, 0 would hand out an ephemeral substitute.
+    /// A forward that names port 0 on either side is refused before anything is bound or any
+    /// forward directory made: bound on the host, 0 would hand out an ephemeral substitute.
     #[test]
     fn a_forward_naming_port_zero_is_refused_before_anything_is_bound() {
         let data = TmpDir::new();
