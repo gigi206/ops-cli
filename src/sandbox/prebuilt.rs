@@ -1148,30 +1148,66 @@ where
     F: FnOnce() -> io::Result<(String, String)>,
 {
     let project_id = super::binds::project_runtime_id(ctx.project)?;
-    let lock_file = lock_file(kind);
-    let mut lock = read_pins(ctx.layout, project_id.as_str(), &lock_file)?;
+    let (url, hash) = pin_or_mint(ctx.layout, project_id.as_str(), &lock_file(kind), key, mint)?;
+    build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash, decor)
+}
+
+/// The pin `key` holds in the project's lock `lock_file`, minting it with `mint` and writing it when
+/// it holds none.
+///
+/// A missing key is minted under a lock of its own, beside the package lock and named by the key's
+/// hash, and the lock is read again once that is held: two cold launches of one project that both
+/// need the package used to mint it twice — two downloads and hashes, or two runs of a resolve
+/// command, the later write winning — and now the second waits for the first and takes its pin. Only
+/// launches minting the same key wait on each other; one with a pinned key takes no lock at all.
+///
+/// Written ADDITIVELY, the way `nixhub::provision` persists a freshly-resolved pin and for the same
+/// reason: minting is the slow part, so a concurrent cold provision of the same project has a wide
+/// window to pin a *different* package while this one is still working. Writing the snapshot taken
+/// before the mint would drop that pin, and the package would silently re-resolve and re-pin on the
+/// next launch — a second trust-on-first-use, and a network round-trip on a path documented as
+/// offline. Re-reading and merging just this key keeps the other one, under the lock's writer guard,
+/// so another writer cannot land between that re-read and the write.
+fn pin_or_mint<F>(
+    layout: &Layout,
+    project_id: &str,
+    lock_file: &str,
+    key: &str,
+    mint: F,
+) -> io::Result<(String, String)>
+where
+    F: FnOnce() -> io::Result<(String, String)>,
+{
+    if let Some(pin) = read_pins(layout, project_id, lock_file)?.get(key) {
+        return Ok((pin.url.clone(), pin.hash.clone()));
+    }
+    let path = lock_path(layout, project_id, lock_file);
+    let mut minting = path.file_name().unwrap_or_default().to_os_string();
+    minting.push(format!(
+        ".mint-{}",
+        &crate::trust::hash_bytes(key.as_bytes())[..16]
+    ));
+    let waiting = |held: &Path| {
+        crate::diag::note(&format!(
+            "waiting for another sbx pinning `{key}` (it holds `{}`)",
+            held.display()
+        ));
+    };
+    let _minting = crate::sandbox::flock_at(&path.with_file_name(minting), true, Some(&waiting))?;
+    let mut lock = read_pins(layout, project_id, lock_file)?;
     let ((url, hash), minted) = pinned_or_mint(&mut lock, key, mint)?;
     if minted {
-        // Written ADDITIVELY, the way `nixhub::provision` persists a freshly-resolved pin and for
-        // the same reason: minting is the slow part (a download and a hash, or a resolve command in
-        // a cage), so a concurrent cold provision of the same project has a wide window to pin a
-        // *different* package while this one is still working. Writing the snapshot taken before
-        // the mint would drop that pin, and the package would silently re-resolve and re-pin on the
-        // next launch — a second trust-on-first-use, and a network round-trip on a path documented
-        // as offline. Re-reading and merging just this key keeps the other one.
-        // Under the lock's writer guard, so another writer cannot land between this re-read and
-        // the write below.
         let _writing = crate::store::hold_lock_for_write(
-            &lock_path(ctx.layout, project_id.as_str(), &lock_file),
+            &path,
             &crate::store::waiting_for_writer("the package lock"),
         )?;
-        let mut disk = read_pins(ctx.layout, project_id.as_str(), &lock_file)?;
+        let mut disk = read_pins(layout, project_id, lock_file)?;
         if let Some(entry) = lock.get(key) {
             disk.insert(key.to_string(), entry.clone());
         }
-        write_pins(ctx.layout, project_id.as_str(), &lock_file, &disk)?;
+        write_pins(layout, project_id, lock_file, &disk)?;
     }
-    build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash, decor)
+    Ok((url, hash))
 }
 
 /// Provision one declared package host-side: resolve its locator to a hash (pinning it on first use),
@@ -1585,6 +1621,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Two cold launches of one project that need the same unpinned package mint it once: the
+    /// second waits on the key's own lock, reads the pin the first wrote, and never runs its mint.
+    #[test]
+    fn two_cold_launches_mint_one_package_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tmp = TmpDir::new();
+        let minted = std::sync::Arc::new(AtomicUsize::new(0));
+        let launch = |n: usize| {
+            let data = tmp.path().to_path_buf();
+            let minted = std::sync::Arc::clone(&minted);
+            std::thread::spawn(move || {
+                pin_or_mint(
+                    &Layout::under(&data),
+                    "p1",
+                    "deb-packages.lock",
+                    "deb:demo",
+                    || {
+                        minted.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        Ok((
+                            format!("https://mirror{n}.test/demo.deb"),
+                            format!("sha256-{n}"),
+                        ))
+                    },
+                )
+                .expect("the pin")
+            })
+        };
+        let (a, b) = (launch(1), launch(2));
+        let (a, b) = (a.join().unwrap(), b.join().unwrap());
+        assert_eq!(minted.load(Ordering::SeqCst), 1, "one download, not two");
+        assert_eq!(a, b, "both launches build the one pin");
+        assert_eq!(
+            pins(&Layout::under(tmp.path()), "p1", "deb-packages.lock")["deb:demo"].hash,
+            a.1
+        );
     }
 
     /// The offline invariant, stated by `provision_resolve`'s docstring and until now pinned by
