@@ -258,7 +258,7 @@ pub(super) fn handle_https_forward(
                         &mut client,
                         "400 Bad Request",
                         "bad-request:chunked",
-                        &format!("the chunked request body could not be read: {e}"),
+                        &unreadable_chunked_body_detail(&e),
                     );
                 }
                 // A `Content-Length` body that ends early is a transport failure rather than a
@@ -434,7 +434,7 @@ pub(super) fn handle_https_forward(
                     &mut client,
                     "400 Bad Request",
                     "bad-request:chunked",
-                    &format!("the chunked request body could not be read: {e}"),
+                    &unreadable_chunked_body_detail(&e),
                 );
             }
         };
