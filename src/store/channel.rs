@@ -698,6 +698,30 @@ pub(crate) fn write_lock(lock_path: &Path, source: &str, rev: &str) -> io::Resul
     crate::sandbox::atomicfile::write_atomic(lock_path, format!("{source}\n{rev}\n").as_bytes())
 }
 
+/// The guard a writer of the lock file at `lock_path` holds while it reads what the lock says and
+/// writes what follows from it, so another writer's write cannot land between the two.
+///
+/// The `flock` is taken on a file beside the lock, `<lock>.write-lock`, never on the lock itself:
+/// [`write_lock`] replaces the lock by a rename, a new inode each time, so a lock held on the old
+/// one would guard nothing. It is the project store lock's form ([`crate::sandbox::flock_at`]):
+/// created owner-only, closed on exec, and when it is busy `waiting` is told the file before the
+/// wait, since a cage that sees sbx's data directory read-only can hold it as well and keep this
+/// writer waiting. Dropping the guard releases it.
+pub(crate) fn hold_lock_for_write(
+    lock_path: &Path,
+    waiting: &dyn Fn(&Path),
+) -> io::Result<LockWriter> {
+    let mut name = lock_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".write-lock");
+    crate::sandbox::flock_at(&lock_path.with_file_name(name), true, Some(waiting)).map(LockWriter)
+}
+
+/// What [`hold_lock_for_write`] hands back: the lock's writers take turns while it lives.
+pub(crate) struct LockWriter(
+    // Held only for its `Drop`: closing the fd is what releases the `flock`. Never read.
+    #[allow(dead_code)] std::fs::File,
+);
+
 /// Resolve a channel reference to its current locked revision via
 /// `nix flake metadata`, so provisioning can pin that exact revision.
 fn resolve_channel_rev(nix: &Path, channel: &str) -> io::Result<String> {

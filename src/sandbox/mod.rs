@@ -206,6 +206,10 @@ pub(crate) use projects::{
 };
 #[cfg(test)]
 pub(crate) use projectstore::PROJECT_MARKER;
+/// The `flock` a lock file's guard is taken with, owner-only and closed on exec, saying what it
+/// waits for. Re-exported for the channel locks' writer guard
+/// ([`crate::store::hold_lock_for_write`]), so the two take their turns one way.
+pub(crate) use projectstore::flock_at;
 pub(crate) use projectstore::reflink_verdict;
 pub(crate) use proxy::child::main as run_proxy;
 pub(crate) use proxy::{

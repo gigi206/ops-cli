@@ -195,7 +195,11 @@ fn acquire_shared_gc_lock(layout: &Layout, exclusive: bool) -> io::Result<Shared
 /// Open the lock file `path`, creating it owner-only and its parent with it, and `flock` it shared
 /// or exclusive, blocking until the lock is granted. When it is busy and `waiting` is given, that
 /// is called once with `path` before the wait, for the caller to say what it waits for.
-fn flock_at(path: &Path, exclusive: bool, waiting: Option<&dyn Fn(&Path)>) -> io::Result<fs::File> {
+pub(crate) fn flock_at(
+    path: &Path,
+    exclusive: bool,
+    waiting: Option<&dyn Fn(&Path)>,
+) -> io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     if let Some(parent) = path.parent() {
