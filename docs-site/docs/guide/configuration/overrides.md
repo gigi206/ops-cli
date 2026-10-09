@@ -353,10 +353,11 @@ posture:
   *closed* by dropping a bad entry (a missing bind or tool, an unknown syscall token, a
   malformed device path: less capability/relaxation, never a wider posture), so they
   warn and skip.
-- `--forward` is the exception among them: a malformed value (`9200:nope`, `9200:9119:8787`)
-  is a **hard error**. A flag has nothing else to save, and the alternative is worse than a
-  dropped entry: the launch would come up with the forward silently missing and the port you
-  meant to publish answering nothing. A bad entry in a config *file* still warns and skips,
+- `--forward` is the exception among them: a malformed value (`9200:nope`,
+  `9200:9119:8787`, or a port of `0`, alone or on either side of a remap) is a **hard
+  error**. A flag has nothing else to save, and the alternative is worse than a dropped
+  entry: the launch would come up with the forward silently missing and the port you meant
+  to publish answering nothing. A bad entry in a config *file* still warns and skips,
   because there one typo must not void a whole layer.
 
 ## Environment footgun notice
