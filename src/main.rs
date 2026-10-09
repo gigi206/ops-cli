@@ -498,12 +498,10 @@ fn split_one_rule(
 /// once and then slept for longer than the machine will run.
 fn interval_seconds(value: Option<&OsString>) -> Result<u64, String> {
     let v = value.ok_or_else(|| "`--interval` needs a value in seconds".to_string())?;
-    let secs: u64 = v.to_str().and_then(|s| s.parse().ok()).ok_or_else(|| {
-        format!(
-            "invalid interval `{}` — expected a whole number of seconds",
-            v.to_string_lossy()
-        )
-    })?;
+    let secs: u64 = v
+        .to_str()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("invalid interval {v:?} — expected a whole number of seconds"))?;
     if secs == 0 {
         return Err("interval must be at least 1 second".to_string());
     }
@@ -1084,8 +1082,13 @@ fn format_log_time(at_epoch_ms: u128) -> String {
     // will drop this alias — but it stays the correct FFI type, and on sbx's x86_64 target it is
     // already 64-bit, so the widening is a no-op here. Silence the notice on the one line that names
     // it rather than reach for a hardcoded integer type that would be wrong on a 32-bit target.
+    //
+    // Converted with a check rather than `as`: a stamp past what `time_t` holds would otherwise wrap
+    // to an arbitrary second, and render as a plausible time that is not the event's.
     #[allow(deprecated)]
-    let secs = (at_epoch_ms / 1000) as libc::time_t;
+    let Ok(secs) = libc::time_t::try_from(at_epoch_ms / 1000) else {
+        return "--:--:--".to_string();
+    };
     // SAFETY: `localtime_r` writes the broken-down local time into our stack `tm` and reads only the
     // `time_t` we pass; it is the thread-safe variant, so no shared state is mutated.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -2327,6 +2330,24 @@ mod tests {
                 .is_empty(),
             "a different project must select no session"
         );
+    }
+
+    /// A stamp past what `time_t` holds renders as unknown, not as the plausible time it would wrap
+    /// to: this one's low bits name a second in 2023.
+    #[test]
+    fn a_stamp_no_time_t_holds_renders_as_unknown() {
+        assert_eq!(
+            format_log_time(((1u128 << 64) * 1000) + 1_700_000_000_000),
+            "--:--:--"
+        );
+    }
+
+    /// An `--interval` value that is not a number is quoted escaped, as every other refused value
+    /// is, so a control sequence in it is shown rather than run by the terminal.
+    #[test]
+    fn a_refused_interval_is_quoted_escaped() {
+        let why = interval_seconds(Some(&OsString::from("\u{1b}[31mred"))).unwrap_err();
+        assert!(!why.contains('\u{1b}') && why.contains("\\u{1b}"), "{why}");
     }
 
     /// A registry that cannot be read leaves the scope of a `--session` load unknown, and the load
