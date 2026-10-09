@@ -681,11 +681,13 @@ refusal is answered on accept, under 50ms, before the request is even read. Bodi
 for pool reuse stay under 256 KiB per body; past that they stream. The request-body
 budget is 16 times the per-request cap, floored by available memory.
 
-On an `http2` host three more reasons exist: `http2-handshake` (no common ALPN),
-`http2-required` (negotiated anything but `h2`: never downgraded to HTTP/1.1), and
-`http2-stream-cap` (`429` past 256 concurrent streams, announced in `SETTINGS`).
-Header lists are capped at 64 KiB per leg, and an extended-`CONNECT` over h2 is
-`405 method-not-allowed` (gRPC is POST).
+On an `http2` host three more reasons exist: `http2-handshake` (a TLS handshake that
+failed or did not complete within the socket timeout: no common ALPN, a client that
+refused the minted certificate or closed, or one that sent nothing), `http2-required`
+(negotiated anything but `h2`: never downgraded to HTTP/1.1), and `http2-stream-cap`
+(`429` past 256 concurrent streams, announced in `SETTINGS`). Header lists are capped at
+64 KiB per leg, and an extended-`CONNECT` over h2 is `405 method-not-allowed` (gRPC is
+POST).
 
 `upstream-http2-unsupported` belongs to a host designated
 [`http2`](../configuration/network#http2-and-grpc) alone: gRPC is HTTP/2 end to end and the
