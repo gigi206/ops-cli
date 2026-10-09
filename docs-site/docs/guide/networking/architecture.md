@@ -359,6 +359,15 @@ once. A head that is truncated, oversized, past its budget or not valid UTF-8 is
 caller that connects and closes without sending a byte is not an attempt, and leaves
 nothing behind.
 
+Inside a CONNECT tunnel, the first read is also what completes the interception
+handshake. A client that never completes it is recorded the same way, against the host
+the CONNECT named: one that refuses the minted certificate with an alert, one that
+closes instead, and one that sends nothing at all until the socket times out, which is
+what a protocol whose server speaks first does through a CONNECT that no `tcp://` rule
+splices. Nothing is written back to such a client, since no TLS session exists to carry
+an answer. A tunnel that did complete its handshake and then ends before a request
+arrives is how a persistent connection closes, and leaves nothing behind either.
+
 Four hop headers are never forwarded upstream: `Connection`, `Proxy-Connection`,
 `Proxy-Authorization` (a credential for the proxy hop, never the origin) and `Expect`
 (answered by the proxy directly). A client copy of a header sbx injects is stripped too,
