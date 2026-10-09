@@ -368,6 +368,19 @@ fn bridge(client: TcpStream, sock: &Path) -> io::Result<()> {
 /// Shared with [`super::nettap`], whose captured connections have exactly this shape — a cage-side
 /// TCP stream and a host-side Unix socket to the proxy — so the teardown rule keeps one spelling.
 pub(super) fn pump_tcp_uds(client: TcpStream, uds: UnixStream) -> io::Result<()> {
+    pump_tcp_uds_with(std::thread::Builder::new(), client, uds)
+}
+
+/// [`pump_tcp_uds`], with the builder of the host-to-cage direction's thread passed in, so a test
+/// can ask for one the host is certain to refuse.
+///
+/// A refused thread ends the connection, both sockets shut down rather than left to a copy in one
+/// direction only, and is an error: the bare `std::thread::spawn` panicked there instead.
+fn pump_tcp_uds_with(
+    builder: std::thread::Builder,
+    client: TcpStream,
+    uds: UnixStream,
+) -> io::Result<()> {
     // Two handles per socket (read + write), plus one each to force the teardown after the inline
     // copy ends. `try_clone` dups the fd, so every handle refers to the same socket.
     let mut client_rd = client.try_clone()?;
@@ -377,12 +390,19 @@ pub(super) fn pump_tcp_uds(client: TcpStream, uds: UnixStream) -> io::Result<()>
     let uds_shut = uds.try_clone()?;
     let mut uds_rd = uds;
 
-    let t = std::thread::spawn(move || {
+    let copy_in = move || {
         let _ = std::io::copy(&mut client_rd, &mut uds_wr);
         // The browser half closed (or the TCP conn ended) → tell the cage forwarder by shutting
         // the UDS write half, so it sees EOF and stops responding; the inline copy then reads 0.
         let _ = uds_wr.shutdown(Shutdown::Write);
-    });
+    };
+    let Some(t) = super::conncap::spawn_joinable(builder, "forward", copy_in) else {
+        let _ = client_shut.shutdown(Shutdown::Both);
+        let _ = uds_shut.shutdown(Shutdown::Both);
+        return Err(io::Error::other(
+            "no thread for the connection's host-to-cage direction",
+        ));
+    };
     let _ = std::io::copy(&mut uds_rd, &mut client_wr);
     // The cage half closed → tell the browser by shutting the TCP write half, then force both
     // sockets fully down so the spawned copy's read returns and the join below always completes.
@@ -514,6 +534,39 @@ mod tests {
     use crate::testutil::TmpDir;
     use std::io::{Read, Write};
     use std::time::Duration;
+
+    /// A connection whose host-to-cage thread the host refuses ends as an error, both its sockets
+    /// shut down, rather than panicking or leaving one direction copying alone. The refusal is a
+    /// stack no host can reserve.
+    #[test]
+    fn a_connection_without_its_second_thread_ends_as_an_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut browser = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (client, _) = listener.accept().unwrap();
+        let (uds, mut cage) = UnixStream::pair().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ended = pump_tcp_uds_with(
+                std::thread::Builder::new().stack_size(usize::MAX / 8),
+                client,
+                uds,
+            );
+            let _ = done_tx.send(ended.is_err());
+        });
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "a connection without its second direction ends, as an error"
+        );
+        browser
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        cage.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(browser.read(&mut buf).expect("the end, not a timeout"), 0);
+        assert_eq!(cage.read(&mut buf).expect("the end, not a timeout"), 0);
+    }
 
     /// Starts a forwarder on ports the OS has just handed out. A port is chosen by binding and
     /// releasing it, so between the release and the forwarder's own bind there is a window
