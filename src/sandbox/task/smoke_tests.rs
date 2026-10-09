@@ -710,3 +710,59 @@ fn an_output_task_writes_its_artifact_through_the_cage() {
         "the earlier artifact is gone"
     );
 }
+
+/// A task that declares a `tcp://` destination runs in a cage that resolves that name through a
+/// hosts file of its own, written for the invocation beside the session's other runtime files, and
+/// gone once the invocation has ended: a networked task's whole hosts-file cycle, through a real
+/// proxy and a real cage.
+#[test]
+fn a_networked_task_resolves_its_own_destination_and_leaves_no_file_behind() {
+    let project = TmpDir::new();
+    let Some(shell) = userland_shell() else {
+        skip_incapable!("skipping networked task smoke: need bwrap, userns, and nix");
+        return;
+    };
+    let mut lookup = echo_task(&shell.to_string_lossy());
+    lookup.name = "lookup".into();
+    lookup.cmd = vec![
+        shell.to_string_lossy().into_owned(),
+        "-c".into(),
+        "cat /etc/hosts".into(),
+    ];
+    lookup.params.clear();
+    lookup.secrets.clear();
+    lookup.network = vec![crate::allowlist::classify("tcp://db.smoke.test:15432").unwrap()];
+    let Some((engine, data)) = engine_for(vec![lookup], project.path(), "smoke-net") else {
+        skip_incapable!("skipping networked task smoke: prerequisites absent");
+        return;
+    };
+
+    let outcome = engine
+        .run(
+            "lookup",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            next_invocation(),
+        )
+        .expect("the task runs");
+    assert_eq!(outcome.exit, 0, "stderr: {:?}", outcome.stderr);
+    let stdout = outcome.stdout.expect("stdout is shown");
+    assert!(
+        stdout.contains("db.smoke.test"),
+        "the declared destination must resolve inside the task's cage: {stdout}"
+    );
+
+    let left: Vec<_> = std::fs::read_dir(data.join("egress"))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("hosts-") || n.starts_with("sshcfg-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        left.is_empty(),
+        "the invocation's own files go when it ends: {left:?}"
+    );
+}
