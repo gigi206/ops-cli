@@ -560,7 +560,7 @@ impl NetworkView {
 
 /// Whether a listed egress rule allows, denies, or mutes (`dontaudit` — suppresses a denied
 /// request's log line without changing the verdict).
-#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum NetRuleKind {
     Allow,
     Deny,
