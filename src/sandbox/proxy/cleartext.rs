@@ -231,21 +231,43 @@ pub(super) fn handle_cleartext(
     // reads the bytes the cage would receive rather than a compressed body the mask cannot see into;
     // otherwise the client's own `Accept-Encoding` is forwarded as it was written.
     let reserialized = reserialize_request(&origin, &[], None, false, masks_reflection);
-    upstream.write_all(&reserialized)?;
+    if upstream.write_all(&reserialized).is_err() {
+        return NoFinalHead::UpstreamClosed.refuse(
+            &mut client,
+            ctx,
+            crate::sandbox::control::Proto::Http,
+            &host,
+            port,
+            method,
+            &path,
+        );
+    }
     flow.up
         .fetch_add(reserialized.len() as u64, Ordering::Relaxed);
     if body_len > 0 && head_expects_continue(head) {
         let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
         let _ = client.flush();
     }
-    // Teed as it is relayed — a pass-through, so the forwarded stream is unchanged.
+    // Teed as it is relayed — a pass-through, so the forwarded stream is unchanged. A failure here
+    // may be either side's, a client that stopped sending or an upstream that stopped taking, so it
+    // stays the dropped connection rather than a refusal blaming the upstream.
     copy_exact(
         &mut tee_request_body(&mut client, capture.as_ref()),
         &mut upstream,
         body_len,
     )?;
     flow.up.fetch_add(body_len, Ordering::Relaxed);
-    upstream.flush().ok();
+    if upstream.flush().is_err() {
+        return NoFinalHead::UpstreamClosed.refuse(
+            &mut client,
+            ctx,
+            crate::sandbox::control::Proto::Http,
+            &host,
+            port,
+            method,
+            &path,
+        );
+    }
 
     // The request is permitted and fully forwarded; the response may now idle between bursts, so
     // lift the upstream read timeout for the relay below (same rationale as the tunneled path).
@@ -287,20 +309,14 @@ pub(super) fn handle_cleartext(
     // have its flood carried anyway, past the ceiling that stopped the head relay, on a leg whose
     // read bound `begin_response_stream` has already lifted.
     if let Some(why) = no_final {
-        ctx.push_log(
+        return why.refuse(
+            &mut client,
+            ctx,
             crate::sandbox::control::Proto::Http,
             &host,
             port,
-            Some(method),
-            Some(&path),
-            crate::sandbox::control::LogVerdict::Error,
-            why.tag(),
-        );
-        return write_refusal(
-            &mut client,
-            "502 Bad Gateway",
-            why.tag(),
-            &why.sentence(&host),
+            method,
+            &path,
         );
     }
     if let Some(code) = parse_status_code(&resp_head)
