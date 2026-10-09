@@ -704,9 +704,10 @@ pub(crate) struct Overlay<'a> {
     /// reaching here is one the database carries). It is interpolated into the [`CAGE_LOCALTIME`]
     /// link target and into `TZ`.
     pub(crate) timezone: &'a str,
-    /// The `mise:` tokens whose vendor a trusted layer declared as publishing continuously, so the
-    /// cage's mise accepts a release with no cooling-off period for them. Empty for almost every
-    /// cage; when it is empty no variable is set at all, so mise keeps its own default.
+    /// The keys ([`crate::sandbox::packages::mise_tool_key`]) of the `mise:` packages whose vendor a
+    /// trusted layer declared as publishing continuously, so the cage's mise accepts a release with
+    /// no cooling-off period for them. Empty for almost every cage; when it is empty no variable is
+    /// set at all, so mise keeps its own default.
     pub(crate) fresh_release_tokens: &'a [String],
     /// The project mise files sbx declared inert, named to the cage's own mise so it skips them
     /// too. Empty whenever the project has none, or has one that is honored.
