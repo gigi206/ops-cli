@@ -1986,3 +1986,32 @@ fn both_readers_are_joined_before_an_error_is_returned() {
         "the stderr reader must have been joined"
     );
 }
+
+/// An output tree nested as deep as a path allows is sized on a small stack: the walk keeps its
+/// own list of directories rather than recursing once per level. Files at the bottom and beside a
+/// link are counted, and the link is not followed.
+#[test]
+fn a_deeply_nested_output_is_sized_without_recursing() {
+    let tmp = crate::testutil::TmpDir::new();
+    let dir = tmp.path().join("out");
+    let deep: PathBuf = std::iter::repeat_n("d", 1500).collect();
+    std::fs::create_dir_all(dir.join(&deep)).unwrap();
+    std::fs::write(dir.join(&deep).join("f"), b"12345").unwrap();
+    std::fs::write(dir.join("g"), b"123").unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("big"), vec![0u8; 4096]).unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+    let claim = OutputClaim {
+        dir,
+        task: "t".into(),
+        held: Arc::new(Mutex::new(BTreeSet::new())),
+    };
+    let size = std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(move || claim.size())
+        .expect("a small-stack thread")
+        .join()
+        .expect("the walk returns");
+    assert_eq!(size, 8);
+}
