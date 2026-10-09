@@ -108,7 +108,9 @@ default** and require `--yes` to apply, since they act on more than one tree at 
 Two trees are always protected:
 
 - a tree a **live session** holds is refused: stop it with [`sbx session stop`](session#stop) first;
-- the **current project's** own tree is refused without `--force`.
+- the **current project's** own tree is refused without `--force`, and so is every named tree
+  when the working directory cannot be resolved, since the current project cannot then be
+  told apart from the others.
 
 ## Examples
 
