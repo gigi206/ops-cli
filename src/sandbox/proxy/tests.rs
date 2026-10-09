@@ -7379,6 +7379,80 @@ fn a_chunked_body_over_the_ceiling_keeps_its_own_refusal() {
     );
 }
 
+/// A `chunked` request body that stops arriving is answered with a sentence that names the timeout,
+/// not with the operating system's words for it, the same split a head that stops arriving gets.
+///
+/// Both planes that de-chunk read a body on two paths, held before a signer is asked about it and
+/// de-chunked on its way to an upstream already opened, and each of the four writes its own refusal.
+#[test]
+fn a_chunked_body_that_stops_arriving_is_refused_as_a_timeout_on_every_path() {
+    // One chunk that declares sixteen bytes and delivers three, then nothing.
+    let stalled = "Transfer-Encoding: chunked\r\n\r\n10\r\nabc";
+    for (plane, held) in [
+        ("tunnel", true),
+        ("tunnel", false),
+        ("forward", true),
+        ("forward", false),
+    ] {
+        // Reached only on the de-chunking path, which opens the upstream before it reads the body.
+        let (addr, upstream_ca, _seen) = spawn_upstream_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let der = ca.ca_cert_der();
+        let ctx = ProxyCtx::new(ca, policy(&["host.test:*"]))
+            .unwrap()
+            .with_upstream(Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            ))
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+            .with_timeout(Duration::from_millis(300));
+        // A signer that digests the body is what makes a plane hold it before anything is opened.
+        let ctx = Arc::new(if held {
+            ctx.with_injections(vec![digesting_injection()])
+        } else {
+            ctx
+        });
+        let resp = if plane == "tunnel" {
+            through_proxy(
+                ctx,
+                der,
+                "host.test",
+                "host.test",
+                addr.port(),
+                format!("POST / HTTP/1.1\r\nHost: host.test\r\n{stalled}").as_bytes(),
+            )
+        } else {
+            through_cleartext(
+                ctx,
+                format!(
+                    "POST https://host.test:{}/ HTTP/1.1\r\nHost: host.test\r\n{stalled}",
+                    addr.port()
+                )
+                .as_bytes(),
+            )
+        }
+        .unwrap_or_default();
+        let path = if held { "held" } else { "de-chunked" };
+        assert!(
+            resp.contains("400") && resp.contains("bad-request:chunked"),
+            "{plane}, {path}: a body that stops arriving is the chunked refusal: {resp:?}"
+        );
+        assert!(
+            resp.contains("the chunked request body stopped arriving and the connection timed out"),
+            "{plane}, {path}: the refusal names the timeout: {resp:?}"
+        );
+        assert!(
+            !resp.contains("os error"),
+            "{plane}, {path}: and not in the operating system's words: {resp:?}"
+        );
+    }
+}
+
 /// The launch's own ceiling is the one the de-chunker enforces.
 ///
 /// The number reaches the wire through four hands — the table, the policy, the context, the reader —
