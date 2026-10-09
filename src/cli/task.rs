@@ -768,7 +768,7 @@ fn task_run(args: &[OsString]) -> ExitCode {
         Ok(r) => r,
         Err(e) => return unreachable_plane(&e),
     };
-    render_result("run", &name, &result, json)
+    render_result("run", Some(&name), &result, json)
 }
 
 /// `sbx task run --detach`: start an operation and return its invocation id without waiting.
@@ -903,20 +903,23 @@ fn task_result(args: &[OsString]) -> ExitCode {
         Ok(r) => r,
         Err(e) => return unreachable_plane(&e),
     };
-    // Which operation this was is asked of the session rather than of the caller, who named an
-    // invocation and has no reason to also remember what it ran. A session that no longer knows
-    // leaves the field as the id, which is still true.
-    let name = sandbox::task_control::read_info(&plane.socket, &target)
+    let name = invocation_operation(&plane.socket, &target);
+    render_result("result", name.as_deref(), &result, json)
+}
+
+/// The operation invocation `target` ran, asked of the session rather than of the caller, who named
+/// an invocation and has no reason to also remember what it ran. `None` when the session no longer
+/// knows: the id in its place would read, in the `--json` document, as an operation's name.
+fn invocation_operation(socket: &std::path::Path, target: &str) -> Option<String> {
+    sandbox::task_control::read_info(socket, target)
         .ok()
         .flatten()
         .and_then(|fields| {
             fields
-                .iter()
+                .into_iter()
                 .find(|(key, _)| key == "operation")
-                .map(|(_, value)| value.clone())
+                .map(|(_, value)| value)
         })
-        .unwrap_or_else(|| target.clone());
-    render_result("result", &name, &result, json)
 }
 
 /// Print one invocation's result — as prose on the real streams, or as one JSON document.
@@ -924,7 +927,12 @@ fn task_result(args: &[OsString]) -> ExitCode {
 /// `verb` names the subcommand a refusal is reported under: the same answer reaches this from `run`
 /// (the plane declined to run anything) and from `result` (there is nothing here to give you), and a
 /// message prefixed with the wrong one sends a reader to the wrong page.
-fn render_result(verb: &str, name: &str, result: &client::RunResult, json: bool) -> ExitCode {
+fn render_result(
+    verb: &str,
+    name: Option<&str>,
+    result: &client::RunResult,
+    json: bool,
+) -> ExitCode {
     if json {
         return run_as_json(name, result);
     }
@@ -1011,8 +1019,9 @@ fn exit_byte(exit: i32) -> u8 {
 /// interleave with it — so under `--json` stdout carries the document and nothing else.
 #[derive(serde::Serialize)]
 struct RunView<'a> {
-    /// The operation invoked, as the caller named it.
-    task: &'a str,
+    /// The operation invoked, as the caller named it. `null` only from `task result` when the
+    /// session no longer knows which operation the invocation ran.
+    task: Option<&'a str>,
     /// This invocation's id — what `sbx task show`/`stop`/`logs` take. `null` when the plane refused
     /// before admitting the request (an exhausted quota), where no invocation exists to name.
     id: Option<u64>,
@@ -1078,7 +1087,7 @@ struct RunRefusalView<'a> {
 /// invocation: every value is already substituted and redacted host-side by the time it arrives here,
 /// which is what makes encoding it safe — a credential containing a quote would survive escaping,
 /// and the needles that find it match raw bytes.
-fn run_view<'a>(name: &'a str, result: &'a client::RunResult) -> RunView<'a> {
+fn run_view<'a>(name: Option<&'a str>, result: &'a client::RunResult) -> RunView<'a> {
     RunView {
         task: name,
         // Drawn after admission, so a zero is the plane declining before any invocation existed.
@@ -1112,7 +1121,7 @@ fn run_view<'a>(name: &'a str, result: &'a client::RunResult) -> RunView<'a> {
 ///
 /// A refusal is a document too — a caller that parses stdout must not have to fall back to reading
 /// prose off stderr to learn that nothing ran.
-fn run_as_json(name: &str, result: &client::RunResult) -> ExitCode {
+fn run_as_json(name: Option<&str>, result: &client::RunResult) -> ExitCode {
     let view = run_view(name, result);
     if let Err(code) = print_json("task run", &view) {
         return code;
@@ -1941,6 +1950,37 @@ mod tests {
         );
     }
 
+    /// An invocation whose operation the session no longer knows is `null` in the document, never its
+    /// id standing in for an operation's name; one it knows is named.
+    #[test]
+    fn a_result_whose_operation_is_unknown_names_none() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let dir = crate::testutil::TmpDir::new();
+        let serve = |name: &str, answer: &'static [u8]| {
+            let socket = dir.join(name);
+            let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+            let session = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut cmd = String::new();
+                BufReader::new(&stream).read_line(&mut cmd).expect("read");
+                (&stream).write_all(answer).expect("answer");
+                cmd
+            });
+            (socket, session)
+        };
+        let (forgot, session) = serve("forgot.sock", b"err nothing here is called `42`\n");
+        assert_eq!(invocation_operation(&forgot, "42"), None);
+        assert_eq!(session.join().unwrap(), "INFO 42\n");
+        let (knows, session) = serve("knows.sock", b"field operation\tdump\nok\n");
+        assert_eq!(invocation_operation(&knows, "42").as_deref(), Some("dump"));
+        session.join().unwrap();
+
+        let result = client::RunResult::default();
+        let doc = serde_json::to_value(run_view(None, &result)).expect("encode");
+        assert!(doc["task"].is_null(), "{doc}");
+    }
+
     /// A command's exit code is returned as it is, and one no process returns is a failure: the
     /// `-1` the client reads for an `exit` field it could not parse is never clamped into a success.
     #[test]
@@ -2393,7 +2433,7 @@ mod tests {
             output: Some(("/opt/sbx/task-out/dump".to_string(), 4096)),
         };
         let doc: serde_json::Value = serde_json::from_str(
-            &serde_json::to_string(&run_view("dump", &result)).expect("encode"),
+            &serde_json::to_string(&run_view(Some("dump"), &result)).expect("encode"),
         )
         .expect("decode");
         assert_eq!(doc["task"], "dump");
@@ -2470,7 +2510,7 @@ mod tests {
             stderr: Some(String::new()),
             ..Default::default()
         };
-        let doc = serde_json::to_value(run_view("quiet", &result)).expect("encode");
+        let doc = serde_json::to_value(run_view(Some("quiet"), &result)).expect("encode");
         assert!(doc["stdout"].is_null(), "hidden is not the same as empty");
         assert_eq!(doc["stderr"], "");
     }
@@ -2484,7 +2524,7 @@ mod tests {
             error: Some("the session's invocation quota is exhausted".to_string()),
             ..Default::default()
         };
-        let doc = serde_json::to_value(run_view("dump", &result)).expect("encode");
+        let doc = serde_json::to_value(run_view(Some("dump"), &result)).expect("encode");
         assert_eq!(doc["error"], "the session's invocation quota is exhausted");
         assert!(
             doc["exit"].is_null(),
@@ -2499,7 +2539,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            serde_json::to_value(run_view("q", &admitted)).expect("encode")["id"],
+            serde_json::to_value(run_view(Some("q"), &admitted)).expect("encode")["id"],
             4
         );
     }
