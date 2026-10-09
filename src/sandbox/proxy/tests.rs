@@ -5599,6 +5599,29 @@ fn an_upstream_that_closes_without_answering_is_refused_rather_than_relayed_empt
     );
 }
 
+/// An upstream that closes without answering is refused on the cleartext plane as on the others:
+/// a `502 upstream-closed`, not an empty success.
+#[test]
+fn a_cleartext_upstream_that_closes_without_answering_is_refused() {
+    let (addr, _up_head) = spawn_plain_upstream(b"");
+    let port = addr.port();
+    let rule = format!("http://upstream.test:{port}");
+    let ctx = Arc::new(
+        ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[rule.as_str()]))
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    let request = format!(
+        "GET http://upstream.test:{port}/path HTTP/1.1\r\nHost: upstream.test:{port}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+    assert!(
+        resp.contains("502 Bad Gateway") && resp.contains("upstream-closed"),
+        "{resp:?}"
+    );
+}
+
 /// The same ceiling on the cleartext plane, which reaches it by a second route.
 ///
 /// Stopping the head relay is not enough on its own here. Past the ceiling there is no final head,
