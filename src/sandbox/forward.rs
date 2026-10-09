@@ -15,10 +15,10 @@
 //!
 //! The shape is the egress forwarder's mirror, with the listener and the dialer swapped:
 //!
-//! - the host binds a `TcpListener` on `127.0.0.1:<host port>` (and, best-effort, on
-//!   `[::1]:<host port>` so a `localhost` callback the browser sends over IPv6 is caught too) for
-//!   each declared forward — loopback only, never an external interface, and **fail-closed on
-//!   collision** on the primary `127.0.0.1` bind: sbx does not pick an ephemeral substitute,
+//! - the host binds a `TcpListener` on `127.0.0.1:<host port>` (and on `[::1]:<host port>`, when
+//!   the host has IPv6 loopback, so a `localhost` callback the browser sends over IPv6 is caught
+//!   too) for each declared forward — loopback only, never an external interface, and
+//!   **fail-closed on collision** on either address: sbx does not pick an ephemeral substitute,
 //!   because it cannot know what the caller published, so a port already in use aborts the launch
 //!   with a message pointing at the remap form;
 //! - a per-launch host directory is bound read-write into the cage at `/tmp/sbx-forward`, so the
@@ -135,9 +135,9 @@ pub(crate) struct Forward {
 /// a message naming the port when it is already in use: sbx does not pick an ephemeral substitute,
 /// because nothing tells it what the caller published — an OAuth redirect URL is fixed by its
 /// provider, and a moved dev-server port is one the caller must be told about. Moving off a taken
-/// host port is the remap form's job, and the message says so. The `[::1]` bind is best-effort — it
-/// catches a `localhost` callback the browser sends over IPv6, but a host with IPv6 disabled simply
-/// keeps the v4 path.
+/// host port is the remap form's job, and the message says so. The `[::1]` bind catches a
+/// `localhost` callback the browser sends over IPv6; a host without IPv6 loopback keeps the v4 path
+/// alone, and a `[::1]` port another process holds fails the launch closed like a taken v4 one.
 ///
 /// A failure part-way through leaves nothing running: the [`Forwarder`] guard is constructed before
 /// the first bind and every listener is registered in it as it is spawned, so an error returns by
@@ -228,13 +228,36 @@ pub(crate) fn start(
             .accepts
             .push(spawn_accept(v4, host_sock.clone(), shutdown.clone()));
 
-        // v6 loopback (`::1`) is best-effort: many hosts resolve `localhost` to `::1` first, so
-        // binding it too catches an IPv6 callback. A host with IPv6 disabled (or the address
-        // already taken) simply skips it — v4 stays the primary path.
-        if let Ok(v6) = TcpListener::bind(("::1", host)) {
-            guard
+        // v6 loopback (`::1`): many hosts resolve `localhost` to `::1` first, so binding it too
+        // catches an IPv6 callback. Skipped only on a host without IPv6 loopback, where no
+        // `localhost` connection can go that way. Anything else fails closed like the v4 bind: a
+        // `[::1]:<port>` another process holds would receive every connection a browser sends to
+        // `localhost` over IPv6, an OAuth callback's code among them, while the forward reads as up.
+        match TcpListener::bind(("::1", host)) {
+            Ok(v6) => guard
                 .accepts
-                .push(spawn_accept(v6, host_sock.clone(), shutdown.clone()));
+                .push(spawn_accept(v6, host_sock.clone(), shutdown.clone())),
+            Err(e) if no_ipv6_loopback(&e) => {}
+            Err(e) => {
+                // The cause is named only when the errno says it; any other failure is quoted as
+                // itself.
+                let held = match e.kind() {
+                    io::ErrorKind::AddrInUse => {
+                        " — another process holds it there, and a `localhost` connection a \
+                         browser sends over IPv6 would reach it instead of the cage"
+                    }
+                    _ => "",
+                };
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot bind host port {host} on `[::1]` for forward ({e}){held}. To \
+                         reach the cage's :{cage} from a free host port instead, forward \
+                         `<port>:{cage}`",
+                        cage = fwd.cage,
+                    ),
+                ));
+            }
         }
 
         forwards.push(Forward {
@@ -254,6 +277,16 @@ pub(crate) fn start(
     }];
 
     Ok((guard, Wiring { binds, forwards }))
+}
+
+/// Whether a failed `[::1]` bind means the host has no IPv6 loopback to bind, rather than that the
+/// port is held there: the address is not configured (`EADDRNOTAVAIL`), or the family is not built
+/// in (`EAFNOSUPPORT`).
+fn no_ipv6_loopback(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EADDRNOTAVAIL | libc::EAFNOSUPPORT)
+    )
 }
 
 /// How many forward directories this process has made: the second half of each one's name, the
@@ -677,6 +710,51 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(freed, "dropping the guard must free the host port");
+    }
+
+    /// A host port free on `127.0.0.1` and held on `[::1]` by another process fails the launch
+    /// closed, naming `[::1]`: half bound, the forward would read as up while a `localhost`
+    /// connection over IPv6 reached that process instead of the cage.
+    #[test]
+    fn a_port_held_on_ipv6_loopback_fails_closed() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let mut left = 5;
+        loop {
+            let held = match TcpListener::bind(("::1", 0)) {
+                Ok(held) => held,
+                Err(e) => {
+                    skip_incapable!("no IPv6 loopback on this host ({e})");
+                    return;
+                }
+            };
+            let port = held.local_addr().unwrap().port();
+            match start(&layout, vec![ForwardPort::same(port)]) {
+                Ok(_) => panic!("a port held on `[::1]` must fail closed, not succeed"),
+                Err(e) => {
+                    let msg = e.to_string();
+                    // The v4 side was won by something else between the two binds: not what this
+                    // asserts, so try another port.
+                    if !msg.contains("[::1]") && left > 0 {
+                        left -= 1;
+                        continue;
+                    }
+                    assert!(
+                        msg.contains(&format!("cannot bind host port {port} on `[::1]`")),
+                        "the refusal must name the IPv6 side: {msg}"
+                    );
+                    assert!(msg.contains(&format!("forward `<port>:{port}`")), "{msg}");
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            std::fs::read_dir(layout.data_dir().join("forward"))
+                .expect("the forward directory")
+                .count(),
+            0,
+            "the refused launch leaves nothing behind"
+        );
     }
 
     /// A port already in use fails the launch **closed** — `start` returns an error naming the port,
