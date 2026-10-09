@@ -1650,6 +1650,40 @@ fn a_second_invocation_of_the_same_task_is_refused_while_the_first_holds_it() {
         .expect("the hold is released with the invocation");
 }
 
+/// Two sessions of one project each run their own engine, in their own process, over one output
+/// tree: the second claim of a task's directory is refused while the first holds it, through a
+/// lock no cage is shown, and the hold is released with the claim.
+#[test]
+fn a_second_session_of_the_project_is_refused_the_directory_while_the_first_holds_it() {
+    let root = crate::testutil::TmpDir::new();
+    let mut task = task();
+    task.output = true;
+    let first = engine_with_project(root.path(), vec![task.clone()]);
+    let second = engine_with_project(root.path(), vec![task.clone()]);
+
+    let held = first
+        .claim_output(&task)
+        .expect("the first session's claim");
+    let e = second.claim_output(&task).unwrap_err();
+    assert!(
+        e.contains("another session"),
+        "the refusal must say why: {e}"
+    );
+    let locks = held.dir.parent().unwrap().with_file_name(TASK_OUT_LOCKS);
+    assert!(locks.join(&task.name).exists());
+    // A copy of the descriptor, as a cage forked at this moment would hold until its exec.
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: duplicating a descriptor the claim owns; the copy is closed below.
+    let copy = unsafe { libc::dup(held.lock.as_raw_fd()) };
+    assert!(copy >= 0);
+    drop(held);
+    second
+        .claim_output(&task)
+        .expect("the hold is released with the first claim, whatever copies remain");
+    // SAFETY: the copy made above, closed once.
+    unsafe { libc::close(copy) };
+}
+
 /// A destination plan for one `tcp://` rule, built the way a launch builds it.
 fn tcp_plan(rule: &str) -> (Vec<crate::allowlist::Rule>, super::super::egress::TcpPlan) {
     let rules = vec![crate::allowlist::classify(rule).expect("a valid rule")];
@@ -2006,6 +2040,7 @@ fn a_deeply_nested_output_is_sized_without_recursing() {
         dir,
         task: "t".into(),
         held: Arc::new(Mutex::new(BTreeSet::new())),
+        lock: std::fs::File::create(tmp.path().join("t.lock")).expect("a lock file"),
     };
     let size = std::thread::Builder::new()
         .stack_size(64 * 1024)

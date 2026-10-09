@@ -71,6 +71,11 @@ const TASK_OUT_ENV: &str = "SBX_TASK_OUT";
 pub(crate) const TASK_OUT_AGENT: &str = "/opt/sbx/task-out";
 pub(crate) const TASK_OUT_TREE: &str = "task-out";
 
+/// The sibling of [`TASK_OUT_TREE`] that holds one lock file per task name, taken by every claim of
+/// that task's output directory. Beside the output tree rather than inside it, because the agent's
+/// cage is shown that tree.
+const TASK_OUT_LOCKS: &str = "task-out.locks";
+
 /// The **one** number that names an invocation, everywhere it is named: its host-side artifacts (its
 /// proxy sockets, its exec supervisor, its systemd scope), its line in the session's log, the row
 /// `sbx task status` shows while it runs, and the id `sbx task stop` takes. A session can serve two
@@ -1474,13 +1479,40 @@ impl TaskEngine {
                 ));
             }
         }
-        let dir = match self.output_root() {
-            Ok(root) => root.join(&task.name),
+        let root = match self.output_root() {
+            Ok(root) => root,
             Err(e) => {
                 locked(&self.output_held).remove(&task.name);
                 return Err(format!("no project tree for this task's output ({e})"));
             }
         };
+        // The set above holds the name within this process; another session of the same project
+        // runs in another process and shares the directory, so the claim also takes a lock on the
+        // name across processes. The lock file sits beside the output tree, under the project's
+        // runtime directory, which no cage is shown: the agent reads `task-out/` itself, and a lock
+        // it could open there, even read-only, it could hold to refuse every invocation.
+        let lock_path = root.with_file_name(TASK_OUT_LOCKS).join(&task.name);
+        let lock = match super::projectstore::try_flock_at(&lock_path, true) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                locked(&self.output_held).remove(&task.name);
+                return Err(format!(
+                    "another session of this project is running `{}` and writing to its output \
+                     directory — a task's directory is one per task, so two at once would \
+                     interleave",
+                    task.name
+                ));
+            }
+            Err(e) => {
+                locked(&self.output_held).remove(&task.name);
+                return Err(format!(
+                    "cannot take the lock on `{}`'s output directory ({}): {e}",
+                    task.name,
+                    lock_path.display()
+                ));
+            }
+        };
+        let dir = root.join(&task.name);
         let prepare = || -> io::Result<()> {
             if dir.exists() {
                 super::gc::force_remove_dir_all(&dir)?;
@@ -1498,6 +1530,7 @@ impl TaskEngine {
             dir,
             task: task.name.clone(),
             held: self.output_held.clone(),
+            lock,
         })
     }
 
@@ -2033,6 +2066,8 @@ struct OutputClaim {
     dir: PathBuf,
     task: String,
     held: Arc<Mutex<BTreeSet<String>>>,
+    /// The lock on the task's name across processes, released in `Drop`.
+    lock: std::fs::File,
 }
 
 impl OutputClaim {
@@ -2072,6 +2107,14 @@ impl OutputClaim {
 
 impl Drop for OutputClaim {
     fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+        // Released explicitly rather than by the close: a thread of this process forking a cage at
+        // this moment leaves the child a copy of the descriptor until it execs, and that copy holds
+        // the lock (`flock(2)`), so the next claim would be refused as another session's.
+        // `LOCK_UN` on any copy releases it for all of them. Before the set below, so a claim in
+        // this process never finds the name free there and still locked here.
+        // SAFETY: `flock` on the descriptor this claim owns.
+        unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
         // The same lock `claim_output` takes through `locked`, released the same way: taking it
         // with recovery and releasing it without would strand the claim, and every later invocation
         // of this task would be refused for a conflict with an invocation that has already ended.
