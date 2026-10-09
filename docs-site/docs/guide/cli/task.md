@@ -287,7 +287,8 @@ back named rather than in the clear, and `output` is
 `{"path": …, "bytes": …}` when the operation declares one. A refusal is a document too: `error` says
 why and `exit` is `null`, because nothing ran; the exit code is still 125. `id` is `null` only when
 the plane declined before admitting the request (an exhausted quota), where no invocation exists to
-name.
+name. `task` is `null` only from [`result`](#result), when the session no longer knows which operation
+the invocation ran.
 
 Inside a cage the client stays as it is: it prints the same raw fields it always has, one per line.
 An agent parses that; a person reads this.
@@ -347,7 +348,8 @@ What a detached invocation produced: host-only.
 
 The output is **identical** to what a foreground `run` would have printed, down to the exit code:
 detaching changes when a result arrives, not what it is. The streams are already substituted and
-truncated exactly as they would have been, and `--json` prints the same document as `run --json`.
+truncated exactly as they would have been, and `--json` prints the same document as `run --json`,
+except that `task` is `null` when the session no longer knows which operation the invocation ran.
 
 It takes an **invocation id**, never an operation name: a result belongs to one run, and a name
 would name several.
