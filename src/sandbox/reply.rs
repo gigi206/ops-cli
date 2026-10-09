@@ -260,8 +260,9 @@ mod tests {
         }
 
         // The two readers addressed by session rather than by socket: `RULES` fails like the others,
-        // and the `LIST` sweep names a session that did not answer in full rather than listing part
-        // of its answer as all.
+        // and reads an `err` as an error that is not a cut, as `LOG` does, rather than as a session
+        // holding no rule; the `LIST` sweep names a session that did not answer in full rather than
+        // listing part of its answer as all.
         let data_dir = dir.join("data");
         std::fs::create_dir_all(control::control_dir(&data_dir)).expect("egress dir");
         let socket = control::control_socket(&data_dir, 4242);
@@ -274,7 +275,14 @@ mod tests {
             let server = answer_once(&socket, wire);
             let read = control::query_manual(&data_dir, 4242).map(drop);
             server.join().expect("the server thread");
-            assert_eq!(read.is_ok(), whole, "egress RULES: {read:?}");
+            if wire.starts_with(b"err ") {
+                assert!(
+                    read.as_ref().is_err_and(|e| !unanswered(e)),
+                    "egress RULES, an err line: {read:?}"
+                );
+            } else {
+                assert_eq!(read.is_ok(), whole, "egress RULES: {read:?}");
+            }
 
             let _ = std::fs::remove_file(&socket);
             let server = answer_once(&socket, wire);
