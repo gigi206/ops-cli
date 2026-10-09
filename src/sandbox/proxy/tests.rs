@@ -6636,6 +6636,170 @@ fn a_client_that_refuses_the_minted_leaf_is_logged_rather_than_read_as_a_finishe
     );
 }
 
+/// How a cage's client stops taking part in the interception handshake, in
+/// [`a_tunnel_whose_handshake_never_finished_is_logged_and_one_that_finished_is_not`].
+#[derive(Clone, Copy, Debug)]
+enum HandshakeEnd {
+    /// Sends nothing after the CONNECT, as a client of a protocol whose server speaks first does.
+    Silent,
+    /// Sends its hello, reads the start of the proxy's answer, and ends its side of the stream
+    /// without an alert.
+    ClosesMidHandshake,
+    /// Refuses the minted leaf with an alert and keeps its socket open.
+    AlertsAndStays,
+    /// Completes the handshake and then sends nothing: a tunnel opened ahead of a request that
+    /// never came.
+    FinishesThenSilent,
+}
+
+/// Run one CONNECT whose client ends as `end`, against a proxy whose client-socket timeout is
+/// `timeout`, and return the lines it logged with how long the connection's thread was held.
+fn tunnel_ended_as(
+    end: HandshakeEnd,
+    timeout: Duration,
+) -> (Vec<crate::sandbox::control::LogEvent>, Duration) {
+    let log = Arc::new(crate::sandbox::control::LogRing::new(
+        crate::sandbox::control::LOG_RING_CAP,
+    ));
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let ca_der = ca.ca_cert_der();
+    let ctx = Arc::new(
+        ProxyCtx::new(ca, policy(&["upstream.test:*"]))
+            .unwrap()
+            .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None)),
+    );
+    let (mut test_end, cage_end) = UnixStream::pair().unwrap();
+    // The timeout the accept loop gives every client socket, shrunk so a silent client costs this
+    // test a fraction of a second.
+    cage_end.set_read_timeout(Some(timeout)).unwrap();
+    let served = {
+        let c = ctx.clone();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let _ = handle_client(cage_end, &c);
+            started.elapsed()
+        })
+    };
+    write!(test_end, "CONNECT upstream.test:443 HTTP/1.1\r\n\r\n").unwrap();
+    test_end.flush().unwrap();
+    assert!(
+        read_until_blank(&mut test_end)
+            .unwrap()
+            .contains("200 Connection established"),
+        "the CONNECT must be accepted before the handshake can be tested"
+    );
+    // A backstop on this side's own reads, so a proxy that never answers fails the test instead
+    // of hanging it.
+    test_end
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let roots = match end {
+        HandshakeEnd::AlertsAndStays => RootCertStore::empty(),
+        _ => {
+            let mut roots = RootCertStore::empty();
+            roots.add(ca_der).unwrap();
+            roots
+        }
+    };
+    let mut conn = ClientConnection::new(
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ),
+        ServerName::try_from("upstream.test").unwrap(),
+    )
+    .unwrap();
+    // Each shape drives the client as far as it goes. The socket stays open until the proxy's
+    // thread is done, so only the proxy decides when the connection ends.
+    match end {
+        HandshakeEnd::Silent => {}
+        HandshakeEnd::ClosesMidHandshake => {
+            conn.write_tls(&mut test_end).unwrap();
+            let mut answer = [0u8; 512];
+            assert!(test_end.read(&mut answer).unwrap() > 0, "the proxy answers");
+            // A half-close, so the proxy reads an end of stream. Dropping a socket with the rest of
+            // the proxy's answer unread would reach it as a reset instead, a failed read that was
+            // logged before this shape was.
+            test_end.shutdown(std::net::Shutdown::Write).unwrap();
+        }
+        HandshakeEnd::AlertsAndStays => {
+            while conn.is_handshaking() {
+                if conn.complete_io(&mut test_end).is_err() {
+                    break;
+                }
+            }
+            assert!(
+                conn.is_handshaking(),
+                "a client with no sbx CA cannot finish the handshake"
+            );
+        }
+        HandshakeEnd::FinishesThenSilent => {
+            while conn.is_handshaking() {
+                conn.complete_io(&mut test_end).unwrap();
+            }
+        }
+    }
+    let held = served.join().unwrap();
+    drop(test_end);
+    ctx.events.as_ref().unwrap().flush();
+    (log.snapshot(None, None, false).events, held)
+}
+
+/// A tunnel whose handshake never finished is the same failed attempt as one whose client sent an
+/// alert, whichever way the client stopped, and it is recorded against the tunnel's host. A tunnel
+/// whose handshake finished and which then carried nothing is how a persistent connection ends, and
+/// it stays silent.
+///
+/// The first read of a turn drives the handshake, and a client that closed, or fell silent past the
+/// socket timeout, used to be read there as a tunnel its client had finished with. A cage speaking
+/// a protocol whose server speaks first, through a CONNECT no `tcp://` rule splices, waited for a
+/// greeting while the proxy waited for a TLS hello, and the connection then dropped with nothing in
+/// `sbx net logs`.
+///
+/// Nothing is written back to a client that never completed the handshake: there is no session to
+/// carry it, and trying would drive the handshake again and hold the thread for a second timeout.
+/// The bound on the elapsed time is what says so.
+#[test]
+fn a_tunnel_whose_handshake_never_finished_is_logged_and_one_that_finished_is_not() {
+    let timeout = Duration::from_millis(400);
+    for end in [
+        HandshakeEnd::ClosesMidHandshake,
+        HandshakeEnd::Silent,
+        HandshakeEnd::AlertsAndStays,
+    ] {
+        let (events, held) = tunnel_ended_as(end, timeout);
+        assert_eq!(
+            events.len(),
+            1,
+            "{end:?}: the failed handshake is one attempt, recorded once: {events:?}"
+        );
+        assert_eq!(
+            events[0].verdict,
+            crate::sandbox::control::LogVerdict::Blocked,
+            "{end:?}"
+        );
+        assert_eq!(events[0].reason, "bad-request:head", "{end:?}");
+        assert_eq!(events[0].host, "upstream.test", "{end:?}");
+        // The silent client is waited for once, which is the timeout doing its job. The other two
+        // stopped at once, so nothing should hold the thread for even one timeout.
+        let allowed = match end {
+            HandshakeEnd::Silent => 2 * timeout,
+            _ => timeout,
+        };
+        assert!(
+            held < allowed,
+            "{end:?}: the thread was held {held:?}, not under {allowed:?}: nothing may be written \
+             into a handshake that never finished"
+        );
+    }
+    let (events, _) = tunnel_ended_as(HandshakeEnd::FinishesThenSilent, timeout);
+    assert!(
+        events.is_empty(),
+        "a tunnel that finished its handshake and carried nothing is no attempt: {events:?}"
+    );
+}
+
 #[test]
 fn read_chunked_body_dechunks_a_well_formed_body() {
     // one chunk + the terminating zero chunk, with a chunk extension on the size line (ignored).
