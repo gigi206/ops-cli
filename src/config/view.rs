@@ -1136,7 +1136,9 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
     // (`All`) view: the single-source `--global/--local/--default` views show what one config *file*
     // contributes, which an override is not. Per-invocation CLI flags are not previewed here (run the
     // launch to see them); passing default (empty) CLI overrides reads only the ambient environment.
-    if matches!(source, super::Source::All) {
+    let with_override = matches!(source, super::Source::All);
+    let unoverridden = resolved.clone();
+    if with_override {
         apply_ambient_override(&mut resolved, cwd);
     }
 
@@ -1216,12 +1218,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
             // The app's effective network decides whether its credentials inject — the same posture
             // the launch enforces. Pass it so the compact roster agrees with the launch (and the
             // `--app` detail view), never claiming an injection a narrowed network drops.
-            let (eff_network, _) = launched_scalar(
-                app.network.as_ref(),
-                app.network_origin,
-                &resolved.network,
-                resolved.network_origin,
-            );
+            let launched = launched_config(&unoverridden, name, with_override.then_some(cwd));
+            let eff_network = launched.map_or_else(|| resolved.network.clone(), |l| l.network);
             app_view(
                 name,
                 app,
@@ -1722,12 +1720,14 @@ fn app_limits_view(limits: &sandbox::cgroup::Limits) -> Option<AppLimitsView> {
 /// <name>` would launch with, annotated with provenance. `None` when no such app is declared (the
 /// CLI then errors, listing the available names). Pure data gathering, like [`build`].
 pub(crate) fn build_app_detail(cwd: &Path, name: &str) -> Option<AppDetailView> {
-    let mut resolved = super::load(cwd);
+    let unoverridden = super::load(cwd);
     // The same ambient override the full view folds in, for the same reason: an app inherits every
     // field it does not set from the baseline, so a `SBX_NET` in the reader's shell decides the
     // posture this view is reporting. Without it `sbx config show --app <name>` named a network the
     // launch would not use — the one view where an app's inherited fields are the whole point.
+    let mut resolved = unoverridden.clone();
     apply_ambient_override(&mut resolved, cwd);
+    let launched = launched_config(&unoverridden, name, Some(cwd))?;
     let app = resolved.apps.get(name)?;
     // Pinned identities keyed by a package's locator: flake refs → revision, deb/appimage URLs →
     // short content hash. Keys almost never collide across backends (a `.deb` URL, an `.AppImage`
@@ -1740,7 +1740,31 @@ pub(crate) fn build_app_detail(cwd: &Path, name: &str) -> Option<AppDetailView> 
     flake_pins.extend(sandbox::appimage_pinned_hashes(cwd));
     flake_pins.extend(sandbox::tarball_pinned_hashes(cwd));
     flake_pins.extend(sandbox::binary_pinned_hashes(cwd));
-    Some(app_detail_view(cwd, name, app, &resolved, &flake_pins))
+    Some(app_detail_view(
+        cwd,
+        name,
+        app,
+        &resolved,
+        &launched,
+        &flake_pins,
+    ))
+}
+
+/// The configuration `sbx app <name>` launches with, in the launch's order: the app's overlay
+/// folded onto the baseline, then the ambient one-shot override when `cwd` is given. `None` when no
+/// such app is declared.
+///
+/// Built rather than inferred, because an override's postures are made from the ones they replace
+/// (a bare `--proc` mode keeps the lists below it, a `[notify]` mode keeps `repeat_after`, a
+/// mode-less `[network]` keeps the mode): at launch that is the app's, not the baseline's.
+fn launched_config(unoverridden: &Resolved, name: &str, cwd: Option<&Path>) -> Option<Resolved> {
+    let mut launched = unoverridden.clone();
+    let app = launched.apps.remove(name)?;
+    launched.merge_app(app);
+    if let Some(cwd) = cwd {
+        apply_ambient_override(&mut launched, cwd);
+    }
+    Some(launched)
 }
 
 /// Project one app's effective configuration plus per-field provenance: a scalar the app set is
@@ -1754,6 +1778,7 @@ fn app_detail_view(
     name: &str,
     app: &super::ResolvedApp,
     baseline: &Resolved,
+    launched: &Resolved,
     flake_pins: &BTreeMap<String, String>,
 ) -> AppDetailView {
     // Effective network/GUI: the app's own posture when it set one, else the baseline's — then the
@@ -1764,10 +1789,11 @@ fn app_detail_view(
         app.network_origin,
         &baseline.network,
         baseline.network_origin,
+        (&launched.network, launched.network_origin),
     );
     // A one-shot posture replaces the merged network after the app's verbs were applied to it, so
     // they apply only to a network the override left alone.
-    if !overridden(baseline.network_origin)
+    if !overridden(launched.network_origin)
         && let NetworkPolicy::Allowlist(policy) = &mut eff_network
     {
         policy.apply_default_methods(&app.default_methods);
@@ -1786,6 +1812,7 @@ fn app_detail_view(
         app.proc_origin,
         &baseline.proc,
         baseline.proc_origin,
+        (&launched.proc, launched.proc_origin),
     );
     let proc = proc_view(&eff_proc);
     let (eff_notify, notify_origin) = launched_scalar(
@@ -1793,6 +1820,7 @@ fn app_detail_view(
         app.notify_origin,
         &baseline.notify,
         baseline.notify_origin,
+        (&launched.notify, launched.notify_origin),
     );
     let notify = notify_view(&eff_notify);
     let (eff_gui, gui_origin) = launched_scalar(
@@ -1800,6 +1828,7 @@ fn app_detail_view(
         app.gui_origin,
         &baseline.gui,
         baseline.gui_origin,
+        (&launched.gui, launched.gui_origin),
     );
     let gui = match eff_gui {
         super::GuiPolicy::Wayland => GuiView::Wayland,
@@ -1811,24 +1840,31 @@ fn app_detail_view(
         app.gpu_origin,
         &baseline.gpu,
         baseline.gpu_origin,
+        (&launched.gpu, launched.gpu_origin),
     );
     let (eff_allow_insecure_http, allow_insecure_http_origin) = launched_scalar(
         app.allow_insecure_http.as_ref(),
         app.allow_insecure_http_origin,
         &baseline.allow_insecure_http,
         baseline.allow_insecure_http_origin,
+        (
+            &launched.allow_insecure_http,
+            launched.allow_insecure_http_origin,
+        ),
     );
     let (eff_audio, audio_origin) = launched_scalar(
         app.audio.as_ref(),
         app.audio_origin,
         &baseline.audio,
         baseline.audio_origin,
+        (&launched.audio, launched.audio_origin),
     );
     let (eff_dbus, dbus_origin) = launched_scalar(
         app.dbus.as_ref(),
         app.dbus_origin,
         &baseline.dbus,
         baseline.dbus_origin,
+        (&launched.dbus, launched.dbus_origin),
     );
 
     // Effective forward: the app's own ports ∪ the baseline's — the same union `merge_app`
@@ -1882,42 +1918,49 @@ fn app_detail_view(
 
     // Effective limits: the app's overrides folded onto the baseline; each field's origin is the
     // app's when it set the field, else inherited from the baseline. A field a one-shot override
-    // set keeps the override's value, which the launch applies after the app's.
-    let mut app_limits = app.limits.clone();
-    if overridden(baseline.limits_origin.memory_high) {
-        app_limits.memory_high = None;
-    }
-    if overridden(baseline.limits_origin.memory_max) {
-        app_limits.memory_max = None;
-    }
-    if overridden(baseline.limits_origin.tasks_max) {
-        app_limits.tasks_max = None;
-    }
+    // set holds the launch's value, since the launch applies the override after the app's.
     let mut eff_limits = baseline.limits.clone();
-    super::overlay_limits(&mut eff_limits, app_limits.clone());
-    let limit = |(value, _ov): (String, bool),
+    super::overlay_limits(&mut eff_limits, app.limits.clone());
+    let limit = |eff: (String, bool),
+                 launched_value: (String, bool),
+                 launched_origin: super::Provenance,
                  set: bool,
                  origin: super::Provenance,
-                 baseline_origin: super::Provenance| LimitView {
-        value,
-        origin: origin_or_inherited(set, origin, baseline_origin),
+                 baseline_origin: super::Provenance| {
+        if overridden(launched_origin) {
+            LimitView {
+                value: launched_value.0,
+                origin: ProvenanceView::Override,
+            }
+        } else {
+            LimitView {
+                value: eff.0,
+                origin: origin_or_inherited(set, origin, baseline_origin),
+            }
+        }
     };
     let limits = LimitsView {
         memory_high: limit(
             eff_limits.memory_high(),
-            app_limits.memory_high.is_some(),
+            launched.limits.memory_high(),
+            launched.limits_origin.memory_high,
+            app.limits.memory_high.is_some(),
             app.limits_origin.memory_high,
             baseline.limits_origin.memory_high,
         ),
         memory_max: limit(
             eff_limits.memory_max(),
-            app_limits.memory_max.is_some(),
+            launched.limits.memory_max(),
+            launched.limits_origin.memory_max,
+            app.limits.memory_max.is_some(),
             app.limits_origin.memory_max,
             baseline.limits_origin.memory_max,
         ),
         tasks_max: limit(
             eff_limits.tasks_max(),
-            app_limits.tasks_max.is_some(),
+            launched.limits.tasks_max(),
+            launched.limits_origin.tasks_max,
+            app.limits.tasks_max.is_some(),
             app.limits_origin.tasks_max,
             baseline.limits_origin.tasks_max,
         ),
@@ -2083,17 +2126,19 @@ fn overridden(origin: super::Provenance) -> bool {
 
 /// A field an app may replace, as `sbx app <name>` launches it, with its provenance: the app's own
 /// value when it set one, else the baseline's. A one-shot override is the exception either way: the
-/// launch applies it after the app's overlay, so a field it set holds the override's value even
-/// where the app set its own. `baseline` here already carries the override.
+/// launch applies it after the app's overlay, so a field it set holds what the override made of
+/// the app's value, read from `launched` ([`launched_config`]), even where the app set its own.
 fn launched_scalar<T: Clone>(
     app: Option<&T>,
     app_origin: super::Provenance,
     baseline: &T,
     baseline_origin: super::Provenance,
+    launched: (&T, super::Provenance),
 ) -> (T, ProvenanceView) {
     match app {
-        Some(value) if !overridden(baseline_origin) => (value.clone(), app_origin.into()),
-        _ => (
+        _ if overridden(launched.1) => (launched.0.clone(), ProvenanceView::Override),
+        Some(value) => (value.clone(), app_origin.into()),
+        None => (
             baseline.clone(),
             origin_or_inherited(false, app_origin, baseline_origin),
         ),
@@ -2287,6 +2332,7 @@ mod tests {
             "demo",
             app,
             &resolved,
+            &launched_config(&resolved, "demo", None).unwrap(),
             &BTreeMap::new(),
         );
         let dropped = |notes: &[String]| -> Vec<String> {
@@ -2855,6 +2901,7 @@ mod tests {
             "demo",
             &app,
             &baseline,
+            &launched,
             &BTreeMap::new(),
         );
 
@@ -2891,6 +2938,79 @@ mod tests {
             serde_json::to_value(network_view(&launched.network)).unwrap()
         );
         assert!(matches!(detail.network_origin, ProvenanceView::Override));
+    }
+
+    /// An override's posture is made from the one it replaces: a `[proc]` or `[network]` table with
+    /// no `mode` keeps the mode below it, a `[notify]` mode keeps `repeat_after`. At launch what it
+    /// replaces is the app's, so the detail view shows what the override made of the app's
+    /// posture, not of the baseline's.
+    #[test]
+    fn the_detail_view_builds_an_override_on_the_apps_own_posture() {
+        use crate::config::overrides::Override;
+        let cfg = |text: &str| crate::config::schema::parse(text.as_bytes()).unwrap();
+        let resolved = crate::config::resolve(
+            cfg("[app.demo]\n\
+                 cmd = [\"demo\"]\n\
+                 [app.demo.proc]\n\
+                 mode = \"enforce\"\n\
+                 deny = [\"curl\"]\n\
+                 [app.demo.notify]\n\
+                 mode = \"once\"\n\
+                 repeat_after = \"5m\"\n\
+                 [app.demo.network]\n\
+                 mode = \"ask\"\n\
+                 allow = [\"api.example.com\"]\n"),
+            None,
+            &Default::default(),
+        );
+        let app = resolved.apps["demo"].clone();
+        let over = || {
+            Override::for_test(cfg("[proc]\n\
+                                    deny = [\"ssh\"]\n\
+                                    [notify]\n\
+                                    mode = \"always\"\n\
+                                    [network]\n\
+                                    allow = [\"other.example.com\"]\n"))
+        };
+        let mut launched = resolved.clone();
+        launched.merge_app(app.clone());
+        launched.apply_override(over(), None).unwrap();
+        let mut baseline = resolved.clone();
+        baseline.apply_override(over(), None).unwrap();
+        let detail = app_detail_view(
+            std::path::Path::new("/proj"),
+            "demo",
+            &app,
+            &baseline,
+            &launched,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(detail.proc.mode, launched.proc.mode.as_str());
+        assert_eq!(
+            detail.proc.mode, "enforce",
+            "a mode-less table keeps the app's mode"
+        );
+        assert_eq!(detail.proc.deny, ["ssh"]);
+        assert_eq!(
+            detail.notify.repeat_after,
+            notify_view(&launched.notify).repeat_after
+        );
+        assert_eq!(
+            detail.notify.repeat_after, "5m",
+            "the app's spacing survives a mode"
+        );
+        assert_eq!(
+            serde_json::to_value(&detail.network).unwrap(),
+            serde_json::to_value(network_view(&launched.network)).unwrap()
+        );
+        assert!(matches!(
+            detail.network,
+            NetworkView::Allowlist {
+                default_action: NetDefaultView::Ask,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3055,6 +3175,7 @@ mod tests {
             "demo",
             &app,
             &baseline,
+            &merged,
             &BTreeMap::new(),
         );
 

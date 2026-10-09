@@ -255,6 +255,14 @@ pub(super) fn capture_line(capture: &str, capture_max_kb: Option<u64>) -> Option
     Some(format!("{cap} — read it with `sbx net logs --with-body`"))
 }
 
+/// The line naming what a configured secret seen leaving through a WebSocket does, or `None` at the
+/// default (`warn`). Stated for the reason a capture is: a tunnel closed on a sighting looks from
+/// inside the cage exactly like one its peer closed.
+pub(super) fn websocket_secret_line(websocket_secret: &str) -> Option<&'static str> {
+    (websocket_secret != "warn")
+        .then_some("websocket secret: block (a tunnel carrying one out is closed)")
+}
+
 /// The `network:` line and the posture preamble that precedes any rule listing: the mode word and
 /// its provenance tag, the ask-timeout and ask-notice lines, the capture and websocket-secret
 /// statements, and the transport block.
@@ -328,17 +336,8 @@ pub(super) fn write_net_posture_head(
             if let Some(cap) = capture_line(capture, *capture_max_kb) {
                 let _ = writeln!(o, "    {}", style::dim_prose(&cap, pal));
             }
-            // Stated for the same reason, and only when it is not the default: a tunnel closed on a
-            // sighting looks from inside the cage exactly like one its peer closed.
-            if websocket_secret != "warn" {
-                let _ = writeln!(
-                    o,
-                    "    {}",
-                    style::dim_prose(
-                        "websocket secret: block (a tunnel carrying one out is closed)",
-                        pal
-                    )
-                );
+            if let Some(line) = websocket_secret_line(websocket_secret) {
+                let _ = writeln!(o, "    {}", style::dim_prose(line, pal));
             }
             write_net_transport(
                 o,

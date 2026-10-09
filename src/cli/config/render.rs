@@ -9,7 +9,8 @@ use crate::{net_mode_word, short_rev};
 
 use super::format::{
     bind_mode_tag, capture_line, channel_text, opt_provenance_tag, package_line, provenance_parts,
-    provenance_tag, sanitized_list, service_line, write_net_posture_head, write_notify,
+    provenance_tag, sanitized_list, service_line, websocket_secret_line, write_net_posture_head,
+    write_notify,
 };
 
 /// The layered environment, after the trust gate. Shown even when empty: a reader looking for a
@@ -671,16 +672,7 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
         // The host groups a learned credential may travel across. Surfaced because it widens a
         // security guard and an app usually inherits it from a bundle rather than writing it: a
         // reader auditing what a launch granted has to be able to see it here.
-        if !shared_credential.is_empty() {
-            let _ = writeln!(
-                o,
-                "    {dim}shared_credential (one service for a credential the cage signs in \
-                 for):{r}"
-            );
-            for group in shared_credential {
-                let _ = writeln!(o, "      {n}{}{r}", group.join(", "));
-            }
-        }
+        write_shared_credential(&mut o, shared_credential, "    ", pal);
         // The egress-stats toggle is meaningful only under a filtering posture (the proxy runs
         // only then), so it rides the network section. Shown both ways — an audit knob is worth
         // surfacing — naming the reader command when on.
@@ -696,6 +688,30 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
     }
 
     o
+}
+
+/// The host groups a credential the cage signs in for may travel across, indented by `indent`, or
+/// nothing when there are none. Surfaced because it widens a security guard and an app usually
+/// inherits it from a bundle rather than writing it: a reader auditing what a launch granted has to
+/// be able to see it.
+fn write_shared_credential(
+    o: &mut String,
+    groups: &[Vec<String>],
+    indent: &str,
+    pal: &style::Palette,
+) {
+    use std::fmt::Write as _;
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    if groups.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        o,
+        "{indent}{dim}shared_credential (one service for a credential the cage signs in for):{r}"
+    );
+    for group in groups {
+        let _ = writeln!(o, "{indent}  {n}{}{r}", group.join(", "));
+    }
 }
 
 /// Credentials the egress proxy injects — by destination and source locator, never the value.
@@ -1075,16 +1091,26 @@ fn app_row_network(
                 );
             }
         }
-        // Stated in both forms, like the baseline's: what an app captures is never left to
-        // `--details` or to its detail view.
+        // Stated in both forms, like the baseline's: what an app captures, and whether a tunnel
+        // carrying a secret out is closed, is never left to `--details` or to its detail view. The
+        // groups a credential may travel across are listed with the rules.
         if let NetworkView::Allowlist {
             capture,
             capture_max_kb,
+            websocket_secret,
+            shared_credential,
             ..
         } = net
-            && let Some(cap) = capture_line(capture, *capture_max_kb)
         {
-            let _ = writeln!(o, "        {}", style::dim_prose(&cap, pal));
+            if let Some(cap) = capture_line(capture, *capture_max_kb) {
+                let _ = writeln!(o, "        {}", style::dim_prose(&cap, pal));
+            }
+            if let Some(line) = websocket_secret_line(websocket_secret) {
+                let _ = writeln!(o, "        {}", style::dim_prose(line, pal));
+            }
+            if details {
+                write_shared_credential(o, shared_credential, "        ", pal);
+            }
         }
     }
 }
@@ -2568,8 +2594,9 @@ mod tests {
         );
     }
 
-    /// An app overlay that captures traffic says so in the roster's compact form as under
-    /// `--details`, in the baseline's words: a capture is never left to the detail view.
+    /// An app overlay that captures traffic, or closes a tunnel carrying a secret, says so in the
+    /// roster's compact form as under `--details`, in the baseline's words; the groups a credential
+    /// may travel across come with the rules under `--details`.
     #[test]
     fn an_app_overlays_capture_is_stated_in_the_roster() {
         use config::view::*;
@@ -2584,6 +2611,15 @@ mod tests {
             *capture = "bodies".into();
             *capture_max_kb = Some(64);
         }
+        if let NetworkView::Allowlist {
+            websocket_secret,
+            shared_credential,
+            ..
+        } = &mut net
+        {
+            *websocket_secret = "block".into();
+            *shared_credential = vec![vec!["a.example.com".into(), "b.example.com".into()]];
+        }
         let view = ConfigView {
             apps: vec![AppView {
                 network: Some(net),
@@ -2596,6 +2632,15 @@ mod tests {
             assert!(
                 out.contains("capture: bodies (up to 64 KiB per body)"),
                 "details={details}:\n{out}"
+            );
+            assert!(
+                out.contains("websocket secret: block"),
+                "details={details}:\n{out}"
+            );
+            assert_eq!(
+                out.contains("a.example.com, b.example.com"),
+                details,
+                "the credential groups are listed with the rules:\n{out}"
             );
         }
     }
