@@ -74,10 +74,12 @@ and is not named.
 A listing narrowed to the current project or to an app with `-a` learns which sessions those are
 from the session registry, and one that cannot read the registry says so and exits 1 rather than
 showing an empty answer: `sbx net rules --source session`, `sbx proc rules` (which takes every
-session it lists from the registry, `--all` included), `sbx net pending -a`, `sbx net logs -a`, and
-the views that run until stopped, `sbx net live -a`, `sbx net pending watch -a` and `sbx net logs
---follow -a`. So does a drain narrowed the same way, `sbx net pending allow|deny --all` with `-a`
-or a `--local` save, before it answers anything. A listing that is not narrowed only labels its
+session it lists from the registry, `--all` included), `sbx net pending -a` and `sbx net logs -a`.
+So does a drain narrowed the same way, `sbx net pending allow|deny --all` with `-a` or a `--local`
+save, before it answers anything. The views that run until stopped differ here from the way they
+treat a session that does not answer: `sbx net live -a`, `sbx net pending watch -a` and `sbx net
+logs --follow -a` end with exit 1 on whichever refresh finds the registry unreadable, since no
+frame can then say which sessions are the app's. A listing that is not narrowed only labels its
 sessions from the registry, so it warns and goes on.
 
 `sbx task ls` names such a session too and still exits 0: what it lists, the declared operations,
