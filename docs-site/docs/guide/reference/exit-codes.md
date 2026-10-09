@@ -71,6 +71,15 @@ time. Such a listing never says there is nothing to show, since that would read 
 holding nothing. A session that cannot be connected to at all has gone, or never ran that plane,
 and is not named.
 
+A listing narrowed to the current project or to an app with `-a` learns which sessions those are
+from the session registry, and one that cannot read the registry says so and exits 1 rather than
+showing an empty answer: `sbx net rules --source session`, `sbx proc rules` (which takes every
+session it lists from the registry, `--all` included), `sbx net pending -a`, `sbx net logs -a`, and
+the views that run until stopped, `sbx net live -a`, `sbx net pending watch -a` and `sbx net logs
+--follow -a`. So does a drain narrowed the same way, `sbx net pending allow|deny --all` with `-a`
+or a `--local` save, before it answers anything. A listing that is not narrowed only labels its
+sessions from the registry, so it warns and goes on.
+
 `sbx task ls` names such a session too and still exits 0: what it lists, the declared operations,
 was read in full, and only the running count beside them is missing. The views that run until
 stopped name such a session without an exit code. `sbx net live` and `sbx net pending watch` name it
@@ -81,9 +90,10 @@ each run of unanswered reads rather than on every poll, and asks it again from w
 A `--session` rule load is not a name either. `sbx net allow|deny|mute --session` and `sbx proc
 allow|deny --session` load a rule into the live sessions in scope, and exit 1 when that reached
 none or a session refused the rule, since the rule is then not in force where it was meant to
-be. A session whose proxy kept an egress rule without confirming it exits 2, as the
-[`sbx net pending`](../cli/net#sbx-net-pending) answers do, and so does one that could not be
-asked whether it took the rule.
+be, and when the session registry could not be read, since which sessions are in scope is then
+not known and nothing is loaded. A session whose proxy kept an egress rule without confirming
+it exits 2, as the [`sbx net pending`](../cli/net#sbx-net-pending) answers do, and so does one
+that could not be asked whether it took the rule.
 
 A view given no session id reads the session of the project it runs in: `sbx logs`, `sbx proc
 ls|live|logs`, `sbx fs logs` and `sbx ssh-agent logs`. When that project has no session to
