@@ -99,6 +99,11 @@ but **empty** reads as **absent**, the same rule
 [`SBX_DATA_DIR`](../reference/environment-variables) follows, so `SBX_NET= sbx run` launches
 on whatever posture the config decides instead of refusing.
 
+The per-key forms follow the same rule. `SBX_LIMIT_MEMORY_MAX=` leaves the limit to the config
+rather than refusing the launch, and `SBX_PACKAGE_jq=` declares no package rather than warning
+about one. `SBX_ENV_FOO=` leaves `FOO` to whatever sets it below, rather than emptying it in the
+cage: to hand the cage an empty variable, write `--env FOO=`, or an `[env]` table in a blob.
+
 The flag does not follow that rule: `--net ""` is a usage error (exit 2). The asymmetry is
 deliberate, because the two say different things. A variable arrives from an environment
 nobody re-read, where emptying it is the ordinary way to neutralise a value inherited from a
