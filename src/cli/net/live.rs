@@ -282,6 +282,24 @@ pub(super) fn net_live(args: &[OsString]) -> ExitCode {
 mod tests {
     use super::*;
 
+    /// `-a <app>` on `net live`, with a session registry that cannot be read, reports the registry
+    /// instead of an empty listing that would read as the app having no tunnel open. Without the filter
+    /// the registry only labels the listing, and the gather goes ahead.
+    #[test]
+    fn an_app_filter_the_registry_cannot_resolve_is_refused_by_net_live() {
+        use crate::testutil::TmpDir;
+        let data = TmpDir::new();
+        std::fs::write(data.join("sessions"), b"not a directory").unwrap();
+        let why = collect_flows(data.path(), Some("demo"))
+            .err()
+            .expect("the app's sessions are not known");
+        assert!(
+            why.contains("cannot read the session registry") && why.contains("`demo`"),
+            "{why}"
+        );
+        assert!(collect_flows(data.path(), None).is_ok());
+    }
+
     #[test]
     fn parse_live_args_defaults_and_overrides() {
         let osv = |xs: &[&str]| xs.iter().map(OsString::from).collect::<Vec<_>>();
