@@ -645,12 +645,9 @@ impl Applier {
         let Some(ring) = &self.sinks.capture else {
             return false;
         };
-        let caps = ring.caps();
-        // Each part is cut at its cap before it is sent: the two heads at the head cap (the response
-        // one shares its buffer with the start of the body), the three bodies and the two tunnel
-        // directions at the body cap, and the injected header names bounded like any logged field.
-        let most = 2 * caps.head + 4 * caps.body + MAX_FIELD;
-        if capture.is_empty() || capture.weight() > most {
+        // Each part is cut at its cap before it is sent, and the injected header names are bounded
+        // like any logged field; a part past what the proxy can have taken is refused whole.
+        if capture.is_empty() || !capture.fits(ring.caps(), MAX_FIELD) {
             return false;
         }
         ring.insert(capture.filed_as(seq));
@@ -1185,6 +1182,113 @@ mod tests {
         let released = ring.snapshot(Some(2), Some(0), false).events;
         assert_eq!(released.len(), 1);
         assert_eq!(released[0].status, Some(200));
+    }
+
+    /// The most bytes a capture at `caps` can carry in each part, in [`Masked::into_parts`] order,
+    /// with the response's head and body splitting their shared buffer at the head cap.
+    fn part_caps(caps: CaptureCaps) -> [usize; CAPTURE_PARTS] {
+        [
+            caps.head, MAX_FIELD, caps.body, caps.head, caps.body, caps.body, caps.body,
+        ]
+    }
+
+    /// A capture for `id` whose parts hold `sizes` bytes each.
+    fn sized(id: u64, sizes: [usize; CAPTURE_PARTS]) -> Masked {
+        Masked::received(
+            id,
+            sizes.map(|n| CaptureBytes {
+                bytes: vec![b'x'; n],
+                truncated: false,
+            }),
+        )
+    }
+
+    /// What the ring holds for its first event, in bytes.
+    fn held(store: &CaptureRing) -> usize {
+        store.get(&[1]).0.iter().map(|c| c.weight()).sum()
+    }
+
+    /// A capture with every part at the most the proxy can take is filed, and so is a response that
+    /// is all head, which fills the response's shared buffer with no body.
+    #[test]
+    fn a_capture_at_every_cap_is_filed() {
+        for level in [CaptureLevel::Headers, CaptureLevel::Bodies] {
+            let store = Arc::new(CaptureRing::new(CaptureCaps::new(level, 8)));
+            let caps = store.caps();
+            let mut all_head = part_caps(caps);
+            all_head[3] = caps.head + caps.body;
+            all_head[4] = 0;
+            for sizes in [part_caps(caps), all_head] {
+                let store = Arc::new(CaptureRing::new(caps));
+                let events = for_capture(Arc::new(LogRing::new(LOG_RING_CAP)), Arc::clone(&store));
+                let id = events.log(entry("api.example.com", LogVerdict::Allow, false));
+                events.send(ProxyEvent::CaptureFiled {
+                    id,
+                    capture: sized(id, sizes),
+                });
+                events.flush();
+                assert_eq!(
+                    held(&store),
+                    sizes.iter().sum::<usize>(),
+                    "{level:?} {sizes:?}"
+                );
+            }
+        }
+    }
+
+    /// One part a byte past its own cap is refused even though the filing as a whole fits, so
+    /// filings of one exchange that each carry a different part fold into an entry bounded by the
+    /// parts' caps, not by as many whole captures as there are filings.
+    #[test]
+    fn a_part_over_its_own_cap_is_refused_and_folded_filings_hold_each_part_once() {
+        let caps = CaptureCaps::new(CaptureLevel::Bodies, 8);
+        let mut over = Vec::new();
+        for part in 0..CAPTURE_PARTS {
+            let mut sizes = [0; CAPTURE_PARTS];
+            sizes[part] = part_caps(caps)[part] + 1;
+            if part == 3 {
+                // The response head alone may take the whole shared buffer.
+                sizes[part] += caps.body;
+            }
+            over.push(sizes);
+        }
+        let mut both = part_caps(caps);
+        both[3] = caps.head + 1;
+        over.push(both);
+        for sizes in over {
+            let store = Arc::new(CaptureRing::new(caps));
+            let events = for_capture(Arc::new(LogRing::new(LOG_RING_CAP)), Arc::clone(&store));
+            let id = events.log(entry("api.example.com", LogVerdict::Allow, false));
+            events.send(ProxyEvent::CaptureGrew {
+                id,
+                capture: sized(id, sizes),
+            });
+            events.flush();
+            assert_eq!(held(&store), 0, "{sizes:?} must be refused");
+        }
+
+        let store = Arc::new(CaptureRing::new(caps));
+        let events = for_capture(Arc::new(LogRing::new(LOG_RING_CAP)), Arc::clone(&store));
+        let id = events.log(entry("api.example.com", LogVerdict::Allow, false));
+        // Filed one part at a time, each at its own cap, the response's head and body apart: the
+        // entry they fold into holds each part once, and a part filed again replaces its copy.
+        let mut filings: Vec<[usize; CAPTURE_PARTS]> = (0..CAPTURE_PARTS)
+            .map(|part| {
+                let mut sizes = [0; CAPTURE_PARTS];
+                sizes[part] = part_caps(caps)[part];
+                sizes
+            })
+            .collect();
+        filings[3][3] = caps.head + caps.body;
+        filings.push(filings[0]);
+        for sizes in filings {
+            events.send(ProxyEvent::CaptureGrew {
+                id,
+                capture: sized(id, sizes),
+            });
+        }
+        events.flush();
+        assert_eq!(held(&store), 2 * caps.head + 5 * caps.body + MAX_FIELD);
     }
 
     /// An amendment naming a number the proxy never logged, or one past what the ring still holds,

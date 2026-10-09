@@ -291,7 +291,17 @@ impl Capture {
 
     /// Whether nothing at all was captured for this exchange.
     pub(crate) fn is_empty(&self) -> bool {
-        self.parts().is_empty()
+        [
+            &self.req_head,
+            &self.injected,
+            &self.req_body,
+            &self.res_head,
+            &self.res_body,
+            &self.ws_up,
+            &self.ws_down,
+        ]
+        .iter()
+        .all(|b| b.is_empty())
     }
 
     /// This capture's weight against the ring's byte budget.
@@ -403,6 +413,25 @@ impl Masked {
     pub(crate) fn weight(&self) -> usize {
         self.0.weight()
     }
+
+    /// Whether no part is larger than the proxy can have taken at `caps`, the injected header
+    /// names held to `names_max`: the request head at the head cap, the request body and each
+    /// tunnel direction at the body cap, and the response's head and body together at both, since
+    /// they are cut from one buffer that a response with no blank line fills with head alone.
+    ///
+    /// Held per part rather than in total because filings of one exchange fold part by part (see
+    /// [`CaptureRing::insert`]): a total alone would let each filing carry a different part at the
+    /// whole bound, and the entry they fold into grow to several captures' worth.
+    pub(crate) fn fits(&self, caps: CaptureCaps, names_max: usize) -> bool {
+        let c = &self.0;
+        c.req_head.weight() <= caps.head
+            && c.injected.weight() <= names_max
+            && c.req_body.weight() <= caps.body
+            && c.res_head.weight() + c.res_body.weight() <= caps.head + caps.body
+            && c.res_body.weight() <= caps.body
+            && c.ws_up.weight() <= caps.body
+            && c.ws_down.weight() <= caps.body
+    }
 }
 
 /// The bounded store of captured exchanges, shared (via `Arc`) between the side applying what the
@@ -452,7 +481,7 @@ impl CaptureRing {
     }
 
     /// The per-part caps this ring was built with, so the forwarding path sizes its buffers from the
-    /// same source of truth the ring enforces.
+    /// same source of truth the supervisor holds each filing to ([`Masked::fits`]).
     pub(crate) fn caps(&self) -> CaptureCaps {
         self.caps
     }
@@ -551,8 +580,17 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 /// Decode standard base64, returning `None` on any malformed input (a bad character, a bad length,
 /// misplaced padding) — a capture that does not decode is dropped rather than rendered as garbage.
 pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim_end_matches('=');
-    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    // Padded, as [`base64_encode`] writes it: whole groups of four, ending in at most two `=`.
+    if !s.len().is_multiple_of(4) {
+        return None;
+    }
+    let capacity = s.len() / 4 * 3;
+    let unpadded = s.trim_end_matches('=');
+    if s.len() - unpadded.len() > 2 {
+        return None;
+    }
+    let s = unpadded;
+    let mut out = Vec::with_capacity(capacity);
     let mut acc: u32 = 0;
     let mut bits = 0u32;
     for c in s.bytes() {
@@ -626,6 +664,12 @@ mod tests {
             None,
             "a lone 6-bit group cannot be a byte"
         );
+        for malformed in ["====", "Zm9vYmFy======", "Zg=", "Zg===", "Zm9vYg", "Zg=a"] {
+            assert_eq!(base64_decode(malformed), None, "{malformed:?}");
+        }
+        assert_eq!(base64_decode("").as_deref(), Some(&b""[..]));
+        assert_eq!(base64_decode("Zg==").as_deref(), Some(&b"f"[..]));
+        assert_eq!(base64_decode("Zm8=").as_deref(), Some(&b"fo"[..]));
     }
 
     /// File `cap` into `ring` the way the proxy files one: masked against every value
