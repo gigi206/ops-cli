@@ -296,6 +296,13 @@ fn scan_ambient() -> AmbientOverrides {
         let (Some(k), Some(v)) = (k.to_str(), v.to_str()) else {
             continue;
         };
+        // Set but empty reads as absent, as for every other `SBX_*` override (`env_nonempty`):
+        // clearing a variable is how an inherited value is switched off. So an empty limit does
+        // not refuse the launch, an empty locator does not name a package, and an empty
+        // `SBX_ENV_*` leaves the variable to the config.
+        if v.is_empty() {
+            continue;
+        }
         if let Some(name) = k.strip_prefix(SBX_ENV_PREFIX) {
             if !name.is_empty() {
                 a.env.push((name.to_string(), v.to_string()));
@@ -3224,6 +3231,42 @@ mod tests {
                 .contains(&("tasks_max".to_string(), "8192".to_string())),
             "{:?}",
             ambient.limits
+        );
+    }
+
+    /// An `SBX_*` variable set but empty reads as absent, the rule every override follows, for the
+    /// per-key forms too: an empty limit does not refuse the launch, an empty locator does not name
+    /// a package, and an empty `SBX_ENV_*` does not override the config's value with nothing.
+    #[test]
+    fn an_empty_per_key_variable_reads_as_absent() {
+        let _lock = crate::testutil::env_lock();
+        let _limit = crate::testutil::EnvVar::set("SBX_LIMIT_MEMORY_MAX", "");
+        let _pkg = crate::testutil::EnvVar::set("SBX_PACKAGE_hello", "");
+        let _env = crate::testutil::EnvVar::set("SBX_ENV_SBX_TEST_EMPTY", "");
+        // The witness: a set limit beside them is read, so the absence below is the rule's.
+        let _set = crate::testutil::EnvVar::set("SBX_LIMIT_TASKS_MAX", "64");
+        let ambient = scan_ambient();
+        assert!(
+            ambient
+                .limits
+                .contains(&("tasks_max".to_string(), "64".to_string())),
+            "{:?}",
+            ambient.limits
+        );
+        assert!(
+            !ambient.limits.iter().any(|(k, _)| k == "memory_max"),
+            "{:?}",
+            ambient.limits
+        );
+        assert!(
+            !ambient.packages.iter().any(|(k, _)| k == "hello"),
+            "{:?}",
+            ambient.packages
+        );
+        assert!(
+            !ambient.env.iter().any(|(k, _)| k == "SBX_TEST_EMPTY"),
+            "{:?}",
+            ambient.env
         );
     }
 
