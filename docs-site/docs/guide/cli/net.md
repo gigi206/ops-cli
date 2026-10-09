@@ -89,7 +89,9 @@ holds the rule, so the next request there is decided by it; a session whose prox
 confirm it is named as such, the command exits with code 2, and running it again pushes the
 rule once more. So does a session that could not be asked at all, since whether it holds the
 rule is then not known; one that ended in the meantime is passed over. A load that reached no session in scope, or that a session refused (one
-running an sbx too old to load a live rule), exits 1: the rule is not in force there.
+running an sbx too old to load a live rule), exits 1: the rule is not in force there. So does
+a load whose scope is not known because the session registry could not be read: it loads
+nothing rather than counting as one that reached no session.
 Standard output names the sessions that took the rule, and where to see it; every session
 that did not, and the config write that would persist the rule instead, is said on standard
 error. It writes no file (so it never re-trusts the project) and dies with the
