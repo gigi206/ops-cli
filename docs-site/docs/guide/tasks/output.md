@@ -44,7 +44,9 @@ Two things to keep in mind:
 
 `[task.defaults] nonce = true` makes each invocation's placeholders unforgeable: they read `${NAME@a91f3c}` where the
 nonce is drawn per call and reported out of band, so the command could not have predicted it, and a
-placeholder copied from an earlier result is detectably stale. Escaping the command's own `${…}` was
+placeholder copied from an earlier result is detectably stale. When the host's randomness cannot be
+read, the invocation is refused before its command runs, rather than run under a nonce the command
+could guess. Escaping the command's own `${…}` was
 considered and rejected, it is imitable, and it would corrupt legitimate payloads (shell, CI YAML,
 templates are full of `${…}`).
 
