@@ -1397,8 +1397,9 @@ impl Resolved {
             self.observe_record_origin = Provenance::Override;
         }
 
-        // `forward` — trusted by invocation; the ports add to the effective set (a collection, so a
-        // bad port — only `0` is possible after parse — is warned and skipped, not fatal). The
+        // `forward` — trusted by invocation; the ports add to the effective set. The flag and
+        // `SBX_FORWARD` refuse a bad port at parse, so a forward reaching here from them is valid;
+        // one from a blob is validated like any layer's, warned and skipped, not fatal. The
         // override is the final word and additive: its ports union onto the resolved set, and the
         // origin stamps `Override` when it contributes any (it cannot remove a baseline's ports,
         // matching the additive model of `--bind`/`--package`).
