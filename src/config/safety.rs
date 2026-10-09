@@ -47,7 +47,7 @@ fn verdict(file_uid: u32, mode: u32, euid: u32, what: &str) -> io::Result<()> {
 /// before the parser ever saw a key. `sbx run`, `sbx config show`, a shell-prompt integration and
 /// `sbx trust` all take this path. The ceiling is three orders of magnitude above the largest
 /// profile this repository ships (~21 KiB), so it bounds the attack without bounding any use.
-const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+pub(super) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// A refusal carries `PermissionDenied`, the closest kind to "this file is not
 /// trustworthy to load". `what` is the kind of file, as the reader knows it.
