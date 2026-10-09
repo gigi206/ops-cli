@@ -38,7 +38,8 @@ Lists the allow/deny rules of the effective filtering posture, each tagged `conf
 rule shows `tcp://`; an egress group shows as one `@<name>` row (`--expand`
 unfolds it). `--app <name>` shows what `sbx app run <name>` would launch with. `--source
 session` queries live `ask`-session rules remembered from `--session` answers (`manual`
-is accepted as an alias), names a session that does not answer in full and then exits 1
+is accepted as an alias), names a session that does not answer in full, refuses the question or
+cannot be asked, and then exits 1
 ([exit codes](../reference/exit-codes#a-listing-that-could-not-read-a-session-exits-1)). Under
 `shared`/`none` there are no rules. See [Egress observability](../networking/observability).
 

@@ -186,7 +186,7 @@ fn manual_rules_of(
             // as holding none.
             Err(e) => {
                 crate::diag::warn(&format!(
-                    "net rules: session {pid} could not be asked ({e}), so its rules are not listed"
+                    "net rules: session {pid} could not be read ({e}), so its rules are not listed"
                 ));
                 unanswered = true;
                 continue;
