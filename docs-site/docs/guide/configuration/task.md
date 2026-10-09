@@ -70,7 +70,8 @@ nonce      = false     # unforgeable substitution placeholders, see Output
 
 Declared as a `[task.defaults]` sub-table rather than bare keys beside the entries, so a setting can
 never be swallowed by whichever task table happens to precede it in the file. A task can therefore
-not be named `defaults`. A `timeout` takes `"30s"`, `"5m"`, `"2h"` or bare seconds, and may never
+not be named `defaults`. Nor can its name begin with `-`: every `sbx task` verb reads such an
+argument as an option, so the operation could never be named on the command line. A `timeout` takes `"30s"`, `"5m"`, `"2h"` or bare seconds, and may never
 be zero. A `max_output` takes bytes with an optional `B` / `KiB` / `MiB` / `K` / `M` suffix
 (`"64KiB"`, `"1MiB"`, `"4096"`), and must be positive.
 
