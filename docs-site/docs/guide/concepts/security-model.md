@@ -304,6 +304,18 @@ lean on it:
   session. It is a live account, not an audit trail; redirect `--json` to a file to keep
   one.
 
+**`sbx` itself runs nothing it finds in the project.** The programs `sbx` runs on the host
+(bubblewrap, nix, `git`, `systemd-run`, the `ssh-askpass` that approves a signature) are found
+on your `PATH`, and an entry of it that lies in the project, a `<project>/.venv/bin` an
+activated environment or a `direnv` put in front of `/usr/bin`, or a link leading there, is
+left out of the search with a warning naming the program it passed over: the cage writes that
+directory, so what is there is whatever a session left. An `SSH_ASKPASS` naming a file in the
+project is refused the same way. Launched with your home as the project, that leaves out
+`~/.local/bin` and a single-user nix's `~/.nix-profile/bin` too, which the cage then writes; a
+read-write [bind](../configuration/binds) is written by the cage as well and is not weighed by
+this search, so do not put one on your `PATH`. A project at `/` is the exception: the cage writes
+everything there, and leaving out every program would protect nothing.
+
 **The git carrier is closed by default.** A git hook is the one entry in the table above
 that no legitimate agent task needs to write, and the feed does not show it. So
 `.git/hooks/` and `.git/config` are [read-only in every cage](../configuration/fs#read-only-without-an-entry-the-project-config-and-git)
