@@ -159,46 +159,19 @@ pub(super) fn net_rules(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `sbx net rules --source session`: the live overlay rules this project's running sessions carry —
-/// loaded with `sbx net allow|deny --session` or remembered from a `sbx net pending … --session`
-/// answer. These live in the sessions' memory (not config) and are gone when the sessions end. The
-/// proxy folds them into its effective policy, so they apply in any filtering posture, not only
-/// `ask`. Cross-references the registry to find the sessions for this project (by the
-/// canonical project root the registry keys on), queries each one's control socket, and lists the
-/// merged, deduped rules. No config read, no launch, no nix.
-fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: bool) -> ExitCode {
+/// The live overlay rules the sessions `pids` carry, merged and deduped, and whether any of them
+/// could not be read: one that did not answer in full, or could not be asked at all, is named on
+/// stderr rather than read as holding none. A session gone between the registry read and the query
+/// is passed over in silence.
+fn manual_rules_of(
+    data_dir: &Path,
+    pids: impl IntoIterator<Item = u32>,
+) -> (Vec<config::view::NetRuleView>, bool) {
     use config::view::{NetRuleKind, NetRuleView, RuleSourceView};
-    let data_dir = match egress_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-    // Which sessions to query: `-a <app>` selects that app's session(s) (from the registry, across
-    // projects — an app's live rules are the same wherever it runs); otherwise this project's
-    // sessions, keyed by the canonical project root (the registry stores canonical paths; fall back
-    // to the cwd as-is if it cannot be canonicalized).
-    let (pids, scope): (Vec<u32>, String) = match app {
-        Some(name) => (
-            session_pids_for_app(&data_dir, name).into_iter().collect(),
-            format!(" (app: {name})"),
-        ),
-        None => {
-            let project = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-            (
-                pending_session_context(&data_dir)
-                    .into_iter()
-                    .filter(|(_, proj, _)| *proj == project)
-                    .map(|(pid, _, _)| pid)
-                    .collect(),
-                String::new(),
-            )
-        }
-    };
-
-    // Merge + dedup the manual rules across this project's sessions.
     let mut rules: Vec<NetRuleView> = Vec::new();
     let mut unanswered = false;
     for pid in pids {
-        let rows = match sandbox::control::query_manual(&data_dir, pid) {
+        let rows = match sandbox::control::query_manual(data_dir, pid) {
             Ok(rows) => rows,
             // Reached, and its answer did not arrive in full: it may hold rules, so it is named
             // rather than read as holding none.
@@ -208,7 +181,16 @@ fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: b
                 continue;
             }
             // The session ended between the registry read and the query.
-            Err(_) => continue,
+            Err(e) if sandbox::control::session_gone(&e) => continue,
+            // Reached or not, it answered nothing about its rules, so it is named rather than read
+            // as holding none.
+            Err(e) => {
+                crate::diag::warn(&format!(
+                    "net rules: session {pid} could not be asked ({e}), so its rules are not listed"
+                ));
+                unanswered = true;
+                continue;
+            }
         };
         for row in rows {
             // A live rule crosses the control socket as text, so its reach is re-derived here
@@ -237,6 +219,47 @@ fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: b
             }
         }
     }
+
+    (rules, unanswered)
+}
+
+/// `sbx net rules --source session`: the live overlay rules this project's running sessions carry —
+/// loaded with `sbx net allow|deny --session` or remembered from a `sbx net pending … --session`
+/// answer. These live in the sessions' memory (not config) and are gone when the sessions end. The
+/// proxy folds them into its effective policy, so they apply in any filtering posture, not only
+/// `ask`. Cross-references the registry to find the sessions for this project (by the
+/// canonical project root the registry keys on), queries each one's control socket, and lists the
+/// merged, deduped rules. No config read, no launch, no nix.
+fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: bool) -> ExitCode {
+    use config::view::NetRuleView;
+    let data_dir = match egress_dir_or_fail() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    // Which sessions to query: `-a <app>` selects that app's session(s) (from the registry, across
+    // projects — an app's live rules are the same wherever it runs); otherwise this project's
+    // sessions, keyed by the canonical project root (the registry stores canonical paths; fall back
+    // to the cwd as-is if it cannot be canonicalized).
+    let (pids, scope): (Vec<u32>, String) = match app {
+        Some(name) => (
+            session_pids_for_app(&data_dir, name).into_iter().collect(),
+            format!(" (app: {name})"),
+        ),
+        None => {
+            let project = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+            (
+                pending_session_context(&data_dir)
+                    .into_iter()
+                    .filter(|(_, proj, _)| *proj == project)
+                    .map(|(pid, _, _)| pid)
+                    .collect(),
+                String::new(),
+            )
+        }
+    };
+
+    // Merge + dedup the manual rules across this project's sessions.
+    let (rules, unanswered) = manual_rules_of(&data_dir, pids);
 
     let listed = if unanswered {
         ExitCode::FAILURE
@@ -733,6 +756,27 @@ fn persist_egress_removal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session gone between the registry read and the query is passed over in silence; one that
+    /// could not be asked for another reason is named and makes the listing incomplete, rather than
+    /// being read as holding no rules. The second is a socket path too long to connect to, an error
+    /// that is neither a session gone nor one that answered short.
+    #[test]
+    fn a_session_that_cannot_be_asked_is_named_and_one_gone_is_not() {
+        let tmp = crate::testutil::TmpDir::new();
+        let (rules, unanswered) = manual_rules_of(tmp.path(), [4242]);
+        assert!(rules.is_empty());
+        assert!(!unanswered, "a session with no socket has ended");
+
+        let deep = tmp.path().join("d".repeat(120));
+        std::fs::create_dir_all(&deep).unwrap();
+        let (rules, unanswered) = manual_rules_of(&deep, [4242]);
+        assert!(rules.is_empty());
+        assert!(
+            unanswered,
+            "a session that could not be asked leaves the listing incomplete"
+        );
+    }
 
     /// A stand-in for session `pid` under `data`: its egress control socket answers the one rule
     /// load it accepts with `reply`, and the thread hands back the command it received.
