@@ -118,6 +118,22 @@ fn engine_on(
     Some((engine, data))
 }
 
+/// The userland's shell, for a task command a cage can run, or `None` without bwrap or nix.
+fn userland_shell() -> Option<PathBuf> {
+    crate::pathfind::find_on_path("bwrap")
+        .and(crate::store::resolve_nix(None))
+        .and_then(|nix| {
+            let data = TmpDir::new();
+            let layout = crate::store::Layout::under(data.path());
+            let nixpkgs = crate::store::LockTarget::global(&layout, None)
+                .resolve(&nix, &layout)
+                .ok()?;
+            super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
+                .ok()
+                .map(|u| u.shell_bin)
+        })
+}
+
 /// A task that prints its credential and its parameter, so both paths are observable at once.
 fn echo_task(shell: &str) -> TaskSpec {
     TaskSpec {
@@ -496,18 +512,7 @@ fn a_pool_tool_runs_by_name_and_its_pool_is_read_only() {
 #[test]
 fn the_timeout_kills_a_hanging_task_and_the_cap_truncates_a_loud_one() {
     let project = TmpDir::new();
-    let shell = match crate::pathfind::find_on_path("bwrap")
-        .and(crate::store::resolve_nix(None))
-        .and_then(|nix| {
-            let data = TmpDir::new();
-            let layout = crate::store::Layout::under(data.path());
-            let nixpkgs = crate::store::LockTarget::global(&layout, None)
-                .resolve(&nix, &layout)
-                .ok()?;
-            super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
-                .ok()
-                .map(|u| u.shell_bin)
-        }) {
+    let shell = match userland_shell() {
         Some(shell) => shell,
         None => {
             skip_incapable!("skipping task ceiling smoke: need bwrap, userns, and nix");
@@ -648,5 +653,60 @@ fn a_declared_task_runs_on_the_distribution_the_session_declared() {
     assert!(
         stdout.contains("Debian"),
         "the image's own package tool must be the one that answered: {stdout}"
+    );
+}
+
+/// A task declaring `output` writes its artifact through a real cage into its directory, which the
+/// invocation empties just before the command starts: the bind source has to exist by then, and
+/// what an earlier invocation left there is gone.
+#[test]
+fn an_output_task_writes_its_artifact_through_the_cage() {
+    let project = TmpDir::new();
+    let Some(shell) = userland_shell() else {
+        skip_incapable!("skipping task output smoke: need bwrap, userns, and nix");
+        return;
+    };
+    let mut dump = echo_task(&shell.to_string_lossy());
+    dump.name = "dump".into();
+    dump.cmd = vec![
+        shell.to_string_lossy().into_owned(),
+        "-c".into(),
+        "printf hello > \"$SBX_TASK_OUT/a.txt\"".into(),
+    ];
+    dump.params.clear();
+    dump.secrets.clear();
+    dump.output = true;
+    let Some((engine, _data)) = engine_for(vec![dump.clone()], project.path(), "smoke-output")
+    else {
+        skip_incapable!("skipping task output smoke: prerequisites absent");
+        return;
+    };
+    let earlier = engine.claim_output(&dump).expect("an earlier claim");
+    earlier.prepare().expect("prepare the directory");
+    std::fs::write(earlier.dir.join("stale.txt"), b"yesterday").expect("an earlier artifact");
+    let dir = earlier.dir.clone();
+    drop(earlier);
+
+    let outcome = engine
+        .run(
+            "dump",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            next_invocation(),
+        )
+        .expect("the task runs");
+    assert_eq!(outcome.exit, 0, "{outcome:?}");
+    assert_eq!(
+        outcome.output.as_ref().map(|(_, bytes)| *bytes),
+        Some(5),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("a.txt")).expect("the artifact"),
+        b"hello"
+    );
+    assert!(
+        !dir.join("stale.txt").exists(),
+        "the earlier artifact is gone"
     );
 }
