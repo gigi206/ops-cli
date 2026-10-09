@@ -346,20 +346,24 @@ const MAX_KEPT_LOGS: usize = 100;
 /// the very path [`detach_log_path`] keyed on that pid, finds nothing for the rest of the
 /// session's life. Best-effort throughout — a directory that cannot be read, a registry that
 /// cannot be read, a file whose age cannot be told or that cannot be removed, all cost a bounded
-/// directory and never a session that was otherwise ready to run.
+/// directory and never a session that was otherwise ready to run, nor a live session's log.
 fn reap_old_logs(dir: &Path, opening: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     // `dir` is `<data>/logs`, so its parent is the data directory the registry is rooted under.
     // `live` validates each record's `(pid, start_ticks)` pair, so a pid the kernel has reused
-    // cannot make a dead session look alive; an unreadable registry yields an empty set, which is
-    // simply the unguarded trim.
-    let live: std::collections::HashSet<u32> = dir
+    // cannot make a dead session look alive. A registry that cannot be read leaves this launch's
+    // trim undone: which logs are live is then unknown, and trimming without the guard would
+    // unlink the log of a session that has only been quiet. A registry that does not exist yet is
+    // no sessions, and is trimmed.
+    let Some(sessions) = dir
         .parent()
         .and_then(|data| crate::session::Registry::at(data).live().ok())
-        .map(|sessions| sessions.iter().map(|s| s.pid).collect())
-        .unwrap_or_default();
+    else {
+        return;
+    };
+    let live: std::collections::HashSet<u32> = sessions.iter().map(|s| s.pid).collect();
     let mut logs: Vec<(std::time::SystemTime, PathBuf)> = entries
         .filter_map(Result::ok)
         .map(|e| e.path())
