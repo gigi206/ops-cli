@@ -191,7 +191,9 @@ SBX_LIMIT_MEMORY_MAX=16G sbx run
 ```
 
 The key is one of `memory_high` / `memory_max` / `tasks_max` (the `SBX_LIMIT_` suffix
-is case-insensitive). A one-shot limit tunes that field without dropping the others.
+is case-insensitive). Two variables that spell one key in different cases and set it to
+different values are refused (exit 2), since which of them the environment lists last is
+not an order you chose. A one-shot limit tunes that field without dropping the others.
 The command line beats the environment, and both beat the config file. See
 [One-shot overrides](overrides).
 
