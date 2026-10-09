@@ -976,8 +976,14 @@ fn render_result(verb: &str, name: &str, result: &client::RunResult, json: bool)
             result.redacted
         ));
     }
-    // The command's own exit code, clamped into the byte a process can return.
-    ExitCode::from(result.exit.clamp(0, 255) as u8)
+    ExitCode::from(exit_byte(result.exit))
+}
+
+/// The byte `sbx task run` returns for the command's exit code `exit`. A code no process returns —
+/// a negative one, which is what the client reads for an `exit` field it could not parse, or one
+/// past 255 — is a failure, never clamped into the success `0` is.
+fn exit_byte(exit: i32) -> u8 {
+    u8::try_from(exit).unwrap_or(1)
 }
 
 /// One invocation as a machine reads it: everything the prose path says in warnings, as fields.
@@ -1095,7 +1101,7 @@ fn run_as_json(name: &str, result: &client::RunResult) -> ExitCode {
     }
     match result.error {
         Some(_) => ExitCode::from(REFUSED_EXIT),
-        None => ExitCode::from(result.exit.clamp(0, 255) as u8),
+        None => ExitCode::from(exit_byte(result.exit)),
     }
 }
 
@@ -1803,6 +1809,17 @@ fn unreachable_plane(e: &std::io::Error) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command's exit code is returned as it is, and one no process returns is a failure: the
+    /// `-1` the client reads for an `exit` field it could not parse is never clamped into a success.
+    #[test]
+    fn an_exit_code_no_process_returns_is_a_failure() {
+        assert_eq!(exit_byte(0), 0);
+        assert_eq!(exit_byte(137), 137);
+        assert_eq!(exit_byte(255), 255);
+        assert_eq!(exit_byte(-1), 1);
+        assert_eq!(exit_byte(256), 1);
+    }
 
     /// A session whose host socket is reached and refuses the reader, closing before it reads the
     /// command as the peer check does, is handed back as unread rather than counted as running
