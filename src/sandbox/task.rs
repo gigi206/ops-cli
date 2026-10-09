@@ -1550,6 +1550,12 @@ impl TaskEngine {
     fn enter(&self, id: u64, task: &str, detached: bool) -> Result<RunGuard, String> {
         match self.running.lock() {
             Ok(mut running) => {
+                // Ids come from one monotonic counter, so a repeat is a caller's mistake; admitted,
+                // it would replace the live entry, and the earlier invocation's guard would then
+                // remove the later one's on its way out, leaving it unseen and unstoppable.
+                if running.contains_key(&id) {
+                    return Err(format!("invocation {id} is already running"));
+                }
                 if running.len() >= MAX_LIVE {
                     return Err(format!(
                         "{} invocations are already running, which is the limit — each one holds a \
