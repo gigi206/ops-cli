@@ -107,11 +107,11 @@ fn engine_on(
         super::super::cgroup::Limits::default(),
         slug,
         None,
+        // The userland's own, as the launcher hands them over: the forwarder runs inside the task's
+        // cage, where a host path names nothing.
         CageForwarder {
-            socat: crate::pathfind::find_on_path("socat")
-                .unwrap_or_else(|| PathBuf::from("/nonexistent/socat")),
-            shell: crate::pathfind::find_on_path("bash")
-                .unwrap_or_else(|| PathBuf::from("/nonexistent/bash")),
+            socat: userland.socat_bin.clone(),
+            shell: userland.shell_bin.clone(),
         },
         crate::sandbox::redact::MIN_LEN_DEFAULT,
     );
