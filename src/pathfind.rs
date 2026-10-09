@@ -2,22 +2,29 @@
 //!
 //! The prerequisite checks share one first-match-wins search: the same routine
 //! that finds the sandbox engine also finds the nix binary that drives the
-//! store. Only an **absolute** `PATH` entry is searched, whichever routine asks
-//! — see [`candidates`] for what a relative one would otherwise resolve to.
+//! store. Only an **absolute** `PATH` entry outside the project is searched,
+//! whichever routine asks — see [`candidates`] for what a relative one would
+//! otherwise resolve to, and what one in the project would let the cage plant.
 
 use std::path::{Path, PathBuf};
 
 /// Search `$PATH` for an executable file with the given name, returning the first match.
 pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    find_in_dirs(name, std::env::split_paths(&path))
+    let tree = untrusted_tree();
+    say_left_out(name, std::env::split_paths(&path), tree.as_deref());
+    find_in_dirs(name, std::env::split_paths(&path), tree.as_deref())
 }
 
 /// Pure core of [`find_on_path`]: the first directory whose `name` entry is
-/// executable. Split out so it can be tested without mutating the process
-/// `PATH`.
-pub(crate) fn find_in_dirs(name: &str, dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
-    candidates(name, dirs).find(|cand| is_executable(cand))
+/// executable, none in `untrusted`. Split out so it can be tested without mutating
+/// the process `PATH` or its working directory.
+pub(crate) fn find_in_dirs(
+    name: &str,
+    dirs: impl Iterator<Item = PathBuf>,
+    untrusted: Option<&Path>,
+) -> Option<PathBuf> {
+    candidates(name, dirs, untrusted).find(|cand| is_executable(cand))
 }
 
 /// Every executable named `name` on `$PATH`, in search order. Where [`find_on_path`]
@@ -29,15 +36,58 @@ pub(crate) fn find_all_on_path(name: &str) -> Vec<PathBuf> {
     let Some(path) = std::env::var_os("PATH") else {
         return Vec::new();
     };
-    find_all_in_dirs(name, std::env::split_paths(&path))
+    let tree = untrusted_tree();
+    say_left_out(name, std::env::split_paths(&path), tree.as_deref());
+    find_all_in_dirs(name, std::env::split_paths(&path), tree.as_deref())
 }
 
 /// Pure core of [`find_all_on_path`]: every directory whose `name` entry is executable,
-/// in iteration order. Split out so it can be tested without mutating the process `PATH`.
-pub(crate) fn find_all_in_dirs(name: &str, dirs: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
-    candidates(name, dirs)
+/// in iteration order, none in `untrusted`. Split out so it can be tested without
+/// mutating the process `PATH` or its working directory.
+pub(crate) fn find_all_in_dirs(
+    name: &str,
+    dirs: impl Iterator<Item = PathBuf>,
+    untrusted: Option<&Path>,
+) -> Vec<PathBuf> {
+    candidates(name, dirs, untrusted)
         .filter(|cand| is_executable(cand))
         .collect()
+}
+
+/// The tree the cage writes as the project, canonical: the working directory every verb runs in.
+/// `None` when that is `/`, a project the cage writes whole, where leaving out what lies under it
+/// would leave out every program and protect nothing, or when it cannot be read.
+pub(crate) fn untrusted_tree() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+    cwd.parent().is_some().then_some(cwd)
+}
+
+/// Whether `p` lies in `tree`, read through every link on the way to it: a `PATH` entry that is a
+/// link into the project is the project.
+pub(crate) fn lies_in(tree: &Path, p: &Path) -> bool {
+    crate::trust::canonicalize_existing_prefix(p).starts_with(tree)
+}
+
+/// Say, once per program, each executable `name` the search leaves out because it lies in
+/// `untrusted`: without a word, a program found only there would read as not installed.
+fn say_left_out(name: &str, dirs: impl Iterator<Item = PathBuf>, untrusted: Option<&Path>) {
+    use std::sync::{Mutex, OnceLock};
+    static SAID: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    let Some(tree) = untrusted else { return };
+    for found in candidates(name, dirs, None).filter(|c| is_executable(c)) {
+        if !lies_in(tree, found.parent().unwrap_or(&found)) {
+            continue;
+        }
+        let mut said = crate::sandbox::locks::locked(SAID.get_or_init(Mutex::default));
+        if !said.contains(&found) {
+            crate::diag::warn(&format!(
+                "`{}` on your PATH is not used: it lies in the project, which the cage writes, so \
+                 a session could have put it there. Install `{name}` outside the project",
+                crate::sandbox::sanitize(&found.display().to_string())
+            ));
+            said.push(found);
+        }
+    }
 }
 
 /// What `name` may be, one candidate per **absolute** `PATH` entry. A relative entry yields none.
@@ -56,6 +106,13 @@ pub(crate) fn find_all_in_dirs(name: &str, dirs: impl Iterator<Item = PathBuf>) 
 /// the same class of thing and would resolve the same way. A `PATH` entry that means anything to
 /// sbx is one that means the same thing from any directory.
 ///
+/// An absolute entry in `untrusted`, the project, is dropped for the same reason: the cage writes
+/// the project, so a `<project>/.venv/bin` an activated environment or a `direnv` put in front of
+/// `/usr/bin` holds whatever a session left there, and the ownership check is satisfied by what it
+/// holds. Read through links, so an entry linking into the project counts as the project. A
+/// read-write bind is written by the cage too and is not weighed here: `PATH` lookups do not know
+/// the binds.
+///
 /// And `name` must be a bare file name. One holding a `/` is not a `PATH` lookup at all —
 /// `dir.join("/bin/sh")` is `/bin/sh` whatever `dir` is, and `dir.join("../x")` leaves it — so it
 /// would be answered by a file the `PATH` never named. Such a name, an empty one, `.` and `..`
@@ -63,10 +120,13 @@ pub(crate) fn find_all_in_dirs(name: &str, dirs: impl Iterator<Item = PathBuf>) 
 fn candidates<'a>(
     name: &'a str,
     dirs: impl Iterator<Item = PathBuf> + 'a,
+    untrusted: Option<&'a Path>,
 ) -> impl Iterator<Item = PathBuf> + 'a {
     let bare = !name.is_empty() && !name.contains('/') && name != "." && name != "..";
-    dirs.filter(move |dir| bare && dir.is_absolute())
-        .map(move |dir| dir.join(name))
+    dirs.filter(move |dir| {
+        bare && dir.is_absolute() && !untrusted.is_some_and(|tree| lies_in(tree, dir))
+    })
+    .map(move |dir| dir.join(name))
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -103,6 +163,47 @@ mod tests {
     use crate::testutil::TmpDir;
     use std::os::unix::fs::PermissionsExt;
 
+    /// The scenario measured on the engine and the askpass lookups: a `<project>/.venv/bin` an
+    /// activated environment put in front of the system directory holds a planted program, and the
+    /// search takes the system one. An entry that is a link into the project is the project too.
+    #[test]
+    fn a_path_entry_in_the_project_is_not_searched() {
+        let tmp = TmpDir::new();
+        let root = tmp.path().canonicalize().unwrap();
+        let project = root.join("proj");
+        let venv = project.join(".venv/bin");
+        let system = root.join("usr/bin");
+        let linked = root.join("linked-bin");
+        std::fs::create_dir_all(&venv).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        std::os::unix::fs::symlink(&venv, &linked).unwrap();
+        for name in ["bwrap", "nix", "ssh-askpass"] {
+            for dir in [&venv, &system] {
+                let tool = dir.join(name);
+                std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
+                std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            for first in [&venv, &linked] {
+                let dirs = || [first.clone(), system.clone()].into_iter();
+                assert_eq!(
+                    find_in_dirs(name, dirs(), Some(&project)),
+                    Some(system.join(name)),
+                    "{name} through {}",
+                    first.display()
+                );
+                assert_eq!(
+                    find_all_in_dirs(name, dirs(), Some(&project)),
+                    vec![system.join(name)]
+                );
+                assert_eq!(
+                    find_in_dirs(name, dirs(), None),
+                    Some(first.join(name)),
+                    "outside any project the first entry still wins"
+                );
+            }
+        }
+    }
+
     fn write_exec(path: &Path) {
         std::fs::write(path, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -117,9 +218,9 @@ mod tests {
         let dirs = || std::iter::once(bin.clone());
         let absolute = dir.join("outside");
         for name in [absolute.to_str().unwrap(), "../outside", "", ".", ".."] {
-            assert_eq!(find_in_dirs(name, dirs()), None, "{name:?} was found");
+            assert_eq!(find_in_dirs(name, dirs(), None), None, "{name:?} was found");
             assert!(
-                find_all_in_dirs(name, dirs()).is_empty(),
+                find_all_in_dirs(name, dirs(), None).is_empty(),
                 "{name:?} was found"
             );
         }
@@ -149,11 +250,11 @@ mod tests {
 
         let dirs = [a.path().to_path_buf(), b.path().to_path_buf()];
         // present only in `b`, and executable
-        let found = find_in_dirs("tool", dirs.iter().cloned());
+        let found = find_in_dirs("tool", dirs.iter().cloned(), None);
         assert_eq!(found.as_deref(), Some(tool.as_path()));
 
         // absent everywhere
-        assert!(find_in_dirs("absent", dirs.into_iter()).is_none());
+        assert!(find_in_dirs("absent", dirs.into_iter(), None).is_none());
     }
 
     #[test]
@@ -165,7 +266,7 @@ mod tests {
         write_exec(&b.join("tool"));
 
         let dirs = [a.path().to_path_buf(), b.path().to_path_buf()];
-        let found = find_all_in_dirs("tool", dirs.iter().cloned());
+        let found = find_all_in_dirs("tool", dirs.iter().cloned(), None);
         assert_eq!(
             found,
             vec![a.join("tool"), b.join("tool")],
@@ -173,7 +274,7 @@ mod tests {
         );
 
         // A name present in neither yields an empty list, not a panic.
-        assert!(find_all_in_dirs("absent", dirs.into_iter()).is_empty());
+        assert!(find_all_in_dirs("absent", dirs.into_iter(), None).is_empty());
     }
 
     #[test]
@@ -192,7 +293,7 @@ mod tests {
             PathBuf::from("../tools"),
             PathBuf::from("/usr/bin"),
         ];
-        let formed: Vec<PathBuf> = candidates("bw", dirs.into_iter()).collect();
+        let formed: Vec<PathBuf> = candidates("bw", dirs.into_iter(), None).collect();
         assert_eq!(
             formed,
             vec![PathBuf::from("/usr/bin/bw")],
@@ -213,10 +314,13 @@ mod tests {
         let dirs = || [PathBuf::new(), dir.path().to_path_buf()].into_iter();
 
         assert_eq!(
-            find_in_dirs("tool", dirs()).as_deref(),
+            find_in_dirs("tool", dirs(), None).as_deref(),
             Some(dir.join("tool").as_path())
         );
-        assert_eq!(find_all_in_dirs("tool", dirs()), vec![dir.join("tool")]);
+        assert_eq!(
+            find_all_in_dirs("tool", dirs(), None),
+            vec![dir.join("tool")]
+        );
     }
 
     /// No production launch names its program by a bare literal, because such a name never reaches
