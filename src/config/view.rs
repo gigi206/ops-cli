@@ -70,6 +70,8 @@ pub(crate) struct ConfigView {
     /// Whether the egress proxy records `sbx net stats` (on by default; off via `[network] stats =
     /// false`). Only meaningful under a filtering posture (the proxy runs only then).
     pub(crate) egress_stats: bool,
+    /// Which layer set `egress_stats`: the highest whose accepted `[network]` table wrote `stats`.
+    pub(crate) egress_stats_origin: ProvenanceView,
     /// The shortest credential this launch scans for, in bytes (`[redact] min_len`).
     pub(crate) redact_min_len: usize,
     /// Which layer supplied the redaction floor (`Default` when no config set it).
@@ -169,6 +171,9 @@ pub(crate) struct ConfigView {
     pub(crate) ssh_agent_origin: ProvenanceView,
     /// Whether every signature must be confirmed on the host desktop first (`[ssh_agent] confirm`).
     pub(crate) ssh_agent_confirm: bool,
+    /// Which layer decided `ssh_agent_confirm`: the highest that asked for the prompt, else the
+    /// highest that wrote `confirm = false`.
+    pub(crate) ssh_agent_confirm_origin: ProvenanceView,
     /// The broker plugins this cage would stand up (`[broker.<name>]`), each pairing a host
     /// resource with the policy it is brokered under. Empty when none is bound.
     pub(crate) brokers: Vec<BrokerView>,
@@ -1262,6 +1267,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         network,
         network_origin: resolved.network_origin.into(),
         egress_stats: resolved.egress_stats,
+        egress_stats_origin: resolved.egress_stats_origin.into(),
         redact_min_len: resolved.redact_min_len,
         redact_min_len_origin: resolved.redact_min_len_origin.into(),
         observe_record: resolved.observe_record,
@@ -1317,6 +1323,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
             })
             .collect(),
         ssh_agent_confirm: resolved.ssh_agent_confirm,
+        ssh_agent_confirm_origin: resolved.ssh_agent_confirm_origin.into(),
         apps_share_install_pools: resolved.apps_share_install_pools,
         apps_share_install_pools_origin: resolved.apps_share_install_pools_origin.into(),
         limits,
@@ -2421,6 +2428,7 @@ mod tests {
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
+            ssh_agent_confirm_origin: Default::default(),
             brokers: Vec::new(),
             cwd: "/proj".into(),
             env: vec![EnvVar {
@@ -2480,6 +2488,7 @@ mod tests {
             },
             network_origin: ProvenanceView::Project,
             egress_stats: true,
+            egress_stats_origin: Default::default(),
             redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             redact_min_len_origin: Default::default(),
             observe_record: false,

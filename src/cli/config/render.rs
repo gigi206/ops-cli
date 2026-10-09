@@ -499,6 +499,15 @@ fn grants_section(view: &config::view::ConfigView, pal: &style::Palette) -> Opti
             },
             provenance_tag(view.ssh_agent_origin, pal)
         );
+        // The prompt merges by its own rule (any layer may add it, none remove it), so the layer
+        // that asked for it need not be the one that granted the keys; it is named when it differs.
+        if view.ssh_agent_confirm && view.ssh_agent_confirm_origin != view.ssh_agent_origin {
+            let _ = writeln!(
+                o,
+                "    {dim}confirmation asked for by:{r}{}",
+                provenance_tag(view.ssh_agent_confirm_origin, pal)
+            );
+        }
     }
     (!o.is_empty()).then_some(o)
 }
@@ -678,12 +687,13 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
         // surfacing — naming the reader command when on.
         let _ = writeln!(
             o,
-            "    {dim}stats: {}{r}",
+            "    {dim}stats: {}{r}{}",
             if view.egress_stats {
                 "recording (sbx net stats)"
             } else {
                 "off"
-            }
+            },
+            provenance_tag(view.egress_stats_origin, pal)
         );
     }
 
@@ -1486,6 +1496,7 @@ mod tests {
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
+            ssh_agent_confirm_origin: Default::default(),
             apps_share_install_pools: false,
             apps_share_install_pools_origin: Default::default(),
             cwd: "/proj".into(),
@@ -1507,6 +1518,7 @@ mod tests {
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
             egress_stats: true,
+            egress_stats_origin: Default::default(),
             redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             redact_min_len_origin: Default::default(),
             observe_record: false,
@@ -2399,6 +2411,39 @@ mod tests {
                 p.name, p.reset, p.ok, p.reset
             )),
             "the moved floor names the length and the layer it came from:\n{out}"
+        );
+    }
+
+    /// The egress audit toggle and the signature confirmation each name the layer that decided
+    /// them, the confirmation on its own line only when that layer is not the one that granted the
+    /// keys: it merges by its own rule, so the two can differ.
+    #[test]
+    fn config_render_names_the_layer_behind_the_audit_toggle_and_the_confirmation() {
+        use config::view::ProvenanceView;
+        let plain = style::Palette::plain();
+        let mut view = sample_config_view();
+        view.egress_stats = false;
+        view.egress_stats_origin = ProvenanceView::Project;
+        let out = render_config(&view, &plain, false);
+        assert!(
+            out.contains("stats: off  (project)"),
+            "the toggle is tagged with its layer:\n{out}"
+        );
+
+        view.ssh_agent = vec!["id_ed25519".into()];
+        view.ssh_agent_confirm = true;
+        view.ssh_agent_origin = ProvenanceView::Project;
+        view.ssh_agent_confirm_origin = ProvenanceView::Global;
+        let out = render_config(&view, &plain, false);
+        assert!(
+            out.contains("confirmation asked for by:  (global)"),
+            "a prompt the global asked for, over keys the project granted, is named:\n{out}"
+        );
+        view.ssh_agent_confirm_origin = ProvenanceView::Project;
+        let out = render_config(&view, &plain, false);
+        assert!(
+            !out.contains("confirmation asked for by"),
+            "the same layer as the keys' tag says nothing more:\n{out}"
         );
     }
 
