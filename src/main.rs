@@ -536,14 +536,24 @@ fn config_cwd() -> Result<PathBuf, ExitCode> {
 }
 
 /// The project id of the current working directory — the name the runtime tree of the project you
-/// are standing in carries — so a listing can mark that tree and a removal can refuse it. The cwd is
-/// hashed the way a launch hashes its own ([`sandbox::project_id`]), so the two always agree about
-/// which tree is this project's. Best-effort: `None` when the cwd cannot be read or canonicalized
-/// (deleted mid-run, or no cwd), in which case nothing is marked and nothing is refused.
+/// are standing in carries — so a listing can mark that tree. The cwd is hashed the way a launch
+/// hashes its own ([`sandbox::project_id`]), so the two always agree about which tree is this
+/// project's. Best-effort, for a listing: `None` when the cwd cannot be read or canonicalized
+/// (deleted mid-run, or no cwd), in which case nothing is marked.
 fn current_project_id() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let canonical = cwd.canonicalize().ok()?;
-    Some(sandbox::project_id(&canonical))
+    current_project_identity().ok()
+}
+
+/// [`current_project_id`], with why the working directory could not be resolved when it cannot. A
+/// removal asks this one: a current project it cannot identify is one it cannot rule out, so it
+/// refuses rather than guarding nothing.
+fn current_project_identity() -> Result<String, String> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("the working directory cannot be read: {e}"))?;
+    let canonical = cwd
+        .canonicalize()
+        .map_err(|e| format!("`{}` cannot be resolved: {e}", cwd.display()))?;
+    Ok(sandbox::project_id(&canonical))
 }
 
 /// Resolve sbx's on-disk layout, mapping an unresolvable data directory to an error exit. Shared by
