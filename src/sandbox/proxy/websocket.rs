@@ -268,7 +268,7 @@ fn refuse_upgrade(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn relay_upgrade(
     mut br: BufReader<StreamOwned<ServerConnection, UnixStream>>,
-    mut upstream: StreamOwned<ClientConnection, TcpStream>,
+    mut upstream: UpstreamTls,
     inner: &Head,
     injected: &[(String, String)],
     redactions: &[SecretNeedle],
@@ -648,7 +648,7 @@ struct SeededPending {
 pub(super) fn relay_websocket(
     mut client: StreamOwned<ServerConnection, UnixStream>,
     client_pending: &[u8],
-    mut upstream: StreamOwned<ClientConnection, TcpStream>,
+    mut upstream: UpstreamTls,
     upstream_pending: &[u8],
     deflate: Deflate,
     dest: &str,

@@ -34,7 +34,7 @@
 //! silent empty response.
 
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -42,7 +42,98 @@ use std::time::{Duration, Instant};
 use rustls::{ClientConnection, StreamOwned};
 
 /// A validated TLS connection to a real upstream — what the pool holds and hands out.
-pub(super) type UpstreamTls = StreamOwned<ClientConnection, TcpStream>;
+pub(super) type UpstreamTls = StreamOwned<ClientConnection, RecordTally>;
+
+/// The socket to an upstream, read through a tally of where the TLS records it delivers end.
+///
+/// rustls takes whatever the socket has into a buffer of its own, and says nothing of the bytes it
+/// holds there that do not yet make a whole record. Every byte rustls reads comes through here, from
+/// the first of the handshake on, so the tally knows what rustls cannot tell: whether what it was
+/// given stops exactly where a record does ([`Self::at_record_boundary`]), or inside one that the
+/// rest of has not arrived. A record is a five-byte header — type, version, a big-endian length —
+/// and that many bytes of body, in the clear whatever the session encrypts.
+///
+/// Writes go straight to the socket, and the socket itself is reached through `Deref` for what is
+/// asked of it rather than read from it: timeouts, blocking mode, a peek, its address.
+pub(super) struct RecordTally {
+    sock: TcpStream,
+    /// The header of the record being read, as far as it has arrived.
+    header: [u8; RECORD_HEADER_LEN],
+    /// How many bytes of `header` have arrived; `0` between records and while a body is read.
+    header_seen: usize,
+    /// How many bytes of the current record's body are still to come.
+    body_left: usize,
+}
+
+/// A TLS record header: content type, protocol version, and the body's length.
+const RECORD_HEADER_LEN: usize = 5;
+
+impl RecordTally {
+    /// `sock`, before anything has been read from it.
+    pub(super) fn new(sock: TcpStream) -> Self {
+        RecordTally {
+            sock,
+            header: [0; RECORD_HEADER_LEN],
+            header_seen: 0,
+            body_left: 0,
+        }
+    }
+
+    /// Whether everything read so far ends exactly where a record does.
+    pub(super) fn at_record_boundary(&self) -> bool {
+        self.header_seen == 0 && self.body_left == 0
+    }
+
+    /// Follow the record framing across `read`, the bytes just delivered.
+    fn tally(&mut self, mut read: &[u8]) {
+        while !read.is_empty() {
+            if self.body_left > 0 {
+                let take = self.body_left.min(read.len());
+                self.body_left -= take;
+                read = &read[take..];
+                continue;
+            }
+            let take = (RECORD_HEADER_LEN - self.header_seen).min(read.len());
+            self.header[self.header_seen..self.header_seen + take].copy_from_slice(&read[..take]);
+            self.header_seen += take;
+            read = &read[take..];
+            if self.header_seen == RECORD_HEADER_LEN {
+                self.body_left = usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
+                self.header_seen = 0;
+            }
+        }
+    }
+}
+
+impl Read for RecordTally {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.sock.read(buf)?;
+        self.tally(&buf[..n]);
+        Ok(n)
+    }
+}
+
+impl Write for RecordTally {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.sock.write(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        self.sock.write_vectored(bufs)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sock.flush()
+    }
+}
+
+impl std::ops::Deref for RecordTally {
+    type Target = TcpStream;
+
+    fn deref(&self) -> &TcpStream {
+        &self.sock
+    }
+}
 
 /// Parked connections per `(host, port, credentials)` key.
 const MAX_PER_KEY: usize = 4;
@@ -144,16 +235,13 @@ impl UpstreamPool {
     /// The caller has already decided the *HTTP* question — that the response ended where its
     /// framing said and left the connection reusable. What this settles is the *socket* question:
     /// whether anything at all is still pending on it. The proxy's own buffered reader is drained
-    /// by the caller before it gets here; a non-blocking peek at the socket then answers for the
-    /// kernel's receive queue, and a non-blocking read through the TLS session for rustls's
-    /// decrypted plaintext. `WouldBlock` from both means all three are empty; anything else —
-    /// bytes, an end of stream, an error — means this connection has already moved on from the
-    /// message that just finished, and it is not offered to anyone.
-    ///
-    /// One place stays out of reach: a record whose first part the relay itself pulled into rustls
-    /// while reading the end of the message, and whose rest has not arrived. rustls says nothing
-    /// about undecrypted bytes it holds. The rest arriving while the connection waits is caught by
-    /// the checkout probe; only a rest arriving after a request was written to it goes unseen.
+    /// by the caller before it gets here; a non-blocking read through the TLS session then takes
+    /// what the kernel holds into rustls and answers for rustls's decrypted plaintext, and the
+    /// socket's [`RecordTally`] answers for what rustls holds and cannot decrypt yet: the start of a
+    /// record whose rest has not arrived, whether this read or the relay's last one took it in.
+    /// `WouldBlock` with nothing left inside a record means all of it is empty; anything else —
+    /// bytes, part of a record, an end of stream, an error — means this connection has already
+    /// moved on from the message that just finished, and it is not offered to anyone.
     pub(super) fn park(&self, key: PoolKey, mut stream: UpstreamTls, timeout: Duration) {
         // The response relay ran with no read timeout so a streaming completion would not be cut.
         // A connection that is not relaying anything has no such claim, so put the bound back before
@@ -219,17 +307,15 @@ fn still_live(sock: &TcpStream) -> bool {
 
 /// Whether the connection holds nothing beyond the message that just finished — see the reasoning
 /// in [`UpstreamPool::park`]. Reading through the TLS session rather than off the socket is what
-/// makes this cover rustls's own decrypted buffer, which a large relayed read leaves bytes in.
+/// makes this cover rustls's own decrypted buffer, which a large relayed read leaves bytes in, and
+/// the tally is what covers the bytes rustls holds and cannot decrypt.
 fn is_quiet(stream: &mut UpstreamTls) -> bool {
     if stream.sock.set_nonblocking(true).is_err() {
         return false;
     }
     let mut one = [0u8; 1];
-    // The socket is asked first, by a peek: a read through the session takes whatever has arrived
-    // into rustls's own buffer, and for a record only partly there it then answers `WouldBlock`,
-    // leaving bytes behind that no later check can see.
-    let quiet = matches!(stream.sock.peek(&mut one), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
-        && matches!(stream.read(&mut one), Err(e) if e.kind() == io::ErrorKind::WouldBlock);
+    let quiet = matches!(stream.read(&mut one), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
+        && stream.sock.at_record_boundary();
     stream.sock.set_nonblocking(false).is_ok() && quiet
 }
 
@@ -281,7 +367,8 @@ mod tests {
         );
         let name = ServerName::try_from("upstream.test").unwrap();
         let conn = ClientConnection::new(client_config, name).unwrap();
-        let mut client = StreamOwned::new(conn, TcpStream::connect(addr).unwrap());
+        let mut client =
+            StreamOwned::new(conn, RecordTally::new(TcpStream::connect(addr).unwrap()));
         let mut hello = [0u8; 5];
         client.read_exact(&mut hello).unwrap();
         assert_eq!(&hello, b"hello");
@@ -297,6 +384,85 @@ mod tests {
         sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut one = [0u8; 1];
         assert_eq!(sock.peek(&mut one).unwrap(), 1, "the bytes must arrive");
+    }
+
+    /// A tally over a socket nothing is read from, so `tally` is driven by hand.
+    fn tally() -> RecordTally {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let sock = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        RecordTally::new(sock)
+    }
+
+    /// A record header: application data, TLS 1.2 on the wire, `len` bytes of body.
+    fn header(len: u16) -> Vec<u8> {
+        let mut h = vec![23, 3, 3];
+        h.extend_from_slice(&len.to_be_bytes());
+        h
+    }
+
+    /// The tally follows records however the reads cut them: a header or a body split across two
+    /// reads, a record with no body, several records in one read, and a read that stops inside a
+    /// header or a body is never at a boundary.
+    #[test]
+    fn the_tally_finds_where_records_end_however_the_reads_cut_them() {
+        let mut t = tally();
+        assert!(t.at_record_boundary(), "nothing read yet");
+
+        let mut two = header(3);
+        two.extend_from_slice(b"abc");
+        two.extend(header(0));
+        two.extend(header(2));
+        two.extend_from_slice(b"xy");
+        t.tally(&two);
+        assert!(t.at_record_boundary(), "three whole records in one read");
+
+        let mut one = header(4);
+        one.extend_from_slice(b"wxyz");
+        for cut in 1..one.len() {
+            let mut t = tally();
+            t.tally(&one[..cut]);
+            assert!(!t.at_record_boundary(), "stopped {cut} bytes in");
+            t.tally(&one[cut..]);
+            assert!(t.at_record_boundary(), "completed from {cut}");
+        }
+
+        let mut t = tally();
+        t.tally(&header(0)[..2]);
+        assert!(!t.at_record_boundary(), "inside an empty record's header");
+        t.tally(&header(0)[2..]);
+        assert!(
+            t.at_record_boundary(),
+            "an empty record ends with its header"
+        );
+    }
+
+    /// The residual a peek at the socket cannot see: the relay's own read, taking the end of the
+    /// message, took in the start of a record past it whose rest has not arrived. The kernel holds
+    /// nothing and rustls has nothing to decrypt, and the connection is still not quiet.
+    #[test]
+    fn a_record_the_last_read_took_half_of_is_not_quiet() {
+        let mut client = connected(|tls| {
+            tls.conn.writer().write_all(b"world").unwrap();
+            let mut bytes = Vec::new();
+            tls.conn.write_tls(&mut bytes).unwrap();
+            tls.conn.writer().write_all(b"UNSOLICITED").unwrap();
+            let mut next = Vec::new();
+            tls.conn.write_tls(&mut next).unwrap();
+            // One write, so the message and the start of the next record arrive together.
+            bytes.extend_from_slice(&next[..next.len() / 2]);
+            tls.sock.write_all(&bytes).unwrap();
+        });
+        let mut world = [0u8; 5];
+        client.read_exact(&mut world).unwrap();
+        assert_eq!(&world, b"world");
+        client.sock.set_nonblocking(true).unwrap();
+        let mut one = [0u8; 1];
+        assert!(
+            matches!(client.sock.peek(&mut one), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+            "the precondition: the kernel holds nothing, the read took it all"
+        );
+        client.sock.set_nonblocking(false).unwrap();
+        assert!(!is_quiet(&mut client));
     }
 
     #[test]

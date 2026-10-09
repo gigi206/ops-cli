@@ -855,9 +855,11 @@ fn connect_upstream(ctx: &ProxyCtx, checked: &link::Checked) -> Result<UpstreamT
 
 /// The TLS session to `host` over `sock`, its handshake driven and the certificate validated now,
 /// or `None` when either fails.
-fn handshake(mut sock: TcpStream, host: &str, ctx: &ProxyCtx) -> Option<UpstreamTls> {
+fn handshake(sock: TcpStream, host: &str, ctx: &ProxyCtx) -> Option<UpstreamTls> {
     let name = upstream_server_name(host).ok()?;
     let mut conn = ClientConnection::new(ctx.upstream.clone(), name).ok()?;
+    // Tallied from the first byte, so the pool can tell where the records it was handed end.
+    let mut sock = pool::RecordTally::new(sock);
     // drives + validates the TLS handshake now; a forged/self-signed upstream fails here
     conn.complete_io(&mut sock).ok()?;
     Some(StreamOwned::new(conn, sock))

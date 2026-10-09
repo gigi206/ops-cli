@@ -3519,6 +3519,16 @@ impl UpstreamWitness {
 fn spawn_keepalive_upstream(
     response: &'static [u8],
 ) -> (SocketAddr, CertificateDer<'static>, UpstreamWitness) {
+    spawn_keepalive_upstream_with(response, false)
+}
+
+/// [`spawn_keepalive_upstream`], each response written in one socket write with the first half of
+/// one more TLS record behind it when `trailing_half_record` is set: what a proxy reading the end
+/// of the response takes in with it, and whose rest never comes.
+fn spawn_keepalive_upstream_with(
+    response: &'static [u8],
+    trailing_half_record: bool,
+) -> (SocketAddr, CertificateDer<'static>, UpstreamWitness) {
     let ca = Arc::new(Ca::ephemeral().unwrap());
     let ca_der = ca.ca_cert_der();
     let server_config = Arc::new(
@@ -3559,7 +3569,18 @@ fn spawn_keepalive_upstream(
                     seen.lock()
                         .unwrap()
                         .push(String::from_utf8_lossy(&head).into_owned());
-                    if tls.write_all(response).is_err() || tls.flush().is_err() {
+                    if trailing_half_record {
+                        let mut bytes = Vec::new();
+                        let mut next = Vec::new();
+                        let sealed = tls.conn.writer().write_all(response).is_ok()
+                            && tls.conn.write_tls(&mut bytes).is_ok()
+                            && tls.conn.writer().write_all(b"UNSOLICITED").is_ok()
+                            && tls.conn.write_tls(&mut next).is_ok();
+                        bytes.extend_from_slice(&next[..next.len() / 2]);
+                        if !sealed || tls.sock.write_all(&bytes).is_err() {
+                            return;
+                        }
+                    } else if tls.write_all(response).is_err() || tls.flush().is_err() {
                         return;
                     }
                 }
@@ -5466,6 +5487,41 @@ fn a_response_head_sbx_alone_can_frame_does_not_keep_the_connection() {
         pool_ctx.pool.as_ref().unwrap().len(),
         0,
         "and the connection is not parked for a later request"
+    );
+}
+
+/// The residual the socket alone cannot show: the start of a record past the message arrived with
+/// its end, so the proxy's read of the response took it into rustls, and nothing is left in the
+/// kernel to see. The connection is not parked, and each request gets a connection of its own.
+#[test]
+fn a_connection_whose_last_read_took_part_of_a_record_is_not_reused() {
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream_with(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", true);
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+    let pool_ctx = ctx.clone();
+    let got = through_proxy_repeatedly(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[
+            b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        ],
+    )
+    .unwrap();
+    for resp in &got {
+        assert!(resp.ends_with("hello"), "both responses arrive: {resp:?}");
+    }
+    assert_eq!(
+        upstream.connections(),
+        2,
+        "the first connection is not reused"
+    );
+    assert_eq!(
+        pool_ctx.pool.as_ref().unwrap().len(),
+        0,
+        "nor parked at all"
     );
 }
 
