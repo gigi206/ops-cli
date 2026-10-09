@@ -180,6 +180,10 @@ fn manual_rules_of(
 ) -> (Vec<config::view::NetRuleView>, bool) {
     use config::view::{NetRuleKind, NetRuleView, RuleSourceView};
     let mut rules: Vec<NetRuleView> = Vec::new();
+    // What is already listed, so a rule several sessions hold is listed once without a scan of the
+    // list per row.
+    let mut listed: std::collections::HashSet<(NetRuleKind, String)> =
+        std::collections::HashSet::new();
     let mut unanswered = false;
     for pid in pids {
         let rows = match sandbox::control::query_manual(data_dir, pid) {
@@ -222,10 +226,7 @@ fn manual_rules_of(
                 group: None,
                 catch_all,
             };
-            if !rules
-                .iter()
-                .any(|r| r.kind == view.kind && r.rule == view.rule)
-            {
+            if listed.insert((view.kind, view.rule.clone())) {
                 rules.push(view);
             }
         }
@@ -837,6 +838,38 @@ mod tests {
         assert!(
             unanswered,
             "a session that could not be asked leaves the listing incomplete"
+        );
+    }
+
+    /// A rule several sessions hold is listed once, and the same text under another kind is a rule of
+    /// its own.
+    #[test]
+    fn a_rule_several_sessions_hold_is_listed_once() {
+        let data = crate::testutil::TmpDir::new();
+        let sessions = [
+            stand_in_session(
+                data.path(),
+                424_270,
+                "manual allow a.test\nmanual deny a.test\nok".to_string(),
+            ),
+            stand_in_session(
+                data.path(),
+                424_271,
+                "manual allow a.test\nmanual allow b.test\nok".to_string(),
+            ),
+        ];
+        let (rules, unanswered) = manual_rules_of(data.path(), [424_270, 424_271]);
+        for (socket, session) in sessions {
+            assert_eq!(received(&socket, session), "RULES");
+        }
+        assert!(!unanswered);
+        let listed: Vec<_> = rules
+            .iter()
+            .map(|r| (r.kind == config::view::NetRuleKind::Allow, r.rule.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            [(true, "a.test"), (false, "a.test"), (true, "b.test")]
         );
     }
 
