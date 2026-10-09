@@ -52,7 +52,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 /// Where the per-launch host directory appears in the cage. Under the `/tmp` tmpfs (a writable
@@ -172,14 +172,17 @@ pub(crate) fn start(
         }
     }
 
-    let dir = layout
-        .data_dir()
-        .join("forward")
-        .join(format!("fwd-{}", std::process::id()));
+    let parent = layout.data_dir().join("forward");
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(&dir)?;
+        .create(&parent)?;
+    let dir = parent.join(format!(
+        "fwd-{}-{}",
+        std::process::id(),
+        LAUNCHES.fetch_add(1, Ordering::Relaxed)
+    ));
+    fresh_dir(&dir)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     // The guard owns the partial state from here on, before the first bind can fail. Every listener
@@ -203,14 +206,6 @@ pub(crate) fn start(
         // **cage** port, which is what identifies a forward — so two entries can never name one
         // socket, and the name matches the `TCP-CONNECT` the in-cage `socat` is given.
         let host_sock = dir.join(format!("p-{}.sock", fwd.cage));
-        // A predecessor with this pid that was `SIGKILL`ed never ran `Forwarder::drop`, so its
-        // socket file can still be sitting in the directory this launch reuses (the directory is
-        // keyed by pid). `socat UNIX-LISTEN` refuses a path that already exists, and the in-cage
-        // forwarder runs with its output on `/dev/null` — the forward would simply never carry a
-        // byte and say nothing about why. Clearing the name is the same pre-bind removal the egress
-        // control socket does, and it is confined to this pid's own directory, which no live
-        // process can be using.
-        let _ = std::fs::remove_file(&host_sock);
 
         // v4 loopback is mandatory — `127.0.0.1`, never the wildcard, so the port is never exposed
         // on an external interface. Fail-closed on any bind error, naming the port and both likely
@@ -259,6 +254,36 @@ pub(crate) fn start(
     }];
 
     Ok((guard, Wiring { binds, forwards }))
+}
+
+/// How many forward directories this process has made: the second half of each one's name, the
+/// first being the pid ([`fresh_dir`]).
+static LAUNCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Make `dir`, one launch's forward directory, empty and `0700`, whatever was at that name.
+///
+/// The directory is bound into the cage read-write, so the cage can widen its mode, and leave a
+/// socket, a fifo or a directory at any name in it. Keyed by pid alone, it was one directory for
+/// every launch of a process, which a second launch's teardown removed from under the first, and
+/// the directory a later process inherited when its pid was that of a `SIGKILL`ed predecessor whose
+/// teardown never ran: its mode was kept as the cage left it (`DirBuilder::mode` applies only to a
+/// directory it creates), and a leftover at a socket's name made the in-cage `socat UNIX-LISTEN`
+/// fail into `/dev/null`, so the forward carried nothing and said nothing.
+///
+/// The name carries the pid and a count this process never hands out twice, so a directory already
+/// there is a dead predecessor's: it is removed, without following any link inside it, and made
+/// again. The count starts at zero in each process, so the first launch of a recycled pid takes
+/// over its predecessor's first directory; nothing reaps `forward/`, and a directory a killed
+/// process left at a higher count waits for a process that reaches that count.
+fn fresh_dir(dir: &Path) -> io::Result<()> {
+    let make = || std::fs::DirBuilder::new().mode(0o700).create(dir);
+    match make() {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            std::fs::remove_dir_all(dir)?;
+            make()
+        }
+        made => made,
+    }
 }
 
 /// Put `listener` into non-blocking mode and spawn its accept loop. Non-blocking so the loop can
@@ -850,12 +875,12 @@ mod tests {
 
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
-        let (guard, _wiring, picked) =
+        let (guard, wiring, picked) =
             start_on_free_ports(&layout, 1, |p| vec![ForwardPort::same(p[0])]);
         let port = picked[0];
         // Stand in for the in-cage socat: bind the host-side socket path (the same inode the cage
         // would bind through the dir bind) and echo one line back, uppercased.
-        let sock_path = wiring_host_socket(&layout, port);
+        let sock_path = wiring_host_socket(&wiring, port);
         let cage = UnixListener::bind(&sock_path).expect("bind the stand-in cage socket");
         let echo = std::thread::spawn(move || {
             let mut conn = accept_within(&cage, "the bridge never dialed the stand-in cage socket");
@@ -983,56 +1008,65 @@ mod tests {
             "a failed `start` must not hold the ports it already bound for the life of the process"
         );
         // The per-launch directory goes with them, by the same drop.
-        assert!(
-            !layout
-                .data_dir()
-                .join("forward")
-                .join(format!("fwd-{}", std::process::id()))
-                .exists(),
+        assert_eq!(
+            std::fs::read_dir(layout.data_dir().join("forward"))
+                .expect("the forward directory")
+                .count(),
+            0,
             "a failed `start` must not leave its socket directory behind"
         );
         drop(held);
     }
 
-    /// The per-launch directory is keyed by pid alone, so a launch can inherit the directory of a
-    /// `SIGKILL`ed predecessor that reused the pid — `Forwarder::drop` never ran for it. The
-    /// in-cage `socat UNIX-LISTEN` refuses a path that already exists and reports it into
-    /// `/dev/null`, so the leftover would silently cost the session every byte of that forward.
-    /// `start` clears the name it is about to hand the cage.
+    /// A forward directory already at its name is a dead predecessor's, and the launch gets it back
+    /// empty and `0700` whatever the predecessor's cage left: a widened mode, a stale socket, a
+    /// directory at a socket's name, a link out of it. The link's target is left alone.
     #[test]
-    fn a_stale_socket_left_by_a_dead_predecessor_is_cleared_before_the_cage_binds() {
-        use std::os::unix::net::UnixListener;
+    fn a_directory_left_by_a_dead_predecessor_is_made_again_empty_and_private() {
+        use std::os::unix::fs::PermissionsExt as _;
 
+        let tmp = TmpDir::new();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("kept"), b"").unwrap();
+        let dir = tmp.path().join("fwd-1-0");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("p-9119.sock"), b"").unwrap();
+        std::fs::create_dir(dir.join("p-9120.sock")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("p-9121.sock")).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        fresh_dir(&dir).expect("make the directory again");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(
+            outside.join("kept").exists(),
+            "a link inside is not followed"
+        );
+    }
+
+    /// Two launches in one process each get a directory of their own, so ending one cannot remove
+    /// the sockets of the other.
+    #[test]
+    fn two_launches_in_one_process_do_not_share_a_directory() {
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
-        let mut left = 5;
-        let (guard, port) = loop {
-            let probe = TcpListener::bind(("127.0.0.1", 0)).expect("an ephemeral port");
-            let port = probe.local_addr().expect("the bound address").port();
-            drop(probe);
-            // What the killed predecessor left behind, at the exact name this launch will use.
-            let stale = wiring_host_socket(&layout, port);
-            std::fs::create_dir_all(stale.parent().expect("the socket sits in a directory"))
-                .expect("stage the predecessor's directory");
-            std::fs::write(&stale, b"").expect("stage the predecessor's socket file");
-            match start(&layout, vec![ForwardPort::same(port)]) {
-                Ok((guard, _wiring)) => break (guard, port),
-                // The probed port was taken between the probe and the bind — see
-                // `start_on_free_ports`.
-                Err(e) if e.kind() == io::ErrorKind::AddrInUse && left > 0 => left -= 1,
-                Err(e) => panic!("start binds the port it was given: {e:?}"),
-            }
-        };
-
-        // The in-cage forwarder's bind is the thing that must succeed; here the test stands in for
-        // it, because `UNIX-LISTEN` and `UnixListener::bind` fail on an existing path alike.
-        let sock = wiring_host_socket(&layout, port);
-        let bound = UnixListener::bind(&sock).expect(
-            "the cage's socat must be able to bind its socket: a leftover file at that name \
-             fails its `UNIX-LISTEN` into `/dev/null`, and the forward carries nothing all session",
+        let (first, first_wiring, _) =
+            start_on_free_ports(&layout, 1, |p| vec![ForwardPort::same(p[0])]);
+        let (second, second_wiring, _) =
+            start_on_free_ports(&layout, 1, |p| vec![ForwardPort::same(p[0])]);
+        let (a, b) = (&first_wiring.binds[0].src, &second_wiring.binds[0].src);
+        assert_ne!(a, b);
+        drop(first);
+        assert!(!a.exists());
+        assert!(
+            b.exists(),
+            "ending one launch must not remove the other's directory"
         );
-        drop(bound);
-        drop(guard);
+        drop(second);
     }
 
     /// The forward directory is bound into the cage read-**write** — the in-cage `socat` creates
@@ -1156,13 +1190,13 @@ mod tests {
 
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
-        let (guard, _wiring, picked) =
+        let (guard, wiring, picked) =
             start_on_free_ports(&layout, 1, |p| vec![ForwardPort::same(p[0])]);
         let port = picked[0];
 
         // The stand-in cage: accept in a loop (the round-trip test accepts once) and echo, so every
         // connection of the run meets the same trivial responder and the figure is the bridge's.
-        let sock_path = wiring_host_socket(&layout, port);
+        let sock_path = wiring_host_socket(&wiring, port);
         let cage = UnixListener::bind(&sock_path).expect("bind the stand-in cage socket");
         let stop = Arc::new(AtomicBool::new(false));
         let cage_stop = Arc::clone(&stop);
@@ -1253,14 +1287,10 @@ mod tests {
     /// bound the same thing: a step of the bridge that a broken dial simply never reaches.
     const ACCEPT_DEADLINE: Duration = Duration::from_secs(10);
 
-    /// The host-side socket path `start` creates for `port`, so the round-trip test can bind the
-    /// stand-in cage there. Mirrors `start`'s construction exactly (keyed by this pid).
+    /// The host-side socket path `start` wired for `port`, so a test can bind the stand-in cage
+    /// there: in the directory the wiring binds into the cage.
     #[cfg(test)]
-    fn wiring_host_socket(layout: &Layout, port: u16) -> PathBuf {
-        layout
-            .data_dir()
-            .join("forward")
-            .join(format!("fwd-{}", std::process::id()))
-            .join(format!("p-{port}.sock"))
+    fn wiring_host_socket(wiring: &Wiring, port: u16) -> PathBuf {
+        wiring.binds[0].src.join(format!("p-{port}.sock"))
     }
 }
