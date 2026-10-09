@@ -423,9 +423,14 @@ fn identity_userns_bears_capabilities() -> bool {
         }
         child => {
             let mut status = 0;
-            // SAFETY: `child` is this process's own child and `status` a live integer the call
-            // writes.
-            let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+            let waited = loop {
+                // SAFETY: `child` is this process's own child and `status` a live integer the call
+                // writes.
+                let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+                if waited >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    break waited;
+                }
+            };
             waited == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
         }
     }
@@ -479,7 +484,7 @@ fn configure(holder: libc::pid_t, info: OwnedFd, block: OwnedFd, tap: Option<&Ta
         }
     };
     finish_report(info);
-    if let Err(e) = join_netns(child) {
+    if let Err(e) = join_netns(child, holder) {
         unconfigured(
             tap.is_some(),
             &format!("the cage's network namespace could not be joined ({e})"),
@@ -639,10 +644,22 @@ fn read_child_pid(info: &OwnedFd, timeout: std::time::Duration) -> io::Result<li
                     return Err(e);
                 }
             }
-            n => seen.extend_from_slice(&buf[..n.unsigned_abs()]),
+            n => {
+                seen.extend_from_slice(&buf[..n.unsigned_abs()]);
+                if seen.len() > INFO_REPORT_MAX {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bwrap's report runs past its bound without naming its child",
+                    ));
+                }
+            }
         }
     }
 }
+
+/// The most of bwrap's `--info-fd` report read while waiting for the child's pid: the whole report
+/// is a few hundred bytes, and the pid is its first member.
+const INFO_REPORT_MAX: usize = 64 * 1024;
 
 /// Read the rest of bwrap's `--info-fd` report, to its end, before the reading end is closed.
 ///
@@ -721,6 +738,20 @@ fn child_pid(report: &[u8]) -> Option<libc::pid_t> {
 /// netlink constants below are: a frozen kernel ABI that `libc` does not expose on every target.
 const NS_GET_USERNS: u64 = 0xb701;
 
+/// Whether `pid` is still a child of `bwrap`, as the report bwrap wrote about it said: the child
+/// waits on the block pipe until it is released, so it ends before only if something killed it,
+/// and its pid may then be another process's.
+fn still_child_of(pid: libc::pid_t, bwrap: libc::pid_t) -> io::Result<()> {
+    let parent = u32::try_from(pid).ok().and_then(super::attach::read_ppid);
+    if parent != u32::try_from(bwrap).ok() {
+        return Err(io::Error::other(format!(
+            "the process bwrap reported ({pid}) is no longer its child, so its namespace is not \
+             the cage's"
+        )));
+    }
+    Ok(())
+}
+
 /// Join the network namespace of `pid`, through the user namespace that owns it, and become root
 /// there — which is what lets this process configure the namespace and hand a program it starts
 /// (`nft`) the capabilities to do the same.
@@ -733,7 +764,7 @@ const NS_GET_USERNS: u64 = 0xb701;
 ///
 /// A network namespace owned by the host's user namespace — a setuid bwrap creates it with real
 /// privilege — is refused before any join: this process holds no capability there.
-fn join_netns(pid: libc::pid_t) -> io::Result<()> {
+fn join_netns(pid: libc::pid_t, bwrap: libc::pid_t) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let net = std::fs::File::open(format!("/proc/{pid}/ns/net")).map_err(|e| {
         if e.kind() == io::ErrorKind::PermissionDenied {
@@ -746,6 +777,9 @@ fn join_netns(pid: libc::pid_t) -> io::Result<()> {
             e
         }
     })?;
+    // Asked once the namespace is held: a pid that ended and was reused before the open is no
+    // longer bwrap's child, and one reused after it is refused rather than joined.
+    still_child_of(pid, bwrap)?;
     // SAFETY: `net` is a live namespace descriptor; `NS_GET_USERNS` takes no argument and returns a
     // new descriptor or `-1`.
     let owner = unsafe { libc::ioctl(net.as_raw_fd(), NS_GET_USERNS as _) };
@@ -865,7 +899,7 @@ pub(crate) fn run_probe(argv: &[OsString]) -> ! {
             "bubblewrap did not start a sandbox to probe ({e})"
         )),
     };
-    let verdict = match join_netns(pid) {
+    let verdict = match join_netns(pid, cage.id() as libc::pid_t) {
         Err(e) => Err((
             PROBE_NAMESPACE_REFUSED,
             format!("the cage's network namespace could not be joined ({e})"),
@@ -928,6 +962,11 @@ fn throwaway_cage(
     match read_child_pid(&info_r, CHILD_PID_TIMEOUT) {
         Ok(pid) => Ok((cage, pid, block_w, info_r)),
         Err(e) => {
+            // Released before the wait below: a child bwrap started is held on the block pipe with
+            // bwrap's standard error open, and a wait with the write end still open here would
+            // last as long as that child.
+            drop(block_w);
+            drop(info_r);
             let _ = cage.kill();
             let said = cage
                 .wait_with_output()
@@ -958,34 +997,85 @@ pub(super) enum Probe {
 /// A probe that cannot be started at all reads as a refused namespace: nothing proved the
 /// namespace can be configured, and the launch reads the same answer, so the two stay in step.
 pub(super) fn probe(exe: &Path, bwrap: &Path, nft: Option<&Path>) -> Probe {
+    probe_within(exe, bwrap, nft, PROBE_TIMEOUT)
+}
+
+/// How long a `__net-probe` may take before it is killed and read as a refusal: its own steps are
+/// bounded ([`CHILD_PID_TIMEOUT`] for bwrap's report), and a launch or `doctor` waiting on one that
+/// hangs past them would wait without a word.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// [`probe`] given `budget` to answer in.
+fn probe_within(
+    exe: &Path,
+    bwrap: &Path,
+    nft: Option<&Path>,
+    budget: std::time::Duration,
+) -> Probe {
+    use std::io::Read as _;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__net-probe").arg(bwrap);
     if let Some(nft) = nft {
         cmd.arg(nft);
     }
-    let out = match cmd
+    let mut child = match cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .output()
+        .stderr(std::process::Stdio::piped())
+        .spawn()
     {
-        Ok(out) => out,
+        Ok(child) => child,
         Err(e) => return Probe::NamespaceRefused(format!("the probe could not run ({e})")),
     };
-    if out.status.success() {
+    // Read on a thread of its own, so a long answer never fills the pipe while the probe is waited
+    // on.
+    let reader = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut said = Vec::new();
+            let _ = err.read_to_end(&mut said);
+            said
+        })
+    });
+    let deadline = std::time::Instant::now() + budget;
+    let waited = super::cagewait::wait_capped(&mut child, deadline, PROBE_POLL);
+    let said = reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    let status = match waited {
+        Ok((_, true)) => {
+            return Probe::NamespaceRefused(format!(
+                "the probe did not answer within {} s",
+                budget.as_secs()
+            ));
+        }
+        Ok((status, false)) => status,
+        Err(e) => {
+            return Probe::NamespaceRefused(format!("the probe could not be waited on ({e})"));
+        }
+    };
+    if status.success() {
         return Probe::Passed;
     }
-    let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    let why = if why.is_empty() {
-        "the probe failed without saying why".to_string()
-    } else {
-        why
+    let why = String::from_utf8_lossy(&said).trim().to_string();
+    let why = match (why.is_empty(), status.code()) {
+        (false, _) => why,
+        (true, None) => format!("the probe was ended by a signal ({status})"),
+        (true, Some(_)) => "the probe failed without saying why".to_string(),
     };
-    if out.status.code() == Some(PROBE_NAMESPACE_REFUSED) {
+    // Ended by a signal, the probe stopped wherever it was, the join included: nothing says the
+    // namespace can be configured, which is what the launch decides on.
+    if status
+        .code()
+        .is_none_or(|code| code == PROBE_NAMESPACE_REFUSED)
+    {
         Probe::NamespaceRefused(why)
     } else {
         Probe::RulesRefused(why)
     }
 }
+
+/// How often a `__net-probe` is checked for an answer.
+const PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Whether sbx can configure the network namespace the launch's `bwrap` creates, asked of a
 /// throwaway [`probe`] so the answer is the kernel's, reached through the steps the configurer
@@ -1521,19 +1611,28 @@ fn read_ack(fd: libc::c_int) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let n = n as usize;
+    let invalid = |why: &str| Err(io::Error::new(io::ErrorKind::InvalidData, why.to_string()));
     // An NLMSG_ERROR payload is the 16-byte header, then an i32 error, then the offending header.
     if n < NLMSG_HDR_LEN + 4 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "short netlink reply",
-        ));
+        return invalid("short netlink reply");
     }
+    let len = u32::from_ne_bytes([rbuf[0], rbuf[1], rbuf[2], rbuf[3]]) as usize;
     let msg_type = u16::from_ne_bytes([rbuf[4], rbuf[5]]);
-    if msg_type == NLMSG_ERROR {
-        let err = i32::from_ne_bytes([rbuf[16], rbuf[17], rbuf[18], rbuf[19]]);
-        if err != 0 {
-            return Err(io::Error::from_raw_os_error(-err));
-        }
+    let seq = u32::from_ne_bytes([rbuf[8], rbuf[9], rbuf[10], rbuf[11]]);
+    // Each request is sent alone and asks for an acknowledgement, which is what answers it: a
+    // reply of another kind, to another request or longer than what arrived is no answer to it.
+    if len < NLMSG_HDR_LEN + 4 || len > n {
+        return invalid("a netlink reply whose length does not fit what arrived");
+    }
+    if seq != 1 {
+        return invalid("a netlink reply to another request");
+    }
+    if msg_type != NLMSG_ERROR {
+        return invalid("a netlink reply that is not an acknowledgement");
+    }
+    let err = i32::from_ne_bytes([rbuf[16], rbuf[17], rbuf[18], rbuf[19]]);
+    if err != 0 {
+        return Err(io::Error::from_raw_os_error(-err));
     }
     Ok(())
 }
@@ -1945,8 +2044,14 @@ mod tests {
         let (tap, rest) = split_holder_args(&argv).expect("accounted for");
         assert!(tap.is_none());
         assert_eq!(rest, &tail[1..]);
+        // Closed, or the number taken since by another test running beside this one: either
+        // way, no longer this binary.
+        let running = std::fs::metadata("/proc/self/exe").expect("the running build");
         assert!(
-            std::fs::metadata(format!("/proc/self/fd/{fd}")).is_err(),
+            !std::fs::metadata(format!("/proc/self/fd/{fd}")).is_ok_and(|now| {
+                use std::os::unix::fs::MetadataExt as _;
+                (now.dev(), now.ino()) == (running.dev(), running.ino())
+            }),
             "the descriptor is closed"
         );
 
@@ -2050,6 +2155,163 @@ mod tests {
             !argv.iter().any(|a| a == "--report-fd"),
             "no channel, no option: {argv:?}"
         );
+    }
+
+    /// A stand-in at `dir/name` running `body`, past the `ETXTBSY` a parallel fork can leave.
+    fn stand_in(dir: &crate::testutil::TmpDir, name: &str, body: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        crate::testutil::write_script(&path, body);
+        path
+    }
+
+    /// A throwaway cage whose bwrap ends without a report is let go even when what bwrap started is
+    /// still held on the block pipe with bwrap's standard error open: the pipe is released before
+    /// the wait, so the child ends and the wait with it.
+    #[test]
+    fn a_throwaway_cage_that_reports_nothing_is_not_waited_on_forever() {
+        let tmp = crate::testutil::TmpDir::new();
+        // `--info-fd N --block-fd M` come first, as `with_sync_fds` places them: a child that
+        // closes the report and waits on the block pipe, holding standard error, outlives it.
+        // Through bash, whose redirections take a descriptor of more than one digit.
+        let bwrap = stand_in(
+            &tmp,
+            "bwrap",
+            r#"exec bash -c 'info=$2; block=$4; ( eval "exec $info>&-"; cat <&"$block" >/dev/null ) & exit 0' bash "$@""#,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = loop {
+                match throwaway_cage(&bwrap) {
+                    Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    other => break other.map(|_| ()),
+                }
+            };
+            let _ = tx.send(started);
+        });
+        let started = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the throwaway cage was waited on past the child it left");
+        // Ended without a report, not refused before it started: the path that waits was taken.
+        let e = started.expect_err("no report, no cage");
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "{e}");
+    }
+
+    /// A probe that hangs is killed at its budget and read as a refusal; one ended by a signal is
+    /// read as the namespace refused, never as rules the kernel declined, and says so.
+    #[test]
+    fn a_probe_that_hangs_or_dies_on_a_signal_is_a_namespace_refusal() {
+        let tmp = crate::testutil::TmpDir::new();
+        let refused = |body: &str, name: &str, budget: u64| loop {
+            let exe = stand_in(&tmp, name, body);
+            match probe_within(
+                &exe,
+                Path::new("/bin/false"),
+                None,
+                std::time::Duration::from_secs(budget),
+            ) {
+                Probe::NamespaceRefused(why) if why.contains("Text file busy") => continue,
+                Probe::NamespaceRefused(why) => break why,
+                Probe::RulesRefused(why) => panic!("read as rules refused: {why}"),
+                Probe::Passed => panic!("read as passed"),
+            }
+        };
+        let started = std::time::Instant::now();
+        let why = refused("exec sleep 5", "hangs", 1);
+        assert!(why.contains("did not answer within 1 s"), "{why}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        let why = refused("kill -SEGV $$", "dies", 30);
+        assert!(why.contains("signal"), "{why}");
+        // An exit is still read by its code.
+        let exe = stand_in(&tmp, "rules", "echo nft said no >&2; exit 1");
+        let answer = loop {
+            match probe_within(
+                &exe,
+                Path::new("/bin/false"),
+                None,
+                std::time::Duration::from_secs(30),
+            ) {
+                Probe::NamespaceRefused(why) if why.contains("Text file busy") => continue,
+                other => break other,
+            }
+        };
+        assert!(
+            matches!(&answer, Probe::RulesRefused(why) if why == "nft said no"),
+            "an exit other than the namespace's code is rules refused"
+        );
+    }
+
+    /// bwrap's report is read only as far as its bound while waiting for the child's pid: a report
+    /// that runs on without naming one is refused rather than held without end.
+    #[test]
+    fn a_report_that_runs_past_its_bound_without_a_pid_is_refused() {
+        let (read, write) = std::os::unix::net::UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut write = write;
+            let filler = vec![b' '; INFO_REPORT_MAX + 1024];
+            let _ = std::io::Write::write_all(&mut write, &filler);
+            // Held open, so only the bound can end the read.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        let read = OwnedFd::from(read);
+        let e = read_child_pid(&read, std::time::Duration::from_secs(20)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+        writer.join().unwrap();
+    }
+
+    /// The acknowledgement a request asked for is its only answer: another kind of reply, one to
+    /// another request or one longer than what arrived is refused, and the error it carries is the
+    /// one returned.
+    #[test]
+    fn only_the_acknowledgement_of_the_request_answers_it() {
+        let reply = |msg_type: u16, seq: u32, len: u32, err: i32| {
+            let mut out = Vec::new();
+            out.extend_from_slice(&len.to_ne_bytes());
+            out.extend_from_slice(&msg_type.to_ne_bytes());
+            out.extend_from_slice(&0u16.to_ne_bytes());
+            out.extend_from_slice(&seq.to_ne_bytes());
+            out.extend_from_slice(&0u32.to_ne_bytes());
+            out.extend_from_slice(&err.to_ne_bytes());
+            out
+        };
+        let ack = |bytes: Vec<u8>| {
+            let (ours, kernel) = std::os::unix::net::UnixDatagram::pair().unwrap();
+            kernel.send(&bytes).unwrap();
+            read_ack(ours.as_raw_fd())
+        };
+        let whole = (NLMSG_HDR_LEN + 4) as u32;
+        assert!(ack(reply(NLMSG_ERROR, 1, whole, 0)).is_ok());
+        assert_eq!(
+            ack(reply(NLMSG_ERROR, 1, whole, -libc::EPERM))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+        for (bytes, what) in [
+            // `NLMSG_DONE`, the end of a dump.
+            (reply(0x3, 1, whole, 0), "another kind"),
+            (reply(NLMSG_ERROR, 2, whole, 0), "another request"),
+            (reply(NLMSG_ERROR, 1, whole + 64, 0), "longer than arrived"),
+        ] {
+            assert_eq!(
+                ack(bytes).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{what}"
+            );
+        }
+    }
+
+    /// The namespace joined is the one of bwrap's own child: a pid whose parent is not that bwrap
+    /// is refused.
+    #[test]
+    fn a_pid_that_is_not_bwraps_child_is_not_joined() {
+        let me = std::process::id() as libc::pid_t;
+        // SAFETY: `getppid` takes no argument and cannot fail.
+        let parent = unsafe { libc::getppid() };
+        assert!(still_child_of(me, parent).is_ok());
+        let why = still_child_of(me, me).unwrap_err().to_string();
+        assert!(why.contains("no longer its child"), "{why}");
     }
 
     #[test]

@@ -467,7 +467,7 @@ fn parent_map() -> BTreeMap<u32, u32> {
 }
 
 /// Parse the parent pid from a process's `/proc/<pid>/stat`.
-fn read_ppid(pid: u32) -> Option<u32> {
+pub(in crate::sandbox) fn read_ppid(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = &stat[stat.rfind(')')? + 1..];
     // Fields after `)`: state, ppid, … — ppid is the second whitespace token.
