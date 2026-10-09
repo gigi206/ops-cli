@@ -1461,6 +1461,14 @@ fn parse_blob(value: &str) -> Result<RawConfig, String> {
         Some("") => return Err("`@` names no file (write `@<file>` to read one)".to_string()),
         Some(path) => super::safety::read_safe_bytes(std::path::Path::new(path))
             .map_err(|e| format!("cannot read override file: {e}"))?,
+        // An inline blob is held to the ceiling a file is held to. The kernel bounds an argument or
+        // a variable too, but at 32 pages, which passes this ceiling where a page is 64 KiB.
+        None if value.len() as u64 > super::safety::MAX_CONFIG_BYTES => {
+            return Err(format!(
+                "the inline config is larger than {} bytes",
+                super::safety::MAX_CONFIG_BYTES
+            ));
+        }
         None => value.as_bytes().to_vec(),
     };
     schema::parse(&bytes)
@@ -2296,6 +2304,18 @@ mod tests {
             err.starts_with("SBX_CONFIG: ") && err.contains("`@` names no file"),
             "{err}"
         );
+    }
+
+    /// An inline blob is held to the size a file is held to, and one at the ceiling still parses.
+    #[test]
+    fn an_inline_blob_keeps_to_the_file_ceiling() {
+        let ceiling = super::super::safety::MAX_CONFIG_BYTES as usize;
+        let err = parse_blob(&"#".repeat(ceiling + 1)).unwrap_err();
+        assert!(
+            err.contains(&format!("larger than {ceiling} bytes")),
+            "{err}"
+        );
+        assert!(parse_blob(&"#".repeat(ceiling)).is_ok());
     }
 
     #[test]
