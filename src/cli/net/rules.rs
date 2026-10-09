@@ -12,8 +12,8 @@ use std::process::ExitCode;
 use crate::{
     ALL_NEEDS_SESSION, SESSION_IGNORES_FILE_SCOPE, admit_egress_rule, config_cwd,
     egress_dir_or_fail, fold_app_overlay, in_scope, net_mode_word, pending_session_context,
-    persist_egress_rule, removal_takes_no_session_flags, report_rule_write, session_pids_for_app,
-    session_scope_pids, split_one_rule, split_session_flags,
+    persist_egress_rule, removal_takes_no_session_flags, report_rule_write, session_scope_pids,
+    split_one_rule, split_session_flags,
 };
 use crate::{config, diag, help, sandbox, style};
 
@@ -247,27 +247,21 @@ fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: b
         Ok(d) => d,
         Err(code) => return code,
     };
-    // Which sessions to query: `-a <app>` selects that app's session(s) (from the registry, across
-    // projects — an app's live rules are the same wherever it runs); otherwise this project's
-    // sessions, keyed by the canonical project root (the registry stores canonical paths; fall back
-    // to the cwd as-is if it cannot be canonicalized).
-    let (pids, scope): (Vec<u32>, String) = match app {
-        Some(name) => (
-            session_pids_for_app(&data_dir, name).into_iter().collect(),
-            format!(" (app: {name})"),
-        ),
-        None => {
-            let project = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-            (
-                pending_session_context(&data_dir)
-                    .into_iter()
-                    .filter(|(_, proj, _)| *proj == project)
-                    .map(|(pid, _, _)| pid)
-                    .collect(),
-                String::new(),
-            )
-        }
+    // Which sessions to query, resolved as a `--session` load resolves the sessions it loads into:
+    // `-a <app>` selects that app's session(s) across projects (an app's live rules are the same
+    // wherever it runs), otherwise this project's, keyed by the canonical project root. A cwd that
+    // cannot be canonicalized is an error rather than a project no session runs in, which would
+    // list nothing and succeed.
+    let (project_pids, app_pids) = match session_scope_pids(&data_dir, app.is_some(), app, cwd) {
+        Ok(filters) => filters,
+        Err(code) => return code,
     };
+    let pids = sandbox::control::session_pids(&data_dir)
+        .into_iter()
+        .filter(|pid| in_scope(*pid, &project_pids, &app_pids));
+    let scope = app
+        .map(|name| format!(" (app: {name})"))
+        .unwrap_or_default();
 
     // Merge + dedup the manual rules across this project's sessions.
     let (rules, unanswered) = manual_rules_of(&data_dir, pids);
@@ -997,6 +991,22 @@ mod tests {
             }
             assert_eq!(code, ExitCode::FAILURE, "sessions answering {replies:?}");
         }
+    }
+
+    /// A cwd that cannot be resolved to a project is an error for the session listing, not a project
+    /// no session runs in: the listing would otherwise say nothing and succeed.
+    #[test]
+    fn a_session_listing_from_an_unresolvable_directory_fails() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let _data_var = EnvVar::set("SBX_DATA_DIR", data.path());
+        let gone = data.path().join("gone");
+        assert_eq!(
+            net_rules_manual(&gone, None, None, false),
+            ExitCode::FAILURE
+        );
     }
 
     /// A session in scope that could not be asked to load the rule is named on stderr and exits 2,
