@@ -2199,6 +2199,26 @@ fn the_run_parser_takes_streams_by_length_not_by_keyword() {
     assert!(parsed.error.is_none());
 }
 
+/// An answer the plane did not finish is an error, never a result: read as whole, every line it
+/// did not reach kept its default, and the default `exit` is `0`. Nothing at all, an answer cut after
+/// its `exit`, and one cut after its last stream all lack the closing `ok`.
+#[test]
+fn an_answer_without_its_closing_ok_is_not_a_result() {
+    for raw in [
+        &b""[..],
+        b"id 4\n",
+        b"id 4\nexit 0\n",
+        b"id 4\nexit 0\nstdout 2\nok\nstderr -1\n",
+    ] {
+        let e = client::parse_run(raw).expect_err(&String::from_utf8_lossy(raw));
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "{raw:?}");
+    }
+    // An `ok` the command printed is part of its stream, so the answer still needs its own.
+    let whole = client::parse_run(b"id 4\nexit 3\nstdout 2\nok\nstderr -1\nok\n").unwrap();
+    assert_eq!(whole.exit, 3);
+    assert_eq!(whole.stdout.as_deref(), Some("ok"));
+}
+
 // The nonce must survive the socket: a `${NAME@nonce}` in the text is unforgeable only because
 // the nonce arrives out of band. Computing it and dropping it here would remove the property.
 /// A declared payload longer than what arrived is an error, on the same terms the server side
