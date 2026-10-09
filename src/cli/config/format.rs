@@ -241,6 +241,20 @@ pub(super) fn write_notify(
     }
 }
 
+/// The line naming a traffic capture, or `None` when the posture captures nothing. A capture
+/// retains the plaintext of every inspected exchange, so wherever a posture is shown it is stated —
+/// never a silent property of a launch — in these words.
+pub(super) fn capture_line(capture: &str, capture_max_kb: Option<u64>) -> Option<String> {
+    if capture == "off" {
+        return None;
+    }
+    let cap = match capture_max_kb {
+        Some(kb) => format!("capture: {capture} (up to {kb} KiB per body)"),
+        None => format!("capture: {capture}"),
+    };
+    Some(format!("{cap} — read it with `sbx net logs --with-body`"))
+}
+
 /// The `network:` line and the posture preamble that precedes any rule listing: the mode word and
 /// its provenance tag, the ask-timeout and ask-notice lines, the capture and websocket-secret
 /// statements, and the transport block.
@@ -311,21 +325,8 @@ pub(super) fn write_net_posture_head(
                     )
                 );
             }
-            // A traffic capture retains the plaintext of every inspected exchange, so it is always
-            // stated — never a silent property of a launch.
-            if capture != "off" {
-                let cap = match capture_max_kb {
-                    Some(kb) => format!("capture: {capture} (up to {kb} KiB per body)"),
-                    None => format!("capture: {capture}"),
-                };
-                let _ = writeln!(
-                    o,
-                    "    {}",
-                    style::dim_prose(
-                        &format!("{cap} — read it with `sbx net logs --with-body`"),
-                        pal
-                    )
-                );
+            if let Some(cap) = capture_line(capture, *capture_max_kb) {
+                let _ = writeln!(o, "    {}", style::dim_prose(&cap, pal));
             }
             // Stated for the same reason, and only when it is not the default: a tunnel closed on a
             // sighting looks from inside the cage exactly like one its peer closed.

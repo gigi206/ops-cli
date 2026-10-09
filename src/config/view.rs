@@ -517,6 +517,40 @@ pub(crate) enum NetworkView {
     },
 }
 
+#[cfg(test)]
+impl NetworkView {
+    /// An allowlist view carrying `allow`, `deny` and `builtin` and every other setting at its
+    /// default, for a test about how rules render.
+    pub(crate) fn test_allowlist(
+        default_action: NetDefaultView,
+        allow: &[&str],
+        deny: &[&str],
+        builtin: &[&str],
+    ) -> Self {
+        let texts = |list: &[&str]| list.iter().map(|s| s.to_string()).collect();
+        NetworkView::Allowlist {
+            default_action,
+            ask_timeout: None,
+            ask_notice: None,
+            allow: texts(allow),
+            deny: texts(deny),
+            mute: Vec::new(),
+            http2: Vec::new(),
+            shared_credential: Vec::new(),
+            capture: "off".to_string(),
+            capture_max_kb: None,
+            websocket_secret: "warn".to_string(),
+            pool: true,
+            ca_roots: false,
+            dns_cache_ttl: None,
+            idle_timeout: None,
+            max_connections: None,
+            body_max_mb: None,
+            builtin: texts(builtin),
+        }
+    }
+}
+
 /// Whether a listed egress rule allows, denies, or mutes (`dontaudit` — suppresses a denied
 /// request's log line without changing the verdict).
 #[derive(Serialize, Clone, Copy, PartialEq, Eq)]
@@ -797,26 +831,6 @@ pub(crate) struct AppEnvVar {
     pub(crate) value: String,
 }
 
-/// An app overlay's own network posture, projected for display. An allowlist carries its declared
-/// allow/deny rules and the always-allowed built-in set: the proxy unions that set into
-/// whatever policy is in effect at launch, so for an app it is part of what `sbx app <name>` can
-/// reach — and the baseline `network` section shows it only when the *baseline* is an allowlist, so
-/// a profile that puts its allowlist in the app overlay (the common case) would otherwise show it
-/// nowhere. The CLI shows this compactly by default and expands the rules under `--details`.
-#[derive(Serialize)]
-pub(crate) enum AppNetworkView {
-    Shared,
-    Isolated,
-    Allowlist {
-        default_action: NetDefaultView,
-        ask_timeout: Option<String>,
-        ask_notice: Option<bool>,
-        allow: Vec<String>,
-        deny: Vec<String>,
-        builtin: Vec<String>,
-    },
-}
-
 /// An app overlay's own cgroup limit overrides, projected for display: only the fields the app
 /// itself tunes, each as its systemd token. Unlike the baseline `limits` view (which shows the
 /// effective value or the built-in default), an app inherits the baseline's *resolved* value for
@@ -876,8 +890,13 @@ pub(crate) struct AppView {
     /// backend is visible under `--details`. The overlay's own packages, not the baseline-merged
     /// set. A compact name list by default; each full line under `--details`.
     pub(crate) packages: Vec<PackageView>,
-    /// The app's own network posture, with an allowlist's rules, when it set one.
-    pub(crate) network: Option<AppNetworkView>,
+    /// The app's own network posture, when it set one, projected exactly as the baseline's is: an
+    /// allowlist carries its rules, the always-allowed built-in set (the proxy unions it into
+    /// whatever policy is in effect, so it is part of what `sbx app <name>` can reach, and a profile
+    /// that puts its allowlist here is shown it nowhere else), and every setting `network_view`
+    /// surfaces, a traffic capture among them. The CLI shows it compactly by default and expands
+    /// the rules under `--details`.
+    pub(crate) network: Option<NetworkView>,
     /// The app's own GUI posture, when it set one — the same [`GuiView`] the baseline `gui` field
     /// carries, so the overlay and the baseline render and serialize a display identically.
     pub(crate) gui: Option<GuiView>,
@@ -1622,21 +1641,7 @@ fn app_view(
             .iter()
             .map(|p| package_view(p, flake_pins))
             .collect(),
-        network: app_network.as_ref().map(|n| match n {
-            NetworkPolicy::Shared => AppNetworkView::Shared,
-            NetworkPolicy::Isolated => AppNetworkView::Isolated,
-            NetworkPolicy::Allowlist(a) => AppNetworkView::Allowlist {
-                default_action: a.default_action().into(),
-                ask_timeout: ask_timeout_view(a),
-                ask_notice: ask_notice_view(a),
-                allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
-                deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
-                builtin: sandbox::builtin_allow_rules()
-                    .iter()
-                    .map(|r| r.to_string())
-                    .collect(),
-            },
-        }),
+        network: app_network.as_ref().map(network_view),
         gui: app.gui.as_ref().map(|g| match g {
             super::GuiPolicy::Wayland => GuiView::Wayland,
             super::GuiPolicy::Offscreen => GuiView::Offscreen,
@@ -2488,14 +2493,12 @@ mod tests {
                     withheld_reason: None,
                     pinned_rev: None,
                 }],
-                network: Some(AppNetworkView::Allowlist {
-                    default_action: NetDefaultView::Deny,
-                    ask_timeout: None,
-                    ask_notice: None,
-                    allow: vec!["api.example.com".into()],
-                    deny: vec!["api.example.com/admin".into()],
-                    builtin: vec!["cache.nixos.org".into()],
-                }),
+                network: Some(NetworkView::test_allowlist(
+                    NetDefaultView::Deny,
+                    &["api.example.com"],
+                    &["api.example.com/admin"],
+                    &["cache.nixos.org"],
+                )),
                 gui: None,
                 gpu: None,
                 allow_insecure_http: None,

@@ -8,7 +8,7 @@ use crate::{config, style};
 use crate::{net_mode_word, short_rev};
 
 use super::format::{
-    bind_mode_tag, channel_text, opt_provenance_tag, package_line, provenance_parts,
+    bind_mode_tag, capture_line, channel_text, opt_provenance_tag, package_line, provenance_parts,
     provenance_tag, sanitized_list, service_line, write_net_posture_head, write_notify,
 };
 
@@ -1006,7 +1006,7 @@ fn app_row_network(
     pal: &style::Palette,
     details: bool,
 ) {
-    use config::view::AppNetworkView;
+    use config::view::NetworkView;
     use std::fmt::Write as _;
     let (n, warn, dim, r) = (pal.name, pal.warn, pal.dim, pal.reset);
     // An overlay is a compact summary by default — one line per field; an allowlist shows
@@ -1016,22 +1016,23 @@ fn app_row_network(
     // is an allowlist, which a profile's app-overlay allowlist is not).
     if let Some(net) = &app.network {
         match net {
-            AppNetworkView::Shared => {
+            NetworkView::Shared => {
                 let _ = writeln!(o, "      {dim}network:{r} shared {dim}(host network){r}");
             }
-            AppNetworkView::Isolated => {
+            NetworkView::Isolated => {
                 let _ = writeln!(
                     o,
                     "      {dim}network:{r} none {dim}(isolated — no network){r}"
                 );
             }
-            AppNetworkView::Allowlist {
+            NetworkView::Allowlist {
                 default_action,
                 ask_timeout,
                 ask_notice,
                 allow,
                 deny,
                 builtin,
+                ..
             } if details => {
                 let _ = writeln!(
                     o,
@@ -1059,7 +1060,7 @@ fn app_row_network(
                 }
                 let _ = writeln!(o, "        {dim}(deny wins over allow){r}");
             }
-            AppNetworkView::Allowlist {
+            NetworkView::Allowlist {
                 default_action,
                 allow,
                 deny,
@@ -1073,6 +1074,17 @@ fn app_row_network(
                     deny.len()
                 );
             }
+        }
+        // Stated in both forms, like the baseline's: what an app captures is never left to
+        // `--details` or to its detail view.
+        if let NetworkView::Allowlist {
+            capture,
+            capture_max_kb,
+            ..
+        } = net
+            && let Some(cap) = capture_line(capture, *capture_max_kb)
+        {
+            let _ = writeln!(o, "        {}", style::dim_prose(&cap, pal));
         }
     }
 }
@@ -1666,13 +1678,23 @@ mod tests {
                     pinned_rev: None,
                 },
             ],
-            network: Some(AppNetworkView::Allowlist {
-                default_action: NetDefaultView::Ask,
-                ask_timeout: Some("30s".into()),
-                ask_notice: Some(false),
-                allow: vec!["api.example.com".into(), "registry.example.org".into()],
-                deny: vec!["telemetry.example.net".into()],
-                builtin: vec!["cache.nixos.org".into(), "channels.nixos.org".into()],
+            network: Some({
+                let mut net = NetworkView::test_allowlist(
+                    NetDefaultView::Ask,
+                    &["api.example.com", "registry.example.org"],
+                    &["telemetry.example.net"],
+                    &["cache.nixos.org", "channels.nixos.org"],
+                );
+                if let NetworkView::Allowlist {
+                    ask_timeout,
+                    ask_notice,
+                    ..
+                } = &mut net
+                {
+                    *ask_timeout = Some("30s".into());
+                    *ask_notice = Some(false);
+                }
+                net
             }),
             gui: Some(GuiView::Wayland),
             gpu: Some(true),
@@ -1721,7 +1743,7 @@ mod tests {
             ..blank_app_view("beta")
         };
         let opened_out = AppView {
-            network: Some(AppNetworkView::Shared),
+            network: Some(NetworkView::Shared),
             gui: Some(GuiView::None),
             gpu: Some(false),
             allow_insecure_http: Some(false),
@@ -1735,7 +1757,7 @@ mod tests {
             ..blank_app_view("gamma")
         };
         let closed_in = AppView {
-            network: Some(AppNetworkView::Isolated),
+            network: Some(NetworkView::Isolated),
             gui: Some(GuiView::Offscreen),
             limits: Some(AppLimitsView {
                 memory_high: Some("2G".into()),
@@ -2500,14 +2522,12 @@ mod tests {
         use config::view::*;
         let view = ConfigView {
             apps: vec![AppView {
-                network: Some(AppNetworkView::Allowlist {
-                    default_action: config::view::NetDefaultView::Deny,
-                    ask_timeout: None,
-                    ask_notice: None,
-                    allow: vec!["api.example.com".into(), "github.com".into()],
-                    deny: vec!["github.com/secret".into()],
-                    builtin: vec!["cache.nixos.org".into()],
-                }),
+                network: Some(NetworkView::test_allowlist(
+                    config::view::NetDefaultView::Deny,
+                    &["api.example.com", "github.com"],
+                    &["github.com/secret"],
+                    &["cache.nixos.org"],
+                )),
                 ..blank_app_view("demo-app")
             }],
             ..blank_config_view()
@@ -2548,6 +2568,38 @@ mod tests {
         );
     }
 
+    /// An app overlay that captures traffic says so in the roster's compact form as under
+    /// `--details`, in the baseline's words: a capture is never left to the detail view.
+    #[test]
+    fn an_app_overlays_capture_is_stated_in_the_roster() {
+        use config::view::*;
+        let mut net =
+            NetworkView::test_allowlist(NetDefaultView::Deny, &["api.example.com"], &[], &[]);
+        if let NetworkView::Allowlist {
+            capture,
+            capture_max_kb,
+            ..
+        } = &mut net
+        {
+            *capture = "bodies".into();
+            *capture_max_kb = Some(64);
+        }
+        let view = ConfigView {
+            apps: vec![AppView {
+                network: Some(net),
+                ..blank_app_view("demo-app")
+            }],
+            ..blank_config_view()
+        };
+        for details in [false, true] {
+            let out = render_config(&view, &style::Palette::plain(), details);
+            assert!(
+                out.contains("capture: bodies (up to 64 KiB per body)"),
+                "details={details}:\n{out}"
+            );
+        }
+    }
+
     #[test]
     fn config_render_app_overlay_postures_carry_the_baseline_parentheticals() {
         // An app overlay's simple postures read with the same parentheticals the baseline sections
@@ -2556,15 +2608,15 @@ mod tests {
         // compositor-exposure caveat. None of these is an expandable list, so they render the same
         // with or without `--details` — the default render is enough to pin them.
         use config::view::*;
-        let app = |name: &str, network: Option<AppNetworkView>, gui: Option<GuiView>| AppView {
+        let app = |name: &str, network: Option<NetworkView>, gui: Option<GuiView>| AppView {
             network,
             gui,
             ..blank_app_view(name)
         };
         let view = ConfigView {
             apps: vec![
-                app("shared-app", Some(AppNetworkView::Shared), None),
-                app("none-app", Some(AppNetworkView::Isolated), None),
+                app("shared-app", Some(NetworkView::Shared), None),
+                app("none-app", Some(NetworkView::Isolated), None),
                 app("gui-app", None, Some(GuiView::Wayland)),
             ],
             ..blank_config_view()

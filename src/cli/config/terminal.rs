@@ -16,10 +16,10 @@
 //! compile until this module says how it is shown.
 
 use crate::config::view::{
-    AppDetailView, AppEnvVar, AppLimitsView, AppNetworkView, AppProvisionView, AppView, BindView,
-    BrokerView, ChannelView, ConfigView, EnvVar, GuiView, LimitView, LimitsView, MiseView,
-    NetworkView, NixToolView, NonNixToolView, NotifyView, OpenView, PackageView, PluginView,
-    ProcView, SecretView, ServiceView, TaskView, ToolsView,
+    AppDetailView, AppEnvVar, AppLimitsView, AppProvisionView, AppView, BindView, BrokerView,
+    ChannelView, ConfigView, EnvVar, GuiView, LimitView, LimitsView, MiseView, NetworkView,
+    NixToolView, NonNixToolView, NotifyView, OpenView, PackageView, PluginView, ProcView,
+    SecretView, ServiceView, TaskView, ToolsView,
 };
 
 /// The baseline view [`super::render::render_config`] prints.
@@ -484,29 +484,6 @@ fn network_view(network: &NetworkView) -> NetworkView {
     }
 }
 
-/// An app's own network posture, the narrower shape of [`network_view`]'s.
-fn app_network_view(network: &AppNetworkView) -> AppNetworkView {
-    match network {
-        AppNetworkView::Shared => AppNetworkView::Shared,
-        AppNetworkView::Isolated => AppNetworkView::Isolated,
-        AppNetworkView::Allowlist {
-            default_action,
-            ask_timeout,
-            ask_notice,
-            allow,
-            deny,
-            builtin,
-        } => AppNetworkView::Allowlist {
-            default_action: *default_action,
-            ask_timeout: optional(ask_timeout),
-            ask_notice: *ask_notice,
-            allow: texts(allow),
-            deny: texts(deny),
-            builtin: texts(builtin),
-        },
-    }
-}
-
 /// The GUI posture. It carries no text; it is rebuilt variant by variant so that a variant added
 /// later has to be placed here.
 fn gui_view(gui: &GuiView) -> GuiView {
@@ -695,7 +672,7 @@ fn app(app: &AppView) -> AppView {
         open: open.iter().map(open_handler).collect(),
         service: service.iter().map(service_entry).collect(),
         packages: packages.iter().map(package).collect(),
-        network: network.as_ref().map(app_network_view),
+        network: network.as_ref().map(network_view),
         gui: gui.as_ref().map(gui_view),
         gpu: *gpu,
         allow_insecure_http: *allow_insecure_http,
