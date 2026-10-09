@@ -95,6 +95,10 @@ They answer only a caller in `sbx`'s own PID namespace, never a cage's, and an o
 kernel cannot tell them which namespace a caller runs in, so there they refuse every
 connection. A launch runs without it. See [the security model](../concepts/security-model).
 
+A [`distro`](../configuration/distro) image needs **Linux 5.6 or later**, also unchecked by
+`doctor`: the paths an image has to supply are looked up beneath the image's own root
+(`openat2`), and an older kernel has the image refused with that reason.
+
 ## Running under WSL2
 
 `sbx` runs inside a WSL2 distribution without adaptation. The shipping binary is
