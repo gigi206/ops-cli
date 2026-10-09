@@ -143,12 +143,17 @@ impl UpstreamPool {
     ///
     /// The caller has already decided the *HTTP* question — that the response ended where its
     /// framing said and left the connection reusable. What this settles is the *socket* question:
-    /// whether anything at all is still pending on it. One non-blocking read through the TLS session
-    /// answers that for all three places bytes can hide — the proxy's own buffered reader is drained
-    /// by the caller before it gets here, while rustls's decrypted plaintext and the kernel's
-    /// receive queue are both reached by this single read. `WouldBlock` means all three are empty;
-    /// anything else — bytes, an end of stream, an error — means this connection has already moved
-    /// on from the message that just finished, and it is not offered to anyone.
+    /// whether anything at all is still pending on it. The proxy's own buffered reader is drained
+    /// by the caller before it gets here; a non-blocking peek at the socket then answers for the
+    /// kernel's receive queue, and a non-blocking read through the TLS session for rustls's
+    /// decrypted plaintext. `WouldBlock` from both means all three are empty; anything else —
+    /// bytes, an end of stream, an error — means this connection has already moved on from the
+    /// message that just finished, and it is not offered to anyone.
+    ///
+    /// One place stays out of reach: a record whose first part the relay itself pulled into rustls
+    /// while reading the end of the message, and whose rest has not arrived. rustls says nothing
+    /// about undecrypted bytes it holds. The rest arriving while the connection waits is caught by
+    /// the checkout probe; only a rest arriving after a request was written to it goes unseen.
     pub(super) fn park(&self, key: PoolKey, mut stream: UpstreamTls, timeout: Duration) {
         // The response relay ran with no read timeout so a streaming completion would not be cut.
         // A connection that is not relaying anything has no such claim, so put the bound back before
@@ -220,6 +225,108 @@ fn is_quiet(stream: &mut UpstreamTls) -> bool {
         return false;
     }
     let mut one = [0u8; 1];
-    let quiet = matches!(stream.read(&mut one), Err(e) if e.kind() == io::ErrorKind::WouldBlock);
+    // The socket is asked first, by a peek: a read through the session takes whatever has arrived
+    // into rustls's own buffer, and for a record only partly there it then answers `WouldBlock`,
+    // leaving bytes behind that no later check can see.
+    let quiet = matches!(stream.sock.peek(&mut one), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
+        && matches!(stream.read(&mut one), Err(e) if e.kind() == io::ErrorKind::WouldBlock);
     stream.sock.set_nonblocking(false).is_ok() && quiet
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::proxy::ca::{Ca, CertResolver};
+    use rustls::pki_types::ServerName;
+    use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// A validated client session to a local server that first sends `hello`, then `after` (handed
+    /// the server's session and socket) once the client has read it. Returns the client session
+    /// once `after` has run.
+    fn connected(
+        after: impl FnOnce(&mut StreamOwned<ServerConnection, TcpStream>) + Send + 'static,
+    ) -> UpstreamTls {
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.ca_cert_der()).unwrap();
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (read_tx, read_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut tls = StreamOwned::new(ServerConnection::new(server_config).unwrap(), sock);
+            tls.write_all(b"hello").unwrap();
+            tls.flush().unwrap();
+            read_rx.recv().unwrap();
+            after(&mut tls);
+            done_tx.send(()).unwrap();
+            // Held open until the client is done with it.
+            let _ = read_rx.recv();
+        });
+        let client_config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let name = ServerName::try_from("upstream.test").unwrap();
+        let conn = ClientConnection::new(client_config, name).unwrap();
+        let mut client = StreamOwned::new(conn, TcpStream::connect(addr).unwrap());
+        let mut hello = [0u8; 5];
+        client.read_exact(&mut hello).unwrap();
+        assert_eq!(&hello, b"hello");
+        read_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+        // Keep the server's thread (and so its socket) alive past this function.
+        std::mem::forget(read_tx);
+        client
+    }
+
+    /// Wait until the kernel holds bytes for `sock`, so a probe meets them rather than racing them.
+    fn wait_readable(sock: &TcpStream) {
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut one = [0u8; 1];
+        assert_eq!(sock.peek(&mut one).unwrap(), 1, "the bytes must arrive");
+    }
+
+    #[test]
+    fn a_connection_with_nothing_past_the_message_is_quiet() {
+        let mut client = connected(|_| {});
+        assert!(is_quiet(&mut client));
+    }
+
+    /// A TLS record of which only the first part has arrived is bytes past the message, as much as a
+    /// whole one: reading it through the session would move it into rustls's buffer and answer
+    /// `WouldBlock`, and the rest would then complete it into the next request's response.
+    #[test]
+    fn a_record_that_has_only_partly_arrived_is_not_quiet() {
+        let mut client = connected(|tls| {
+            tls.conn.writer().write_all(b"UNSOLICITED").unwrap();
+            let mut record = Vec::new();
+            tls.conn.write_tls(&mut record).unwrap();
+            tls.sock.write_all(&record[..record.len() / 2]).unwrap();
+        });
+        wait_readable(&client.sock);
+        assert!(!is_quiet(&mut client));
+    }
+
+    #[test]
+    fn a_whole_record_past_the_message_is_not_quiet() {
+        let mut client = connected(|tls| {
+            tls.write_all(b"UNSOLICITED").unwrap();
+            tls.flush().unwrap();
+        });
+        wait_readable(&client.sock);
+        assert!(!is_quiet(&mut client));
+    }
 }
