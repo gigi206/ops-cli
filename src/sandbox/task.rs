@@ -1277,6 +1277,30 @@ impl TaskEngine {
         let err_reader = std::thread::spawn(move || read_capped(&mut err_pipe, cap, scan_margin));
 
         let deadline = Instant::now() + task.timeout;
+        let waited = self.await_cage(&mut child, deadline, invocation);
+        let waited = end_on_failure(&mut child, waited);
+        let streams = join_readers(out_reader, err_reader);
+        let (status, timed_out, stopped) = waited?;
+        let ((stdout, out_cut), (stderr, err_cut)) = streams?;
+        Ok(RawOutput {
+            exit: super::launch::status_code(status),
+            stdout,
+            stderr,
+            stdout_cut: out_cut,
+            stderr_cut: err_cut,
+            timed_out,
+            stopped,
+        })
+    }
+
+    /// Wait for the cage `child` to end, killing it at `deadline` or when invocation `invocation`
+    /// is asked to stop. Its status, and whether it ended on the timeout's kill or on the stop's.
+    fn await_cage(
+        &self,
+        child: &mut std::process::Child,
+        deadline: Instant,
+        invocation: u64,
+    ) -> io::Result<(std::process::ExitStatus, bool, bool)> {
         let mut timed_out = false;
         let mut stopped = false;
         let status = loop {
@@ -1307,24 +1331,7 @@ impl TaskEngine {
                 None => std::thread::sleep(POLL_INTERVAL),
             }
         };
-
-        // A reader thread that panicked leaves no bytes rather than taking the invocation down: the
-        // exit status is the part a caller most needs, and losing a stream is the safe direction.
-        let (stdout, out_cut) = out_reader
-            .join()
-            .unwrap_or_else(|_| Ok((Vec::new(), false)))?;
-        let (stderr, err_cut) = err_reader
-            .join()
-            .unwrap_or_else(|_| Ok((Vec::new(), false)))?;
-        Ok(RawOutput {
-            exit: super::launch::status_code(status),
-            stdout,
-            stderr,
-            stdout_cut: out_cut,
-            stderr_cut: err_cut,
-            timed_out,
-            stopped,
-        })
+        Ok((status, timed_out, stopped))
     }
 
     /// Whether invocation `id` has been asked to stop.
@@ -2311,6 +2318,42 @@ pub(super) fn spawn_launcher(mut command: Command) -> io::Result<std::process::C
     let child = command.spawn();
     drop(command);
     child
+}
+
+/// `waited`, after ending the cage `child` when waiting on it failed.
+///
+/// An error out of the wait used to return at once: the cage went on running with its credential,
+/// past its timeout and out of reach of a stop, and its two readers were left detached. Killing it
+/// by pid is safe here because nothing else reaps sbx's children — `main` takes back the default
+/// `SIGCHLD` before it starts anything, and no code waits on `-1` — so the pid stays this child's,
+/// a zombie at worst, until it is waited for below.
+fn end_on_failure<T>(child: &mut std::process::Child, waited: io::Result<T>) -> io::Result<T> {
+    if waited.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    waited
+}
+
+/// One stream as a reader kept it: the bytes, and whether the stream was cut.
+type Stream = (Vec<u8>, bool);
+
+/// What one stream reader hands back.
+type Captured = io::Result<Stream>;
+
+/// What the two stream readers read, joining both before either's error is returned.
+///
+/// The second used to be joined only when the first read cleanly, so an error on stdout left the
+/// stderr reader detached. A reader thread that panicked leaves no bytes rather than taking the
+/// invocation down: the exit status is the part a caller most needs, and losing a stream is the
+/// safe direction.
+fn join_readers(
+    out: std::thread::JoinHandle<Captured>,
+    err: std::thread::JoinHandle<Captured>,
+) -> io::Result<(Stream, Stream)> {
+    let out = out.join().unwrap_or_else(|_| Ok((Vec::new(), false)));
+    let err = err.join().unwrap_or_else(|_| Ok((Vec::new(), false)));
+    Ok((out?, err?))
 }
 
 /// Read a stream up to `cap` bytes, reporting whether it was cut. Reading continues past the cap
