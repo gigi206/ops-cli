@@ -2208,7 +2208,10 @@ impl Eq for WriteGuard {}
 ///
 /// Under the trust store and never beside the file: a project's `.sbx.toml` sits in a tree its cage
 /// writes, where a guard file could be planted or held by the cage to stall every write, while the
-/// trust store is a control-plane root a launch keeps out of the cage's reach.
+/// trust store is a control-plane root a launch shows a cage empty. The exception is the one the
+/// security model names for every root: a bind declared at or inside the trust store shows it,
+/// read-only, and a `flock` needs no more than a read-only open, so such a cage can hold a guard
+/// and keep an edit of that file waiting.
 fn guard_path(root: &Path, config: &Path) -> Option<PathBuf> {
     crate::trust::marker_path(&root.join("write-locks"), config)
 }
