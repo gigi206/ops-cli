@@ -63,6 +63,25 @@ fn a_launchers_credential_memfds_do_not_outlive_the_fork_that_carries_them() {
 
 // --- how many run at once ---
 
+/// An id already live is refused rather than admitted over the running entry, whose guard would
+/// otherwise remove the later invocation's entry when the earlier one ends.
+#[test]
+fn an_id_already_live_is_refused() {
+    let engine = TaskEngine::inventory_only(Vec::new());
+    let first = engine
+        .enter(7, "probe", false)
+        .expect("the first is admitted");
+    let refused = match engine.enter(7, "probe", false) {
+        Ok(_) => panic!("a live id must not be admitted twice"),
+        Err(why) => why,
+    };
+    assert!(refused.contains("already running"), "{refused}");
+    drop(first);
+    engine
+        .enter(7, "probe", false)
+        .expect("an id no longer live is not refused");
+}
+
 /// The registry admits [`MAX_LIVE`] invocations and refuses the next, whether or not anyone is
 /// waiting for them.
 ///
