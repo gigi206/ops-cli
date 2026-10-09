@@ -30,6 +30,24 @@ fn log_event(
     }
 }
 
+/// `-a <app>` on `net logs`, with a session registry that cannot be read, reports the registry
+/// instead of an empty listing that would read as the app having logged nothing. Without the filter
+/// the registry only labels the listing, and the gather goes ahead.
+#[test]
+fn an_app_filter_the_registry_cannot_resolve_is_refused_by_net_logs() {
+    use crate::testutil::TmpDir;
+    let data = TmpDir::new();
+    std::fs::write(data.join("sessions"), b"not a directory").unwrap();
+    let why = collect_logs(data.path(), Some("demo"), false, None)
+        .err()
+        .expect("the app's sessions are not known");
+    assert!(
+        why.contains("cannot read the session registry") && why.contains("`demo`"),
+        "{why}"
+    );
+    assert!(collect_logs(data.path(), None, false, None).is_ok());
+}
+
 /// A secret seen crossing a tunnel is shown on a PLAIN `sbx net logs`, with no flag asked for,
 /// and it says plainly that nothing was stopped.
 ///
