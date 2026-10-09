@@ -87,7 +87,8 @@ proactive sibling of [`sbx net pending allow <id> --session`](../networking/ask)
 a request that already parked. The command returns once each session's proxy has confirmed it
 holds the rule, so the next request there is decided by it; a session whose proxy did not
 confirm it is named as such, the command exits with code 2, and running it again pushes the
-rule once more. A load that reached no session in scope, or that a session refused (one
+rule once more. So does a session that could not be asked at all, since whether it holds the
+rule is then not known; one that ended in the meantime is passed over. A load that reached no session in scope, or that a session refused (one
 running an sbx too old to load a live rule), exits 1: the rule is not in force there.
 Standard output names the sessions that took the rule, and where to see it; every session
 that did not, and the config write that would persist the rule instead, is said on standard
