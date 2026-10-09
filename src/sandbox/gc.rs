@@ -999,7 +999,10 @@ fn contained_in(root: &Path, candidate: &Path) -> Option<PathBuf> {
 
 /// Open `name` as a directory, refusing a symlink at that component — relative to `parent` when one
 /// is given, and from the filesystem root otherwise.
-fn open_dir_nofollow(parent: Option<&OwnedFd>, name: &std::ffi::CStr) -> io::Result<OwnedFd> {
+pub(in crate::sandbox) fn open_dir_nofollow(
+    parent: Option<&OwnedFd>,
+    name: &std::ffi::CStr,
+) -> io::Result<OwnedFd> {
     open_dir_as(libc::O_RDONLY, parent, name)
 }
 

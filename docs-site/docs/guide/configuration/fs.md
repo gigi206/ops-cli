@@ -399,6 +399,13 @@ repository, this project included, so holding git's other files in that bind wou
 nothing: none is held there, nothing it names refuses the launch, and the launch warns, naming
 the bind and the file. Bind a narrower directory, or that one read-only, to keep them held.
 
+A global git configuration inside the project, which a launch in your home or a
+`GIT_CONFIG_GLOBAL` naming a project file makes, is held instead: it is read-only in the cage,
+like `.git/config`. git reads a relative `GIT_CONFIG_GLOBAL` from the top of the work tree it
+runs in, so for this project that is a file of the project. One that is absent there is not
+created: the launch warns that the cage could create it, and pointing `GIT_CONFIG_GLOBAL`
+outside the project closes it.
+
 sbx's own data directory is written too, under other names: the cage's home at
 `/home/sandbox`, its store at `/nix` and the install pools all live in it. A read-only mount at
 the host path would hold nothing there, so a hooks directory, an included file or a repository

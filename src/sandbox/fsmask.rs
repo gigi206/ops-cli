@@ -56,7 +56,7 @@ use crate::config::fspolicy::{FsPolicy, has_wildcard, matches_component};
 use crate::diag::visible;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -147,6 +147,9 @@ pub(crate) struct Reach {
     binds: Vec<BindReach>,
     /// sbx's data directory, canonical, or `None` when it did not resolve.
     data: Option<PathBuf>,
+    /// The files the host's git reads as its global configuration, as it names them
+    /// ([`git_global_configs`]).
+    git_global: Vec<PathBuf>,
 }
 
 /// One config bind as the reach sees it.
@@ -165,7 +168,7 @@ impl Reach {
     /// `binds` and sbx's data directory, against the global git configuration the environment
     /// names ([`git_global_configs`]).
     pub(crate) fn of(root: &Path, binds: &[crate::config::Bind], data: Option<&Path>) -> Self {
-        Reach::with_git_global(root, binds, data, &git_global_configs())
+        Reach::with_git_global(root, binds, data, &git_global_configs(root))
     }
 
     /// [`Reach::of`] against the global git configuration files `git_global`, as the host names
@@ -217,6 +220,7 @@ impl Reach {
                 })
                 .collect(),
             data: data.map(crate::trust::canonicalize_existing_prefix),
+            git_global: git_global.to_vec(),
         }
     }
 
@@ -281,15 +285,20 @@ impl Reach {
 /// The files the host's git reads as its global configuration, as git finds them:
 /// `$GIT_CONFIG_GLOBAL` alone when it is set, otherwise `$XDG_CONFIG_HOME/git/config` (with
 /// `~/.config` in its place when that is unset) and `~/.gitconfig`. Absent ones are listed too,
-/// since the cage could create one.
-fn git_global_configs() -> Vec<PathBuf> {
-    let var = |name: &str| {
-        std::env::var_os(name)
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-    };
-    if let Some(file) = var("GIT_CONFIG_GLOBAL") {
-        return vec![file];
+/// since the cage could create one. A relative `$GIT_CONFIG_GLOBAL` is read by git from the top of
+/// the work tree it runs in, which for this launch is the project at `root`.
+fn git_global_configs(root: &Path) -> Vec<PathBuf> {
+    git_global_configs_in(root, |name| std::env::var_os(name))
+}
+
+/// [`git_global_configs`] against the environment `env` answers.
+fn git_global_configs_in(
+    root: &Path,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let var = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    if let Some(file) = env("GIT_CONFIG_GLOBAL").filter(|f| !f.is_empty()) {
+        return vec![root.join(file)];
     }
     let home = var("HOME");
     let xdg = var("XDG_CONFIG_HOME").or_else(|| home.as_ref().map(|h| h.join(".config")));
@@ -388,18 +397,29 @@ pub(crate) fn mask_dir(data_dir: &Path, pid: u32) -> PathBuf {
 /// pid. Fails loudly: a mask whose source is missing is a mask bubblewrap would refuse to mount,
 /// and a launch that silently continued would run with the paths open.
 pub(crate) fn stage_decoys(dir: &Path) -> io::Result<Decoys> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let file = dir.join("file");
     let d = dir.join("dir");
     // A leftover from a crashed run at this pid could hold anything, and `gc` keeps entries whose
     // pid reads live — which this launch's pid does. So both decoys are re-made rather than reused:
-    // an "empty" directory that still held a predecessor's contents would be no mask at all.
-    let _ = std::fs::remove_dir_all(&d);
-    let _ = std::fs::remove_file(&file);
-    std::fs::create_dir_all(&d)?;
-    std::fs::write(&file, b"")?;
-    // Written empty first, then closed off: a decoy the launch could not read either is what makes
+    // an "empty" directory that still held a predecessor's contents would be no mask at all. A
+    // leftover that cannot be removed fails the launch, and each decoy is created where nothing
+    // is, so one that survived is never taken for a new one.
+    let gone = |removed: io::Result<()>| match removed {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    };
+    gone(std::fs::remove_dir_all(&d))?;
+    gone(std::fs::remove_file(&file))?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::create_dir(&d)?;
+    // Empty, and closed off from the start: a decoy the launch could not read either is what makes
     // the refusal come from the file's own mode rather than from where it happens to sit.
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000))?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o000)
+        .open(&file)?;
     Ok(Decoys { file, dir: d })
 }
 
@@ -418,6 +438,17 @@ pub(crate) fn expand(
     policy: &FsPolicy,
     binds: &[crate::config::Bind],
     data: Option<&Path>,
+) -> Expanded {
+    expand_against(project, policy, binds, data, git_global_configs)
+}
+
+/// [`expand`] against the global git configuration `git_global` names for the canonical project.
+fn expand_against(
+    project: &Path,
+    policy: &FsPolicy,
+    binds: &[crate::config::Bind],
+    data: Option<&Path>,
+    git_global: fn(&Path) -> Vec<PathBuf>,
 ) -> Expanded {
     let _asking = GitAsking::open();
     let mut out = Expanded::default();
@@ -469,7 +500,7 @@ pub(crate) fn expand(
     // Every question below is asked of the host's git, and a `.git` or a `config` reached through a
     // link, or a `commondir` other than a linked worktree's, would have it answer from elsewhere:
     // refused first, and nothing is asked.
-    let reach = Reach::of(&root, binds, data);
+    let reach = Reach::with_git_global(&root, binds, data, &git_global(&root));
     // A read-write bind holding the global git configuration leaves the carrier open whatever is
     // held, and nothing in it is held: said rather than refused, since the bind is a trusted grant.
     if git_protected(&root, policy.git_writable())
@@ -514,6 +545,11 @@ pub(crate) fn expand(
                 0,
             );
         }
+    }
+    if git_protected(&root, policy.git_writable())
+        || git_file_protected(&root, policy.git_writable())
+    {
+        git_global_held(&reach, &mut carrier, &mut out.warnings, &mut out.refused);
     }
     for mut m in builtin.into_iter().chain(carrier) {
         m.builtin = true;
@@ -838,6 +874,35 @@ impl GitRepo {
             .unwrap_or(&path)
             .display()
             .to_string()
+    }
+}
+
+/// Hold the global configuration the host's git reads, where the cage writes it at its own name: in
+/// the project, it can name a program your git runs in every repository, this one included, so it
+/// is read-only in the cage like `.git/config` ([`git_file`]). An absent one there is said rather
+/// than refused, since the cage could create it: what to do is to name a global configuration
+/// outside the project. In a read-write bind nothing is held ([`Reach::unheld`] warns instead).
+fn git_global_held(
+    reach: &Reach,
+    carrier: &mut Vec<Masked>,
+    warnings: &mut Vec<String>,
+    refused: &mut Option<String>,
+) {
+    for file in &reach.git_global {
+        let at = crate::trust::canonicalize_existing_prefix(file);
+        if !reach.in_project(&at) {
+            continue;
+        }
+        if std::fs::symlink_metadata(&at).is_ok() {
+            git_file(reach, &at, None, refused, carrier);
+        } else {
+            warnings.push(visible(&format!(
+                "your git reads `{}` as its global configuration, which is in the project and \
+                 absent: the cage could create it and name a program there that your git runs \
+                 in every repository. Point `GIT_CONFIG_GLOBAL` outside the project to close it",
+                at.display()
+            )));
+        }
     }
 }
 
@@ -1725,17 +1790,28 @@ fn ask_host_git(
     let reader = child.stdout.take().map(|mut out| {
         std::thread::spawn(move || {
             let mut answer = Vec::new();
-            let _ = out.read_to_end(&mut answer);
-            answer
+            out.read_to_end(&mut answer).map(|_| answer)
         })
     });
     let waited = super::cagewait::wait_capped(&mut child, deadline, GIT_ASK_POLL);
-    let answer = reader
-        .and_then(|reader| reader.join().ok())
-        .unwrap_or_default();
+    // An answer cut short reads as one that says less, so it is never taken for git's answer.
+    let answer = match reader.map(std::thread::JoinHandle::join) {
+        None => Ok(Vec::new()),
+        Some(Ok(read)) => read,
+        Some(Err(_)) => Err(std::io::Error::other(
+            "the thread reading its answer panicked",
+        )),
+    };
     match waited {
         Ok((_, true)) => Err(held()),
-        Ok((status, false)) => Ok((status, answer)),
+        // Killed by anything but the budget, git answered nothing, and its status would read as an
+        // answer: a key that is not set, or a directory that is not a repository.
+        Ok((status, false)) if status.code().is_none() => Err(visible(&format!(
+            "the host's git was ended by a signal asked `{question}` about `{}` ({status}), so \
+             what it reads there is not known. Launch again. {GIT_WRITABLE_HINT}",
+            repo.dir.display()
+        ))),
+        Ok((status, false)) => answer.map(|answer| (status, answer)).map_err(failed),
         Err(e) => Err(failed(e)),
     }
 }
@@ -1955,12 +2031,24 @@ fn include_masks(
     masks: &mut Vec<Masked>,
     refused: &mut Option<String>,
 ) -> Vec<PathBuf> {
-    // `-z` records: `file:<origin>` NUL `<key>` LF `<value>` NUL.
-    let text = String::from_utf8_lossy(out);
+    // `-z` records: `file:<origin>` NUL `<key>` LF `<value>` NUL. Read exactly or not at all: a
+    // name taken approximately would protect some other file than the one git includes.
+    let unread = |why: &str| {
+        visible(&format!(
+            "{GIT_CONFIG_READ}: git lists an include {why}, which sbx cannot hold for certain. \
+             Rename the file or fix the entry (`git config --show-origin --get-regexp include`), \
+             then launch again. {GIT_WRITABLE_HINT}"
+        ))
+    };
+    let Ok(text) = std::str::from_utf8(out) else {
+        refused.get_or_insert_with(|| unread("by a name that is not UTF-8"));
+        return Vec::new();
+    };
     let mut fields = text.split('\0');
     let mut found: Vec<PathBuf> = Vec::new();
     while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
         let Some((key, value)) = entry.split_once('\n') else {
+            refused.get_or_insert_with(|| unread(&format!("entry `{entry}` with no value")));
             continue;
         };
         let base = origin
@@ -2364,8 +2452,15 @@ fn main_work_tree(repo: &GitRepo) -> Result<Option<GitRepo>, String> {
 /// the cage does not write it, or where there is no `.git`, git reads no work tree of this
 /// repository there.
 fn linked_work_tree(reach: &Reach, dir: &Path) -> Result<Option<PathBuf>, String> {
-    let Some(listed) = listed_work_tree(dir) else {
-        return Ok(None);
+    let listed = match listed_work_tree(dir) {
+        Ok(Some(listed)) => listed,
+        Ok(None) => return Ok(None),
+        // git runs in a work tree whatever its listing says, so one hidden from the listing where
+        // the cage writes would go unprotected.
+        Err(e) if reach.writes(dir) => {
+            return Err(visible(&git_unreadable("read", &dir.join("gitdir"), &e)));
+        }
+        Err(_) => return Ok(None),
     };
     let what = "the `.git` file of a worktree";
     if let Some(reason) = git_link_on_the_way(reach, &listed.join(".git"), what, GIT_LINK_INSTEAD) {
@@ -2421,13 +2516,19 @@ fn linked_work_tree(reach: &Reach, dir: &Path) -> Result<Option<PathBuf>, String
 }
 
 /// The work tree git lists for the linked worktree whose directory is `dir`: the path its `gitdir`
-/// names, less a final `.git`, or `None` when there is none to read ([`read_git_path`]).
-fn listed_work_tree(dir: &Path) -> Option<PathBuf> {
-    let named = read_git_path(&dir.join("gitdir"), b"").ok().flatten()?;
+/// names, less a final `.git`, or `None` when there is none ([`read_git_path`]); the error when a
+/// `gitdir` is there and cannot be read, since git still runs in that work tree.
+fn listed_work_tree(dir: &Path) -> io::Result<Option<PathBuf>> {
+    let named = match read_git_path(&dir.join("gitdir"), b"") {
+        Ok(Some(named)) => named,
+        Ok(None) => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     if named.file_name() == Some(std::ffi::OsStr::new(".git")) {
-        return named.parent().map(Path::to_path_buf);
+        return Ok(named.parent().map(Path::to_path_buf));
     }
-    Some(named)
+    Ok(Some(named))
 }
 
 /// What the end of a session looks for in the repository the project's git reads, where no mount
@@ -3036,7 +3137,7 @@ impl RepoWatch {
         let listed = worktree_dirs(&self.reach, &self.repo.common)
             .dirs
             .into_iter()
-            .filter_map(|dir| listed_work_tree(&dir))
+            .filter_map(|dir| listed_work_tree(&dir).ok().flatten())
             .map(|tree| crate::trust::canonicalize_existing_prefix(&tree).join(".git"));
         let covered = self
             .trees
@@ -3059,7 +3160,21 @@ impl RepoWatch {
             .iter()
             .filter(|dir| !self.trees.iter().any(|tree| tree.dir == **dir))
             .filter_map(|dir| {
-                let work_tree = crate::trust::canonicalize_existing_prefix(&listed_work_tree(dir)?);
+                let listed = match listed_work_tree(dir) {
+                    Ok(listed) => listed?,
+                    // A listing hidden during the session is said rather than read as none.
+                    Err(e) if self.reach.writes(dir) => {
+                        return Some(format!(
+                            "`{}` cannot be read ({e}): a worktree of this repository may have \
+                             been added during the session without sbx seeing where. Check `{}` \
+                             before running git in any work tree of it",
+                            dir.join("gitdir").display(),
+                            dir.display()
+                        ));
+                    }
+                    Err(_) => return None,
+                };
+                let work_tree = crate::trust::canonicalize_existing_prefix(&listed);
                 let dot_git = work_tree.join(".git");
                 let there = std::fs::symlink_metadata(&dot_git).is_ok();
                 (there && self.reach.holds(&dot_git)).then(|| {
@@ -3284,12 +3399,19 @@ const GIT_CONFIG_READ: &str = "a file your git reads as configuration";
 /// Create, empty, each built-in directory mask whose directory is absent, so its bind has
 /// something to land on. See [`git_hook_dirs`] for why an absent one is masked at all.
 ///
-/// One component at a time below `root`, each checked with `symlink_metadata` and made with a
-/// non-recursive `mkdir`: `create_dir_all` would follow a link the cage planted in an intermediate
-/// component and make the directory wherever it points. A component that exists and is not a
-/// directory is an error, and the launch refuses on it, since the mask it was for cannot be placed.
+/// One component at a time below `root`, through descriptors: each opened with `O_NOFOLLOW` from
+/// the one above it, and an absent one made there with `mkdirat` and opened the same way. A
+/// `create_dir_all` would follow a link the cage planted in an intermediate component and make the
+/// directory wherever it points, and so would a check by name followed by a `mkdir` if the
+/// component were replaced in between. A component that exists and is not a directory is an
+/// error, and the launch refuses on it, since the mask it was for cannot be placed.
 pub(crate) fn create_absent_dirs(expanded: &Expanded) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_name = |name: &std::ffi::OsStr| {
+        std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a name holding a NUL"))
+    };
     for m in expanded.readonly.iter().filter(|m| m.builtin && m.is_dir) {
         let Some(root) = expanded.reach.root_of(&m.path) else {
             continue;
@@ -3298,29 +3420,33 @@ pub(crate) fn create_absent_dirs(expanded: &Expanded) -> io::Result<()> {
             continue;
         };
         let mut at = root.to_path_buf();
+        let mut dir = super::gc::open_dir_nofollow(None, &c_name(root.as_os_str())?)?;
         for part in rel.components() {
             at.push(part);
-            match std::fs::symlink_metadata(&at) {
-                Ok(meta) if meta.is_dir() => continue,
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!("{} is not a directory", at.display()),
-                    ));
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-            match std::fs::DirBuilder::new().mode(0o755).create(&at) {
-                Ok(()) => {}
-                // Made by someone else in between: acceptable only if it is a directory.
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    if !std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_dir()) {
-                        return Err(e);
+            let name = c_name(part.as_os_str())?;
+            let not_a_directory = |e: io::Error| match e.raw_os_error() {
+                Some(libc::ELOOP | libc::ENOTDIR) => io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} is not a directory", at.display()),
+                ),
+                _ => e,
+            };
+            dir = match super::gc::open_dir_nofollow(Some(&dir), &name) {
+                Ok(next) => next,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // SAFETY: `dir` is a live descriptor and `name` is NUL-terminated, both valid
+                    // for the call.
+                    if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755) } != 0 {
+                        let e = io::Error::last_os_error();
+                        // Made by someone else in between: the open below decides what it is.
+                        if e.kind() != io::ErrorKind::AlreadyExists {
+                            return Err(e);
+                        }
                     }
+                    super::gc::open_dir_nofollow(Some(&dir), &name).map_err(not_a_directory)?
                 }
-                Err(e) => return Err(e),
-            }
+                Err(e) => return Err(not_a_directory(e)),
+            };
         }
     }
     Ok(())
@@ -4405,6 +4531,7 @@ fn entry_names(project: &Path, entry: &str, path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+    use std::os::unix::fs::PermissionsExt;
 
     /// A project with a key, a certificate directory and an ordinary file.
     fn project(tmp: &TmpDir) -> PathBuf {
@@ -6194,6 +6321,40 @@ mod tests {
         assert!(refused(&feat, &[rw_bind(&main)]).is_some());
     }
 
+    /// A linked worktree whose `gitdir` cannot be read is still one git runs in, so where the cage
+    /// writes the listing the launch refuses rather than leave that worktree unprotected, and the
+    /// end of a session names one hidden that way during it. Where the cage does not write it,
+    /// nothing is refused. Made unreadable as a directory in place of the file, which holds as root.
+    #[test]
+    fn a_worktree_listing_that_cannot_be_read_refuses_where_the_cage_writes_it() {
+        let tmp = TmpDir::new();
+        let Some((main, feat, git)) = linked_worktree(&tmp) else {
+            skip_incapable!("skipping an unreadable worktree listing: no git, or a cage mount");
+            return;
+        };
+        let watch = GitWatch::start(&main, false, &[], None).expect("a carried repository");
+        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/sib"]));
+        let gitdir = main.join(".git/worktrees/sib/gitdir");
+        std::fs::remove_file(&gitdir).unwrap();
+        std::fs::create_dir(&gitdir).unwrap();
+        let findings = watch.findings();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("cannot be read") && f.contains(&gitdir.display().to_string())),
+            "{findings:?}"
+        );
+        let why = expand(&main, &FsPolicy::default(), &[], None)
+            .refused
+            .expect("an unreadable listing where the cage writes refuses");
+        assert!(why.contains(&gitdir.display().to_string()), "{why}");
+        assert_eq!(
+            expand(&feat, &FsPolicy::default(), &[], None).refused,
+            None,
+            "not the cage's to write"
+        );
+    }
+
     /// The end of a session looks at the repository a linked worktree's `.git` file names: a
     /// gitlink added to the worktree's own index is named, and a `commondir` appearing in the main
     /// `.git` is named where the cage writes it, not where it does not, as the next launch refuses
@@ -7793,8 +7954,14 @@ mod tests {
             .expect("a link on the way refuses");
         assert!(why.contains("via` is a symbolic link"), "{why}");
 
-        std::fs::write(&git, "not a pointer\n").unwrap();
-        held_alone(&expand(&root, &FsPolicy::default(), &[], None));
+        // Whatever git cannot read as a pointer, too long for one included, is still held.
+        for unread in [
+            "not a pointer\n".to_string(),
+            format!("gitdir: {}", "/x".repeat(5000)),
+        ] {
+            std::fs::write(&git, unread).unwrap();
+            held_alone(&expand(&root, &FsPolicy::default(), &[], None));
+        }
     }
 
     #[test]
@@ -7965,6 +8132,124 @@ mod tests {
         );
     }
 
+    /// A question to the host's git that ends on a signal is no answer: its status would read as a
+    /// key that is not set or a directory that is not a repository, so it refuses. One that exits
+    /// is taken as it is, whatever its code, for the caller to read.
+    #[test]
+    fn a_question_the_host_git_dies_on_is_refused_and_an_exit_is_an_answer() {
+        let tmp = TmpDir::new();
+        let repo = GitRepo::at(tmp.path().join(".git"), tmp.path().to_path_buf());
+        let ask = |script: &str| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", script]);
+            ask_host_git(command, &repo, "git config core.hooksPath")
+        };
+        let why = ask("kill -SEGV $$").expect_err("a signal is no answer");
+        assert!(why.contains("ended by a signal"), "{why}");
+        let (status, answer) = ask("printf ok").unwrap();
+        assert!(status.success());
+        assert_eq!(answer, b"ok");
+        let (status, answer) = ask("exit 1").unwrap();
+        assert_eq!(status.code(), Some(1));
+        assert!(answer.is_empty());
+    }
+
+    /// An include git lists by a name that is not UTF-8 refuses rather than being held under an
+    /// approximate name, and so does an entry with no value; a well-formed list refuses nothing.
+    #[test]
+    fn an_include_list_sbx_cannot_read_exactly_refuses() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp).canonicalize().unwrap();
+        let reach = Reach::of(&root, &[], None);
+        let refusal = |out: &[u8]| {
+            let (mut masks, mut refused) = (Vec::new(), None);
+            include_masks(&reach, out, &mut masks, &mut refused);
+            refused
+        };
+        let origin = format!("file:{}/.git/config", root.display());
+        let mut bytes = format!("{origin}\0include.path\n{}/inc-", root.display()).into_bytes();
+        bytes.extend_from_slice(b"\xff.cfg\0");
+        let why = refusal(&bytes).expect("a name that is not UTF-8 refuses");
+        assert!(why.contains("not UTF-8"), "{why}");
+        let why = refusal(format!("{origin}\0include.path\0").as_bytes())
+            .expect("an entry with no value refuses");
+        assert!(why.contains("with no value"), "{why}");
+        assert_eq!(
+            refusal(format!("{origin}\0include.path\n/elsewhere/inc.cfg\0").as_bytes()),
+            None
+        );
+    }
+
+    /// A relative `GIT_CONFIG_GLOBAL` is the file git reads at the top of the work tree, and an
+    /// absolute one is itself; unset, the two defaults stand.
+    #[test]
+    fn the_global_git_configuration_is_found_where_git_reads_it() {
+        let root = Path::new("/proj");
+        let with = |global: Option<&str>| {
+            git_global_configs_in(root, |name| match name {
+                "GIT_CONFIG_GLOBAL" => global.map(Into::into),
+                "HOME" => Some("/home/u".into()),
+                _ => None,
+            })
+        };
+        assert_eq!(with(Some("rel.cfg")), [root.join("rel.cfg")]);
+        assert_eq!(with(Some("/etc/g.cfg")), [PathBuf::from("/etc/g.cfg")]);
+        assert_eq!(
+            with(None),
+            [
+                PathBuf::from("/home/u/.config/git/config"),
+                PathBuf::from("/home/u/.gitconfig")
+            ]
+        );
+    }
+
+    /// A global git configuration in the project is read-only in the cage like `.git/config`, and
+    /// an absent one there is said, since the cage could create it; one outside is left alone.
+    #[test]
+    fn a_global_git_configuration_in_the_project_is_held_and_an_absent_one_is_said() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp).canonicalize().unwrap();
+        std::fs::write(root.join("global.cfg"), b"[core]\n").unwrap();
+        let outside = tmp.path().canonicalize().unwrap().join("outside.cfg");
+        std::fs::write(&outside, b"[core]\n").unwrap();
+        let reach = Reach::with_git_global(
+            &root,
+            &[],
+            None,
+            &[root.join("global.cfg"), root.join("absent.cfg"), outside],
+        );
+        let (mut carrier, mut warnings, mut refused) = (Vec::new(), Vec::new(), None);
+        git_global_held(&reach, &mut carrier, &mut warnings, &mut refused);
+        assert_eq!(refused, None);
+        let held: Vec<&Path> = carrier.iter().map(|m| m.path.as_path()).collect();
+        assert_eq!(held, [root.join("global.cfg").as_path()]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("absent.cfg"), "{warnings:?}");
+
+        // Held at launch while git's files are, and the global file is not git's own to hold
+        // otherwise.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+        let e = expand_against(&root, &FsPolicy::default(), &[], None, |root| {
+            vec![root.join("global.cfg")]
+        });
+        assert!(
+            e.readonly
+                .iter()
+                .any(|m| m.path == root.join("global.cfg") && m.builtin),
+            "{:?}",
+            e.readonly
+        );
+        let lifted = FsPolicy {
+            git_writable: Some(true),
+            ..FsPolicy::default()
+        };
+        let e = expand_against(&root, &lifted, &[], None, |root| {
+            vec![root.join("global.cfg")]
+        });
+        assert!(!e.readonly.iter().any(|m| m.path == root.join("global.cfg")));
+    }
+
     #[test]
     fn the_decoys_are_one_closed_file_and_one_empty_directory() {
         let tmp = TmpDir::new();
@@ -7984,6 +8269,28 @@ mod tests {
         // Staging twice at the same pid replaces the residue rather than failing.
         let again = stage_decoys(&dir).unwrap();
         assert_eq!(again.file, d.file);
+    }
+
+    /// A leftover the staging cannot remove fails the launch rather than standing in as the decoy:
+    /// a directory that kept a predecessor's contents would mask nothing. Run as root, the removal
+    /// succeeds and the decoy is the empty one, which is the other half of the same rule.
+    #[test]
+    fn a_leftover_decoy_that_cannot_be_removed_is_never_reused() {
+        let tmp = TmpDir::new();
+        let dir = tmp.path().join("mask-1");
+        let stuck = dir.join("dir/stuck");
+        std::fs::create_dir_all(&stuck).unwrap();
+        std::fs::write(stuck.join("left"), b"PREDECESSOR").unwrap();
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let staged = stage_decoys(&dir);
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).unwrap();
+        match staged {
+            Err(_) => {}
+            Ok(d) => assert!(
+                std::fs::read_dir(&d.dir).unwrap().next().is_none(),
+                "a decoy directory is empty or the launch fails"
+            ),
+        }
     }
 
     #[test]
