@@ -173,7 +173,7 @@ pub(crate) use gc::{
 };
 pub(crate) use launch::{
     Learned, RollMode, SessionHeader, app, attach, detach_log_path, distro_lock_path,
-    effective_lock_target, gc, parse_session_header, run, run_mise, stop,
+    effective_lock_target, gc, parse_session_header, run, run_mise, shell_quote, stop,
     superseded_reclaimable_hint, upgrade_mise_packages, upgrade_provision_steps,
 };
 pub(crate) use learn::Synthesis;

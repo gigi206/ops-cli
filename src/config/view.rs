@@ -207,12 +207,33 @@ pub(crate) struct BindView {
     pub(crate) layer: Option<ProvenanceView>,
 }
 
+/// An argv as one line a reader can split back into its words: a word a shell would split, expand
+/// or unquote is single-quoted, every other one is shown as it is. "Every other" is a closed set,
+/// the one Python's `shlex.quote` leaves bare, so a byte nobody thought of is quoted rather than
+/// passed through.
+fn display_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|word| {
+            let bare = !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b));
+            if bare {
+                word.clone()
+            } else {
+                sandbox::shell_quote(word)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Project a resolved handler table for display, in scheme order.
 fn open_views(open: &std::collections::BTreeMap<String, super::OpenHandler>) -> Vec<OpenView> {
     open.iter()
         .map(|(scheme, h)| OpenView {
             scheme: scheme.clone(),
-            cmd: h.argv.join(" "),
+            cmd: display_argv(&h.argv),
             mode: match h.mode {
                 super::OpenMode::Exec => "exec".to_string(),
                 super::OpenMode::Detach => "detach".to_string(),
@@ -243,7 +264,7 @@ fn service_views(
         .iter()
         .map(|(name, s)| ServiceView {
             name: name.clone(),
-            cmd: s.argv.join(" "),
+            cmd: display_argv(&s.argv),
             enable: (!s.enable.is_empty()).then(|| {
                 s.enable
                     .iter()
@@ -523,9 +544,9 @@ pub(crate) enum RuleSourceView {
 /// `catch_all` marks the one rule whose reach its own text does not show: a `re:` regex that matches
 /// every host (see [`crate::allowlist::Rule::opens_every_host`]). The grammar refuses a bare `*`
 /// precisely so a policy reads as what it does, and a catch-all regex is the accepted way to say the
-/// same thing — so it is labelled here rather than left to be spotted. False for every other rule,
-/// and for a collapsed `@<group>` row, whose text names no pattern to judge (`--expand` shows the
-/// members, each judged on its own).
+/// same thing — so it is labelled here rather than left to be spotted. A collapsed `@<group>` row
+/// carries it when any rule it folds does, since its text names no pattern a reader could judge
+/// (`--expand` shows the members, each judged on its own). False for every other rule.
 #[derive(Serialize, Clone)]
 pub(crate) struct NetRuleView {
     pub(crate) kind: NetRuleKind,
@@ -572,7 +593,7 @@ fn project_config_rules(
                     source: RuleSourceView::Config,
                     rule: format!("@{g}"),
                     group: Some(g.clone()),
-                    catch_all: false,
+                    catch_all: rules[i..j].iter().any(|r| r.opens_every_host()),
                 });
                 i = j;
             }
@@ -654,8 +675,8 @@ pub(crate) fn proc_view(p: &crate::proc_policy::ProcPolicy) -> ProcView {
 pub(crate) struct NotifyView {
     /// Event name → `off` / `once` / `always`, in the events' declaration order.
     pub(crate) events: Vec<(String, String)>,
-    /// The quiet period between repeats of one problem, as it was written (`"5m"`), or empty when
-    /// every occurrence is announced.
+    /// The quiet period between repeats of one problem, in the largest whole unit it divides into
+    /// (`"5m"` for `"300s"` as for `"5m"`), or empty when every occurrence is announced.
     pub(crate) repeat_after: String,
 }
 
@@ -668,7 +689,7 @@ pub(crate) fn notify_view(p: &crate::notify::NotifyPolicy) -> NotifyView {
             .collect(),
         repeat_after: p
             .repeat_after()
-            .map(|d| format!("{}s", d.as_secs()))
+            .map(|d| fmt_secs(d.as_secs()))
             .unwrap_or_default(),
     }
 }
@@ -1176,8 +1197,19 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
             // The app's effective network decides whether its credentials inject — the same posture
             // the launch enforces. Pass it so the compact roster agrees with the launch (and the
             // `--app` detail view), never claiming an injection a narrowed network drops.
-            let eff_network = app.network.as_ref().unwrap_or(&resolved.network);
-            app_view(name, app, eff_network, &flake_pins)
+            let (eff_network, _) = launched_scalar(
+                app.network.as_ref(),
+                app.network_origin,
+                &resolved.network,
+                resolved.network_origin,
+            );
+            app_view(
+                name,
+                app,
+                &eff_network,
+                &resolved.declared_secrets,
+                &flake_pins,
+            )
         })
         .collect();
 
@@ -1540,12 +1572,15 @@ fn app_view(
     name: &str,
     app: &super::ResolvedApp,
     eff_network: &NetworkPolicy,
+    baseline_secrets: &[super::HeaderSecret],
     flake_pins: &BTreeMap<String, String>,
 ) -> AppView {
     // A credential injects only under an allowlist (the proxy that performs it). When the app's
     // effective network is anything else, the launch injects none, so the roster shows none too —
     // the same posture `enforce_secret_posture` applies at merge, kept consistent across views.
     let injects = matches!(eff_network, NetworkPolicy::Allowlist(_));
+    let mut notes = app.warnings.clone();
+    notes.extend(app_secret_posture(baseline_secrets, app, eff_network).1);
     // The roster shows the app's *own* network overlay; apply its read-by-default verb posture
     // (`default_methods`) to a clone so the expanded rules render the verbs the launch enforces —
     // matching `config show --app` and `net rules --app`, not the un-narrowed declared form.
@@ -1559,14 +1594,14 @@ fn app_view(
         name: name.to_string(),
         open: open_views(&app.open),
         service: service_views(&app.service),
-        cmd: (!app.cmd.is_empty()).then(|| app.cmd.join(" ")),
+        cmd: (!app.cmd.is_empty()).then(|| display_argv(&app.cmd)),
         contract: contract_view(app),
         provisions: app
             .provisions
             .iter()
             .map(|p| AppProvisionView {
                 bundle: p.bundle.clone(),
-                cmd: p.argv.join(" "),
+                cmd: display_argv(&p.argv),
             })
             .collect(),
         home_scope: match app.home_scope {
@@ -1624,8 +1659,25 @@ fn app_view(
         } else {
             Vec::new()
         },
-        notes: app.warnings.clone(),
+        notes,
     }
+}
+
+/// What `merge_app`'s posture check makes of an app's credentials under its effective network:
+/// whether it drops every one of them, the baseline's and the app's, and the note it leaves when it
+/// does. One answer for the roster and the detail view, so one app reads the same in both.
+fn app_secret_posture(
+    baseline_secrets: &[super::HeaderSecret],
+    app: &super::ResolvedApp,
+    eff_network: &NetworkPolicy,
+) -> (bool, Vec<String>) {
+    let mut eff_secrets = baseline_secrets.to_vec();
+    eff_secrets.extend(app.secrets.iter().cloned());
+    let mut notes = Vec::new();
+    super::enforce_secret_posture(eff_network, &mut eff_secrets, &mut notes);
+    let dropped =
+        eff_secrets.is_empty() && !(baseline_secrets.is_empty() && app.secrets.is_empty());
+    (dropped, notes)
 }
 
 /// Project a resolved credential list for display: which header carries it, where it goes, the
@@ -1702,19 +1754,20 @@ fn app_detail_view(
     // Effective network/GUI: the app's own posture when it set one, else the baseline's — then the
     // app's read-by-default verb posture applied to it, mirroring `merge_app` so the detail view
     // shows the verbs the launch enforces (the merge_app-agreement guard pins this).
-    let mut eff_network = app
-        .network
-        .clone()
-        .unwrap_or_else(|| baseline.network.clone());
-    if let NetworkPolicy::Allowlist(policy) = &mut eff_network {
+    let (mut eff_network, network_origin) = launched_scalar(
+        app.network.as_ref(),
+        app.network_origin,
+        &baseline.network,
+        baseline.network_origin,
+    );
+    // A one-shot posture replaces the merged network after the app's verbs were applied to it, so
+    // they apply only to a network the override left alone.
+    if !overridden(baseline.network_origin)
+        && let NetworkPolicy::Allowlist(policy) = &mut eff_network
+    {
         policy.apply_default_methods(&app.default_methods);
     }
     let network = network_view(&eff_network);
-    let network_origin = origin_or_inherited(
-        app.network.is_some(),
-        app.network_origin,
-        baseline.network_origin,
-    );
     // The handlers the launch would freeze: the baseline's, with the app's folded over by scheme —
     // the same rule `merge_app` applies, so the view and the cage agree on what answers a link.
     let mut eff_open = baseline.open.clone();
@@ -1723,40 +1776,55 @@ fn app_detail_view(
     // reader asking what else runs beside this app wants the answer, not this layer's delta.
     let mut eff_service = baseline.service.clone();
     eff_service.extend(app.service.clone());
-    let eff_proc = app.proc.clone().unwrap_or_else(|| baseline.proc.clone());
+    let (eff_proc, proc_origin) = launched_scalar(
+        app.proc.as_ref(),
+        app.proc_origin,
+        &baseline.proc,
+        baseline.proc_origin,
+    );
     let proc = proc_view(&eff_proc);
-    let proc_origin =
-        origin_or_inherited(app.proc.is_some(), app.proc_origin, baseline.proc_origin);
-    let eff_notify = app.notify.unwrap_or(baseline.notify);
-    let notify = notify_view(&eff_notify);
-    let notify_origin = origin_or_inherited(
-        app.notify.is_some(),
+    let (eff_notify, notify_origin) = launched_scalar(
+        app.notify.as_ref(),
         app.notify_origin,
+        &baseline.notify,
         baseline.notify_origin,
     );
-    let eff_gui = app.gui.unwrap_or(baseline.gui);
+    let notify = notify_view(&eff_notify);
+    let (eff_gui, gui_origin) = launched_scalar(
+        app.gui.as_ref(),
+        app.gui_origin,
+        &baseline.gui,
+        baseline.gui_origin,
+    );
     let gui = match eff_gui {
         super::GuiPolicy::Wayland => GuiView::Wayland,
         super::GuiPolicy::Offscreen => GuiView::Offscreen,
         super::GuiPolicy::None => GuiView::None,
     };
-    let gui_origin = origin_or_inherited(app.gui.is_some(), app.gui_origin, baseline.gui_origin);
-    let eff_gpu = app.gpu.unwrap_or(baseline.gpu);
-    let gpu_origin = origin_or_inherited(app.gpu.is_some(), app.gpu_origin, baseline.gpu_origin);
-    let eff_allow_insecure_http = app
-        .allow_insecure_http
-        .unwrap_or(baseline.allow_insecure_http);
-    let allow_insecure_http_origin = origin_or_inherited(
-        app.allow_insecure_http.is_some(),
+    let (eff_gpu, gpu_origin) = launched_scalar(
+        app.gpu.as_ref(),
+        app.gpu_origin,
+        &baseline.gpu,
+        baseline.gpu_origin,
+    );
+    let (eff_allow_insecure_http, allow_insecure_http_origin) = launched_scalar(
+        app.allow_insecure_http.as_ref(),
         app.allow_insecure_http_origin,
+        &baseline.allow_insecure_http,
         baseline.allow_insecure_http_origin,
     );
-    let eff_audio = app.audio.unwrap_or(baseline.audio);
-    let audio_origin =
-        origin_or_inherited(app.audio.is_some(), app.audio_origin, baseline.audio_origin);
-    let eff_dbus = app.dbus.unwrap_or(baseline.dbus);
-    let dbus_origin =
-        origin_or_inherited(app.dbus.is_some(), app.dbus_origin, baseline.dbus_origin);
+    let (eff_audio, audio_origin) = launched_scalar(
+        app.audio.as_ref(),
+        app.audio_origin,
+        &baseline.audio,
+        baseline.audio_origin,
+    );
+    let (eff_dbus, dbus_origin) = launched_scalar(
+        app.dbus.as_ref(),
+        app.dbus_origin,
+        &baseline.dbus,
+        baseline.dbus_origin,
+    );
 
     // Effective forward: the app's own ports ∪ the baseline's — the same union `merge_app`
     // performs — with the origin `Inherited` when the app added none of its own.
@@ -1808,9 +1876,20 @@ fn app_detail_view(
     );
 
     // Effective limits: the app's overrides folded onto the baseline; each field's origin is the
-    // app's when it set the field, else inherited from the baseline.
+    // app's when it set the field, else inherited from the baseline. A field a one-shot override
+    // set keeps the override's value, which the launch applies after the app's.
+    let mut app_limits = app.limits.clone();
+    if overridden(baseline.limits_origin.memory_high) {
+        app_limits.memory_high = None;
+    }
+    if overridden(baseline.limits_origin.memory_max) {
+        app_limits.memory_max = None;
+    }
+    if overridden(baseline.limits_origin.tasks_max) {
+        app_limits.tasks_max = None;
+    }
     let mut eff_limits = baseline.limits.clone();
-    super::overlay_limits(&mut eff_limits, app.limits.clone());
+    super::overlay_limits(&mut eff_limits, app_limits.clone());
     let limit = |(value, _ov): (String, bool),
                  set: bool,
                  origin: super::Provenance,
@@ -1821,19 +1900,19 @@ fn app_detail_view(
     let limits = LimitsView {
         memory_high: limit(
             eff_limits.memory_high(),
-            app.limits.memory_high.is_some(),
+            app_limits.memory_high.is_some(),
             app.limits_origin.memory_high,
             baseline.limits_origin.memory_high,
         ),
         memory_max: limit(
             eff_limits.memory_max(),
-            app.limits.memory_max.is_some(),
+            app_limits.memory_max.is_some(),
             app.limits_origin.memory_max,
             baseline.limits_origin.memory_max,
         ),
         tasks_max: limit(
             eff_limits.tasks_max(),
-            app.limits.tasks_max.is_some(),
+            app_limits.tasks_max.is_some(),
             app.limits_origin.tasks_max,
             baseline.limits_origin.tasks_max,
         ),
@@ -1859,12 +1938,8 @@ fn app_detail_view(
     // allowlist (the proxy that injects them runs only under one). Reproduce that check so the
     // count — and the note — match what `sbx app <name>` would actually inject; otherwise the
     // view over-reports credentials an app silently drops by narrowing its network.
-    let mut eff_secrets = baseline.declared_secrets.clone();
-    eff_secrets.extend(app.secrets.iter().cloned());
-    let mut secret_notes = Vec::new();
-    super::enforce_secret_posture(&eff_network, &mut eff_secrets, &mut secret_notes);
-    let secrets_dropped =
-        eff_secrets.is_empty() && !(baseline.declared_secrets.is_empty() && app.secrets.is_empty());
+    let (secrets_dropped, secret_notes) =
+        app_secret_posture(&baseline.declared_secrets, app, &eff_network);
     let mut notes = app.warnings.clone();
     notes.extend(secret_notes);
 
@@ -1873,7 +1948,7 @@ fn app_detail_view(
         cwd: cwd.display().to_string(),
         open: open_views(&eff_open),
         service: service_views(&eff_service),
-        cmd: (!app.cmd.is_empty()).then(|| app.cmd.join(" ")),
+        cmd: (!app.cmd.is_empty()).then(|| display_argv(&app.cmd)),
         cmd_origin: app.cmd_origin.into(),
         contract: contract_view(app),
         provisions: app
@@ -1881,7 +1956,7 @@ fn app_detail_view(
             .iter()
             .map(|p| AppProvisionView {
                 bundle: p.bundle.clone(),
-                cmd: p.argv.join(" "),
+                cmd: display_argv(&p.argv),
             })
             .collect(),
         home_scope: match app.home_scope {
@@ -1996,8 +2071,33 @@ fn shadows_baseline_secret(
     })
 }
 
+/// Whether a one-shot override (a `--config`/flag or an ambient `SBX_*`) set a baseline field.
+fn overridden(origin: super::Provenance) -> bool {
+    matches!(origin, super::Provenance::Override)
+}
+
+/// A field an app may replace, as `sbx app <name>` launches it, with its provenance: the app's own
+/// value when it set one, else the baseline's. A one-shot override is the exception either way: the
+/// launch applies it after the app's overlay, so a field it set holds the override's value even
+/// where the app set its own. `baseline` here already carries the override.
+fn launched_scalar<T: Clone>(
+    app: Option<&T>,
+    app_origin: super::Provenance,
+    baseline: &T,
+    baseline_origin: super::Provenance,
+) -> (T, ProvenanceView) {
+    match app {
+        Some(value) if !overridden(baseline_origin) => (value.clone(), app_origin.into()),
+        _ => (
+            baseline.clone(),
+            origin_or_inherited(false, app_origin, baseline_origin),
+        ),
+    }
+}
+
 /// A scalar app field's provenance for the detail view, as a three-way answer: the app layer that
-/// set it when the app did, else `Inherited` when a *baseline* layer set it, else `Default`.
+/// set it when the app did, else `Inherited` when a *baseline* layer set it, else `Default` — or
+/// `Override` when what the app inherits is a one-shot override's value.
 ///
 /// The last distinction is the one this view exists to make. Answering `Inherited` for everything
 /// the app left alone says "this value comes from your config" about ten fields nobody ever
@@ -2011,10 +2111,12 @@ fn origin_or_inherited(
 ) -> ProvenanceView {
     if app_set {
         app_origin.into()
-    } else if matches!(baseline_origin, super::Provenance::Default) {
-        ProvenanceView::Default
     } else {
-        ProvenanceView::Inherited
+        match baseline_origin {
+            super::Provenance::Default => ProvenanceView::Default,
+            super::Provenance::Override => ProvenanceView::Override,
+            _ => ProvenanceView::Inherited,
+        }
     }
 }
 
@@ -2092,6 +2194,126 @@ mod tests {
                 .count(),
             2,
             "both expanded group hosts carry their origin"
+        );
+    }
+
+    /// A folded `@<group>` row shows no pattern, so it carries the catch-all label when a rule it
+    /// folds matches every host — and only then, judged on that run of the group alone.
+    #[test]
+    fn a_folded_group_holding_a_catch_all_rule_is_labelled() {
+        use crate::allowlist::{EgressPolicy, classify};
+        let tagged = |entry: &str, group: &str| {
+            let mut rule = classify(entry).unwrap();
+            rule.group = Some(group.into());
+            rule
+        };
+        let policy = EgressPolicy::new(
+            vec![
+                tagged("a.example.com", "wide"),
+                tagged("re:.*", "wide"),
+                classify("api.example.com").unwrap(),
+                tagged("b.example.com", "narrow"),
+            ],
+            vec![],
+        );
+        let rows: Vec<_> = net_rules_view(&policy, false)
+            .into_iter()
+            .filter(|r| r.source == RuleSourceView::Config)
+            .map(|r| (r.rule, r.catch_all))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("@wide".to_string(), true),
+                ("https://api.example.com".to_string(), false),
+                ("@narrow".to_string(), false),
+            ]
+        );
+    }
+
+    /// The repeat spacing reads in the unit the other durations of `sbx config` use.
+    #[test]
+    fn notify_view_shows_the_repeat_spacing_in_its_largest_whole_unit() {
+        use crate::notify::{NotifyMode, NotifyPolicy};
+        use std::time::Duration;
+        let spaced = |secs: u64| {
+            notify_view(
+                &NotifyPolicy::uniform(NotifyMode::Always)
+                    .with_repeat_after(Some(Duration::from_secs(secs))),
+            )
+            .repeat_after
+        };
+        assert_eq!(spaced(300), "5m");
+        assert_eq!(spaced(7200), "2h");
+        assert_eq!(spaced(90), "90s");
+        assert_eq!(
+            notify_view(&NotifyPolicy::uniform(NotifyMode::Always)).repeat_after,
+            ""
+        );
+    }
+
+    /// An app whose network drops its credentials says so in the roster as in its detail view, in
+    /// the same words, since the two are what a reader compares.
+    #[test]
+    fn the_roster_notes_dropped_credentials_as_the_detail_view_does() {
+        let cfg = |text: &str| crate::config::schema::parse(text.as_bytes()).unwrap();
+        let resolved = crate::config::resolve(
+            cfg("network = \"deny\"\n\
+                 [app.demo]\n\
+                 cmd = [\"demo\"]\n\
+                 network = \"shared\"\n\
+                 [app.demo.secret.\"api.example.com\"]\n\
+                 from = \"env://DEMO_API_KEY\"\n\
+                 header = \"Authorization\"\n\
+                 type = \"bearer\"\n"),
+            None,
+            &Default::default(),
+        );
+        let app = &resolved.apps["demo"];
+        let roster = app_view(
+            "demo",
+            app,
+            &NetworkPolicy::Shared,
+            &resolved.declared_secrets,
+            &BTreeMap::new(),
+        );
+        let detail = app_detail_view(
+            std::path::Path::new("/proj"),
+            "demo",
+            app,
+            &resolved,
+            &BTreeMap::new(),
+        );
+        let dropped = |notes: &[String]| -> Vec<String> {
+            notes
+                .iter()
+                .filter(|n| n.contains("HTTP-header secret"))
+                .cloned()
+                .collect()
+        };
+        assert!(roster.secrets.is_empty());
+        assert_eq!(dropped(&roster.notes).len(), 1, "{:?}", roster.notes);
+        assert_eq!(dropped(&roster.notes), dropped(&detail.notes));
+    }
+
+    /// A command shows each word so it reads back as itself: one a shell would split, expand or
+    /// unquote is quoted, and a plain word stays bare.
+    #[test]
+    fn a_command_is_shown_with_the_words_a_shell_would_change_quoted() {
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            display_argv(&argv(&[
+                "npx",
+                "-y",
+                "@scope/pkg@1.2",
+                "--port=8080",
+                "a,b:c"
+            ])),
+            "npx -y @scope/pkg@1.2 --port=8080 a,b:c"
+        );
+        assert_eq!(
+            display_argv(&argv(&["bash", "-c", "echo 'hi' there", "", "$HOME", "*"])),
+            "bash -c 'echo '\\''hi'\\'' there' '' '$HOME' '*'"
         );
     }
 
@@ -2482,7 +2704,7 @@ mod tests {
             warnings: vec![],
             refusals: Vec::new(),
         };
-        let view = app_view("demo-app", &app, &NetworkPolicy::Shared, &pins);
+        let view = app_view("demo-app", &app, &NetworkPolicy::Shared, &[], &pins);
         assert_eq!(view.packages[0].name, "pinned-tool");
         assert_eq!(view.packages[0].pinned_rev.as_deref(), Some(rev));
     }
@@ -2585,6 +2807,87 @@ mod tests {
         let mut folded = vec![baseline];
         crate::config::secrets::upsert_secret(&mut folded, &mut warnings, "app demo", unrelated);
         assert_eq!(folded.len(), 2, "and the fold keeps both");
+    }
+
+    /// A launch applies a one-shot override after the app's overlay, so the detail view reports the
+    /// override's value, tagged `override`, for a field the app set as well as for one it inherits,
+    /// and what it reports matches the configuration that launch builds.
+    #[test]
+    fn the_detail_view_reports_an_override_over_the_apps_own_field_as_the_launch_applies_it() {
+        use crate::config::overrides::Override;
+        let cfg = |text: &str| crate::config::schema::parse(text.as_bytes()).unwrap();
+        let resolved = crate::config::resolve(
+            cfg("audio = false\n\
+                 [app.demo]\n\
+                 cmd = [\"demo\"]\n\
+                 gpu = true\n\
+                 dbus = true\n\
+                 [app.demo.limits]\n\
+                 tasks_max = \"8192\"\n\
+                 memory_max = \"8G\"\n\
+                 [app.demo.network]\n\
+                 mode = \"deny\"\n\
+                 allow = [\"api.example.com\"]\n"),
+            None,
+            &Default::default(),
+        );
+        let app = resolved.apps["demo"].clone();
+        let over = || {
+            Override::for_test(cfg("gpu = false\n\
+                                    audio = true\n\
+                                    [limits]\n\
+                                    tasks_max = \"512\"\n\
+                                    [network]\n\
+                                    mode = \"deny\"\n\
+                                    allow = [\"other.example.com\"]\n"))
+        };
+
+        let mut launched = resolved.clone();
+        launched.merge_app(app.clone());
+        launched.apply_override(over(), None).unwrap();
+        let mut baseline = resolved.clone();
+        baseline.apply_override(over(), None).unwrap();
+        let detail = app_detail_view(
+            std::path::Path::new("/proj"),
+            "demo",
+            &app,
+            &baseline,
+            &BTreeMap::new(),
+        );
+
+        assert!(
+            !launched.gpu && !detail.gpu,
+            "the app set gpu, the override closed it"
+        );
+        assert!(matches!(detail.gpu_origin, ProvenanceView::Override));
+        assert!(launched.audio && detail.audio, "inherited, then overridden");
+        assert!(matches!(detail.audio_origin, ProvenanceView::Override));
+        assert!(
+            launched.dbus && detail.dbus,
+            "the override left the app's own value"
+        );
+        assert!(matches!(detail.dbus_origin, ProvenanceView::Global));
+        assert_eq!(detail.limits.tasks_max.value, launched.limits.tasks_max().0);
+        assert_eq!(detail.limits.tasks_max.value, "512");
+        assert!(matches!(
+            detail.limits.tasks_max.origin,
+            ProvenanceView::Override
+        ));
+        assert_eq!(
+            detail.limits.memory_max.value,
+            launched.limits.memory_max().0
+        );
+        assert!(matches!(
+            detail.limits.memory_max.origin,
+            ProvenanceView::Global
+        ));
+        // The override's network replaces the app's after its read-by-default verbs were applied,
+        // so its rules carry no such narrowing.
+        assert_eq!(
+            serde_json::to_value(&detail.network).unwrap(),
+            serde_json::to_value(network_view(&launched.network)).unwrap()
+        );
+        assert!(matches!(detail.network_origin, ProvenanceView::Override));
     }
 
     #[test]

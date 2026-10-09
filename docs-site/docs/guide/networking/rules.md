@@ -565,6 +565,9 @@ ALLOWED  https://anything.example.test
   note: that rule matches every host — this URL is not what makes it pass
 ```
 
+A group that holds such a rule carries the label on its folded `@<group>` row, since that row
+shows no pattern at all; `--expand` then shows which member it is.
+
 The label is decided by asking the pattern itself, not by recognising `.*`: a rule is
 tested against sentinel URLs sharing no host, port, or path, and one that admits them
 all admits anything. It never changes a verdict: a catch-all rule is legitimate, it

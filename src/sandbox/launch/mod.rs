@@ -92,9 +92,9 @@ pub(crate) use session::{attach, stop};
 // `launch`", and these four are read from `sandbox` itself.
 pub(in crate::sandbox) use cage::{cage_command, status_code};
 pub(in crate::sandbox) use reclaim::{session_housekeeping, shared_store_gc};
-// The supervisor tests build `/bin/sh` scripts around fixture paths, and quote them the same way.
-#[cfg(test)]
-pub(in crate::sandbox) use startup::shell_quote;
+// The supervisor tests build `/bin/sh` scripts around fixture paths and quote them the same way,
+// and `sbx config` quotes a command's words with it for display.
+pub(crate) use startup::shell_quote;
 
 /// The hard prerequisites and per-launch resolution shared by `run` and `shell`:
 /// the engine, sbx's store layout, the current directory, the resolved
