@@ -879,7 +879,8 @@ impl GitRepo {
 
 /// Hold the global configuration the host's git reads, where the cage writes it at its own name: in
 /// the project, it can name a program your git runs in every repository, this one included, so it
-/// is read-only in the cage like `.git/config` ([`git_file`]). An absent one there is said rather
+/// is read-only in the cage like `.git/config` ([`git_file`]). One reached through a link where
+/// the cage writes refuses the launch ([`git_link_on_the_way`]). An absent one there is said rather
 /// than refused, since the cage could create it: what to do is to name a global configuration
 /// outside the project. In a read-write bind nothing is held ([`Reach::unheld`] warns instead).
 fn git_global_held(
@@ -889,6 +890,17 @@ fn git_global_held(
     refused: &mut Option<String>,
 ) {
     for file in &reach.git_global {
+        // A link on the way where the cage writes refuses, wherever it points, as an include's
+        // does: the cage could point it elsewhere and your git would read what it names.
+        if let Some(reason) = git_link_on_the_way(
+            reach,
+            file,
+            "the global configuration your git reads",
+            GIT_LINK_INSTEAD,
+        ) {
+            refused.get_or_insert(reason);
+            continue;
+        }
         let at = crate::trust::canonicalize_existing_prefix(file);
         if !reach.in_project(&at) {
             continue;
@@ -8248,6 +8260,31 @@ mod tests {
             vec![root.join("global.cfg")]
         });
         assert!(!e.readonly.iter().any(|m| m.path == root.join("global.cfg")));
+    }
+
+    /// A global git configuration the project names through a link refuses the launch, wherever
+    /// the link points: the cage could point it elsewhere, and the host's git would read that.
+    #[test]
+    fn a_global_git_configuration_reached_through_a_link_in_the_project_refuses() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp).canonicalize().unwrap();
+        if !git_repo_at(&root, &[]) {
+            skip_incapable!("skipping a global git configuration behind a link: no git");
+            return;
+        }
+        let outside = tmp.path().canonicalize().unwrap().join("dotfiles.cfg");
+        std::fs::write(&outside, b"[core]\n").unwrap();
+        std::fs::write(root.join("real.cfg"), b"[core]\n").unwrap();
+        for target in [root.join("real.cfg"), outside] {
+            let link = root.join(".gitconfig");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let e = expand_against(&root, &FsPolicy::default(), &[], None, |root| {
+                vec![root.join(".gitconfig")]
+            });
+            let why = e.refused.expect("a link the cage can repoint refuses");
+            assert!(why.contains(".gitconfig` is a symbolic link"), "{why}");
+        }
     }
 
     #[test]

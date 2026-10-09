@@ -402,9 +402,10 @@ the bind and the file. Bind a narrower directory, or that one read-only, to keep
 A global git configuration inside the project, which a launch in your home or a
 `GIT_CONFIG_GLOBAL` naming a project file makes, is held instead: it is read-only in the cage,
 like `.git/config`. git reads a relative `GIT_CONFIG_GLOBAL` from the top of the work tree it
-runs in, so for this project that is a file of the project. One that is absent there is not
-created: the launch warns that the cage could create it, and pointing `GIT_CONFIG_GLOBAL`
-outside the project closes it.
+runs in, so for this project that is a file of the project. One reached through a symbolic link
+in the project refuses the launch, wherever the link points, as an include does: the cage could
+point it elsewhere. One that is absent there is not created: the launch warns that the cage
+could create it, and pointing `GIT_CONFIG_GLOBAL` outside the project closes it.
 
 sbx's own data directory is written too, under other names: the cage's home at
 `/home/sandbox`, its store at `/nix` and the install pools all live in it. A read-only mount at
