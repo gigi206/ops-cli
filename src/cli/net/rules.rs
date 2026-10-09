@@ -49,16 +49,10 @@ pub(super) fn net_rules(args: &[OsString]) -> ExitCode {
                     diag::error("sbx: `--source` needs a value (config, builtin, session)");
                     return ExitCode::from(2);
                 };
-                source = Some(match v {
-                    "config" => RuleSourceView::Config,
-                    "builtin" => RuleSourceView::Builtin,
-                    // `session` is the live `--session`-answered overlay; `manual` is kept as an
-                    // accepted alias for the same source.
-                    "session" | "manual" => RuleSourceView::Manual,
-                    other => {
-                        diag::error(&format!(
-                            "sbx: unknown rule source '{other}' (known: config, builtin, session)"
-                        ));
+                source = Some(match rule_source(v) {
+                    Ok(s) => s,
+                    Err(message) => {
+                        diag::error(&message);
                         return ExitCode::from(2);
                     }
                 });
@@ -157,6 +151,23 @@ pub(super) fn net_rules(args: &[OsString]) -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     crate::cli::print_document(&render_net_rules(mode, &scope, &shown, total, &pal));
     ExitCode::SUCCESS
+}
+
+/// The rule source a `--source` value names, or the usage error that refuses it. The refused value
+/// is quoted in its `Debug` form: [`diag::error`] keeps line breaks, and a value carrying one would
+/// put a line of its own on stderr.
+fn rule_source(value: &str) -> Result<config::view::RuleSourceView, String> {
+    use config::view::RuleSourceView;
+    match value {
+        "config" => Ok(RuleSourceView::Config),
+        "builtin" => Ok(RuleSourceView::Builtin),
+        // `session` is the live `--session`-answered overlay; `manual` is kept as an accepted alias
+        // for the same source.
+        "session" | "manual" => Ok(RuleSourceView::Manual),
+        other => Err(format!(
+            "sbx: unknown rule source {other:?} (known: config, builtin, session)"
+        )),
+    }
 }
 
 /// The live overlay rules the sessions `pids` carry, merged and deduped, and whether any of them
@@ -1137,6 +1148,19 @@ mod tests {
         assert!(
             out.starts_with("loaded allow rule `re:^a b` into 1 live session(s):"),
             "{out:?}"
+        );
+    }
+
+    /// A refused `--source` value stays on the one line of the usage error that names it.
+    #[test]
+    fn a_refused_rule_source_is_quoted_on_one_line() {
+        assert!(matches!(
+            rule_source("session"),
+            Ok(config::view::RuleSourceView::Manual)
+        ));
+        assert_eq!(
+            rule_source("a\nsbx: FAKE").err().as_deref(),
+            Some("sbx: unknown rule source \"a\\nsbx: FAKE\" (known: config, builtin, session)")
         );
     }
 
