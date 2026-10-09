@@ -348,35 +348,44 @@ pub(super) const DISTRO_SUPPLIED: &[&str] = &[
 /// `etc/passwd` would otherwise land on the host's. The same holds for the paths *this* function
 /// writes, which are not the image's, and the walk has to precede the "does the image carry it?"
 /// question because `symlink_metadata` on the destination answers about wherever the link points.
+///
+/// The directory the walk checked is held by its descriptor, and the question and the creation are
+/// both put to it: a name above the destination exchanged in between reaches neither. The leaf is
+/// created without following a link, `O_EXCL` for a file, so one appearing between the question
+/// and the creation is an existing entry left alone rather than a path written through.
 pub(super) fn create_distro_mountpoints(rootfs: &Path) -> io::Result<()> {
     for (path, kind) in DISTRO_MOUNTPOINTS {
         let rel = path.trim_start_matches('/');
         let (parent_rel, name) = rel.rsplit_once('/').map_or(("", rel), |(p, n)| (p, n));
         let parent =
-            crate::sandbox::cagedir::ensure_under(rootfs, parent_rel, 0o755).map_err(|e| {
+            crate::sandbox::cagedir::hold_under(rootfs, parent_rel, 0o755).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!("cannot make the mountpoint `{path}`: {e}"),
                 )
             })?;
-        let dest = parent.join(name);
-        if dest.symlink_metadata().is_ok() {
-            continue;
+        let name = std::ffi::OsStr::new(name);
+        match crate::sandbox::attach::lstat_at(&parent, name) {
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
-        match kind {
+        let dest = crate::sandbox::cagedir::entry(&parent, name)?;
+        let created = match kind {
             Mountpoint::Dir => {
                 use std::os::unix::fs::DirBuilderExt as _;
-                std::fs::DirBuilder::new()
-                    .mode(0o755)
-                    .create(&dest)
-                    .or_else(|e| match e.kind() {
-                        io::ErrorKind::AlreadyExists => Ok(()),
-                        _ => Err(e),
-                    })?;
+                std::fs::DirBuilder::new().mode(0o755).create(&dest)
             }
-            Mountpoint::File => {
-                std::fs::File::create(&dest)?;
-            }
+            Mountpoint::File => std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest)
+                .map(drop),
+        };
+        match created {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(())
