@@ -1869,6 +1869,61 @@ fn a_hosts_file_that_cannot_be_written_refuses_the_task() {
     );
 }
 
+/// A cage path that climbs out of the mount it names has no host counterpart: joined onto the
+/// mount's source, its `..` would name a host file outside the mount, which the cage would resolve
+/// in its own tree instead.
+#[test]
+fn a_cage_path_climbing_out_of_its_mount_has_no_host_counterpart() {
+    let root = crate::testutil::TmpDir::new();
+    let task = task();
+    let engine = engine_with_project(root.path(), vec![task.clone()]);
+    let project = engine.project.clone();
+    assert_eq!(
+        engine.host_path(&project.join("bin/run.sh"), &task),
+        Some(project.join("bin/run.sh"))
+    );
+    assert_eq!(
+        engine.host_path(&project.join("../outside/secret"), &task),
+        None
+    );
+    assert_eq!(
+        engine.host_path(&project.join("bin/./run.sh"), &task),
+        Some(project.join("bin/run.sh"))
+    );
+}
+
+/// The hosts file a networked invocation writes is one its files guard removes: the two derive the
+/// path from one place, and the file goes when the guard does.
+#[test]
+fn the_hosts_file_of_an_invocation_goes_when_it_ends() {
+    let data = crate::testutil::TmpDir::new();
+    let (rules, tcp) = tcp_plan("tcp://db.internal:5432");
+    let mut networked = task();
+    networked.network = rules;
+    let engine = engine_at(data.path(), vec![networked.clone()]);
+    std::fs::create_dir_all(data.join("egress")).expect("the egress directory");
+    // This test's own number: the pid in the name is shared with every other test in the binary.
+    let invocation = 9_000_002;
+    let files = engine.invocation_files(invocation);
+    engine
+        .build_spec(
+            vec![OsString::from("psql")],
+            &engine.base_env,
+            &networked,
+            &Invocation {
+                number: invocation,
+                proxy_binds: &[],
+                tcp: &tcp,
+                output: None,
+            },
+        )
+        .expect("the spec");
+    let hosts = engine.invocation_file("hosts", invocation);
+    assert!(hosts.exists(), "the spec writes the hosts file");
+    drop(files);
+    assert!(!hosts.exists(), "the guard removes it");
+}
+
 /// A task that declares a tool gets the pool — read-only, at the path the install used — and
 /// that tool's directory at the *front* of its `PATH`. Read-only is the point: the pool is what
 /// makes a `mise:` tool's provenance trustworthy, and a writable one would give that back.
