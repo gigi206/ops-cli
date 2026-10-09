@@ -463,6 +463,13 @@ fn split_one_rule(
         }
     };
     let rule = match parsed.positionals.as_slice() {
+        // A rule that is nothing but space names nothing: refused here, on the add and the remove
+        // path alike, rather than reported by the grammar on one and as a removal that found
+        // nothing on the other.
+        [r] if r.trim().is_empty() => {
+            diag::error(&format!("sbx: {namespace} {verb}: the rule is empty"));
+            return Err(ExitCode::from(2));
+        }
         [r] => r.trim().to_string(),
         [] => {
             diag::error(&format!(
@@ -2348,6 +2355,28 @@ mod tests {
     fn a_refused_interval_is_quoted_escaped() {
         let why = interval_seconds(Some(&OsString::from("\u{1b}[31mred"))).unwrap_err();
         assert!(!why.contains('\u{1b}') && why.contains("\\u{1b}"), "{why}");
+    }
+
+    /// A rule that is nothing but space is refused as empty on the remove path as on the add path:
+    /// it names nothing, and a removal reporting that it found nothing to remove would read as a
+    /// rule that was simply absent.
+    #[test]
+    fn a_rule_of_only_space_is_refused_on_every_path() {
+        for (namespace, verb) in [
+            ("net", "allow"),
+            ("net", "unallow"),
+            ("proc", "allow"),
+            ("proc", "unallow"),
+        ] {
+            assert!(
+                matches!(
+                    split_one_rule(namespace, verb, &[OsString::from("   ")]),
+                    Err(code) if code == ExitCode::from(2)
+                ),
+                "{namespace} {verb}"
+            );
+        }
+        assert!(split_one_rule("net", "unallow", &[OsString::from(" a.test ")]).is_ok());
     }
 
     /// A registry that cannot be read leaves the scope of a `--session` load unknown, and the load
