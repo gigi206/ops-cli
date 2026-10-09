@@ -1194,6 +1194,24 @@ fn net_pending_drain_and_save(
 mod tests {
     use super::*;
 
+    /// `-a <app>` on `net pending`, with a session registry that cannot be read, reports the registry
+    /// instead of an empty listing that would read as the app having nothing parked. Without the filter
+    /// the registry only labels the listing, and the gather goes ahead.
+    #[test]
+    fn an_app_filter_the_registry_cannot_resolve_is_refused_by_net_pending() {
+        use crate::testutil::TmpDir;
+        let data = TmpDir::new();
+        std::fs::write(data.join("sessions"), b"not a directory").unwrap();
+        let why = collect_pending(data.path(), Some("demo"))
+            .err()
+            .expect("the app's sessions are not known");
+        assert!(
+            why.contains("cannot read the session registry") && why.contains("`demo`"),
+            "{why}"
+        );
+        assert!(collect_pending(data.path(), None).is_ok());
+    }
+
     /// `--app <name>` on an answer by id: a session the registry knows as another app is refused,
     /// one it does not know is given the benefit of the doubt, and an unreadable registry is that
     /// doubt only when nothing is saved. With `--save` the name picks the config the rule is
