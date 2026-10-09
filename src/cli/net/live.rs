@@ -53,24 +53,25 @@ fn parse_live_args(args: &[OsString]) -> Result<LiveArgs, String> {
 /// gather behind each `net live` tick. No launch / nix / network.
 ///
 /// A session that was reached and did not answer in full comes back in [`Swept::unread`], scoped
-/// the same way, and each tick names it in its frame.
+/// the same way, and each tick names it in its frame. `Err` is the line to print when `app` is set
+/// and the registry cannot say which sessions run it: an empty frame would claim the app has no
+/// tunnel open.
 ///
 /// [`Swept::unread`]: sandbox::control::Swept::unread
 fn collect_flows(
     data_dir: &Path,
     app: Option<&str>,
-) -> (
-    sandbox::control::Swept<sandbox::control::SessionFlows>,
-    Vec<(u32, PathBuf, String)>,
-) {
+) -> Result<super::Gathered<sandbox::control::SessionFlows>, String> {
+    let app_pids = app
+        .map(|name| session_pids_for_app(data_dir, name))
+        .transpose()?;
     let mut swept = sandbox::control::flows_all(data_dir);
-    if let Some(name) = app {
-        let pids = session_pids_for_app(data_dir, name);
+    if let Some(pids) = app_pids {
         swept.read.retain(|s| pids.contains(&s.pid));
         swept.unread.retain(|(pid, _)| pids.contains(pid));
     }
     let context = pending_session_context(data_dir);
-    (swept, context)
+    Ok((swept, context))
 }
 
 /// Render a flow's age compactly: `12s`, `3m04s`, `2h05m`.
@@ -240,7 +241,13 @@ pub(super) fn net_live(args: &[OsString]) -> ExitCode {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let (swept, context) = collect_flows(&data_dir, parsed.app.as_deref());
+        let (swept, context) = match collect_flows(&data_dir, parsed.app.as_deref()) {
+            Ok(collected) => collected,
+            Err(message) => {
+                diag::error(&message);
+                return ExitCode::FAILURE;
+            }
+        };
         // Build this tick's frame, then write it once — a broken downstream pipe (`… | head`) is
         // detected on the single write and ends the view cleanly (Rust ignores SIGPIPE).
         let mut out = std::io::stdout().lock();

@@ -12,10 +12,10 @@ use std::time::Duration;
 
 use crate::cli::logs;
 use crate::{
-    ALL_NEEDS_SESSION, SESSION_IGNORES_FILE_SCOPE, egress_dir_or_fail, format_log_time, in_scope,
-    interval_seconds, persist_proc_rule, removal_takes_no_session_flags, report_rule_write,
-    resolve_session_target, session_pids_for_app, session_pids_for_project, session_scope_pids,
-    split_one_rule, split_scope, split_session_flags,
+    ALL_NEEDS_SESSION, SESSION_IGNORES_FILE_SCOPE, ScopeFilter, egress_dir_or_fail,
+    format_log_time, in_scope, interval_seconds, persist_proc_rule, pids_of_app,
+    removal_takes_no_session_flags, report_rule_write, resolve_session_target, session_scope_pids,
+    sessions_of_project, split_one_rule, split_scope, split_session_flags,
 };
 use crate::{
     config, config_cwd, diag, help, layout_or_fail, live_sessions, observe, proc_policy, sandbox,
@@ -317,7 +317,7 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
         Err(code) => return code,
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let project_pids = if all {
+    let project = if all {
         None
     } else {
         // Refused, not swallowed. `None` here means "no filter", so an identity that could not be
@@ -325,7 +325,7 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
         // them — which is what `--all` is for asking. Its two siblings (`sbx proc pending` above and
         // `sbx net rules`) already refuse; this one used `.ok()`.
         match sandbox::project_identity(&cwd) {
-            Ok((_, canonical)) => Some(session_pids_for_project(&data_dir, &canonical)),
+            Ok((_, canonical)) => Some(canonical),
             Err(e) => {
                 diag::error(&format!(
                     "sbx: cannot resolve the current project directory: {e}"
@@ -335,15 +335,19 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
             }
         }
     };
-    let app_pids = parsed
-        .app
-        .as_deref()
-        .map(|n| session_pids_for_app(&data_dir, n));
-
+    // One read of the registry serves the listing and both filters, so a registry that cannot be
+    // read is said once, as the error it is, before any filter could narrow the listing to nothing.
     let sessions = match live_sessions(&data_dir) {
         Ok(s) => s,
         Err(code) => return code,
     };
+    let project_pids: ScopeFilter = project.map(|canonical| {
+        sessions_of_project(&sessions, &canonical)
+            .into_iter()
+            .map(|s| s.pid)
+            .collect()
+    });
+    let app_pids: ScopeFilter = parsed.app.as_deref().map(|n| pids_of_app(&sessions, n));
     let mut rows: Vec<(u32, &'static str, String)> = Vec::new();
     // A session with no exec supervisor has no socket to connect to and holds no rule; one that was
     // reached and did not answer in full may hold some, so it is named rather than left out.

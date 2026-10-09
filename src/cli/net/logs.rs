@@ -145,24 +145,25 @@ fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
 /// view is what makes that sequence contiguous again. What the reader sees is decided in
 /// [`filtered_log_events`], which drops the muted events unless `--all` asked for them.
 ///
-/// `follow` names the `--follow` reader this listing seeds, `None` for the one-shot listing.
+/// `follow` names the `--follow` reader this listing seeds, `None` for the one-shot listing. `Err`
+/// is the line to print when `app` is set and the registry cannot say which sessions run it: an
+/// empty listing would claim the app logged nothing.
 fn collect_logs(
     data_dir: &Path,
     app: Option<&str>,
     with_capture: bool,
     follow: Option<sandbox::control::Follow>,
-) -> (
-    sandbox::control::Swept<sandbox::control::SessionLog>,
-    Vec<(u32, PathBuf, String)>,
-) {
+) -> Result<super::Gathered<sandbox::control::SessionLog>, String> {
+    let app_pids = app
+        .map(|name| session_pids_for_app(data_dir, name))
+        .transpose()?;
     let mut swept = sandbox::control::log_all(data_dir, true, with_capture, follow);
-    if let Some(name) = app {
-        let pids = session_pids_for_app(data_dir, name);
+    if let Some(pids) = app_pids {
         swept.read.retain(|s| pids.contains(&s.pid));
         swept.unread.retain(|(pid, _)| pids.contains(pid));
     }
     let context = pending_session_context(data_dir);
-    (swept, context)
+    Ok((swept, context))
 }
 
 /// Whether one event passes the ongoing `--host`/`--verdict` filters (the `-n` limit is separate —
@@ -252,7 +253,14 @@ pub(super) fn net_logs(args: &[OsString]) -> ExitCode {
         return net_logs_follow(&data_dir, &view, &pal);
     }
 
-    let (swept, context) = collect_logs(&data_dir, view.app.as_deref(), view.wants_capture(), None);
+    let (swept, context) =
+        match collect_logs(&data_dir, view.app.as_deref(), view.wants_capture(), None) {
+            Ok(collected) => collected,
+            Err(message) => {
+                diag::error(&message);
+                return ExitCode::FAILURE;
+            }
+        };
     let sessions = swept.read;
     warn_unanswered_logs(&swept.unread);
     let listed = if swept.unread.is_empty() {
@@ -352,12 +360,18 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     // Seed: the current listing (human render, or NDJSON of the retained events), respecting `-n`.
     // Only actual events are written — the one-shot's "nothing to show" line is skipped, so a follow
     // that pipes to `head` on an idle session emits no spurious line then spins.
-    let (swept, context) = collect_logs(
+    let (swept, context) = match collect_logs(
         data_dir,
         view.app.as_deref(),
         view.wants_capture(),
         Some(follow),
-    );
+    ) {
+        Ok(collected) => collected,
+        Err(message) => {
+            diag::error(&message);
+            return ExitCode::FAILURE;
+        }
+    };
     // Named for the seed, and again by a poll only when a session stops answering after it had
     // answered: a session that goes on not answering is named once, not on every round.
     warn_unanswered_logs(&swept.unread);
@@ -421,7 +435,15 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
         let context = pending_session_context(data_dir);
         let mut pids = sandbox::control::session_pids(data_dir);
         if let Some(name) = view.app.as_deref() {
-            let allowed = session_pids_for_app(data_dir, name);
+            // The registry was read for the seed; one that cannot be read now ends the follow
+            // rather than going on as if the app's sessions had all ended.
+            let allowed = match session_pids_for_app(data_dir, name) {
+                Ok(allowed) => allowed,
+                Err(message) => {
+                    diag::error(&message);
+                    return ExitCode::FAILURE;
+                }
+            };
             pids.retain(|p| allowed.contains(p));
         }
 

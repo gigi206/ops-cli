@@ -897,13 +897,12 @@ fn asked_sessions(data_dir: &Path) -> Result<Vec<session::Session>, String> {
         .map_err(|e| format!("cannot read the session registry: {e}"))
 }
 
-/// The live sessions for a command that only shows them or narrows a listing by them. A registry
-/// that cannot be read is said as a warning, once per data directory however many of the helpers
-/// below one command calls, and then answers as no sessions: every reader here labels or filters by
-/// what a record says, so the empty answer leaves a listing unlabelled or narrowed to nothing, and
-/// the warning is what tells that apart from a machine with no sessions. A reader whose answer
-/// would choose where a write lands, or whether a live rule load counts as done, asks
-/// [`asked_sessions`] and refuses instead.
+/// The live sessions for a command that only labels what it shows by them. A registry that cannot
+/// be read is said as a warning, once per data directory however many times one command asks, and
+/// then answers as no sessions, which leaves the listing unlabelled rather than wrong. A reader that
+/// *selects* by what a record says — a `-a <app>` or project filter, a write's target, the scope of
+/// a live rule load — asks [`asked_sessions`] and refuses instead: an empty selection would read as
+/// a complete answer that there was nothing to show, answer or load.
 fn sessions_or_warn(data_dir: &Path) -> Vec<session::Session> {
     asked_sessions(data_dir).unwrap_or_else(|why| {
         say_unread_registry(data_dir, &why);
@@ -923,8 +922,7 @@ fn say_unread_registry(data_dir: &Path, why: &str) {
         .unwrap_or(true);
     if first {
         diag::warn(&format!(
-            "{why} — no session's project or app is known, so a session is listed without them \
-             and a filter by either selects none"
+            "{why} — no session's project or app is known, so a session is listed without them"
         ));
     }
 }
@@ -955,9 +953,15 @@ fn pending_session_context(data_dir: &Path) -> Vec<(u32, PathBuf, String)> {
 /// The live-session pids that belong to app `name` (an `sbx app <name>` session), from the registry
 /// — the basis for scoping `sbx net pending` to one app. A session not in the registry (a race, or a
 /// plain shell) has no known app, so under a filter it is excluded: scoping to an app shows only
-/// sessions the registry confirms are that app.
-fn session_pids_for_app(data_dir: &Path, name: &str) -> std::collections::HashSet<u32> {
-    pids_of_app(&sessions_or_warn(data_dir), name)
+/// sessions the registry confirms are that app. `Err` is the line to print when the registry could
+/// not be read, so the caller refuses rather than reporting that the app has nothing.
+fn session_pids_for_app(
+    data_dir: &Path,
+    name: &str,
+) -> Result<std::collections::HashSet<u32>, String> {
+    asked_sessions(data_dir)
+        .map(|live| pids_of_app(&live, name))
+        .map_err(|why| format!("sbx: {why} — which sessions run app `{name}` is not known"))
 }
 
 /// The app a session pid runs as (`sbx app <name>`), from the registry — `Ok(None)` if the session
@@ -975,13 +979,18 @@ fn session_app_of(data_dir: &Path, pid: u32) -> Result<Option<String>, String> {
 /// basis for scoping `sbx net pending` to the current project. The match is `s.project == project`,
 /// the exact comparison the launch path records and `sbx gc` already uses (both sides go through
 /// [`sandbox::project_identity`]), so a session and its project never disagree. A session not in the
-/// registry has no known project, so under a filter it is excluded.
-fn session_pids_for_project(data_dir: &Path, project: &Path) -> std::collections::HashSet<u32> {
-    let live = sessions_or_warn(data_dir);
-    sessions_of_project(&live, project)
+/// registry has no known project, so under a filter it is excluded. `Err` is the line to print when
+/// the registry could not be read, as for [`session_pids_for_app`].
+fn session_pids_for_project(
+    data_dir: &Path,
+    project: &Path,
+) -> Result<std::collections::HashSet<u32>, String> {
+    let live = asked_sessions(data_dir)
+        .map_err(|why| format!("sbx: {why} — which sessions run in this project is not known"))?;
+    Ok(sessions_of_project(&live, project)
         .into_iter()
         .map(|s| s.pid)
-        .collect()
+        .collect())
 }
 
 /// The pids one `--session` scope filter selects, or `None` when that filter is not active — the
@@ -1023,7 +1032,7 @@ fn session_scope_pids(
     }
     let live = asked_sessions(data_dir).map_err(|why| {
         diag::error(&format!(
-            "sbx: {why} — which sessions are in scope is not known, so nothing was loaded"
+            "sbx: {why} — which sessions are in scope is not known"
         ));
         ExitCode::FAILURE
     })?;
@@ -2267,14 +2276,16 @@ mod tests {
             .expect("register the session");
 
         // The filter returns this app's live pid...
-        let pids = session_pids_for_app(data.path(), "demo-app");
+        let pids = session_pids_for_app(data.path(), "demo-app").unwrap();
         assert!(
             pids.contains(&std::process::id()),
             "the app's live session must be selected: {pids:?}"
         );
         // ...and nothing for a different app, so an `--all -a other` drain excludes this session.
         assert!(
-            session_pids_for_app(data.path(), "other").is_empty(),
+            session_pids_for_app(data.path(), "other")
+                .unwrap()
+                .is_empty(),
             "a different app must select no session"
         );
     }
@@ -2303,13 +2314,17 @@ mod tests {
         // Filtering by the same cwd (resolved the same way) selects this session...
         let here = sandbox::project_identity(proj.path()).unwrap().1;
         assert!(
-            session_pids_for_project(data.path(), &here).contains(&std::process::id()),
+            session_pids_for_project(data.path(), &here)
+                .unwrap()
+                .contains(&std::process::id()),
             "this project's live session must be selected"
         );
         // ...and a different project selects nothing (so a local bulk save there drains zero).
         let elsewhere = sandbox::project_identity(other.path()).unwrap().1;
         assert!(
-            session_pids_for_project(data.path(), &elsewhere).is_empty(),
+            session_pids_for_project(data.path(), &elsewhere)
+                .unwrap()
+                .is_empty(),
             "a different project must select no session"
         );
     }
@@ -2348,9 +2363,13 @@ mod tests {
         let why = session_app_of(data.path(), std::process::id())
             .expect_err("the app check cannot be made");
         assert!(why.contains("cannot read the session registry"), "{why}");
-        // A listing narrows to nothing, after the warning, rather than failing.
-        assert!(session_pids_for_project(data.path(), proj.path()).is_empty());
-        assert!(session_pids_for_app(data.path(), "demo-app").is_empty());
+        // A filter cannot be applied either: it reports the registry instead of selecting none.
+        let why = session_pids_for_project(data.path(), proj.path())
+            .expect_err("this project's sessions are not known");
+        assert!(why.contains("cannot read the session registry"), "{why}");
+        let why = session_pids_for_app(data.path(), "demo-app")
+            .expect_err("the app's sessions are not known");
+        assert!(why.contains("`demo-app`"), "{why}");
     }
 
     /// `sbx proc ls`, `sbx proc live` and `sbx proc logs` are one family, so "no id" has to mean the

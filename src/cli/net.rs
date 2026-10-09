@@ -112,6 +112,11 @@ fn net_groups(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// What one sweep of the live control sockets hands a listing: the sessions it reached, and the
+/// registry context `(pid, project, label)` their headers are written from. Shared by the gathers
+/// of `net pending`, `net logs` and `net live`, which differ only in what each session answers.
+type Gathered<T> = (sandbox::control::Swept<T>, Vec<(u32, PathBuf, String)>);
+
 /// One session's header line: `session <pid> [<agent>] <project>`, or `session <pid>
 /// (unregistered)` when the registry does not know it.
 ///

@@ -24,23 +24,24 @@ use super::{write_session_header, write_unanswered};
 /// Query the live control sockets for the parked requests, scoped to one app's session(s) when
 /// `app` is set, and pair them with their registry context (`(pid, project, label)`). The shared
 /// gather step behind both the one-shot listing and the `watch` loop. No launch / nix / network.
+/// `Err` is the line to print when `app` is set and the registry cannot say which sessions run it:
+/// an empty listing would claim nothing is parked there.
 fn collect_pending(
     data_dir: &Path,
     app: Option<&str>,
-) -> (
-    sandbox::control::Swept<sandbox::control::SessionPending>,
-    Vec<(u32, PathBuf, String)>,
-) {
-    let mut swept = sandbox::control::list_all(data_dir);
+) -> Result<super::Gathered<sandbox::control::SessionPending>, String> {
     // `--app <name>` scopes the listing to that app's session(s) (the registry maps pid → app),
     // the ones that did not answer as well as the ones that did.
-    if let Some(name) = app {
-        let pids = session_pids_for_app(data_dir, name);
+    let app_pids = app
+        .map(|name| session_pids_for_app(data_dir, name))
+        .transpose()?;
+    let mut swept = sandbox::control::list_all(data_dir);
+    if let Some(pids) = app_pids {
         swept.read.retain(|s| pids.contains(&s.pid));
         swept.unread.retain(|(pid, _)| pids.contains(pid));
     }
     let context = pending_session_context(data_dir);
-    (swept, context)
+    Ok((swept, context))
 }
 
 /// The rule string that matches the destination just answered, port included. A host-level rule
@@ -114,7 +115,13 @@ pub(super) fn net_pending_list(args: &[OsString]) -> ExitCode {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let (swept, context) = collect_pending(&data_dir, app.as_deref());
+    let (swept, context) = match collect_pending(&data_dir, app.as_deref()) {
+        Ok(collected) => collected,
+        Err(message) => {
+            diag::error(&message);
+            return ExitCode::FAILURE;
+        }
+    };
     let sessions = swept.read;
     for (pid, e) in &swept.unread {
         crate::cli::warn_unanswered("net pending", *pid, e, "what it has parked is not listed");
@@ -243,7 +250,13 @@ pub(super) fn net_pending_watch(args: &[OsString]) -> ExitCode {
     let (dim, r) = (pal.dim, pal.reset);
     let secs = parsed.interval.as_secs();
     loop {
-        let (swept, context) = collect_pending(&data_dir, parsed.app.as_deref());
+        let (swept, context) = match collect_pending(&data_dir, parsed.app.as_deref()) {
+            Ok(collected) => collected,
+            Err(message) => {
+                diag::error(&message);
+                return ExitCode::FAILURE;
+            }
+        };
         let body = render_pending(
             &swept.read,
             &swept.unread,
@@ -755,10 +768,21 @@ fn net_pending_answer_all(
         Ok(d) => d,
         Err(code) => return code,
     };
-    let context = pending_session_context(&data_dir);
     // `--app <name>` scopes the drain to that app's session pids (from the registry); an unregistered
-    // session has no known app, so it is excluded under a filter.
-    let app_pids = app.map(|name| session_pids_for_app(&data_dir, name));
+    // session has no known app, so it is excluded under a filter. A registry that cannot be read is
+    // refused before anything is answered, rather than draining nothing and reporting the app had
+    // nothing parked.
+    let app_pids = match app
+        .map(|name| session_pids_for_app(&data_dir, name))
+        .transpose()
+    {
+        Ok(pids) => pids,
+        Err(message) => {
+            diag::error(&message);
+            return ExitCode::FAILURE;
+        }
+    };
+    let context = pending_session_context(&data_dir);
     let drain = drain_sessions(&data_dir, verdict, session, |pid| {
         app_pids.as_ref().is_none_or(|pids| pids.contains(&pid))
     });
@@ -1039,11 +1063,25 @@ fn net_pending_drain_and_save(
     };
 
     // Two composing pid filters: the project (a `--local` save) and the app (`-a`). A session must
-    // pass every active filter to be drained.
-    let app_pids = app.map(|name| session_pids_for_app(&data_dir, name));
-    let project_pids = project_canonical
-        .as_deref()
-        .map(|canon| session_pids_for_project(&data_dir, canon));
+    // pass every active filter to be drained. A registry that cannot be read leaves either unknown,
+    // and is refused before the drain, which cannot be taken back.
+    let filters = app
+        .map(|name| session_pids_for_app(&data_dir, name))
+        .transpose()
+        .and_then(|app_pids| {
+            let project_pids = project_canonical
+                .as_deref()
+                .map(|canon| session_pids_for_project(&data_dir, canon))
+                .transpose()?;
+            Ok((app_pids, project_pids))
+        });
+    let (app_pids, project_pids) = match filters {
+        Ok(filters) => filters,
+        Err(message) => {
+            diag::error(&message);
+            return ExitCode::FAILURE;
+        }
+    };
 
     let context = pending_session_context(&data_dir);
     // Both filters must pass: `--app` and `--local` compose rather than override, so a session is
