@@ -1517,16 +1517,19 @@ fn persist_egress_rule(
         })?;
     }
 
+    // Shown escaped: a `re:` pattern may carry a character that reorders a line, which the grammar
+    // admits and a terminal would act on. The rule is written and compared as given.
+    let shown = diag::visible(rule);
     Ok(match written.outcome {
         AddOutcome::AlreadyPresent => {
-            format!("{verb} {rule} is already present in {target} — no change")
+            format!("{verb} {shown} is already present in {target} — no change")
         }
         AddOutcome::Added { created_mode } => {
             let mut msg = match created_mode {
                 Some(mode) => {
-                    format!("set network mode `{mode}` and added {verb} {rule} to {target}")
+                    format!("set network mode `{mode}` and added {verb} {shown} to {target}")
                 }
-                None => format!("added {verb} {rule} to {target}"),
+                None => format!("added {verb} {shown} to {target}"),
             };
             if gated {
                 msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
@@ -1583,14 +1586,17 @@ fn persist_proc_rule(
         })?;
     }
 
+    let shown = diag::visible(rule);
     Ok(match written.outcome {
         AddOutcome::AlreadyPresent => {
-            format!("{verb} {rule} is already present in {target} — no change")
+            format!("{verb} {shown} is already present in {target} — no change")
         }
         AddOutcome::Added { created_mode } => {
             let mut msg = match created_mode {
-                Some(mode) => format!("set proc mode `{mode}` and added {verb} {rule} to {target}"),
-                None => format!("added {verb} {rule} to {target}"),
+                Some(mode) => {
+                    format!("set proc mode `{mode}` and added {verb} {shown} to {target}")
+                }
+                None => format!("added {verb} {shown} to {target}"),
             };
             if gated {
                 msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
@@ -1652,12 +1658,13 @@ fn persist_fs_mask(
         })?;
     }
 
+    let shown = diag::visible(entry);
     Ok(match written.outcome {
         AddOutcome::AlreadyPresent => {
-            format!("{verb} {entry} is already present in {target} — no change")
+            format!("{verb} {shown} is already present in {target} — no change")
         }
         AddOutcome::Added { .. } => {
-            let mut msg = format!("added {verb} {entry} to {target}");
+            let mut msg = format!("added {verb} {shown} to {target}");
             if gated {
                 msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
             }
@@ -1796,8 +1803,9 @@ fn persist_removal<E: std::fmt::Display>(
 
     let outcome = remove(&path, app_key).map_err(|e| (2, e.to_string()))?;
 
+    let shown = diag::visible(rule);
     match outcome {
-        RemoveOutcome::NotPresent => Ok(format!("{noun} {rule} was not in {target} — no change")),
+        RemoveOutcome::NotPresent => Ok(format!("{noun} {shown} was not in {target} — no change")),
         RemoveOutcome::Removed { text, .. } => {
             // Re-trust only after an actual change (the file bytes changed). Fail-safe ordering: a
             // crash between the write and the trust leaves a correct-but-untrusted file the next
@@ -1816,7 +1824,7 @@ fn persist_removal<E: std::fmt::Display>(
                     )
                 })?;
             }
-            let mut msg = format!("removed {noun} {rule} from {target}");
+            let mut msg = format!("removed {noun} {shown} from {target}");
             if gated {
                 msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
             }
@@ -2442,6 +2450,43 @@ mod tests {
             .unwrap(),
             Some("nix (Nix) 2.31.0".to_string())
         );
+    }
+
+    /// The line reporting a rule's write names the rule escaped, on the add and the remove path:
+    /// a `re:` pattern may carry a character that reorders a line, which the grammar admits and a
+    /// terminal would act on. The rule is written and compared as given.
+    #[test]
+    fn a_written_rule_is_named_escaped_in_the_report() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        use config::manage::{EgressList, Scope};
+        let _env = env_lock();
+        let home = TmpDir::new();
+        let _config = EnvVar::set("XDG_CONFIG_HOME", home.join("config"));
+        let rule = "re:^https://a\\.test/\u{202e}x";
+        assert!(
+            admit_egress_rule(rule, EgressList::Allow.slot()).is_ok(),
+            "the grammar admits the character, which is what makes the escape matter"
+        );
+        let added = persist_egress_rule(EgressList::Allow, rule, &Scope::Global, None, home.path())
+            .expect("the rule is written");
+        let removed = persist_removal(
+            "net",
+            ("unallow", "allow"),
+            rule,
+            &Scope::Global,
+            None,
+            home.path(),
+            |path, app_key| {
+                config::manage::remove_egress_rule(path, app_key, EgressList::Allow, rule)
+            },
+        )
+        .expect("the rule is removed");
+        for line in [&added, &removed] {
+            assert!(
+                !line.contains('\u{202e}') && line.contains("\\u{202e}"),
+                "{line}"
+            );
+        }
     }
 
     /// A registry that cannot be read leaves the scope of a `--session` load unknown, and the load
