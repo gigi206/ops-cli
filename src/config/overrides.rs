@@ -216,6 +216,7 @@ struct TypedLabels {
     bind: &'static str,
     limit: &'static str,
     package: &'static str,
+    env: &'static str,
     forward: &'static str,
     gpu: &'static str,
     audio: &'static str,
@@ -228,6 +229,7 @@ const CLI_LABELS: TypedLabels = TypedLabels {
     bind: "--bind",
     limit: "--limit",
     package: "--package",
+    env: "--env",
     forward: "--forward",
     gpu: "--gpu",
     audio: "--audio",
@@ -240,6 +242,7 @@ const ENV_LABELS: TypedLabels = TypedLabels {
     bind: "SBX_BIND",
     limit: "SBX_LIMIT_*",
     package: "SBX_PACKAGE_*",
+    env: "SBX_ENV_*",
     forward: "SBX_FORWARD",
     gpu: "SBX_GPU",
     audio: "SBX_AUDIO",
@@ -1117,8 +1120,10 @@ fn parse_forward_token(token: &str, label: &str) -> Result<schema::RawForward, S
 }
 
 /// Build a `RawConfig` fragment from a source's typed inputs. A *structural* error (a bad `--net`
-/// posture keyword, an empty `--bind` path, an unknown `--limit` key, an empty `--package` name) is
-/// fail-closed; a set-but-invalid *value* passes through to the downstream validation.
+/// posture keyword, an empty `--bind` path, an unknown `--limit` key, an empty `--package` name or
+/// locator, an empty `--env` name) is fail-closed: a part the form requires is missing, and no
+/// downstream check could make a value of nothing. A set-but-invalid *value* passes through to the
+/// downstream validation.
 #[allow(clippy::too_many_arguments)]
 fn build_typed_fragment(
     net: Option<&str>,
@@ -1195,9 +1200,24 @@ fn build_typed_fragment(
         if name.is_empty() {
             return Err(format!("{}: empty package name", lbl.package));
         }
+        if locator.is_empty() {
+            return Err(format!(
+                "{}: empty package locator for `{}`",
+                lbl.package,
+                crate::diag::visible(name)
+            ));
+        }
         raw.packages.insert(name.clone(), locator.clone());
     }
     for (key, value) in env {
+        // The value is left out of the refusal: it may be a credential, and the missing name is
+        // what the message has to say.
+        if key.is_empty() {
+            return Err(format!(
+                "{}: empty variable name (expected KEY=VALUE)",
+                lbl.env
+            ));
+        }
         raw.env.insert(key.clone(), value.clone());
     }
     // `--seccomp` / `--device` carry their entries verbatim into the `[seccomp]` / `[devices]`
@@ -2518,6 +2538,39 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("empty package name"), "{err}");
+    }
+
+    /// A part a typed form requires and leaves empty is refused at the flag: the name of an
+    /// `--env` pair, and the locator of a `--package` one, as the package's own name already is.
+    /// Nothing downstream could make a value of nothing, so the launch would go on without what
+    /// was typed.
+    #[test]
+    fn an_empty_name_or_locator_is_refused_at_the_flag() {
+        let err = collect_cli(Cli {
+            env: &["=x"],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("--env") && err.contains("empty variable name"),
+            "{err}"
+        );
+        let err = collect_cli(Cli {
+            packages: &["hello="],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("--package") && err.contains("empty package locator for `hello`"),
+            "{err}"
+        );
+        // A value that is merely empty is still a value: `FOO=` sets the variable to nothing.
+        let ov = collect_cli(Cli {
+            env: &["FOO="],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ov.raw.env.get("FOO").map(String::as_str), Some(""));
     }
 
     #[test]
