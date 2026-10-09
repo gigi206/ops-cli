@@ -1948,3 +1948,41 @@ fn no_randomness_refuses_the_nonce_rather_than_inventing_one() {
     .expect("bytes were written");
     assert_eq!(drawn, "0abcff");
 }
+
+/// A cage whose wait failed is killed and reaped before the failure is returned, so it does not
+/// run on past its timeout with nothing left to stop it.
+#[test]
+fn a_failed_wait_ends_the_cage_before_it_is_reported() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let waited: io::Result<()> = Err(io::Error::other("the wait failed"));
+    assert!(end_on_failure(&mut child, waited).is_err());
+    let status = child
+        .try_wait()
+        .expect("the status")
+        .expect("the cage has ended by the time the failure is returned");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+}
+
+/// Both stream readers are joined before either one's error is returned: an error on stdout does
+/// not leave the stderr reader running detached.
+#[test]
+fn both_readers_are_joined_before_an_error_is_returned() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let done = Arc::new(AtomicBool::new(false));
+    let out = std::thread::spawn(|| -> Captured { Err(io::Error::other("stdout failed")) });
+    let finished = Arc::clone(&done);
+    let err = std::thread::spawn(move || -> Captured {
+        std::thread::sleep(Duration::from_millis(200));
+        finished.store(true, Ordering::SeqCst);
+        Ok((Vec::new(), false))
+    });
+    assert!(join_readers(out, err).is_err());
+    assert!(
+        done.load(Ordering::SeqCst),
+        "the stderr reader must have been joined"
+    );
+}
