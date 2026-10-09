@@ -418,6 +418,9 @@ pub(super) fn create_distro_mountpoints(rootfs: &Path) -> io::Result<()> {
 /// directory. Covering `/etc` to reach `/etc/myapp.conf` would empty the distribution's `/etc`, and
 /// creating the file would write a project's mountpoint into a tree other projects share, so the
 /// launch stops and says which directory it will not hide.
+///
+/// So is a destination that is not an absolute path, or that climbs with `..`: the rules above read
+/// a destination's ancestors and its first component, which for such a path name another one.
 pub(super) fn distro_writable(
     rootfs: &Path,
     project: &Path,
@@ -425,6 +428,19 @@ pub(super) fn distro_writable(
 ) -> io::Result<Vec<PathBuf>> {
     let mut out: Vec<PathBuf> = DISTRO_TMPFS.iter().map(PathBuf::from).collect();
     for dest in std::iter::once(project).chain(binds.iter().map(|b| b.dest.as_path())) {
+        // Every rule below reads a destination as a path from the cage's root: its ancestors, its
+        // first component. A relative one, or one climbing with `..`, would be answered about some
+        // other path, and the directory created for it would be named after neither.
+        if !dest.is_absolute()
+            || dest
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(io::Error::other(format!(
+                "`{}` is not a path a mount can be given inside the cage",
+                dest.display()
+            )));
+        }
         if out.iter().any(|t| dest.starts_with(t)) || in_image(rootfs, dest) {
             continue;
         }
@@ -545,7 +561,16 @@ fn writable_anchor(rootfs: &Path, dest: &Path) -> io::Result<PathBuf> {
         )));
     };
     let top = Path::new("/").join(first);
-    std::fs::create_dir_all(rootfs.join(top.strip_prefix("/").unwrap_or(&top)))?;
+    // Through the same walk as the populated case above, so the one directory created in the tree
+    // is made with its mode and never through a link, and refused as that case refuses a name sbx
+    // cannot spell.
+    let Some(name) = first.as_os_str().to_str() else {
+        return Err(io::Error::other(format!(
+            "`{}` is not a path sbx can create in the image",
+            top.display()
+        )));
+    };
+    crate::sandbox::cagedir::ensure_under(rootfs, name, 0o755)?;
     Ok(top)
 }
 
