@@ -3388,3 +3388,51 @@ fn the_cage_runs_its_command_only_while_each_held_source_is_the_object_held() {
         "another filesystem's object with the same inode passes: {stderr}"
     );
 }
+
+/// A link an image carries is read as the image reads it, never followed onto the host: an absolute
+/// target names a path inside the image, which the image may lack. Followed on the host, a
+/// destination under `/link` read as carried when the host held it, and an empty host directory
+/// read as the image's own place to cover with a tmpfs.
+#[test]
+fn an_image_link_is_read_inside_the_image_not_followed_onto_the_host() {
+    let tmp = TmpDir::new();
+    let outside = tmp.join("outside");
+    std::fs::create_dir_all(outside.join("carried")).unwrap();
+    std::fs::write(outside.join("carried/file"), b"host").unwrap();
+    std::fs::create_dir_all(outside.join("empty")).unwrap();
+    let rootfs = tmp.join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    std::os::unix::fs::symlink(&outside, rootfs.join("link")).unwrap();
+
+    assert!(
+        !in_image(&rootfs, Path::new("/link/carried/file")),
+        "the image lacks what its link names; the host's file says nothing about it"
+    );
+    assert!(
+        writable_anchor(&rootfs, Path::new("/link/empty/x")).is_err(),
+        "an empty host directory is not one the image carries to cover"
+    );
+    // What the image does carry is still read as carried, the link itself included.
+    std::fs::create_dir_all(rootfs.join("srv/data")).unwrap();
+    assert!(in_image(&rootfs, Path::new("/srv/data")));
+    assert!(in_image(&rootfs, Path::new("/link")));
+
+    // An empty directory the image carries is covered itself.
+    std::fs::create_dir_all(rootfs.join("srv/empty")).unwrap();
+    assert_eq!(
+        writable_anchor(&rootfs, Path::new("/srv/empty/x")).unwrap(),
+        PathBuf::from("/srv/empty")
+    );
+    // A populated one gets the one directory it lacks, created in the image and covered, and never
+    // the rest of the path.
+    std::fs::create_dir_all(rootfs.join("run/lock")).unwrap();
+    assert_eq!(
+        writable_anchor(&rootfs, Path::new("/run/user/1000")).unwrap(),
+        PathBuf::from("/run/user")
+    );
+    assert!(rootfs.join("run/user").is_dir());
+    assert_eq!(
+        std::fs::read_dir(rootfs.join("run/user")).unwrap().count(),
+        0
+    );
+}
