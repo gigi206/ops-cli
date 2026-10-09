@@ -427,13 +427,63 @@ pub(super) fn distro_writable(
     Ok(out)
 }
 
-/// Whether `dest` is a path the image itself carries. `symlink_metadata`, so a symlink counts as
-/// carried: it is what an image put there, and the mount lands on it rather than through it.
+/// Whether `dest` is a path the image itself carries. The last component is not followed, so a
+/// symlink counts as carried: it is what an image put there, and the mount lands on it rather than
+/// through it. Anything that cannot be read as the image reads it counts as not carried, and
+/// [`writable_anchor`] then says why.
 fn in_image(rootfs: &Path, dest: &Path) -> bool {
-    rootfs
-        .join(dest.strip_prefix("/").unwrap_or(dest))
-        .symlink_metadata()
-        .is_ok()
+    crate::sandbox::attach::open_dir_path(rootfs)
+        .and_then(|root| image_entry(&root, dest))
+        .is_ok_and(|entry| entry.is_some())
+}
+
+/// What the image at `root` carries at `dest`, looked at as the cage will see it: every component
+/// but the last resolved beneath the image's root ([`crate::sandbox::attach::open_in_root`]), so a
+/// link the image carries reads `..` and an absolute target as the image's own, and the last one
+/// looked at without following it. `None` when nothing is there.
+///
+/// Read by path joined onto the root, an absolute link the image carries — Debian's
+/// `var/run -> /run` is one — was followed on the host: a destination below it read as carried when the host had it, and a
+/// host directory decided whether a tmpfs went over the image's.
+fn image_entry(root: &std::os::fd::OwnedFd, dest: &Path) -> io::Result<Option<libc::stat>> {
+    const DIR: libc::c_int = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let relative = dest.strip_prefix("/").unwrap_or(dest);
+    let Some(name) = relative.file_name() else {
+        return Ok(None);
+    };
+    let parent = relative
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    match crate::sandbox::attach::open_in_root(root, parent, DIR)
+        .and_then(|dir| crate::sandbox::attach::lstat_at(&dir, name))
+    {
+        Ok(stat) => Ok(Some(stat)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether the directory the image carries at `dest` holds nothing, read beneath the image's root
+/// as [`image_entry`] reads it.
+fn image_dir_is_empty(root: &std::os::fd::OwnedFd, dest: &Path) -> io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    const LISTED: libc::c_int =
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let relative = dest.strip_prefix("/").unwrap_or(dest);
+    let dir = crate::sandbox::attach::open_in_root(root, relative, LISTED)?;
+    Ok(
+        std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?
+            .next()
+            .is_none(),
+    )
 }
 
 /// The directory to cover with a tmpfs so `dest` can be created under it. See [`distro_writable`]
@@ -441,24 +491,25 @@ fn in_image(rootfs: &Path, dest: &Path) -> bool {
 fn writable_anchor(rootfs: &Path, dest: &Path) -> io::Result<PathBuf> {
     // Deepest first: the shallowest tmpfs that works hides the most, so the deepest one that works
     // is the one to take. `below` is the ancestor visited just before, the one the image lacks.
+    let root = crate::sandbox::attach::open_dir_path(rootfs)?;
     let mut below: Option<&Path> = None;
     for ancestor in dest.ancestors().skip(1) {
         if ancestor == Path::new("/") {
             break;
         }
-        let on_image = rootfs.join(ancestor.strip_prefix("/").unwrap_or(ancestor));
-        let Ok(meta) = on_image.symlink_metadata() else {
+        let Some(stat) = image_entry(&root, ancestor)? else {
             below = Some(ancestor);
             continue;
         };
-        if meta.is_dir() && std::fs::read_dir(&on_image)?.next().is_none() {
+        let is_dir = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
+        if is_dir && image_dir_is_empty(&root, ancestor)? {
             return Ok(ancestor.to_path_buf());
         }
         // A populated directory, with a directory the image lacks between it and the destination:
         // create that one, refusing a link on the way, and cover it. A symlink the image placed is
         // not a directory here, and is refused below rather than followed.
         if let Some(missing) = below
-            && meta.is_dir()
+            && is_dir
         {
             // Refused rather than converted lossily: a replaced byte would name another directory.
             let Some(rel) = missing.strip_prefix("/").unwrap_or(missing).to_str() else {
