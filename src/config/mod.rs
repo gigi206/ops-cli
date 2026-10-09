@@ -588,6 +588,9 @@ pub(crate) struct Resolved {
     /// `[app.<name>.network]` table is ignored (warned), and `sbx config show --app` does not surface
     /// the inherited value — the app inherits this baseline.
     pub(crate) egress_stats: bool,
+    /// Which layer set [`Resolved::egress_stats`]: the highest whose accepted `[network]` table
+    /// wrote `stats`, `Default` when none did.
+    pub(crate) egress_stats_origin: Provenance,
     /// The resolved process/exec posture: the default (`off`) unless the global config or a trusted
     /// project set a mode. An untrusted project's choice is dropped with a warning — it may not forge
     /// or loosen the enforcement of its own agent.
@@ -726,6 +729,9 @@ pub(crate) struct Resolved {
     /// it. With no askpass helper on the host the launch gives the cage no agent at all, rather than
     /// a grant whose promised confirmation never appears.
     pub(crate) ssh_agent_confirm: bool,
+    /// Which layer decided [`Resolved::ssh_agent_confirm`], as [`fold_confirm`] folds it: the highest
+    /// that asked for the prompt, else the highest that wrote `confirm = false`, else `Default`.
+    pub(crate) ssh_agent_confirm_origin: Provenance,
     /// The shortest credential, in bytes, this launch scans for — `[redact] min_len`, defaulting to
     /// [`crate::sandbox::redact::MIN_LEN_DEFAULT`]. One floor for both renderings of a needle set:
     /// the proxy's outbound refusal and inbound mask, and the `${name}` substitution over a task's
@@ -1302,6 +1308,7 @@ impl Resolved {
         if let Some((policy, stats)) = new_network {
             if let Some(b) = stats {
                 self.egress_stats = b;
+                self.egress_stats_origin = Provenance::Override;
             }
             // A posture carrying no rules of its own replaces a table that had some, and that is
             // the case worth naming: the operator asked for a posture and lost a list they never
@@ -1438,10 +1445,16 @@ impl Resolved {
             }
         }
         if ssh_agent.is_some() {
-            let (over, confirm) = apply_ssh_agent(&mut self.warnings, OVERRIDE_SOURCE, ssh_agent);
+            let said = ssh_agent.as_ref().and_then(|raw| raw.confirm);
+            let (over, _) = apply_ssh_agent(&mut self.warnings, OVERRIDE_SOURCE, ssh_agent);
             // Confirmation ORs in, like every other layer: an invoker may add the prompt, and the
             // one place it must not be possible to *remove* it is the most convenient one to try.
-            self.ssh_agent_confirm |= confirm;
+            fold_confirm(
+                &mut self.ssh_agent_confirm,
+                &mut self.ssh_agent_confirm_origin,
+                said,
+                Provenance::Override,
+            );
             if !over.is_empty() {
                 union_ssh_agent(&mut self.ssh_agent, over);
                 self.ssh_agent_origin = Provenance::Override;
@@ -2192,6 +2205,7 @@ fn resolve(
     // default, and the toggle written beside it must not be the one half of it that still lands —
     // the same rule the project layer applies.
     let mut egress_stats = true;
+    let mut egress_stats_origin = Provenance::Default;
     let global_stats = global.network.as_ref().and_then(network_stats_of);
     if let Some(field) = global.network.as_ref() {
         warn_if_baseline_sets_default_methods(&mut warnings, GLOBAL_CONFIG, field);
@@ -2218,6 +2232,7 @@ fn resolve(
         && let Some(b) = global_stats
     {
         egress_stats = b;
+        egress_stats_origin = Provenance::Global;
     }
     // The GUI posture is trusted by location at the global layer; an invalid or unset value
     // falls back to the default (no display).
@@ -2364,8 +2379,15 @@ fn resolve(
     };
     // The ssh-agent grant is trusted by location at the global layer, and layers like the device
     // grant: a bad entry is dropped (warned), a project's unions onto this.
-    let (mut ssh_agent, mut ssh_agent_confirm) =
-        apply_ssh_agent(&mut warnings, GLOBAL_CONFIG, global.ssh_agent);
+    let global_confirm = global.ssh_agent.as_ref().and_then(|raw| raw.confirm);
+    let (mut ssh_agent, _) = apply_ssh_agent(&mut warnings, GLOBAL_CONFIG, global.ssh_agent);
+    let (mut ssh_agent_confirm, mut ssh_agent_confirm_origin) = (false, Provenance::Default);
+    fold_confirm(
+        &mut ssh_agent_confirm,
+        &mut ssh_agent_confirm_origin,
+        global_confirm,
+        Provenance::Global,
+    );
     let mut ssh_agent_origin = if ssh_agent.is_empty() {
         Provenance::Default
     } else {
@@ -2660,6 +2682,7 @@ fn resolve(
             );
             if accepted && let Some(b) = stats {
                 egress_stats = b;
+                egress_stats_origin = Provenance::Project;
             }
         }
         // `proc` is a security field — a trusted project may set its agent's exec posture; an
@@ -2885,8 +2908,14 @@ fn resolve(
                 |w| {
                     // `confirm` rides the same table but is not part of the key set, so it is
                     // folded here, where it is produced, rather than smuggled through the union.
-                    let (keys, confirm) = apply_ssh_agent(w, PROJECT_CONFIG, Some(raw));
-                    ssh_agent_confirm |= confirm;
+                    let said = raw.confirm;
+                    let (keys, _) = apply_ssh_agent(w, PROJECT_CONFIG, Some(raw));
+                    fold_confirm(
+                        &mut ssh_agent_confirm,
+                        &mut ssh_agent_confirm_origin,
+                        said,
+                        Provenance::Project,
+                    );
                     keys
                 },
                 union_ssh_agent,
@@ -3091,6 +3120,7 @@ fn resolve(
         network_origin,
         net_groups,
         egress_stats,
+        egress_stats_origin,
         redact_min_len,
         redact_min_len_origin,
         observe_record,
@@ -3122,6 +3152,7 @@ fn resolve(
         ssh_agent,
         ssh_agent_origin,
         ssh_agent_confirm,
+        ssh_agent_confirm_origin,
         brokers,
         secrets,
         declared_secrets,
@@ -3589,6 +3620,20 @@ fn warn_unknown_task_keys(
                  this field (check the spelling; a newer sbx's fields are ignored here on purpose)"
             ));
         }
+    }
+}
+
+/// Fold one layer's `[ssh_agent] confirm` into the value and its origin, layers taken lowest
+/// first. The value ORs: a layer may ask for the prompt, none may remove it. The origin names the
+/// layer that decided the value: one asking for the prompt always does, one writing `false` does
+/// only while no layer below asked for it, since its `false` then is the value. A layer that did not
+/// write the key changes neither.
+fn fold_confirm(value: &mut bool, origin: &mut Provenance, said: Option<bool>, layer: Provenance) {
+    if let Some(said) = said {
+        if said || !*value {
+            *origin = layer;
+        }
+        *value |= said;
     }
 }
 
@@ -5152,6 +5197,94 @@ mod a_layer_replaces_only_what_it_declares {
             named(&r.secrets),
             vec!["NARROW_TOKEN"],
             "the override must not put the baseline value the profile displaced back on the wire"
+        );
+    }
+}
+
+/// Each value whose layers merge by a rule of their own — a toggle the highest layer writes, a
+/// prompt every layer can add and none remove — names the layer that decided it, computed in the
+/// same resolution the launch takes rather than read back from the layers afterwards.
+#[cfg(test)]
+mod the_layer_that_decided_a_value {
+    use super::bad_fields_cost_a_field::{cfg, global, layered};
+    use super::*;
+
+    /// The egress audit toggle names the layer that set it: the highest whose accepted `[network]`
+    /// table wrote `stats`, a one-shot override above them all, and the built-in default otherwise.
+    #[test]
+    fn the_egress_stats_toggle_names_the_layer_that_set_it() {
+        let deny_off = "[network]\nmode = \"deny\"\nstats = false\n";
+        let deny_on = "[network]\nmode = \"deny\"\nstats = true\n";
+        assert_eq!(global("").egress_stats_origin, Provenance::Default);
+        assert_eq!(
+            global("[network]\nmode = \"deny\"\n").egress_stats_origin,
+            Provenance::Default
+        );
+        assert_eq!(global(deny_off).egress_stats_origin, Provenance::Global);
+        // A value equal to the default still names the layer that wrote it.
+        assert_eq!(global(deny_on).egress_stats_origin, Provenance::Global);
+
+        let p = layered(deny_off, deny_on, TrustState::Trusted);
+        assert!(p.egress_stats);
+        assert_eq!(p.egress_stats_origin, Provenance::Project);
+        // An untrusted project's table is dropped, and its `stats` with it.
+        let u = layered(deny_off, deny_on, TrustState::Untrusted);
+        assert!(!u.egress_stats);
+        assert_eq!(u.egress_stats_origin, Provenance::Global);
+        // A refused table leaves both the value and its origin where the layer below put them.
+        let refused = layered(
+            deny_off,
+            "[network]\nmode = \"bogus\"\nstats = true\n",
+            TrustState::Trusted,
+        );
+        assert_eq!(refused.egress_stats_origin, Provenance::Global);
+
+        let mut o = layered(deny_off, "", TrustState::Trusted);
+        o.apply_override(Override::for_test(cfg(deny_on)), None)
+            .expect("the override applies");
+        assert!(o.egress_stats);
+        assert_eq!(o.egress_stats_origin, Provenance::Override);
+    }
+
+    /// `[ssh_agent] confirm` ORs across layers, and its origin names the layer that decided the
+    /// value: one asking for the prompt, else the highest that wrote `false`, else the default.
+    #[test]
+    fn the_signature_confirmation_names_the_layer_that_decided_it() {
+        let on = "[ssh_agent]\nconfirm = true\n";
+        let off = "[ssh_agent]\nconfirm = false\n";
+        let decided = |g: &str, p: &str| {
+            let r = layered(g, p, TrustState::Trusted);
+            (r.ssh_agent_confirm, r.ssh_agent_confirm_origin)
+        };
+        assert_eq!(decided("", ""), (false, Provenance::Default));
+        assert_eq!(decided(on, ""), (true, Provenance::Global));
+        assert_eq!(decided(off, ""), (false, Provenance::Global));
+        // The case the OR decides: a project's `false` cannot remove the prompt the global asked
+        // for, so the global is what decided it.
+        assert_eq!(decided(on, off), (true, Provenance::Global));
+        assert_eq!(decided(off, on), (true, Provenance::Project));
+        assert_eq!(decided(off, off), (false, Provenance::Project));
+        assert_eq!(decided(on, on), (true, Provenance::Project));
+        let u = layered("", on, TrustState::Untrusted);
+        assert_eq!(
+            (u.ssh_agent_confirm, u.ssh_agent_confirm_origin),
+            (false, Provenance::Default)
+        );
+
+        let mut o = layered(on, "", TrustState::Trusted);
+        o.apply_override(Override::for_test(cfg(off)), None)
+            .expect("the override applies");
+        assert_eq!(
+            (o.ssh_agent_confirm, o.ssh_agent_confirm_origin),
+            (true, Provenance::Global),
+            "an override cannot remove the prompt either"
+        );
+        let mut o = layered(off, "", TrustState::Trusted);
+        o.apply_override(Override::for_test(cfg(on)), None)
+            .expect("the override applies");
+        assert_eq!(
+            (o.ssh_agent_confirm, o.ssh_agent_confirm_origin),
+            (true, Provenance::Override)
         );
     }
 }
