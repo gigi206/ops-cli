@@ -27,11 +27,6 @@
 //! validated under) and the variable names in `env_allow`. Not the program, not the rest of the
 //! environment, not the mounts.
 
-#![allow(
-    clippy::expect_used,
-    reason = "`stdout`/`stderr` are taken from a child this function spawned with `Stdio::piped()` for both, and nothing takes them first"
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{self, Read};
@@ -1290,7 +1285,15 @@ impl TaskEngine {
         // Read both streams on their own threads so neither can block the other by filling its pipe
         // while the runner waits on the wrong one.
         let cap = task.max_output as usize;
+        #[allow(
+            clippy::expect_used,
+            reason = "the child was spawned just above with `Stdio::piped()` for stdout, and nothing takes it first"
+        )]
         let mut out_pipe = child.stdout.take().expect("stdout piped");
+        #[allow(
+            clippy::expect_used,
+            reason = "the child was spawned just above with `Stdio::piped()` for stderr, and nothing takes it first"
+        )]
         let mut err_pipe = child.stderr.take().expect("stderr piped");
         let out_reader = std::thread::spawn(move || read_capped(&mut out_pipe, cap, scan_margin));
         let err_reader = std::thread::spawn(move || read_capped(&mut err_pipe, cap, scan_margin));
