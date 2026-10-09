@@ -1714,7 +1714,7 @@ fn persist_removal<E: std::fmt::Display>(
 
     match outcome {
         RemoveOutcome::NotPresent => Ok(format!("{noun} {rule} was not in {target} — no change")),
-        RemoveOutcome::Removed { text } => {
+        RemoveOutcome::Removed { text, .. } => {
             // Re-trust only after an actual change (the file bytes changed). Fail-safe ordering: a
             // crash between the write and the trust leaves a correct-but-untrusted file the next
             // launch drops — never a security hole.

@@ -228,10 +228,12 @@ impl AddOutcome {
 /// A no-op outcome (`AlreadyPresent`, [`SetOutcome::Unchanged`], `false`) carries text too, and the
 /// same text the decision was made on: nothing was written, so what is attested to is the document
 /// as read — consistent with the answer given, and still not a second read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Written<T> {
     pub(crate) outcome: T,
     pub(crate) text: String,
+    /// The file's writer guard, held until the caller has attested to `text` ([`WriteGuard`]).
+    pub(crate) writing: WriteGuard,
 }
 
 impl std::fmt::Display for ManageError {
@@ -452,6 +454,7 @@ pub(crate) enum SetOutcome {
 /// silently dropped whole at the next load (e.g. a filtering `network` posture reverting to open
 /// egress), so this fails closed and loud rather than reporting success over a broken file.
 pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<Written<SetOutcome>, ManageError> {
+    let writing = hold_for_write(path)?;
     let mut doc = read_or_empty(path)?;
     // Rendered rather than read off disk, so the comparison below asks the question that matters —
     // "would writing this change the file?" — and not the one about how `toml_edit` happens to
@@ -464,7 +467,7 @@ pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<Written<SetOutcom
     if let Some(array) = parsed_array(val) {
         let created = put_value(&mut doc, key, array)?;
         return match validate_layer(&before, &doc, super::load::is_profile_file(path)) {
-            Ok(()) => commit(path, &doc, &before, created),
+            Ok(()) => commit(path, &doc, &before, created, writing),
             Err(detail) => Err(ManageError::InvalidValue(key.to_string(), detail)),
         };
     }
@@ -476,7 +479,7 @@ pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<Written<SetOutcom
             return Err(ManageError::InvalidValue(key.to_string(), detail));
         }
     }
-    commit(path, &doc, &before, created)
+    commit(path, &doc, &before, created, writing)
 }
 
 /// Write `doc` unless it renders exactly as `before`, and name the outcome. The tail both arms of
@@ -487,15 +490,18 @@ fn commit(
     doc: &DocumentMut,
     before: &str,
     created: bool,
+    writing: WriteGuard,
 ) -> Result<Written<SetOutcome>, ManageError> {
     if doc.to_string() == before {
         return Ok(Written {
+            writing,
             outcome: SetOutcome::Unchanged,
             text: before.to_string(),
         });
     }
     let text = write_doc(path, doc)?;
     Ok(Written {
+        writing,
         outcome: if created {
             SetOutcome::Created
         } else {
@@ -518,6 +524,7 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<Written<bool>, 
     if let Some(verb) = rule_list_verb(key) {
         return Err(ManageError::UseRuleVerb(key.to_string(), verb));
     }
+    let writing = hold_for_write(path)?;
     let mut doc = read_or_empty(path)?;
     // Captured before `list_at` materializes the array, so the gate below compares against the
     // file as it stands on disk.
@@ -528,6 +535,7 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<Written<bool>, 
         .any(|v| v.as_str().is_some_and(|s| s == entry) || render_value(v) == entry)
     {
         return Ok(Written {
+            writing,
             outcome: false,
             text: doc.to_string(),
         });
@@ -550,6 +558,7 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<Written<bool>, 
     }
     let text = write_doc(path, &doc)?;
     Ok(Written {
+        writing,
         outcome: true,
         text,
     })
@@ -561,6 +570,7 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<Written<bool>, 
 /// than deleted: `deny = []` states "nothing is closed here" and is a different claim from the key
 /// being absent, which a parent layer may still fill.
 pub(crate) fn remove(path: &Path, key: &str, entry: &str) -> Result<Written<bool>, ManageError> {
+    let writing = hold_for_write(path)?;
     let mut doc = read_or_empty(path)?;
     // As in `add`: the pre-edit text, before `list_at` may materialize an empty array.
     let before = doc.to_string();
@@ -572,6 +582,7 @@ pub(crate) fn remove(path: &Path, key: &str, entry: &str) -> Result<Written<bool
         // `before`, not the document: `list_at` may have materialized an empty list that was never
         // written, and what is attested to must be the file as it stands.
         return Ok(Written {
+            writing,
             outcome: false,
             text: before,
         });
@@ -581,6 +592,7 @@ pub(crate) fn remove(path: &Path, key: &str, entry: &str) -> Result<Written<bool
         Ok(()) => {
             let text = write_doc(path, &doc)?;
             Ok(Written {
+                writing,
                 outcome: true,
                 text,
             })
@@ -1183,6 +1195,7 @@ fn admit_known_values(raw: &super::schema::RawConfig) -> Result<(), String> {
 /// The check is the layer's own parser rather than a list of field names, so it stays right as the
 /// schema's required set changes.
 pub(crate) fn unset(path: &Path, key: &str) -> Result<Written<bool>, ManageError> {
+    let writing = hold_for_write(path)?;
     let mut doc = read_or_empty(path)?;
     let before = doc.to_string();
     let segments = split_key(key)?;
@@ -1190,6 +1203,7 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<Written<bool>, ManageError
 
     let Some(table) = existing_parent_mut(&mut doc, parents) else {
         return Ok(Written {
+            writing,
             outcome: false,
             text: doc.to_string(),
         });
@@ -1197,6 +1211,7 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<Written<bool>, ManageError
     let existed = table.remove(leaf[0].as_str()).is_some();
     if !existed {
         return Ok(Written {
+            writing,
             outcome: false,
             text: doc.to_string(),
         });
@@ -1206,6 +1221,7 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<Written<bool>, ManageError
     }
     let text = write_doc(path, &doc)?;
     Ok(Written {
+        writing,
         outcome: true,
         text,
     })
@@ -1259,6 +1275,7 @@ pub(crate) fn add_egress_rule(
         Malformed(String),
     }
 
+    let writing = hold_for_write(path)?;
     let mut doc = read_or_empty(path)?;
     let before = doc.to_string();
     let parent = layer_parent(&mut doc, app)?;
@@ -1359,7 +1376,11 @@ pub(crate) fn add_egress_rule(
         ));
     }
     let text = commit_rule(path, &doc, &before, &outcome)?;
-    Ok(Written { outcome, text })
+    Ok(Written {
+        outcome,
+        text,
+        writing,
+    })
 }
 
 /// Add a process/exec `rule` to the `[proc]` `list` of the target file (baseline or `[app.<name>]`).
@@ -1385,6 +1406,7 @@ pub(crate) fn add_proc_rule(
         Malformed(String),
     }
 
+    let writing = hold_for_write(path)?;
     let mut doc = read_or_empty(path)?;
     let before = doc.to_string();
     let parent = layer_parent(&mut doc, app)?;
@@ -1458,7 +1480,11 @@ pub(crate) fn add_proc_rule(
         ));
     }
     let text = commit_rule(path, &doc, &before, &outcome)?;
-    Ok(Written { outcome, text })
+    Ok(Written {
+        outcome,
+        text,
+        writing,
+    })
 }
 
 /// Write `doc` unless the rule was already there, and return the text a caller attests to.
@@ -1544,6 +1570,7 @@ pub(crate) fn add_learned_proc_rules(
     app: Option<&str>,
     rules: &[String],
 ) -> Result<Written<LearnedProcWrite>, ManageError> {
+    let writing = hold_for_write(path)?;
     let mut doc = read_or_empty(path)?;
     let before = doc.to_string();
     let parent = layer_parent(&mut doc, app)?;
@@ -1608,7 +1635,11 @@ pub(crate) fn add_learned_proc_rules(
     } else {
         before
     };
-    Ok(Written { outcome, text })
+    Ok(Written {
+        outcome,
+        text,
+        writing,
+    })
 }
 
 /// Guard the `mode` of a `[proc]` table/bare-string before appending an allow/deny rule to it. A
@@ -1656,7 +1687,11 @@ pub(crate) enum RemoveOutcome {
     /// so a payload writing between sbx's write and that read would have its own config attested
     /// and applied at the next launch. The no-op arm carries nothing because it wrote nothing,
     /// which makes "re-trust after a no-op" unspellable rather than merely unused.
-    Removed { text: String },
+    Removed {
+        text: String,
+        /// The file's writer guard, held until the caller has attested to `text` ([`WriteGuard`]).
+        writing: WriteGuard,
+    },
     /// The rule was not present (nothing changed): an idempotent no-op.
     NotPresent,
 }
@@ -1707,6 +1742,7 @@ pub(crate) fn add_fs_mask(
     list: FsList,
     entry: &str,
 ) -> Result<Written<AddOutcome>, ManageError> {
+    let writing = hold_for_write(path)?;
     let mut doc = read_or_empty(path)?;
     let before = doc.to_string();
     let parent = layer_parent(&mut doc, app)?;
@@ -1756,7 +1792,11 @@ pub(crate) fn add_fs_mask(
         ));
     }
     let text = commit_rule(path, &doc, &before, &outcome)?;
-    Ok(Written { outcome, text })
+    Ok(Written {
+        outcome,
+        text,
+        writing,
+    })
 }
 
 /// Take one path `entry` back out of `[fs].deny` or `[fs].readonly` — the removal sibling of
@@ -1787,6 +1827,7 @@ fn remove_rule_from(
 ) -> Result<RemoveOutcome, ManageError> {
     // An absent file reads as an empty document, which holds nothing to remove; any other failure
     // to read it is reported rather than taken for an absence.
+    let writing = hold_for_write(path)?;
     let mut doc = read_or_empty(path)?;
     // Navigate to the table's parent WITHOUT creating anything (the add paths create the
     // `[app.<name>]` scaffolding; removal must not).
@@ -1843,7 +1884,7 @@ fn remove_rule_from(
         return Ok(RemoveOutcome::NotPresent);
     }
     let text = write_doc(path, &doc)?;
-    Ok(RemoveOutcome::Removed { text })
+    Ok(RemoveOutcome::Removed { text, writing })
 }
 
 /// The egress rules the `list` of one config file holds, under `[app.<name>]` when an app is named.
@@ -2108,6 +2149,112 @@ fn existing_parent_mut<'d>(
         table = table.get_mut(seg).and_then(Item::as_table_like_mut)?;
     }
     Some(table)
+}
+
+/// The writer guard of one config file: a verb that edits the file holds it from the read its edit
+/// starts from to the moment its caller has attested to the text it wrote, so two writers take
+/// turns instead of the later one writing back a document read before the earlier one's write.
+///
+/// Without it two learning runs ending together on one `.sbx.toml` each wrote their own rules over
+/// a read that lacked the other's, and one run's rules were lost; and a writer that re-trusted
+/// after the other had written left a marker that matched neither file, so the next launch read
+/// the project as changed.
+///
+/// Carried by [`Written`] and [`RemoveOutcome::Removed`] rather than released when the edit
+/// returns, because the attestation is the caller's and happens after the write. A thread that
+/// edits the same file again while it still holds an earlier outcome shares the guard it already
+/// holds ([`HELD`]) rather than waiting on it: the `flock` is exclusive per open, so a second open
+/// in that thread would wait for itself forever. Sharing is sound there because the edits of this
+/// module never call one another, so one thread never has two of them between read and write.
+///
+/// `None` when no guard could be named: no trust store directory, or a config path that is not
+/// UTF-8 ([`crate::trust::marker_path`]). The edit then proceeds unguarded, as every edit did
+/// before the guard existed.
+pub(crate) struct WriteGuard(
+    // Held only for its `Drop`: closing the fd is what releases the `flock`. Never read.
+    #[allow(dead_code)] Option<std::rc::Rc<std::fs::File>>,
+);
+
+thread_local! {
+    /// The writer guards this thread holds, by guard path, for [`hold_for_write`] to share rather
+    /// than open a second time ([`WriteGuard`]). Weak, so the last outcome dropped releases it.
+    static HELD: std::cell::RefCell<std::collections::HashMap<PathBuf, std::rc::Weak<std::fs::File>>> =
+        std::cell::RefCell::default();
+}
+
+impl std::fmt::Debug for WriteGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "WriteGuard(held)"
+        } else {
+            "WriteGuard(none)"
+        })
+    }
+}
+
+/// Two outcomes are equal on what they say about the file; which one holds a guard is not part
+/// of that.
+impl PartialEq for WriteGuard {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for WriteGuard {}
+
+/// Where the writer guard of the config file `config` lives under `root`: `write-locks/` and the
+/// trust marker's own key for that file ([`crate::trust::marker_path`]), so every spelling of one
+/// file — relative, through a linked directory — names one guard, and two files never share one.
+///
+/// Under the trust store and never beside the file: a project's `.sbx.toml` sits in a tree its cage
+/// writes, where a guard file could be planted or held by the cage to stall every write, while the
+/// trust store is a control-plane root a launch keeps out of the cage's reach.
+fn guard_path(root: &Path, config: &Path) -> Option<PathBuf> {
+    crate::trust::marker_path(&root.join("write-locks"), config)
+}
+
+/// The root [`guard_path`] places guards under: the trust store directory.
+#[cfg(not(test))]
+fn guard_root(_config: &Path) -> Option<PathBuf> {
+    crate::trust::default_store_dir()
+}
+
+/// The root [`guard_path`] places guards under in a unit test: the directory of the file, which
+/// the test's own fixture owns, so the suite never writes the trust store of the user running it.
+#[cfg(test)]
+fn guard_root(config: &Path) -> Option<PathBuf> {
+    config.parent().map(Path::to_path_buf)
+}
+
+/// Take the writer guard of the config file at `path` ([`WriteGuard`]), waiting while another sbx
+/// holds it, after saying so.
+fn hold_for_write(path: &Path) -> Result<WriteGuard, ManageError> {
+    let Some(guard) = guard_root(path).and_then(|root| guard_path(&root, path)) else {
+        return Ok(WriteGuard(None));
+    };
+    if let Some(file) = HELD.with_borrow(|held| held.get(&guard).and_then(std::rc::Weak::upgrade)) {
+        return Ok(WriteGuard(Some(file)));
+    }
+    let waiting = |held: &Path| {
+        crate::diag::note(&format!(
+            "waiting for another sbx writing `{}` (it holds `{}`)",
+            path.display(),
+            held.display()
+        ));
+    };
+    let file = std::rc::Rc::new(
+        crate::sandbox::flock_at(&guard, true, Some(&waiting)).map_err(|e| {
+            ManageError::Write(
+                path.to_path_buf(),
+                format!("cannot take its writer guard {}: {e}", guard.display()),
+            )
+        })?,
+    );
+    HELD.with_borrow_mut(|held| {
+        held.retain(|_, file| file.strong_count() > 0);
+        held.insert(guard, std::rc::Rc::downgrade(&file));
+    });
+    Ok(WriteGuard(Some(file)))
 }
 
 /// Parse the file into an editable document, treating an absent file as an empty one (so a `set`
@@ -3614,7 +3761,7 @@ mod tests {
         // Remove it → gone; a second removal is a reported no-op.
         let removed =
             remove_egress_rule(&p, None, EgressList::Mute, "play.googleapis.com").unwrap();
-        let RemoveOutcome::Removed { text } = &removed else {
+        let RemoveOutcome::Removed { text, .. } = &removed else {
             panic!("the rule was present, so it is removed: {removed:?}");
         };
         assert_eq!(
@@ -4598,5 +4745,106 @@ mod tests {
             remove_egress_rule(&p, None, EgressList::Allow, "github.com").unwrap(),
             RemoveOutcome::NotPresent
         ));
+    }
+
+    /// Every spelling of one config file names one guard, and two files never share one: the
+    /// guard is keyed the way the trust marker is, on the file's canonical path.
+    #[test]
+    fn a_config_file_names_one_writer_guard_whatever_its_spelling() {
+        let tmp = crate::testutil::TmpDir::new();
+        let root = tmp.path().join("state");
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let linked = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&project, &linked).unwrap();
+        let file = project.join(".sbx.toml");
+
+        let guard = guard_path(&root, &file).expect("a UTF-8 path names a guard");
+        assert!(
+            guard.starts_with(root.join("write-locks")),
+            "{}",
+            guard.display()
+        );
+        assert_eq!(
+            guard_path(&root, &linked.join(".sbx.toml")),
+            Some(guard.clone())
+        );
+        std::fs::create_dir(project.join("sub")).unwrap();
+        assert_eq!(
+            guard_path(&root, &project.join("sub/../.sbx.toml")),
+            Some(guard.clone())
+        );
+        assert_ne!(guard_path(&root, &project.join("other.toml")), Some(guard));
+    }
+
+    /// A writer that still holds the outcome of its edit keeps another thread's edit of the same
+    /// file waiting until it lets it go, so the caller's attestation is made before the next read.
+    /// The same thread editing the file again shares the guard instead of waiting on itself.
+    #[test]
+    fn an_edit_of_a_config_file_waits_while_another_writer_holds_its_outcome() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "");
+        let first = add(&p, "fs.deny", "a/").expect("the first edit");
+        let again = add(&p, "fs.deny", "b/").expect("the same thread edits again without waiting");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                let written = add(&p, "fs.deny", "c/").map(|w| w.outcome);
+                tx.send(()).unwrap();
+                written
+            })
+        };
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the other thread's edit landed while this thread held its outcomes"
+        );
+        drop(first);
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "one outcome let go while another still holds the guard"
+        );
+        drop(again);
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the edit proceeds once the outcomes are let go");
+        assert!(
+            other.join().unwrap().expect("the other edit"),
+            "the other entry is new"
+        );
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            ["a/", "b/", "c/"].iter().all(|e| body.contains(e)),
+            "{body}"
+        );
+    }
+
+    /// Two threads adding to one file each find every entry the other added: no write is made over
+    /// a read that missed the other's.
+    #[test]
+    fn two_writers_of_one_config_file_lose_none_of_each_others_entries() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "");
+        let writers: Vec<_> = (0..2)
+            .map(|w| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        add(&p, "fs.deny", &format!("w{w}-{i}/")).expect("an edit");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let body = std::fs::read_to_string(&p).unwrap();
+        let lost: Vec<String> = (0..2)
+            .flat_map(|w| (0..25).map(move |i| format!("w{w}-{i}/")))
+            .filter(|e| !body.contains(&format!("\"{e}\"")))
+            .collect();
+        assert!(lost.is_empty(), "lost {lost:?}");
     }
 }
