@@ -236,7 +236,8 @@ fn proc_inject_session(
             "{}",
             style::prose(
                 &format!(
-                    "loaded {verb} rule `{rule}` into {} live session(s): {}",
+                    "loaded {verb} rule `{}` into {} live session(s): {}",
+                    diag::visible(rule),
                     loaded.len(),
                     loaded
                         .iter()
@@ -398,10 +399,13 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
     outln!("{}live session rules{}", pal.head, pal.reset);
     for (pid, verdict, rule) in rows {
         let hue = if verdict == "deny" { pal.err } else { pal.ok };
+        // Shown escaped, as the load that put it there names it: a pattern may carry a character
+        // that reorders a line.
         outln!(
             "  {dim}{pid}{r}  {hue}{verdict}{r}  {rule}",
             dim = pal.dim,
             r = pal.reset,
+            rule = diag::visible(&rule),
         );
     }
     listed
