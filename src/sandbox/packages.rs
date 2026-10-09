@@ -164,13 +164,37 @@ pub(crate) fn provision(
     })
 }
 
-/// The `mise:` tokens of the packages a trusted layer named in `accepts_fresh_releases`.
+/// The key mise files a declared token under: the token without its `[options]` and without an
+/// explicit `@version`. `github:example/tool[version_prefix=v]` is `github:example/tool`; an npm
+/// scope is not a version (see [`crate::sandbox::taskpool::split_version`]).
 ///
-/// Maps declared package **names** to the tokens mise is asked about, so the locator stays written
-/// once (in `packages`) and the exemption cannot drift from it. Trusted-only and `mise:`-only, on
-/// the same filter as [`mise_packages`]: a name that resolves to a `nix:` or prebuilt package is
-/// dropped, because no freshness delay governs those and pretending otherwise would put a token in
-/// front of mise that names nothing it equips.
+/// It is the form mise's own lists match a tool by. Its JSON reports file a tool under it, and mise
+/// matches a `minimum_release_age_excludes` entry against this key alone: an entry that carries the
+/// options or a version matches nothing.
+pub(crate) fn mise_tool_key(token: &str) -> String {
+    let bare = match (token.find('['), token.rfind(']')) {
+        (Some(open), Some(close)) if open < close => {
+            format!("{}{}", &token[..open], &token[close + 1..])
+        }
+        _ => token.to_string(),
+    };
+    crate::sandbox::taskpool::split_version(&bare).0.to_string()
+}
+
+/// The keys mise exempts from its release-age delay for the packages a trusted layer named in
+/// `accepts_fresh_releases`.
+///
+/// Maps declared package **names** to the `mise:` packages they declare, so the locator stays
+/// written once (in `packages`) and the exemption cannot drift from it. Trusted-only and
+/// `mise:`-only, on the same filter as [`mise_packages`]: a name that resolves to a `nix:` or
+/// prebuilt package is dropped, because no freshness delay governs those and pretending otherwise
+/// would put an entry in front of mise that names nothing it equips.
+///
+/// Each package is named by its [`mise_tool_key`], not by its token: mise matches an exemption
+/// against that key alone, so a token carrying options or a version, written whole, exempted
+/// nothing. A key that still carries a comma is left out rather than joined, because the list is
+/// comma-separated and such a key would name neither itself nor its neighbour; no tool mise knows
+/// is named with one.
 ///
 /// A name matching no declared package yields nothing. That is deliberate rather than an error: the
 /// list is unioned across a project, an app and its bundles, so a name is routinely declared beside
@@ -183,10 +207,11 @@ pub(crate) fn fresh_release_tokens(packages: &[Package], named: &[String]) -> Ve
             if pkg.name != *name || pkg.state != TrustState::Trusted {
                 continue;
             }
-            if let Backend::Mise(token) = &pkg.backend
-                && !out.contains(token)
-            {
-                out.push(token.clone());
+            if let Backend::Mise(token) = &pkg.backend {
+                let key = mise_tool_key(token);
+                if !key.contains(',') && !out.contains(&key) {
+                    out.push(key);
+                }
             }
         }
     }
