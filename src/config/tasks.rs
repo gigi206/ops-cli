@@ -595,7 +595,17 @@ fn validate_task_name(name: &str) -> Result<(), String> {
              output into, and this one addresses that tree's parent rather than a place inside it"
         ));
     }
-    validate_secret_name(name).map(|_| ())
+    validate_secret_name(name)?;
+    // Every `sbx task` verb reads an argument that begins with `-` as an option, so an operation
+    // named that way could be declared and never named on the command line. Checked after the
+    // character set, so the name quoted here is one it admitted.
+    if name.starts_with('-') {
+        return Err(format!(
+            "`{name}` is not a task name — it begins with `-`, which `sbx task` reads as an option, \
+             so the operation could never be named on the command line"
+        ));
+    }
+    Ok(())
 }
 
 /// Validate the parameter declarations. The order is the section's **key** order, not the file's:
@@ -2057,6 +2067,27 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// A name every `sbx task` verb would read as an option is refused where it is declared, rather
+    /// than accepted and never reachable from the command line; a dash inside a name is still a name.
+    #[test]
+    fn a_task_cannot_be_named_like_an_option() {
+        let validated = |name: &str| {
+            validate_task(
+                name,
+                raw_task(),
+                &TaskOrigin::Project,
+                &TaskDefaults::default(),
+                &SecretDefaults::default(),
+                &PluginRegistry::default(),
+            )
+        };
+        for name in ["-x", "--json"] {
+            let e = validated(name).unwrap_err();
+            assert!(e.contains("reads as an option"), "{name}: {e}");
+        }
+        assert!(validated("db-migrate").is_ok());
     }
 
     #[test]
