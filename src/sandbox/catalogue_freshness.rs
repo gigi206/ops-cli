@@ -286,10 +286,12 @@ fn every_shipped_package_still_resolves_at_its_vendor() {
                     continue;
                 };
                 let argv = vec![mise.clone(), "latest".to_string(), token.clone()];
-                // The exemption the cage sets for this package, set here too. Without it the two
-                // packages that need one are reported broken while they launch perfectly.
+                // The exemption the cage sets for this package, set here too and in the same form,
+                // the package's key: without it the two packages that need one are reported broken
+                // while they launch perfectly, and mise matches an exemption by key alone.
+                let key = crate::sandbox::packages::mise_tool_key(token);
                 let env: Vec<(&str, &str)> = if *fresh {
-                    vec![("MISE_MINIMUM_RELEASE_AGE_EXCLUDES", token.as_str())]
+                    vec![("MISE_MINIMUM_RELEASE_AGE_EXCLUDES", key.as_str())]
                 } else {
                     vec![]
                 };
