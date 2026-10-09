@@ -129,9 +129,10 @@ SBX_FORWARD=1455,8080 sbx run -- ./dev-server
 ```
 
 Unlike a config file, where a malformed entry warns and is skipped so one typo cannot void a
-whole layer, a malformed flag value (`9200:nope`, `9200:9119:8787`) is a **hard error**: there
-is nothing else in the flag to save, and a silently-dropped forward would leave the launch up
-with the port you meant to publish answering nothing.
+whole layer, a malformed flag value (`9200:nope`, `9200:9119:8787`, or a port of `0`, alone or
+on either side of a remap) is a **hard error**: there is nothing else in the flag to save, and
+a silently-dropped forward would leave the launch up with the port you meant to publish
+answering nothing.
 
 ## The first consumer: codex's ChatGPT login
 
