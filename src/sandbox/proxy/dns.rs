@@ -182,16 +182,20 @@ impl Drop for Settle {
                 format!("the lookup for `{}` ended without an answer", self.name),
             ))
         });
+        // The name leaves the table before a caller is woken, so a caller that asks again on
+        // reading this answer starts a lookup of its own rather than joining the one that ended.
+        {
+            let mut table = locked(&self.in_flight);
+            if table
+                .get(&self.name)
+                .is_some_and(|s| Arc::ptr_eq(s, &self.slot))
+            {
+                table.remove(&self.name);
+            }
+        }
         let (stored, ready) = &*self.slot;
         *locked(stored) = Some(answer);
         ready.notify_all();
-        let mut table = locked(&self.in_flight);
-        if table
-            .get(&self.name)
-            .is_some_and(|s| Arc::ptr_eq(s, &self.slot))
-        {
-            table.remove(&self.name);
-        }
     }
 }
 
@@ -520,6 +524,34 @@ mod tests {
         // Settled, the place is free again.
         lookups.lookup("two.test").unwrap();
         assert_eq!(gate.calls(), 2);
+    }
+
+    /// A lookup that ends takes its name out of the table before it wakes anyone: a caller that
+    /// asks again on reading the answer must start a lookup of its own, not join the one that ended.
+    #[test]
+    fn a_settled_lookup_leaves_the_table_before_its_answer_is_published() {
+        let in_flight: Arc<Mutex<HashMap<String, InFlight>>> = Arc::default();
+        let slot = InFlight::default();
+        locked(&in_flight).insert("s.test".into(), Arc::clone(&slot));
+        let settle = Settle {
+            name: "s.test".into(),
+            slot: Arc::clone(&slot),
+            in_flight: Arc::clone(&in_flight),
+            answer: Some(Ok(vec![IpAddr::from([1, 2, 3, 4])])),
+        };
+        let table = locked(&in_flight);
+        let ending = std::thread::spawn(move || drop(settle));
+        // Held here, the table stops the lookup at its removal; anything it published before that
+        // would show now.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            locked(&slot.0).is_none(),
+            "the answer was published while the name was still in the table"
+        );
+        drop(table);
+        ending.join().unwrap();
+        assert!(locked(&slot.0).is_some());
+        assert!(locked(&in_flight).is_empty());
     }
 
     #[test]
