@@ -64,11 +64,15 @@ pub(super) fn serve_tunneled_request(
     // TLS shut down cleanly so a client still watching reads an end-of-stream and not a dropped
     // socket.
     //
-    // Only those shapes. This read is also what drives the first turn's handshake to completion, so
-    // a client that will not accept the minted leaf arrives here as the alert it sent — an attempt
-    // that failed, not a tunnel that ended. Swallowing it left a cage whose trust store has no sbx
-    // CA with nothing at all in `sbx net logs`, so anything else is handed to the head reader's own
-    // refusal, which names the host and logs the attempt.
+    // Only those shapes, and only once the handshake is done. This read is also what drives the
+    // first turn's handshake to completion, so a client that will not accept the minted leaf
+    // arrives here as the alert it sent — an attempt that failed, not a tunnel that ended.
+    // Swallowing it left a cage whose trust store has no sbx CA with nothing at all in `sbx net
+    // logs`, so anything else is handed to the head reader's own refusal, which names the host and
+    // logs the attempt. The three shapes above are that same attempt while the handshake is still
+    // running: a client that drops the connection instead of sending an alert, or one that sends
+    // nothing at all because it waits for the server to speak first, never had a tunnel to finish.
+    // They are logged like the alert, and the h2 plane logs its own failed handshakes the same way.
     //
     // `Ok(true)` is a byte waiting, `Ok(false)` the tunnel ending, `Err` the read failing.
     let has_request = match br.fill_buf() {
@@ -89,6 +93,10 @@ pub(super) fn serve_tunneled_request(
     };
     match has_request {
         Ok(true) => {}
+        Ok(false) if br.get_ref().conn.is_handshaking() => {
+            log_unreadable_inner_head(ctx, connect_host, port);
+            return Ok(Turn::Close);
+        }
         Ok(false) => {
             finish_tls(br.get_mut());
             return Ok(Turn::Close);
@@ -1012,6 +1020,10 @@ pub(super) fn serve_tunneled_request(
 /// nothing on it with [`Turn::Close`] and no line, which is how a persistent connection is meant to
 /// end. A read that *failed* there does reach this, including the TLS alert of a client that
 /// refused the minted leaf: that is an attempt, and it is logged as one.
+///
+/// Logged and not answered while the handshake is still running: there is no TLS session yet for
+/// the refusal to travel in, and writing one would only drive the handshake again, holding the
+/// thread for another read timeout against a client that has stopped taking part in it.
 fn refuse_unreadable_inner_head(
     br: &mut ClientTls,
     ctx: &ProxyCtx,
@@ -1019,6 +1031,22 @@ fn refuse_unreadable_inner_head(
     port: u16,
     err: &io::Error,
 ) -> io::Result<Turn> {
+    log_unreadable_inner_head(ctx, connect_host, port);
+    if br.get_ref().conn.is_handshaking() {
+        return Ok(Turn::Close);
+    }
+    respond_refusal_tls(
+        br,
+        "400 Bad Request",
+        UNREADABLE_HEAD,
+        &unreadable_head_detail(err),
+    )
+}
+
+/// The line a tunneled head that never became a request leaves in `sbx net logs`: the reason the
+/// entrance uses for the same event, against the host and port the CONNECT fixed, with no method
+/// and no path because no request line was read.
+fn log_unreadable_inner_head(ctx: &ProxyCtx, connect_host: &str, port: u16) {
     ctx.push_log(
         crate::sandbox::control::Proto::Https,
         connect_host,
@@ -1028,12 +1056,6 @@ fn refuse_unreadable_inner_head(
         crate::sandbox::control::LogVerdict::Blocked,
         UNREADABLE_HEAD,
     );
-    respond_refusal_tls(
-        br,
-        "400 Bad Request",
-        UNREADABLE_HEAD,
-        &unreadable_head_detail(err),
-    )
 }
 
 /// Write a refusal to the client through the buffered TLS stream (the in-tunnel error paths,
