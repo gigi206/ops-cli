@@ -190,7 +190,9 @@ accepts_fresh_releases = ["amp"]
 
 The values are package names as written in `packages`, never backend locators, so the locator stays
 written once and the two cannot drift. A name matching no declared package is ignored, which is what
-lets a project, an app and its bundles each carry their own list.
+lets a project, an app and its bundles each carry their own list. What mise is told to exempt is the
+tool the locator names, without its options or its version, because that is the only form mise
+matches: `mise:ubi:owner/tool[exe=tool]@1.2` lifts the delay for `ubi:owner/tool`.
 
 This is a security field, [trusted-only](#why-the-tool-sources-are-trusted-only) like `packages`
 itself, and it is a real trade: it accepts a build the vendor published moments ago. Declare it per
