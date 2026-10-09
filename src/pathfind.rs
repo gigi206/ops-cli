@@ -75,14 +75,23 @@ fn say_left_out(name: &str, dirs: impl Iterator<Item = PathBuf>, untrusted: Opti
     static SAID: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
     let Some(tree) = untrusted else { return };
     for found in candidates(name, dirs, None).filter(|c| is_executable(c)) {
-        if !lies_in(tree, found.parent().unwrap_or(&found)) {
+        if !in_project(tree, &found) {
             continue;
         }
         let mut said = crate::sandbox::locks::locked(SAID.get_or_init(Mutex::default));
         if !said.contains(&found) {
+            let target = crate::trust::canonicalize_existing_prefix(&found);
+            let lies = if target == found {
+                String::from("it lies in the project")
+            } else {
+                format!(
+                    "it leads to `{}`, in the project",
+                    crate::sandbox::sanitize(&target.display().to_string())
+                )
+            };
             crate::diag::warn(&format!(
-                "`{}` on your PATH is not used: it lies in the project, which the cage writes, so \
-                 a session could have put it there. Install `{name}` outside the project",
+                "`{}` on your PATH is not used: {lies}, which the cage writes, so a session could \
+                 have put it there. Install `{name}` outside the project",
                 crate::sandbox::sanitize(&found.display().to_string())
             ));
             said.push(found);
@@ -123,10 +132,15 @@ fn candidates<'a>(
     untrusted: Option<&'a Path>,
 ) -> impl Iterator<Item = PathBuf> + 'a {
     let bare = !name.is_empty() && !name.contains('/') && name != "." && name != "..";
-    dirs.filter(move |dir| {
-        bare && dir.is_absolute() && !untrusted.is_some_and(|tree| lies_in(tree, dir))
-    })
-    .map(move |dir| dir.join(name))
+    dirs.filter(move |dir| bare && dir.is_absolute())
+        .map(move |dir| dir.join(name))
+        .filter(move |cand| !untrusted.is_some_and(|tree| in_project(tree, cand)))
+}
+
+/// Whether the candidate `cand` is the project's: its directory lies there, or it is a link whose
+/// target does — a `~/bin/nix` linking to a build in the project is that build.
+fn in_project(tree: &Path, cand: &Path) -> bool {
+    cand.parent().is_some_and(|dir| lies_in(tree, dir)) || lies_in(tree, cand)
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -177,6 +191,9 @@ mod tests {
         std::fs::create_dir_all(&venv).unwrap();
         std::fs::create_dir_all(&system).unwrap();
         std::os::unix::fs::symlink(&venv, &linked).unwrap();
+        // A program linked from outside the project to a build inside it.
+        let home_bin = root.join("home-bin");
+        std::fs::create_dir_all(&home_bin).unwrap();
         for name in ["bwrap", "nix", "ssh-askpass"] {
             for dir in [&venv, &system] {
                 let tool = dir.join(name);
@@ -201,6 +218,13 @@ mod tests {
                     "outside any project the first entry still wins"
                 );
             }
+            std::os::unix::fs::symlink(venv.join(name), home_bin.join(name)).unwrap();
+            let dirs = || [home_bin.clone(), system.clone()].into_iter();
+            assert_eq!(
+                find_in_dirs(name, dirs(), Some(&project)),
+                Some(system.join(name)),
+                "{name} linked from outside to the project"
+            );
         }
     }
 
