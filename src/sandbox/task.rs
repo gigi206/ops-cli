@@ -351,15 +351,25 @@ pub(crate) struct TaskOutcome {
 /// Draw this invocation's substitution nonce: 6 hex characters from the system CSPRNG (already in the
 /// dependency tree via rustls/rcgen). Short, because it only has to be unpredictable *per
 /// invocation* — it authenticates a placeholder inside one result, it is not a secret.
-fn invocation_nonce() -> String {
+fn invocation_nonce() -> io::Result<String> {
     use ring::rand::SecureRandom;
+    nonce_from(|bytes| ring::rand::SystemRandom::new().fill(bytes).is_ok())
+}
+
+/// A nonce from the bytes `fill` writes, or an error when it could not write them.
+///
+/// No randomness means no unforgeable nonce, so the invocation is refused before its command runs.
+/// It used to go on with the nonce `unseeded`, a constant: a command could print
+/// `${NAME@unseeded}` and a caller comparing it against the nonce reported for the invocation would
+/// read it as authenticated, the one thing the nonce exists to prevent.
+fn nonce_from(fill: impl FnOnce(&mut [u8]) -> bool) -> io::Result<String> {
     let mut bytes = [0u8; 3];
-    if ring::rand::SystemRandom::new().fill(&mut bytes).is_err() {
-        // No randomness means no unforgeable nonce; say so in the placeholder rather than emit a
-        // predictable one that would read as authenticated.
-        return "unseeded".to_string();
+    if !fill(&mut bytes) {
+        return Err(io::Error::other(
+            "the system's randomness could not be read, so no substitution nonce can be drawn",
+        ));
     }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Why an invocation was refused or failed. A refusal names *what* was wrong without echoing a
@@ -756,6 +766,12 @@ impl TaskEngine {
             .task(name)
             .ok_or_else(|| TaskError::Unknown(name.into()))?;
         let argv = substitute(&task.cmd, &values).map_err(TaskError::refused)?;
+        // Drawn before anything that costs something — a credential resolved through a plugin, a
+        // proxy started — so an invocation refused for want of randomness has done none of it.
+        let nonce = match task.nonce {
+            true => Some(invocation_nonce().map_err(TaskError::Io)?),
+            false => None,
+        };
         // Recorded here, where it is the task's own command: below it is wrapped for exec
         // confinement and for the egress forwarder, and neither is what a reader is asking about.
         self.note_argv(invocation, &argv);
@@ -930,10 +946,9 @@ impl TaskEngine {
         let started = Instant::now();
         // A failure message is substituted too: it can carry the command's own diagnostics, and
         // there is no reason for the one path that reports trouble to be the one that leaks.
-        let placeholder = if task.nonce {
-            Placeholder::Nonced(invocation_nonce())
-        } else {
-            Placeholder::Plain
+        let placeholder = match nonce {
+            Some(nonce) => Placeholder::Nonced(nonce),
+            None => Placeholder::Plain,
         };
         // One byte less than the longest needle: enough that a credential lying across the output
         // ceiling is whole when the scan runs. See [`read_capped`].
