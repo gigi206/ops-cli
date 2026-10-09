@@ -651,6 +651,10 @@ fn render_inject(
     let (h, r) = (pal.head, pal.reset);
     let mut o = String::new();
     if !loaded.is_empty() {
+        // The grammar that admitted the rule refuses a control byte but not a character that
+        // reorders a line (U+202E), which a `re:` pattern may carry; standard output writes text as
+        // given, so the rule is rendered through the one sanitiser, as the listing renders it.
+        let rule = crate::sandbox::sanitize(rule);
         let _ = writeln!(
             o,
             "{}",
@@ -1115,6 +1119,24 @@ mod tests {
             out.lines().filter(|l| l.contains("ctl.test")).count(),
             1,
             "and one rule stays one line: {out:?}"
+        );
+    }
+
+    /// A rule a `--session` load reports on standard output reaches it with no character that
+    /// reorders the line: the rule grammar admits U+202E in a `re:` pattern, and nothing between the
+    /// render and the terminal filters it.
+    #[test]
+    fn a_loaded_rule_cannot_reorder_the_line_that_reports_it() {
+        let rule = "re:^a\u{202e}b";
+        assert!(
+            crate::allowlist::classify_in(rule, crate::allowlist::Slot::Allow).is_ok(),
+            "the premise: the grammar admits the character"
+        );
+        let out = render_inject("allow", rule, &[7], &[], &style::Palette::plain());
+        assert!(!out.contains('\u{202e}'), "{out:?}");
+        assert!(
+            out.starts_with("loaded allow rule `re:^a b` into 1 live session(s):"),
+            "{out:?}"
         );
     }
 
