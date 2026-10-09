@@ -85,6 +85,12 @@ per trusted project config, holding the SHA-256 of the file's contents, keyed by
 config's canonical path, and beside it (`<marker>.approved`) the bytes that hash was taken
 over, which `sbx trust` diffs against on the next approval. See [The trust gate](trust).
 
+Under it, `write-locks/` holds one empty file per config file sbx has edited, keyed the same
+way. An edit (`sbx config set`, a rule `sbx net allow` saves, the rules a learning run writes)
+holds that file's lock from the moment it reads the config to the moment it has re-trusted what
+it wrote, so two edits of one file take turns instead of the later one writing back a copy that
+lacks the earlier one's change. A second edit waits, and says which file it waits for.
+
 The trust store dir is required to be an **absolute** path: a relative base would
 let a cloned repository pre-approve itself.
 
