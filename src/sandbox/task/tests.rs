@@ -1883,7 +1883,7 @@ fn a_cage_path_climbing_out_of_its_mount_has_no_host_counterpart() {
         Some(project.join("bin/run.sh"))
     );
     assert_eq!(
-        engine.host_path(&project.join("../outside/secret"), &task),
+        engine.host_path(&project.join("bin/../../outside/secret"), &task),
         None
     );
     assert_eq!(
