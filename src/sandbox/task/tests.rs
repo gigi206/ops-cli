@@ -1620,11 +1620,13 @@ fn claiming_the_directory_clears_what_a_previous_invocation_left() {
     let engine = engine_with_project(root.path(), vec![task.clone()]);
 
     let first = engine.claim_output(&task).expect("the first claim");
+    first.prepare().expect("prepare the directory");
     std::fs::write(first.dir.join("stale.sql"), b"yesterday").expect("write");
     assert_eq!(first.size(), 9, "the size reports what is really there");
     drop(first);
 
     let second = engine.claim_output(&task).expect("the second claim");
+    second.prepare().expect("prepare the directory");
     assert!(
         !second.dir.join("stale.sql").exists(),
         "a claim must not hand back the previous invocation's artifact"
@@ -1648,6 +1650,37 @@ fn a_second_invocation_of_the_same_task_is_refused_while_the_first_holds_it() {
     engine
         .claim_output(&task)
         .expect("the hold is released with the invocation");
+}
+
+/// An invocation that fails after its admission, before its command starts, leaves the previous
+/// artifact where it was: the directory is emptied only once nothing but the command can fail.
+#[test]
+fn an_invocation_failing_before_its_command_keeps_the_previous_artifact() {
+    let root = crate::testutil::TmpDir::new();
+    let mut task = task();
+    task.output = true;
+    task.secrets = vec![TaskSecret {
+        var: "PGPASSWORD".into(),
+        sources: vec![],
+        encode: Encoding::Raw,
+        description: None,
+    }];
+    let engine = engine_with_project(root.path(), vec![task.clone()]);
+    let earlier = engine.claim_output(&task).expect("an earlier claim");
+    earlier.prepare().expect("prepare the directory");
+    std::fs::write(earlier.dir.join("dump.sql"), b"yesterday").expect("write");
+    let dir = earlier.dir.clone();
+    drop(earlier);
+
+    let params = BTreeMap::from([("sql".to_string(), "SELECT one".to_string())]);
+    let e = engine
+        .run("db-query", &params, &BTreeMap::new(), next_invocation())
+        .expect_err("a credential no source resolves fails the invocation");
+    assert!(matches!(e, TaskError::Credential(_)), "{e:?}");
+    assert_eq!(
+        std::fs::read(dir.join("dump.sql")).expect("the previous artifact"),
+        b"yesterday"
+    );
 }
 
 /// Two sessions of one project each run their own engine, in their own process, over one output

@@ -964,7 +964,7 @@ impl TaskEngine {
             .unwrap_or(0)
             .saturating_sub(1);
         let raw = self
-            .exec(&spec, task, invocation, scan_margin)
+            .exec(&spec, task, invocation, scan_margin, output.as_ref())
             .map_err(|e| {
                 let (text, _) =
                     super::redact::redact_string(&e.to_string(), &needles, &placeholder);
@@ -1244,6 +1244,7 @@ impl TaskEngine {
         task: &TaskSpec,
         invocation: u64,
         scan_margin: usize,
+        output: Option<&OutputClaim>,
     ) -> io::Result<RawOutput> {
         // The same assembly a launch makes, rather than a second spelling of it: a task cage never
         // carries a netns dummy, so the holder step the shared form adds is a no-op here — and stays
@@ -1262,6 +1263,19 @@ impl TaskEngine {
                 timed_out: false,
                 stopped: true,
             });
+        }
+        // The output directory is emptied here, past every step that can still stop the invocation
+        // short of its command: it is a bind source by path, so it only has to exist at the spawn.
+        if let Some(o) = output {
+            o.prepare().map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot prepare the output directory {}: {e}",
+                        o.dir.display()
+                    ),
+                )
+            })?;
         }
         let mut command = cage.into_command();
         command
@@ -1439,8 +1453,9 @@ impl TaskEngine {
         output_root_for(&self.layout, &self.project)
     }
 
-    /// Claim `task`'s output directory for one invocation: empty it, create it, and hold the name so
-    /// a concurrent invocation of the same task is refused rather than writing into the same place.
+    /// Claim `task`'s output directory for one invocation: hold the name so a concurrent invocation
+    /// of the same task is refused rather than writing into the same place. The claim empties the
+    /// directory once the command is about to start ([`OutputClaim::prepare`]).
     ///
     /// Emptying is what keeps a predictable path honest. The directory is one per task, so a caller
     /// knows where to look without being told — and would otherwise find the previous invocation's
@@ -1512,22 +1527,8 @@ impl TaskEngine {
                 ));
             }
         };
-        let dir = root.join(&task.name);
-        let prepare = || -> io::Result<()> {
-            if dir.exists() {
-                super::gc::force_remove_dir_all(&dir)?;
-            }
-            std::fs::create_dir_all(&dir)
-        };
-        if let Err(e) = prepare() {
-            locked(&self.output_held).remove(&task.name);
-            return Err(format!(
-                "cannot prepare the output directory {}: {e}",
-                dir.display()
-            ));
-        }
         Ok(OutputClaim {
-            dir,
+            dir: root.join(&task.name),
             task: task.name.clone(),
             held: self.output_held.clone(),
             lock,
@@ -2071,6 +2072,21 @@ struct OutputClaim {
 }
 
 impl OutputClaim {
+    /// Empty the directory, or make it: what sits there once the command runs is its own work.
+    ///
+    /// Called by the invocation just before its command starts, not when the directory is claimed:
+    /// the claim is taken at admission, where it refuses a concurrent invocation early, and every
+    /// step between the two can still fail — the nonce, a credential, the proxy, the spec, the cage's
+    /// composition, a stop asked for meanwhile. Emptied
+    /// at the claim, an invocation that failed there had already destroyed the previous artifact
+    /// and left nothing in its place.
+    fn prepare(&self) -> io::Result<()> {
+        if self.dir.exists() {
+            super::gc::force_remove_dir_all(&self.dir)?;
+        }
+        std::fs::create_dir_all(&self.dir)
+    }
+
     /// What the directory holds now, in bytes — reported so a caller learns an artifact was produced
     /// without having to go and look. A link is counted as nothing and never followed: neither
     /// `DirEntry::file_type` nor `DirEntry::metadata` traverses one. What is counted is what could
