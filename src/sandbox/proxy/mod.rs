@@ -115,7 +115,7 @@
 //! | `503` | `connection-cap`         | the proxy is already serving as many client connections as it will serve at once (`[network] max_connections`). Answered on the accept loop, before anything is read, so the caller's own request is still unread when the connection closes and the refusal arrives followed by a reset |
 //! | `503` | `body-buffer-cap`        | the proxy is already holding as much request-body data as it will hold at one time (retry when one in flight completes). Nothing is wrong with the request: it is a shared ceiling on host memory, since the proxy buffers host-side and the cage's own `MemoryMax` does not reach it |
 //! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target (or, on an absolute-form request, with the request-line host): another host, a port other than the one connected to, or a value that is not an authority at all ([`authority_bound_to`]) |
-//! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. Every inspected plane reads the framing through one shared check ([`inspect_framing`]), so the same request is refused under the same reason whichever plane it arrived on. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:dup-transfer-encoding`, `bad-request:invalid-content-length`, `bad-request:control-char` (a byte in the request line or a header that another parser could read as a line break — see [`head_carries_control_byte`]), `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed or over the proxy cap), or `bad-request:head` (a head that never arrived whole: truncated, over [`HEAD_MAX`], past [`head_deadline`], or not UTF-8 — read before there is a request line, so it names no method, and no host but the one a CONNECT already fixed; inside a tunnel it is also a client that never completed the interception handshake, whether it sent an alert, closed, or fell silent past the socket timeout, and such a client is answered with nothing since no TLS session exists to carry the answer). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
+//! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. Every inspected plane reads the framing through one shared check ([`inspect_framing`]), so the same request is refused under the same reason whichever plane it arrived on. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:dup-transfer-encoding`, `bad-request:invalid-content-length`, `bad-request:control-char` (a byte in the request line or a header that another parser could read as a line break — see [`head_carries_control_byte`]), `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed, over the proxy cap, or stopped arriving before its end), or `bad-request:head` (a head that never arrived whole: truncated, over [`HEAD_MAX`], past [`head_deadline`], or not UTF-8 — read before there is a request line, so it names no method, and no host but the one a CONNECT already fixed; inside a tunnel it is also a client that never completed the interception handshake, whether it sent an alert, closed, or fell silent past the socket timeout, and such a client is answered with nothing since no TLS session exists to carry the answer). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
 //! | `405` | `method-not-allowed`     | a non-CONNECT request that is neither a routable `http://` nor `https://` absolute-form (a bare origin-form has no destination) |
 //! | `502` | `dns-failure`            | DNS resolution failed for an allowed host, or was refused because the proxy was already looking up as many names as it looks up at once (twice the policy's `[network] max_connections`) |
 //! | `502` | `upstream-unreachable`   | the host is allowed but the TCP connection failed |
@@ -2253,6 +2253,21 @@ fn unreadable_head_detail(err: &io::Error) -> String {
             "the request head stopped arriving and the connection timed out".to_string()
         }
         _ => err.to_string(),
+    }
+}
+
+/// What a caller is told about a `chunked` request body that could not be read whole, on either
+/// plane that de-chunks one and on both paths each reads it on.
+///
+/// The same split as [`unreadable_head_detail`]: a socket that timed out is named in a sentence of
+/// this module's rather than in the operating system's words, and every other cause is quoted after
+/// the sentence that says which part of the request it was.
+fn unreadable_chunked_body_detail(err: &io::Error) -> String {
+    match err.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+            "the chunked request body stopped arriving and the connection timed out".to_string()
+        }
+        _ => format!("the chunked request body could not be read: {err}"),
     }
 }
 

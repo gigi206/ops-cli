@@ -441,7 +441,7 @@ pub(super) fn serve_tunneled_request(
                         &mut br,
                         "400 Bad Request",
                         "bad-request:chunked",
-                        &format!("the chunked request body could not be read: {e}"),
+                        &unreadable_chunked_body_detail(&e),
                     );
                 }
                 Err(e) => return Err(e),
@@ -724,7 +724,7 @@ pub(super) fn serve_tunneled_request(
                     &mut br,
                     "400 Bad Request",
                     "bad-request:chunked",
-                    &format!("the chunked request body could not be read: {e}"),
+                    &unreadable_chunked_body_detail(&e),
                 );
             }
         };
