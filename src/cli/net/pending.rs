@@ -1194,6 +1194,40 @@ fn net_pending_drain_and_save(
 mod tests {
     use super::*;
 
+    /// A drain narrowed to an app answers nothing when the session registry cannot be read, and
+    /// says so with a failure, rather than draining no session and reporting the app had nothing
+    /// parked. The same command against a registry that does not exist yet drains nothing and
+    /// succeeds, which is what ties the failure to the registry rather than to the data directory.
+    #[test]
+    fn a_drain_narrowed_to_an_app_refuses_an_unreadable_registry() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        let _env = env_lock();
+        let data = TmpDir::new();
+        let _dir = EnvVar::set("SBX_DATA_DIR", data.path());
+        assert!(
+            crate::store::Layout::from_env().is_some(),
+            "the data directory is one sbx accepts"
+        );
+        let argv = |xs: &[&str]| xs.iter().map(OsString::from).collect::<Vec<_>>();
+        let drains = [
+            argv(&["--all", "-a", "demo"]),
+            argv(&["--all", "--save", "-g", "-a", "demo"]),
+        ];
+        for args in &drains {
+            assert!(
+                net_pending_answer(sandbox::control::Verdict::Allow, args) == ExitCode::SUCCESS,
+                "no registry yet is no sessions, and nothing to drain: {args:?}"
+            );
+        }
+        std::fs::write(data.join("sessions"), b"not a directory").unwrap();
+        for args in &drains {
+            assert!(
+                net_pending_answer(sandbox::control::Verdict::Allow, args) == ExitCode::FAILURE,
+                "{args:?}"
+            );
+        }
+    }
+
     /// `-a <app>` on `net pending`, with a session registry that cannot be read, reports the registry
     /// instead of an empty listing that would read as the app having nothing parked. Without the filter
     /// the registry only labels the listing, and the gather goes ahead.
