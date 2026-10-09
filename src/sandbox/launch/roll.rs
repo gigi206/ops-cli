@@ -15,6 +15,7 @@ use super::cage::{echo_cage_output, run_captured};
 use super::equip::{MISE_STATE_MARKER, mise_state_cmd, mise_upgrade_cmd};
 use super::startup::provision_only_cmd;
 use super::*;
+use crate::sandbox::packages::mise_tool_key;
 
 /// Whether an `sbx upgrade` run applies what it resolves, or only reports it (`--dry-run`).
 ///
@@ -729,20 +730,6 @@ enum MiseCheck {
     NotEquipped { tool: String },
     /// Installed, but mise could not ask the tool's registry what is newest.
     Unknown { tool: String, why: String },
-}
-
-/// The key mise files a declared token under in its JSON reports: the token without its
-/// `[options]` and without an explicit `@version`. `github:example/tool[version_prefix=v]` is
-/// reported as `github:example/tool`; an npm scope is not a version (see
-/// [`crate::sandbox::taskpool::split_version`]).
-fn mise_tool_key(token: &str) -> String {
-    let bare = match (token.find('['), token.rfind(']')) {
-        (Some(open), Some(close)) if open < close => {
-            format!("{}{}", &token[..open], &token[close + 1..])
-        }
-        _ => token.to_string(),
-    };
-    crate::sandbox::taskpool::split_version(&bare).0.to_string()
 }
 
 /// Read what [`mise_state_cmd`] printed into one [`MiseCheck`] per declared tool.
