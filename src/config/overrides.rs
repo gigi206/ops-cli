@@ -1437,6 +1437,7 @@ fn parse_raw_limit(value: &str) -> RawLimit {
 /// wording, and it already names the path, so this prefix does not repeat it.
 fn parse_blob(value: &str) -> Result<RawConfig, String> {
     let bytes = match value.strip_prefix('@') {
+        Some("") => return Err("`@` names no file (write `@<file>` to read one)".to_string()),
         Some(path) => super::safety::read_safe_bytes(std::path::Path::new(path))
             .map_err(|e| format!("cannot read override file: {e}"))?,
         None => value.as_bytes().to_vec(),
@@ -2250,6 +2251,30 @@ mod tests {
         // The gate names the path it failed on, so the prefix does not have to: assert the file is
         // still identified, since an override that aborts a launch must say which one.
         assert!(err.contains("/no/such/sbx-override.toml"), "{err}");
+    }
+
+    /// `@` with nothing after it names no file, and says so, rather than reporting a failed read
+    /// of an empty path. Both blob surfaces reach it.
+    #[test]
+    fn an_at_sign_alone_names_no_file() {
+        let err = collect_cli(Cli {
+            config: &["@"],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.starts_with("--config (#1): ") && err.contains("`@` names no file"),
+            "{err}"
+        );
+        let err = ambient(AmbientOverrides {
+            config: Some("@".to_string()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.starts_with("SBX_CONFIG: ") && err.contains("`@` names no file"),
+            "{err}"
+        );
     }
 
     #[test]
