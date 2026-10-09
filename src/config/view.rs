@@ -212,25 +212,27 @@ pub(crate) struct BindView {
     pub(crate) layer: Option<ProvenanceView>,
 }
 
-/// An argv as one line a reader can split back into its words: a word a shell would split, expand
-/// or unquote is single-quoted, every other one is shown as it is. "Every other" is a closed set,
-/// the one Python's `shlex.quote` leaves bare, so a byte nobody thought of is quoted rather than
-/// passed through.
+/// An argv as one line a reader can split back into its words, each written by [`shell_word`].
 fn display_argv(argv: &[String]) -> String {
     argv.iter()
-        .map(|word| {
-            let bare = !word.is_empty()
-                && word
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b));
-            if bare {
-                word.clone()
-            } else {
-                sandbox::shell_quote(word)
-            }
-        })
+        .map(|word| shell_word(word))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// One word as a shell reads it back as itself: single-quoted when a shell would split, expand or
+/// unquote it, shown as it is otherwise. "Otherwise" is a closed set, the one Python's
+/// `shlex.quote` leaves bare, so a byte nobody thought of is quoted rather than passed through.
+pub(crate) fn shell_word(word: &str) -> String {
+    let bare = !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b));
+    if bare {
+        word.to_string()
+    } else {
+        sandbox::shell_quote(word)
+    }
 }
 
 /// Project a resolved handler table for display, in scheme order.
