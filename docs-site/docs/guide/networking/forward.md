@@ -36,9 +36,11 @@ allow = ["chatgpt.com"]
 
 - **`forward = [port, …]`**: a list of entries, each a TCP port number in `1-65535`
   (`0` and out-of-range values are warned about and skipped, per entry). Each is bound on the
-  host's `127.0.0.1`, and, best-effort, on `[::1]` so a `localhost` callback the browser sends
-  over IPv6 is caught too, loopback only, never an external interface, and bridged to the cage's
-  own loopback at the *same* port. Entries are ordered canonically by `(cage, host)` port, so
+  host's `127.0.0.1`, and on `[::1]` when the host has IPv6 loopback, so a `localhost` callback
+  the browser sends over IPv6 is caught too. A port another process already holds on either
+  address fails the launch rather than leave that process answering half of `localhost`. Each is
+  bound on loopback only, never on an external interface, and is bridged to the cage's own
+  loopback at the *same* port. Entries are ordered canonically by `(cage, host)` port, so
   two equivalent layers produce one identical set. The in-cage bridge connects the service on
   `127.0.0.1:<port>`, so a cage service that binds only IPv6 loopback (`::1`) is not reached: bind `127.0.0.1` or all interfaces inside the cage.
 - **Loopback only, which means the machine and not the account.** sbx never binds an external
