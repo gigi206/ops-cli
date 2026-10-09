@@ -51,6 +51,11 @@ a FIFO, a directory or a loose-permission file is refused by name rather than la
 The distinction matters most for `SBX_CONFIG=@…`, which can reach `sbx` from an ambient
 environment nobody re-read.
 
+Both forms are held to the size any config file is held to: a blob past 1 MiB is refused
+(exit 2) before it is parsed. On most hosts the kernel stops an inline blob well before
+that, since it caps one argument or variable at 32 pages (128 KiB with 4 KiB pages), so a
+large override belongs in a file named with `@<file>`.
+
 A file that is not valid TOML is a usage error (exit 2), and the error quotes the line it
 stopped at. That line is printed as text: a control character or a character that reorders
 a line is written out as an escape (`\x1b`, `\u{202e}`), so the quote shows what the file
