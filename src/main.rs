@@ -987,13 +987,14 @@ fn in_scope(pid: u32, project_pids: &ScopeFilter, app_pids: &ScopeFilter) -> boo
 }
 
 /// The exit code a `--session` rule load ends with, from how many sessions in scope `held` the rule,
-/// `refused` it, or kept it without their proxy confirming it decides requests (`unconfirmed`).
+/// `refused` it, or left it unknown whether it decides their requests (`unconfirmed`): kept without
+/// their proxy confirming it, or not answering whether they took it.
 ///
 /// A load succeeds only when every session it reached holds the rule, and it reached at least one.
 /// A session that refused it, one running an sbx too old to load a live rule, goes on without it,
 /// and a load that reached none applied nothing: both exit 1, so `sbx net deny X --session && …`
 /// does not go on as if X were denied there. An unconfirmed session exits 2, the code the answer by
-/// id and the drain give the same state. Shared by `sbx net allow|deny|mute --session` and `sbx proc
+/// id and the drain give the same state, and running the load again settles it. Shared by `sbx net allow|deny|mute --session` and `sbx proc
 /// allow|deny --session` for the reason [`session_scope_pids`] is: two copies of when a live rule
 /// counts as loaded would come to disagree.
 fn session_load_code(held: usize, refused: usize, unconfirmed: usize) -> ExitCode {
