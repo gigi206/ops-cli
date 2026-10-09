@@ -1875,8 +1875,13 @@ pub(crate) mod client {
         pub(crate) output: Option<(String, u64)>,
     }
 
-    /// Parse a `RUN` response. The length-prefixed streams are read by byte count, so a payload
+    /// Parse a `RUN`, `DETACH` or `RESULT` response. The length-prefixed streams are read by byte count, so a payload
     /// containing the protocol's own keywords cannot be mistaken for a header line.
+    ///
+    /// An answer ends on its `err …` line or on its closing `ok`; one that ends on neither is an
+    /// [`io::ErrorKind::UnexpectedEof`] error. Read as whole, an answer the plane never finished —
+    /// it died before writing, or mid-way — carried the defaults of every line it did not reach,
+    /// and `exit` defaults to `0`: the command read as one that ran and succeeded.
     pub(crate) fn parse_run(raw: &[u8]) -> io::Result<RunResult> {
         let mut out = RunResult::default();
         let mut rest = raw;
@@ -1886,6 +1891,11 @@ pub(crate) mod client {
             let line = String::from_utf8_lossy(line).into_owned();
             if let Some(msg) = line.strip_prefix("err ") {
                 out.error = Some(msg.to_string());
+                return Ok(out);
+            }
+            // The streams are taken by their declared length below, never read as lines, so an `ok`
+            // the command printed cannot end the answer here.
+            if line == "ok" {
                 return Ok(out);
             }
             let Some((key, value)) = line.split_once(' ') else {
@@ -1951,7 +1961,10 @@ pub(crate) mod client {
                 _ => {}
             }
         }
-        Ok(out)
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the task plane's answer ended before its closing `ok`",
+        ))
     }
 
     /// Split off one `\n`-terminated line, returning it without the newline.
