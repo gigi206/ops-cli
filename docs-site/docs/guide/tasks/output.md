@@ -103,7 +103,8 @@ leaves there is chosen with that in mind. A file the agent must not read does no
 **It is emptied when the invocation claims it.** A predictable path is only honest if what sits there
 is *this* invocation's work; otherwise a caller reads the previous artifact and cannot tell. If you
 want to keep an artifact, copy it out. For the same reason, a second invocation of the same task is
-**refused** while the first still holds the directory: two would interleave in one place.
+**refused** while the first still holds the directory, whether it comes from the same session or from
+another session of the same project: two would interleave in one place.
 
 **It is a real directory, never a tmpfs.** A tmpfs is RAM: a 300 MiB dump would be 300 MiB of memory,
 and the cage's own cgroup would kill it. The directory lives under the project's runtime tree, so
