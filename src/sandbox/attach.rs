@@ -326,7 +326,6 @@ fn in_session_cage(pid: u32, project: &Path) -> bool {
 /// time instead, and any link on it refused. `None` when the path is not there, not a directory,
 /// or cannot be read.
 fn project_inside(pid: u32, project: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
     const DIR: libc::c_int = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
     let root = CString::new(format!("/proc/{pid}/root")).ok()?;
@@ -348,34 +347,58 @@ fn project_inside(pid: u32, project: &Path) -> Option<(u64, u64)> {
         true => PathBuf::from("."),
         false => components.iter().collect(),
     };
-    let relative = CString::new(relative.as_os_str().as_bytes()).ok()?;
-    // `struct open_how`: the open flags, the mode, the resolution flags.
-    let how: [u64; 3] = [
-        DIR as u64,
-        0,
-        libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS,
-    ];
-    // SAFETY: `openat2` reads the path and the three-word `open_how` it is handed with that
-    // structure's size, and returns a fresh descriptor or -1.
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root.as_raw_fd(),
-            relative.as_ptr(),
-            how.as_ptr(),
-            std::mem::size_of_val(&how),
-        )
-    };
-    let dir = if fd >= 0 {
-        // SAFETY: the descriptor `openat2` returned, owned from here on.
-        unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) }
-    } else if io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) {
-        walk_without_links(root, &components)?
-    } else {
-        return None;
+    let dir = match open_in_root(&root, &relative, DIR) {
+        Ok(dir) => dir,
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => walk_without_links(root, &components)?,
+        Err(_) => return None,
     };
     let meta = std::fs::File::from(dir).metadata().ok()?;
     Some((meta.dev(), meta.ino()))
+}
+
+/// Open `relative` beneath the directory `root` as a process whose root `root` is would: `openat2`
+/// with `RESOLVE_IN_ROOT` reads `..` and an absolute link as that root's, never the host's, and
+/// `RESOLVE_NO_MAGICLINKS` refuses the `/proc` links that jump elsewhere. `flags` are the open
+/// flags. The kernel's own error comes back as it is, `ENOSYS` included on a kernel without
+/// `openat2` (before 5.6), so each caller decides what it does without one; an `EAGAIN`, which the
+/// kernel answers when a rename raced the resolution, is asked again a few times first.
+pub(in crate::sandbox) fn open_in_root(
+    root: &OwnedFd,
+    relative: &Path,
+    flags: libc::c_int,
+) -> io::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let relative = CString::new(relative.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path holding a NUL"))?;
+    // `struct open_how`: the open flags, the mode, the resolution flags.
+    let how: [u64; 3] = [
+        flags as u64,
+        0,
+        libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS,
+    ];
+    let mut tries = 0;
+    loop {
+        // SAFETY: `openat2` reads the path and the three-word `open_how` it is handed with that
+        // structure's size, and returns a fresh descriptor or -1.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                root.as_raw_fd(),
+                relative.as_ptr(),
+                how.as_ptr(),
+                std::mem::size_of_val(&how),
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: the descriptor `openat2` returned, owned from here on.
+            return Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) });
+        }
+        let e = io::Error::last_os_error();
+        tries += 1;
+        if e.raw_os_error() != Some(libc::EAGAIN) || tries >= 8 {
+            return Err(e);
+        }
+    }
 }
 
 /// The directory `components` name beneath `root`, opened one component at a time with every link
