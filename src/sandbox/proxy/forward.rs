@@ -261,6 +261,9 @@ pub(super) fn handle_https_forward(
                         &format!("the chunked request body could not be read: {e}"),
                     );
                 }
+                // A `Content-Length` body that ends early is a transport failure rather than a
+                // malformed request, and stays the dropped connection it is when the body streams,
+                // as on the tunneled plane.
                 Err(e) => return Err(e),
             }
         }
