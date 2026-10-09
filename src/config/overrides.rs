@@ -1064,8 +1064,9 @@ fn union_forward_opt(
 /// it is an explicit request the user mistyped: unlike a config file, where a bad entry is warned
 /// and skipped so one typo cannot void a whole layer, there is nothing else in a flag to save.
 ///
-/// A port of `0` parses here and is dropped downstream by the resolver's validator (a value-range
-/// concern, not a structural one — the additive model).
+/// A port of `0` is refused with them. It names no port a socket can be bound to, and dropped
+/// downstream with a warning it would bring the launch up with that forward missing, the outcome the
+/// flag fails closed to avoid. A config file's `0` is still warned and skipped by the resolver.
 fn parse_forward(spec: &str, label: &str) -> Result<Vec<schema::RawForward>, String> {
     let entries: Vec<schema::RawForward> = spec
         .split(',')
@@ -1082,19 +1083,19 @@ fn parse_forward(spec: &str, label: &str) -> Result<Vec<schema::RawForward>, Str
 /// Parse one token of a `--forward` value. Both sides of a remap are checked here so the flag fails
 /// at the point of the mistake, naming the token as typed.
 fn parse_forward_token(token: &str, label: &str) -> Result<schema::RawForward, String> {
+    // Range-checked here although the schema holds an `i64` and the resolver checks it again: a
+    // flag fails at the point of the mistake, naming the token as typed, while a *config* value is
+    // range-checked downstream so that a bad port cannot take its whole layer with it.
+    let port = |s: &str| s.parse::<u16>().ok().filter(|&p| p != 0);
     let Some((host, cage)) = token.split_once(':') else {
-        // Checked as a `u16` here even though the schema holds an `i64`: a flag fails at the point
-        // of the mistake, naming the token as typed, while a *config* value is range-checked
-        // downstream so that a bad port cannot take its whole layer with it.
-        return token
-            .parse::<u16>()
+        return port(token)
             .map(|p| schema::RawForward::Port(p.into()))
-            .map_err(|_| format!("{label}: `{token}` is not a valid port (expected 0–65535)"));
+            .ok_or_else(|| format!("{label}: `{token}` is not a valid port (expected 1-65535)"));
     };
     let bad = |side: &str, which: &str| {
         format!(
-            "{label}: `{token}` is not a valid forward — the {which} side `{side}` is not a port \
-             (expected `<host>:<cage>`, e.g. `9200:9119`)"
+            "{label}: `{token}` is not a valid forward — the {which} side `{side}` is not a port in \
+             1-65535 (expected `<host>:<cage>`, e.g. `9200:9119`)"
         )
     };
     if cage.contains(':') {
@@ -1103,8 +1104,8 @@ fn parse_forward_token(token: &str, label: &str) -> Result<schema::RawForward, S
              `<host>:<cage>`, e.g. `9200:9119`)"
         ));
     }
-    host.parse::<u16>().map_err(|_| bad(host, "host"))?;
-    cage.parse::<u16>().map_err(|_| bad(cage, "cage"))?;
+    port(host).ok_or_else(|| bad(host, "host"))?;
+    port(cage).ok_or_else(|| bad(cage, "cage"))?;
     Ok(schema::RawForward::Remap(token.to_string()))
 }
 
@@ -1737,6 +1738,44 @@ mod tests {
                 "`{bad}` must be a structural error naming the flag and the token: {err}"
             );
         }
+    }
+
+    /// A port of `0` is refused by the flag like any other port out of 1-65535, on its own and on
+    /// either side of a remap. Passed on, the resolver warned and dropped it, and the launch came up
+    /// with the forward the caller typed missing, which is what the flag fails closed to prevent.
+    #[test]
+    fn the_forward_flag_refuses_a_port_out_of_1_to_65535_on_every_side() {
+        for good in ["1", "65535", "1:65535", "65535:1"] {
+            assert!(
+                collect_cli(Cli {
+                    forward: &[good],
+                    ..Default::default()
+                })
+                .is_ok(),
+                "`{good}` is a forward"
+            );
+        }
+        for bad in ["0", "65536", "0:9119", "9200:0", "65536:9119", "9200:65536"] {
+            let err = collect_cli(Cli {
+                forward: &[bad],
+                ..Default::default()
+            })
+            .unwrap_err();
+            assert!(
+                err.contains("--forward") && err.contains(bad) && err.contains("1-65535"),
+                "`{bad}` must be refused naming the flag, the token and the range: {err}"
+            );
+        }
+        // The environment's spelling is parsed by the same function and refused the same way.
+        let err = ambient(AmbientOverrides {
+            forward: vec!["0".into()],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("SBX_FORWARD") && err.contains("1-65535"),
+            "{err}"
+        );
     }
 
     #[test]
