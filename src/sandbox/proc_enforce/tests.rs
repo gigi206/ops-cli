@@ -4637,9 +4637,23 @@ fn a_descriptor_the_caller_holds_is_refused_as_something_that_is_there() {
         flags >= 0
     }
 
+    // Taken just under the descriptor limit, highest first. The kernel hands out the lowest free
+    // number, so the lowest free numbers of a low range are the very ones the next open on another
+    // thread takes once this process's table reaches it; the top of the table is the last it fills.
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` writes the one `rlimit` it is handed.
+    let top = match unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } {
+        0 => limit.rlim_cur.min(1 << 20) as libc::c_int,
+        _ => 1024,
+    };
     for _ in 0..8 {
         // Two numbers this process does not hold: one the child is made to hold, one nobody does.
-        let mut free = (200..400).filter(|n| !held_here(*n));
+        let mut free = (top.saturating_sub(64).max(3)..top)
+            .rev()
+            .filter(|n| !held_here(*n));
         let (Some(held), Some(never)) = (free.next(), free.next()) else {
             break;
         };
@@ -4647,13 +4661,24 @@ fn a_descriptor_the_caller_holds_is_refused_as_something_that_is_there() {
         let mut cmd = std::process::Command::new("sleep");
         cmd.arg("30").process_group(0);
         // SAFETY: the closure runs in the forked child before `execve`, where only
-        // async-signal-safe calls are allowed. `open`, `dup2` and `close` are; nothing is
+        // async-signal-safe calls are allowed. `open`, `dup2`, `fcntl` and `close` are; nothing is
         // allocated and no lock is taken. `dup2` clears close-on-exec on the new descriptor, so it
-        // survives into `sleep`.
+        // survives into `sleep`. When `open` itself returned `held`, the lowest number free in the
+        // child, `dup2` onto the same number changes nothing, so the flag is cleared directly and
+        // the descriptor is kept rather than closed.
         unsafe {
             cmd.pre_exec(move || {
                 let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-                if fd < 0 || libc::dup2(fd, held) < 0 {
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if fd == held {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    return Ok(());
+                }
+                if libc::dup2(fd, held) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 libc::close(fd);
