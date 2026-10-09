@@ -328,14 +328,7 @@ fn in_session_cage(pid: u32, project: &Path) -> bool {
 fn project_inside(pid: u32, project: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
     const DIR: libc::c_int = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    let root = CString::new(format!("/proc/{pid}/root")).ok()?;
-    // SAFETY: `open` reads the NUL-terminated path and returns a fresh descriptor or -1.
-    let root = unsafe { libc::open(root.as_ptr(), DIR) };
-    if root < 0 {
-        return None;
-    }
-    // SAFETY: the descriptor `open` returned above, owned from here on.
-    let root = unsafe { OwnedFd::from_raw_fd(root) };
+    let root = open_dir_path(Path::new(&format!("/proc/{pid}/root"))).ok()?;
     let components: Vec<&std::ffi::OsStr> = project
         .components()
         .filter_map(|c| match c {
@@ -354,6 +347,54 @@ fn project_inside(pid: u32, project: &Path) -> Option<(u64, u64)> {
     };
     let meta = std::fs::File::from(dir).metadata().ok()?;
     Some((meta.dev(), meta.ino()))
+}
+
+/// The directory at `path`, opened `O_PATH` as a root to resolve beneath ([`open_in_root`]).
+///
+/// By the syscall rather than through `OpenOptions::custom_flags`, which masks `O_PATH` out on musl,
+/// the target this binary ships as ([`crate::sandbox::forward::dial_cage_socket`] says how).
+pub(in crate::sandbox) fn open_dir_path(path: &Path) -> io::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path holding a NUL"))?;
+    // SAFETY: `open` reads the NUL-terminated path and returns a fresh descriptor or -1.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor `open` returned above, owned from here on.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The status of `name` in the directory `dir`, the link itself if it is one.
+pub(in crate::sandbox) fn lstat_at(
+    dir: &OwnedFd,
+    name: &std::ffi::OsStr,
+) -> io::Result<libc::stat> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a name holding a NUL"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `dir` is a live descriptor, `name` is NUL-terminated, and `stat` is a buffer of the
+    // structure's size that the call fills.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fstatat` returned 0, so it filled the buffer.
+    Ok(unsafe { stat.assume_init() })
 }
 
 /// Open `relative` beneath the directory `root` as a process whose root `root` is would: `openat2`

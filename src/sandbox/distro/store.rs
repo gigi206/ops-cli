@@ -532,20 +532,8 @@ fn sync_filesystem_of(path: &Path) -> io::Result<()> {
 /// names `/opt/…` was refused on a host without that directory. A kernel without `openat2` cannot
 /// resolve this way, and the check refuses rather than resolving on the host.
 fn check_supplied(rootfs: &Path, locator: &str) -> io::Result<()> {
-    use std::os::fd::FromRawFd as _;
     const DIR: libc::c_int = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    // Opened by the syscall rather than through `OpenOptions::custom_flags`, which masks `O_PATH`
-    // out on musl, the target this binary ships as ([`crate::sandbox::forward::dial_cage_socket`]
-    // says how).
-    let c_root = std::ffi::CString::new(rootfs.as_os_str().as_encoded_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the image path holds a NUL"))?;
-    // SAFETY: `open` reads the NUL-terminated path and returns a fresh descriptor or -1.
-    let root = unsafe { libc::open(c_root.as_ptr(), DIR) };
-    if root < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the descriptor `open` returned above, owned from here on.
-    let root = unsafe { std::os::fd::OwnedFd::from_raw_fd(root) };
+    let root = crate::sandbox::attach::open_dir_path(rootfs)?;
     let mut missing: Vec<&str> = Vec::new();
     for p in crate::sandbox::binds::DISTRO_SUPPLIED.iter().copied() {
         let relative = Path::new(p.trim_start_matches('/'));
@@ -554,7 +542,10 @@ fn check_supplied(rootfs: &Path, locator: &str) -> io::Result<()> {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         let looked = crate::sandbox::attach::open_in_root(&root, parent, DIR)
-            .and_then(|dir| lstat_at(&dir, relative.file_name().unwrap_or_default()));
+            .and_then(|dir| {
+                crate::sandbox::attach::lstat_at(&dir, relative.file_name().unwrap_or_default())
+            })
+            .map(|_| ());
         match looked {
             Ok(()) => {}
             Err(e)
@@ -591,30 +582,6 @@ fn check_supplied(rootfs: &Path, locator: &str) -> io::Result<()> {
          (sbx cannot add them: they sit under the image's own read-only tree)",
         missing.join(", ")
     )))
-}
-
-/// Whether `name` is there in the directory `dir`, the link itself if it is one.
-fn lstat_at(dir: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::ffi::OsStrExt as _;
-    let name = std::ffi::CString::new(name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a name holding a NUL"))?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `dir` is a live descriptor, `name` is NUL-terminated, and `stat` is a buffer of the
-    // structure's size that the call fills.
-    let rc = unsafe {
-        libc::fstatat(
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
 }
 
 #[cfg(test)]
