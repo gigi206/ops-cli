@@ -7004,3 +7004,56 @@ fn sbx_test_refuses_where_a_launch_would() {
     );
     assert!(said.contains("DENIED"), "{said}");
 }
+
+/// Two `sbx config add` processes editing one project config at once lose none of each other's
+/// entries, and the lock they take turns on lives under the trust store, never in the project.
+#[test]
+fn concurrent_config_edits_of_one_file_keep_every_entry_and_lock_outside_the_project() {
+    let fx = std::sync::Arc::new(Project::new("cfg"));
+    let writers: Vec<_> = (0..2)
+        .map(|w| {
+            let fx = std::sync::Arc::clone(&fx);
+            std::thread::spawn(move || {
+                for i in 0..10 {
+                    let entry = format!("w{w}-{i}/");
+                    let out = fx.run(&["config", "add", "fs.deny", &entry]);
+                    assert!(
+                        out.status.success(),
+                        "add {entry}:\n{}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    let body = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
+    let lost: Vec<String> = (0..2)
+        .flat_map(|w| (0..10).map(move |i| format!("w{w}-{i}/")))
+        .filter(|e| !body.contains(&format!("\"{e}\"")))
+        .collect();
+    assert!(lost.is_empty(), "lost {lost:?} from:\n{body}");
+
+    let locks: Vec<_> = std::fs::read_dir(fx.state_home.path().join("sbx/trusted/write-locks"))
+        .expect("the lock directory under the trust store")
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(
+        locks.len(),
+        1,
+        "one lock for the one file edited: {locks:?}"
+    );
+    let in_project: Vec<_> = std::fs::read_dir(fx.proj.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .filter(|n| n != ".sbx.toml")
+        .collect();
+    assert!(
+        in_project.is_empty(),
+        "nothing beside the config: {in_project:?}"
+    );
+}
