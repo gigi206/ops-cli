@@ -226,7 +226,7 @@ pub(crate) fn start(
         })?;
         guard
             .accepts
-            .push(spawn_accept(v4, host_sock.clone(), shutdown.clone()));
+            .push(spawn_accept(v4, host_sock.clone(), shutdown.clone())?);
 
         // v6 loopback (`::1`): many hosts resolve `localhost` to `::1` first, so binding it too
         // catches an IPv6 callback. Skipped only on a host without IPv6 loopback, where no
@@ -236,7 +236,7 @@ pub(crate) fn start(
         match TcpListener::bind(("::1", host)) {
             Ok(v6) => guard
                 .accepts
-                .push(spawn_accept(v6, host_sock.clone(), shutdown.clone())),
+                .push(spawn_accept(v6, host_sock.clone(), shutdown.clone())?),
             Err(e) if no_ipv6_loopback(&e) => {}
             Err(e) => {
                 // The cause is named only when the errno says it; any other failure is quoted as
@@ -321,9 +321,37 @@ fn fresh_dir(dir: &Path) -> io::Result<()> {
 
 /// Put `listener` into non-blocking mode and spawn its accept loop. Non-blocking so the loop can
 /// poll the shutdown flag between accepts and exit promptly when the guard drops.
-fn spawn_accept(listener: TcpListener, sock: PathBuf, shutdown: Arc<AtomicBool>) -> JoinHandle<()> {
-    let _ = listener.set_nonblocking(true);
-    std::thread::spawn(move || accept_loop(listener, sock, shutdown))
+///
+/// Either step failing is an error, which fails the launch through the guard like a refused bind.
+/// Left blocking, the loop would sit in `accept` and never read the flag, and the guard's join
+/// would wait on it for good; a thread the host refuses panicked in `std::thread::spawn`.
+fn spawn_accept(
+    listener: TcpListener,
+    sock: PathBuf,
+    shutdown: Arc<AtomicBool>,
+) -> io::Result<JoinHandle<()>> {
+    // Named like every other refusal of `start`, which carries the port: the bare error would read
+    // `sbx: Cannot allocate memory` with nothing to say which forward it stopped.
+    let at = listener.local_addr();
+    spawn_accept_with(std::thread::Builder::new(), listener, sock, shutdown).map_err(|e| {
+        let what = match at {
+            Ok(addr) => format!("cannot serve host port {} on {}", addr.port(), addr.ip()),
+            Err(_) => "cannot serve a host port".to_string(),
+        };
+        io::Error::new(e.kind(), format!("{what} for forward ({e})"))
+    })
+}
+
+/// [`spawn_accept`], with the builder of the loop's thread passed in, so a test can ask for one
+/// the host is certain to refuse.
+fn spawn_accept_with(
+    builder: std::thread::Builder,
+    listener: TcpListener,
+    sock: PathBuf,
+    shutdown: Arc<AtomicBool>,
+) -> io::Result<JoinHandle<()>> {
+    listener.set_nonblocking(true)?;
+    builder.spawn(move || accept_loop(listener, sock, shutdown))
 }
 
 /// Per-listener accept loop: for each accepted host TCP connection, connect to the in-cage
@@ -592,6 +620,20 @@ mod tests {
     use crate::testutil::TmpDir;
     use std::io::{Read, Write};
     use std::time::Duration;
+
+    /// An accept loop the host refuses a thread for is an error, so the launch fails through its
+    /// guard rather than panicking with a port bound and nothing serving it.
+    #[test]
+    fn an_accept_loop_without_its_thread_is_an_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused = spawn_accept_with(
+            std::thread::Builder::new().stack_size(usize::MAX / 8),
+            listener,
+            PathBuf::from("/nonexistent"),
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(refused.is_err());
+    }
 
     /// A connection whose host-to-cage thread the host refuses ends as an error, both its sockets
     /// shut down, rather than panicking or leaving one direction copying alone. The refusal is a
