@@ -38,7 +38,7 @@ mod provisioning;
 pub(crate) use channel::{
     LockTarget, Origin, Scope, Upgrade, hold_lock_for_write, is_pinned_revision,
     live_base_revisions, live_mise_revisions, read_global_lock, read_lock_lines,
-    resolve_engine_ref, revision_of, witness_revision, write_lock,
+    resolve_engine_ref, revision_of, waiting_for_writer, witness_revision, write_lock,
 };
 #[cfg(test)]
 pub(crate) use engine::embedded_proc_shim;

@@ -716,6 +716,17 @@ pub(crate) fn hold_lock_for_write(
     crate::sandbox::flock_at(&lock_path.with_file_name(name), true, Some(waiting)).map(LockWriter)
 }
 
+/// What a writer of the lock `lock` names (`the image lock`, `the tools lock`) says when its guard is
+/// busy: another sbx writing that lock, or a cage that sees sbx's data directory and holds the guard.
+pub(crate) fn waiting_for_writer(lock: &'static str) -> impl Fn(&Path) {
+    move |guard: &Path| {
+        crate::diag::note(&format!(
+            "waiting for `{}`, which another sbx holds while it writes {lock}",
+            guard.display()
+        ));
+    }
+}
+
 /// What [`hold_lock_for_write`] hands back: the lock's writers take turns while it lives.
 pub(crate) struct LockWriter(
     // Held only for its `Drop`: closing the fd is what releases the `flock`. Never read.

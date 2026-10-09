@@ -189,7 +189,10 @@ fn pin_unless_moved(
     key: &str,
     read: &LockRead,
 ) -> io::Result<bool> {
-    let _writing = crate::store::hold_lock_for_write(lock_path, &waiting_for_writer)?;
+    let _writing = crate::store::hold_lock_for_write(
+        lock_path,
+        &crate::store::waiting_for_writer("the image lock"),
+    )?;
     let now = crate::store::read_lock_lines(lock_path)?;
     if now == Some((locator.to_string(), Some(key.to_string()))) {
         return Ok(true);
@@ -206,15 +209,6 @@ fn pin_unless_moved(
     }
     crate::store::write_lock(lock_path, locator, key)?;
     Ok(true)
-}
-
-/// Say what an image lock's writer waits for: another sbx writing the same lock, or a cage that
-/// sees sbx's data directory and holds its writer guard.
-fn waiting_for_writer(guard: &Path) {
-    crate::diag::note(&format!(
-        "waiting for `{}`, which another sbx holds while it writes the image lock",
-        guard.display()
-    ));
 }
 
 /// What a roll of the distribution lock did: the image it names, the digest it now records, and
@@ -292,7 +286,10 @@ pub(crate) fn refresh(
         derived_key(&base, run)
     };
     if mode.applies() {
-        let _writing = crate::store::hold_lock_for_write(lock_path, &waiting_for_writer)?;
+        let _writing = crate::store::hold_lock_for_write(
+            lock_path,
+            &crate::store::waiting_for_writer("the image lock"),
+        )?;
         crate::store::write_lock(lock_path, locator, &key)?;
     }
     Ok(Rolled {
