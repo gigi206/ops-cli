@@ -460,18 +460,29 @@ pub(super) fn handle_https_forward(
         // Exactly one retry, and only for a connection that came from the pool — see the tunneled
         // path for why the peek, and why the read bound is lifted before it.
         loop {
-            match upstream.write_all(req) {
+            // The flush is part of the write: a parked connection that fails it is as gone as one
+            // that fails the write, and is retried below like it.
+            match upstream.write_all(req).and_then(|()| upstream.flush()) {
                 Ok(()) => {
-                    upstream.flush().ok();
                     begin_response_stream(&upstream.sock);
                     if !from_pool || upstream_spoke(&upstream.sock) {
                         break;
                     }
                 }
                 // The same two cases as the tunneled path, for the same reasons: a fresh connection
-                // that refuses the write is a real error, a parked one is a far side that is gone
+                // that refuses the write closed under it, a parked one is a far side that is gone
                 // and reached us as a reset rather than at the peek.
-                Err(e) if !from_pool => return Err(e),
+                Err(_) if !from_pool => {
+                    return NoFinalHead::UpstreamClosed.refuse(
+                        &mut client,
+                        ctx,
+                        crate::sandbox::control::Proto::Https,
+                        &host,
+                        port,
+                        verb,
+                        &path,
+                    );
+                }
                 Err(_) => {}
             }
             // Same rule as the tunneled path: replay what may be replayed, refuse the rest plainly.
@@ -507,7 +518,17 @@ pub(super) fn handle_https_forward(
         // A body the proxy does not hold: forwarded straight from the client, on its own connection.
         let reserialized =
             reserialize_request(&origin, &injected, None, keep_alive, masks_reflection);
-        upstream.write_all(&reserialized)?;
+        if upstream.write_all(&reserialized).is_err() {
+            return NoFinalHead::UpstreamClosed.refuse(
+                &mut client,
+                ctx,
+                crate::sandbox::control::Proto::Https,
+                &host,
+                port,
+                verb,
+                &path,
+            );
+        }
         flow.up
             .fetch_add(reserialized.len() as u64, Ordering::Relaxed);
         // Answer a client `Expect: 100-continue` now (the request is permitted and the upstream is
@@ -517,14 +538,26 @@ pub(super) fn handle_https_forward(
             let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
             let _ = client.flush();
         }
-        // Teed as it is relayed — a pass-through, so the forwarded stream is unchanged.
+        // Teed as it is relayed — a pass-through, so the forwarded stream is unchanged. A failure
+        // here may be either side's, a client that stopped sending or an upstream that stopped
+        // taking, so it stays the dropped connection rather than a refusal blaming the upstream.
         copy_exact(
             &mut tee_request_body(&mut client, capture.as_ref()),
             &mut upstream,
             body_len,
         )?;
         flow.up.fetch_add(body_len, Ordering::Relaxed);
-        upstream.flush().ok();
+        if upstream.flush().is_err() {
+            return NoFinalHead::UpstreamClosed.refuse(
+                &mut client,
+                ctx,
+                crate::sandbox::control::Proto::Https,
+                &host,
+                port,
+                verb,
+                &path,
+            );
+        }
         // The request is fully forwarded; the response may idle between bursts, so lift the timeout.
         begin_response_stream(&upstream.sock);
     }
@@ -567,20 +600,14 @@ pub(super) fn handle_https_forward(
     // be indistinguishable from a genuine zero-byte response — see the tunneled path. Which cause
     // it was, and the words for it, come from the relay ([`NoFinalHead`]).
     if let Some(why) = no_final {
-        ctx.push_log(
+        return why.refuse(
+            &mut client,
+            ctx,
             crate::sandbox::control::Proto::Https,
             &host,
             port,
-            Some(verb),
-            Some(&path),
-            crate::sandbox::control::LogVerdict::Error,
-            why.tag(),
-        );
-        return write_refusal(
-            &mut client,
-            "502 Bad Gateway",
-            why.tag(),
-            &why.sentence(&host),
+            verb,
+            &path,
         );
     }
     if let Some(code) = parse_status_code(&resp_head)
@@ -764,6 +791,10 @@ mod tests {
                     }
                 }
             }
+            // An empty response is an upstream that closes without answering: it goes at once.
+            if response.is_empty() {
+                return;
+            }
             let _ = tls.write_all(response);
             let _ = tls.flush();
             // Read to the client's close before letting the socket go: closing one that still holds
@@ -774,6 +805,42 @@ mod tests {
             let _ = tls.read_to_end(&mut rest);
         });
         (port, ca_der)
+    }
+
+    /// An upstream reached and then closed without answering is refused with a `502` naming it on
+    /// this plane too, never relayed as an empty success or dropped with no status. A write the
+    /// upstream refused under the same close takes the same refusal, by the same method.
+    #[test]
+    fn an_upstream_that_closes_without_answering_is_refused_on_the_forward_plane() {
+        let (port, upstream_ca) = spawn_https_upstream(b"");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let ctx = ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            EgressPolicy::new(vec![classify("closing.test:*").unwrap()], vec![]),
+        )
+        .unwrap()
+        .with_upstream(upstream_cfg)
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
+        let request = format!(
+            "GET https://closing.test:{port}/p HTTP/1.1\r\nHost: closing.test:{port}\r\n\r\n"
+        );
+        let bytes = request.into_bytes();
+        let head = parse_head(&bytes).unwrap();
+        let (method, target) = request_line_parts(&head.request_line).unwrap();
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        handle_https_forward(client, &head, &bytes, &method, &target, &ctx).unwrap();
+        let mut transcript = String::new();
+        peer.read_to_string(&mut transcript).unwrap();
+        assert!(
+            transcript.contains("502 Bad Gateway") && transcript.contains("upstream-closed"),
+            "{transcript:?}"
+        );
     }
 
     /// A WebSocket handshake this plane *allows* is recorded under `WS`, exactly as one it refuses.

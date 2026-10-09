@@ -1909,6 +1909,37 @@ impl NoFinalHead {
             ),
         }
     }
+
+    /// Log this for the request `method target` to `host:port` on `proto`, and answer the client
+    /// on `w` with the `502` that names it.
+    ///
+    /// Every plane writes this one refusal when its upstream yields no final response: for the
+    /// three causes the relay reports, and for a request the upstream would not take, which is
+    /// [`Self::UpstreamClosed`] reached earlier — the connection reset or closed under the write.
+    /// That last one used to leave the plane as a bare error, dropping the client's connection with
+    /// no status and leaving no line in the log beside the allow already recorded.
+    #[allow(clippy::too_many_arguments)]
+    fn refuse<W: Write>(
+        self,
+        w: &mut W,
+        ctx: &ProxyCtx,
+        proto: super::control::Proto,
+        host: &str,
+        port: u16,
+        method: &str,
+        target: &str,
+    ) -> io::Result<()> {
+        ctx.push_log(
+            proto,
+            host,
+            port,
+            Some(method),
+            Some(target),
+            super::control::LogVerdict::Error,
+            self.tag(),
+        );
+        write_refusal(w, "502 Bad Gateway", self.tag(), &self.sentence(host))
+    }
 }
 
 /// The most interim `1xx` heads one exchange relays before the upstream is cut off.
