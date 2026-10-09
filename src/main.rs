@@ -188,12 +188,23 @@ fn close_inherited_descriptors() {
     }
     // A kernel older than 5.9, or a filter that refuses the call: one at a time, the ones the
     // kernel lists, or every number below the limit when it cannot list them.
-    let open: Vec<libc::c_int> = match std::fs::read_dir("/proc/self/fd") {
-        Ok(dir) => dir
-            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+    // The listing is collected before anything is closed, so its own descriptor is not among the
+    // numbers closed under it.
+    let open: Option<Vec<libc::c_int>> = std::fs::read_dir("/proc/self/fd").ok().map(|dir| {
+        dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
             .filter(|&fd| fd > 2)
-            .collect(),
-        Err(_) => {
+            .collect()
+    });
+    let close = |fd: libc::c_int| {
+        // SAFETY: none of these numbers is one this process opened: the listing's own descriptor
+        // is closed by now, and a number that is not open answers `EBADF`.
+        unsafe { libc::close(fd) };
+    };
+    match open {
+        Some(open) => open.into_iter().for_each(close),
+        // Every number below the limit, closed as it is counted rather than gathered first: up to
+        // a million of them, which as a list is four megabytes held for nothing.
+        None => {
             let mut limit = libc::rlimit {
                 rlim_cur: 0,
                 rlim_max: 0,
@@ -203,13 +214,8 @@ fn close_inherited_descriptors() {
                 0 => limit.rlim_cur.min(1 << 20),
                 _ => 1 << 20,
             };
-            (3..top as libc::c_int).collect()
+            (3..top as libc::c_int).for_each(close);
         }
-    };
-    for fd in open {
-        // SAFETY: none of these numbers is one this process opened: the listing's own descriptor
-        // is closed by now, and a number that is not open answers `EBADF`.
-        unsafe { libc::close(fd) };
     }
 }
 
