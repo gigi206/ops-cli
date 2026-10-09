@@ -267,18 +267,37 @@ impl Confirmer {
     /// [`askpass`](Self::askpass) with the environment's contribution passed in, so the search order
     /// is testable without mutating the process environment.
     fn askpass_from(from_env: Option<PathBuf>) -> Option<PathBuf> {
-        Self::search(from_env, ASKPASS_NAMES, ASKPASS_PATHS)
+        Self::search(
+            from_env,
+            ASKPASS_NAMES,
+            ASKPASS_PATHS,
+            crate::pathfind::untrusted_tree().as_deref(),
+        )
     }
 
     /// The search itself, with its candidate lists passed in — so "nothing was found", the case that
     /// refuses the whole grant, is testable on a host that does have a helper.
-    fn search(from_env: Option<PathBuf>, names: &[&str], paths: &[&str]) -> Option<PathBuf> {
+    fn search(
+        from_env: Option<PathBuf>,
+        names: &[&str],
+        paths: &[&str],
+        untrusted: Option<&Path>,
+    ) -> Option<PathBuf> {
         // An `$SSH_ASKPASS` naming nothing is not taken on trust: a helper that cannot start would
         // fail every confirmation, and the fall-through to a real one keeps a stale variable from
-        // turning the feature off in practice. It is weighed no further: the variable is read from
-        // sbx's own process environment, so setting it already means being this user.
+        // turning the feature off in practice. Setting the variable means being this user, but
+        // the file it names may not be theirs to keep: one in `untrusted`, the project the cage
+        // writes, is whatever a session left there, and its exit status approves a signature, so
+        // it is refused, said, and the search goes on.
         if let Some(path) = from_env.filter(|p| p.is_file()) {
-            return Some(path);
+            if !untrusted.is_some_and(|tree| crate::pathfind::lies_in(tree, &path)) {
+                return Some(path);
+            }
+            crate::diag::warn(&format!(
+                "SSH_ASKPASS names `{}`, which lies in the project, where the cage writes: it is \
+                 not used to confirm a signature",
+                crate::sandbox::sanitize(&path.display().to_string())
+            ));
         }
         // The one arm where the user holds neither the contents nor the mode of what is found, and
         // what is found decides whether a key gets used — so each match is weighed for owner and
@@ -1853,8 +1872,8 @@ mod tests {
 
         // A host with no helper at all yields nothing — which is what makes the launch refuse the
         // grant rather than run a broker whose confirmation could never appear.
-        assert!(Confirmer::search(None, &[], &["/nonexistent/askpass"]).is_none());
-        assert!(Confirmer::search(Some(PathBuf::from("/nonexistent")), &[], &[]).is_none());
+        assert!(Confirmer::search(None, &[], &["/nonexistent/askpass"], None).is_none());
+        assert!(Confirmer::search(Some(PathBuf::from("/nonexistent")), &[], &[], None).is_none());
 
         // The load-bearing half: that environment is *sbx's*, never the cage's. The launcher hands
         // a resolved `[env]` to the cage and to nothing else, and this module reads the variable in
@@ -1865,6 +1884,30 @@ mod tests {
             source.matches("var_os(\"SSH_ASKPASS\")").count(),
             1,
             "the askpass may be resolved from one place only: sbx's own environment"
+        );
+    }
+
+    /// An `$SSH_ASKPASS` that lies in the project is refused, its exit status approving a signature
+    /// whatever a session left in the file; one outside it is taken as before.
+    #[test]
+    fn an_askpass_in_the_project_is_not_used() {
+        let tmp = crate::testutil::TmpDir::new();
+        let root = tmp.path().canonicalize().unwrap();
+        let project = root.join("proj");
+        std::fs::create_dir_all(project.join(".venv/bin")).unwrap();
+        let planted = project.join(".venv/bin/ssh-askpass");
+        let outside = root.join("ssh-askpass");
+        for helper in [&planted, &outside] {
+            std::fs::write(helper, b"#!/bin/sh\nexit 0\n").unwrap();
+        }
+        assert_eq!(
+            Confirmer::search(Some(planted), &[], &[], Some(&project)),
+            None,
+            "the planted helper is refused, and there is no other"
+        );
+        assert_eq!(
+            Confirmer::search(Some(outside.clone()), &[], &[], Some(&project)),
+            Some(outside)
         );
     }
 
