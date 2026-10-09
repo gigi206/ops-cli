@@ -38,6 +38,11 @@ structural error and the launch is refused (exit 2), like a mistyped flag. `SBX_
 `SBX_DEVICE` and `SBX_FS` each carry exactly one value (a list is a `--config`/`SBX_CONFIG`
 concern), while `SBX_SECCOMP` and `SBX_FORWARD` take a comma-separated list in a single value.
 
+A variable that is set but empty reads as absent, and the per-key forms follow that rule
+too. So `SBX_LIMIT_<key>=` and `SBX_PACKAGE_<name>=` declare nothing, and `SBX_ENV_FOO=`
+leaves `FOO` to the config rather than emptying it in the cage; `--env FOO=` does that. See
+[One-shot overrides](../configuration/overrides).
+
 Precedence, lowest to highest:
 `SBX_CONFIG < SBX_* typed < --config < --* typed`.
 
