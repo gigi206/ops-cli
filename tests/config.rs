@@ -5307,7 +5307,7 @@ fn a_write_to_a_profile_is_held_to_how_the_loader_reads_one() {
     let apps = fx.config_home.path().join("sbx/apps");
     let linked = fx.scratch().join("linked-apps");
     std::os::unix::fs::symlink(&apps, &linked).unwrap();
-    let dotted = apps.join("../apps/demo.toml");
+    let dotted = fx.config_home.path().join("sbx/apps/../apps/demo.toml");
     let through_link = linked.join("demo.toml");
     for (dir, file) in [
         (fx.scratch(), dotted.to_str().unwrap()),
