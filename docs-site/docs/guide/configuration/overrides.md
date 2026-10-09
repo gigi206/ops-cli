@@ -352,12 +352,14 @@ posture:
   a bad `nixpkgs`) is a
   **hard error, exit 2, no launch**. Silently keeping the baseline could leave a *wider*
   posture, or, for `--notify`, a *quieter* one, than the mistyped intent.
-- A **structural** error (a `--limit` with no `=`, a `--bind` with an empty path, a bad
-  `--net` keyword, an unknown limit key) is likewise a hard error.
+- A **structural** error (a `--limit` with no `=`, a `--bind` with an empty path, an
+  `--env` with an empty name, a `--package` with an empty name or locator, a bad `--net`
+  keyword, an unknown limit key) is likewise a hard error. An empty part is refused at the
+  flag because nothing downstream could make a value of nothing.
 - The **additive** fields (`env`/`binds`/`packages`/`seccomp`/`devices`) fail
-  *closed* by dropping a bad entry (a missing bind or tool, an unknown syscall token, a
-  malformed device path: less capability/relaxation, never a wider posture), so they
-  warn and skip.
+  *closed* by dropping an entry that has every part but a bad value (a missing bind or
+  tool, an unknown syscall token, a malformed device path: less capability/relaxation,
+  never a wider posture), so they warn and skip.
 - `--forward` is the exception among them: a malformed value (`9200:nope`,
   `9200:9119:8787`, or a port of `0`, alone or on either side of a remap) is a **hard
   error**. A flag has nothing else to save, and the alternative is worse than a dropped
