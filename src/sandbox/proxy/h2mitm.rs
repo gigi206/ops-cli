@@ -130,8 +130,9 @@ async fn serve(
     let tls = match tokio::time::timeout(ctx.timeout, acceptor.accept(client)).await {
         Ok(Ok(t)) => t,
         _ => {
-            // No common ALPN (an HTTP/1.1-only client reached a designated h2 host) or a
-            // handshake failure — nothing to inspect. Pre-stream, so no method/path to log.
+            // No common ALPN (an HTTP/1.1-only client reached a designated h2 host), another
+            // handshake failure, or a handshake that did not finish within the timeout — nothing
+            // to inspect. Pre-stream, so no method/path to log.
             ctx.push_log(
                 Proto::Https,
                 connect_host,
@@ -1681,6 +1682,100 @@ mod tests {
     // signature; the tests below still spell their own policy imports where they build one.
     use crate::allowlist::EgressPolicy;
     use crate::sandbox::egress_stats::Counts;
+
+    /// A tunnel to an `http2` host whose TLS handshake never completes is logged once, under
+    /// `http2-handshake`, whichever way it failed: no common ALPN, a client refusing the minted
+    /// certificate, closing partway, or sending nothing until the socket timeout. The guide lists
+    /// the four, and this is what holds the list to the code.
+    #[test]
+    fn every_way_an_h2_handshake_fails_is_logged_as_http2_handshake() {
+        use std::io::Read as _;
+        for end in [
+            "offers only http/1.1",
+            "refuses the leaf",
+            "closes partway",
+            "sends nothing",
+        ] {
+            let log = Arc::new(crate::sandbox::control::LogRing::new(
+                crate::sandbox::control::LOG_RING_CAP,
+            ));
+            let ca = Arc::new(super::super::Ca::ephemeral().unwrap());
+            let ca_der = ca.ca_cert_der();
+            let ctx = Arc::new(
+                ProxyCtx::new(
+                    ca,
+                    EgressPolicy::new(
+                        vec![crate::allowlist::classify("grpc.test:*").unwrap()],
+                        vec![],
+                    ),
+                )
+                .unwrap()
+                .with_timeout(std::time::Duration::from_millis(300))
+                .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None)),
+            );
+            let (mut test_end, cage_end) = std::os::unix::net::UnixStream::pair().unwrap();
+            test_end
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let served = {
+                let c = ctx.clone();
+                std::thread::spawn(move || handle(cage_end, "grpc.test", 443, &c))
+            };
+            let established = b"HTTP/1.1 200 Connection established\r\n\r\n";
+            let mut reply = vec![0u8; established.len()];
+            test_end.read_exact(&mut reply).unwrap();
+            assert_eq!(reply, established);
+            // The client that offers only `http/1.1` trusts the sbx CA, so its handshake can fail
+            // on nothing but the protocol. The others have no sbx CA in their trust store, so the
+            // minted leaf is one they refuse.
+            let mut roots = rustls::RootCertStore::empty();
+            if end == "offers only http/1.1" {
+                roots.add(ca_der).unwrap();
+            }
+            let mut config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            config.alpn_protocols = if end == "offers only http/1.1" {
+                vec![b"http/1.1".to_vec()]
+            } else {
+                vec![b"h2".to_vec()]
+            };
+            let mut conn = rustls::ClientConnection::new(
+                Arc::new(config),
+                rustls::pki_types::ServerName::try_from("grpc.test").unwrap(),
+            )
+            .unwrap();
+            match end {
+                "offers only http/1.1" | "refuses the leaf" => {
+                    while conn.is_handshaking() {
+                        if conn.complete_io(&mut test_end).is_err() {
+                            break;
+                        }
+                    }
+                }
+                "closes partway" => {
+                    conn.write_tls(&mut test_end).unwrap();
+                    let mut answer = [0u8; 512];
+                    assert!(test_end.read(&mut answer).unwrap() > 0, "the proxy answers");
+                    test_end.shutdown(std::net::Shutdown::Write).unwrap();
+                }
+                _ => {}
+            }
+            // The socket stays open until the proxy is done, so only the proxy ends the connection.
+            served.join().unwrap().unwrap();
+            drop(test_end);
+            ctx.events.as_ref().unwrap().flush();
+            let events = log.snapshot(None, None, false).events;
+            assert_eq!(events.len(), 1, "{end}: one attempt, one line: {events:?}");
+            assert_eq!(events[0].reason, "http2-handshake", "{end}: {events:?}");
+            assert_eq!(
+                events[0].verdict,
+                crate::sandbox::control::LogVerdict::Blocked,
+                "{end}"
+            );
+            assert_eq!(events[0].host, "grpc.test", "{end}");
+        }
+    }
 
     /// The scheme the upstream is told is the one the transport is, not the one the cage wrote.
     ///
