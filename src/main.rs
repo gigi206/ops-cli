@@ -1857,21 +1857,36 @@ fn format_age(secs: u64) -> String {
     }
 }
 
+/// How long `sbx doctor` waits on `nix --version` before reporting no version: a wrapper that hangs
+/// would otherwise hold the whole report.
+const NIX_VERSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Best-effort nix version (the first line of `nix --version`). The version is
 /// store-independent, so it runs nix directly.
 fn nix_version(nix: &Path) -> Option<String> {
-    let out = std::process::Command::new(nix)
-        .arg("--version")
-        .output()
-        .ok()?;
-    out.status.success().then(|| {
+    nix_version_within(nix, NIX_VERSION_DEADLINE).ok().flatten()
+}
+
+/// [`nix_version`] against a deadline of the caller's, through the one bounded wait host-side steps
+/// share ([`sandbox::resolver::output_within`]): past it the process is killed and the answer is a
+/// `TimedOut` error. `Ok(None)` is a nix that ran and failed.
+fn nix_version_within(
+    nix: &Path,
+    deadline: std::time::Duration,
+) -> std::io::Result<Option<String>> {
+    let out = sandbox::resolver::output_within(
+        std::process::Command::new(nix).arg("--version"),
+        deadline,
+        "`nix --version`",
+    )?;
+    Ok(out.status.success().then(|| {
         String::from_utf8_lossy(&out.stdout)
             .lines()
             .next()
             .unwrap_or_default()
             .trim()
             .to_string()
-    })
+    }))
 }
 
 /// Outcome of probing unprivileged user-namespace support.
@@ -2395,6 +2410,38 @@ mod tests {
             );
         }
         assert!(split_one_rule("net", "unallow", &[OsString::from(" a.test ")]).is_ok());
+    }
+
+    /// `sbx doctor` asks nix its version through the one bounded wait host-side steps share: a
+    /// `nix` that hangs is killed at the deadline and reported as no version, rather than holding
+    /// the whole report. A `nix` that answers is read as before.
+    #[test]
+    fn a_nix_that_does_not_answer_its_version_is_given_up_on() {
+        use crate::testutil::{TmpDir, result_past_etxtbsy, write_script};
+        let dir = TmpDir::new();
+        let hangs = dir.join("hangs");
+        write_script(&hangs, "sleep 10");
+        let started = std::time::Instant::now();
+        let err = result_past_etxtbsy("the hanging nix", || {
+            nix_version_within(&hangs, std::time::Duration::from_millis(300))
+        })
+        .expect_err("a nix that never answers has no version");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "given up on at the deadline, not waited out: {:?}",
+            started.elapsed()
+        );
+
+        let answers = dir.join("answers");
+        write_script(&answers, "echo 'nix (Nix) 2.31.0'");
+        assert_eq!(
+            result_past_etxtbsy("the answering nix", || {
+                nix_version_within(&answers, std::time::Duration::from_secs(30))
+            })
+            .unwrap(),
+            Some("nix (Nix) 2.31.0".to_string())
+        );
     }
 
     /// A registry that cannot be read leaves the scope of a `--session` load unknown, and the load
