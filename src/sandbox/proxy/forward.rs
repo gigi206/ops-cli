@@ -375,7 +375,10 @@ pub(super) fn handle_https_forward(
         request_line: format!("{method} {path} {version}"),
         headers: head.headers.clone(),
     };
-    let forwarded: Option<Vec<u8>> = if !replayable {
+    // The serialized head and the body, kept apart and written one after the other. Joined, the
+    // copy of a held body lived beside the body itself until the join was done, outside the
+    // reservation that bounds what the proxy holds: up to twice `BodyLimits::total` at once.
+    let forwarded: Option<(Vec<u8>, Vec<u8>)> = if !replayable {
         // A body streaming straight from the client: gone once written, which is why such a request
         // never took a parked connection.
         None
@@ -389,15 +392,14 @@ pub(super) fn handle_https_forward(
         if let Some(c) = &capture {
             c.set_request_body(&body);
         }
-        let mut req = reserialize_request(
+        let head = reserialize_request(
             &origin,
             &injected,
             Some(body.len() as u64),
             keep_alive,
             masks_reflection,
         );
-        req.extend_from_slice(&body);
-        Some(req)
+        Some((head, body))
     } else if chunked {
         // A `Transfer-Encoding: chunked` request: de-chunk the body into a bounded buffer and forward
         // a clean `Content-Length`-framed request (the reserializer strips the client's
@@ -439,33 +441,33 @@ pub(super) fn handle_https_forward(
         if let Some(c) = &capture {
             c.set_request_body(&body);
         }
-        let mut req = reserialize_request(
+        let head = reserialize_request(
             &origin,
             &injected,
             Some(body.len() as u64),
             keep_alive,
             masks_reflection,
         );
-        req.extend_from_slice(&body);
-        Some(req)
+        Some((head, body))
     } else {
         // Replayable, neither held nor chunked: a request with no body at all.
-        Some(reserialize_request(
-            &origin,
-            &injected,
-            None,
-            keep_alive,
-            masks_reflection,
+        Some((
+            reserialize_request(&origin, &injected, None, keep_alive, masks_reflection),
+            Vec::new(),
         ))
     };
 
-    if let Some(req) = &forwarded {
+    if let Some((head, body)) = &forwarded {
         // Exactly one retry, and only for a connection that came from the pool — see the tunneled
         // path for why the peek, and why the read bound is lifted before it.
         loop {
             // The flush is part of the write: a parked connection that fails it is as gone as one
             // that fails the write, and is retried below like it.
-            match upstream.write_all(req).and_then(|()| upstream.flush()) {
+            match upstream
+                .write_all(head)
+                .and_then(|()| upstream.write_all(body))
+                .and_then(|()| upstream.flush())
+            {
                 Ok(()) => {
                     begin_response_stream(&upstream.sock);
                     if !from_pool || upstream_spoke(&upstream.sock) {
@@ -516,7 +518,8 @@ pub(super) fn handle_https_forward(
             upstream = fresh;
             from_pool = false;
         }
-        flow.up.fetch_add(req.len() as u64, Ordering::Relaxed);
+        flow.up
+            .fetch_add((head.len() + body.len()) as u64, Ordering::Relaxed);
     } else {
         // A body the proxy does not hold: forwarded straight from the client, on its own connection.
         let reserialized =
