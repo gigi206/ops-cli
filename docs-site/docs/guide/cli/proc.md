@@ -260,8 +260,9 @@ It writes **no config** (so, unlike a config write, it never re-trusts the proje
 current project by default; `-a <app>` / `--all` widen it, and the config-scope flags (`-l`/`-g`) do
 not apply. A `--session allow` only loads into an `ask` session (it is inert under `enforce`, and is
 reported as such). A load that reached no enforcing session in scope, or that a session refused,
-exits 1: the rule is not in force there. An inert `allow` does not fail it, since under `enforce`
-everything not denied already runs. It governs **future** execs: it does not un-park (`allow`) or retroactively
+exits 1: the rule is not in force there. So does one whose scope is not known because the session
+registry could not be read; it loads nothing. An inert `allow` does not fail it, since under
+`enforce` everything not denied already runs. It governs **future** execs: it does not un-park (`allow`) or retroactively
 refuse (`deny`) an `execve` already parked; decide those with [`pending`](#pending).
 
 ## `unallow` / `undeny`
@@ -319,7 +320,8 @@ sbx proc rules [-a|--app <name>] [--all] [--json]
 List the live `--session` rule overlay of the running enforcing session(s): the rules loaded with
 `sbx proc allow`/`deny --session`, which nothing else surfaces (the config-file `[proc]` rules are
 shown by [`sbx config show`](config)). Scopes to the current project by default; `-a <app>`/`--all`
-widen it. A session in scope that does not answer in full is named, and the listing exits 1
+widen it. A session in scope that does not answer in full is named, and the listing exits 1, as it
+does when the session registry it takes its sessions from cannot be read
 ([exit codes](../reference/exit-codes#a-listing-that-could-not-read-a-session-exits-1)).
 
 ```sh
