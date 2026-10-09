@@ -202,6 +202,20 @@ fn spawn_upstream_capturing(
     CertificateDer<'static>,
     std::sync::mpsc::Receiver<String>,
 ) {
+    let (addr, ca_der, head, _body) = spawn_upstream_capturing_request(response);
+    (addr, ca_der, head)
+}
+
+/// [`spawn_upstream_capturing`], handing back the request body too: the `Content-Length` bytes that
+/// followed the head, on the second channel.
+fn spawn_upstream_capturing_request(
+    response: &'static [u8],
+) -> (
+    SocketAddr,
+    CertificateDer<'static>,
+    std::sync::mpsc::Receiver<String>,
+    std::sync::mpsc::Receiver<Vec<u8>>,
+) {
     let ca = Arc::new(Ca::ephemeral().unwrap());
     let ca_der = ca.ca_cert_der();
     let server_config = Arc::new(
@@ -212,6 +226,7 @@ fn spawn_upstream_capturing(
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
+    let (body_tx, body_rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let Ok((sock, _)) = listener.accept() else {
             return;
@@ -221,6 +236,7 @@ fn spawn_upstream_capturing(
         };
         let mut tls = StreamOwned::new(conn, sock);
         let mut head = String::new();
+        let mut body = Vec::new();
         {
             let mut br = BufReader::new(&mut tls);
             let mut line = String::new();
@@ -232,14 +248,33 @@ fn spawn_upstream_capturing(
                     Ok(_) => head.push_str(&line),
                 }
             }
+            let declared = head.lines().find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            });
+            if let Some(len) = declared {
+                // Bounded, so a body that never comes fails the test that waits for it rather than
+                // hanging it.
+                let _ = br
+                    .get_ref()
+                    .sock
+                    .set_read_timeout(Some(Duration::from_secs(5)));
+                body.resize(len, 0);
+                if br.read_exact(&mut body).is_err() {
+                    body.clear();
+                }
+            }
         }
         let _ = tx.send(head);
+        let _ = body_tx.send(body);
         let _ = tls.write_all(response);
         let _ = tls.flush();
         // Read to the client's close before letting the socket go.
         //
-        // Not politeness: the request body is still sitting unread (the head loop above stops at
-        // the blank line, and its `BufReader` is dropped with whatever it had). Closing a socket
+        // Not politeness: a body not read above — a `chunked` one, or bytes past the
+        // `Content-Length` — is still sitting unread, and the head loop's `BufReader` is dropped
+        // with whatever it had read ahead. Closing a socket
         // that holds unread received data makes Linux send an RST rather than a FIN, and an RST
         // discards whatever this end had queued to send — including the response just written. It
         // fires only when the response has not yet been delivered, which is why it surfaced as a
@@ -249,7 +284,7 @@ fn spawn_upstream_capturing(
         let mut rest = Vec::new();
         let _ = tls.read_to_end(&mut rest);
     });
-    (addr, ca_der, rx)
+    (addr, ca_der, rx, body_rx)
 }
 
 /// Drive one HTTPS request through the proxy over a freshly bound UDS, returning the decrypted
@@ -2206,6 +2241,95 @@ fn an_absolute_form_https_request_is_forwarded_over_a_validated_tls_upstream() {
             .contains("connection: close"),
         "the proxy must force Connection: close upstream: {upstream_head:?}"
     );
+}
+
+/// A request body reaches the upstream whole on both planes that can hold one, framed by
+/// `Content-Length` or `chunked`, held or not: a held body and its head are written one after the
+/// other, and neither may be lost between them.
+#[test]
+fn a_request_body_reaches_the_upstream_whole_on_both_planes() {
+    let upstream = || {
+        let (addr, upstream_ca, _head, body) = spawn_upstream_capturing_request(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        (addr, cfg, body)
+    };
+    // With a digest the body is held whatever its framing; without one a `chunked` body is
+    // de-chunked into its own buffer and a `Content-Length` one streams. Every arm is crossed.
+    let injections = |digest: bool| match digest {
+        true => vec![digesting_injection()],
+        false => Vec::new(),
+    };
+    let ctx = |cfg: Arc<ClientConfig>, digest: bool| {
+        Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["host.test:*"]).with_pool(false),
+            )
+            .unwrap()
+            .with_upstream(cfg)
+            .with_injections(injections(digest))
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        )
+    };
+    for (digest, framing) in [true, false].into_iter().flat_map(|digest| {
+        [
+            (digest, "Content-Length: 11\r\n\r\nhello world"),
+            (
+                digest,
+                "Transfer-Encoding: chunked\r\n\r\nb\r\nhello world\r\n0\r\n\r\n",
+            ),
+        ]
+    }) {
+        // The tunneled plane.
+        let (addr, cfg, body) = upstream();
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let tunneled = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["host.test:*"]).with_pool(false))
+                .unwrap()
+                .with_upstream(cfg)
+                .with_injections(injections(digest))
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let request = format!("POST / HTTP/1.1\r\nHost: host.test\r\n{framing}");
+        let resp = through_proxy(
+            tunneled,
+            proxy_ca_der,
+            "host.test",
+            "host.test",
+            addr.port(),
+            request.as_bytes(),
+        )
+        .unwrap();
+        assert!(resp.contains("200"), "{resp:?}");
+        assert_eq!(
+            body.recv_timeout(UPSTREAM_WAIT).unwrap_or_default(),
+            b"hello world",
+            "tunneled, digest {digest}, {framing:?}"
+        );
+
+        // The absolute-form plane.
+        let (addr, cfg, body) = upstream();
+        let request = format!(
+            "POST https://host.test:{}/ HTTP/1.1\r\nHost: host.test\r\n{framing}",
+            addr.port()
+        );
+        let resp = through_cleartext(ctx(cfg, digest), request.as_bytes()).unwrap();
+        assert!(resp.contains("200"), "{resp:?}");
+        assert_eq!(
+            body.recv_timeout(UPSTREAM_WAIT).unwrap_or_default(),
+            b"hello world",
+            "absolute-form, digest {digest}, {framing:?}"
+        );
+    }
 }
 
 /// The **absolute-form** plane holds and digests a body on the same terms as the tunneled one.
