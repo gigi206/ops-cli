@@ -52,7 +52,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 /// Where the per-launch host directory appears in the cage. Under the `/tmp` tmpfs (a writable
@@ -95,6 +95,9 @@ pub(crate) struct Forwarder {
     dir: PathBuf,
     shutdown: Arc<AtomicBool>,
     accepts: Vec<JoinHandle<()>>,
+    /// This process's hold on `dir`, given back once `Drop` has removed it: a field drops after
+    /// the body of `Drop::drop`.
+    _live: LiveDir,
 }
 
 impl Drop for Forwarder {
@@ -187,11 +190,8 @@ pub(crate) fn start(
         .recursive(true)
         .mode(0o700)
         .create(&parent)?;
-    let dir = parent.join(format!(
-        "fwd-{}-{}",
-        std::process::id(),
-        LAUNCHES.fetch_add(1, Ordering::Relaxed)
-    ));
+    let dir = parent.join(dir_name(std::process::id()));
+    let live = LiveDir::take(&dir)?;
     fresh_dir(&dir)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -207,6 +207,7 @@ pub(crate) fn start(
         dir: dir.clone(),
         shutdown: shutdown.clone(),
         accepts: Vec::new(),
+        _live: live,
     };
     let mut forwards = Vec::with_capacity(ports.len());
 
@@ -299,25 +300,71 @@ fn no_ipv6_loopback(e: &io::Error) -> bool {
     )
 }
 
-/// How many forward directories this process has made: the second half of each one's name, the
-/// first being the pid ([`fresh_dir`]).
-static LAUNCHES: AtomicU64 = AtomicU64::new(0);
+/// The name of the forward directory of the process `pid`: `fwd-<pid>`.
+///
+/// Its width is part of two contracts. `sbx gc` reads the pid off it to sweep a dead launch's
+/// directory, and the data-directory cap reserves room for the socket inside it
+/// ([`crate::store::Layout`]'s longest socket suffix): a wider name would overrun `sun_path` under a
+/// data directory the cap accepts.
+pub(crate) fn dir_name(pid: u32) -> String {
+    format!("fwd-{pid}")
+}
+
+/// The forward directories a launch of this process holds, so a second launch running at the same
+/// time is refused its directory rather than emptying it under the first.
+static LIVE_DIRS: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// One launch's hold on its forward directory in [`LIVE_DIRS`], released on drop.
+struct LiveDir(PathBuf);
+
+impl LiveDir {
+    /// Hold `dir`, or refuse when a launch of this process already does.
+    ///
+    /// The name carries the pid alone, so two launches of one process name one directory, and the
+    /// second's [`fresh_dir`] would empty the first's sockets. sbx launches one cage at a time per
+    /// process — `sbx upgrade` drops each launch's guard before the next — so this is the shape a
+    /// future caller could reach rather than one that runs today.
+    fn take(dir: &Path) -> io::Result<Self> {
+        let mut live = LIVE_DIRS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !live.insert(dir.to_path_buf()) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "another launch of this process is forwarding through {}; one forwarding \
+                     launch runs at a time per process",
+                    dir.display()
+                ),
+            ));
+        }
+        Ok(LiveDir(dir.to_path_buf()))
+    }
+}
+
+impl Drop for LiveDir {
+    fn drop(&mut self) {
+        LIVE_DIRS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
 
 /// Make `dir`, one launch's forward directory, empty and `0700`, whatever was at that name.
 ///
 /// The directory is bound into the cage read-write, so the cage can widen its mode, and leave a
-/// socket, a fifo or a directory at any name in it. Keyed by pid alone, it was one directory for
-/// every launch of a process, which a second launch's teardown removed from under the first, and
-/// the directory a later process inherited when its pid was that of a `SIGKILL`ed predecessor whose
-/// teardown never ran: its mode was kept as the cage left it (`DirBuilder::mode` applies only to a
+/// socket, a fifo or a directory at any name in it. Keyed by pid, it is the directory a later
+/// process inherits when its pid is that of a `SIGKILL`ed predecessor whose teardown never ran:
+/// reused as found, its mode stayed as that cage left it (`DirBuilder::mode` applies only to a
 /// directory it creates), and a leftover at a socket's name made the in-cage `socat UNIX-LISTEN`
 /// fail into `/dev/null`, so the forward carried nothing and said nothing.
 ///
-/// The name carries the pid and a count this process never hands out twice, so a directory already
-/// there is a dead predecessor's: it is removed, without following any link inside it, and made
-/// again. The count starts at zero in each process, so the first launch of a recycled pid takes
-/// over its predecessor's first directory; nothing reaps `forward/`, and a directory a killed
-/// process left at a higher count waits for a process that reaches that count.
+/// A directory already at the name is a dead predecessor's — a live launch of this process holds
+/// it in [`LIVE_DIRS`] first — so it is removed, without following any link inside it, and made
+/// again. One a killed process left behind is also reaped by `sbx gc`, which reads the pid off its
+/// name and removes the entries of launches no longer running.
 fn fresh_dir(dir: &Path) -> io::Result<()> {
     let make = || std::fs::DirBuilder::new().mode(0o700).create(dir);
     match make() {
@@ -1290,7 +1337,7 @@ mod tests {
         let outside = tmp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("kept"), b"").unwrap();
-        let dir = tmp.path().join("fwd-1-0");
+        let dir = tmp.path().join("fwd-1");
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("p-9119.sock"), b"").unwrap();
         std::fs::create_dir(dir.join("p-9120.sock")).unwrap();
@@ -1309,24 +1356,28 @@ mod tests {
         );
     }
 
-    /// Two launches in one process each get a directory of their own, so ending one cannot remove
-    /// the sockets of the other.
+    /// A second launch of this process is refused its forward directory while the first holds it,
+    /// rather than emptying the first's sockets, and admitted once the first has ended. The name
+    /// is the pid alone, which `sbx gc` and the data-directory cap both read.
     #[test]
-    fn two_launches_in_one_process_do_not_share_a_directory() {
+    fn a_second_launch_of_the_process_is_refused_the_directory_while_the_first_holds_it() {
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
         let (first, first_wiring, _) =
             start_on_free_ports(&layout, 1, |p| vec![ForwardPort::same(p[0])]);
-        let (second, second_wiring, _) =
-            start_on_free_ports(&layout, 1, |p| vec![ForwardPort::same(p[0])]);
-        let (a, b) = (&first_wiring.binds[0].src, &second_wiring.binds[0].src);
-        assert_ne!(a, b);
-        drop(first);
-        assert!(!a.exists());
-        assert!(
-            b.exists(),
-            "ending one launch must not remove the other's directory"
+        let dir = first_wiring.binds[0].src.clone();
+        assert_eq!(
+            dir.file_name().unwrap().to_string_lossy(),
+            format!("fwd-{}", std::process::id())
         );
+        let e = start(&layout, vec![ForwardPort::same(1)])
+            .err()
+            .expect("a second launch is refused");
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+        assert!(dir.exists(), "the first launch's directory is left alone");
+        drop(first);
+        assert!(!dir.exists());
+        let (second, _, _) = start_on_free_ports(&layout, 1, |p| vec![ForwardPort::same(p[0])]);
         drop(second);
     }
 
