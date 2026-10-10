@@ -779,12 +779,25 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
 ///
 /// A foreground session has no log by design — its output is on the user's own terminal — which is
 /// a different answer from "no such session", and conflating them would send someone hunting for a
-/// file that was never meant to exist.
+/// file that was never meant to exist. When the registry cannot be read, neither reason can be told,
+/// and the answer is the 1 of a failure about the id.
 fn explain_missing_log(data_dir: &Path, id: u32, path: &Path) -> ExitCode {
-    let record = session::Registry::at(data_dir)
-        .live()
-        .ok()
-        .and_then(|sessions| sessions.into_iter().find(|s| s.pid == id));
+    let sessions = match crate::asked_sessions(data_dir) {
+        Ok(sessions) => sessions,
+        // The log is still not there; whether `id` names a session is what the registry would have
+        // said. Not knowing is not "no such session", so this is the 1 of an answer about the id
+        // rather than the 2 of a name that names nothing — the choice `sbx task` makes for its own
+        // session ids.
+        Err(why) => {
+            diag::error(&format!(
+                "sbx: no log for session {id} ({}) — {why}, so whether that session runs is not \
+                 known.",
+                path.display()
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
+    let record = sessions.into_iter().find(|s| s.pid == id);
     let known = record.is_some();
     match record {
         Some(s) if !s.detached => {
