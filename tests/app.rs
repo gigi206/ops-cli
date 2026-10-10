@@ -528,7 +528,7 @@ fn register_live_session(fx: &Project, app: &str) {
     let sessions = fx.data_home.path().join("sbx/sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     let pid = std::process::id();
-    let start = start_ticks(pid).expect("this process's start time");
+    let start = common::start_ticks(pid);
     // The record's `project` is hex-encoded raw bytes, as the registry writes it.
     let project: String = fx
         .proj
@@ -700,14 +700,6 @@ fn prune_yes_refuses_when_the_session_registry_cannot_be_read() {
         "the preview must still work: {}",
         text(&preview)
     );
-}
-
-/// This process's start time in clock ticks, as the session registry records it — read from
-/// `/proc/<pid>/stat`'s 22nd field, past the parenthesised comm which may itself contain spaces.
-fn start_ticks(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rsplit_once(')')?.1;
-    after_comm.split_whitespace().nth(19)?.parse().ok()
 }
 
 #[test]
