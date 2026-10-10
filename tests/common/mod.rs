@@ -430,6 +430,19 @@ pub fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// `path` as a TOML string, quoted and escaped by the `toml` crate, for a config a test writes by
+/// hand. The fixture root is wherever the environment puts it (`SBX_TEST_TMPDIR`, else the cache
+/// home), and a `"` or a `\` in it, written between two quotes, would end the string early or
+/// start an escape. Rust's `{:?}` is no substitute: it writes a control character as `\u{1b}`,
+/// which TOML refuses.
+///
+/// A TOML document is UTF-8, so a path that is not cannot be written at all: the failure is
+/// located at the line that called this.
+#[track_caller]
+pub fn toml_str(path: &std::path::Path) -> String {
+    toml::Value::String(path.to_str().expect("a fixture path is UTF-8").to_owned()).to_string()
+}
+
 /// What a `--json` verb printed on stdout, parsed.
 ///
 /// A document that does not parse fails the test with the exit status and both streams. The parse

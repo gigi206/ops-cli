@@ -6,7 +6,7 @@
 #[macro_use]
 mod common;
 use common::fixture::TmpDir;
-use common::transient_fetch_failure;
+use common::{toml_str, transient_fetch_failure};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -878,19 +878,12 @@ fn control_plane_home(tag: &str) -> (TmpDir, PathBuf) {
     (home, h)
 }
 
-/// `path` as a TOML string, quoted and escaped by the `toml` crate, for a config a test writes by
-/// hand. The fixture root is wherever the environment puts it (`SBX_TEST_TMPDIR`, else the cache
-/// home), and a `"` or a `\` in it, written between two quotes, would end the string early or
-/// start an escape.
-fn toml_str(path: &Path) -> String {
-    toml::Value::String(path.to_str().expect("a fixture path is UTF-8").to_owned()).to_string()
-}
-
 #[test]
 fn a_path_reaches_a_hand_written_config_as_the_string_it_is() {
     // Without a `'` the crate answers with a literal string, and with one with a multi-line literal;
-    // each must read back as the path it was given.
-    for path in ["/a\"b\\c d/\u{e9}", "/a\"b\\c d'e/\u{e9}"] {
+    // each must read back as the path it was given. The control character is the one `{:?}` writes
+    // in a form TOML refuses.
+    for path in ["/a\"b\\c d/\u{e9}", "/a\"b\\c d'e/\u{e9}", "/a\u{1b}b"] {
         let read: toml::Table = toml::from_str(&format!("p = {}", toml_str(Path::new(path))))
             .expect("the quoted path is a TOML string");
         assert_eq!(read["p"].as_str(), Some(path));
