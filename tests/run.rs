@@ -1849,22 +1849,10 @@ const AQUA_RESOLVE_BUDGET: u32 = 5;
 /// Its own function so the rule is held by a test rather than by the endpoint: a probe that has to
 /// spend the very budget it reports, to prove it reads it correctly, is not a test.
 fn quota_remaining(body: &str) -> Option<u32> {
-    // Keyed on `core` and not on the payload's first `remaining`: the resources are serialised in
-    // alphabetical order, so the first one is `code_search`, which carries a budget of its own.
-    let after_key = body
-        .split("\"core\"")
-        .nth(1)?
-        .split("\"remaining\"")
-        .nth(1)?;
-    after_key
-        .trim_start()
-        .trim_start_matches(':')
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse::<u32>()
-        .ok()
+    // Parsed and read by key, `resources.core.remaining`: every resource carries a `remaining` of
+    // its own, and the one that governs a release download is `core`'s.
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    u32::try_from(body["resources"]["core"]["remaining"].as_u64()?).ok()
 }
 
 #[test]
@@ -1879,6 +1867,13 @@ fn the_quota_probe_reads_the_budget_that_governs_a_tool_install() {
     assert_eq!(
         quota_remaining(r#"{"resources":{"core":{"remaining":44}}}"#),
         Some(44)
+    );
+    // A `core` without a `remaining` of its own is not read off the resource after it.
+    assert_eq!(
+        quota_remaining(
+            r#"{"resources":{"core":{"limit":60},"graphql":{"limit":0,"remaining":17}}}"#
+        ),
+        None
     );
     // Nothing to read is not evidence of an empty budget, and must never skip a test on its own.
     assert_eq!(quota_remaining("not json at all"), None);
