@@ -5,7 +5,7 @@
 //! listings mark which of their entries are already in place. Most of it exercises the built-in
 //! store (compiled into the binary — no fetch, no signature), so it runs everywhere; the one case
 //! that needs a real remote store builds a signed one in a local git repository and clones it over
-//! `file://`, and skips itself when git is not on PATH.
+//! `file://`, and skips itself when no working git is on PATH.
 
 #[macro_use]
 mod common;
@@ -182,6 +182,15 @@ fn run_failing(args: &[&str], home: &Path) -> (i32, String) {
     (code, stderr)
 }
 
+/// Whether a working `git` is on `PATH`: one that runs and answers `--version`. A git that is
+/// there but fails would otherwise fail a test at its first `git_run`, as though the test had.
+fn git_works() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
 /// Run `git <args>` in `dir`, asserted to have succeeded. A failure shows both streams: git says
 /// why on either, `nothing to commit` on stdout and most errors on stderr.
 fn git_run(dir: &Path, args: &[&str]) {
@@ -205,8 +214,8 @@ fn git_run(dir: &Path, args: &[&str]) {
 
 #[test]
 fn adding_a_store_with_no_trust_anchor_shows_the_key_it_ships_and_configures_nothing() {
-    if Command::new("git").arg("--version").output().is_err() {
-        skip_incapable!("skipping: git is not on PATH");
+    if !git_works() {
+        skip_incapable!("skipping: no working git on PATH");
         return;
     }
     let home = TmpDir::new("plugins");
@@ -276,8 +285,8 @@ fn adding_a_store_with_no_trust_anchor_shows_the_key_it_ships_and_configures_not
 
 #[test]
 fn confirming_a_key_accepted_on_first_use_ends_the_standing_caution() {
-    if Command::new("git").arg("--version").output().is_err() {
-        skip_incapable!("skipping: git is not on PATH");
+    if !git_works() {
+        skip_incapable!("skipping: no working git on PATH");
         return;
     }
     let home = TmpDir::new("plugins");
@@ -401,8 +410,8 @@ fn versioned_plugin(root: &Path, name: &str, scheme: &str, version: &str, body: 
 
 #[test]
 fn upgrading_follows_the_digest_and_keeps_what_is_installed_when_it_cannot() {
-    if Command::new("git").arg("--version").output().is_err() {
-        skip_incapable!("skipping: git is not on PATH");
+    if !git_works() {
+        skip_incapable!("skipping: no working git on PATH");
         return;
     }
     let home = TmpDir::new("plugins");
@@ -488,8 +497,8 @@ fn upgrading_follows_the_digest_and_keeps_what_is_installed_when_it_cannot() {
 
 #[test]
 fn a_store_that_changes_its_key_is_named_and_rotated_only_deliberately() {
-    if Command::new("git").arg("--version").output().is_err() {
-        skip_incapable!("skipping: git is not on PATH");
+    if !git_works() {
+        skip_incapable!("skipping: no working git on PATH");
         return;
     }
     let home = TmpDir::new("plugins");
@@ -556,8 +565,8 @@ fn a_store_that_changes_its_key_is_named_and_rotated_only_deliberately() {
 
 #[test]
 fn the_markers_and_the_installed_filter_agree_on_what_is_in_place() {
-    if Command::new("git").arg("--version").output().is_err() {
-        skip_incapable!("skipping: git is not on PATH");
+    if !git_works() {
+        skip_incapable!("skipping: no working git on PATH");
         return;
     }
     let home = TmpDir::new("plugins");
@@ -625,8 +634,8 @@ fn the_markers_and_the_installed_filter_agree_on_what_is_in_place() {
 
 #[test]
 fn a_plugin_holding_a_stores_scheme_blocks_that_entry_visibly() {
-    if Command::new("git").arg("--version").output().is_err() {
-        skip_incapable!("skipping: git is not on PATH");
+    if !git_works() {
+        skip_incapable!("skipping: no working git on PATH");
         return;
     }
     let home = TmpDir::new("plugins");
