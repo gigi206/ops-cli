@@ -61,7 +61,9 @@ impl TmpDir {
             Some(p) => format!("{p}-{tag}-{pid}-{n}"),
             None => format!("{tag}-{pid}-{n}"),
         });
-        std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("the fixture {}: {e}", d.display()));
+        // Exclusively: a directory already under this name is a leftover of a killed run whose pid
+        // this run now holds, and none of what it holds is this test's.
+        create_afresh(&d);
         TmpDir(d)
     }
 
