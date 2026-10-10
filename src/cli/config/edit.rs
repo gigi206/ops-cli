@@ -14,6 +14,7 @@ use crate::cli::confirm::{
     render_config_same_value, render_config_unchanged, render_config_write, render_list_edit,
     render_list_unchanged, render_trusted_whole_file,
 };
+use crate::cli::trust::TrustOutcome;
 use crate::{ScopeArgs, config_cwd, split_scope};
 use crate::{config, diag, style, trust};
 
@@ -251,7 +252,7 @@ fn admit_config_write(
         ));
         diag::hint(&format!(
             "       review it and run `sbx trust {}`, then retry — or use `sbx config edit --trust`, \
-             which opens the file first",
+             which shows what trusting it grants before it trusts it",
             path.display()
         ));
         return Err(ExitCode::from(2));
@@ -764,15 +765,18 @@ fn editor_script(editor: &std::ffi::OsStr) -> OsString {
 /// positional so it needs no quoting, and appended after the command line by [`editor_script`] so
 /// it is never the command. Because the trust gate hashes the whole file, an edit that
 /// changes a trusted file re-arms it — detected after the editor exits (the verdict becomes
-/// Changed) and warned, or applied at once with `--trust`.
+/// Changed) and warned. With `--trust`, the file is instead shown once the editor has closed, as
+/// `sbx trust` shows it, and the bytes shown are trusted once that is confirmed — at a terminal, or
+/// by `--yes` for a caller that has none.
 ///
 /// All of that is about a **gated** target. The global config is trusted by location, so it has no
 /// marker to re-arm and none to write: `--trust` there is answered with the note the key-writing
 /// verbs give, and nothing is stored. See [`scope_is_gated`].
 ///
-/// A `--trust` on a gated target that could not be recorded fails the verb, exactly as it does for
-/// the key-writing verbs and through the same tail ([`record_trust`]): the editor's changes are on
-/// disk, and their security fields are inert until a marker exists.
+/// A `--trust` on a gated target that ends without a marker — not confirmed, or not recordable —
+/// fails the verb, exactly as it does for the key-writing verbs and through the same tail
+/// ([`record_trust`]): the editor's changes are on disk, and their security fields are inert until
+/// a marker exists.
 ///
 /// # Two limits of running an editor, stated rather than implied
 ///
@@ -798,13 +802,28 @@ fn editor_script(editor: &std::ffi::OsStr) -> OsString {
 /// the editor left it.
 pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
     use std::os::unix::fs::DirBuilderExt as _;
+    // `--yes` answers the review `--trust` puts up, which no other management verb has, so it is
+    // taken out here rather than taught to [`crate::split_scope`], where every verb would accept it
+    // and do nothing with it. A `--` ends the options here as it does there.
+    let upto = args
+        .iter()
+        .position(|a| a.to_str() == Some("--"))
+        .unwrap_or(args.len());
+    let is_yes = |a: &OsString| a.to_str() == Some("--yes");
+    let yes = args[..upto].iter().any(is_yes);
+    let rest: Vec<OsString> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| *i >= upto || !is_yes(a))
+        .map(|(_, a)| a.clone())
+        .collect();
     let ScopeArgs {
         positionals,
         scope,
         trust: trust_flag,
         app,
         ..
-    } = match split_scope(args) {
+    } = match split_scope(&rest) {
         Ok(parsed) => parsed,
         Err(e) => {
             diag::error(&format!("sbx: config edit: {e}"));
@@ -813,6 +832,15 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
     };
     if let Some(code) = reject_app("edit", &app) {
         return code;
+    }
+    // Refused rather than dropped, like an inapplicable `--app`: without `--trust` there is no
+    // review for it to answer, and whoever typed it believes something will be trusted.
+    if yes && !trust_flag {
+        diag::error(
+            "sbx: config edit: `--yes` answers the review `--trust` shows; it does nothing \
+             without `--trust`",
+        );
+        return config_usage("edit");
     }
     if !positionals.is_empty() {
         return config_usage("edit");
@@ -854,9 +882,10 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
     // gate that does not exist. Both are settled before the editor runs, so the answer cannot depend
     // on what was saved.
     //
-    // This verb deliberately skips [`admit_config_write`]: `--trust` here blesses a file the editor
-    // just showed, which is the one case where blessing bytes sbx did not author is what the user
-    // asked for. It is the escape hatch the other four verbs point at when they refuse.
+    // This verb deliberately skips [`admit_config_write`]: `--trust` here blesses a file sbx shows
+    // once the editor has closed — what changed since it was last approved, or all of it — and only
+    // once that is confirmed, which is the one case where blessing bytes sbx did not author is what
+    // the user asked for. It is the escape hatch the other four verbs point at when they refuse.
     let gated = scope_is_gated(&scope);
     let store_dir = trust::default_store_dir();
     let was_trusted = gated
@@ -935,7 +964,7 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
     // blessed the whole file — so `sbx config edit --trust` on a cloned repo could print
     // `sh: 1: code: not found` and then `trusted <path>`, and every later launch honoured a config
     // the user never saw a byte of. That is the exact inverse of what this verb's skipping of
-    // `admit_config_write` is justified by: "`--trust` here blesses a file the editor just showed".
+    // `admit_config_write` is justified by: what `--trust` blesses here is what the user has seen.
     //
     // So a non-zero exit stops here, before anything is trusted and before a trust state is
     // reported for an edit that did not happen. It is also the only way this function's own exit
@@ -965,12 +994,14 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
         // Reporting success would tell `sbx config edit --trust && sbx run …` that the gate was
         // armed when it was not, and the launch that follows would run against a config whose
         // `[network]`, `[binds]`, `[fs]` and `[secret]` are dropped.
-        // The one path that hashes the file rather than composed text, and the only admitted
-        // caller of [`crate::trust::trust`] outside `sbx trust`: sbx wrote none of these bytes —
-        // the editor showed the user the file and left what they saved, which is what they are
-        // approving. There is nothing else here to attest to.
+        //
+        // sbx wrote none of these bytes, and the project tree is writable from a cage: what is on
+        // disk now may not be what the user saved, nor what they saw in the editor. So they are
+        // shown, as `sbx trust` shows them, and the marker attests to the bytes that were shown
+        // ([`crate::cli::trust::review_and_trust`]); a write landing after that read leaves a file
+        // that no longer matches its marker.
         if let Err(code) = record_trust(&path, store_dir.as_deref(), "the file was saved", |dir| {
-            trust::trust(dir, &path)
+            crate::cli::trust::review_and_trust(dir, &path, yes)
         }) {
             return code;
         }
@@ -1041,12 +1072,13 @@ fn report_write_trust(
         // config now: the reasoning is [`record_trust`]'s and [`crate::trust::trust_written`]'s.
         return match record_trust(path, store_dir, "the field was written", |dir| {
             if !config::manage::admission_verified(path) {
-                return Err(std::io::Error::other(format!(
+                return TrustOutcome::Failed(std::io::Error::other(format!(
                     "{}: the write was not held to what sbx checked before it",
                     path.display()
                 )));
             }
             trust::trust_written(dir, path, attested.text.as_bytes(), attested.mise)
+                .map_or_else(TrustOutcome::Failed, |()| TrustOutcome::Recorded)
         }) {
             Ok(()) => ExitCode::SUCCESS,
             Err(code) => code,
@@ -1071,7 +1103,8 @@ fn report_write_trust(
 }
 
 /// Record `--trust` for `path` and report the outcome: the whole-file marker on success, a refusal
-/// on either way it can fail (no trust store to write into, or the store rejecting the file).
+/// on each way it can end without one (no trust store to write into, nobody approving what the
+/// review showed, or the store rejecting the file).
 ///
 /// One tail shared by `edit` and the key-writing verbs, because the two states the failure leaves
 /// behind are the same state: the file is on disk carrying security fields, and they are inert
@@ -1086,25 +1119,32 @@ fn report_write_trust(
 /// **What is attested to is the caller's, and it is passed in rather than chosen here.** `attest`
 /// is handed the trust store directory and records the marker: the key-writing verbs pass
 /// [`crate::trust::trust_written`] over the text they composed, `edit` passes
-/// [`crate::trust::trust`] because there the bytes on disk are exactly what the user approved. The
-/// distinction is a security property, not a preference — a re-read blesses whatever a concurrent
-/// writer left, and the project tree is bound read-write into the cage — so this tail is unable to
-/// make the choice on a caller's behalf. A verb that wants the re-reading form has to write the
-/// call itself, where a reader (and the guard in [`crate::trust`]) can see it.
+/// [`crate::cli::trust::review_and_trust`], which shows the file and attests to the bytes it
+/// showed. Neither hashes a later read of the path — that blesses whatever a concurrent writer
+/// left, and the project tree is bound read-write into the cage — and the choice stays with the
+/// caller, where a reader (and the guard in [`crate::trust`]) can see it.
 fn record_trust(
     path: &Path,
     store_dir: Option<&Path>,
     saved: &str,
-    attest: impl FnOnce(&Path) -> std::io::Result<()>,
+    attest: impl FnOnce(&Path) -> TrustOutcome,
 ) -> Result<(), ExitCode> {
     match store_dir {
         Some(dir) => match attest(dir) {
-            Ok(()) => {
+            TrustOutcome::Recorded => {
                 let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
                 outln!("{}", render_trusted_whole_file(path, &pal));
                 Ok(())
             }
-            Err(e) => {
+            TrustOutcome::Declined => {
+                diag::error(&format!("sbx: not trusting {}", path.display()));
+                diag::hint(&format!(
+                    "       {saved} but does not apply; run `sbx trust {}`",
+                    path.display()
+                ));
+                Err(ExitCode::FAILURE)
+            }
+            TrustOutcome::Failed(e) => {
                 diag::error(&format!("sbx: could not trust {e}"));
                 diag::hint(&format!(
                     "       {saved} but does not apply; run `sbx trust {}`",
@@ -1738,9 +1778,10 @@ mod tests {
         let cfg = tmp.join("edited.toml");
         std::fs::write(&cfg, "[network]\nmode = \"deny\"\n").unwrap();
 
-        // An editor that saves nothing and exits 0, so the run reaches the `--trust` tail; and no
-        // absolute `HOME`/`XDG_STATE_HOME`, which is what leaves `trust::default_store_dir` with
-        // nowhere to write a marker.
+        // An editor that saves nothing and exits 0, so the run reaches the `--trust` tail; `--yes`,
+        // so a review left unanswered for want of a terminal is not what fails it; and no absolute
+        // `HOME`/`XDG_STATE_HOME`, which is what leaves `trust::default_store_dir` with nowhere to
+        // write a marker.
         let _visual = crate::testutil::EnvVar::set("VISUAL", "true");
         let _editor = crate::testutil::EnvVar::set("EDITOR", "true");
         let _home = crate::testutil::EnvVar::unset("HOME");
@@ -1754,6 +1795,7 @@ mod tests {
             OsString::from("-c"),
             OsString::from(cfg.as_os_str()),
             OsString::from("--trust"),
+            OsString::from("--yes"),
         ];
         assert!(
             same_exit_code(config_edit(&args), ExitCode::FAILURE),

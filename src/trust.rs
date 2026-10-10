@@ -816,24 +816,26 @@ pub(crate) fn admission(
     (verdict, inputs, ConfigRead::Bytes(sbx_bytes))
 }
 
-/// Record trust for `config_path`: hash the file's current contents — and those of
-/// every file its trust covers ([`trust_inputs_for`]) — and write the marker. Every byte
-/// is read through the safety gate, so a world-writable or foreign-owned `.sbx.toml`,
-/// mise file or sops file is refused rather than blessed, and the hash covers exactly
-/// the gated bytes of all of them.
+/// Record trust for `config_path` over the file as it is now, and every file its trust covers
+/// ([`trust_inputs_for`]): a test fixture for a config whose review is not what the test is about.
+/// No verb records trust this way. Each attests to bytes it holds ([`trust_written`]), because a
+/// read at bless time attests to whatever a concurrent writer left there.
+#[cfg(test)]
 pub(crate) fn trust(store_dir: &Path, config_path: &Path) -> io::Result<()> {
     trust_inner(store_dir, config_path, None)
 }
 
-/// [`trust`] over bytes the caller already holds, for a caller that has just *written* the file.
+/// Record trust for `config_path` over bytes the caller holds: the text it composed and wrote, or
+/// the contents it showed for approval. Every byte is read through the safety gate, so a
+/// world-writable or foreign-owned `.sbx.toml`, mise file or sops file is refused rather than
+/// blessed.
 ///
-/// The difference is one read, and it is the whole point. `trust` reads `config_path` back and
-/// attests to whatever is there at that moment; a caller that composed and wrote the file already
-/// knows what it meant to bless, and the project tree is bound read-write into the cage — so a
-/// payload that writes between the caller's write and `trust`'s read gets its own config attested.
-/// Hashing the given bytes instead means a file changed underneath simply no longer matches its
-/// marker, and the next launch drops it: the fail-safe answer, and the one the caller's own gate
-/// already assumes it gets.
+/// The bytes are the caller's rather than a read of `config_path` at this moment, and that is the
+/// whole point. A caller that composed the file, or showed it, already knows what it meant to
+/// bless, and the project tree is bound read-write into the cage — so reading the path back here
+/// would attest to whatever a payload wrote in between. Hashing the given bytes instead means a file
+/// changed underneath simply no longer matches its marker, and the next launch drops it: the
+/// fail-safe answer, and the one the caller's own gate already assumes it gets.
 ///
 /// The covered files — the sibling mise files and the sops files the config names — are still read
 /// here, because the caller did not write those — attesting to bytes it never composed would be
@@ -988,8 +990,8 @@ pub(crate) fn untrust(store_dir: &Path, config_path: &Path) -> io::Result<bool> 
 #[cfg(test)]
 mod tests {
 
-    /// Every re-trust that follows a write sbx composed hashes that text; the two verbs that hash
-    /// the *path* are named here, and nothing else in the crate may.
+    /// Every re-trust that follows a write sbx composed hashes that text, and nothing in the crate
+    /// hashes the *path*.
     ///
     /// A verb that writes a config and then blesses it has one obligation: attest to the delta it
     /// authored. `trust` reads the path back, so it attests to whatever is there at that moment —
@@ -1003,14 +1005,13 @@ mod tests {
     /// satisfies it by absence. So every `.rs` under `src/` is read, and each is asked the same
     /// question.
     ///
-    /// One caller legitimately hashes the path, and it is named with the count it carries:
-    /// `src/cli/config/edit.rs`, the `sbx config edit --trust` path — the editor showed the user
-    /// the file and left what they saved, and sbx composed none of it. The `sbx trust <path>` verb
-    /// is not one: it prints the contents it is about to grant and asks, so the bytes it attests to
-    /// are the ones it showed, and it sits in the second table.
-    ///
-    /// The count is pinned rather than the file merely admitted, so a second re-reading call added
-    /// inside that file fails here as loudly as one added anywhere else.
+    /// No caller hashes the path. `sbx config edit --trust` was the last: sbx composed none of what
+    /// the editor left, so it hashed the file as it found it once the editor exited — and the
+    /// project tree is writable from the cage, so that need not be what the user saved. It now
+    /// prints the contents it is about to grant and asks, as `sbx trust <path>` does, through the
+    /// same code, so the bytes it attests to are the ones it showed: it sits in the second table,
+    /// under `src/cli/trust.rs`. `trust` is left to the tests as a fixture, and the first table
+    /// stays, empty, so a production call put back fails here as well as at the compiler.
     ///
     /// The second table is the other half of the same rule: the writers that do attest to their own
     /// text, with how many such calls each holds. It is what catches a verb that drops its re-trust
@@ -1019,11 +1020,11 @@ mod tests {
     #[test]
     fn every_re_trust_after_a_write_sbx_composed_attests_to_that_text() {
         /// The files admitted to hash the path, and how many such calls each holds.
-        const HASHES_THE_PATH: &[(&str, usize)] = &[("src/cli/config/edit.rs", 1)];
+        const HASHES_THE_PATH: &[(&str, usize)] = &[];
         /// The files that attest to bytes they hold, and how many such calls each holds: the
         /// egress, proc and `[fs]` mask add paths, the proc-learn write, the shared removal path,
-        /// the tail of the four key-writing `sbx config` verbs, and `sbx trust` over the contents
-        /// it showed.
+        /// the tail of the four key-writing `sbx config` verbs, and the review `sbx trust` and
+        /// `sbx config edit --trust` share, over the contents it showed.
         const HASHES_ITS_OWN_TEXT: &[(&str, usize)] = &[
             ("src/main.rs", 5),
             ("src/cli/config/edit.rs", 1),
@@ -1064,8 +1065,7 @@ mod tests {
             reread,
             expect(HASHES_THE_PATH),
             "a re-trust after a write sbx composed must hash that text (`trust_written`), never \
-             read the file back; only `sbx config edit` blesses bytes sbx neither authored nor \
-             showed"
+             read the file back; no verb blesses bytes sbx neither authored nor showed"
         );
         assert_eq!(
             attested,
