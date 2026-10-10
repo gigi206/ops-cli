@@ -1474,16 +1474,30 @@ fn an_app_home_persists_across_launches_and_is_isolated_from_the_project_shell()
     );
 }
 
+/// The project trees under `data`, listed strictly. Every caller reads them after a launch, which
+/// creates `projects/`, so a listing that fails, `NotFound` included, means the layout moved: an
+/// empty answer from it would let an assertion that something is absent pass on nothing at all.
+fn project_trees(data: &Path) -> Vec<PathBuf> {
+    let projects = data.join("sbx").join("projects");
+    std::fs::read_dir(&projects)
+        .unwrap_or_else(|e| panic!("cannot list {}: {e}", projects.display()))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|e| panic!("cannot read an entry of {}: {e}", projects.display()))
+                .path()
+        })
+        .collect()
+}
+
 /// Every per-project home an app has on disk under `data`, as the directories themselves. A
 /// `home_scope = "project"` app roots its home at `projects/<id>/apps/<app>/home`, one per project
 /// it was launched in; a global-scope app has none of these and keeps a single
 /// `apps/<app>/home` instead. The project id is a hash, so a test finds these by walking rather
 /// than by naming one.
 fn per_project_app_homes(data: &Path, app: &str) -> Vec<PathBuf> {
-    let projects = data.join("sbx").join("projects");
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
-        let home = entry.path().join("apps").join(app).join("home");
+    for project in project_trees(data) {
+        let home = project.join("apps").join(app).join("home");
         if home.is_dir() {
             out.push(home);
         }
@@ -6833,15 +6847,9 @@ fn mise_installs_entries(installs: &Path) -> Vec<String> {
 /// never creates one, so the set is exactly the app launches. Used to prove a `nix:` self-equip
 /// lands in the launching project's own pool (aligned with that project's `/nix`), not app-global.
 fn per_project_app_mise_installs(data: &Path, app: &str) -> Vec<(PathBuf, Vec<String>)> {
-    let projects = data.join("sbx").join("projects");
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
-        let installs = entry
-            .path()
-            .join("apps")
-            .join(app)
-            .join("mise")
-            .join("installs");
+    for project in project_trees(data) {
+        let installs = project.join("apps").join(app).join("mise").join("installs");
         if installs.is_dir() {
             let entries = mise_installs_entries(&installs);
             out.push((installs, entries));
@@ -7170,9 +7178,8 @@ fn a_shared_pool_lets_the_second_app_reuse_what_the_first_installed() {
 /// a per-tool shim (its non-interactive PATH entry). Used as the teeth that the in-cage roll
 /// touched the right home.
 fn project_home_mise_shim(data: &Path, name: &str) -> Option<PathBuf> {
-    let projects = data.join("sbx").join("projects");
-    for entry in std::fs::read_dir(&projects).ok()?.flatten() {
-        let shim = entry.path().join("home/.local/share/mise/shims").join(name);
+    for project in project_trees(data) {
+        let shim = project.join("home/.local/share/mise/shims").join(name);
         // The shim is a symlink mise writes inside the cage, pointing at the cage's own mise
         // (`/nix/store/<hash>-mise-<ver>/bin/mise` in the per-project store mounted at `/nix`).
         // That target resolves only inside the cage, not on the host, so `exists()` — which
@@ -7716,9 +7723,7 @@ fn project_store_dir(data: &Path) -> Option<PathBuf> {
 /// is) sits there whether or not mise ever ran. Taken together they are: the pool entry proves mise
 /// ran, and its target being in *this project's* store proves what it installed landed there.
 fn project_home_mise_installed(data: &Path, tool: &str) -> bool {
-    let projects = data.join("sbx").join("projects");
-    for entry in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
-        let project = entry.path();
+    for project in project_trees(data) {
         let installs = project.join("home/.local/share/mise/installs").join(tool);
         let Ok(versions) = std::fs::read_dir(&installs) else {
             continue;
