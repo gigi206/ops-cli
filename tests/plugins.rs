@@ -188,7 +188,7 @@ fn adding_a_store_with_no_trust_anchor_shows_the_key_it_ships_and_configures_not
     git_run(repo.path(), &["init", "-q"]);
     git_run(repo.path(), &["add", "-A"]);
     git_run(repo.path(), &["commit", "-qm", "store"]);
-    let url = format!("file://{}", repo.path().to_str().unwrap());
+    let url = common::file_url(repo.path());
 
     // No --key and no --trust: the refusal shows the key the store ships, so the choice is made
     // with the key in view instead of after pinning it.
@@ -272,7 +272,7 @@ fn confirming_a_key_accepted_on_first_use_ends_the_standing_caution() {
     git_run(repo.path(), &["init", "-q"]);
     git_run(repo.path(), &["add", "-A"]);
     git_run(repo.path(), &["commit", "-qm", "store"]);
-    let url = format!("file://{}", repo.path().to_str().unwrap());
+    let url = common::file_url(repo.path());
 
     run(
         &[
@@ -366,7 +366,7 @@ fn signed_store(home: &Path, repo: &Path, key_file: &str, rev: Option<&str>) -> 
     }
     git_run(repo, &["add", "-A"]);
     git_run(repo, &["commit", "-qm", "publish"]);
-    (format!("file://{}", repo.to_str().unwrap()), key)
+    (common::file_url(repo), key)
 }
 
 /// Write a plugin with an explicit version and resolver body, over whatever was there — the shape a
