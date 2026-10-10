@@ -417,18 +417,18 @@ mod tests {
             let nix = dir.join("nix");
             write_script(
                 &nix,
+                // The files it reads and appends to sit beside it, and are reached from its own
+                // path, so the script names no fixture path whatever the fixture root holds.
                 &format!(
-                    "echo \"$*\" >> '{calls}'\n\
+                    "d=$(dirname \"$0\")\n\
+                     echo \"$*\" >> \"$d/calls\"\n\
                      case \"$*\" in\n\
-                       *' eval '*releases/latest*) cat '{api}' ;;\n\
-                       *' eval '*.sha256*) cat '{sums}' ;;\n\
+                       *' eval '*releases/latest*) cat \"$d/api.json\" ;;\n\
+                       *' eval '*.sha256*) cat \"$d/sums\" ;;\n\
                        *'store prefetch-file'*) \
                          printf '{{\"hash\":\"sha256-AAAA\",\"storePath\":\"{logical}\"}}' ;;\n\
                        *) exit 1 ;;\n\
                      esac",
-                    calls = dir.join("calls").display(),
-                    api = dir.join("api.json").display(),
-                    sums = dir.join("sums").display(),
                 ),
             );
             // Run once past the ETXTBSY a just-written executable meets in a multi-threaded test.
@@ -466,7 +466,10 @@ mod tests {
         }
 
         fn calls(&self) -> String {
-            std::fs::read_to_string(self.dir.join("calls")).unwrap_or_default()
+            // Read lossily: a call carries fixture paths, which need not be UTF-8, and what a test
+            // looks for in the calls is plain text either way.
+            let bytes = std::fs::read(self.dir.join("calls")).unwrap_or_default();
+            String::from_utf8_lossy(&bytes).into_owned()
         }
     }
 
