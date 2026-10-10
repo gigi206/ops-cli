@@ -49,7 +49,9 @@ info <name>` exits 1 when several installed plugins claim the name. `sbx task st
 exits 1 when the operation is declared and not running, and every `sbx task` verb exits 1 when no
 session offers operations at all. `sbx task secrets`, `status`, `logs` and `stop` also exit 1
 rather than 2 for an operation the sessions that answered do not declare, while a session that
-could not list its operations may. [`sbx task run`](../cli/task#run) and `sbx task result` are
+could not list its operations may. `sbx session logs <id>` exits 1 rather than 2 for a log that is
+not there when the session registry cannot be read, since whether the id names a session is then
+not known. [`sbx task run`](../cli/task#run) and `sbx task result` are
 the exception the other way: they answer an unknown operation or invocation with 125, the code
 every refusal of theirs gets, because 2 is a code the command they wrap can return itself.
 
