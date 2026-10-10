@@ -377,6 +377,18 @@ pub mod procs;
 
 use std::process::{Command, Output};
 
+/// `path` as one word of a shell script: single-quoted, each quote inside closed, escaped and
+/// reopened. The fixture root comes from the environment, so it may hold a blank or a quote, and an
+/// unquoted path in a driven script would then split or run as code.
+pub fn sh(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+/// A word of a driven command line, quoted the same way.
+pub fn sh_word(word: &str) -> String {
+    sh(std::path::Path::new(word))
+}
+
 /// Run the binary under test with `args`.
 ///
 /// The global config is isolated the way the launching suites isolate theirs: a fixed empty

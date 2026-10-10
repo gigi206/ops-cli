@@ -16,7 +16,7 @@ use std::process::{Command, Output};
 #[macro_use]
 mod common;
 use common::fixture::TmpDir;
-use common::{sbx, stdout_of, walk};
+use common::{sbx, sh, sh_word, stdout_of, walk};
 
 /// The directory holding the test binary, so a driven shell finds `sbx` on its `PATH` —
 /// the emitted scripts call the command by name, exactly as an installed one would.
@@ -31,18 +31,6 @@ fn bin_dir() -> PathBuf {
 /// drops — on a failed assertion as well as on success.
 fn scratch(tag: &str) -> TmpDir {
     TmpDir::prefixed("cmpl", tag)
-}
-
-/// `path` as one word of a shell script: single-quoted, each quote inside closed, escaped and
-/// reopened. The fixture root comes from the environment, so it may hold a blank or a quote, and an
-/// unquoted path in a driven script would then split or run as code.
-fn sh(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
-}
-
-/// A word of a driven command line, quoted the same way.
-fn sh_word(word: &str) -> String {
-    sh(Path::new(word))
 }
 
 /// One line per case for a shell driver: `expected US cursor US words-before-the-cursor`.
