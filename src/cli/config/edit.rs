@@ -701,9 +701,10 @@ sbx_editor() {
 /// as text (`<editor> "$@"`), a line that contributed no word made the file the command, and the
 /// config file sbx was asked to open ran as a program on the host. That was an empty or blank
 /// value, one that expands to nothing (`$UNSET`), one that ends in a separator (`vim;`, `vim &&`)
-/// and one that names the positional parameters (`"$@"`). Each now ends in the refusal (exit 127)
-/// or in a syntax error, before anything runs: `$1` is shifted away before the line is read, so
-/// `"$@"` expands to nothing.
+/// and one that names the positional parameters (`"$@"`). Now a line that leaves no word is refused
+/// (exit 127), and so is one that names the positional parameters, since `$1` is shifted away
+/// before the line is read. `vim &&` and `vim |` are a syntax error, and nothing runs. `vim;` runs
+/// `vim` on the file.
 ///
 /// A leading `NAME=value` word is an assignment for the editor, as the shell reads one in front of
 /// a command, so it is exported rather than run.
