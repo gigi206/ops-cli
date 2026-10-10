@@ -912,6 +912,15 @@ fn a_bind_that_nests_with_a_structural_mount_is_warned_but_kept() {
     // suggests. The bind is still honored (trusted field, not dropped), but the overlap is
     // surfaced. Not `/etc`: it holds `/etc/localtime`, a link the sandbox creates, which a bind
     // cannot make room for, so a bind of `/etc` is dropped rather than kept with a warning.
+    //
+    // The bind is a host path, and a missing one is dropped like any other, so a host without it
+    // cannot run this test.
+    let Ok(canon) = Path::new("/usr/share").canonicalize() else {
+        skip_incapable!(
+            "skipping a_bind_that_nests_with_a_structural_mount_is_warned_but_kept: no /usr/share here"
+        );
+        return;
+    };
     let fx = Project::new("cfg");
     fx.write_project("binds = [\"/usr/share\"]\n");
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
@@ -922,7 +931,6 @@ fn a_bind_that_nests_with_a_structural_mount_is_warned_but_kept() {
     let stderr = String::from_utf8_lossy(&out.stderr);
 
     // The bind is kept (the warning does not drop it).
-    let canon = Path::new("/usr/share").canonicalize().unwrap();
     assert!(
         stdout.contains(&*canon.to_string_lossy()),
         "the trusted bind must still be honored:\n{stdout}"
