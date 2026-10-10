@@ -1171,8 +1171,8 @@ fn local_save_refusal(path: &Path, exists: bool) -> String {
 /// `sbx proc allow --local` re-trust unconditionally after writing, so they must be admitted here
 /// first; `sbx config set|add|rm|unset --trust` blesses only when asked, so it is admitted only when
 /// the flag is passed (see `cli::config::edit::admit_config_write`). The one deliberate exception is
-/// `sbx config edit --trust`, where the editor showed the user the file: what you have seen may be
-/// blessed.
+/// `sbx config edit --trust`, which shows the user what the file grants once the editor closes and
+/// blesses those bytes only once that is confirmed: what you have approved may be blessed.
 ///
 /// `has_mise` is what keeps the bootstrap arm inside that invariant. A project's trust marker
 /// covers the `.sbx.toml` **and every mise file beside it** ([`trust::content_hash`]), because the
