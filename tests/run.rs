@@ -4939,8 +4939,8 @@ fn a_proc_learn_run_that_never_reached_its_command_keeps_the_launchs_code() {
 
 /// Poll `127.0.0.1:<port>` from the host until a read returns a body containing `marker`, or time
 /// out. Returns the matching body, or `None` on timeout (a refused connect, or the marker never
-/// arriving). Used by the forward e2e to wait for the in-cage server to come up and the forwarder
-/// to bridge a connection — a partial/early read that lacks the marker keeps polling rather than
+/// arriving). Used by the forward e2e to wait for the forwarder to bridge a connection to the
+/// listening cage server — a partial/early read that lacks the marker keeps polling rather than
 /// being accepted.
 fn read_loopback_until(port: u16, marker: &str, deadline: std::time::Duration) -> Option<String> {
     use std::io::{Read, Write};
@@ -4963,7 +4963,9 @@ fn read_loopback_until(port: u16, marker: &str, deadline: std::time::Duration) -
 }
 
 /// Pick a free host loopback TCP port by binding port 0 and reading back the assigned port, then
-/// releasing it — the same race-free trick the inbound unit tests use.
+/// releasing it. Free when it is picked, not reserved: another process may bind it before the
+/// launch does. The forward e2e keeps its cage server's log for that case, where the launch says it
+/// cannot bind the host port and the failure quotes it.
 fn free_loopback_port() -> u16 {
     let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind an ephemeral port");
     l.local_addr().unwrap().port()
@@ -4974,100 +4976,160 @@ fn a_forward_bridges_a_host_loopback_port_into_the_cage() {
     // The inbound loopback-forward path end to end through the real binary: a trusted
     // `network = "none"` cage with `forward = [<port>]` starts a service on its own loopback, and a
     // host process reaches it only because sbx bound the host port and the in-cage socat bridged it
-    // over the shared Unix socket. Teeth: with `forward` declared the host curl gets the cage
-    // server's marker; a second project with the SAME server but NO `forward` is unreachable from
-    // the host (connection refused) — so the forwarder is provably the bridge, not some ambient
-    // route. The in-cage HTTP server is `socat` (already in the base closure; declared `nix:socat`
-    // to put it on PATH), serving a fixed one-line banner on connect. Skips (never fails) when the
-    // host cannot sandbox or the cache is unreachable (the first launch seeds the store).
+    // over the shared Unix socket. Teeth: with `forward` declared the host gets the cage server's
+    // marker; a second project running the SAME server, listening, but with NO `forward` refuses the
+    // host's connection — nothing binds the host port — so the forwarder is provably the bridge, not
+    // some ambient route. The in-cage server is `socat` (already in the base closure; declared
+    // `nix:socat` to put it on PATH), serving a fixed one-line banner on connect. Skips (never
+    // fails) when the host cannot sandbox or the cache is unreachable.
+    use std::time::{Duration, Instant};
+
     let port = free_loopback_port();
     let marker = "SBX-FORWARD-OK";
-
-    // Helper: run the cage server in the background (spawn, not wait), poll from the host, kill.
-    // The in-cage server is `socat` serving a static banner file on each connection: the file is
-    // written into the project (bound in-cage at its real path), and `SYSTEM:cat <file>` avoids any
-    // nested shell-quoting. `fork` handles the (possibly several) poll connections.
-    let run_server_and_probe =
-        |proj: &Path, data: &Path, state: &Path, with_forward: bool| -> Option<String> {
-            // The banner file the cage server serves — the project is bound at its real path in-cage,
-            // so the same absolute path resolves on both sides.
-            let banner = proj.join("banner.txt");
-            std::fs::write(&banner, format!("HTTP/1.0 200 OK\r\n\r\n{marker}\r\n")).unwrap();
-            let server_cmd = format!(
-                "exec socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr SYSTEM:\"cat {}\"",
-                banner.display()
-            );
-            // Write the config for this project.
-            let cfg = if with_forward {
-                format!(
-                    "network = \"none\"\nforward = [{port}]\n[packages]\nsocat = \"nix:socat\"\n"
-                )
-            } else {
-                "network = \"none\"\n[packages]\nsocat = \"nix:socat\"\n".to_string()
-            };
-            std::fs::write(proj.join(".sbx.toml"), cfg).unwrap();
-            // Trust so the security fields (network, forward) are honored.
-            let trusted = sbx_in(proj, data, state, &["trust", "--yes", ".sbx.toml"]);
-            assert!(
-                trusted.status.success(),
-                "trust: {}",
-                String::from_utf8_lossy(&trusted.stderr)
-            );
-            // Spawn the cage server in the background; hold the child so we can kill it after probing.
-            let mut child = sbx()
-                .args(["run", "--", "sh", "-c", &server_cmd])
-                .current_dir(proj)
-                .env("XDG_DATA_HOME", data)
-                .env("XDG_STATE_HOME", state)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("spawn cage server");
-            let got = read_loopback_until(port, marker, std::time::Duration::from_secs(20));
-            let _ = child.kill();
-            let _ = child.wait();
-            got
-        };
-
-    let proj_a = TmpDir::prefixed("r", "ingr-a");
     let data = TmpDir::prefixed("r", "ingr-data");
     let state = TmpDir::prefixed("r", "ingr-state");
 
-    // Capability + cache probe on the first project (also seeds the store for the socat closure).
-    std::fs::write(
-        proj_a.path().join(".sbx.toml"),
-        "network = \"none\"\n[packages]\nsocat = \"nix:socat\"\n",
-    )
-    .unwrap();
+    // The cage server, run in the project directory it is handed as `$1`: `socat` serving the
+    // banner file on each connection (`fork` handles the several connections), then a connection of
+    // the cage's own to that listener, and only once one is accepted a `forward-ready` file in the
+    // project. That file is what the host waits on: it says the server listens on the cage's
+    // loopback whatever the host can reach, so the half without `forward` cannot pass on a server
+    // that never came up. Both files are named relative to the project, which keeps every path out
+    // of the script.
+    let server = format!(
+        "cd \"$1\" || exit 1\n\
+         socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr SYSTEM:'cat banner.txt' &\n\
+         until socat -u OPEN:/dev/null TCP:127.0.0.1:{port} 2>/dev/null; do sleep 0.1; done\n\
+         touch forward-ready\n\
+         wait\n"
+    );
+
+    // One project per half, in one data dir, both trusted so the security fields (`network`,
+    // `forward`) are honored, and both launched once before anything is timed: the untrusted
+    // capability probe drops `[packages]`, and each project seeds its own store, so without this a
+    // half's first launch would provision inside the window the host waits in. `false` when the
+    // test is skipped.
+    let prepare = |proj: &Path, forward: bool| -> bool {
+        let forward = if forward {
+            format!("forward = [{port}]\n")
+        } else {
+            String::new()
+        };
+        std::fs::write(
+            proj.join(".sbx.toml"),
+            format!("network = \"none\"\n{forward}[packages]\nsocat = \"nix:socat\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("banner.txt"),
+            format!("HTTP/1.0 200 OK\r\n\r\n{marker}\r\n"),
+        )
+        .unwrap();
+        let trusted = sbx_in(
+            proj,
+            data.path(),
+            state.path(),
+            &["trust", "--yes", ".sbx.toml"],
+        );
+        assert!(
+            trusted.status.success(),
+            "trust: {}",
+            String::from_utf8_lossy(&trusted.stderr)
+        );
+        match common::probe(|| {
+            sbx_in(
+                proj,
+                data.path(),
+                state.path(),
+                &["run", "--", "socat", "-V"],
+            )
+        }) {
+            common::Probe::Ran(_) => true,
+            common::Probe::Unreachable(why) => {
+                skip_unreachable!(
+                    "skipping forward e2e: the trusted launch failed on a download, twice ({why})"
+                );
+                false
+            }
+            common::Probe::Incapable(why) => {
+                panic!("a trusted launch failed on a host that ran the untrusted probe: {why}")
+            }
+        }
+    };
+
+    // Run the cage server in `proj` and wait for its witness. The server's stderr is kept beside
+    // the project, so a forwarder that could not bind the port, or a server that never came up,
+    // says why. A server with no witness within the budget is a failure: the project was launched
+    // warm, so nothing is left to provision.
+    let serve = |proj: &Path| -> (KillOnDrop, PathBuf) {
+        let log = proj.join("server.log");
+        let child = KillOnDrop(
+            sbx_session_in(proj, data.path(), state.path())
+                .args(["run", "--", "sh", "-c", &server, "sh"])
+                .arg(proj)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::fs::File::create(&log).expect("create the server log"))
+                .spawn()
+                .expect("spawn the cage server"),
+        );
+        let ready = proj.join("forward-ready");
+        let by = Instant::now() + Duration::from_secs(60);
+        while !ready.exists() && Instant::now() < by {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !ready.exists() {
+            drop(child);
+            panic!(
+                "the cage server never said it was listening:\n{}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+        }
+        (child, log)
+    };
+
+    let proj_a = TmpDir::prefixed("r", "ingr-a");
+    let proj_b = TmpDir::prefixed("r", "ingr-b");
+    std::fs::write(proj_a.path().join(".sbx.toml"), "network = \"none\"\n").unwrap();
     probe_or_skip!("forward e2e", run_in(proj_a.path(), data.path(), &["true"]));
     need_reachable!(
         cache_reachable(),
         "skipping forward e2e: the binary cache is unreachable (socat closure unseeded)"
     );
-
-    // With `forward`: the host must reach the cage server through the forwarder.
-    let with = run_server_and_probe(proj_a.path(), data.path(), state.path(), true);
-    let Some(body) = with else {
-        skip_incapable!(
-            "skipping forward e2e: the cage server did not come up in time (slow first seed?)"
-        );
+    if !prepare(proj_a.path(), true) || !prepare(proj_b.path(), false) {
         return;
-    };
+    }
+
+    // With `forward`: the host reaches the cage server through the forwarder.
+    let (server_a, log) = serve(proj_a.path());
+    let body = read_loopback_until(port, marker, Duration::from_secs(20));
+    drop(server_a);
     assert!(
-        body.contains(marker),
-        "the host must reach the cage server through the forward forwarder, got: {body:?}"
+        body.is_some(),
+        "the host must reach the listening cage server through the forwarder; the server said:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
     );
 
-    // Teeth: a second project with the SAME cage server but NO `forward` must be unreachable from
-    // the host — nothing binds the host port, so the connect is refused. This is what proves the
-    // forwarder (not an ambient route) is the bridge.
-    let proj_b = TmpDir::prefixed("r", "ingr-b");
-    let data_b = TmpDir::prefixed("r", "ingr-datb");
-    let state_b = TmpDir::prefixed("r", "ingr-statb");
-    let without = run_server_and_probe(proj_b.path(), data_b.path(), state_b.path(), false);
+    // Without `forward`: the same server, listening in the second project, leaves the host port
+    // with nothing behind it, so the connection is refused rather than merely unanswered. That
+    // also fails on a forwarder of the first project that outlived its launch.
+    let (server_b, log) = serve(proj_b.path());
+    let mut answered = None;
+    for _ in 0..20 {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            other => {
+                answered = Some(format!("{other:?}"));
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(server_b);
     assert!(
-        without.is_none(),
-        "without `forward` the host must NOT reach the cage loopback, but got: {without:?}"
+        answered.is_none(),
+        "without `forward` the host port must refuse a connection, but it gave {answered:?}; the \
+         server said:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
     );
 }
 
