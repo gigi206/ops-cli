@@ -2215,7 +2215,7 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
             "sh",
             "-c",
             "curl -s https://postman-echo.com/get?a=1; \
-             curl -s https://postman-echo.com/get?a=2; sleep 30",
+             curl -s https://postman-echo.com/get?a=2; sleep 300",
         ])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
@@ -2252,8 +2252,11 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
         }
         std::thread::sleep(std::time::Duration::from_millis(400));
     }
-    // Stopped before the assertions, so a failure never leaves a cage running.
-    let _ = sbx_in(
+    // Stopped before the assertions, so a failure never leaves a cage running, and the stop itself
+    // asserted after them: a detached session has no parent to die with, so a stop that failed
+    // leaves it running past the test. It sleeps far longer than anything ahead of this, so it is
+    // always there to stop, and a failed stop is never mistaken for a session that had ended.
+    let stopped = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -2276,6 +2279,11 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
     assert!(
         feed.contains("signed with ${"),
         "the key is replaced by the credential's name, in the plugin's own words:\n{feed}"
+    );
+    assert!(
+        stopped.status.success(),
+        "the detached session must stop, or it outlives the test: {}",
+        String::from_utf8_lossy(&stopped.stderr)
     );
 
     // 5. A declared operation signs in its own ephemeral cage, through a proxy that lives for one
@@ -2301,7 +2309,7 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
     assert!(trusted.status.success());
 
     let started = sbx()
-        .args(["run", "--detach", "--", "sleep", "60"])
+        .args(["run", "--detach", "--", "sleep", "300"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", state.path())
@@ -2346,7 +2354,8 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
         }
         std::thread::sleep(std::time::Duration::from_millis(400));
     }
-    let _ = sbx_in(
+    // Asserted after the feed, as the session above is.
+    let stopped = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -2362,6 +2371,11 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
         task_feed.contains(want),
         "an operation's own proxy records into the session's feed, not into one nobody can \
          read:\n{task_feed}"
+    );
+    assert!(
+        stopped.status.success(),
+        "the detached session must stop, or it outlives the test: {}",
+        String::from_utf8_lossy(&stopped.stderr)
     );
 }
 
