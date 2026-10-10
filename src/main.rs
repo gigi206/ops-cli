@@ -2466,13 +2466,14 @@ mod tests {
         );
     }
 
-    /// The line reporting a rule's write names the rule escaped, on the add and the remove path:
-    /// a `re:` pattern may carry a character that reorders a line, which the grammar admits and a
-    /// terminal would act on. The rule is written and compared as given.
+    /// The line reporting a rule's write names the rule escaped, on the add and the remove path,
+    /// for an egress and a proc rule alike: a `re:` pattern or an exec rule may carry a character
+    /// that reorders a line, which both grammars admit and a terminal would act on. The rule is
+    /// written and compared as given.
     #[test]
     fn a_written_rule_is_named_escaped_in_the_report() {
         use crate::testutil::{EnvVar, TmpDir, env_lock};
-        use config::manage::{EgressList, Scope};
+        use config::manage::{EgressList, ProcList, Scope};
         let _env = env_lock();
         let home = TmpDir::new();
         let _config = EnvVar::set("XDG_CONFIG_HOME", home.join("config"));
@@ -2495,7 +2496,15 @@ mod tests {
             },
         )
         .expect("the rule is removed");
-        for line in [&added, &removed] {
+        let program = "cu\u{202e}rl";
+        assert!(
+            proc_policy::validate_rule(program).is_ok(),
+            "the exec-rule grammar admits the character too"
+        );
+        let proc_added =
+            persist_proc_rule(ProcList::Deny, program, &Scope::Global, None, home.path())
+                .expect("the proc rule is written");
+        for line in [&added, &removed, &proc_added] {
             assert!(
                 !line.contains('\u{202e}') && line.contains("\\u{202e}"),
                 "{line}"
