@@ -673,7 +673,8 @@ fn editor_from(var: impl Fn(&str) -> Option<OsString>) -> OsString {
 
 /// What [`editor_script`] puts before the editor's command line. The file arrives as `$1` and the
 /// `PATH` its program is looked up in as `$2`. Both are kept in variables nothing may reassign, and
-/// shifted away before the line is read.
+/// shifted away before the line is read. An empty `$2` searches nothing: a shell reads an empty
+/// `PATH` as the working directory.
 const EDITOR_PRELUDE: &str = r#"sbx_file=$1
 sbx_search=$2
 readonly sbx_file sbx_search
@@ -695,7 +696,7 @@ sbx_editor() {
     case $1 in
         */*) ;;
         *)
-            if ! sbx_program=$(PATH=$sbx_search; command -v "$1"); then
+            if [ -z "$sbx_search" ] || ! sbx_program=$(PATH=$sbx_search; command -v "$1"); then
                 echo "sbx: config: the editor \`$1\` is not on PATH (an entry that is relative or in the project is not searched)" >&2
                 exit 127
             fi
@@ -1238,19 +1239,21 @@ mod tests {
         let shell = crate::pathfind::find_on_path("sh").expect("an `sh` on PATH");
         let mut stray = std::env::var_os("PATH").unwrap_or_default();
         stray.push(":");
-        let run = |line: &str| {
+        let searched = crate::pathfind::searched_path();
+        let run_in = |line: &str, search: &std::ffi::OsStr| {
             std::process::Command::new(&shell)
                 .arg("-c")
                 .arg(editor_script(std::ffi::OsStr::new(line)))
                 .arg("sh")
                 .arg(&file)
-                .arg(crate::pathfind::searched_path())
+                .arg(search)
                 .current_dir(project.path())
                 .env("PATH", &stray)
                 .env("SBX_TEST_MARKER", &marker)
                 .output()
                 .expect("spawn sh")
         };
+        let run = |line: &str| run_in(line, &searched);
 
         let out = run("sbx-editor-probe --wait");
         assert!(!marker.exists(), "the project's program ran: {out:?}");
@@ -1259,6 +1262,13 @@ mod tests {
             String::from_utf8_lossy(&out.stderr).contains("is not on PATH"),
             "{out:?}"
         );
+        // An empty search is no search at all, not the working directory a shell reads it as.
+        let out = run_in("sbx-editor-probe --wait", std::ffi::OsStr::new(""));
+        assert!(
+            !marker.exists(),
+            "an empty search ran the project's program: {out:?}"
+        );
+        assert_eq!(out.status.code(), Some(127), "{out:?}");
 
         // A program on an absolute entry is found, a builtin stays itself, and a first word holding
         // a `/` is taken as written; each still gets the file as its last argument.
