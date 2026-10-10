@@ -516,11 +516,6 @@ fn prune_previews_the_undeclared_tool_by_provider_and_removes_nothing() {
     );
 }
 
-/// A prune deletes trees out of the very home a running session of this app is using: its `PATH`
-/// entries and interpreters live in `installs/`, so a build in flight loses its tool mid-command.
-/// The applying form is refused while such a session exists; the preview stays safe and stays
-/// available.
-///
 /// Register a live session of `app` in the fixture's registry: a record for *this* process, which
 /// is alive, so it survives the liveness pruning the registry does on every read.
 fn register_live_session(fx: &Project, app: &str) {
@@ -621,6 +616,10 @@ fn reset_empties_every_home_and_pool_and_keeps_the_profile() {
     );
 }
 
+/// A prune deletes trees out of the very home a running session of this app is using: its `PATH`
+/// entries and interpreters live in `installs/`, so a build in flight loses its tool mid-command.
+/// The applying form is refused while such a session exists; the preview stays safe and stays
+/// available.
 #[test]
 fn prune_yes_refuses_while_a_session_of_that_app_is_live() {
     let fx = fixture_with_a_leftover();
