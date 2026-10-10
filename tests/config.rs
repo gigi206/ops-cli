@@ -64,6 +64,22 @@ impl Project {
         std::fs::create_dir_all(&p).unwrap();
         p
     }
+
+    /// Stage a headless stand-in for `$EDITOR` running `script`, and return the value to set
+    /// `EDITOR` to.
+    ///
+    /// The value names the script relative to the project directory, which is where `sbx config
+    /// edit` runs it from. sbx spawns an editor spelled with `[A-Za-z0-9_./-]` alone directly, and
+    /// hands anything else to `sh -c` as a command line. An absolute path would take whichever of
+    /// the two the characters of the fixture root decide, and a root holding a space or a quote
+    /// would hand the shell a command it cannot read.
+    fn stage_editor(&self, script: &str) -> &'static str {
+        use std::os::unix::fs::PermissionsExt;
+        let editor = self.proj.path().join("fake-editor.sh");
+        std::fs::write(&editor, script).unwrap();
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        "./fake-editor.sh"
+    }
 }
 
 #[test]
@@ -5236,24 +5252,17 @@ fn config_set_add_and_rm_edit_a_list_through_the_real_binary() {
 
 #[test]
 fn config_edit_runs_the_editor_and_warns_when_it_re_arms_trust() {
-    use std::os::unix::fs::PermissionsExt;
     let fx = Project::new("cfg");
     fx.write_project("nixpkgs = \"nixos-23.11\"\n");
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     // A non-interactive "editor": a script that appends a line to its file argument, standing in
     // for a real $EDITOR so the test stays headless.
-    let editor = fx.scratch().join("fake-editor.sh");
-    std::fs::write(
-        &editor,
-        "#!/bin/sh\nprintf '\\n[env]\\nEDITED = \"yes\"\\n' >> \"$1\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let editor = fx.stage_editor("#!/bin/sh\nprintf '\\n[env]\\nEDITED = \"yes\"\\n' >> \"$1\"\n");
 
     let out = fx
         .cmd(&["config", "edit"])
-        .env("EDITOR", &editor)
+        .env("EDITOR", editor)
         .env_remove("VISUAL")
         .output()
         .expect("spawn sbx");
@@ -5330,20 +5339,13 @@ fn a_write_to_a_profile_is_held_to_how_the_loader_reads_one() {
 /// without a cage, and sbx must still read that it ran and exited 0.
 #[test]
 fn config_edit_reads_the_editors_exit_under_an_ignored_sigchld() {
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
     let fx = Project::new("cfg");
     fx.write_project("nixpkgs = \"nixos-23.11\"\n");
-    let editor = fx.scratch().join("fake-editor.sh");
-    std::fs::write(
-        &editor,
-        "#!/bin/sh\nprintf '\\n[env]\\nEDITED = \"yes\"\\n' >> \"$1\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let editor = fx.stage_editor("#!/bin/sh\nprintf '\\n[env]\\nEDITED = \"yes\"\\n' >> \"$1\"\n");
 
     let mut command = fx.cmd(&["config", "edit"]);
-    command.env("EDITOR", &editor).env_remove("VISUAL");
+    command.env("EDITOR", editor).env_remove("VISUAL");
     // SAFETY: `signal` is async-signal-safe, and nothing else runs between the fork and the exec.
     unsafe {
         command.pre_exec(|| {
@@ -5368,23 +5370,16 @@ fn config_edit_reads_the_editors_exit_under_an_ignored_sigchld() {
 
 #[test]
 fn config_edit_global_trust_writes_no_marker_and_says_why() {
-    use std::os::unix::fs::PermissionsExt;
     // The global config is trusted **by location**: the loader consults no marker for it. A
     // `--trust` here used to write one anyway and print "the whole file is now trusted", which is a
     // gate the reader does not have — the marker is never read back, so the sentence describes
     // nothing. The four key-writing verbs already answered this case; `edit` never computed it.
     let fx = Project::new("cfg");
-    let editor = fx.scratch().join("global-editor.sh");
-    std::fs::write(
-        &editor,
-        "#!/bin/sh\nprintf '[env]\\nGLOBAL = \"yes\"\\n' >> \"$1\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let editor = fx.stage_editor("#!/bin/sh\nprintf '[env]\\nGLOBAL = \"yes\"\\n' >> \"$1\"\n");
 
     let out = fx
         .cmd(&["config", "edit", "--global", "--trust"])
-        .env("EDITOR", &editor)
+        .env("EDITOR", editor)
         .env_remove("VISUAL")
         .output()
         .expect("spawn sbx");
