@@ -254,9 +254,10 @@ fn adding_a_store_with_no_trust_anchor_shows_the_key_it_ships_and_configures_not
         listing.contains("configured plugin stores: (none)"),
         "the refused add must configure nothing:\n{listing}"
     );
+    // Every entry is read or the test fails: an entry skipped on an error could be the residue.
     let residue: Vec<_> = std::fs::read_dir(home.path().join("sbx"))
         .expect("the data dir")
-        .flatten()
+        .map(|e| e.expect("an entry of the data dir"))
         .filter(|e| e.file_name().to_string_lossy().starts_with(".store-probe-"))
         .collect();
     assert!(residue.is_empty(), "a probe clone leaked: {residue:?}");
