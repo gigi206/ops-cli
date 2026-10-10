@@ -443,6 +443,13 @@ pub fn toml_str(path: &std::path::Path) -> String {
     toml::Value::String(path.to_str().expect("a fixture path is UTF-8").to_owned()).to_string()
 }
 
+/// `text` as a TOML string, quoted and escaped by the `toml` crate, for a value a fixture writes
+/// into a manifest or a config: a `"` or a `\` in it would otherwise end the string early or start
+/// an escape.
+pub fn toml_text(text: &str) -> String {
+    toml::Value::String(text.to_owned()).to_string()
+}
+
 // A fixture path as a `file://` URL, one definition shared with the unit tests.
 include!("../../src/testurl.rs");
 
