@@ -7556,6 +7556,9 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
     const REV: &str = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
     // `body` is the `default` output expression; the rest of the flake is fixed. A quoted heredoc
     // delimiter is not needed — the whole file is an sbx-owned literal here, no shell interpolation.
+    // The system is this host's, as the launcher names it: a flake is evaluated pure, where
+    // `builtins.currentSystem` does not exist.
+    let arch = std::env::consts::ARCH;
     let toml = |body: &str| {
         format!(
             "[app.fk]\n\
@@ -7565,8 +7568,8 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
              {{\n\
                inputs.nixpkgs.url = \"github:NixOS/nixpkgs/{REV}\";\n\
                outputs = {{ self, nixpkgs }}:\n\
-                 let pkgs = nixpkgs.legacyPackages.x86_64-linux;\n\
-                 in {{ packages.x86_64-linux.default = {body}; }};\n\
+                 let pkgs = nixpkgs.legacyPackages.{arch}-linux;\n\
+                 in {{ packages.{arch}-linux.default = {body}; }};\n\
              }}\n\
              '''\n\
              [app.fk.network]\n\
