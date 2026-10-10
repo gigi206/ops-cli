@@ -4806,16 +4806,29 @@ fn bwrap_refusing_the_learning_cage(dir: &Path) -> Option<PathBuf> {
         &stand_in,
         format!(
             "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = --json-status-fd ]; then\n    \
-             exec '{}' --ro-bind /sbx-e2e-no-such-source /sbx-e2e-mnt \"$@\"\n  fi\ndone\n\
-             exec '{}' \"$@\"\n",
-            real.display(),
-            real.display()
+             exec {real} --ro-bind /sbx-e2e-no-such-source /sbx-e2e-mnt \"$@\"\n  fi\ndone\n\
+             exec {real} \"$@\"\n",
+            real = common::sh(&real),
         ),
     )
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
     Some(stand_in)
+}
+
+#[test]
+fn a_word_quoted_for_sh_reaches_the_script_as_it_was() {
+    // A blank, a quote of each kind and an expansion: the stand-in above quotes a path from `PATH`
+    // into the script it writes, and any of these in it would otherwise split the word, end the
+    // quote or be expanded.
+    let word = "/a b/c'd/\"e\"/$f";
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("printf %s {}", common::sh_word(word)))
+        .output()
+        .expect("run /bin/sh");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), word);
 }
 
 /// Run `command` with a fresh terminal as its stdin, stdout and stderr, which is what makes a
