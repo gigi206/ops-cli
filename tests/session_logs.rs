@@ -113,10 +113,30 @@ fn each_reading_prints_exactly_what_it_names() {
         err(&o)
     );
 
-    // A log that is not there is explained rather than reported as empty.
+    // A log that is not there is explained rather than reported as empty, and an id the registry
+    // does not hold is a name that names nothing.
     let o = sbx_in(&data.0, &["session", "logs", "9999"]);
-    assert!(!o.status.success());
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
     assert!(err(&o).contains("no log for session 9999"), "{}", err(&o));
+    assert!(out(&o).is_empty());
+}
+
+/// A log that is not there, for an id the registry cannot be asked about: whether the id names a
+/// session is not known, so the answer is the 1 of a failure about it rather than the 2 of a name
+/// that names nothing. No hint points at `sbx session ls`, which reads the same registry.
+#[test]
+fn a_missing_log_under_an_unreadable_registry_is_a_failure_not_a_usage_error() {
+    let data = Data::new("missing");
+    std::fs::write(data.0.join("sessions"), b"not a directory").expect("write the registry");
+    let o = sbx_in(&data.0, &["session", "logs", "9999"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(
+        err(&o).contains("no log for session 9999")
+            && err(&o).contains("cannot read the session registry")
+            && !err(&o).contains("session ls"),
+        "{}",
+        err(&o)
+    );
     assert!(out(&o).is_empty());
 }
 
