@@ -903,14 +903,7 @@ fn net_groups_export_import_round_trips_between_configs() {
     // Export just `mcp` to a file. Its name travels as the file name, so the destination reads it
     // back under `mcp` without the fragment saying so.
     let frag = src.proj.path().join("mcp.toml");
-    let out = src.run(&[
-        "net",
-        "groups",
-        "export",
-        "mcp",
-        "--out",
-        frag.to_str().unwrap(),
-    ]);
+    let out = src.run_with_path(&["net", "groups", "export", "mcp", "--out"], &frag, &[]);
     assert!(
         out.status.success(),
         "export failed: {}",
@@ -919,7 +912,7 @@ fn net_groups_export_import_round_trips_between_configs() {
 
     // Import it into a *different* config, then it resolves there.
     let dst = Project::new("net");
-    let out = dst.run(&["net", "groups", "import", frag.to_str().unwrap()]);
+    let out = dst.run_with_path(&["net", "groups", "import"], &frag, &[]);
     assert!(
         out.status.success(),
         "import failed: {}",
@@ -933,14 +926,14 @@ fn net_groups_export_import_round_trips_between_configs() {
     );
 
     // Re-import → a collision is refused (nothing written); `--force` overwrites.
-    let again = dst.run(&["net", "groups", "import", frag.to_str().unwrap()]);
+    let again = dst.run_with_path(&["net", "groups", "import"], &frag, &[]);
     assert!(!again.status.success());
     assert!(
         String::from_utf8_lossy(&again.stderr).contains("already exists"),
         "a collision must be refused: {}",
         String::from_utf8_lossy(&again.stderr)
     );
-    let forced = dst.run(&["net", "groups", "import", frag.to_str().unwrap(), "--force"]);
+    let forced = dst.run_with_path(&["net", "groups", "import"], &frag, &["--force"]);
     assert!(
         forced.status.success(),
         "--force must overwrite: {}",
@@ -958,7 +951,7 @@ fn a_forced_group_import_names_what_it_dropped_and_keeps_the_group_it_replaced()
     let frag = fx.proj.path().join("ci.toml");
     std::fs::write(&frag, "entries = [\"{GET} https://api.example.com\"]\n").unwrap();
     assert!(
-        fx.run(&["net", "groups", "import", frag.to_str().unwrap()])
+        fx.run_with_path(&["net", "groups", "import"], &frag, &[])
             .status
             .success()
     );
@@ -972,21 +965,17 @@ fn a_forced_group_import_names_what_it_dropped_and_keeps_the_group_it_replaced()
     .unwrap();
     // The file is not named `ci.toml`, so the name it lands under is the one `--as` gives.
     assert!(
-        fx.run(&[
-            "net",
-            "groups",
-            "import",
-            "--force",
-            "--as",
-            "ci",
-            local.to_str().unwrap()
-        ])
+        fx.run_with_path(
+            &["net", "groups", "import", "--force", "--as", "ci"],
+            &local,
+            &[]
+        )
         .status
         .success()
     );
 
     // Re-importing the pristine fragment drops that entry — and says so, by name.
-    let forced = fx.run(&["net", "groups", "import", "--force", frag.to_str().unwrap()]);
+    let forced = fx.run_with_path(&["net", "groups", "import", "--force"], &frag, &[]);
     assert!(forced.status.success());
     let err = String::from_utf8_lossy(&forced.stderr).to_string();
     assert!(
@@ -1011,15 +1000,11 @@ fn a_forced_group_import_names_what_it_dropped_and_keeps_the_group_it_replaced()
         assert_eq!(mode, 0o600, "the kept fragment must be owner-only");
     }
     assert!(
-        fx.run(&[
-            "net",
-            "groups",
-            "import",
-            "--force",
-            "--as",
-            "ci",
-            kept.to_str().unwrap()
-        ])
+        fx.run_with_path(
+            &["net", "groups", "import", "--force", "--as", "ci"],
+            &kept,
+            &[]
+        )
         .status
         .success()
     );
@@ -1031,15 +1016,11 @@ fn a_forced_group_import_names_what_it_dropped_and_keeps_the_group_it_replaced()
 
     // A re-import that changes nothing keeps no copy and reports no loss.
     std::fs::remove_file(&kept).unwrap();
-    let again = fx.run(&[
-        "net",
-        "groups",
-        "import",
-        "--force",
-        "--as",
-        "ci",
-        local.to_str().unwrap(),
-    ]);
+    let again = fx.run_with_path(
+        &["net", "groups", "import", "--force", "--as", "ci"],
+        &local,
+        &[],
+    );
     assert!(again.status.success());
     assert!(
         !kept.exists(),
@@ -1061,7 +1042,7 @@ fn net_groups_import_flags_entries_that_will_not_resolve() {
     let bad = fx.proj.path().join("bad.toml");
     std::fs::write(&bad, "entries = [\"https://*\", \"@nested\"]\n").unwrap();
 
-    let clean = fx.run(&["net", "groups", "import", good.to_str().unwrap()]);
+    let clean = fx.run_with_path(&["net", "groups", "import"], &good, &[]);
     assert!(clean.status.success());
     assert!(
         !String::from_utf8_lossy(&clean.stderr).contains("will not resolve"),
@@ -1069,7 +1050,7 @@ fn net_groups_import_flags_entries_that_will_not_resolve() {
         String::from_utf8_lossy(&clean.stderr)
     );
 
-    let out = fx.run(&["net", "groups", "import", bad.to_str().unwrap()]);
+    let out = fx.run_with_path(&["net", "groups", "import"], &bad, &[]);
     assert!(
         out.status.success(),
         "import itself succeeds (the name is valid)"
