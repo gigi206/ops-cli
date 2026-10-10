@@ -632,10 +632,10 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
     std::fs::write(
         project.path().join(".sbx.toml"),
         format!(
-            "binds = [\n  {{ path = \"{}\", mode = \"rw\" }},\n  \"{}\",\n  \"{}\",\n]\n",
-            rw_dir.display(),
-            ro_dir.display(),
-            ro_file.display(),
+            "binds = [\n  {{ path = {}, mode = \"rw\" }},\n  {},\n  {},\n]\n",
+            toml_str(&rw_dir),
+            toml_str(&ro_dir),
+            toml_str(&ro_file),
         ),
     )
     .unwrap();
@@ -853,12 +853,31 @@ fn control_plane_home(tag: &str) -> (TmpDir, PathBuf) {
     (home, h)
 }
 
+/// `path` as a TOML string, quoted and escaped by the `toml` crate, for a config a test writes by
+/// hand. The fixture root is wherever the environment puts it (`SBX_TEST_TMPDIR`, else the cache
+/// home), and a `"` or a `\` in it, written between two quotes, would end the string early or
+/// start an escape.
+fn toml_str(path: &Path) -> String {
+    toml::Value::String(path.to_str().expect("a fixture path is UTF-8").to_owned()).to_string()
+}
+
+#[test]
+fn a_path_reaches_a_hand_written_config_as_the_string_it_is() {
+    // Without a `'` the crate answers with a literal string, and with one with a multi-line literal;
+    // each must read back as the path it was given.
+    for path in ["/a\"b\\c d/\u{e9}", "/a\"b\\c d'e/\u{e9}"] {
+        let read: toml::Table = toml::from_str(&format!("p = {}", toml_str(Path::new(path))))
+            .expect("the quoted path is a TOML string");
+        assert_eq!(read["p"].as_str(), Some(path));
+    }
+}
+
 /// Writes the global config under the config home `config`, trusted by location, declaring
 /// `binds` in this order, each a host path and its mode.
 fn global_binds(config: &Path, binds: &[(&Path, &str)]) {
     let list: Vec<String> = binds
         .iter()
-        .map(|(path, mode)| format!("{{ path = \"{}\", mode = \"{mode}\" }}", path.display()))
+        .map(|(path, mode)| format!("{{ path = {}, mode = \"{mode}\" }}", toml_str(path)))
         .collect();
     std::fs::create_dir_all(config.join("sbx")).unwrap();
     std::fs::write(
@@ -10385,7 +10404,7 @@ fn a_broker_that_cannot_be_provided_warns_and_the_launch_still_succeeds() {
     let missing = data.path().join("no-such-agent.sock");
     std::fs::write(
         sbx_cfg.join("sbx.toml"),
-        format!("[broker.fake-broker]\nsocket = \"{}\"\n", missing.display()),
+        format!("[broker.fake-broker]\nsocket = {}\n", toml_str(&missing)),
     )
     .unwrap();
     let out = sbx()
