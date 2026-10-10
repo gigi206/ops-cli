@@ -6590,22 +6590,19 @@ fn every_listing_verb_that_offers_json_emits_a_document_even_when_empty() {
     }
 }
 
-/// Run `sbx <args>` with its standard output a pipe whose reading end is already closed, so its
-/// first write fails every time rather than by a race.
+/// The writing end of a pipe whose reading end is already closed, as one of a child's streams: the
+/// child's first write to it fails every time rather than by a race.
+fn closed_pipe() -> std::process::Stdio {
+    let (reader, writer) = std::io::pipe().expect("create a pipe");
+    // Closed before the child exists: a reading end still open would let the write succeed.
+    drop(reader);
+    writer.into()
+}
+
+/// Run `sbx <args>` with its standard output a [`closed_pipe`].
 fn run_into_a_closed_pipe(p: &Project, args: &[&str]) -> std::process::Output {
-    use std::os::fd::FromRawFd;
-    use std::process::Stdio;
-    let mut ends = [0; 2];
-    // SAFETY: `pipe2` fills the two-element array it is handed.
-    assert_eq!(
-        unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
-        0
-    );
-    // SAFETY: the reading end was just opened here and nothing else holds it.
-    unsafe { libc::close(ends[0]) };
     p.cmd(args)
-        // SAFETY: the writing end was just opened here, and the `Stdio` takes it over.
-        .stdout(unsafe { Stdio::from_raw_fd(ends[1]) })
+        .stdout(closed_pipe())
         .output()
         .expect("spawn sbx")
 }
@@ -6727,7 +6724,6 @@ fn an_answer_that_cannot_be_written_is_a_failure() {
 /// answers 1 all exited 101.
 #[test]
 fn a_diagnostic_that_cannot_be_written_leaves_the_exit_code_alone() {
-    use std::os::fd::FromRawFd;
     use std::process::Stdio;
     let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
         skip_incapable!(
@@ -6738,18 +6734,6 @@ fn a_diagnostic_that_cannot_be_written_leaves_the_exit_code_alone() {
     let p = Project::new("fullerr");
     // Untrusted, so `config show` warns that the table is ignored and still succeeds.
     p.write_project("[network]\nallow = [\"x.test\"]\n");
-    let closed_pipe = || {
-        let mut ends = [0; 2];
-        // SAFETY: `pipe2` fills the two-element array it is handed.
-        assert_eq!(
-            unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
-            0
-        );
-        // SAFETY: the reading end was just opened here and nothing else holds it.
-        unsafe { libc::close(ends[0]) };
-        // SAFETY: the writing end was just opened here, and the `Stdio` takes it over.
-        unsafe { Stdio::from_raw_fd(ends[1]) }
-    };
     for (verb, code) in [
         (vec!["app", "show", "nope"], 2),
         (vec!["config", "show"], 0),
