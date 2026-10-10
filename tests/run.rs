@@ -1897,6 +1897,31 @@ fn grpcb_in_reachable() -> bool {
     })
 }
 
+/// The 64 characters of signature a demo signer puts after `DEMO ` in the `Authorization` the echo
+/// sends back, or `None` when the body holds no such header or ends short of it. Read with `get`,
+/// so an answer cut short, or cut inside a character, is named by the caller with the body rather
+/// than ending the test on an out-of-range slice that says nothing of it.
+fn demo_signature(body: &str) -> Option<&str> {
+    let at = body.find("DEMO ")?;
+    body.get(at + 5..at + 5 + 64)
+}
+
+#[test]
+fn a_demo_signature_is_read_only_from_a_body_that_holds_it_whole() {
+    let sig = "a".repeat(64);
+    assert_eq!(
+        demo_signature(&format!(r#"{{"authorization":"DEMO {sig}"}}"#)),
+        Some(sig.as_str())
+    );
+    assert_eq!(demo_signature("no header at all"), None);
+    assert_eq!(demo_signature("DEMO abc"), None, "an answer cut short");
+    // A two-byte character across the signature's last byte: the cut falls inside it.
+    assert_eq!(
+        demo_signature(&format!("DEMO {}\u{e9}", "a".repeat(63))),
+        None
+    );
+}
+
 /// Whether the public `postman-echo.com` request echo is reachable — the signer e2e depends on it
 /// (it is the only way to see what actually reached the upstream), so an outage skips that test
 /// rather than reddening the suite.
@@ -2113,10 +2138,11 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
     // nothing about what reached the upstream, since a refusal from sbx and an error page from the
     // echo's own front both name the host too.
     let of = |body: &str| -> String {
-        let Some(at) = body.find("DEMO ") else {
-            panic!("the signature did not reach the upstream; the answer was: {body}");
-        };
-        body[at + 5..at + 5 + 64].to_string()
+        demo_signature(body)
+            .unwrap_or_else(|| {
+                panic!("the signature did not reach the upstream whole; the answer was: {body}")
+            })
+            .to_string()
     };
     assert_ne!(
         of(&first),
