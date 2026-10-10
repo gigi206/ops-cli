@@ -600,12 +600,14 @@ pub(super) fn config_path_cmd(args: &[OsString]) -> ExitCode {
 }
 
 /// Render the config-file resolution overview: each layer in order (global base, project overlay)
-/// with its path and whether the file is present. Returned as a string so a test can assert it
+/// with its path and whether the file is present. A file whose presence cannot be read (a
+/// directory on the way without search permission) says so with the error, rather than reading as
+/// absent: an absent layer is one a reader would go and create. Returned as a string so a test can assert it
 /// without a terminal. The label column is padded as plain text before color is applied, so the
 /// path column stays aligned regardless of styling.
 fn render_resolution_layers(layers: &[config::manage::Layer], pal: &style::Palette) -> String {
     use std::fmt::Write as _;
-    let (h, nm, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
+    let (h, nm, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let mut o = String::new();
     let _ = writeln!(
         o,
@@ -616,10 +618,10 @@ fn render_resolution_layers(layers: &[config::manage::Layer], pal: &style::Palet
         let label = format!("{:<8}", layer.label);
         match &layer.path {
             Some(p) => {
-                let (state, hue) = if p.try_exists().unwrap_or(false) {
-                    ("present", ok)
-                } else {
-                    ("absent", dim)
+                let (state, hue) = match p.try_exists() {
+                    Ok(true) => ("present".to_string(), ok),
+                    Ok(false) => ("absent".to_string(), dim),
+                    Err(e) => (format!("cannot be read: {e}"), warn),
                 };
                 let _ = writeln!(o, "  {nm}{label}{r}{}  {hue}({state}){r}", p.display());
             }
@@ -1492,6 +1494,39 @@ mod tests {
         // A key whose quote never closed is not one any write accepted; report it gated, the answer
         // that over-reports rather than under-reports.
         assert!(is_security_key("app.\"my.app.env.FOO"));
+    }
+
+    /// A layer whose presence cannot be read is named with the error, not marked absent.
+    #[test]
+    fn resolution_layers_render_a_file_it_cannot_look_at_as_unreadable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: `geteuid` reads this process's credentials and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!("running as root, which looks into a directory whatever its mode");
+            return;
+        }
+        /// Gives the directory its search permission back, so the fixture can be removed.
+        struct Restore<'a>(&'a Path);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let tmp = crate::testutil::TmpDir::new();
+        let locked = tmp.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("sbx.toml"), "x = 1\n").unwrap();
+        let _restore = Restore(&locked);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let layers = vec![config::manage::Layer {
+            label: "global",
+            path: Some(locked.join("sbx.toml")),
+        }];
+        let plain = render_resolution_layers(&layers, &style::Palette::plain());
+        assert!(
+            plain.contains("(cannot be read: ") && !plain.contains("(absent)"),
+            "{plain}"
+        );
     }
 
     #[test]
