@@ -680,12 +680,14 @@ sbx_search=$2
 readonly sbx_file sbx_search
 shift 2
 sbx_editor() {
+    sbx_own_path=
     while [ "$#" -gt 0 ]; do
         sbx_name=${1%%=*}
         [ "$sbx_name" != "$1" ] || break
         case $sbx_name in
             '' | [!A-Za-z_]* | *[!A-Za-z0-9_]*) break ;;
         esac
+        [ "$sbx_name" != PATH ] || sbx_own_path=1
         export "$1"
         shift
     done
@@ -696,12 +698,14 @@ sbx_editor() {
     case $1 in
         */*) ;;
         *)
-            if [ -z "$sbx_search" ] || ! sbx_program=$(PATH=$sbx_search; command -v "$1"); then
-                echo "sbx: config: the editor \`$1\` is not on PATH (an entry that is relative or in the project is not searched)" >&2
-                exit 127
+            if [ -z "$sbx_own_path" ]; then
+                if [ -z "$sbx_search" ] || ! sbx_program=$(PATH=$sbx_search; command -v "$1"); then
+                    echo "sbx: config: the editor \`$1\` is not on PATH (an entry that is relative or in the project is not searched)" >&2
+                    exit 127
+                fi
+                shift
+                set -- "$sbx_program" "$@"
             fi
-            shift
-            set -- "$sbx_program" "$@"
             ;;
     esac
     "$@" "$sbx_file"
@@ -727,7 +731,9 @@ sbx_editor() {
 /// hands over: the absolute entries outside the project, the ones the direct branch searches. The
 /// shell's own search reads every entry, so with a stray empty one (`PATH="$PATH:"`) an editor
 /// missing from the host (`code --wait` over ssh) was found in the project, which the cage writes,
-/// and run. A first word holding a `/` is a path the user wrote and is taken as it stands. The
+/// and run. A first word holding a `/` is a path the user wrote and is taken as it stands, and so
+/// is a `PATH` the line assigns itself (`PATH=/opt/x/bin myeditor`): the program is looked up in
+/// that one, where an empty entry searches the working directory, as `./x` would. The
 /// editor still inherits the environment whole, so what it runs in turn, `env` or `nohup` included,
 /// is looked up in that, as everything an editor spawns is.
 ///
@@ -1355,6 +1361,13 @@ mod tests {
             "printf '%s\\n' \"$@\" > \"$SBX_TEST_ARGS\"\nprintf '%s\\n' \"${VAR-unset}\" >> \"$SBX_TEST_ARGS\"\n",
         )
         .unwrap();
+        // A program on no inherited `PATH` entry, for a line that assigns a `PATH` of its own: a
+        // link to the `sh` sbx runs, so nothing freshly written is executed.
+        let own = tmp.join("own");
+        std::fs::create_dir(&own).unwrap();
+        let sh = crate::pathfind::find_on_path("sh").expect("an `sh` on PATH");
+        std::os::unix::fs::symlink(sh.canonicalize().unwrap(), own.join("sbx-own-sh")).unwrap();
+        let own = crate::sandbox::shell_quote(own.to_str().expect("a fixture path is UTF-8"));
         let record = crate::sandbox::shell_quote(record.to_str().expect("a fixture path is UTF-8"));
         let file_line = file.to_str().expect("a fixture path is UTF-8");
         for (line, expected) in [
@@ -1378,6 +1391,10 @@ mod tests {
             (
                 format!("VAR=\"a b\" sh {record}"),
                 format!("{file_line}\na b\n"),
+            ),
+            (
+                format!("PATH={own} sbx-own-sh {record}"),
+                format!("{file_line}\nunset\n"),
             ),
         ] {
             let _ = std::fs::remove_file(&args);
