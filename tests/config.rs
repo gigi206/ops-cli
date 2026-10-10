@@ -5316,6 +5316,57 @@ fn config_edit_reads_the_editors_exit_under_an_ignored_sigchld() {
     );
 }
 
+/// A config directory sbx creates on a key write is owner-only, as `config edit` and the imports
+/// make it: one at the umask lists the names of an operator's apps and bundles to every other uid.
+/// An exported fragment is meant to be handed on, so its directory still takes the umask.
+#[test]
+fn a_config_directory_a_key_write_creates_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    /// Run `cmd` under umask 022, whatever the test runner's is, asserted to have succeeded.
+    #[track_caller]
+    fn under_umask_022(cmd: &mut Command) -> std::process::Output {
+        // SAFETY: `umask` is async-signal-safe, and nothing else runs between the fork and the exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::umask(0o022);
+                Ok(())
+            });
+        }
+        common::output_ok(cmd)
+    }
+    let mode = |p: &Path| {
+        format!(
+            "{:o}",
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        )
+    };
+    let fx = Project::new("cfg");
+
+    under_umask_022(&mut fx.cmd(&["config", "set", "-g", "env.X", "1"]));
+    let global = fx.config_home.path().join("sbx");
+    assert_eq!(mode(&global), "700", "the global config directory");
+
+    let explicit = fx.scratch().join("new/a/b.toml");
+    under_umask_022(
+        fx.cmd(&["config", "set", "-c"])
+            .arg(&explicit)
+            .args(["env.X", "1"]),
+    );
+    for dir in [fx.scratch().join("new"), fx.scratch().join("new/a")] {
+        assert_eq!(mode(&dir), "700", "{}", dir.display());
+    }
+
+    fx.write_bundle("demo", "packages = { jq = \"nix:jq\" }\n");
+    let out = fx.scratch().join("exported/demo.toml");
+    under_umask_022(fx.cmd(&["bundle", "export", "demo", "--out"]).arg(&out));
+    assert_eq!(
+        mode(&fx.scratch().join("exported")),
+        "755",
+        "an export's directory takes the umask"
+    );
+}
+
 #[test]
 fn config_edit_global_trust_writes_no_marker_and_says_why() {
     // The global config is trusted **by location**: the loader consults no marker for it. A
