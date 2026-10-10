@@ -6416,6 +6416,100 @@ fn config_edit_trusts_nothing_when_the_editor_never_ran() {
     );
 }
 
+/// `config edit --trust` shows what it is about to trust and asks, as `sbx trust` does, then trusts
+/// the contents it showed. It hashed the file as it found it once the editor exited, a read nobody
+/// saw: a cage able to write the project config could replace it in between, and an editor that
+/// showed nothing (`VISUAL=true`) left the whole file trusted unseen. Without a terminal, and
+/// without `--yes`, nothing is trusted.
+#[test]
+fn config_edit_trust_shows_what_it_grants_and_asks_first() {
+    // An editor that writes a security field, and one that shows nothing and exits 0.
+    for edits in [true, false] {
+        let fx = Project::new("cfg");
+        let mut cmd = fx.cmd(&["config", "edit", "--trust"]);
+        if edits {
+            fx.write_project("nixpkgs = \"nixos-23.11\"\n");
+            let editor = fx.stage_editor(
+                "#!/bin/sh\nprintf 'nixpkgs = \"nixos-23.11\"\\n[network]\\nmode = \"deny\"\\n' > \"$1\"\n",
+            );
+            cmd.env_remove("VISUAL").env("EDITOR", editor);
+        } else {
+            fx.write_project("nixpkgs = \"nixos-23.11\"\n[network]\nmode = \"deny\"\n");
+            cmd.env("VISUAL", "true");
+        }
+        let out = cmd.output().expect("spawn sbx");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "edits={edits}: {stderr}");
+        assert!(
+            stderr.contains("trusting it grants") && stderr.contains("+mode = \"deny\""),
+            "edits={edits}: the review shows the file:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("pass --yes")
+                && stderr.contains("the file was saved but does not apply"),
+            "edits={edits}: the refusal says what to do:\n{stderr}"
+        );
+        assert!(
+            names_in(&fx.state_home.path().join("sbx/trusted")).is_empty(),
+            "edits={edits}: nothing may be trusted:\n{stderr}"
+        );
+    }
+
+    // `--yes` approves what the review shows, a mise file the edit brought in included.
+    let fx = Project::new("cfg");
+    fx.write_project("nixpkgs = \"nixos-23.11\"\n");
+    let editor = fx.stage_editor(
+        "#!/bin/sh\nprintf 'nixpkgs = \"nixos-23.11\"\\n[network]\\nmode = \"deny\"\\n' > \"$1\"\n\
+         printf '[tools]\\njq = \"1.7\"\\n' > \"$(dirname \"$1\")/mise.toml\"\n",
+    );
+    let out = common::output_ok(
+        fx.cmd(&["config", "edit", "--trust", "--yes"])
+            .env_remove("VISUAL")
+            .env("EDITOR", editor),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("+mode = \"deny\"") && stderr.contains("+jq = \"1.7\""),
+        "the review shows the config and the mise file:\n{stderr}"
+    );
+    let shown = fx.run_ok(&["trust", "--show", ".sbx.toml"]);
+    let verdict = format!(
+        "{}{}",
+        String::from_utf8_lossy(&shown.stdout),
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(verdict.contains("is trusted"), "{verdict}");
+}
+
+/// `--yes` answers the review `config edit --trust` puts up, and nothing else: without `--trust` it
+/// is refused before the editor runs, and the verbs that take no review still refuse it.
+#[test]
+fn config_edit_yes_answers_only_the_trust_review() {
+    let fx = Project::new("cfg");
+    fx.write_project("nixpkgs = \"nixos-23.11\"\n");
+    let marker = fx.scratch().join("marker");
+    let editor = fx.stage_editor("#!/bin/sh\necho ran > \"$SBX_TEST_MARKER\"\n");
+    let out = fx
+        .cmd(&["config", "edit", "--yes"])
+        .env_remove("VISUAL")
+        .env("EDITOR", editor)
+        .env("SBX_TEST_MARKER", &marker)
+        .output()
+        .expect("spawn sbx");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("does nothing without `--trust`"),
+        "the refusal says why:\n{stderr}"
+    );
+    assert!(!marker.exists(), "the editor must not run:\n{stderr}");
+
+    let out = fx.run(&["config", "set", "env.X", "1", "--yes"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("unknown flag `--yes`"), "{stderr}");
+}
+
 /// The file `config edit` opens is an argument of the editor and never the command, whatever the
 /// editor variables hold. A cloned repository can ship its `.sbx.toml` executable, since git keeps
 /// the mode, and a command line that contributed no word made that file the command: it ran on the
