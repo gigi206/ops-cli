@@ -214,7 +214,7 @@ one step:
 
 ```sh
 sbx config set network ask --trust     # write, then re-trust
-sbx config edit --trust                # edit, then re-trust as the editor closes
+sbx config edit --trust                # edit, then review what it grants and re-trust
 ```
 
 The global config and app profiles are trusted by location, so writing to either
