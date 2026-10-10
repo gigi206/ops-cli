@@ -6438,6 +6438,38 @@ fn config_edit_never_runs_the_file_it_opens() {
     );
 }
 
+/// The program an editor command line names is looked up where a `PATH` search reads, never in the
+/// project through an empty `PATH` entry. That is an editor missing from the host (`code --wait`
+/// over ssh) with a stray `PATH="$PATH:"`, and a repository that ships a program of that name.
+#[test]
+fn config_edit_does_not_find_the_editor_in_the_project() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Project::new("cfg");
+    fx.write_project("nixpkgs = \"nixos-23.11\"\n");
+    let marker = fx.scratch().join("marker");
+    let probe = fx.proj.path().join("sbx-editor-probe");
+    std::fs::write(&probe, "#!/bin/sh\necho ran > \"$SBX_TEST_MARKER\"\n").unwrap();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut stray = std::env::var_os("PATH").unwrap_or_default();
+    stray.push(":");
+
+    let out = fx
+        .cmd(&["config", "edit"])
+        .env_remove("VISUAL")
+        .env("EDITOR", "sbx-editor-probe --wait")
+        .env("PATH", &stray)
+        .env("SBX_TEST_MARKER", &marker)
+        .output()
+        .expect("spawn sbx");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!marker.exists(), "the project's program ran:\n{stderr}");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("`sbx-editor-probe` is not on PATH"),
+        "the refusal names the program:\n{stderr}"
+    );
+}
+
 /// An editor command line reaches `sh` as the bytes it holds. A lossy conversion turned a byte no
 /// encoding renders into `U+FFFD`, so `sh` ran a program other than the one named, or reported a
 /// file that exists as not found.
