@@ -906,7 +906,8 @@ fn a_signer_whose_grant_names_a_socket_is_refused_by_name() {
     let src = TmpDir::new("plugins");
     let sockets = TmpDir::new("plugins");
     let socket = sockets.path().join("S.agent");
-    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(&socket)
+        .unwrap_or_else(|e| panic!("binding {}: {e}", socket.display()));
 
     let dir = src.path().join("greedy");
     std::fs::create_dir_all(&dir).unwrap();
