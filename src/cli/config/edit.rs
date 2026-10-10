@@ -708,8 +708,16 @@ sbx_editor() {
 ///
 /// A leading `NAME=value` word is an assignment for the editor, as the shell reads one in front of
 /// a command, so it is exported rather than run.
-fn editor_script(editor: &str) -> String {
-    format!("{EDITOR_PRELUDE}sbx_editor {editor}\n")
+///
+/// The line goes in as the bytes it is. `$EDITOR` is an `OsString`, and its lossy conversion would
+/// hand `sh` a `U+FFFD` where the value held a byte no encoding renders, so `sh` would run a program
+/// other than the one named, or report a file that exists as not found.
+fn editor_script(editor: &std::ffi::OsStr) -> OsString {
+    let mut script = OsString::from(EDITOR_PRELUDE);
+    script.push("sbx_editor ");
+    script.push(editor);
+    script.push("\n");
+    script
 }
 
 /// `sbx config edit`: open the target layer file in `$VISUAL`/`$EDITOR` (falling back to `vi`).
@@ -866,7 +874,7 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
             };
             std::process::Command::new(shell)
                 .arg("-c")
-                .arg(editor_script(&editor))
+                .arg(editor_script(&editor_os))
                 .arg("sh")
                 .arg(&path)
                 .status()
@@ -1158,7 +1166,24 @@ mod tests {
 
     /// Run [`editor_script`] for the command line `editor` through the `sh` sbx runs it with, on
     /// `file`, with `env` added and `$UNSET`/`$VAR` removed. The exit code, and what `sh` said.
-    fn run_editor_line(editor: &str, file: &Path, env: &[(&str, &Path)]) -> (Option<i32>, String) {
+    fn run_editor_line(
+        editor: impl AsRef<std::ffi::OsStr>,
+        file: &Path,
+        env: &[(&str, &Path)],
+    ) -> (Option<i32>, String) {
+        let out = editor_line_output(editor.as_ref(), file, env);
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// [`run_editor_line`], with what it wrote on both streams.
+    fn editor_line_output(
+        editor: &std::ffi::OsStr,
+        file: &Path,
+        env: &[(&str, &Path)],
+    ) -> std::process::Output {
         let shell = crate::pathfind::find_on_path("sh").expect("an `sh` on PATH");
         let mut cmd = std::process::Command::new(shell);
         cmd.arg("-c")
@@ -1170,11 +1195,25 @@ mod tests {
         for (key, value) in env {
             cmd.env(key, value);
         }
-        let out = cmd.output().expect("spawn sh");
-        (
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
+        cmd.output().expect("spawn sh")
+    }
+
+    /// The editor's command line reaches `sh` as the bytes it holds, a byte no encoding renders
+    /// included, rather than as its lossy conversion.
+    #[test]
+    fn an_editor_line_reaches_the_shell_as_its_bytes() {
+        let tmp = crate::testutil::TmpDir::new();
+        let file = tmp.join("config.toml");
+        std::fs::write(&file, "").unwrap();
+        let line = std::os::unix::ffi::OsStrExt::from_bytes(&b"printf %s X\xff"[..]);
+        let out = editor_line_output(line, &file, &[]);
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.starts_with(b"X\xff")
+                && !out.stdout.windows(3).any(|w| w == "\u{fffd}".as_bytes()),
+            "the line was not handed over as its bytes: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 
     /// Whatever the editor's command line expands to, the file `config edit` opens is never run as
