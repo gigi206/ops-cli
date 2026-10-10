@@ -124,6 +124,9 @@ impl Project {
     }
 }
 
+/// Both streams, for a failure message and for an assertion that something appears on neither. A
+/// refusal or a note is asserted on stderr itself, where a script reading stdout does not take it
+/// for the verb's answer.
 fn text(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
 }
@@ -384,13 +387,14 @@ fn show_of_an_unknown_app_fails_and_lists_the_declared_ones() {
         "an unknown app is a usage error: {}",
         text(&out)
     );
+    let err = String::from_utf8_lossy(&out.stderr);
     let s = text(&out);
     assert!(
-        s.contains("no app named"),
+        err.contains("no app named"),
         "missing not-found message:\n{s}"
     );
     assert!(
-        s.contains("demo-app"),
+        err.contains("demo-app"),
         "should list the declared apps:\n{s}"
     );
 }
@@ -408,13 +412,14 @@ fn a_profile_with_no_command_is_told_where_the_command_goes() {
     fx.write_profile("ghost", "[network]\nmode = \"deny\"\n");
 
     let out = fx.run(&["app", "run", "ghost"]);
+    let err = String::from_utf8_lossy(&out.stderr);
     let s = text(&out);
     assert!(
-        s.contains("declares no command"),
+        err.contains("declares no command"),
         "a profile with no cmd must be refused, not launched:\n{s}"
     );
     assert!(
-        s.contains("apps/ghost.toml"),
+        err.contains("apps/ghost.toml"),
         "the refusal must name the file that carries the profile:\n{s}"
     );
 }
@@ -544,7 +549,7 @@ fn reset_yes_refuses_while_a_session_of_that_app_is_live() {
         text(&out)
     );
     assert!(
-        text(&out).contains("live session"),
+        String::from_utf8_lossy(&out.stderr).contains("live session"),
         "and say why: {}",
         text(&out)
     );
@@ -620,7 +625,7 @@ fn prune_yes_refuses_while_a_session_of_that_app_is_live() {
         text(&out)
     );
     assert!(
-        text(&out).contains("live session"),
+        String::from_utf8_lossy(&out.stderr).contains("live session"),
         "and say why: {}",
         text(&out)
     );
@@ -659,7 +664,7 @@ fn prune_yes_refuses_when_the_session_registry_cannot_be_read() {
         text(&out)
     );
     assert!(
-        text(&out).contains("cannot read the session registry"),
+        String::from_utf8_lossy(&out.stderr).contains("cannot read the session registry"),
         "and say what it could not know: {}",
         text(&out)
     );
@@ -770,11 +775,15 @@ fn prune_leaves_the_tools_alone_while_the_file_that_declares_them_is_refused() {
         &["app", "prune", "--all", "--yes"],
     ] {
         let out = fx.run(args);
+        let err = String::from_utf8_lossy(&out.stderr);
         let s = text(&out);
         assert!(!out.status.success(), "{args:?}:\n{s}");
-        assert!(s.contains(".sbx.toml"), "{args:?}: the file is named:\n{s}");
         assert!(
-            s.contains("the undeclared mise tools of demo-app are left alone"),
+            err.contains(".sbx.toml"),
+            "{args:?}: the file is named:\n{s}"
+        );
+        assert!(
+            err.contains("the undeclared mise tools of demo-app are left alone"),
             "{args:?}:\n{s}"
         );
         assert!(
@@ -810,11 +819,12 @@ fn prune_all_leaves_alone_only_the_app_whose_bundle_is_missing() {
     fx.set_tool_token("bundled", "aqua-demo-tool", "aqua:demo/tool");
 
     let out = fx.run(&["app", "prune", "--all", "--yes"]);
+    let err = String::from_utf8_lossy(&out.stderr);
     let s = text(&out);
     assert!(!out.status.success(), "{s}");
-    assert!(s.contains("bundled: uses bundle `tools`"), "{s}");
+    assert!(err.contains("bundled: uses bundle `tools`"), "{s}");
     assert!(
-        s.contains("the undeclared mise tools of bundled are left alone"),
+        err.contains("the undeclared mise tools of bundled are left alone"),
         "{s}"
     );
     assert!(fx.installs_dir("bundled").join("aqua-demo-tool").is_dir());
@@ -899,7 +909,9 @@ fn prune_all_skips_a_live_app_names_it_and_still_sweeps_the_rest() {
         text(&out)
     );
     assert!(
-        text(&out).contains("demo-app") && text(&out).contains("live session"),
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .any(|l| l.contains("demo-app") && l.contains("live session")),
         "the skipped app must be named, with the reason: {}",
         text(&out)
     );
@@ -1164,7 +1176,7 @@ fn prune_refuses_a_name_and_all_together() {
     let out = fx.run(&["app", "prune", "demo-app", "--all"]);
     assert_eq!(out.status.code(), Some(2), "{}", text(&out));
     assert!(
-        text(&out).contains("not both"),
+        String::from_utf8_lossy(&out.stderr).contains("not both"),
         "the refusal must say why: {}",
         text(&out)
     );
@@ -1181,11 +1193,12 @@ fn import_names_the_bundle_file_that_sits_beside_the_profile() {
 
     let out = fx.run_with_path(&["app", "import"], &profile, &[]);
     assert!(out.status.success(), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
     let t = text(&out);
     // The command as the reader must type it, with the file — not a `<file>` placeholder they then
     // have to go find. Assert the whole command, so a path that lost its directory still fails.
     assert!(
-        t.contains(&format!("sbx bundle import {}", bundle.display())),
+        err.contains(&format!("sbx bundle import {}", bundle.display())),
         "the remedy should name the sibling bundle file:\n{t}"
     );
 }
@@ -1205,9 +1218,10 @@ fn import_keeps_the_placeholder_when_no_file_backs_the_reference() {
 
     let out = fx.run_with_path(&["app", "import"], &profile, &[]);
     assert!(out.status.success(), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
     let t = text(&out);
     assert!(
-        t.contains("sbx bundle import <file>"),
+        err.contains("sbx bundle import <file>"),
         "an unbacked guess must fall back to the placeholder:\n{t}"
     );
     assert!(
@@ -1232,10 +1246,11 @@ fn import_reports_an_egress_group_the_profile_references_and_nothing_defines() {
 
     let out = fx.run_with_path(&["app", "import"], &profile, &[]);
     assert!(out.status.success(), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
     let t = text(&out);
     assert!(
-        t.contains("@demo-lane")
-            && t.contains(&format!("sbx net groups import {}", group.display())),
+        err.contains("@demo-lane")
+            && err.contains(&format!("sbx net groups import {}", group.display())),
         "an undefined group must be named with the file that defines it:\n{t}"
     );
 
@@ -1281,7 +1296,7 @@ fn a_forced_import_refuses_when_the_profile_it_would_replace_cannot_be_read() {
         text(&out)
     );
     assert!(
-        text(&out).contains("nothing was overwritten"),
+        String::from_utf8_lossy(&out.stderr).contains("nothing was overwritten"),
         "and say what was left alone: {}",
         text(&out)
     );
@@ -1310,10 +1325,11 @@ fn bundle_import_reports_the_groups_the_bundle_itself_references() {
 
     let out = fx.run_with_path(&["bundle", "import"], &bundle, &[]);
     assert!(out.status.success(), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
     let t = text(&out);
     assert!(
-        t.contains("@demo-lane")
-            && t.contains(&format!("sbx net groups import {}", group.display())),
+        err.contains("@demo-lane")
+            && err.contains(&format!("sbx net groups import {}", group.display())),
         "the bundle's own group reference must be reported at its import:\n{t}"
     );
 }
@@ -1338,6 +1354,7 @@ fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
 
     let out = fx.run_with_path(&["app", "import"], &profile, &["--with-deps"]);
     assert!(out.status.success(), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
     let t = text(&out);
     let bundle = std::fs::read_to_string(fx.bundle_path("demo-tool")).unwrap_or_default();
     assert!(
@@ -1359,7 +1376,7 @@ fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
     // The grant belongs to the bytes, not to the verb: this is the one import where the reader did
     // not name the bundle themselves, so a silent credential or egress rule would be least expected.
     assert!(
-        t.contains("egress rule(s)"),
+        err.contains("egress rule(s)"),
         "the grant must still be announced:\n{t}"
     );
 
@@ -1442,7 +1459,7 @@ fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
         text(&out)
     );
     assert!(
-        text(&out).contains("invalid bundle name"),
+        String::from_utf8_lossy(&out.stderr).contains("invalid bundle name"),
         "and must name why:\n{}",
         text(&out)
     );
@@ -1473,7 +1490,7 @@ fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
         text(&out)
     );
     assert!(
-        text(&out).contains("invalid group name"),
+        String::from_utf8_lossy(&out.stderr).contains("invalid group name"),
         "and must name why:\n{}",
         text(&out)
     );
@@ -1517,7 +1534,7 @@ fn show_without_a_name_is_a_usage_error() {
     let out = fx.run(&["app", "show"]);
     assert_eq!(out.status.code(), Some(2), "bare `app show` should exit 2");
     assert!(
-        text(&out).contains("sbx app show <name>"),
+        String::from_utf8_lossy(&out.stderr).contains("sbx app show <name>"),
         "should print the synopsis:\n{}",
         text(&out)
     );
