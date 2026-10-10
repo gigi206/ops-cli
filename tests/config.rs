@@ -1553,17 +1553,12 @@ fn the_trust_gate_reaches_the_sandbox_through_a_real_launch() {
     // the project is trusted. Bind a host path that is neither structural nor under
     // `/tmp` (the sandbox's tmpfs would shadow a `/tmp` bind that is deliberately
     // emitted before it). Skip where the host cannot sandbox or the path is absent.
-    let fx = Project::new("cfg");
-    let can_sandbox = fx
-        .cmd(&["run", "--", "true"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    let target = Path::new("/etc/hostname");
-    if !can_sandbox || !target.exists() {
-        skip_incapable!("skipping launch gate test: host cannot sandbox or /etc/hostname absent");
+    if !Path::new("/etc/hostname").exists() {
+        skip_incapable!("skipping launch gate test: /etc/hostname absent");
         return;
     }
+    let fx = Project::new("cfg");
+    probe_or_skip!("launch gate test", fx.run(&["run", "--", "true"]));
 
     fx.write_project("binds = [\"/etc/hostname\"]\n");
     let probe = "if [ -e /etc/hostname ]; then echo PRESENT; else echo ABSENT; fi";
