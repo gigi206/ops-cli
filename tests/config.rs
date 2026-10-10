@@ -261,11 +261,10 @@ fn config_show_reflects_and_tags_an_ambient_override() {
 
     // A set-but-invalid ambient override is surfaced (as an error note), never silently ignored: the
     // baseline stands, so the view neither lies that a bad value took effect nor hides the mistake.
-    let bad = fx
-        .cmd(&["config", "show"])
-        .env("SBX_CONFIG", "network=\"nonee\"")
-        .output()
-        .expect("spawn sbx");
+    let bad = common::output_ok(
+        fx.cmd(&["config", "show"])
+            .env("SBX_CONFIG", "network=\"nonee\""),
+    );
     let text =
         String::from_utf8_lossy(&bad.stdout).into_owned() + &String::from_utf8_lossy(&bad.stderr);
     assert!(
@@ -295,11 +294,7 @@ fn an_empty_ambient_override_reads_as_absent_while_an_empty_flag_is_a_usage_erro
 
     // The witness first: the channel is read at all, and a value in it is tagged as an override.
     // Without this, the empty case below would pass just as well on a variable sbx never consults.
-    let set = fx
-        .cmd(&["config", "show"])
-        .env("SBX_NET", "none")
-        .output()
-        .expect("spawn sbx");
+    let set = common::output_ok(fx.cmd(&["config", "show"]).env("SBX_NET", "none"));
     let set_out = String::from_utf8_lossy(&set.stdout);
     assert!(
         set_out.contains("network: none") && set_out.contains("(override)"),
@@ -352,11 +347,10 @@ fn an_empty_ambient_override_reads_as_absent_while_an_empty_flag_is_a_usage_erro
 #[test]
 fn config_show_says_so_when_the_ambient_override_will_not_parse() {
     let fx = Project::new("cfg");
-    let out = fx
-        .cmd(&["config", "show"])
-        .env("SBX_CONFIG", "network = [[[")
-        .output()
-        .expect("spawn sbx");
+    let out = common::output_ok(
+        fx.cmd(&["config", "show"])
+            .env("SBX_CONFIG", "network = [[["),
+    );
     let text =
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -453,11 +447,7 @@ fn config_show_reflects_an_ambient_proc_override() {
 
     // A set-but-invalid ambient proc mode is fatal (no safe fallback for a security posture) and
     // surfaced; the baseline `off` stands, so the view neither lies nor hides the mistake.
-    let bad = fx
-        .cmd(&["config", "show"])
-        .env("SBX_PROC", "enfroce")
-        .output()
-        .expect("spawn sbx");
+    let bad = common::output_ok(fx.cmd(&["config", "show"]).env("SBX_PROC", "enfroce"));
     let text =
         String::from_utf8_lossy(&bad.stdout).into_owned() + &String::from_utf8_lossy(&bad.stderr);
     assert!(
@@ -486,11 +476,7 @@ fn config_show_reflects_an_ambient_notify_override() {
 
     // A set-but-invalid ambient mode is fatal, like `proc`: falling back to the baseline could run
     // the launch quieter than the invoker asked for.
-    let bad = fx
-        .cmd(&["config", "show"])
-        .env("SBX_NOTIFY", "alwyas")
-        .output()
-        .expect("spawn sbx");
+    let bad = common::output_ok(fx.cmd(&["config", "show"]).env("SBX_NOTIFY", "alwyas"));
     let text =
         String::from_utf8_lossy(&bad.stdout).into_owned() + &String::from_utf8_lossy(&bad.stderr);
     assert!(
@@ -571,7 +557,7 @@ fn a_mise_file_is_withheld_until_the_project_is_trusted() {
 
     // Trusting the project (which hashes both files) honors it.
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("mise:  .mise.toml (trusted)"),
@@ -590,7 +576,7 @@ fn editing_the_mise_file_re_arms_the_project_trust() {
     // The project declares no security field to drop, so the "changed" signal rides
     // the mise line's withheld reason (stdout), not a dropped-bind warning (stderr).
     fx.write_mise("[tools]\nnode = \"22\"\n");
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("mise:  .mise.toml (withheld: changed since it was trusted"),
@@ -753,7 +739,7 @@ fn network_mute_is_trusted_gated_and_surfaced_in_the_views() {
 
     // Trust it → the allowlist applies and the mute rule is surfaced (dimmed) in `config show`.
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("mute") && stdout.contains("play.googleapis.com"),
@@ -761,7 +747,7 @@ fn network_mute_is_trusted_gated_and_surfaced_in_the_views() {
     );
 
     // …and it is listed by `sbx net rules` too, tagged `mute` (distinct from allow/deny).
-    let rules = fx.run(&["net", "rules"]);
+    let rules = fx.run_ok(&["net", "rules"]);
     let rstdout = String::from_utf8_lossy(&rules.stdout);
     assert!(
         rstdout.contains("mute") && rstdout.contains("play.googleapis.com"),
@@ -791,7 +777,7 @@ fn network_http2_is_trusted_gated_and_surfaced_in_config_show() {
 
     // Trust it → the allowlist applies and the http2 host is surfaced in `config show`.
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("http2") && stdout.contains("grpc.example.com:9001"),
@@ -806,7 +792,7 @@ fn network_http2_is_trusted_gated_and_surfaced_in_config_show() {
          http2 = [\"grpc.example.com:9001\", \"grpc.example.com:99999\"]\n",
     );
     assert!(fx2.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx2.run(&["config", "show"]);
+    let out = fx2.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -842,7 +828,7 @@ fn network_transport_settings_are_trusted_gated_and_surfaced_in_config_show() {
 
     // Trust it → both settings apply and both are surfaced.
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("connection reuse: off"),
@@ -858,7 +844,7 @@ fn network_transport_settings_are_trusted_gated_and_surfaced_in_config_show() {
     let fx2 = Project::new("cfg");
     fx2.write_project("[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n");
     assert!(fx2.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx2.run(&["config", "show"]);
+    let out = fx2.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("api.example.com"),
@@ -876,7 +862,7 @@ fn network_transport_settings_are_trusted_gated_and_surfaced_in_config_show() {
         "[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\ndns_cache_ttl = 0\n",
     );
     assert!(fx3.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx3.run(&["config", "show"]);
+    let out = fx3.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("dns cache: off"),
@@ -886,7 +872,7 @@ fn network_transport_settings_are_trusted_gated_and_surfaced_in_config_show() {
     // `--details` reports the effective posture rather than only the exceptions, so a reader who
     // does not already know the product defaults still learns what this launch gets. `fx2` is the
     // default-posture project, which prints neither line in the baseline view above.
-    let out = fx2.run(&["config", "show", "--details"]);
+    let out = fx2.run_ok(&["config", "show", "--details"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("connection reuse: on"),
@@ -1136,7 +1122,7 @@ fn the_network_posture_is_a_trust_gated_security_field() {
 
     // Trusted: the posture is honored — the cage would isolate the network.
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("network: none"),
@@ -1170,7 +1156,7 @@ fn the_network_allowlist_is_a_trust_gated_security_field() {
 
     // Trusted: the allowlist is honored and its classified rules are shown.
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     // `config show` renders the resolved posture, so a deny-by-default policy reads as `deny`.
     assert!(stdout.contains("network: deny"), "stdout:\n{stdout}");
@@ -1226,7 +1212,7 @@ fn the_egress_stats_toggle_is_shown_and_trust_gated() {
     fx.write_global("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\nstats = false\n");
     // deliberately NOT trusting the project
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("stats: recording"),
@@ -1295,7 +1281,7 @@ fn the_allow_mode_is_a_denylist_default_allow_with_deny_carve_outs() {
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     // `config show` names the mode and frames it as a denylist, not an allowlist.
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("network: allow"), "stdout:\n{stdout}");
     assert!(
@@ -1308,14 +1294,14 @@ fn the_allow_mode_is_a_denylist_default_allow_with_deny_carve_outs() {
     );
 
     // `sbx test net`: an unlisted host is ALLOWED (the new default-allow behavior)...
-    let out = fx.run(&["test", "net", "https://anything.example/page"]);
+    let out = fx.run_ok(&["test", "net", "https://anything.example/page"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("ALLOWED") && stdout.contains("allow-by-default"),
         "an unlisted host must be allowed under allow mode:\n{stdout}"
     );
     // ...while the deny carve-out is still DENIED (deny wins, even under allow-by-default).
-    let out = fx.run(&["test", "net", "https://evil.example/secret"]);
+    let out = fx.run_ok(&["test", "net", "https://evil.example/secret"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("DENIED") && stdout.contains("evil.example/secret"),
@@ -1443,7 +1429,7 @@ fn editing_a_trusted_project_re_arms_the_gate() {
 
     // an edit changes the content hash; the binds must drop again until re-trusted
     fx.write_project("binds = [\"/etc/ssh\", \"/opt/extra\"]\n");
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1546,10 +1532,7 @@ fn the_trust_gate_reaches_the_sandbox_through_a_real_launch() {
     let probe = "if [ -e /etc/hostname ]; then echo PRESENT; else echo ABSENT; fi";
 
     // Untrusted: the security bind must not reach the sandbox.
-    let untrusted = fx
-        .cmd(&["run", "--", "/bin/sh", "-c", probe])
-        .output()
-        .expect("spawn sbx run");
+    let untrusted = common::output_ok(&mut fx.cmd(&["run", "--", "/bin/sh", "-c", probe]));
     assert!(
         String::from_utf8_lossy(&untrusted.stdout).contains("ABSENT"),
         "an untrusted bind must not reach the sandbox; stdout:\n{}\nstderr:\n{}",
@@ -1559,10 +1542,7 @@ fn the_trust_gate_reaches_the_sandbox_through_a_real_launch() {
 
     // Trust it, and the same bind is now visible inside.
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let trusted = fx
-        .cmd(&["run", "--", "/bin/sh", "-c", probe])
-        .output()
-        .expect("spawn sbx run");
+    let trusted = common::output_ok(&mut fx.cmd(&["run", "--", "/bin/sh", "-c", probe]));
     assert!(
         String::from_utf8_lossy(&trusted.stdout).contains("PRESENT"),
         "a trusted bind must reach the sandbox; stdout:\n{}\nstderr:\n{}",
@@ -1593,7 +1573,7 @@ fn config_shows_packages_with_their_trust_verdict() {
 
     // Trusted: shown plainly, no longer withheld.
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("node -> nix:nodejs_20"),
@@ -1616,10 +1596,7 @@ fn a_trusted_project_package_lands_on_the_sandbox_path() {
 
     // Untrusted: the tool is withheld, so it is not on PATH.
     let probe = "command -v hello >/dev/null 2>&1 && echo PRESENT || echo ABSENT";
-    let untrusted = fx
-        .cmd(&["run", "--", "/bin/sh", "-c", probe])
-        .output()
-        .expect("spawn sbx run");
+    let untrusted = common::output_ok(&mut fx.cmd(&["run", "--", "/bin/sh", "-c", probe]));
     assert!(
         String::from_utf8_lossy(&untrusted.stdout).contains("ABSENT"),
         "an untrusted project's tool must not reach PATH; stdout:\n{}\nstderr:\n{}",
@@ -1629,10 +1606,7 @@ fn a_trusted_project_package_lands_on_the_sandbox_path() {
 
     // Trust it, and the tool is provisioned and runs.
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let trusted = fx
-        .cmd(&["run", "--", "hello"])
-        .output()
-        .expect("spawn sbx run");
+    let trusted = common::output_ok(&mut fx.cmd(&["run", "--", "hello"]));
     assert!(
         String::from_utf8_lossy(&trusted.stdout).contains("Hello, world!"),
         "a trusted tool must run inside the sandbox; stdout:\n{}\nstderr:\n{}",
@@ -1676,7 +1650,7 @@ fn config_shows_the_nixpkgs_source_and_gates_a_project_override() {
     let fx = Project::new("cfg");
 
     // default when nothing overrides it
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("nixpkgs: nixos-unstable  (default)"),
         "stdout:\n{}",
@@ -1686,7 +1660,7 @@ fn config_shows_the_nixpkgs_source_and_gates_a_project_override() {
     // an untrusted project override is a security field: ignored (still default),
     // and not silently
     fx.write_project("nixpkgs = \"nixos-23.11\"\n");
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1700,7 +1674,7 @@ fn config_shows_the_nixpkgs_source_and_gates_a_project_override() {
 
     // trusting the project applies the pin
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("nixpkgs: nixos-23.11  (project pin)"),
         "a trusted pin must apply:\n{}",
@@ -1723,7 +1697,7 @@ fn config_shows_the_locked_revision_once_resolved() {
     )
     .unwrap();
 
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     assert!(
         String::from_utf8_lossy(&out.stdout)
             .contains("nixpkgs: nixos-unstable @ 9ae611a  (default)"),
@@ -1869,10 +1843,7 @@ fn a_trusted_pin_to_a_different_channel_runs_a_tool_from_that_channel() {
 
     probe_or_skip!("cross-channel pin test", fx.run(&["run", "--", "true"]));
 
-    let out = fx
-        .cmd(&["run", "--", "hello"])
-        .output()
-        .expect("spawn sbx run");
+    let out = common::output_ok(&mut fx.cmd(&["run", "--", "hello"]));
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("Hello, world!"),
         "a tool pinned to a different channel must run (base must share the pin); \
@@ -1900,7 +1871,7 @@ fn a_registered_resolver_plugin_scheme_is_honored_in_a_secret() {
     );
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("Authorization -> https://api.github.com"),
@@ -2145,7 +2116,7 @@ fn plugins_install_then_list_then_remove_through_the_binary() {
     let out = fx.run(&["plugins", "list"]);
     assert!(out.status.success(), "list must succeed");
     assert!(String::from_utf8_lossy(&out.stdout).contains("installed resolver plugins: (none)"));
-    let out = fx.run(&["plugins", "store", "list"]);
+    let out = fx.run_ok(&["plugins", "store", "list"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("configured plugin stores: (none)"));
 
     // a source plugin whose manifest name differs from its directory name
@@ -2194,7 +2165,7 @@ fn plugins_install_then_list_then_remove_through_the_binary() {
     assert!(out.status.success(), "rm must succeed");
     assert!(String::from_utf8_lossy(&out.stdout).contains("removed 'pass'"));
 
-    let out = fx.run(&["plugins", "list"]);
+    let out = fx.run_ok(&["plugins", "list"]);
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("installed resolver plugins: (none)"),
         "the plugin must be gone after rm"
@@ -2373,7 +2344,7 @@ fn publish_then_add_and_install_through_a_real_clone() {
     );
 
     // The plugin is now installed and claims its scheme.
-    let list = fx.run(&["plugins", "list"]);
+    let list = fx.run_ok(&["plugins", "list"]);
     let stdout = String::from_utf8_lossy(&list.stdout);
     assert!(
         stdout.contains("secret-store"),
@@ -2435,7 +2406,7 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
     // Trusted: the bind is honored — no drop note remains — and the package is admitted, so it
     // shows plainly, no longer marked `(withheld)`.
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("probe: id"),
@@ -2452,7 +2423,7 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
 
     // `--details` expands the compact list to the full per-package line, surfacing the backend the
     // baseline `packages` section shows — the same line, just indented under the app.
-    let out = fx.run(&["config", "show", "--details"]);
+    let out = fx.run_ok(&["config", "show", "--details"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("tool -> nix:ripgrep"),
@@ -2591,7 +2562,7 @@ fn config_show_app_shows_the_effective_config_with_inheritance() {
         "the fold must name what it hid and the flag that shows it:\n{stdout}"
     );
     let detailed = String::from_utf8_lossy(
-        &fx.run(&["config", "show", "--app", "demo", "--details"])
+        &fx.run_ok(&["config", "show", "--app", "demo", "--details"])
             .stdout,
     )
     .to_string();
@@ -2654,8 +2625,8 @@ fn an_apps_channel_is_the_working_directorys_channel_and_the_view_names_it() {
         "a pin is trust-gated, so the project must be vouched for first"
     );
 
-    let inside =
-        String::from_utf8_lossy(&fx.run(&["config", "show", "--app", "demo"]).stdout).into_owned();
+    let inside = String::from_utf8_lossy(&fx.run_ok(&["config", "show", "--app", "demo"]).stdout)
+        .into_owned();
     assert!(
         inside.contains("nixpkgs: nixos-24.11") && inside.contains("(project pin)"),
         "from the pinned project the app view must report the pin, origin included:\n{inside}"
@@ -2664,7 +2635,7 @@ fn an_apps_channel_is_the_working_directorys_channel_and_the_view_names_it() {
     // The same app, same profile, same homes — only the directory differs.
     let elsewhere = TmpDir::new("cfg");
     let outside = String::from_utf8_lossy(
-        &fx.run_in(elsewhere.path(), &["config", "show", "--app", "demo"])
+        &common::output_ok(&mut fx.cmd_in(elsewhere.path(), &["config", "show", "--app", "demo"]))
             .stdout,
     )
     .into_owned();
@@ -2686,14 +2657,10 @@ fn an_apps_channel_is_the_working_directorys_channel_and_the_view_names_it() {
     let doc = common::json_of(&fx.run_ok(&["config", "show", "--app", "demo", "--json"]));
     assert_eq!(doc["nixpkgs"]["source"], "nixos-24.11");
     assert_eq!(doc["nixpkgs"]["origin"], "project pin");
-    let doc = serde_json::from_slice::<serde_json::Value>(
-        &fx.run_in(
-            elsewhere.path(),
-            &["config", "show", "--app", "demo", "--json"],
-        )
-        .stdout,
-    )
-    .expect("--app --json must emit valid JSON");
+    let doc = common::json_of(&common::output_ok(&mut fx.cmd_in(
+        elsewhere.path(),
+        &["config", "show", "--app", "demo", "--json"],
+    )));
     assert_eq!(doc["nixpkgs"]["origin"], "default");
     assert_ne!(doc["nixpkgs"]["source"], "nixos-24.11");
 }
@@ -2729,7 +2696,7 @@ fn a_mode_less_app_network_inherits_the_baseline_mode() {
 
     // `--details` adds what the default view leaves out: the always-allowed built-in set, which is
     // the same for every app and decides nothing about this one.
-    let out = fx.run(&["config", "show", "--app", "demo", "--details"]);
+    let out = fx.run_ok(&["config", "show", "--app", "demo", "--details"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("built-in (always allowed"),
@@ -2987,7 +2954,7 @@ fn config_app_flag_validates_the_name_and_does_not_apply_to_path_or_edit() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let got = fx.run(&["config", "get", "--app", "my.app", "cmd"]);
+    let got = fx.run_ok(&["config", "get", "--app", "my.app", "cmd"]);
     assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "x");
 
     // A name no app could carry is rejected outright.
@@ -3175,7 +3142,7 @@ fn unset_network_mode_on_a_global_app_yields_an_inheriting_table() {
     // is consistent with the project-overlay path (a trusted overlay with a mode-less table tags
     // `app:project` the same way) and is not a routing artifact; per-sub-field network-mode provenance
     // is a possible follow-up, deliberately deferred. Pinned here so a future change is caught.
-    let show = fx.run(&["config", "show", "--app", "demo"]);
+    let show = fx.run_ok(&["config", "show", "--app", "demo"]);
     let stdout = String::from_utf8_lossy(&show.stdout);
     assert!(
         stdout.contains("network: ask") && stdout.contains("(app:global)"),
@@ -3403,7 +3370,7 @@ fn setting_a_key_to_the_value_it_already_holds_leaves_the_trust_gate_alone() {
     );
 
     // The gate really is still open: the security field applies without a fresh `sbx trust`.
-    let show = fx.run(&["config", "show"]);
+    let show = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&show.stdout);
     assert!(
         stdout.contains("network: ask"),
@@ -3579,7 +3546,7 @@ fn sbx_app_import_places_validates_renames_and_removes_a_profile() {
     );
 
     // It now resolves as a trusted-by-location app.
-    let cfg = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).to_string();
+    let cfg = String::from_utf8_lossy(&fx.run_ok(&["config", "show"]).stdout).to_string();
     assert!(cfg.contains("demo-app: demo-app"), "{cfg}");
 
     // A second import without --force refuses to clobber.
@@ -3593,7 +3560,7 @@ fn sbx_app_import_places_validates_renames_and_removes_a_profile() {
     // `--as` re-keys to a different name (the contents are name-agnostic), and `list` shows both.
     let renamed = fx.run(&["app", "import", "demo-app.toml", "--as", "agent"]);
     assert!(renamed.status.success());
-    let listed = String::from_utf8_lossy(&fx.run(&["app", "list"]).stdout).to_string();
+    let listed = String::from_utf8_lossy(&fx.run_ok(&["app", "list"]).stdout).to_string();
     assert!(
         listed.contains("agent") && listed.contains("demo-app"),
         "{listed}"
@@ -3606,7 +3573,7 @@ fn sbx_app_import_places_validates_renames_and_removes_a_profile() {
         "rm failed: {}",
         String::from_utf8_lossy(&rm.stderr)
     );
-    let after = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).to_string();
+    let after = String::from_utf8_lossy(&fx.run_ok(&["config", "show"]).stdout).to_string();
     assert!(
         !after.contains("demo-app: demo-app"),
         "removed app lingers:\n{after}"
@@ -3659,7 +3626,7 @@ fn a_forced_import_names_what_it_dropped_and_keeps_the_profile_it_replaced() {
     assert_eq!(std::fs::read_to_string(&kept).unwrap(), local);
 
     // It is NOT a second profile: the scan takes `*.toml` only, so nothing new appears.
-    let listed = String::from_utf8_lossy(&fx.run(&["app", "list"]).stdout).to_string();
+    let listed = String::from_utf8_lossy(&fx.run_ok(&["app", "list"]).stdout).to_string();
     assert!(!listed.contains("replaced"), "{listed}");
 
     // A re-import that changes nothing keeps no copy and reports no loss.
@@ -3774,7 +3741,7 @@ fn sbx_app_export_emits_a_profile_verbatim_an_inline_app_serialized_and_round_tr
         String::from_utf8_lossy(&imp.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&fx.run(&["app", "list"]).stdout).contains("review"),
+        String::from_utf8_lossy(&fx.run_ok(&["app", "list"]).stdout).contains("review"),
         "the re-imported profile must list"
     );
 
@@ -3900,7 +3867,7 @@ fn the_shipped_profiles_import_and_resolve() {
         dir.display()
     );
     // Each imported profile now resolves as an app (`sbx config` lists it by name).
-    let cfg = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).to_string();
+    let cfg = String::from_utf8_lossy(&fx.run_ok(&["config", "show"]).stdout).to_string();
     for name in &imported {
         assert!(
             cfg.contains(&format!("{name}:")),
@@ -4039,9 +4006,11 @@ mode = "deny"
 
     // The same fold is what a reader sees: the step is rendered beside the command, not buried in
     // the bundle it came from.
-    let shown =
-        String::from_utf8_lossy(&fx.run(&["config", "show", "--app", "orchestrator"]).stdout)
-            .to_string();
+    let shown = String::from_utf8_lossy(
+        &fx.run_ok(&["config", "show", "--app", "orchestrator"])
+            .stdout,
+    )
+    .to_string();
     assert!(
         shown.contains("install: bash -c beta-postinstall") && shown.contains("from bundle beta"),
         "the app's resolved shape shows the step and its author:\n{shown}"
@@ -4155,7 +4124,7 @@ legacy-lane = ["lane.example"]
         "cmd = \"demo\"\nuse = [\"legacy\"]\n[network]\nmode = \"deny\"\nallow = [\"@legacy-lane\"]\n",
     );
 
-    let listed = fx.run(&["bundle"]);
+    let listed = fx.run_ok(&["bundle"]);
     let err = String::from_utf8_lossy(&listed.stderr).to_string();
     assert!(
         err.contains("[bundle.legacy]") && err.contains("bundles/<name>.toml"),
@@ -4287,7 +4256,7 @@ fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced
         .status
         .success()
     );
-    let listed = fx.run(&["bundle", "demo-agent"]);
+    let listed = fx.run_ok(&["bundle", "demo-agent"]);
     assert!(
         String::from_utf8_lossy(&listed.stdout).contains("local.example.org"),
         "re-importing the kept fragment restores the entry"
@@ -4350,7 +4319,7 @@ fn a_forced_bundle_import_names_what_the_incoming_fragment_adds() {
         "the added group must be named rather than read as a reflow:\n{err}"
     );
     // And it reaches the listing the warning sends the reader to.
-    let listed = fx.run(&["bundle", "demo-agent"]);
+    let listed = fx.run_ok(&["bundle", "demo-agent"]);
     assert!(
         String::from_utf8_lossy(&listed.stdout).contains("api.example.com, app.example.com"),
         "the listing must name the hosts the group covers"
@@ -4673,7 +4642,7 @@ fn a_bundle_loss_a_trusted_project_posture_replaces_does_not_stop_the_app() {
             && !text.contains("no table to land in"),
         "the host is open, and the entry is named against the project:\n{text}"
     );
-    let shown = fx.run(&["config", "show", "--app", "demo"]);
+    let shown = fx.run_ok(&["config", "show", "--app", "demo"]);
     let shown = format!(
         "{}{}",
         String::from_utf8_lossy(&shown.stdout),
@@ -5003,7 +4972,7 @@ fn config_set_with_trust_applies_a_security_field_at_once() {
         "--trust should report the file is now trusted"
     );
 
-    let view = fx.run(&["config", "show"]);
+    let view = fx.run_ok(&["config", "show"]);
     assert!(
         String::from_utf8_lossy(&view.stdout).contains("network: none"),
         "the trusted security field must apply:\n{}",
@@ -5021,7 +4990,7 @@ fn config_set_a_security_field_on_an_untrusted_project_is_noted_and_withheld() {
         "an untrusted security write should note it needs trust"
     );
     // And the launch would not honor it: the resolved view still shows the default.
-    let view = fx.run(&["config", "show"]);
+    let view = fx.run_ok(&["config", "show"]);
     assert!(
         String::from_utf8_lossy(&view.stdout).contains("network: deny"),
         "an untrusted network choice is withheld"
@@ -5068,14 +5037,14 @@ fn config_path_lists_the_resolution_order_by_default() {
 
     // The project line must carry exactly the path `--local` targets — the overview is derived from
     // the same primitive, so they can never disagree.
-    let local = fx.run(&["config", "path", "--local"]);
+    let local = fx.run_ok(&["config", "path", "--local"]);
     let local_path = String::from_utf8_lossy(&local.stdout).trim().to_string();
     assert!(s.contains(&local_path), "project line vs --local:\n{s}");
 
     // Once both files exist, each layer reads present.
     fx.write_global("env.A = \"1\"\n");
     fx.write_project("env.B = \"2\"\n");
-    let out = fx.run(&["config", "path"]);
+    let out = fx.run_ok(&["config", "path"]);
     let s = String::from_utf8_lossy(&out.stdout);
     assert_eq!(s.matches("(present)").count(), 2, "both present:\n{s}");
     assert!(!s.contains("(absent)"), "none absent now:\n{s}");
@@ -5129,7 +5098,7 @@ fn config_show_lists_declared_operations_only_once_trusted() {
          [task.fmt]\ncmd = [\"cargo\", \"fmt\"]\n",
     );
 
-    let untrusted = fx.run(&["config", "show"]);
+    let untrusted = fx.run_ok(&["config", "show"]);
     assert!(
         !String::from_utf8_lossy(&untrusted.stdout).contains("tasks ("),
         "an untrusted project declares no operation: {}",
@@ -5137,7 +5106,7 @@ fn config_show_lists_declared_operations_only_once_trusted() {
     );
 
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let shown = fx.run(&["config", "show"]);
+    let shown = fx.run_ok(&["config", "show"]);
     let text = String::from_utf8_lossy(&shown.stdout);
     assert!(
         text.contains("tasks (declared operations a cage may run):"),
@@ -5580,7 +5549,7 @@ fn a_key_write_still_re_trusts_a_project_the_user_had_approved() {
     );
 
     // Blessed for real: the security field the file declares still applies after the write.
-    let show = fx.run(&["config", "show"]);
+    let show = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&show.stdout);
     assert!(
         stdout.contains("good -> nix:hello  (host-side, durable)"),
@@ -5618,7 +5587,7 @@ fn an_untrusted_seccomp_relaxation_is_dropped_but_trusting_applies_it() {
         "trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("seccomp allow: clone:newns, ptrace, unshare"),
@@ -5637,7 +5606,7 @@ fn a_dangerous_seccomp_token_carries_a_caution_and_an_unknown_one_is_dropped() {
     // caution; an unknown syscall name is dropped (fail-closed — it loosens nothing).
     let fx = Project::new("cfg");
     fx.write_global("[seccomp]\nallow = [\"umount2\", \"clone\", \"bogus_syscall\"]\n");
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -5724,7 +5693,7 @@ fn an_untrusted_devices_grant_is_dropped_but_trusting_applies_it() {
         "trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("devices: /dev/dri, /dev/net/tun"),
@@ -5742,7 +5711,7 @@ fn a_malformed_device_entry_is_dropped_and_the_valid_one_kept() {
     // path outside `/dev/` is dropped (fail-closed), the valid device kept.
     let fx = Project::new("cfg");
     fx.write_global("[devices]\nallow = [\"/etc/shadow\", \"/dev/kvm\"]\n");
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -5825,7 +5794,7 @@ fn an_untrusted_gpu_posture_is_dropped_but_trusting_applies_it() {
         "trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("gpu: enabled"),
@@ -5888,7 +5857,7 @@ fn an_untrusted_audio_posture_is_dropped_but_trusting_applies_it() {
         "trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("audio: enabled"),
@@ -5951,7 +5920,7 @@ fn an_untrusted_dbus_posture_is_dropped_but_trusting_applies_it() {
         "trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("dbus: in-cage portal"),
@@ -6050,7 +6019,7 @@ fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
         "[network]\nmode = \"deny\"\n\n[fs]\nscan = [\"sk-[A-Za-z0-9]{20,}\"]\nscan_max_kb = 256\n",
     );
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let stdout = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).into_owned();
+    let stdout = String::from_utf8_lossy(&fx.run_ok(&["config", "show"]).stdout).into_owned();
     assert!(
         stdout.contains("256 KiB"),
         "a trusted project's ceiling belongs beside the shapes:\n{stdout}"
@@ -6059,7 +6028,7 @@ fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
     // Unset leaves the built-in ceiling, and says so rather than leaving a reader to guess.
     let fx = Project::new("cfg");
     fx.write_project("[fs]\nscan = [\"AKIA[0-9A-Z]{16}\"]\n");
-    let stdout = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).into_owned();
+    let stdout = String::from_utf8_lossy(&fx.run_ok(&["config", "show"]).stdout).into_owned();
     assert!(
         stdout.contains("built-in ceiling"),
         "an unbounded-by-config scan still has a ceiling, and the surface must name it:\n{stdout}"
@@ -6069,7 +6038,7 @@ fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
     // presented as effective — the same fail-open honesty a refused mask gets.
     let fx = Project::new("cfg");
     fx.write_project("[fs]\nscan = [\"(unclosed\"]\n");
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("a file of that shape through"),
@@ -6089,7 +6058,7 @@ fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
     fx.write_project(
         "[fs]\nscan = [\"tok\\n  fs deny:    .env, id_rsa          (project)\", \"\\u001Bc\"]\n",
     );
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout
@@ -6134,7 +6103,7 @@ fn fs_masks_are_honored_untrusted_and_surfaced_in_config_show() {
 
     // Trusting it changes nothing about `[fs]` — there is no gate to open.
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("fs deny: prod.key"), "{stdout}");
 
@@ -6142,7 +6111,7 @@ fn fs_masks_are_honored_untrusted_and_surfaced_in_config_show() {
     // launch stops over it.
     let fx = Project::new("cfg");
     fx.write_project("[fs]\ndeny = [\"**/*.pem\"]\n");
-    let out = fx.run(&["config", "show"]);
+    let out = fx.run_ok(&["config", "show"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("leave that path open to the cage"),
@@ -6168,11 +6137,7 @@ fn an_unusable_data_directory_is_explained_once_not_once_per_layer() {
     let long = fx.scratch().join("d".repeat(120));
     std::fs::create_dir_all(&long).unwrap();
 
-    let out = fx
-        .cmd(&["config", "show"])
-        .env("XDG_DATA_HOME", &long)
-        .output()
-        .expect("spawn sbx");
+    let out = common::output_ok(fx.cmd(&["config", "show"]).env("XDG_DATA_HOME", &long));
     let stderr = String::from_utf8_lossy(&out.stderr);
     let spoken = stderr.matches("sbx's data directory is").count();
 
@@ -6222,7 +6187,7 @@ fn a_posture_nobody_configured_folds_and_one_a_layer_set_stays() {
     );
 
     // `--details` is the full picture: every posture back, none of them summarised away.
-    let out = fx.run(&["config", "show", "--app", "demo", "--details"]);
+    let out = fx.run_ok(&["config", "show", "--app", "demo", "--details"]);
     let detailed = String::from_utf8_lossy(&out.stdout);
     for field in [
         "proc:", "notify:", "gui:", "gpu:", "audio:", "dbus:", "limits:", "forward:", "seccomp:",
@@ -6243,7 +6208,7 @@ fn a_posture_nobody_configured_folds_and_one_a_layer_set_stays() {
     // print at its default forever, and only a test that pins the complete list would notice.
     let fx = Project::new("cfg");
     fx.write_profile("bare", "cmd = \"demo-agent\"\n");
-    let out = fx.run(&["config", "show", "--app", "bare"]);
+    let out = fx.run_ok(&["config", "show", "--app", "bare"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(
@@ -6336,7 +6301,7 @@ fn the_network_policy_is_listed_but_its_machinery_stays_behind_details() {
         "what was kept back is counted and named, with the flag that shows it:\n{stdout}"
     );
 
-    let out = fx.run(&["config", "show", "--app", "demo", "--details"]);
+    let out = fx.run_ok(&["config", "show", "--app", "demo", "--details"]);
     let detailed = String::from_utf8_lossy(&out.stdout);
     assert!(
         detailed.contains("noise.example.com")
@@ -6361,7 +6326,7 @@ fn config_edit_trusts_nothing_when_the_editor_never_ran() {
     fx.write_project("nixpkgs = \"nixos-23.11\"\n");
 
     // The state a cloned, never-reviewed project starts in.
-    let before = fx.run(&["trust", "--show", ".sbx.toml"]);
+    let before = fx.run_ok(&["trust", "--show", ".sbx.toml"]);
     assert!(
         String::from_utf8_lossy(&before.stdout).contains("untrusted")
             || String::from_utf8_lossy(&before.stderr).contains("untrusted"),
@@ -6390,7 +6355,7 @@ fn config_edit_trusts_nothing_when_the_editor_never_ran() {
     );
 
     // And the trust store agrees — the marker is what a later launch actually reads.
-    let after = fx.run(&["trust", "--show", ".sbx.toml"]);
+    let after = fx.run_ok(&["trust", "--show", ".sbx.toml"]);
     assert!(
         String::from_utf8_lossy(&after.stdout).contains("untrusted")
             || String::from_utf8_lossy(&after.stderr).contains("untrusted"),
@@ -6465,7 +6430,7 @@ fn bundle_rm_deletes_the_file_and_is_the_inverse_of_import() {
 
     // And the listing agrees, which is the half that would still pass if `rm` had written
     // somewhere else entirely.
-    let listed = p.run(&["bundle"]);
+    let listed = p.run_ok(&["bundle"]);
     let listed = String::from_utf8_lossy(&listed.stdout);
     assert!(!listed.contains("demo"), "still listed: {listed}");
 }
@@ -6905,6 +6870,7 @@ fn an_apps_fs_entry_that_cannot_be_applied_refuses_that_app_alone() {
 
     let other = fx.run(&["app", "run", "nope"]);
     let stderr = String::from_utf8_lossy(&other.stderr);
+    assert_eq!(other.status.code(), Some(2), "{stderr}");
     assert!(
         stderr.contains("no app named") && !stderr.contains("../up.key"),
         "another launch goes on past the configuration: {stderr}"
