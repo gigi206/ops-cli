@@ -6489,6 +6489,30 @@ fn config_edit_never_runs_the_file_it_opens() {
     );
 }
 
+/// A security field `config edit` leaves in an untrusted file is said to wait for trust, as `config
+/// set` says of one it writes; a file that only sets the free `env` table gets no such note.
+#[test]
+fn config_edit_says_a_security_field_it_leaves_waits_for_trust() {
+    for (body, noted) in [
+        ("[network]\\nmode = \"deny\"\\n", true),
+        ("[env]\\nX = \"1\"\\n", false),
+    ] {
+        let fx = Project::new("cfg");
+        let editor = fx.stage_editor(&format!("#!/bin/sh\nprintf '{body}' >> \"$1\"\n"));
+        let out = common::output_ok(
+            fx.cmd(&["config", "edit"])
+                .env_remove("VISUAL")
+                .env("EDITOR", editor),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.contains("holds security fields; they apply only once it is trusted"),
+            noted,
+            "{body}: {stderr}"
+        );
+    }
+}
+
 /// The program an editor command line names is looked up where a `PATH` search reads, never in the
 /// project through an empty `PATH` entry. That is an editor missing from the host (`code --wait`
 /// over ssh) with a stray `PATH="$PATH:"`, and a repository that ships a program of that name.
