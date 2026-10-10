@@ -1669,6 +1669,42 @@ fn net_pending_all_save_local_refuses_an_untrusted_project_before_draining() {
     );
 }
 
+/// A `--local` bulk save drains only this project's sessions, and which sessions run in it is read
+/// from the session registry. A registry that cannot be read refuses the drain, which cannot be
+/// taken back, rather than draining no session and reporting that this project had nothing parked.
+/// The same command against a registry not created yet drains nothing and succeeds, which ties the
+/// failure to the registry rather than to the data directory.
+///
+/// A `sessions` entry that is a plain file is the unreadable registry: reading it as a directory
+/// fails with an error that is not `NotFound`, the one failure the registry reads as no sessions.
+#[test]
+fn net_pending_all_save_local_refuses_an_unreadable_session_registry() {
+    let fx = Project::new("net");
+    let drain = ["net", "pending", "allow", "--all", "--save", "--local"];
+    let quiet = fx.run(&drain);
+    assert!(
+        quiet.status.success()
+            && String::from_utf8_lossy(&quiet.stdout)
+                .contains("no pending requests for this project"),
+        "no registry yet is no sessions, and nothing to drain: {quiet:?}"
+    );
+
+    let data = fx.data_home.path().join("sbx");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("sessions"), b"not a directory").unwrap();
+    let refused = fx.run(&drain);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("which sessions run in this project is not known"),
+        "{stderr}"
+    );
+    assert!(
+        !fx.proj.path().join(".sbx.toml").exists(),
+        "nothing was saved"
+    );
+}
+
 #[test]
 fn net_pending_all_save_global_drains_and_persists_each_host() {
     use std::io::{BufRead, BufReader, Write};
@@ -3320,6 +3356,76 @@ fn an_update_of_an_event_the_follow_never_printed_is_not_printed() {
         })
         .collect();
     assert_eq!(shape, [(2, false), (2, true)], "{}", lines.join("\n"));
+}
+
+/// `net logs --follow -a <app>` reads the session registry again on every round, to know which
+/// sessions run the app. A registry that can no longer be read ends the follow with a failure,
+/// rather than letting it go on as if the app's sessions had all ended. The opening listing is
+/// taken against a registry not created yet, which is no sessions, so it is the round that fails.
+#[test]
+fn a_follow_narrowed_to_an_app_ends_once_the_registry_cannot_be_read() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let fx = Project::new("net");
+    let mut follower = fx
+        .cmd(&["net", "logs", "--follow", "-a", "demo", "-i", "1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sbx net logs --follow");
+    // Lines arrive over a channel, so a deadline bounds the wait rather than a blocking read.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stderr = follower.stderr.take().expect("piped stderr");
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut said = String::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !said.contains("following egress") {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) => said.push_str(&format!("{line}\n")),
+            Err(_) => break,
+        }
+    }
+
+    let data = fx.data_home.path().join("sbx");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("sessions"), b"not a directory").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ended = loop {
+        if let Some(status) = follower.try_wait().expect("poll the follow") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _ = follower.kill();
+    let _ = follower.wait();
+    while let Ok(line) = rx.recv_timeout(Duration::from_secs(1)) {
+        said.push_str(&format!("{line}\n"));
+    }
+
+    assert!(
+        said.contains("following egress"),
+        "the follow started: {said}"
+    );
+    assert_eq!(
+        ended.and_then(|status| status.code()),
+        Some(1),
+        "the round that cannot read the registry ends the follow: {said}"
+    );
+    assert!(
+        said.contains("which sessions run app `demo` is not known"),
+        "{said}"
+    );
 }
 
 /// A stand-in session for a `sbx net logs --follow` run: its pid, its replies in order (`None`
