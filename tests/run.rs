@@ -122,6 +122,25 @@ fn sbx_in(project: &Path, data: &Path, state: &Path, args: &[&str]) -> Output {
         .expect("spawn sbx")
 }
 
+/// A launch on a path the untrusted capability probe did not take — a trusted posture, the
+/// packages it declares — run through [`common::probe`]: its output, or `None` once it failed on a
+/// download twice, which skips the test as unreachable. Any other failure fails the test with the
+/// launch's stderr, since the host has already run a cage.
+fn trusted_launch(what: &str, launch: impl FnMut() -> Output) -> Option<Output> {
+    match common::probe(launch) {
+        common::Probe::Ran(out) => Some(out),
+        common::Probe::Unreachable(why) => {
+            skip_unreachable!(
+                "skipping {what}: a trusted launch failed on a download, twice ({why})"
+            );
+            None
+        }
+        common::Probe::Incapable(why) => {
+            panic!("{what}: a trusted launch failed on a host that ran the untrusted probe: {why}")
+        }
+    }
+}
+
 #[test]
 fn run_detach_without_a_command_is_a_usage_error() {
     // `sbx run` with no command opens the project shell, which needs a terminal — so a detached
@@ -2874,24 +2893,15 @@ fn a_gui_isolated_cage_gets_a_dummy_interface_a_non_gui_one_does_not() {
     // Read only from a launch that ran: an empty listing from a failed one would read as a host
     // without the dummy. The launch degrades rather than fails where the dummy cannot be made, so a
     // failure here is the launch's own, past a download that failed twice.
-    let out = match common::probe(|| {
+    let Some(out) = trusted_launch("netns-dummy e2e", || {
         sbx_in(
             gui.path(),
             data.path(),
             state.path(),
             &["run", "--", "sh", "-c", "cat /proc/net/dev"],
         )
-    }) {
-        common::Probe::Ran(out) => out,
-        common::Probe::Unreachable(why) => {
-            skip_unreachable!(
-                "skipping netns-dummy e2e: the gui launch failed on a download, twice ({why})"
-            );
-            return;
-        }
-        common::Probe::Incapable(why) => {
-            panic!("the trusted gui launch failed on a host that ran the untrusted probe: {why}")
-        }
+    }) else {
+        return;
     };
     let ifaces = String::from_utf8_lossy(&out.stdout).into_owned();
     if !ifaces.contains("dummy0") {
@@ -2973,24 +2983,15 @@ fn a_gui_dummy_interface_opens_no_egress_the_allowlist_still_filters() {
     );
 
     // The holder path is active (dummy0 present); skip if the mechanism is unavailable here.
-    let ifaces = match common::probe(|| {
+    let Some(ifaces) = trusted_launch("dummy-egress e2e", || {
         sbx_in(
             project.path(),
             data.path(),
             state.path(),
             &["run", "--", "sh", "-c", "cat /proc/net/dev"],
         )
-    }) {
-        common::Probe::Ran(out) => out,
-        common::Probe::Unreachable(why) => {
-            skip_unreachable!(
-                "skipping dummy-egress e2e: the gui launch failed on a download, twice ({why})"
-            );
-            return;
-        }
-        common::Probe::Incapable(why) => {
-            panic!("the trusted gui launch failed on a host that ran the untrusted probe: {why}")
-        }
+    }) else {
+        return;
     };
     if !String::from_utf8_lossy(&ifaces.stdout).contains("dummy0") {
         skip_incapable!(
@@ -5107,25 +5108,15 @@ fn a_forward_bridges_a_host_loopback_port_into_the_cage() {
             "trust: {}",
             String::from_utf8_lossy(&trusted.stderr)
         );
-        match common::probe(|| {
+        trusted_launch("forward e2e", || {
             sbx_in(
                 proj,
                 data.path(),
                 state.path(),
                 &["run", "--", "socat", "-V"],
             )
-        }) {
-            common::Probe::Ran(_) => true,
-            common::Probe::Unreachable(why) => {
-                skip_unreachable!(
-                    "skipping forward e2e: the trusted launch failed on a download, twice ({why})"
-                );
-                false
-            }
-            common::Probe::Incapable(why) => {
-                panic!("a trusted launch failed on a host that ran the untrusted probe: {why}")
-            }
-        }
+        })
+        .is_some()
     };
 
     // Run the cage server in `proj` and wait for its witness. The server's stderr is kept beside
