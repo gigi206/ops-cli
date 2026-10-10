@@ -88,8 +88,8 @@ impl Project {
     /// the OS string it is.
     ///
     /// A fixture path starts at the fixture root, which comes from the environment and may hold
-    /// bytes outside UTF-8. A verb that takes a path accepts them; turning the path into a `&str`
-    /// for [`Project::run`] would fail the test before the verb ever saw it.
+    /// bytes outside UTF-8. Whether the verb accepts such a path is the test's question; turning it
+    /// into a `&str` for [`Project::run`] would fail the test before the verb ever saw it.
     pub fn run_with_path(&self, args: &[&str], path: &Path, rest: &[&str]) -> Output {
         self.cmd(args)
             .arg(path)
