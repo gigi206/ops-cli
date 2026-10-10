@@ -128,6 +128,47 @@ fn text(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
 }
 
+/// `sbx app show <app> --json`, parsed, from a run that succeeded.
+fn show_json(fx: &Project, app: &str) -> serde_json::Value {
+    let out = fx.run(&["app", "show", app, "--json"]);
+    assert!(
+        out.status.success(),
+        "sbx app show --json failed: {}",
+        text(&out)
+    );
+    common::json_of(&out)
+}
+
+/// The array at `key` in an `app show --json` document, failing with the whole document when there
+/// is none.
+fn array<'a>(v: &'a serde_json::Value, key: &str) -> &'a [serde_json::Value] {
+    v[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("no `{key}` array in {v}"))
+}
+
+/// The package `backend` names in an `app show --json` document, failing with the whole document
+/// when there is none.
+fn package<'a>(v: &'a serde_json::Value, backend: &str) -> &'a serde_json::Value {
+    array(v, "packages")
+        .iter()
+        .find(|p| p["backend"] == backend)
+        .unwrap_or_else(|| panic!("no {backend} package in {v}"))
+}
+
+/// Assert that an `app show --json` document reads the package `backend` names as installed, with
+/// `detail` in what it says about it, failing with the whole document.
+fn assert_installed(v: &serde_json::Value, backend: &str, detail: &str) {
+    let installed = &package(v, backend)["installed"];
+    assert!(
+        installed["state"] == "installed"
+            && installed["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains(detail)),
+        "the {backend} package should read installed, `{detail}`: {v}"
+    );
+}
+
 const DEB_URL: &str = "https://example.com/demo-app.deb";
 
 /// A profile mixing all three "installed" cases: a `mise:` tool (app-home-scoped), a `deb:` build
@@ -195,39 +236,15 @@ fn show_json_carries_each_packages_installed_state() {
     fx.pin_deb("bbbbbbbbbbbbbbbb", DEB_URL, "sha256-00112233abcdef");
     fx.build_nix("bbbbbbbbbbbbbbbb", "core");
 
-    let out = fx.run(&["app", "show", "demo-app", "--json"]);
-    assert!(
-        out.status.success(),
-        "sbx app show --json failed: {}",
-        text(&out)
-    );
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let v = show_json(&fx, "demo-app");
 
-    assert_eq!(v["name"], "demo-app");
-    let pkgs = v["packages"].as_array().expect("packages array");
-    let by_backend = |backend: &str| {
-        pkgs.iter()
-            .find(|p| p["backend"] == backend)
-            .unwrap_or_else(|| panic!("no {backend} package in {v}"))
-    };
-    assert_eq!(by_backend("mise")["installed"]["state"], "installed");
-    assert!(
-        by_backend("mise")["installed"]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("1.2.3")
-    );
-    assert_eq!(by_backend("deb")["installed"]["state"], "installed");
-    assert_eq!(by_backend("nix")["installed"]["state"], "installed");
-    assert!(
-        by_backend("nix")["installed"]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("built in 1 tree")
-    );
+    assert_eq!(v["name"], "demo-app", "{v}");
+    assert_installed(&v, "mise", "1.2.3");
+    assert_eq!(package(&v, "deb")["installed"]["state"], "installed", "{v}");
+    assert_installed(&v, "nix", "built in 1 tree");
     // The one installed tool is declared, so nothing is orphaned.
     assert!(
-        v["orphans"].as_array().expect("orphans array").is_empty(),
+        array(&v, "orphans").is_empty(),
         "a declared installed tool must not be an orphan: {v}"
     );
 }
@@ -256,21 +273,7 @@ fn show_detects_a_remote_flake_built_into_the_per_project_store() {
         "the flake must not read `not installed`:\n{s}"
     );
 
-    let out = fx.run(&["app", "show", "demo-app", "--json"]);
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
-    let flake = v["packages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["backend"] == "flake")
-        .expect("the flake package");
-    assert_eq!(flake["installed"]["state"], "installed");
-    assert!(
-        flake["installed"]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("tree")
-    );
+    assert_installed(&show_json(&fx, "demo-app"), "flake", "tree");
 }
 
 #[test]
@@ -299,22 +302,8 @@ fn show_detects_an_inline_flake_built_into_the_home() {
         "an inline flake's warm out-link should read `built <pname-version>`, not per-project:\n{s}"
     );
 
-    let out = fx.run(&["app", "show", "demo-app", "--json"]);
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
-    let flake = v["packages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["backend"] == "flake")
-        .expect("the inline flake package");
     // `installed`, not `per-project` — the decisive check that FlakeInline is read via its out-link.
-    assert_eq!(flake["installed"]["state"], "installed");
-    assert!(
-        flake["installed"]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("agent-2.0")
-    );
+    assert_installed(&show_json(&fx, "demo-app"), "flake", "agent-2.0");
 }
 
 #[test]
@@ -348,11 +337,10 @@ fn show_lists_installed_tools_no_declaration_accounts_for() {
     );
 
     // --json carries the orphan by the same `mise:`-prefixed name.
-    let out = fx.run(&["app", "show", "demo-app", "--json"]);
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
-    let orphans = v["orphans"].as_array().expect("orphans array");
+    let v = show_json(&fx, "demo-app");
+    let orphans = array(&v, "orphans");
     assert_eq!(orphans.len(), 1, "one orphan: {v}");
-    assert_eq!(orphans[0]["name"], "mise:npm:extra-thing");
+    assert_eq!(orphans[0]["name"], "mise:npm:extra-thing", "{v}");
 }
 
 #[test]
