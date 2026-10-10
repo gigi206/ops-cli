@@ -306,8 +306,8 @@ activate every security field in the file, including ones you have not read: a
 namespace, and with it the allowlist, the filtering proxy, and the egress log. The rule
 the writing verbs share is that sbx blesses the delta it wrote, never bytes you have not
 approved. The refusal lands before the write, so the file is left alone, and it names the
-two ways through: review it and run `sbx trust`, or use `sbx config edit --trust`, where
-the editor shows you the file first.
+two ways through: review it and run `sbx trust`, or use `sbx config edit --trust`, which
+shows you what trusting it grants first.
 
 A file you trusted and then hand-edited is refused for the same reason, and says so in its
 own words rather than claiming it is untrusted: the edit is exactly what `--trust` would
@@ -336,7 +336,7 @@ and for locating the global config).
 ## `sbx config edit`
 
 ```
-sbx config edit [-l|-g|-c <file>] [--trust]
+sbx config edit [-l|-g|-c <file>] [--trust [--yes]]
 ```
 
 Opens the target file in `$VISUAL` / `$EDITOR` (falling back to `vi`): the way to edit
@@ -357,15 +357,20 @@ and the rest of the tree is writable, but the agent still cannot alter what sbx 
 trusts.
 
 An edit that changes a trusted file re-arms its trust gate, and a launch stops until it
-is re-approved; `--trust` re-trusts as the editor closes. That is about a gated file.
-The global config is trusted by location, exactly as it is for the writing verbs above:
-it carries no marker, so there is none to re-arm and none to write, and `--trust` there
-answers that it is not needed rather than storing something nothing reads back.
+is re-approved. `--trust` re-approves it as the editor closes: sbx shows what the file
+grants, as [`sbx trust`](trust) does (the lines changed since it was last approved, or
+every line when nothing was), and asks you to confirm. Without a terminal it refuses
+unless `--yes` is given. What is trusted is the contents it showed, so a change made after
+that is not; a file that already matches its approval is re-recorded without a question.
+
+All of this is about a gated file. The global config is trusted by location, exactly as
+it is for the writing verbs above: it carries no marker, so there is none to re-arm and
+none to write, and `--trust` there answers that it is not needed rather than storing
+something nothing reads back.
 
 This is also the one verb whose `--trust` blesses a file that was never trusted, where
-`set`, `add`, `rm` and `unset` refuse. The difference is what you saw: the editor put the
-file in front of you, so what is blessed is what you read. It is the way through the
-other four verbs point at.
+`set`, `add`, `rm` and `unset` refuse. The difference is the review: what is blessed is
+what sbx showed you and you confirmed. It is the way through the other four verbs point at.
 
 Two limits worth knowing. Your editor runs on the host with your own privileges and the
 environment you invoked `sbx` with: it is not sandboxed, and this verb is not a
