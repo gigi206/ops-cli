@@ -451,6 +451,29 @@ pub fn json_of(out: &Output) -> serde_json::Value {
     }
 }
 
+/// Run `cmd` to completion, asserted to have succeeded.
+///
+/// An assertion on what a verb printed reads its output, not its exit status: a verb that prints the
+/// expected lines and then fails passes it, and an assertion that something is absent passes on any
+/// run that failed before printing it. A run the test expects to succeed goes through here, and a
+/// failure is located at the line that called this, with the arguments, the status and both
+/// streams.
+#[track_caller]
+pub fn output_ok(cmd: &mut Command) -> Output {
+    let out = cmd.output().expect("spawn sbx");
+    if !out.status.success() {
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
+        panic!(
+            "sbx {} failed ({}):\n{}{}",
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    out
+}
+
 /// Whether an attached shell has printed a prompt into `out` and is ready to be driven.
 ///
 /// The last character of a shell prompt is bash's `\$`, which it renders `#` when the euid is 0 and
