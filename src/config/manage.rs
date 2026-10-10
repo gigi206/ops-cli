@@ -2315,7 +2315,11 @@ fn write_doc(path: &Path, doc: &DocumentMut) -> Result<String, ManageError> {
 /// function exists to prevent for the config itself.
 ///
 /// `fresh_mode` is what a file that does not exist yet is given; an existing one keeps its own
-/// either way. The two callers want different answers and neither should inherit the other's:
+/// either way. With a `fresh_mode`, sbx is writing its own config, and a parent directory that does
+/// not exist yet is created owner-only, like every other directory sbx creates for itself
+/// (`Layout::ensure`, `config edit`, the profile, bundle and group imports): one left at the umask
+/// lists the names of an operator's apps and bundles to every other uid. An existing directory is
+/// left as it is. The two callers want different answers and neither should inherit the other's:
 /// sbx's config is `0600` so its own write always passes the safety gate that later refuses a
 /// world-writable config, while an exported fragment is an artifact meant to be handed to someone
 /// else, and the guide shows `sbx bundle export > bundles.toml` beside `--out`. `None` leaves the
@@ -2325,10 +2329,17 @@ pub(crate) fn write_text(
     text: &str,
     fresh_mode: Option<u32>,
 ) -> Result<(), ManageError> {
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     let err = |e: std::io::Error| ManageError::Write(path.to_path_buf(), e.to_string());
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir).map_err(err)?;
+    match fresh_mode {
+        Some(_) => std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir),
+        None => std::fs::create_dir_all(dir),
+    }
+    .map_err(err)?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
