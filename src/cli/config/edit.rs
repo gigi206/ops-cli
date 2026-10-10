@@ -643,7 +643,8 @@ fn render_resolution_layers(layers: &[config::manage::Layer], pal: &style::Palet
 /// read as one. Answered on the **bytes**, because `$EDITOR` is an `OsString` and a lossy conversion
 /// would let an undecodable byte arrive as `U+FFFD` and pass a check the real value fails.
 ///
-/// Empty is false: there is nothing to run, and the shell branch produces the clearer error.
+/// Empty is false. [`editor_from`] never hands an empty value over, and the shell branch refuses
+/// any value that contributes no word ([`editor_script`]).
 ///
 /// Admitting ASCII alone is also what lets the caller hand the lossy conversion of `$EDITOR` to the
 /// `PATH` search: no byte this predicate accepts changes under it. Widening the set to anything
@@ -656,10 +657,65 @@ fn runs_without_a_shell(editor: &std::ffi::OsStr) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'-'))
 }
 
+/// The editor `sbx config edit` runs: `$VISUAL`, else `$EDITOR`, else `vi`, each read through `var`.
+///
+/// A value that is empty or blank names no program, so it counts as unset and the next one is
+/// taken: `VISUAL=` beside an `$EDITOR` opens that editor, as the help says. A value that expands
+/// to nothing only once the shell reads it (`$UNSET`) cannot be seen from here, and is refused by
+/// [`editor_script`] instead.
+fn editor_from(var: impl Fn(&str) -> Option<OsString>) -> OsString {
+    ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(var)
+        .find(|value| !value.as_encoded_bytes().iter().all(u8::is_ascii_whitespace))
+        .unwrap_or_else(|| OsString::from("vi"))
+}
+
+/// What [`editor_script`] puts before the editor's command line. The file arrives as `$1`, is
+/// kept in a variable nothing may reassign, and is shifted away before the line is read.
+const EDITOR_PRELUDE: &str = r#"sbx_file=$1
+readonly sbx_file
+shift
+sbx_editor() {
+    while [ "$#" -gt 0 ]; do
+        sbx_name=${1%%=*}
+        [ "$sbx_name" != "$1" ] || break
+        case $sbx_name in
+            '' | [!A-Za-z_]* | *[!A-Za-z0-9_]*) break ;;
+        esac
+        export "$1"
+        shift
+    done
+    if [ "$#" -eq 0 ]; then
+        echo "sbx: config: the editor names no program" >&2
+        exit 127
+    fi
+    "$@" "$sbx_file"
+}
+"#;
+
+/// The `sh -c` script that runs the command line `editor` on the file sbx hands it as `$1`.
+///
+/// The command line is handed to a function, which appends the file itself: whatever the line
+/// expands to, the file is an argument of the editor and never the command. Spliced after the line
+/// as text (`<editor> "$@"`), a line that contributed no word made the file the command, and the
+/// config file sbx was asked to open ran as a program on the host. That was an empty or blank
+/// value, one that expands to nothing (`$UNSET`), one that ends in a separator (`vim;`, `vim &&`)
+/// and one that names the positional parameters (`"$@"`). Each now ends in the refusal (exit 127)
+/// or in a syntax error, before anything runs: `$1` is shifted away before the line is read, so
+/// `"$@"` expands to nothing.
+///
+/// A leading `NAME=value` word is an assignment for the editor, as the shell reads one in front of
+/// a command, so it is exported rather than run.
+fn editor_script(editor: &str) -> String {
+    format!("{EDITOR_PRELUDE}sbx_editor {editor}\n")
+}
+
 /// `sbx config edit`: open the target layer file in `$VISUAL`/`$EDITOR` (falling back to `vi`).
 /// The escape hatch for what `set` does not handle — arrays, secrets, and app tables. Runs through
 /// a shell so an editor carrying arguments (e.g. `code --wait`) works, with the path passed as a
-/// positional so it needs no quoting. Because the trust gate hashes the whole file, an edit that
+/// positional so it needs no quoting, and appended after the command line by [`editor_script`] so
+/// it is never the command. Because the trust gate hashes the whole file, an edit that
 /// changes a trusted file re-arms it — detected after the editor exits (the verdict becomes
 /// Changed) and warned, or applied at once with `--trust`.
 ///
@@ -761,9 +817,7 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
             .as_deref()
             .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
 
-    let editor_os = std::env::var_os("VISUAL")
-        .or_else(|| std::env::var_os("EDITOR"))
-        .unwrap_or_else(|| OsString::from("vi"));
+    let editor_os = editor_from(|key| std::env::var_os(key));
     let editor = editor_os.to_string_lossy();
     // `$EDITOR` is a command line, not always a program name: `code -w`, `emacsclient -nw` and
     // `vim -u NONE` are all ordinary values, and they need the shell that has always run them. A
@@ -811,7 +865,7 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
             };
             std::process::Command::new(shell)
                 .arg("-c")
-                .arg(format!("{editor} \"$@\""))
+                .arg(editor_script(&editor))
                 .arg("sh")
                 .arg(&path)
                 .status()
@@ -1079,6 +1133,129 @@ mod tests {
         let undecodable =
             std::os::unix::ffi::OsStrExt::from_bytes(&b"vi\xff"[..]) as &std::ffi::OsStr;
         assert!(!runs_without_a_shell(undecodable));
+    }
+
+    /// An empty or blank `$VISUAL` or `$EDITOR` names no program, so the next one is taken, and
+    /// `vi` when neither names one.
+    #[test]
+    fn an_editor_variable_that_names_no_program_counts_as_unset() {
+        let pick = |visual: Option<&str>, editor: Option<&str>| {
+            editor_from(|key| match key {
+                "VISUAL" => visual.map(OsString::from),
+                "EDITOR" => editor.map(OsString::from),
+                _ => None,
+            })
+        };
+        assert_eq!(pick(Some("code -w"), Some("nano")), "code -w");
+        assert_eq!(pick(Some(""), Some("nano")), "nano");
+        assert_eq!(pick(Some(" \t"), Some("nano")), "nano");
+        assert_eq!(pick(None, Some("nano")), "nano");
+        assert_eq!(pick(Some(""), Some("")), "vi");
+        assert_eq!(pick(None, Some("\n")), "vi");
+        assert_eq!(pick(None, None), "vi");
+    }
+
+    /// Run [`editor_script`] for the command line `editor` through the `sh` sbx runs it with, on
+    /// `file`, with `env` added and `$UNSET`/`$VAR` removed. The exit code, and what `sh` said.
+    fn run_editor_line(editor: &str, file: &Path, env: &[(&str, &Path)]) -> (Option<i32>, String) {
+        let shell = crate::pathfind::find_on_path("sh").expect("an `sh` on PATH");
+        let mut cmd = std::process::Command::new(shell);
+        cmd.arg("-c")
+            .arg(editor_script(editor))
+            .arg("sh")
+            .arg(file)
+            .env_remove("UNSET")
+            .env_remove("VAR");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().expect("spawn sh");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// Whatever the editor's command line expands to, the file `config edit` opens is never run as
+    /// the command. The file here is an executable script that leaves a marker when it runs.
+    ///
+    /// Each line below put the file in command position when it was spliced as `<editor> "$@"`: it
+    /// contributes no word (empty, blank, a variable that expands to nothing), ends in a separator,
+    /// or names the positional parameters the file arrived in.
+    #[test]
+    fn an_editor_line_never_runs_the_file_it_opens() {
+        let tmp = crate::testutil::TmpDir::new();
+        let file = tmp.join("config.toml");
+        let marker = tmp.join("marker");
+        // Written once, before any run: see `testutil::past_etxtbsy` for why a fresh executable
+        // is not run while another thread may be forking.
+        crate::testutil::write_script(&file, "echo ran > \"$SBX_TEST_MARKER\"");
+        for line in [
+            "", " ", "\t", "$UNSET", "true;", "true &&", "true |", "true\n", "\"$@\"", "$1",
+            "VAR=1",
+        ] {
+            let (code, stderr) = run_editor_line(line, &file, &[("SBX_TEST_MARKER", &marker)]);
+            assert!(
+                !marker.exists(),
+                "the editor line {line:?} ran the file it was to open (exit {code:?}): {stderr}"
+            );
+        }
+        // No word at all is refused by name, not left to whatever the shell does next.
+        let (code, stderr) = run_editor_line("$UNSET", &file, &[("SBX_TEST_MARKER", &marker)]);
+        assert_eq!(code, Some(127), "{stderr}");
+        assert!(stderr.contains("the editor names no program"), "{stderr}");
+    }
+
+    /// An ordinary command line still runs as the shell reads it, with the file as its last
+    /// argument: arguments and their quoting, a redirection, a trailing command, and an assignment
+    /// in front of the program, which reaches the program's environment.
+    #[test]
+    fn an_editor_line_gets_the_file_as_its_last_argument() {
+        let tmp = crate::testutil::TmpDir::new();
+        let file = tmp.join("config.toml");
+        std::fs::write(&file, "").unwrap();
+        let record = tmp.join("record.sh");
+        let args = tmp.join("args");
+        // Read by `sh` rather than run as a program, so no fresh executable is exec'd.
+        std::fs::write(
+            &record,
+            "printf '%s\\n' \"$@\" > \"$SBX_TEST_ARGS\"\nprintf '%s\\n' \"${VAR-unset}\" >> \"$SBX_TEST_ARGS\"\n",
+        )
+        .unwrap();
+        let record = crate::sandbox::shell_quote(record.to_str().expect("a fixture path is UTF-8"));
+        let file_line = file.to_str().expect("a fixture path is UTF-8");
+        for (line, expected) in [
+            (
+                format!("sh {record} --flag"),
+                format!("--flag\n{file_line}\nunset\n"),
+            ),
+            (
+                format!("sh {record} \"a b\""),
+                format!("a b\n{file_line}\nunset\n"),
+            ),
+            (
+                format!("sh {record} 2>/dev/null"),
+                format!("{file_line}\nunset\n"),
+            ),
+            (
+                format!("sh {record}; true"),
+                format!("{file_line}\nunset\n"),
+            ),
+            (format!("VAR=1 sh {record}"), format!("{file_line}\n1\n")),
+            (
+                format!("VAR=\"a b\" sh {record}"),
+                format!("{file_line}\na b\n"),
+            ),
+        ] {
+            let _ = std::fs::remove_file(&args);
+            let (code, stderr) = run_editor_line(&line, &file, &[("SBX_TEST_ARGS", &args)]);
+            assert_eq!(code, Some(0), "{line}: {stderr}");
+            assert_eq!(
+                std::fs::read_to_string(&args).unwrap_or_default(),
+                expected,
+                "{line}"
+            );
+        }
     }
 
     /// `sbx config set|add|rm|unset --trust` blesses the text it composed, never a second read of
