@@ -828,12 +828,18 @@ fn net_groups_lists_resolves_and_errors_on_unknown() {
         "the error names the miss and lists the defined groups:\n{stderr}"
     );
 
-    // JSON carries the resolved entries.
-    let out = fx.run_ok(&["net", "groups", "mcp", "--json"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    // JSON carries the resolved entries, under the group they belong to.
+    let v = common::json_of(&fx.run_ok(&["net", "groups", "mcp", "--json"]));
+    let group = &v["groups"][0];
+    let entries: Vec<&serde_json::Value> = group["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("an entries array: {v}"))
+        .iter()
+        .map(|e| &e["entry"])
+        .collect();
     assert!(
-        stdout.contains("\"name\":\"mcp\"") && stdout.contains("mcp.context7.com"),
-        "the JSON view carries the group and its entries:\n{stdout}"
+        group["name"] == "mcp" && entries.contains(&&serde_json::json!("{*} mcp.context7.com:443")),
+        "the JSON view carries the group and its entries:\n{v}"
     );
 }
 
@@ -1382,13 +1388,20 @@ fn a_catch_all_rule_carries_its_reach_from_the_config_to_the_listing() {
         "a rule that names its host stays unlabelled:\n{s}"
     );
 
-    // The same fact in the machine-readable view, where a reader is a script.
-    let json = fx.run(&["net", "rules", "--json"]);
-    let j = String::from_utf8_lossy(&json.stdout);
+    // The same fact in the machine-readable view, where a reader is a script. The flag is omitted
+    // where it is false, so a rule is flagged exactly when it carries `true`.
+    let v = common::json_of(&fx.run_ok(&["net", "rules", "--json"]));
+    let flagged: Vec<&serde_json::Value> = v["rules"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a rules array: {v}"))
+        .iter()
+        .filter(|r| r["catch_all"].as_bool() == Some(true))
+        .map(|r| &r["rule"])
+        .collect();
     assert_eq!(
-        j.matches("\"catch_all\":true").count() + j.matches("\"catch_all\": true").count(),
-        1,
-        "exactly the one catch-all rule is flagged in --json:\n{j}"
+        flagged,
+        ["re:"],
+        "exactly the catch-all rule is flagged in --json:\n{v}"
     );
 
     // And the tester qualifies a pass it decided: the URL is not what made it through.
