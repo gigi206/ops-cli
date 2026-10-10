@@ -132,9 +132,40 @@ fn candidates<'a>(
     untrusted: Option<&'a Path>,
 ) -> impl Iterator<Item = PathBuf> + 'a {
     let bare = !name.is_empty() && !name.contains('/') && name != "." && name != "..";
-    dirs.filter(move |dir| bare && dir.is_absolute())
+    searched_dirs(dirs, untrusted)
+        .filter(move |_| bare)
         .map(move |dir| dir.join(name))
         .filter(move |cand| !untrusted.is_some_and(|tree| in_project(tree, cand)))
+}
+
+/// The `PATH` entries a search reads, in order: the absolute ones outside `untrusted`. The rule
+/// [`candidates`] states, applied to the directories alone.
+fn searched_dirs<'a>(
+    dirs: impl Iterator<Item = PathBuf> + 'a,
+    untrusted: Option<&'a Path>,
+) -> impl Iterator<Item = PathBuf> + 'a {
+    dirs.filter(move |dir| dir.is_absolute() && !untrusted.is_some_and(|tree| lies_in(tree, dir)))
+}
+
+/// `$PATH` reduced to the entries [`find_on_path`] searches, for a shell that resolves a program
+/// itself: a shell's own search reads every entry, an empty one (the working directory, which is
+/// the project) included. Empty when `PATH` is unset or leaves no entry.
+///
+/// What it filters is that one lookup. A link in a searched directory that leads into the project
+/// is still followed, where [`find_on_path`] refuses it, since a shell resolves a name and not
+/// where it leads.
+pub(crate) fn searched_path() -> std::ffi::OsString {
+    let Some(path) = std::env::var_os("PATH") else {
+        return std::ffi::OsString::new();
+    };
+    searched_path_in(&path, untrusted_tree().as_deref())
+}
+
+/// Pure core of [`searched_path`], with the `PATH` value and the project handed in.
+fn searched_path_in(path: &std::ffi::OsStr, untrusted: Option<&Path>) -> std::ffi::OsString {
+    // An entry `split_paths` produced holds no separator, so this does not fail; an empty `PATH`
+    // would refuse the program rather than widen the search.
+    std::env::join_paths(searched_dirs(std::env::split_paths(path), untrusted)).unwrap_or_default()
 }
 
 /// Whether the candidate `cand` is the project's: its directory lies there, or it is a link whose
@@ -279,6 +310,32 @@ mod tests {
 
         // absent everywhere
         assert!(find_in_dirs("absent", dirs.into_iter(), None).is_none());
+    }
+
+    /// The `PATH` handed to a shell keeps the absolute entries outside the project, in order, and
+    /// drops an empty entry, a relative one, and one in the project.
+    #[test]
+    fn a_searched_path_keeps_only_what_a_search_reads() {
+        let tmp = TmpDir::new();
+        let root = tmp.path().canonicalize().unwrap();
+        let project = root.join("proj");
+        let system = root.join("usr/bin");
+        std::fs::create_dir_all(project.join(".venv/bin")).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        let path = std::env::join_paths([
+            system.clone(),
+            PathBuf::new(),
+            PathBuf::from("bin"),
+            project.join(".venv/bin"),
+            PathBuf::from("/opt/tools"),
+        ])
+        .unwrap();
+        let kept = searched_path_in(&path, Some(&project));
+        assert_eq!(
+            std::env::split_paths(&kept).collect::<Vec<_>>(),
+            vec![system, PathBuf::from("/opt/tools")]
+        );
+        assert_eq!(searched_path_in(std::ffi::OsStr::new(":bin"), None), "");
     }
 
     #[test]

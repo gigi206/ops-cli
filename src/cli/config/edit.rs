@@ -671,11 +671,13 @@ fn editor_from(var: impl Fn(&str) -> Option<OsString>) -> OsString {
         .unwrap_or_else(|| OsString::from("vi"))
 }
 
-/// What [`editor_script`] puts before the editor's command line. The file arrives as `$1`, is
-/// kept in a variable nothing may reassign, and is shifted away before the line is read.
+/// What [`editor_script`] puts before the editor's command line. The file arrives as `$1` and the
+/// `PATH` its program is looked up in as `$2`. Both are kept in variables nothing may reassign, and
+/// shifted away before the line is read.
 const EDITOR_PRELUDE: &str = r#"sbx_file=$1
-readonly sbx_file
-shift
+sbx_search=$2
+readonly sbx_file sbx_search
+shift 2
 sbx_editor() {
     while [ "$#" -gt 0 ]; do
         sbx_name=${1%%=*}
@@ -690,6 +692,17 @@ sbx_editor() {
         echo "sbx: config: the editor names no program" >&2
         exit 127
     fi
+    case $1 in
+        */*) ;;
+        *)
+            if ! sbx_program=$(PATH=$sbx_search; command -v "$1"); then
+                echo "sbx: config: the editor \`$1\` is not on PATH (an entry that is relative or in the project is not searched)" >&2
+                exit 127
+            fi
+            shift
+            set -- "$sbx_program" "$@"
+            ;;
+    esac
     "$@" "$sbx_file"
 }
 "#;
@@ -708,6 +721,14 @@ sbx_editor() {
 ///
 /// A leading `NAME=value` word is an assignment for the editor, as the shell reads one in front of
 /// a command, so it is exported rather than run.
+///
+/// The program the line names is looked up in `$2`, the `PATH` [`crate::pathfind::searched_path`]
+/// hands over: the absolute entries outside the project, the ones the direct branch searches. The
+/// shell's own search reads every entry, so with a stray empty one (`PATH="$PATH:"`) an editor
+/// missing from the host (`code --wait` over ssh) was found in the project, which the cage writes,
+/// and run. A first word holding a `/` is a path the user wrote and is taken as it stands. The
+/// editor still inherits the environment whole, so what it runs in turn, `env` or `nohup` included,
+/// is looked up in that, as everything an editor spawns is.
 ///
 /// The line goes in as the bytes it is. `$EDITOR` is an `OsString`, and its lossy conversion would
 /// hand `sh` a `U+FFFD` where the value held a byte no encoding renders, so `sh` would run a program
@@ -877,6 +898,7 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
                 .arg(editor_script(&editor_os))
                 .arg("sh")
                 .arg(&path)
+                .arg(crate::pathfind::searched_path())
                 .status()
         }
     };
@@ -1190,12 +1212,73 @@ mod tests {
             .arg(editor_script(editor))
             .arg("sh")
             .arg(file)
+            .arg(crate::pathfind::searched_path())
             .env_remove("UNSET")
             .env_remove("VAR");
         for (key, value) in env {
             cmd.env(key, value);
         }
         cmd.output().expect("spawn sh")
+    }
+
+    /// The program an editor line names is looked up only where a search reads, whatever the
+    /// shell's own `PATH` holds. Here that `PATH` ends in an empty entry, the working directory is a
+    /// project shipping an executable named like an editor the host does not have, and the line
+    /// passes that name an argument, so it goes through the shell.
+    #[test]
+    fn an_editor_program_is_looked_up_only_where_a_search_reads() {
+        let project = crate::testutil::TmpDir::new();
+        let file = project.join("config.toml");
+        std::fs::write(&file, "").unwrap();
+        let marker = project.join("marker");
+        crate::testutil::write_script(
+            &project.join("sbx-editor-probe"),
+            "echo ran > \"$SBX_TEST_MARKER\"",
+        );
+        let shell = crate::pathfind::find_on_path("sh").expect("an `sh` on PATH");
+        let mut stray = std::env::var_os("PATH").unwrap_or_default();
+        stray.push(":");
+        let run = |line: &str| {
+            std::process::Command::new(&shell)
+                .arg("-c")
+                .arg(editor_script(std::ffi::OsStr::new(line)))
+                .arg("sh")
+                .arg(&file)
+                .arg(crate::pathfind::searched_path())
+                .current_dir(project.path())
+                .env("PATH", &stray)
+                .env("SBX_TEST_MARKER", &marker)
+                .output()
+                .expect("spawn sh")
+        };
+
+        let out = run("sbx-editor-probe --wait");
+        assert!(!marker.exists(), "the project's program ran: {out:?}");
+        assert_eq!(out.status.code(), Some(127), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("is not on PATH"),
+            "{out:?}"
+        );
+
+        // A program on an absolute entry is found, a builtin stays itself, and a first word holding
+        // a `/` is taken as written; each still gets the file as its last argument.
+        let file_line = file.to_str().expect("a fixture path is UTF-8");
+        for line in [
+            "env printf %s:",
+            "exec printf %s:",
+            "/usr/bin/env printf %s:",
+        ] {
+            let out = run(line);
+            assert_eq!(
+                (
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout).into_owned()
+                ),
+                (Some(0), format!("{file_line}:")),
+                "{line}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     /// The editor's command line reaches `sh` as the bytes it holds, a byte no encoding renders
