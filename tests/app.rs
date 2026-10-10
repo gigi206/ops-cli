@@ -1797,19 +1797,25 @@ fn app_export_does_not_write_through_a_symlink_at_its_destination() {
 
     let out = fx.run_with_path(&["app", "export", "demo-app", "--out"], &out_path, &[]);
     assert!(
-        std::fs::read_to_string(&victim).unwrap() == "original\n",
-        "the link's target was written through: {}",
-        text(&out)
-    );
-
-    // Witness: an ordinary destination still receives the profile, and it reads back as one.
-    let plain = fx.proj.path().join("plain.toml");
-    let out = fx.run_with_path(&["app", "export", "demo-app", "--out"], &plain, &[]);
-    assert!(
         out.status.success(),
         "sbx app export failed: {}",
         text(&out)
     );
-    let written = std::fs::read_to_string(&plain).unwrap();
+    assert!(
+        std::fs::read_to_string(&victim).unwrap() == "original\n",
+        "the link's target was written through: {}",
+        text(&out)
+    );
+    // The rename replaced the link itself: the profile now sits at the path that was named, as a
+    // file of its own. An export that wrote nowhere would leave the link standing.
+    assert!(
+        std::fs::symlink_metadata(&out_path)
+            .unwrap()
+            .file_type()
+            .is_file(),
+        "the link at the destination is still there: {}",
+        text(&out)
+    );
+    let written = std::fs::read_to_string(&out_path).unwrap();
     assert!(written.contains("cmd = \"demo\""), "{written}");
 }
