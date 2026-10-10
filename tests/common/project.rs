@@ -84,6 +84,14 @@ impl Project {
         self.cmd(args).output().expect("spawn sbx")
     }
 
+    /// Run `sbx <args>` from the project directory to completion, asserted to have succeeded: an
+    /// assertion on what the verb printed then reads the output of a run that did what it was asked.
+    /// See [`super::output_ok`].
+    #[track_caller]
+    pub fn run_ok(&self, args: &[&str]) -> Output {
+        super::output_ok(&mut self.cmd(args))
+    }
+
     /// Run `sbx <args> <path> <rest>` from the project directory to completion, `path` passed as
     /// the OS string it is.
     ///
