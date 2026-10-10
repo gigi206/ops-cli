@@ -149,7 +149,11 @@ fn pins_clear_of_masks(
 
 /// Establish the mountpoint-chain pins that protect sbx's control plane: create each pin's host
 /// path (they are sbx's own directories — creating a not-yet-existent root here is what stops the
-/// agent pre-creating it unpinned) and turn it into the extra bind that freezes it. On the first
+/// agent pre-creating it unpinned) and turn it into the extra bind that freezes it. A path created
+/// here is owner-only, as every other directory sbx creates for itself and as the XDG
+/// base-directory specification asks of a missing base directory: at the umask, a global config
+/// directory first made by a launch lists the names of an operator's apps and bundles to every
+/// other uid. An existing directory is left as it is. On the first
 /// path that cannot be created, return the error so the caller can fail the launch closed: a pin
 /// that cannot be established would leave the containing read-write bind unprotected.
 ///
@@ -169,13 +173,17 @@ fn establish_control_plane_pins(
     sources: &[crate::config::Bind],
     decoy: Option<&Path>,
 ) -> io::Result<Vec<binds::ExtraBind>> {
+    use std::os::unix::fs::DirBuilderExt as _;
     let mut closed: Vec<&Path> = Vec::new();
     let mut laid = Vec::new();
     for pin in pins {
         if closed.iter().any(|root| pin.path.starts_with(root)) {
             continue;
         }
-        std::fs::create_dir_all(&pin.path)
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&pin.path)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", pin.path.display())))?;
         let src = if pin_shows_itself(pin, sources) {
             pin.path.clone()
