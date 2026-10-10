@@ -224,15 +224,12 @@ impl Release {
             .env("HOME", self.home())
             .env(
                 "SBX_DOWNLOAD_BASE",
-                format!("file://{}", self.root.join("download").display()),
+                common::file_url(&self.root.join("download")),
             )
-            .env(
-                "SBX_RELEASES_API",
-                format!("file://{}", self.root.join("api").display()),
-            )
+            .env("SBX_RELEASES_API", common::file_url(&self.root.join("api")))
             .env(
                 "SBX_SOURCE_BASE",
-                format!("file://{}", self.root.join("source").display()),
+                common::file_url(&self.root.join("source")),
             )
             .current_dir(self.root.path())
             .stdin(Stdio::piped())
