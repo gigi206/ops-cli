@@ -987,8 +987,25 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
                 path.display()
             ));
         }
+    } else if holds_security_fields(&path) {
+        // The note `set` gives a security field it writes to an untrusted file, for the state the
+        // editor leaves: fields that apply only once the file is trusted.
+        diag::note(&format!(
+            "{} holds security fields; they apply only once it is trusted (`sbx trust`)",
+            path.display()
+        ));
     }
     ExitCode::SUCCESS
+}
+
+/// Whether the config at `path` holds a field outside the free `env` table, one that applies only
+/// once the file is trusted ([`is_security_key`]). A file that cannot be read or parsed holds none
+/// worth this note: the loader says what it makes of it.
+fn holds_security_fields(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .is_some_and(|table| table.keys().any(|key| is_security_key(key)))
 }
 
 /// Report the trust consequence of a write, the load-bearing UX of `set`/`unset`: the whole-file
