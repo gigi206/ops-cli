@@ -570,11 +570,18 @@ fn tail_lines(body: &[u8], n: usize) -> &[u8] {
 /// incarnation. The pid is the whole of what the user types and of what names the log file the two
 /// sessions already share, so what would separate them is an id carrying the incarnation: a change
 /// to the surface rather than to this function.
-fn session_is_live(data_dir: &Path, id: u32) -> bool {
-    session::Registry::at(data_dir)
-        .live()
-        .map(|sessions| sessions.iter().any(|s| s.pid == id))
-        .unwrap_or(false)
+///
+/// `Err` is the line to print when the registry cannot be read. Whether the session runs is then
+/// not known, and is not answered as "exited": that ended a `--follow` at exit 0 with "nothing
+/// further will be written" about a session that may still be writing.
+fn session_is_live(data_dir: &Path, id: u32) -> Result<bool, String> {
+    crate::asked_sessions(data_dir).map(|sessions| sessions.iter().any(|s| s.pid == id))
+}
+
+/// The refusal of a follow whose session cannot be told running or exited: following on would wait
+/// for an end it could not see, and stopping quietly would say the session had ended.
+fn not_followed(id: u32, why: &str) -> String {
+    format!("sbx: {why} — whether session {id} still runs is not known, so its log is not followed")
 }
 
 /// `sbx session logs <id> [-f] [-n <N>] [--all]`: show a detached session's output.
@@ -686,10 +693,22 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
         .as_ref()
         .or_else(|| fallback.as_ref().and_then(|(h, _)| h.as_ref()));
 
+    // A registry that cannot be read leaves the state unknown. Without `--follow` that only labels
+    // the note, so it is said as a warning; a follow is refused over it below, and says so there.
+    if let (Err(why), false) = (&live, parsed.follow) {
+        diag::warn(&format!(
+            "{why} — whether session {} still runs is not known",
+            parsed.id
+        ));
+    }
     diag::note(&format!(
         "session {} — {}, started {}{}",
         parsed.id,
-        if live { "running" } else { "exited" },
+        match &live {
+            Ok(true) => "running",
+            Ok(false) => "exited",
+            Err(_) => "state unknown",
+        },
         // `checked_add`, and it is the untrusted-input form rather than a nicety: `h.started` is a
         // bare `u64` taken off a line of the session log, and that log holds the caged agent's own
         // stdout (`parse_session_header` scans every line, and its doc already concedes an agent can
@@ -740,13 +759,20 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
     if !parsed.follow {
         return ExitCode::SUCCESS;
     }
-    if !live {
-        // Nothing will ever be appended to a dead session's log, so following it would hang for
-        // no reason. Say so and exit rather than leaving the user waiting on a silent terminal.
-        diag::hint("       session has exited — nothing further will be written.");
-        return ExitCode::SUCCESS;
+    match live {
+        Ok(true) => follow_log(&path, end, data_dir, parsed.id),
+        Ok(false) => {
+            // Nothing will ever be appended to a dead session's log, so following it would hang
+            // for no reason. Say so and exit rather than leaving the user waiting on a silent
+            // terminal.
+            diag::hint("       session has exited — nothing further will be written.");
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            diag::error(&not_followed(parsed.id, &why));
+            ExitCode::FAILURE
+        }
     }
-    follow_log(&path, end, data_dir, parsed.id)
 }
 
 /// Explain an absent log, distinguishing the two reasons it can be missing.
@@ -798,6 +824,10 @@ fn explain_missing_log(data_dir: &Path, id: u32, path: &Path) -> ExitCode {
 /// walked away (`sbx session logs <id> -f | head`) is announced only by the write error, and
 /// discarding it left this loop opening the log, reading it and failing to write it every 250 ms
 /// until the detached session exited — with the user's shell held on the pipeline the whole time.
+///
+/// A registry that can no longer be read ends the follow at exit 1, after the drain that sample
+/// precedes: what the session wrote up to then is printed, and the follow does not go on waiting
+/// for an end it cannot see.
 fn follow_log(path: &Path, mut pos: u64, data_dir: &Path, id: u32) -> ExitCode {
     let mut out = std::io::stdout();
     loop {
@@ -805,8 +835,13 @@ fn follow_log(path: &Path, mut pos: u64, data_dir: &Path, id: u32) -> ExitCode {
         if drain_log(path, &mut pos, &mut out).is_err() {
             return ExitCode::SUCCESS;
         }
-        if !live {
-            return ExitCode::SUCCESS;
+        match live {
+            Ok(true) => {}
+            Ok(false) => return ExitCode::SUCCESS,
+            Err(why) => {
+                diag::error(&not_followed(id, &why));
+                return ExitCode::FAILURE;
+            }
         }
         std::thread::sleep(FOLLOW_POLL);
     }
@@ -1074,6 +1109,44 @@ mod tests {
         assert!(parse_logs_args(&v(&["12", "-n"])).is_err());
         assert!(parse_logs_args(&v(&["12", "-n", "many"])).is_err());
         assert!(parse_logs_args(&v(&["12", "--nope"])).is_err());
+    }
+
+    /// A follow reads the registry again before each drain. Once the registry cannot be read,
+    /// whether the session still runs is not known, and the follow ends at exit 1 rather than going
+    /// on as if the session ran or stopping as if it had exited.
+    ///
+    /// The session is this process, registered as alive, so the follow runs until the registry is
+    /// replaced by a plain file, which reading as a directory refuses with an error other than
+    /// `NotFound`.
+    #[test]
+    fn a_follow_ends_with_a_failure_once_the_registry_cannot_be_read() {
+        use crate::session::{Kind, Registry, Session, SessionRuntime};
+        let data = crate::testutil::TmpDir::new();
+        let me = Session::current(
+            std::path::PathBuf::from("/home/u/proj"),
+            Kind::Run,
+            SessionRuntime::GlobalApp("demo".to_string()),
+        )
+        .expect("read this process's session identity");
+        Registry::at(data.path())
+            .register(&me)
+            .expect("register the session");
+        let log = data.join("empty.log");
+        std::fs::write(&log, b"").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (dir, pid) = (data.path().to_path_buf(), me.pid);
+        std::thread::spawn(move || {
+            let _ = tx.send(follow_log(&log, 0, &dir, pid));
+        });
+        assert!(
+            rx.recv_timeout(FOLLOW_POLL * 4).is_err(),
+            "a session the registry holds as running is followed"
+        );
+        std::fs::remove_dir_all(data.join("sessions")).unwrap();
+        std::fs::write(data.join("sessions"), b"not a directory").unwrap();
+        let ended = rx.recv_timeout(Duration::from_secs(10));
+        assert!(ended == Ok(ExitCode::FAILURE), "{ended:?}");
     }
 
     /// A stdout stand-in that refuses every write, the way a pipe whose reader has exited does.
