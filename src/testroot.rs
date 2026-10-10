@@ -146,6 +146,30 @@ fn force_remove(path: &std::path::Path) {
     force_remove_within(path, REMOVE_DEPTH);
 }
 
+/// Create the fixture directory `d` empty, taking out whatever a leftover of the same name holds.
+///
+/// A fixture is named after the pid of the run that made it, and the sweep spares every live
+/// pid's fixtures, this run's included. A run killed without its cleanup leaves its directories
+/// behind, and a later run handed the same pid would otherwise adopt one with whatever it still
+/// holds. A directory found under this run's own name is such a leftover — every live one of that
+/// name is this run's — and is removed before the fixture is made afresh.
+///
+/// Allowed to go unused: a suite that includes this text for the root alone makes no fixture of
+/// its own.
+#[allow(dead_code)]
+fn create_afresh(d: &std::path::Path) {
+    if let Err(e) = std::fs::create_dir(d) {
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "the fixture {}: {e}",
+            d.display()
+        );
+        force_remove(d);
+        std::fs::create_dir(d).unwrap_or_else(|e| panic!("the fixture {}: {e}", d.display()));
+    }
+}
+
 /// [`force_remove`], descending at most `depth` more levels.
 fn force_remove_within(path: &std::path::Path, depth: u32) {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

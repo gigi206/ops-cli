@@ -148,20 +148,6 @@ impl TmpDir {
     }
 }
 
-/// Create `d` empty, taking out whatever a leftover of the same name holds ([`TmpDir::new`]).
-fn create_afresh(d: &Path) {
-    if let Err(e) = std::fs::create_dir(d) {
-        assert_eq!(
-            e.kind(),
-            std::io::ErrorKind::AlreadyExists,
-            "the fixture {}: {e}",
-            d.display()
-        );
-        force_remove(d);
-        std::fs::create_dir(d).unwrap_or_else(|e| panic!("the fixture {}: {e}", d.display()));
-    }
-}
-
 impl Drop for TmpDir {
     fn drop(&mut self) {
         force_remove(&self.0);
