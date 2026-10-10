@@ -560,22 +560,35 @@ fn a_cage_environment_value_is_never_substituted_from_the_host() {
     // reported rather than left to look like coverage.
     let project = TmpDir::prefixed("r", "nosub-proj");
     let data = TmpDir::prefixed("r", "nosub-data");
-    let scoped = std::process::Command::new("systemd-run")
-        .arg("--version")
-        .output()
-        .is_ok()
-        && std::env::var_os("XDG_RUNTIME_DIR")
-            .map(|dir| std::path::Path::new(&dir).join("bus").exists())
-            .unwrap_or(false);
-    if !scoped {
-        eprintln!("note: no systemd user scope on this host — the assertions below hold vacuously");
-    }
 
     // capability probe
     probe_or_skip!(
         "substitution e2e",
         run_in(project.path(), data.path(), &["true"])
     );
+
+    // Whether a launch takes the scope path is the launcher's own decision (`cgroup::limiter`),
+    // which `sbx doctor` reports on its resource-limits line after running a live scope, in the
+    // environment these launches inherit. A copy of that decision here would drift from it, as a
+    // check for the session bus did: the user manager is reached through `systemd/private`.
+    let doctor = sbx()
+        .arg("doctor")
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn sbx doctor");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(
+        said.contains("resource limits"),
+        "sbx doctor must report on resource limits: {said}"
+    );
+    if !said.contains("cage capped via a systemd scope") {
+        eprintln!("note: no systemd user scope on this host — the assertions below hold vacuously");
+    }
 
     // The value is read back from inside the cage; the host carries a variable of the same name so
     // a substitution would be visible rather than silently empty.
