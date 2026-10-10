@@ -88,10 +88,7 @@ fn net_rules_json_emits_the_mode_and_tagged_rules() {
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
-    let out = fx.run(&["net", "rules", "--source", "config", "--json"]);
-    assert!(out.status.success());
-    let json: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("net rules --json emits valid JSON");
+    let json = common::json_of(&fx.run_ok(&["net", "rules", "--source", "config", "--json"]));
     assert_eq!(json["mode"], "deny");
     assert_eq!(json["rules"][0]["rule"], "https://github.com");
     assert_eq!(json["rules"][0]["kind"], "Allow");
@@ -186,9 +183,7 @@ fn net_rules_source_session_is_accepted_and_empty_without_live_sessions() {
     assert!(stdout.contains("no rules declared"), "{stdout}");
 
     // `--json` is a clean empty list tagged `session`.
-    let json = fx.run(&["net", "rules", "--source", "session", "--json"]);
-    assert!(json.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let v = common::json_of(&fx.run_ok(&["net", "rules", "--source", "session", "--json"]));
     assert_eq!(v["mode"], "session");
     assert_eq!(v["rules"].as_array().map(|a| a.len()), Some(0));
 
@@ -1525,10 +1520,7 @@ fn net_pending_lists_nothing_when_no_session_is_parked() {
     );
 
     // `--json` is a clean empty list — the contract a front-end relies on.
-    let json = fx.run(&["net", "pending", "--json"]);
-    assert!(json.status.success());
-    let v: serde_json::Value =
-        serde_json::from_slice(&json.stdout).expect("net pending --json is valid JSON");
+    let v = common::json_of(&fx.run_ok(&["net", "pending", "--json"]));
     assert_eq!(v["pending"].as_array().map(|a| a.len()), Some(0));
 }
 
@@ -2127,8 +2119,7 @@ fn net_stats_aggregates_a_projects_sessions_and_filters_by_app() {
     );
 
     // `--json` carries exact counts: cache.nixos.org allow = 10 + 5 = 15.
-    let out = fx.run(&["net", "stats", "--json"]);
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let v = common::json_of(&fx.run_ok(&["net", "stats", "--json"]));
     let cache = v["stats"]
         .as_array()
         .unwrap()
@@ -2146,8 +2137,7 @@ fn net_stats_aggregates_a_projects_sessions_and_filters_by_app() {
     assert_eq!(evil["blocked"], 1);
 
     // `--app demo`: only the tagged session (allow 5), the untagged session's evil.test is gone.
-    let out = fx.run(&["net", "stats", "--app", "demo", "--json"]);
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let v = common::json_of(&fx.run_ok(&["net", "stats", "--app", "demo", "--json"]));
     let rows = v["stats"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "only the app session's host: {rows:?}");
     assert_eq!(rows[0]["host"], "cache.nixos.org");
@@ -2496,9 +2486,9 @@ fn net_pending_list_collapses_identical_retries_in_text_and_json() {
     assert!(t.contains("logs.test:443/api"), "{t}");
 
     // JSON: grouped the same way — one object per destination, dl.test carrying count=2.
-    let json = fx.run(&["net", "pending", "--json"]);
+    let json = fx.run_ok(&["net", "pending", "--json"]);
     server.join().unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let v = common::json_of(&json);
     let arr = v["pending"].as_array().unwrap();
     assert_eq!(arr.len(), 2, "two destinations, not three connections: {v}");
     let dl = arr.iter().find(|r| r["host"] == "dl.test").unwrap();
@@ -2745,9 +2735,7 @@ fn net_rules_targets_an_app_effective_policy() {
     );
 
     // `--json` + `--app`: the effective rules as JSON (the {mode, rules} contract is unchanged).
-    let json = fx.run(&["net", "rules", "--app", "demo", "--json"]);
-    let v: serde_json::Value =
-        serde_json::from_slice(&json.stdout).expect("net rules --app --json emits valid JSON");
+    let v = common::json_of(&fx.run_ok(&["net", "rules", "--app", "demo", "--json"]));
     assert_eq!(v["mode"], "deny");
     assert!(
         v["rules"]
