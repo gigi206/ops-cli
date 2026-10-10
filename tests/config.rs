@@ -100,13 +100,7 @@ fn config_json_is_a_valid_document_carrying_the_resolved_model() {
     let fx = Project::new("cfg");
     fx.write_project("[env]\nFOO = \"bar\"\n\n[packages]\njq = \"nix:jq\"\n");
 
-    let out = fx.run(&["config", "show", "--json"]);
-    assert!(
-        out.status.success(),
-        "`sbx config show --json` should exit 0"
-    );
-    let doc: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("config --json must emit valid JSON");
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--json"]));
 
     assert_eq!(doc["env"][0]["key"], "FOO");
     assert_eq!(doc["env"][0]["value"], "bar");
@@ -241,8 +235,7 @@ F10 = "F10RLO"
     }
 
     // The machine document is not a terminal: it keeps the bytes the config holds.
-    let out = fx.run(&["config", "show", "--json"]);
-    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--json"]));
     assert_eq!(doc["env"][0]["value"], "F08\u{202e}X");
 }
 
@@ -963,8 +956,7 @@ fn a_read_write_bind_is_honored_and_marked() {
         "a writable bind must be marked (rw):\n{stdout}"
     );
 
-    let json = fx.run(&["config", "show", "--json"]);
-    let doc: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--json"]));
     assert_eq!(doc["binds"][0]["writable"], true);
 }
 
@@ -986,17 +978,10 @@ fn a_bind_path_expands_a_leading_home_variable() {
          { path = \"$NOPE/x\" }]\n",
     );
 
-    let out = fx
-        .cmd(&["config", "show", "--json"])
-        .env("HOME", home.path())
-        .output()
-        .expect("spawn sbx");
-    assert!(
-        out.status.success(),
-        "config must succeed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let doc = common::json_of(&common::output_ok(
+        fx.cmd(&["config", "show", "--json"])
+            .env("HOME", home.path()),
+    ));
     let binds = doc["binds"].as_array().expect("binds array");
 
     let home_canon = home.path().canonicalize().unwrap();
@@ -1079,9 +1064,7 @@ fn a_bind_declared_in_both_layers_is_deduplicated_and_the_project_mode_wins() {
     ));
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
-    let json = fx.run(&["config", "show", "--json"]);
-    assert!(json.status.success());
-    let doc: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--json"]));
     let binds = doc["binds"].as_array().expect("binds array");
     assert_eq!(
         binds.len(),
@@ -1118,8 +1101,7 @@ fn a_read_write_bind_over_sbx_own_config_dir_is_forced_read_only() {
         "a rw bind over sbx's control plane must warn:\n{stderr}"
     );
 
-    let json = fx.run(&["config", "show", "--json"]);
-    let doc: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--json"]));
     let binds = doc["binds"].as_array().expect("binds array");
     assert_eq!(
         binds.len(),
@@ -2632,13 +2614,7 @@ fn config_show_app_shows_the_effective_config_with_inheritance() {
     );
 
     // `--json` emits the machine-readable model, carrying the per-field provenance.
-    let out = fx.run(&["config", "show", "--app", "demo", "--json"]);
-    assert!(
-        out.status.success(),
-        "config show --app --json must succeed"
-    );
-    let doc: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("--app --json must emit valid JSON");
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--app", "demo", "--json"]));
     assert_eq!(doc["name"], "demo");
     assert_eq!(
         doc["cmd_origin"], "Global",
@@ -2707,11 +2683,7 @@ fn an_apps_channel_is_the_working_directorys_channel_and_the_view_names_it() {
     // checks: those run without a pin, where the directory's channel and any directory-independent
     // one coincide, so they can only pin the document's *shape*. Only a fixture that carries a pin
     // can tell a channel read from the working directory from one read anywhere else.
-    let doc: serde_json::Value = serde_json::from_slice(
-        &fx.run(&["config", "show", "--app", "demo", "--json"])
-            .stdout,
-    )
-    .expect("--app --json must emit valid JSON");
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--app", "demo", "--json"]));
     assert_eq!(doc["nixpkgs"]["source"], "nixos-24.11");
     assert_eq!(doc["nixpkgs"]["origin"], "project pin");
     let doc = serde_json::from_slice::<serde_json::Value>(
@@ -2807,8 +2779,7 @@ fn config_show_app_with_a_narrowed_network_drops_the_inherited_secret() {
     );
 
     // The JSON model agrees: no credential survives.
-    let out = fx.run(&["config", "show", "--app", "narrow", "--json"]);
-    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--app", "narrow", "--json"]));
     assert_eq!(doc["secrets"].as_array().unwrap().len(), 0);
     assert_eq!(doc["secrets_inherited"], 0);
 }
@@ -3398,8 +3369,7 @@ type   = "bearer"
     }
 
     // The machine document is not a terminal: it keeps the bytes the config holds.
-    let out = fx.run(&["secret", "list", "--json"]);
-    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let doc = common::json_of(&fx.run_ok(&["secret", "list", "--json"]));
     assert_eq!(doc["credentials"][0]["headers"][0], "X-S02\u{202e}X");
 }
 
@@ -3999,9 +3969,7 @@ use = ["empty", "blank", "real"]
 mode = "deny"
 "#,
     );
-    let out = fx.run(&["config", "show", "--app", "builder", "--json"]);
-    assert!(out.status.success());
-    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--app", "builder", "--json"]));
     let steps: Vec<&str> = doc["provisions"]
         .as_array()
         .expect("provisions in the view")
@@ -4051,9 +4019,7 @@ mode = "deny"
 "#,
     );
 
-    let out = fx.run(&["config", "show", "--app", "orchestrator", "--json"]);
-    assert!(out.status.success());
-    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--app", "orchestrator", "--json"]));
     let steps = doc["provisions"]
         .as_array()
         .expect("provisions in the view");
@@ -4109,9 +4075,7 @@ allow = ["{*} https://orchestrator.example.com"]
 "#,
     );
 
-    let out = fx.run(&["config", "show", "--app", "orchestrator", "--json"]);
-    assert!(out.status.success());
-    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--app", "orchestrator", "--json"]));
 
     let pkg = |name: &str| {
         doc["packages"]
@@ -4208,8 +4172,7 @@ legacy-lane = ["lane.example"]
     );
 
     // What the app resolves to is the half that would otherwise be silent.
-    let shown = fx.run(&["config", "show", "--app", "demo", "--json"]);
-    let doc: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--app", "demo", "--json"]));
     assert!(
         doc["packages"].as_array().unwrap().is_empty(),
         "an inline bundle grafts no tool:\n{doc:#}"
@@ -4228,8 +4191,7 @@ legacy-lane = ["lane.example"]
         "packages = { legacy = \"nix:hello\" }\nallow = [\"{GET} https://legacy.example\"]\n",
     );
     fx.write_group("legacy-lane", &["lane.example"]);
-    let shown = fx.run(&["config", "show", "--app", "demo", "--json"]);
-    let doc: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--app", "demo", "--json"]));
     assert!(
         doc["packages"]
             .as_array()
@@ -4432,8 +4394,7 @@ allow = ["{*,WS} https://api.example.com"]
         String::from_utf8_lossy(&clash.stderr)
     );
 
-    let listed = fx.run(&["bundle", "--json"]);
-    let doc: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let doc = common::json_of(&fx.run_ok(&["bundle", "--json"]));
     assert_eq!(doc["bundles"][0]["name"], "demo-agent");
 
     // Re-exporting yields a fragment that imports again — so a bundle can travel machine to machine.
@@ -4450,8 +4411,7 @@ allow = ["{*,WS} https://api.example.com"]
         "orchestrator",
         "cmd = \"orchestrate\"\nuse = [\"demo-agent\"]\n[network]\nmode = \"deny\"\n",
     );
-    let shown = fx.run(&["config", "show", "--app", "orchestrator", "--json"]);
-    let doc: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--app", "orchestrator", "--json"]));
     assert!(
         doc["packages"]
             .as_array()
@@ -4500,13 +4460,12 @@ type = "raw"
         "cmd = \"x\"\nuse = [\"keyed\"]\n[network]\nmode = \"deny\"\n",
     );
 
-    let read = |app: &str| -> serde_json::Value {
-        let out = fx.run(&["config", "show", "--app", app, "--json"]);
-        assert!(out.status.success());
-        serde_json::from_slice(&out.stdout).unwrap()
-    };
+    #[track_caller]
+    fn read(fx: &Project, app: &str) -> serde_json::Value {
+        common::json_of(&fx.run_ok(&["config", "show", "--app", app, "--json"]))
+    }
 
-    let wide = read("wide");
+    let wide = read(&fx, "wide");
     assert_eq!(wide["network"], serde_json::json!("Shared"));
     assert!(
         wide["secrets"].as_array().unwrap().is_empty()
@@ -4521,7 +4480,7 @@ type = "raw"
 
     // The witness: the same bundle under an allowlist *does* inject — so the assertion above is
     // pinned on the posture, not on a bundle secret being unreachable for some other reason.
-    let narrow = read("narrow");
+    let narrow = read(&fx, "narrow");
     assert_eq!(
         narrow["secrets"].as_array().map(Vec::len),
         Some(1),
@@ -4902,8 +4861,7 @@ mode = "deny"
 "#,
     );
 
-    let untrusted = fx.run(&["config", "show", "--app", "sneaky", "--json"]);
-    let doc: serde_json::Value = serde_json::from_slice(&untrusted.stdout).unwrap();
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--app", "sneaky", "--json"]));
     assert!(
         doc["packages"].as_array().unwrap().is_empty(),
         "an untrusted project's `use` grafts no tool:\n{doc:#}"
@@ -4917,8 +4875,7 @@ mode = "deny"
     // Trusting the project applies exactly what was withheld — so the assertion above is pinned on
     // the trust gate, not on the bundle being unreachable for some unrelated reason.
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let trusted = fx.run(&["config", "show", "--app", "sneaky", "--json"]);
-    let doc: serde_json::Value = serde_json::from_slice(&trusted.stdout).unwrap();
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--app", "sneaky", "--json"]));
     assert!(
         doc["packages"]
             .as_array()
@@ -5197,9 +5154,7 @@ fn config_show_lists_declared_operations_only_once_trusted() {
     );
 
     // The JSON carries the same, with `null` for a missing description — absent is not empty.
-    let json = fx.run(&["config", "show", "--json"]);
-    let doc: serde_json::Value =
-        serde_json::from_slice(&json.stdout).expect("config show --json is a document");
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--json"]));
     let tasks = doc["tasks"].as_array().expect("tasks array");
     assert_eq!(tasks.len(), 2, "{tasks:?}");
     assert_eq!(tasks[0]["name"], "build");
@@ -5731,10 +5686,7 @@ fn config_json_carries_the_seccomp_relaxation() {
     // The machine-readable model carries the resolved relaxation, like every other field.
     let fx = Project::new("cfg");
     fx.write_global("[seccomp]\nallow = [\"ptrace\", \"clone:newns\"]\n");
-    let out = fx.run(&["config", "show", "--json"]);
-    assert!(out.status.success(), "config --json should exit 0");
-    let doc: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("config --json must emit valid JSON");
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--json"]));
     let tokens: Vec<String> = doc["seccomp"]
         .as_array()
         .expect("seccomp is an array")
@@ -5835,10 +5787,7 @@ fn config_json_carries_the_devices_grant() {
     // The machine-readable model carries the resolved grant, sorted, like every other field.
     let fx = Project::new("cfg");
     fx.write_global("[devices]\nallow = [\"/dev/kvm\", \"/dev/dri\"]\n");
-    let out = fx.run(&["config", "show", "--json"]);
-    assert!(out.status.success(), "config --json should exit 0");
-    let doc: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("config --json must emit valid JSON");
+    let doc = common::json_of(&fx.run_ok(&["config", "show", "--json"]));
     let paths: Vec<String> = doc["devices"]
         .as_array()
         .expect("devices is an array")
