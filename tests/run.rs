@@ -9027,11 +9027,14 @@ fn a_trusted_audio_posture_equips_a_python_portaudio_tool() {
     )
     .unwrap();
 
+    // The PyPI release is pinned: 0.5.6 finds PortAudio through `ctypes.util.find_library`, the
+    // call the shim answers, and a later release that found the library another way would change
+    // what this test exercises without changing a line of it.
     let check = r#"test -S /run/sbx-pulse && echo PULSE-PRESENT || echo PULSE-ABSENT
 test -f /opt/sbx/audio-pyshim/sitecustomize.py && echo PYSHIM-PRESENT || echo PYSHIM-ABSENT
 test -n "$PYTHONPATH" && echo PYTHONPATH-SET || echo PYTHONPATH-UNSET
 case ":$LD_LIBRARY_PATH:" in *portaudio*) echo PORTAUDIO-ON-LDPATH;; *) echo PORTAUDIO-OFF-LDPATH;; esac
-if command -v uv >/dev/null 2>&1 && uv venv /tmp/pv >/dev/null 2>&1 && VIRTUAL_ENV=/tmp/pv uv pip install -q sounddevice >/dev/null 2>&1; then
+if command -v uv >/dev/null 2>&1 && uv venv /tmp/pv >/dev/null 2>&1 && VIRTUAL_ENV=/tmp/pv uv pip install -q sounddevice==0.5.6 >/dev/null 2>&1; then
   /tmp/pv/bin/python -c "import sounddevice as sd; print('PA-IMPORT-OK'); print('PA-DEVICES-%d' % len(sd.query_devices()))" 2>&1 | tail -4
 else
   echo PA-NOT-INSTALLED
