@@ -1191,7 +1191,7 @@ fn import_names_the_bundle_file_that_sits_beside_the_profile() {
     let bundle = fx.catalogue("bundle", "demo-tool", "[packages]\ntool = \"nix:hello\"\n");
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
-    let out = fx.run(&["app", "import", profile.to_str().unwrap()]);
+    let out = fx.run_with_path(&["app", "import"], &profile, &[]);
     assert!(out.status.success(), "{}", text(&out));
     let t = text(&out);
     // The command as the reader must type it, with the file — not a `<file>` placeholder they then
@@ -1215,7 +1215,7 @@ fn import_keeps_the_placeholder_when_no_file_backs_the_reference() {
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
-    let out = fx.run(&["app", "import", profile.to_str().unwrap()]);
+    let out = fx.run_with_path(&["app", "import"], &profile, &[]);
     assert!(out.status.success(), "{}", text(&out));
     let t = text(&out);
     assert!(
@@ -1242,7 +1242,7 @@ fn import_reports_an_egress_group_the_profile_references_and_nothing_defines() {
         "cmd = \"demo\"\n[network]\nmode = \"deny\"\nallow = [\"@demo-lane\"]\n",
     );
 
-    let out = fx.run(&["app", "import", profile.to_str().unwrap()]);
+    let out = fx.run_with_path(&["app", "import"], &profile, &[]);
     assert!(out.status.success(), "{}", text(&out));
     let t = text(&out);
     assert!(
@@ -1254,11 +1254,11 @@ fn import_reports_an_egress_group_the_profile_references_and_nothing_defines() {
     // Control: once the group is defined, the same import says nothing about it. Without this the
     // test above would pass on a warning printed unconditionally.
     assert!(
-        fx.run(&["net", "groups", "import", group.to_str().unwrap()])
+        fx.run_with_path(&["net", "groups", "import"], &group, &[])
             .status
             .success()
     );
-    let again = fx.run(&["app", "import", "--force", profile.to_str().unwrap()]);
+    let again = fx.run_with_path(&["app", "import", "--force"], &profile, &[]);
     let t = text(&again);
     // Discriminate on the remedy, not on the group's name: the granted posture legitimately prints
     // `allow @demo-lane` on every import, so asserting the name is absent would assert nothing.
@@ -1286,7 +1286,7 @@ fn a_forced_import_refuses_when_the_profile_it_would_replace_cannot_be_read() {
     let source = fx.proj.path().join("demo-app.toml");
     std::fs::write(&source, "cmd = \"new\"\n").unwrap();
 
-    let out = fx.run(&["app", "import", "--force", source.to_str().unwrap()]);
+    let out = fx.run_with_path(&["app", "import", "--force"], &source, &[]);
     assert!(
         !out.status.success(),
         "a profile that cannot be read must refuse the import: {}",
@@ -1320,7 +1320,7 @@ fn bundle_import_reports_the_groups_the_bundle_itself_references() {
         "allow = [\"@demo-lane\"]\n[packages]\ntool = \"nix:hello\"\n",
     );
 
-    let out = fx.run(&["bundle", "import", bundle.to_str().unwrap()]);
+    let out = fx.run_with_path(&["bundle", "import"], &bundle, &[]);
     assert!(out.status.success(), "{}", text(&out));
     let t = text(&out);
     assert!(
@@ -1348,7 +1348,7 @@ fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
-    let out = fx.run(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    let out = fx.run_with_path(&["app", "import"], &profile, &["--with-deps"]);
     assert!(out.status.success(), "{}", text(&out));
     let t = text(&out);
     let bundle = std::fs::read_to_string(fx.bundle_path("demo-tool")).unwrap_or_default();
@@ -1377,13 +1377,7 @@ fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
 
     // Nothing is left to ask for afterwards — the warnings and the writes agree on what "missing"
     // means, which they cannot if each side keeps its own filter.
-    let again = fx.run(&[
-        "app",
-        "import",
-        "--force",
-        "--with-deps",
-        profile.to_str().unwrap(),
-    ]);
+    let again = fx.run_with_path(&["app", "import", "--force", "--with-deps"], &profile, &[]);
     let t = text(&again);
     assert!(
         !t.contains("sbx bundle import") && !t.contains("sbx net groups import"),
@@ -1396,14 +1390,11 @@ fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
     let fx = Project::new("app");
     fx.catalogue("bundle", "demo-tool", "[packages]\ntool = \"nix:hello\"\n");
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
-    let out = fx.run(&[
-        "app",
-        "import",
-        profile.to_str().unwrap(),
-        "--as",
-        "renamed",
-        "--with-deps",
-    ]);
+    let out = fx.run_with_path(
+        &["app", "import"],
+        &profile,
+        &["--as", "renamed", "--with-deps"],
+    );
     assert!(out.status.success(), "{}", text(&out));
     assert!(fx.profile_path("renamed").exists(), "{}", text(&out));
     assert!(
@@ -1425,7 +1416,7 @@ fn with_deps_writes_nothing_at_all_when_a_reference_has_no_file() {
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
-    let out = fx.run(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    let out = fx.run_with_path(&["app", "import"], &profile, &["--with-deps"]);
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -1455,7 +1446,7 @@ fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
     fx.catalogue("bundle", "bad name!", "[packages]\ntool = \"nix:hello\"\n");
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"bad name!\"]\n");
 
-    let out = fx.run(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    let out = fx.run_with_path(&["app", "import"], &profile, &["--with-deps"]);
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -1486,7 +1477,7 @@ fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
         "demo-app",
         "cmd = \"demo\"\n[network]\nmode = \"deny\"\nallow = [\"@bad name!\"]\n",
     );
-    let out = fx.run(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    let out = fx.run_with_path(&["app", "import"], &profile, &["--with-deps"]);
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -1518,7 +1509,7 @@ fn with_deps_merges_only_the_referenced_name_from_a_fragment() {
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
-    let out = fx.run(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    let out = fx.run_with_path(&["app", "import"], &profile, &["--with-deps"]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(
         fx.bundle_path("demo-tool").exists(),
@@ -1816,13 +1807,7 @@ fn app_export_does_not_write_through_a_symlink_at_its_destination() {
     let out_path = fx.proj.path().join("export.toml");
     std::os::unix::fs::symlink(&victim, &out_path).unwrap();
 
-    let out = fx.run(&[
-        "app",
-        "export",
-        "demo-app",
-        "--out",
-        out_path.to_str().unwrap(),
-    ]);
+    let out = fx.run_with_path(&["app", "export", "demo-app", "--out"], &out_path, &[]);
     assert!(
         std::fs::read_to_string(&victim).unwrap() == "original\n",
         "the link's target was written through: {}",
@@ -1831,13 +1816,7 @@ fn app_export_does_not_write_through_a_symlink_at_its_destination() {
 
     // Witness: an ordinary destination still receives the profile, and it reads back as one.
     let plain = fx.proj.path().join("plain.toml");
-    let out = fx.run(&[
-        "app",
-        "export",
-        "demo-app",
-        "--out",
-        plain.to_str().unwrap(),
-    ]);
+    let out = fx.run_with_path(&["app", "export", "demo-app", "--out"], &plain, &[]);
     assert!(
         out.status.success(),
         "sbx app export failed: {}",
