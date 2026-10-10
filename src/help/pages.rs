@@ -1585,10 +1585,10 @@ pub(super) const PAGES: &[Page] = &[
             re-trust in one step (this blesses the whole current file). Which is why --trust is\n\
             refused on a file that was never trusted, or was changed since: sbx blesses\n\
             the delta it wrote, never bytes you have not read. Review it and run `sbx trust`, or use\n\
-            `sbx config edit --trust`, where the editor shows you the file first. The global config\n\
-            and app profiles are trusted by location, so a write to either needs no trust. A free\n\
-            env value needs no trust. Array and table fields (binds, an allowlist, secrets, apps)\n\
-            are edited with `sbx config edit`.",
+            `sbx config edit --trust`, which shows you what trusting it grants first. The global\n\
+            config and app profiles are trusted by location, so a write to either needs no trust.\n\
+            A free env value needs no trust. Array and table fields (binds, an allowlist, secrets,\n\
+            apps) are edited with `sbx config edit`.",
     },
     Page {
         path: &["config", "add"],
@@ -1725,13 +1725,20 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["config", "edit"],
-        synopsis: "sbx config edit [-l|--local|-g|--global|-c <file>] [--trust]",
+        synopsis: "sbx config edit [-l|--local|-g|--global|-c <file>] [--trust [--yes]]",
         summary: "open a config file in your editor",
         options: &[
             ("-l, --local", "the project .sbx.toml (the default)"),
             ("-g, --global", "the global sbx.toml"),
             ("-c <file>", "an explicit config file"),
-            ("--trust", "re-trust the file after editing"),
+            (
+                "--trust",
+                "after editing, show what the file grants and re-trust it once confirmed",
+            ),
+            (
+                "--yes",
+                "with --trust, record without asking (required without a terminal, e.g. in a script)",
+            ),
         ],
         details: "Opens the target file in $VISUAL or $EDITOR (falling back to vi) — the way to edit\n\
             fields `set` does not handle as a single value, such as binds, an allowlist, secrets,\n\
@@ -1748,13 +1755,18 @@ pub(super) const PAGES: &[Page] = &[
             read-only in place — so the rest of the tree is writable but the agent still cannot\n\
             alter what sbx runs or trusts.\n\
             An edit that changes a file you had trusted re-arms its trust gate, so it warns to\n\
-            re-run `sbx trust`; pass --trust to re-trust as the editor closes. That applies to a\n\
-            gated file: the global config is trusted by location and has no marker to re-arm, so\n\
-            --trust there says it is not needed and stores nothing.\n\
+            re-run `sbx trust`; pass --trust to re-trust it as the editor closes. sbx then shows\n\
+            what the file grants, as `sbx trust` does (the lines changed since it was last\n\
+            approved, or every line when nothing was), and asks a terminal to confirm; without one\n\
+            it refuses unless --yes is given. What is trusted is the contents it showed: a change\n\
+            made after that is not. A file that already matches its approval is re-recorded\n\
+            without a question. All of this is about a gated file: the global config is trusted by\n\
+            location and has no marker to re-arm, so --trust there says it is not needed and\n\
+            stores nothing.\n\
             \n\
             This is the one verb whose --trust also blesses a file that was never trusted — `set`,\n\
-            `add`, `rm` and `unset` refuse that. The difference is that the editor showed you the\n\
-            file: what you have seen may be blessed.",
+            `add`, `rm` and `unset` refuse that. The difference is the review: what is blessed is\n\
+            what sbx showed you and you confirmed.",
     },
     Page {
         path: &["config", "show"],
