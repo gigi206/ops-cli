@@ -1608,7 +1608,7 @@ mod tests {
     fn commit_repo(git: &Path, dir: &Path) -> String {
         git_run(git, dir, &["init", "-q"]);
         commit_all(git, dir, "store");
-        format!("file://{}", dir.to_str().unwrap())
+        crate::testutil::file_url(dir)
     }
 
     /// The revision recorded in a configured store's `catalogue.lock`.

@@ -106,6 +106,9 @@ impl Drop for EnvVar {
 // The fixtures' root, one definition shared with the integration suites.
 include!("testroot.rs");
 
+// A fixture path as a `file://` URL, one definition shared with the integration suites.
+include!("testurl.rs");
+
 /// A unique temp directory that removes itself on drop, so tests leave nothing
 /// behind (cleanup runs on panic-unwind too, not just on success).
 pub(crate) struct TmpDir(PathBuf);
