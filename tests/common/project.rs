@@ -84,6 +84,20 @@ impl Project {
         self.cmd(args).output().expect("spawn sbx")
     }
 
+    /// Run `sbx <args> <path> <rest>` from the project directory to completion, `path` passed as
+    /// the OS string it is.
+    ///
+    /// A fixture path starts at the fixture root, which comes from the environment and may hold
+    /// bytes outside UTF-8. A verb that takes a path accepts them; turning the path into a `&str`
+    /// for [`Project::run`] would fail the test before the verb ever saw it.
+    pub fn run_with_path(&self, args: &[&str], path: &Path, rest: &[&str]) -> Output {
+        self.cmd(args)
+            .arg(path)
+            .args(rest)
+            .output()
+            .expect("spawn sbx")
+    }
+
     /// A directory outside the project, for the trees a test binds or installs *from*.
     ///
     /// Outside on purpose: an install that is meant to copy its source in has to be given a source
