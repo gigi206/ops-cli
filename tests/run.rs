@@ -5342,6 +5342,20 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
         "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
+    // The trusted path, launched once before anything is timed: the probe above ran untrusted, on
+    // the shared network, and took none of what the allowlist path stands up.
+    if trusted_launch("net logs e2e", || {
+        sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["run", "--", "true"],
+        )
+    })
+    .is_none()
+    {
+        return;
+    }
 
     // A background session: one allowed fetch (logged `allow`), one denied fetch (logged `deny`),
     // then a sleep long enough to read its live log. The denied fetch fails; `sh` continues.
@@ -5375,22 +5389,12 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
         rows.iter()
             .any(|r| r["host"] == host && r["verdict"] == verdict)
     };
-    // The budget starts at spawn, so it must cover everything the background session does before
-    // its first event exists: provisioning a fresh test store (the whole base cold, including the
-    // one-time locale-archive build) and then two real fetches through the MITM. Measured warm,
-    // that already approaches a minute — so a one-minute budget carried no slack, and a cold shared
-    // store or a machine running several such sessions at once exhausted it before any event was
-    // pushed. Four minutes widens that near-zero margin about fourfold at no cost on the happy path:
-    // the loop breaks as soon as it sees what it is waiting for, so a passing run is unchanged and
-    // only a genuinely broken one pays the wait. The session's own `sleep` must outlive this budget,
-    // or the log — which is live-only — would be gone before the deadline expires.
-    //
-    // A wider budget is not a cure, only more headroom: cold provisioning under heavy parallelism
-    // could still exceed it. The structural fix is to stop timing the provisioning at all — the
-    // warm-up probe above runs *before* the project is trusted, so it warms the `shared` path while
-    // the background session takes the allowlist one, leaving that path's first-launch cost inside
-    // this window. Warming the post-trust path before the clock starts would make the budget
-    // generous rather than merely larger.
+    // The budget starts at spawn. The project's trusted path was launched once before it, so what
+    // is left inside the window is the background session's own start and then two real fetches
+    // through the MITM, not the provisioning a fresh store needs. The loop breaks as soon as it
+    // sees what it is waiting for, so only a broken run pays the budget, and its size is headroom
+    // for a machine running several such sessions at once. The session's own `sleep` must outlive
+    // it, or the log — which is live-only — would be gone before the deadline expires.
     let deadline = Instant::now() + Duration::from_secs(240);
     // Deferred init: the loop assigns `last` on its first iteration, before either break — so it is
     // always set by the post-loop read, with no dead initial store.
@@ -5497,6 +5501,20 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
         "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
+    // The trusted path, launched once before anything is timed: the probe above ran untrusted, on
+    // the shared network, and took none of what the allowlist path stands up.
+    if trusted_launch("net logs --follow e2e", || {
+        sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["run", "--", "true"],
+        )
+    })
+    .is_none()
+    {
+        return;
+    }
 
     // The background session: one allowed and one denied egress, then a sleep long enough to tail.
     let session_log = state.path().join("session-stderr.log");
@@ -5518,9 +5536,8 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
         .expect("spawn the background sbx run");
     let session = KillOnDrop(session);
 
-    // Give the session a moment to come up (the seed then catches early events).
-    std::thread::sleep(Duration::from_secs(2));
-
+    // The follower may start before the session is registered: it reads the registry again on
+    // every poll, and a session it first meets there is read from the start of its ring.
     // The follower streams new events as NDJSON over a pipe; a thread accumulates them so the test
     // can watch the stream grow.
     let mut follower = sbx_session_in(project.path(), data.path(), state.path())
@@ -5557,22 +5574,12 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
     };
     // Poll the accumulating stream until both decisions appear, or a generous deadline — stopping as
     // soon as they do keeps the test fast without a fragile fixed sleep.
-    // The budget starts at spawn, so it must cover everything the background session does before
-    // its first event exists: provisioning a fresh test store (the whole base cold, including the
-    // one-time locale-archive build) and then two real fetches through the MITM. Measured warm,
-    // that already approaches a minute — so a one-minute budget carried no slack, and a cold shared
-    // store or a machine running several such sessions at once exhausted it before any event was
-    // pushed. Four minutes widens that near-zero margin about fourfold at no cost on the happy path:
-    // the loop breaks as soon as it sees what it is waiting for, so a passing run is unchanged and
-    // only a genuinely broken one pays the wait. The session's own `sleep` must outlive this budget,
-    // or the log — which is live-only — would be gone before the deadline expires.
-    //
-    // A wider budget is not a cure, only more headroom: cold provisioning under heavy parallelism
-    // could still exceed it. The structural fix is to stop timing the provisioning at all — the
-    // warm-up probe above runs *before* the project is trusted, so it warms the `shared` path while
-    // the background session takes the allowlist one, leaving that path's first-launch cost inside
-    // this window. Warming the post-trust path before the clock starts would make the budget
-    // generous rather than merely larger.
+    // The budget starts at spawn. The project's trusted path was launched once before it, so what
+    // is left inside the window is the background session's own start and then two real fetches
+    // through the MITM, not the provisioning a fresh store needs. The loop breaks as soon as it
+    // sees what it is waiting for, so only a broken run pays the budget, and its size is headroom
+    // for a machine running several such sessions at once. The session's own `sleep` must outlive
+    // it, or the log — which is live-only — would be gone before the deadline expires.
     let deadline = Instant::now() + Duration::from_secs(240);
     loop {
         {
