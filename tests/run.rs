@@ -661,20 +661,18 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
 
     // The rw bind: the cage writes a marker, and it must land at the host path.
     let rw_target = rw_dir.join("marker");
-    let write_rw = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &[
+    let write_rw = sbx_session_in(project.path(), data.path(), state.path())
+        .args([
             "run",
             "--",
             "sh",
             "-c",
             "echo written-in-cage > \"$1\"",
             "sh",
-            &rw_target.display().to_string(),
-        ],
-    );
+        ])
+        .arg(&rw_target)
+        .output()
+        .expect("spawn sbx");
     assert!(
         write_rw.status.success(),
         "writing into a rw bind failed: {}",
@@ -709,20 +707,11 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
 
     // The ro bind: a write must fail, and no new host file may appear.
     let ro_target = ro_dir.join("marker");
-    let write_ro = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &[
-            "run",
-            "--",
-            "sh",
-            "-c",
-            "echo nope > \"$1\"",
-            "sh",
-            &ro_target.display().to_string(),
-        ],
-    );
+    let write_ro = sbx_session_in(project.path(), data.path(), state.path())
+        .args(["run", "--", "sh", "-c", "echo nope > \"$1\"", "sh"])
+        .arg(&ro_target)
+        .output()
+        .expect("spawn sbx");
     assert!(
         !write_ro.status.success(),
         "writing into a read-only bind unexpectedly succeeded"
@@ -2041,12 +2030,11 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
          \x20       print(json.dumps({\"seq\": ask[\"seq\"], \"error\": \"no credentials for that region\"}), flush=True)",
     );
     for dir in [&signs, &marker, &refuses, &oversteps, &feeds] {
-        let out = sbx_in(
-            project.path(),
-            data.path(),
-            state.path(),
-            &["plugins", "install", dir.to_str().unwrap()],
-        );
+        let out = sbx_session_in(project.path(), data.path(), state.path())
+            .args(["plugins", "install"])
+            .arg(dir)
+            .output()
+            .expect("spawn sbx");
         assert!(
             out.status.success(),
             "installing {}: {}",
@@ -2373,12 +2361,11 @@ fn an_http2_caller_is_told_why_its_request_was_not_signed() {
         "    told = json.dumps(ask.get(\"body\"), sort_keys=True)\n\
          \x20   print(json.dumps({\"seq\": ask[\"seq\"], \"error\": \"no credentials for that region (body=\" + told + \")\"}), flush=True)",
     );
-    let installed = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &["plugins", "install", refuses.to_str().unwrap()],
-    );
+    let installed = sbx_session_in(project.path(), data.path(), state.path())
+        .args(["plugins", "install"])
+        .arg(&refuses)
+        .output()
+        .expect("spawn sbx");
     assert!(
         installed.status.success(),
         "installing the signer: {}",
@@ -2521,12 +2508,11 @@ fn a_signer_that_asked_for_a_body_digest_is_told_it_and_the_body_still_arrives()
          \x20   told = (\"held:\" + b.get(\"sha256\", \"none\")) if b.get(\"held\") else \"unheld\"\n\
          \x20   print(json.dumps({\"seq\": ask[\"seq\"], \"headers\": {\"Authorization\": \"DEMO \" + told}}), flush=True)",
     );
-    let installed = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &["plugins", "install", digests.to_str().unwrap()],
-    );
+    let installed = sbx_session_in(project.path(), data.path(), state.path())
+        .args(["plugins", "install"])
+        .arg(&digests)
+        .output()
+        .expect("spawn sbx");
     assert!(
         installed.status.success(),
         "installing the signer: {}",
@@ -6081,12 +6067,11 @@ fn a_usr_bin_env_shebang_resolves_in_the_cage() {
 
     // run the script by its own absolute path, so the shebang (not an explicit `node`) drives
     // execution — the path through `/usr/bin/env`.
-    let out = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &["run", "--", script.to_str().unwrap()],
-    );
+    let out = sbx_session_in(project.path(), data.path(), state.path())
+        .args(["run", "--"])
+        .arg(&script)
+        .output()
+        .expect("spawn sbx");
     let log = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stderr),
@@ -6496,12 +6481,11 @@ fn a_bin_bash_shebang_resolves_in_the_cage() {
 
     // run the script by its own absolute path, so the shebang (not an explicit `bash`) drives
     // execution — the path through `/bin/bash`.
-    let out = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &["run", "--", script.to_str().unwrap()],
-    );
+    let out = sbx_session_in(project.path(), data.path(), state.path())
+        .args(["run", "--"])
+        .arg(&script)
+        .output()
+        .expect("spawn sbx");
     let log = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stderr),
