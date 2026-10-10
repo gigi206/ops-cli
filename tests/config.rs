@@ -2247,8 +2247,13 @@ fn git_available() -> bool {
 
 /// Run a git subcommand in `dir` with an explicit identity and no signing, independent of the
 /// host's git configuration. Asserts success.
+///
+/// git's output is captured and carried by the failure, which is located at the line that called
+/// this. Inherited, it reached the test binary's own stderr, outside the report of the test that
+/// failed.
+#[track_caller]
 fn git_in(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
+    let out = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args([
@@ -2262,10 +2267,15 @@ fn git_in(dir: &Path, args: &[&str]) {
             "init.defaultBranch=main",
         ])
         .args(args)
-        .status()
-        .expect("spawn git")
-        .success();
-    assert!(ok, "git {args:?} failed");
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed ({}):\n{}{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// The producing side feeds the consuming side through a *real* git clone: `sbx plugins store
