@@ -2825,11 +2825,10 @@ fn a_gui_isolated_cage_gets_a_dummy_interface_a_non_gui_one_does_not() {
         "gui = \"wayland\"\nnetwork = \"none\"\n",
     )
     .unwrap();
-    let probe = run_in(gui.path(), data.path(), &["true"]);
-    if !probe.status.success() {
-        skip_incapable!("skipping netns-dummy e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "netns-dummy e2e",
+        run_in(gui.path(), data.path(), &["true"])
+    );
     let t = sbx_in(
         gui.path(),
         data.path(),
@@ -2841,16 +2840,33 @@ fn a_gui_isolated_cage_gets_a_dummy_interface_a_non_gui_one_does_not() {
         "trust failed: {}",
         String::from_utf8_lossy(&t.stderr)
     );
-    let out = sbx_in(
-        gui.path(),
-        data.path(),
-        state.path(),
-        &["run", "--", "sh", "-c", "cat /proc/net/dev"],
-    );
+    // Read only from a launch that ran: an empty listing from a failed one would read as a host
+    // without the dummy. The launch degrades rather than fails where the dummy cannot be made, so a
+    // failure here is the launch's own, past a download that failed twice.
+    let out = match common::probe(|| {
+        sbx_in(
+            gui.path(),
+            data.path(),
+            state.path(),
+            &["run", "--", "sh", "-c", "cat /proc/net/dev"],
+        )
+    }) {
+        common::Probe::Ran(out) => out,
+        common::Probe::Unreachable(why) => {
+            skip_unreachable!(
+                "skipping netns-dummy e2e: the gui launch failed on a download, twice ({why})"
+            );
+            return;
+        }
+        common::Probe::Incapable(why) => {
+            panic!("the trusted gui launch failed on a host that ran the untrusted probe: {why}")
+        }
+    };
     let ifaces = String::from_utf8_lossy(&out.stdout).into_owned();
     if !ifaces.contains("dummy0") {
         skip_incapable!(
-            "skipping netns-dummy e2e: dummy interface unavailable on this host:\n{ifaces}"
+            "skipping netns-dummy e2e: dummy interface unavailable on this host:\n{ifaces}{}",
+            String::from_utf8_lossy(&out.stderr)
         );
         return;
     }
@@ -2877,6 +2893,12 @@ fn a_gui_isolated_cage_gets_a_dummy_interface_a_non_gui_one_does_not() {
     );
     let ifaces2 = String::from_utf8_lossy(&out2.stdout);
     assert!(
+        out2.status.success() && ifaces2.contains("lo:"),
+        "the non-gui launch must run and list its loopback before its lack of a dummy means \
+         anything: {ifaces2}{}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert!(
         !ifaces2.contains("dummy0"),
         "a non-gui isolated cage must not get a dummy interface (gating): {ifaces2}"
     );
@@ -2899,11 +2921,10 @@ fn a_gui_dummy_interface_opens_no_egress_the_allowlist_still_filters() {
     )
     .unwrap();
 
-    let probe = run_in(project.path(), data.path(), &["true"]);
-    if !probe.status.success() {
-        skip_incapable!("skipping dummy-egress e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "dummy-egress e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
     need_reachable!(
         cache_reachable(),
         "skipping dummy-egress e2e: the binary cache is unreachable"
@@ -2921,14 +2942,30 @@ fn a_gui_dummy_interface_opens_no_egress_the_allowlist_still_filters() {
     );
 
     // The holder path is active (dummy0 present); skip if the mechanism is unavailable here.
-    let ifaces = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &["run", "--", "sh", "-c", "cat /proc/net/dev"],
-    );
+    let ifaces = match common::probe(|| {
+        sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["run", "--", "sh", "-c", "cat /proc/net/dev"],
+        )
+    }) {
+        common::Probe::Ran(out) => out,
+        common::Probe::Unreachable(why) => {
+            skip_unreachable!(
+                "skipping dummy-egress e2e: the gui launch failed on a download, twice ({why})"
+            );
+            return;
+        }
+        common::Probe::Incapable(why) => {
+            panic!("the trusted gui launch failed on a host that ran the untrusted probe: {why}")
+        }
+    };
     if !String::from_utf8_lossy(&ifaces.stdout).contains("dummy0") {
-        skip_incapable!("skipping dummy-egress e2e: dummy interface unavailable on this host");
+        skip_incapable!(
+            "skipping dummy-egress e2e: dummy interface unavailable on this host: {}",
+            String::from_utf8_lossy(&ifaces.stderr)
+        );
         return;
     }
 
