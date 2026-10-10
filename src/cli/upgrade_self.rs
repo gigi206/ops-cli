@@ -687,7 +687,7 @@ mod tests {
                     repo: "owner/name",
                 },
                 source: Source {
-                    download: format!("file://{}", dir.join("releases").display()),
+                    download: crate::testutil::file_url(&dir.join("releases")),
                     api: String::new(),
                 },
                 nix: &nix,
