@@ -1077,6 +1077,9 @@ fn deny_session_loads_a_rule_into_a_running_enforcing_cage() {
     // `--session deny` must load into that one session. The decide-reflects-the-overlay property is
     // unit-tested; this proves the CLI → session enumeration → proc control socket → overlay chain
     // end to end. Skipped, not failed, where the host cannot sandbox.
+    //
+    // A second rule carries a character that reorders a line, which the exec-rule grammar admits:
+    // the line reporting its load and the `proc rules` listing of the overlay both name it escaped.
     let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
     std::fs::write(
         project.path().join(".sbx.toml"),
@@ -1140,6 +1143,17 @@ fn deny_session_loads_a_rule_into_a_running_enforcing_cage() {
         }
         std::thread::sleep(Duration::from_millis(300));
     }
+    let in_project = |args: &[&str]| {
+        sbx_isolated()
+            .args(args)
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", data.path())
+            .output()
+            .expect("sbx proc")
+    };
+    let reordering = in_project(&["proc", "deny", "cu\u{202e}rl", "--session"]);
+    let listing = in_project(&["proc", "rules"]);
 
     // Best-effort teardown before asserting, so a failure does not leave the cage running.
     let _ = sbx_isolated()
@@ -1153,6 +1167,17 @@ fn deny_session_loads_a_rule_into_a_running_enforcing_cage() {
         loaded,
         "the --session deny did not load into the live cage: {last}"
     );
+    for (out, expected) in [
+        (&reordering, "loaded deny rule `cu\\u{202e}rl` into 1"),
+        (&listing, "deny  cu\\u{202e}rl"),
+    ] {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(expected) && !stdout.contains('\u{202e}'),
+            "stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
