@@ -1828,15 +1828,48 @@ fn upgrade_with_an_untrusted_pin_falls_back_to_the_global_lock() {
 
 /// Whether a per-project nixpkgs lock was recorded anywhere under the data dir's
 /// `projects/` tree.
+///
+/// Absent is a `NotFound` or a `NotADirectory`, and nothing else: an error reading the tree fails
+/// the test, at the line that asked, rather than answering `false` to a question nobody looked at.
+#[track_caller]
 fn has_per_project_nixpkgs_lock(data_home: &Path) -> bool {
     let projects = data_home.join("sbx/projects");
-    std::fs::read_dir(&projects)
-        .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.path().join("nixpkgs.lock").is_file())
-        })
-        .unwrap_or(false)
+    for name in names_in(&projects) {
+        let lock = projects.join(name).join("nixpkgs.lock");
+        match std::fs::metadata(&lock) {
+            Ok(meta) if meta.is_file() => return true,
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(e) => panic!("cannot read {}: {e}", lock.display()),
+        }
+    }
+    false
+}
+
+/// The names in `dir`, or none when it does not exist.
+///
+/// Any other error reading it, or one of its entries, fails the test naming the directory, at the
+/// line that asked. An absence check that took an unreadable directory for an empty one would pass
+/// on a store it never read.
+#[track_caller]
+fn names_in(dir: &Path) -> Vec<std::ffi::OsString> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => panic!("cannot read {}: {e}", dir.display()),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => names.push(entry.file_name()),
+            Err(e) => panic!("cannot read an entry of {}: {e}", dir.display()),
+        }
+    }
+    names
 }
 
 #[test]
@@ -5387,9 +5420,7 @@ fn config_edit_global_trust_writes_no_marker_and_says_why() {
 
     // The assertion that matters is on the store, not on the words: nothing was written there.
     let store = fx.state_home.path().join("sbx/trusted");
-    let markers: Vec<_> = std::fs::read_dir(&store)
-        .map(|d| d.flatten().map(|e| e.file_name()).collect())
-        .unwrap_or_default();
+    let markers = names_in(&store);
     assert!(
         markers.is_empty(),
         "a trust marker for the global config is never read back, so none must be written: \
@@ -5466,9 +5497,7 @@ fn a_key_write_refuses_to_bless_a_project_the_user_never_approved() {
 
         // The assertion that matters is on the store, not on the words: nothing was blessed.
         let store = fx.state_home.path().join("sbx/trusted");
-        let markers: Vec<_> = std::fs::read_dir(&store)
-            .map(|d| d.flatten().map(|e| e.file_name()).collect())
-            .unwrap_or_default();
+        let markers = names_in(&store);
         assert!(
             markers.is_empty(),
             "`{}` must have blessed nothing: {markers:?}",
@@ -7016,10 +7045,8 @@ fn concurrent_config_edits_of_one_file_keep_every_entry_and_lock_outside_the_pro
         1,
         "one lock for the one file edited: {locks:?}"
     );
-    let in_project: Vec<_> = std::fs::read_dir(fx.proj.path())
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name())
+    let in_project: Vec<_> = names_in(fx.proj.path())
+        .into_iter()
         .filter(|n| n != ".sbx.toml")
         .collect();
     assert!(
