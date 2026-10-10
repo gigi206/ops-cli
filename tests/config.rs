@@ -2137,10 +2137,9 @@ fn plugins_install_then_list_then_remove_through_the_binary() {
          version=\"0.1.0\"\ndescription=\"read from the pass store\"\n",
         0o755,
     );
-    let source = source.to_str().unwrap();
 
     // install: places it under its manifest name, and names the `rm` token in the report
-    let out = fx.run(&["plugins", "install", source]);
+    let out = fx.run_with_path(&["plugins", "install"], &source, &[]);
     assert!(out.status.success(), "install must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -2160,7 +2159,7 @@ fn plugins_install_then_list_then_remove_through_the_binary() {
     // Where it came from, too: an installed plugin is byte-identical whatever its source, so the
     // recorded provenance is the only thing that can tell a reader which directory to go edit.
     assert!(
-        stdout.contains(&format!("from: local directory {source}")),
+        stdout.contains(&format!("from: local directory {}", source.display())),
         "the listing must name the directory it was installed from:\n{stdout}"
     );
     assert!(
@@ -2193,7 +2192,7 @@ fn plugins_install_refuses_a_colliding_scheme_through_the_binary() {
         0o755,
     );
     assert!(
-        fx.run(&["plugins", "install", alpha.to_str().unwrap()])
+        fx.run_with_path(&["plugins", "install"], &alpha, &[])
             .status
             .success(),
         "the first install must succeed"
@@ -2206,7 +2205,7 @@ fn plugins_install_refuses_a_colliding_scheme_through_the_binary() {
         "name=\"beta\"\ntype=\"resolver\"\nscheme=\"vault\"\nexec=\"resolve\"\n",
         0o755,
     );
-    let out = fx.run(&["plugins", "install", beta.to_str().unwrap()]);
+    let out = fx.run_with_path(&["plugins", "install"], &beta, &[]);
     assert!(!out.status.success(), "a colliding install must fail");
     assert!(
         String::from_utf8_lossy(&out.stderr)
@@ -2250,7 +2249,8 @@ fn git_available() -> bool {
 /// host's git configuration. Asserts success.
 fn git_in(dir: &Path, args: &[&str]) {
     let ok = Command::new("git")
-        .args(["-C", dir.to_str().unwrap()])
+        .arg("-C")
+        .arg(dir)
         .args([
             "-c",
             "user.email=t@t",
@@ -2302,14 +2302,13 @@ fn publish_then_add_and_install_through_a_real_clone() {
 
     // Publish: sign the tree (generating the key on first use).
     let keyfile = fx.scratch().join("store.key");
-    let publish = fx.run(&[
-        "plugins",
-        "store",
-        "publish",
-        repo.to_str().unwrap(),
-        "--key",
-        keyfile.to_str().unwrap(),
-    ]);
+    let publish = fx
+        .cmd(&["plugins", "store", "publish"])
+        .arg(&repo)
+        .arg("--key")
+        .arg(&keyfile)
+        .output()
+        .expect("spawn sbx");
     assert!(
         publish.status.success(),
         "publish failed:\n{}",
@@ -2320,13 +2319,17 @@ fn publish_then_add_and_install_through_a_real_clone() {
     git_in(&repo, &["init", "-q"]);
     git_in(&repo, &["add", "-A"]);
     git_in(&repo, &["commit", "-q", "-m", "store"]);
-    let url = format!("file://{}", repo.to_str().unwrap());
+    let mut url = std::ffi::OsString::from("file://");
+    url.push(&repo);
 
     // Add via a real clone: trust-on-first-use reads the shipped `pubkey` and verifies the cloned
     // catalogue against it (so a clone that mangled the signed bytes would be refused here).
-    let add = fx.run(&[
-        "plugins", "store", "add", "--name", "acme", "--url", &url, "--trust",
-    ]);
+    let add = fx
+        .cmd(&["plugins", "store", "add", "--name", "acme", "--url"])
+        .arg(&url)
+        .arg("--trust")
+        .output()
+        .expect("spawn sbx");
     assert!(
         add.status.success(),
         "add failed:\n{}",
@@ -3732,13 +3735,7 @@ fn sbx_app_export_emits_a_profile_verbatim_an_inline_app_serialized_and_round_tr
         "[app.review]\ncmd = [\"review\", \"--all\"]\n[app.review.env]\nMODE = \"ci\"\n",
     );
     let exported = fx.proj.path().join("review.toml");
-    let exp2 = fx.run(&[
-        "app",
-        "export",
-        "review",
-        "--out",
-        exported.to_str().unwrap(),
-    ]);
+    let exp2 = fx.run_with_path(&["app", "export", "review", "--out"], &exported, &[]);
     assert!(
         exp2.status.success(),
         "inline export failed: {}",
@@ -3754,7 +3751,7 @@ fn sbx_app_export_emits_a_profile_verbatim_an_inline_app_serialized_and_round_tr
         "empty fields must be skipped:\n{serialized}"
     );
     // Re-import the exported file: it resolves as an app, closing the loop.
-    let imp = fx.run(&["app", "import", exported.to_str().unwrap()]);
+    let imp = fx.run_with_path(&["app", "import"], &exported, &[]);
     assert!(
         imp.status.success(),
         "re-import of the exported profile failed: {}",
@@ -3916,13 +3913,7 @@ fn bundle_export_writes_the_same_file_through_the_flag_as_through_a_redirect() {
     std::fs::write(&redirected, &out.stdout).unwrap();
 
     let flagged = fx.proj.path().join("flagged.toml");
-    let out = fx.run(&[
-        "bundle",
-        "export",
-        "demo",
-        "--out",
-        flagged.to_str().unwrap(),
-    ]);
+    let out = fx.run_with_path(&["bundle", "export", "demo", "--out"], &flagged, &[]);
     assert!(out.status.success(), "export to a file failed: {out:?}");
 
     assert_eq!(
@@ -4224,7 +4215,7 @@ fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced
     )
     .unwrap();
     assert!(
-        fx.run(&["bundle", "import", frag.to_str().unwrap()])
+        fx.run_with_path(&["bundle", "import"], &frag, &[])
             .status
             .success()
     );
@@ -4240,20 +4231,17 @@ fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced
     .unwrap();
     // Its file is not named for the bundle, so `--as` says which bundle it lands on.
     assert!(
-        fx.run(&[
-            "bundle",
-            "import",
-            "--force",
-            "--as",
-            "demo-agent",
-            local.to_str().unwrap()
-        ])
+        fx.run_with_path(
+            &["bundle", "import", "--force", "--as", "demo-agent"],
+            &local,
+            &[]
+        )
         .status
         .success()
     );
 
     // Re-importing the pristine fragment drops that rule — and says so, by name.
-    let forced = fx.run(&["bundle", "import", "--force", frag.to_str().unwrap()]);
+    let forced = fx.run_with_path(&["bundle", "import", "--force"], &frag, &[]);
     assert!(forced.status.success());
     let err = String::from_utf8_lossy(&forced.stderr).to_string();
     assert!(
@@ -4283,14 +4271,11 @@ fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced
         );
     }
     assert!(
-        fx.run(&[
-            "bundle",
-            "import",
-            "--force",
-            "--as",
-            "demo-agent",
-            kept.to_str().unwrap()
-        ])
+        fx.run_with_path(
+            &["bundle", "import", "--force", "--as", "demo-agent"],
+            &kept,
+            &[]
+        )
         .status
         .success()
     );
@@ -4303,14 +4288,11 @@ fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced
     // A re-import that changes nothing keeps no copy and reports no loss: `local.toml` now declares
     // exactly what the config holds.
     std::fs::remove_file(&kept).unwrap();
-    let again = fx.run(&[
-        "bundle",
-        "import",
-        "--force",
-        "--as",
-        "demo-agent",
-        local.to_str().unwrap(),
-    ]);
+    let again = fx.run_with_path(
+        &["bundle", "import", "--force", "--as", "demo-agent"],
+        &local,
+        &[],
+    );
     assert!(again.status.success());
     assert!(
         !kept.exists(),
@@ -4334,15 +4316,9 @@ fn a_forced_bundle_import_names_what_the_incoming_fragment_adds() {
     let before = fx.proj.path().join("before.toml");
     std::fs::write(&before, "allow = [\"{GET} https://api.example.com\"]\n").unwrap();
     assert!(
-        fx.run(&[
-            "bundle",
-            "import",
-            "--as",
-            "demo-agent",
-            before.to_str().unwrap()
-        ])
-        .status
-        .success()
+        fx.run_with_path(&["bundle", "import", "--as", "demo-agent"], &before, &[])
+            .status
+            .success()
     );
 
     // The same bundle, one security field richer: where a credential the cage signed in for may
@@ -4354,14 +4330,11 @@ fn a_forced_bundle_import_names_what_the_incoming_fragment_adds() {
          shared_credential = [[\"api.example.com\", \"app.example.com\"]]\n",
     )
     .unwrap();
-    let forced = fx.run(&[
-        "bundle",
-        "import",
-        "--force",
-        "--as",
-        "demo-agent",
-        after.to_str().unwrap(),
-    ]);
+    let forced = fx.run_with_path(
+        &["bundle", "import", "--force", "--as", "demo-agent"],
+        &after,
+        &[],
+    );
     assert!(forced.status.success());
     let err = String::from_utf8_lossy(&forced.stderr).to_string();
     assert!(
@@ -4392,7 +4365,7 @@ allow = ["{*,WS} https://api.example.com"]
     )
     .unwrap();
 
-    let imp = fx.run(&["bundle", "import", frag.to_str().unwrap()]);
+    let imp = fx.run_with_path(&["bundle", "import"], &frag, &[]);
     assert!(
         imp.status.success(),
         "{}",
@@ -4405,7 +4378,7 @@ allow = ["{*,WS} https://api.example.com"]
     );
 
     // A second import of the same name is refused, and writes nothing.
-    let clash = fx.run(&["bundle", "import", frag.to_str().unwrap()]);
+    let clash = fx.run_with_path(&["bundle", "import"], &frag, &[]);
     assert!(!clash.status.success());
     assert!(
         String::from_utf8_lossy(&clash.stderr).contains("the bundle 'demo-agent' already exists"),
@@ -5319,14 +5292,19 @@ fn a_write_to_a_profile_is_held_to_how_the_loader_reads_one() {
     let dotted = fx.config_home.path().join("sbx/apps/../apps/demo.toml");
     let through_link = linked.join("demo.toml");
     for (dir, file) in [
-        (fx.scratch(), dotted.to_str().unwrap()),
-        (fx.scratch(), through_link.to_str().unwrap()),
-        (apps.as_path(), "demo.toml"),
+        (fx.scratch(), dotted.as_path()),
+        (fx.scratch(), through_link.as_path()),
+        (apps.as_path(), Path::new("demo.toml")),
     ] {
-        let out = fx.run_in(dir, &["config", "set", "contract", "bogus", "-c", file]);
+        let out = fx
+            .cmd_in(dir, &["config", "set", "contract", "bogus", "-c"])
+            .arg(file)
+            .output()
+            .expect("spawn sbx");
         assert!(
             !out.status.success(),
-            "`-c {file}` from {} must be refused:\n{}",
+            "`-c {}` from {} must be refused:\n{}",
+            file.display(),
             dir.display(),
             String::from_utf8_lossy(&out.stderr)
         );
