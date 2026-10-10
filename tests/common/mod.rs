@@ -430,6 +430,22 @@ pub fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// What a `--json` verb printed on stdout, parsed.
+///
+/// A document that does not parse fails the test with the exit status and both streams. The parse
+/// error alone says where the document broke, which for a run that failed is the first byte of an
+/// empty stdout, while the reason sits on stderr.
+pub fn json_of(out: &Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout is not a JSON document ({e}); sbx {}:\n{}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
 /// Whether an attached shell has printed a prompt into `out` and is ready to be driven.
 ///
 /// The last character of a shell prompt is bash's `\$`, which it renders `#` when the euid is 0 and
