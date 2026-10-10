@@ -28,31 +28,41 @@ fn sbx(args: &[&str], home: &Path) -> Command {
     cmd
 }
 
-/// Run `cmd` to completion, asserted to have succeeded, returning stdout. The stream is a pipe, so
-/// the output is plain text and can be asserted verbatim.
-///
-/// Held to UTF-8 rather than read lossily: sbx writes text, and a byte that is not would be one it
-/// let through, which a lossy read would hide. A failure shows what was written on both streams.
-fn ok(cmd: &mut Command) -> String {
-    let out = cmd.output().expect("spawn sbx");
-    let shown = cmd
-        .get_args()
+/// The arguments of `cmd`, for a failure message.
+fn shown(cmd: &Command) -> String {
+    cmd.get_args()
         .map(|a| a.to_string_lossy())
         .collect::<Vec<_>>()
-        .join(" ");
-    assert!(
-        out.status.success(),
-        "`sbx {shown}` failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    match String::from_utf8(out.stdout) {
-        Ok(text) => text,
-        Err(e) => panic!(
-            "`sbx {shown}` wrote a stdout that is not UTF-8:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(e.as_bytes()),
+        .join(" ")
+}
+
+/// Both streams of a run as text, held to UTF-8 rather than read lossily: sbx writes text, and a
+/// byte that is not would be one it let through, which a lossy read would hide. A failure names the
+/// command and shows what was written on both streams.
+fn streams(cmd: &Command, out: &std::process::Output) -> (String, String) {
+    let text = |name: &str, bytes: &[u8]| match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(_) => panic!(
+            "`sbx {}` wrote a {name} that is not UTF-8:\nstdout:\n{}\nstderr:\n{}",
+            shown(cmd),
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         ),
-    }
+    };
+    (text("stdout", &out.stdout), text("stderr", &out.stderr))
+}
+
+/// Run `cmd` to completion, asserted to have succeeded, returning stdout. The stream is a pipe, so
+/// the output is plain text and can be asserted verbatim.
+fn ok(cmd: &mut Command) -> String {
+    let out = cmd.output().expect("spawn sbx");
+    assert!(
+        out.status.success(),
+        "`sbx {}` failed: {}",
+        shown(cmd),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    streams(cmd, &out).0
 }
 
 /// Run `sbx <args>` with a throwaway home, asserted to have succeeded, returning stdout.
@@ -151,11 +161,8 @@ fn a_plugin_installed_without_a_record_reads_as_unknown() {
 /// command that reports a broken state writes to each.
 fn both(cmd: &mut Command) -> (i32, String, String) {
     let out = cmd.output().expect("spawn sbx");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    let (stdout, stderr) = streams(cmd, &out);
+    (out.status.code().unwrap_or(-1), stdout, stderr)
 }
 
 /// Run `sbx <args>` like [`run`], but tolerate any exit status and return the code with both
