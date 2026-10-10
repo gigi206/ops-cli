@@ -143,14 +143,13 @@ pub(crate) fn upgrade_self_cmd(mode: crate::sandbox::RollMode) -> ExitCode {
         }
         Ok(Outcome::Replaced { to }) => {
             outln!("sbx: replaced {}: {from} → {to}", target.display());
-            let running = crate::session::Registry::at(layout.data_dir())
-                .live()
-                .map_or(0, |live| live.len());
-            if running > 0 {
-                diag::note(&format!(
-                    "the sessions already running ({running}) keep the sbx they started with \
-                     until they end; `sbx session ls` lists them."
-                ));
+            match running_sessions_note(layout.data_dir()) {
+                Ok(Some(note)) => diag::note(&note),
+                Ok(None) => {}
+                Err(why) => diag::warn(&format!(
+                    "{why} — any session already running keeps the sbx it started with until it \
+                     ends"
+                )),
             }
         }
         Ok(Outcome::Available { tag }) => {
@@ -168,6 +167,20 @@ pub(crate) fn upgrade_self_cmd(mode: crate::sandbox::RollMode) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// The note a replacement ends on: how many sessions still run the sbx they started with, or
+/// `None` when none does. `Err` is the reason the registry cannot be read, which the caller says
+/// as a warning: the replacement stands, and only the count is unknown, which an absent note
+/// would have reported as none.
+fn running_sessions_note(data_dir: &Path) -> Result<Option<String>, String> {
+    let running = crate::asked_sessions(data_dir)?.len();
+    Ok((running > 0).then(|| {
+        format!(
+            "the sessions already running ({running}) keep the sbx they started with until they \
+             end; `sbx session ls` lists them."
+        )
+    }))
 }
 
 /// The file this process was started from, when its user can replace it.
@@ -348,6 +361,36 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     const COMMIT: &str = "0a9ad1c73748cfa9b09d1994ece8a2aaa4ed8fe5";
+
+    /// The note after a replacement counts the sessions still running the old sbx. A registry not
+    /// created yet is none, and no note; one that cannot be read is the reason for a warning, not a
+    /// count of zero. A `sessions` entry that is a plain file is the unreadable registry.
+    #[test]
+    fn the_running_sessions_note_tells_none_from_unknown() {
+        use crate::session::{Kind, Registry, Session, SessionRuntime};
+        let absent = TmpDir::new();
+        assert_eq!(running_sessions_note(absent.path()), Ok(None));
+
+        let unreadable = TmpDir::new();
+        std::fs::write(unreadable.join("sessions"), b"not a directory").unwrap();
+        let why = running_sessions_note(unreadable.path()).expect_err("the registry is unreadable");
+        assert!(why.contains("cannot read the session registry"), "{why}");
+
+        let running = TmpDir::new();
+        let me = Session::current(
+            PathBuf::from("/home/u/proj"),
+            Kind::Run,
+            SessionRuntime::GlobalApp("demo".to_string()),
+        )
+        .expect("read this process's session identity");
+        Registry::at(running.path())
+            .register(&me)
+            .expect("register the session");
+        let note = running_sessions_note(running.path())
+            .expect("the registry is readable")
+            .expect("one session runs");
+        assert!(note.contains("(1)"), "{note}");
+    }
 
     /// A release, a stand-in nix that answers from files, and a binary to replace.
     struct Bench {
