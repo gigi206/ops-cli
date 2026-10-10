@@ -54,7 +54,7 @@ fn net_rules_lists_config_and_builtin_rules_tagged_by_source() {
     );
 
     // `--source builtin` shows only the built-in set; the config rules are gone.
-    let out = fx.run(&["net", "rules", "--source", "builtin"]);
+    let out = fx.run_ok(&["net", "rules", "--source", "builtin"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("(builtin)") && !stdout.contains("github.com  (config)"),
@@ -62,7 +62,7 @@ fn net_rules_lists_config_and_builtin_rules_tagged_by_source() {
     );
 
     // `--source config` shows only the config rules; the built-in set is gone.
-    let out = fx.run(&["net", "rules", "-s", "config"]);
+    let out = fx.run_ok(&["net", "rules", "-s", "config"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("github.com  (config)") && !stdout.contains("(builtin)"),
@@ -70,7 +70,7 @@ fn net_rules_lists_config_and_builtin_rules_tagged_by_source() {
     );
 
     // `--filter` substring-matches the rule text (case-insensitive).
-    let out = fx.run(&["net", "rules", "--filter", "EVIL"]);
+    let out = fx.run_ok(&["net", "rules", "--filter", "EVIL"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("evil.nixos.org") && !stdout.contains("github.com"),
@@ -78,7 +78,7 @@ fn net_rules_lists_config_and_builtin_rules_tagged_by_source() {
     );
 
     // a filter that matches nothing reports it (not silent empty output).
-    let out = fx.run(&["net", "rules", "--filter", "zzz-no-match"]);
+    let out = fx.run_ok(&["net", "rules", "--filter", "zzz-no-match"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("no rules match the filter"));
 }
 
@@ -103,7 +103,7 @@ fn net_rules_under_a_non_filtering_posture_has_no_rules() {
     let fx = Project::new("net");
     fx.write_project("network = \"shared\"\n");
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx.run(&["net", "rules"]);
+    let out = fx.run_ok(&["net", "rules"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     // No rules at all — not even the built-in set, which the proxy unions only under a filtering
     // posture (it does not run under `shared`).
@@ -116,7 +116,7 @@ fn net_rules_under_a_non_filtering_posture_has_no_rules() {
 
     fx.write_project("network = \"none\"\n");
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let out = fx.run(&["net", "rules"]);
+    let out = fx.run_ok(&["net", "rules"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("network: none") && stdout.contains("no egress rules"),
@@ -239,7 +239,7 @@ fn net_allow_bootstraps_a_local_allowlist_retrusts_and_rules_shows_it() {
     );
     // The round-trip: the project is now trusted, so the rule is honored and `sbx net rules` lists
     // it as a config rule (a re-trust failure would have left it untrusted and dropped).
-    let rules = fx.run(&["net", "rules"]);
+    let rules = fx.run_ok(&["net", "rules"]);
     assert!(
         String::from_utf8_lossy(&rules.stdout).contains("allow https://github.com  (config)"),
         "the persisted, re-trusted rule must appear in `sbx net rules`:\n{}",
@@ -247,7 +247,7 @@ fn net_allow_bootstraps_a_local_allowlist_retrusts_and_rules_shows_it() {
     );
 
     // A second add of the same rule is an idempotent no-op.
-    let again = fx.run(&["net", "allow", "github.com"]);
+    let again = fx.run_ok(&["net", "allow", "github.com"]);
     assert!(String::from_utf8_lossy(&again.stdout).contains("already present"));
 }
 
@@ -275,7 +275,7 @@ fn net_mute_and_unmute_round_trip_through_config() {
     );
 
     // It reloads and `sbx net rules` lists it as a config mute rule (tagged `mute`, not allow/deny).
-    let rules = fx.run(&["net", "rules"]);
+    let rules = fx.run_ok(&["net", "rules"]);
     assert!(
         String::from_utf8_lossy(&rules.stdout)
             .contains("mute  https://play.googleapis.com  (config)"),
@@ -295,13 +295,13 @@ fn net_mute_and_unmute_round_trip_through_config() {
         "unmute must report the removal:\n{}",
         String::from_utf8_lossy(&unmuted.stdout)
     );
-    let rules = fx.run(&["net", "rules"]);
+    let rules = fx.run_ok(&["net", "rules"]);
     assert!(
         !String::from_utf8_lossy(&rules.stdout).contains("play.googleapis.com"),
         "the mute rule is gone after unmute:\n{}",
         String::from_utf8_lossy(&rules.stdout)
     );
-    let again = fx.run(&["net", "unmute", "play.googleapis.com"]);
+    let again = fx.run_ok(&["net", "unmute", "play.googleapis.com"]);
     assert!(
         String::from_utf8_lossy(&again.stdout).contains("no change"),
         "a redundant unmute is a reported no-op:\n{}",
@@ -326,7 +326,7 @@ fn net_unallow_and_undeny_round_trip_through_config() {
             .status
             .success()
     );
-    let rules = String::from_utf8_lossy(&fx.run(&["net", "rules"]).stdout).into_owned();
+    let rules = String::from_utf8_lossy(&fx.run_ok(&["net", "rules"]).stdout).into_owned();
     assert!(
         rules.contains("api.example.com") && rules.contains("tracker.example.com"),
         "both rules must be in effect before they are removed:\n{rules}"
@@ -349,7 +349,7 @@ fn net_unallow_and_undeny_round_trip_through_config() {
         );
         // Idempotent, exactly like `unmute`: a rule that is not there is a reported no-op, and the
         // absence of a re-trust line is the visible half of "nothing was written".
-        let again = fx.run(&["net", verb, rule]);
+        let again = fx.run_ok(&["net", verb, rule]);
         let stdout = String::from_utf8_lossy(&again.stdout);
         assert!(
             stdout.contains("no change") && !stdout.contains("re-trusted"),
@@ -357,7 +357,7 @@ fn net_unallow_and_undeny_round_trip_through_config() {
         );
     }
 
-    let rules = String::from_utf8_lossy(&fx.run(&["net", "rules"]).stdout).into_owned();
+    let rules = String::from_utf8_lossy(&fx.run_ok(&["net", "rules"]).stdout).into_owned();
     assert!(
         !rules.contains("api.example.com") && !rules.contains("tracker.example.com"),
         "neither rule may survive its removal:\n{rules}"
@@ -606,7 +606,7 @@ fn net_allow_persists_a_tcp_rule_that_reloads_as_a_splice() {
     );
 
     // The round-trip: it persists with its scheme and reloads as a config rule (the layer visible).
-    let rules = fx.run(&["net", "rules"]);
+    let rules = fx.run_ok(&["net", "rules"]);
     assert!(
         String::from_utf8_lossy(&rules.stdout).contains("allow tcp://ssh.example.com:22  (config)"),
         "the persisted tcp:// rule must reload and show its scheme:\n{}",
@@ -614,7 +614,7 @@ fn net_allow_persists_a_tcp_rule_that_reloads_as_a_splice() {
     );
 
     // And it decides a raw splice — the reloaded rule drives `l4_decision`, not just display.
-    let hit = fx.run(&["test", "net", "tcp://ssh.example.com:22"]);
+    let hit = fx.run_ok(&["test", "net", "tcp://ssh.example.com:22"]);
     assert!(
         String::from_utf8_lossy(&hit.stdout).contains("SPLICED"),
         "the persisted tcp:// rule must splice its host:port:\n{}",
@@ -656,7 +656,7 @@ fn a_host_with_both_a_tcp_and_an_l7_rule_warns() {
     );
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
-    let out = fx.run(&["net", "rules"]);
+    let out = fx.run_ok(&["net", "rules"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("api.example.com")
@@ -670,7 +670,7 @@ fn a_host_with_both_a_tcp_and_an_l7_rule_warns() {
         "[network]\nmode = \"deny\"\nallow = [\"tcp://ssh.example.com:22\", \"api.example.com\"]\n",
     );
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
-    let clean = fx.run(&["net", "rules"]);
+    let clean = fx.run_ok(&["net", "rules"]);
     assert!(
         !String::from_utf8_lossy(&clean.stderr).contains("splice is uninspected"),
         "disjoint single-layer hosts must not warn:\n{}",
@@ -779,7 +779,7 @@ fn a_net_table_defines_no_group_and_is_named_as_an_unknown_section() {
     );
 
     // And the resolved view names the section it passed over, with no hint pointing anywhere.
-    let shown = fx.run(&["config", "show"]);
+    let shown = fx.run_ok(&["config", "show"]);
     let stderr = String::from_utf8_lossy(&shown.stderr);
     assert!(
         stderr.contains("unknown key `net`"),
@@ -834,7 +834,7 @@ fn net_groups_lists_resolves_and_errors_on_unknown() {
     );
 
     // JSON carries the resolved entries.
-    let out = fx.run(&["net", "groups", "mcp", "--json"]);
+    let out = fx.run_ok(&["net", "groups", "mcp", "--json"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("\"name\":\"mcp\"") && stdout.contains("mcp.context7.com"),
@@ -871,7 +871,7 @@ fn net_rules_collapses_a_group_and_expands_on_demand() {
     );
 
     // `--expand`: the group unfolds to its hosts, each noting its `@mcp` origin.
-    let out = fx.run(&[
+    let out = fx.run_ok(&[
         "net", "rules", "-a", "demo", "--source", "config", "--expand",
     ]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -886,7 +886,7 @@ fn net_rules_collapses_a_group_and_expands_on_demand() {
 
     // `--filter` by a host *inside* the group must find it (a filter implies --expand, so a group
     // never hides a matching host behind its collapsed `@mcp` row).
-    let out = fx.run(&["net", "rules", "-a", "demo", "--filter", "context7"]);
+    let out = fx.run_ok(&["net", "rules", "-a", "demo", "--filter", "context7"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("mcp.context7.com") && stdout.contains("(config, @mcp)"),
@@ -924,7 +924,7 @@ fn net_groups_export_import_round_trips_between_configs() {
         "import failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let resolved = dst.run(&["net", "groups", "mcp"]);
+    let resolved = dst.run_ok(&["net", "groups", "mcp"]);
     assert!(
         String::from_utf8_lossy(&resolved.stdout).contains("mcp.context7.com"),
         "the imported group must resolve in the destination:\n{}",
@@ -1022,7 +1022,7 @@ fn a_forced_group_import_names_what_it_dropped_and_keeps_the_group_it_replaced()
         .status
         .success()
     );
-    let listed = fx.run(&["net", "groups", "ci"]);
+    let listed = fx.run_ok(&["net", "groups", "ci"]);
     assert!(
         String::from_utf8_lossy(&listed.stdout).contains("local.example.org"),
         "re-importing the kept fragment restores the entry"
@@ -1238,7 +1238,7 @@ fn inline_app_in_global_sbx_toml_is_dropped_with_migration_guidance() {
         "[app.foo]\ncmd = \"true\"\n\
          [app.foo.network]\nmode = \"deny\"\nallow = [\"api.foo.test\"]\n",
     );
-    let rules = fx.run(&["net", "rules"]);
+    let rules = fx.run_ok(&["net", "rules"]);
     let stderr = String::from_utf8_lossy(&rules.stderr);
     assert!(
         stderr.contains("app `foo`") && stderr.contains("sbx app export foo"),
@@ -1319,7 +1319,7 @@ fn net_allow_app_local_amends_the_profile_rather_than_replacing_it() {
         "the overlay must stay mode-less, which is what makes it amend:\n{body}"
     );
 
-    let shown = fx.run(&["config", "show", "--app", "demo"]);
+    let shown = fx.run_ok(&["config", "show", "--app", "demo"]);
     let text = String::from_utf8_lossy(&shown.stdout).to_string();
     for kept in ["a.test", "b.test", "c.test", "45s"] {
         assert!(
@@ -1376,7 +1376,7 @@ fn a_catch_all_rule_carries_its_reach_from_the_config_to_the_listing() {
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"re:\", \"github.com\"]\n");
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
-    let out = fx.run(&["net", "rules"]);
+    let out = fx.run_ok(&["net", "rules"]);
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(
         s.contains("allow re:  (config, matches every host)"),
@@ -1397,7 +1397,7 @@ fn a_catch_all_rule_carries_its_reach_from_the_config_to_the_listing() {
     );
 
     // And the tester qualifies a pass it decided: the URL is not what made it through.
-    let tested = fx.run(&["test", "net", "https://anything.example.test"]);
+    let tested = fx.run_ok(&["test", "net", "https://anything.example.test"]);
     let t = String::from_utf8_lossy(&tested.stdout);
     assert!(
         t.contains("matches every host"),
@@ -1410,11 +1410,23 @@ fn the_catch_all_refusal_names_each_verbs_own_way_out() {
     // One syntax check serves four entry points, and each must send its author the way *they* were
     // going. Pinned through the real binary because the wiring is what breaks: the grammar knows
     // how to phrase each refusal only if the CLI hands it the verb it was called with.
+    // Each is a usage refusal: exit 2, with the way out on stderr.
+    #[track_caller]
+    fn refusal(p: &Project, args: &[&str]) -> String {
+        let out = p.run(args);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "sbx {} must be refused:\n{stderr}",
+            args.join(" ")
+        );
+        stderr
+    }
     let fx = Project::new("net");
-    let stderr = |out: &Output| String::from_utf8_lossy(&out.stderr).to_string();
 
     // `allow *` wants everything open, and is pointed at the posture that really opens it.
-    let allow = stderr(&fx.run(&["net", "allow", "*"]));
+    let allow = refusal(&fx, &["net", "allow", "*"]);
     assert!(
         allow.contains("mode = \"shared\""),
         "an allow catch-all is pointed at opening the network:\n{allow}"
@@ -1422,14 +1434,14 @@ fn the_catch_all_refusal_names_each_verbs_own_way_out() {
 
     // `deny *` wants everything closed. Pointing *this* author at `shared` would tell them to open
     // the network they just asked to shut — the defect this test exists to keep out.
-    let deny = stderr(&fx.run(&["net", "deny", "*"]));
+    let deny = refusal(&fx, &["net", "deny", "*"]);
     assert!(
         deny.contains("mode = \"none\"") && !deny.contains("shared"),
         "a deny catch-all is pointed at closing the network, never at opening it:\n{deny}"
     );
 
     // A mute changes no verdict, so no posture switch answers it at all.
-    let mute = stderr(&fx.run(&["net", "mute", "*"]));
+    let mute = refusal(&fx, &["net", "mute", "*"]);
     assert!(
         mute.contains("re:.*") && !mute.contains("mode ="),
         "a mute catch-all gets the log-filter answer, not a posture:\n{mute}"
@@ -1451,7 +1463,7 @@ fn the_catch_all_refusal_names_each_verbs_own_way_out() {
             .status
             .success()
     );
-    let target = stderr(&filtered.run(&["test", "net", "https://*"]));
+    let target = refusal(&filtered, &["test", "net", "https://*"]);
     assert!(
         target.contains("not a host") && !target.contains("mode ="),
         "a test target is refused as a request:\n{target}"
@@ -1470,13 +1482,13 @@ fn ask_mode_renders_across_config_rules_and_the_tester() {
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     // `sbx config show` names the ask posture and surfaces the configured timeout.
-    let show = fx.run(&["config", "show"]);
+    let show = fx.run_ok(&["config", "show"]);
     let s = String::from_utf8_lossy(&show.stdout);
     assert!(s.contains("network: ask"), "config show:\n{s}");
     assert!(s.contains("ask timeout: 90s"), "config show:\n{s}");
 
     // `sbx net rules` frames the ask posture and still tags the carve-out rules.
-    let rules = fx.run(&["net", "rules"]);
+    let rules = fx.run_ok(&["net", "rules"]);
     let r = String::from_utf8_lossy(&rules.stdout);
     assert!(r.contains("network: ask"), "net rules:\n{r}");
     assert!(
@@ -1489,11 +1501,11 @@ fn ask_mode_renders_across_config_rules_and_the_tester() {
     );
 
     // `sbx test net` reports an unmatched host as "would ask" (no static verdict).
-    let test = fx.run(&["test", "net", "https://unlisted.example.com/x"]);
+    let test = fx.run_ok(&["test", "net", "https://unlisted.example.com/x"]);
     let t = String::from_utf8_lossy(&test.stdout);
     assert!(t.contains("WOULD ASK"), "test net:\n{t}");
     // A carve-out host still resolves statically: the allow rule auto-passes.
-    let allowed = fx.run(&["test", "net", "https://github.com/x"]);
+    let allowed = fx.run_ok(&["test", "net", "https://github.com/x"]);
     assert!(
         String::from_utf8_lossy(&allowed.stdout).contains("ALLOWED"),
         "an ask-mode allow rule must still pass: {:?}",
@@ -2262,7 +2274,7 @@ fn net_pending_all_app_scoped_drains_a_registered_app_session() {
             .unwrap();
     });
 
-    let out = fx.run(&[
+    let out = fx.run_ok(&[
         "net",
         "pending",
         "allow",
@@ -2301,7 +2313,7 @@ fn net_pending_all_names_an_older_session_instead_of_claiming_empty() {
         // An old server does not understand `ALLOW *`.
         (&stream).write_all(b"err bad-request\n").unwrap();
     });
-    let out = fx.run(&["net", "pending", "allow", "--all"]);
+    let out = fx.run_ok(&["net", "pending", "allow", "--all"]);
     let _ = std::fs::remove_file(&socket);
     server.join().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2334,7 +2346,7 @@ fn net_pending_all_save_names_an_older_session_and_saves_nothing() {
         (&stream).write_all(b"err bad-request\n").unwrap();
     });
     // `--global` avoids the project filter so the unsupported session is reached.
-    let out = fx.run(&["net", "pending", "allow", "--all", "--save", "--global"]);
+    let out = fx.run_ok(&["net", "pending", "allow", "--all", "--save", "--global"]);
     let _ = std::fs::remove_file(&socket);
     server.join().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2471,7 +2483,7 @@ fn net_pending_list_collapses_identical_retries_in_text_and_json() {
 
     // Text: the two dl.test retries collapse to one `×2` line at the lowest seq (44444.1) with the
     // largest wait (80s); the different destination keeps its own line; the higher seq is gone.
-    let text = fx.run(&["net", "pending"]);
+    let text = fx.run_ok(&["net", "pending"]);
     let t = String::from_utf8_lossy(&text.stdout);
     assert!(
         t.contains("44444.1") && t.contains("dl.test:443/latest") && t.contains("×2, waiting 80s"),
@@ -2505,18 +2517,17 @@ fn a_test_verb_answers_under_the_one_shot_override_a_launch_would_carry() {
     let fx = Project::new("net");
     fx.write_global("[network]\nmode = \"deny\"\n");
 
-    let base = fx.run(&["test", "net", "https://example.test/x"]);
+    let base = fx.run_ok(&["test", "net", "https://example.test/x"]);
     let b = String::from_utf8_lossy(&base.stdout);
     assert!(
         b.contains("DENIED"),
         "the project posture denies, with nothing in the environment:\n{b}"
     );
 
-    let under = fx
-        .cmd(&["test", "net", "https://example.test/x"])
-        .env("SBX_NET", "allow")
-        .output()
-        .expect("spawn sbx");
+    let under = common::output_ok(
+        fx.cmd(&["test", "net", "https://example.test/x"])
+            .env("SBX_NET", "allow"),
+    );
     let u = String::from_utf8_lossy(&under.stdout);
     assert!(
         u.contains("ALLOWED"),
@@ -2536,11 +2547,10 @@ fn a_deny_rule_a_one_shot_override_with_rules_of_its_own_drops_is_named() {
          deny = [\"tracker.example.test\"]\n",
     );
     let under = |value: &str| {
-        let out = fx
-            .cmd(&["test", "net", "https://tracker.example.test/x"])
-            .env("SBX_NET", value)
-            .output()
-            .expect("spawn sbx");
+        let out = common::output_ok(
+            fx.cmd(&["test", "net", "https://tracker.example.test/x"])
+                .env("SBX_NET", value),
+        );
         (
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -2578,18 +2588,17 @@ fn the_override_reaches_every_test_verb_and_not_only_the_one_that_wanted_it() {
     let fx = Project::new("net");
     std::fs::write(fx.proj.path().join("secret.txt"), b"").expect("stage the file the mask names");
 
-    let base = fx.run(&["test", "fs", "./secret.txt"]);
+    let base = fx.run_ok(&["test", "fs", "./secret.txt"]);
     let b = String::from_utf8_lossy(&base.stdout);
     assert!(
         b.contains("OPEN"),
         "nothing closes the file with an empty project:\n{b}"
     );
 
-    let under = fx
-        .cmd(&["test", "fs", "./secret.txt"])
-        .env("SBX_CONFIG", "[fs]\ndeny = [\"secret.txt\"]\n")
-        .output()
-        .expect("spawn sbx");
+    let under = common::output_ok(
+        fx.cmd(&["test", "fs", "./secret.txt"])
+            .env("SBX_CONFIG", "[fs]\ndeny = [\"secret.txt\"]\n"),
+    );
     let u = String::from_utf8_lossy(&under.stdout);
     assert!(
         u.contains("DENIED") && u.contains("secret.txt"),
@@ -2728,7 +2737,7 @@ fn net_rules_targets_an_app_effective_policy() {
     );
 
     // `--source config` + `--app`: the app's config rules only, no built-in set.
-    let cfg = fx.run(&["net", "rules", "--app", "demo", "--source", "config"]);
+    let cfg = fx.run_ok(&["net", "rules", "--app", "demo", "--source", "config"]);
     let c = String::from_utf8_lossy(&cfg.stdout);
     assert!(
         c.contains("api.demo.test") && !c.contains("(builtin)"),
@@ -2803,24 +2812,24 @@ fn test_net_method_scopes_a_rule_to_its_verbs() {
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     // the prefix is shown in the rule listing, with the implicit scheme (443 is the default → bare)
-    let rules = fx.run(&["net", "rules", "--source", "config"]);
+    let rules = fx.run_ok(&["net", "rules", "--source", "config"]);
     assert!(
         String::from_utf8_lossy(&rules.stdout).contains("{GET,HEAD} https://api.test"),
         "the method prefix and scheme must be listed"
     );
 
     // GET (and the default verb) reach; POST does not
-    let get = fx.run(&["test", "net", "--method", "GET", "https://api.test/x"]);
+    let get = fx.run_ok(&["test", "net", "--method", "GET", "https://api.test/x"]);
     assert!(
         String::from_utf8_lossy(&get.stdout).contains("ALLOWED"),
         "GET must be allowed by a GET/HEAD rule"
     );
-    let dflt = fx.run(&["test", "net", "https://api.test/x"]);
+    let dflt = fx.run_ok(&["test", "net", "https://api.test/x"]);
     assert!(
         String::from_utf8_lossy(&dflt.stdout).contains("ALLOWED"),
         "the default verb (GET) must be allowed"
     );
-    let post = fx.run(&["test", "net", "-X", "POST", "https://api.test/x"]);
+    let post = fx.run_ok(&["test", "net", "-X", "POST", "https://api.test/x"]);
     assert!(
         String::from_utf8_lossy(&post.stdout).contains("DENIED"),
         "POST must be denied by a GET/HEAD-only rule"
@@ -2835,7 +2844,7 @@ fn test_net_reports_a_tcp_rule_as_a_raw_splice() {
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     // the rule listing shows the `tcp://` scheme, so the layer (the proto) is visible
-    let rules = fx.run(&["net", "rules", "--source", "config"]);
+    let rules = fx.run_ok(&["net", "rules", "--source", "config"]);
     assert!(
         String::from_utf8_lossy(&rules.stdout).contains("tcp://ssh.example.com:22"),
         "the tcp:// scheme must be shown in the rule listing:\n{}",
@@ -2843,7 +2852,7 @@ fn test_net_reports_a_tcp_rule_as_a_raw_splice() {
     );
 
     // the exact host:port is SPLICED (raw L4)
-    let hit = fx.run(&["test", "net", "tcp://ssh.example.com:22"]);
+    let hit = fx.run_ok(&["test", "net", "tcp://ssh.example.com:22"]);
     let h = String::from_utf8_lossy(&hit.stdout);
     assert!(
         h.contains("SPLICED"),
@@ -2851,14 +2860,14 @@ fn test_net_reports_a_tcp_rule_as_a_raw_splice() {
     );
 
     // a different port on the same host is NOT spliced (it would take the inspected L7 path)
-    let other_port = fx.run(&["test", "net", "tcp://ssh.example.com:2222"]);
+    let other_port = fx.run_ok(&["test", "net", "tcp://ssh.example.com:2222"]);
     assert!(
         String::from_utf8_lossy(&other_port.stdout).contains("NOT SPLICED"),
         "a port the tcp:// rule does not cover must not splice"
     );
 
     // a different host is not spliced
-    let other_host = fx.run(&["test", "net", "tcp://other.example.com:22"]);
+    let other_host = fx.run_ok(&["test", "net", "tcp://other.example.com:22"]);
     assert!(
         String::from_utf8_lossy(&other_host.stdout).contains("NOT SPLICED"),
         "an unlisted host must not splice"
@@ -2876,7 +2885,7 @@ fn test_net_reports_a_deny_suppressed_splice() {
     );
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
-    let out = fx.run(&["test", "net", "tcp://evil.com:443"]);
+    let out = fx.run_ok(&["test", "net", "tcp://evil.com:443"]);
     let o = String::from_utf8_lossy(&out.stdout);
     assert!(
         o.contains("NOT SPLICED") && o.contains("deny rule suppressed"),
@@ -2897,7 +2906,7 @@ fn an_app_is_read_by_default_while_the_baseline_shell_stays_open() {
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     // Baseline (no --app): all verbs — a POST is allowed.
-    let base_post = fx.run(&["test", "net", "-X", "POST", "https://shared.test/x"]);
+    let base_post = fx.run_ok(&["test", "net", "-X", "POST", "https://shared.test/x"]);
     assert!(
         String::from_utf8_lossy(&base_post.stdout).contains("ALLOWED"),
         "the baseline shell is all-verbs (Mode A open):\n{}",
@@ -2905,7 +2914,7 @@ fn an_app_is_read_by_default_while_the_baseline_shell_stays_open() {
     );
 
     // The app inherits the same allowlist but is read-by-default: GET passes, POST is denied.
-    let app_get = fx.run(&[
+    let app_get = fx.run_ok(&[
         "test",
         "net",
         "--app",
@@ -2918,7 +2927,7 @@ fn an_app_is_read_by_default_while_the_baseline_shell_stays_open() {
         String::from_utf8_lossy(&app_get.stdout).contains("ALLOWED"),
         "GET under the app passes"
     );
-    let app_post = fx.run(&[
+    let app_post = fx.run_ok(&[
         "test",
         "net",
         "--app",
@@ -2946,7 +2955,7 @@ fn an_app_declares_a_write_host_with_a_star_prefix() {
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     // `net rules --app` shows the unscoped host narrowed and the {*} host kept.
-    let rules = fx.run(&["net", "rules", "--app", "agent"]);
+    let rules = fx.run_ok(&["net", "rules", "--app", "agent"]);
     let r = String::from_utf8_lossy(&rules.stdout);
     assert!(
         r.contains("allow {GET,HEAD} https://read.test"),
@@ -2958,7 +2967,7 @@ fn an_app_declares_a_write_host_with_a_star_prefix() {
     );
 
     // The verdicts follow: POST denied on the read host, allowed on the write host.
-    let read_post = fx.run(&[
+    let read_post = fx.run_ok(&[
         "test",
         "net",
         "--app",
@@ -2971,7 +2980,7 @@ fn an_app_declares_a_write_host_with_a_star_prefix() {
         String::from_utf8_lossy(&read_post.stdout).contains("DENIED"),
         "POST to the read-by-default host is denied"
     );
-    let write_post = fx.run(&[
+    let write_post = fx.run_ok(&[
         "test",
         "net",
         "--app",
