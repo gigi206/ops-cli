@@ -185,6 +185,10 @@ struct Attested<'a> {
 /// a modified, untrusted file — worse than either outcome, since the user must now review bytes sbx
 /// changed under them.
 ///
+/// A write `--trust` will bless is also held to what this read found ([`config::manage::admit_write`]),
+/// through the returned guard: the edit reads the file again, and a file put in place between the
+/// two reads is refused rather than written into and blessed.
+///
 /// Scope decides the gate, not the verb: a `-c <file>` target carries a trust marker like any
 /// project config, so it is admitted the same way. Only the global config and the app profiles are
 /// exempt, and they are exempt because they are trusted by *location* — there is no marker to bless.
@@ -194,23 +198,26 @@ fn admit_config_write(
     gated: bool,
     trust_flag: bool,
     store_dir: Option<&Path>,
-) -> Result<(bool, trust::TrustInputs), ExitCode> {
+) -> Result<(bool, trust::TrustInputs, Option<config::manage::Admission>), ExitCode> {
     if !gated {
-        return Ok((false, trust::TrustInputs::new()));
+        return Ok((false, trust::TrustInputs::new(), None));
     }
     // No store means no marker can be read and none can be written: `--trust` cannot bless anything,
     // which `report_write_trust` says in its own words. Nothing to admit.
     let Some(dir) = store_dir else {
-        return Ok((false, trust::TrustInputs::new()));
+        return Ok((false, trust::TrustInputs::new(), None));
     };
-    let (state, mise) = trust::state_with_inputs(dir, path);
+    // Whether the config exists is answered by the read the verdict was computed over. The mise
+    // files stay a read of their own: for an absent config the attested inputs are empty, so one
+    // that appears or goes between the two reads can only leave a marker that no longer matches.
+    let (state, mise, read) = trust::admission(dir, path);
     let has_mise = !trust::mise_files_for(path).is_empty();
-    if trust_flag && !crate::local_save_permitted(path.exists(), state, has_mise) {
+    if trust_flag && !crate::local_save_permitted(read.exists(), state, has_mise) {
         // A project with no config yet and a mise file beside it is a third case, and it names a
         // different file: `--trust` there would bless the mise file along with the one line sbx is
         // about to write. Saying the missing config "is not trusted" would point at the wrong file
         // and offer a command that cannot run on a file that does not exist.
-        if !path.exists() {
+        if !read.exists() {
             let names = trust::mise_files_for(path)
                 .iter()
                 .filter_map(|p| p.file_name())
@@ -249,7 +256,8 @@ fn admit_config_write(
         ));
         return Err(ExitCode::from(2));
     }
-    Ok((state == trust::TrustState::Trusted, mise))
+    let admission = trust_flag.then(|| config::manage::admit_write(path, read));
+    Ok((state == trust::TrustState::Trusted, mise, admission))
 }
 
 /// Resolve the file a key-taking verb (`get`/`set`/`unset`) targets and the dotted key within it,
@@ -339,7 +347,7 @@ pub(super) fn config_set(args: &[OsString]) -> ExitCode {
             Err(code) => return code,
         };
     let store_dir = trust::default_store_dir();
-    let (was_trusted, admitted_mise) =
+    let (was_trusted, admitted_mise, _admission) =
         match admit_config_write("set", &path, gated, trust, store_dir.as_deref()) {
             Ok(t) => t,
             Err(code) => return code,
@@ -430,7 +438,7 @@ pub(super) fn config_list_edit(args: &[OsString], op: ListEdit) -> ExitCode {
             Err(code) => return code,
         };
     let store_dir = trust::default_store_dir();
-    let (was_trusted, admitted_mise) =
+    let (was_trusted, admitted_mise, _admission) =
         match admit_config_write(verb, &path, gated, trust, store_dir.as_deref()) {
             Ok(t) => t,
             Err(code) => return code,
@@ -510,7 +518,7 @@ pub(super) fn config_unset(args: &[OsString]) -> ExitCode {
             Err(code) => return code,
         };
     let store_dir = trust::default_store_dir();
-    let (was_trusted, admitted_mise) =
+    let (was_trusted, admitted_mise, _admission) =
         match admit_config_write("unset", &path, gated, trust, store_dir.as_deref()) {
             Ok(t) => t,
             Err(code) => return code,
@@ -1015,6 +1023,12 @@ fn report_write_trust(
         // over the mise files `admit_config_write` judged rather than whatever is beside the
         // config now: the reasoning is [`record_trust`]'s and [`crate::trust::trust_written`]'s.
         return match record_trust(path, store_dir, "the field was written", |dir| {
+            if !config::manage::admission_verified(path) {
+                return Err(std::io::Error::other(format!(
+                    "{}: the write was not held to what sbx checked before it",
+                    path.display()
+                )));
+            }
             trust::trust_written(dir, path, attested.text.as_bytes(), attested.mise)
         }) {
             Ok(()) => ExitCode::SUCCESS,
@@ -1430,6 +1444,9 @@ mod tests {
         std::fs::write(&path, "# project config\n").expect("the starting config");
         trust::trust(&store, &path).expect("trust the starting config");
 
+        // Admitted as the verb admits it, so the write is held to the file its gate read.
+        let (_, _, read) = trust::admission(&store, &path);
+        let _admission = config::manage::admit_write(&path, read);
         let written = config::manage::set(&path, "network.stats", "false").expect("the write");
 
         let hostile = "[network]\nmode = \"shared\"\nbinds = [\"/:rw\"]\n";

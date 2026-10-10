@@ -75,6 +75,9 @@ pub(crate) enum ManageError {
     /// The value would make the whole layer unparseable (a type the schema rejects), so the write
     /// was refused rather than committed — a committed invalid layer is silently dropped at load.
     InvalidValue(String, String),
+    /// The file is no longer what the admission of this trust-gated write read ([`admit_write`]),
+    /// so the write was refused before anything was written or trusted.
+    ChangedSinceChecked(PathBuf),
     /// A `deny` rule was added but there is no filtering posture to carry it (and a `deny` must
     /// not silently create an open denylist) — the user must set a posture first.
     DenyNeedsPosture,
@@ -246,6 +249,13 @@ impl std::fmt::Display for ManageError {
                 )
             }
             ManageError::Read(e) => write!(f, "cannot read {e}"),
+            ManageError::ChangedSinceChecked(p) => write!(
+                f,
+                "{} changed between sbx's check of it and the write, so nothing was written or \
+                 trusted — review it, and run `sbx trust {}` if it is yours",
+                p.display(),
+                p.display()
+            ),
             ManageError::Write(p, e) => write!(f, "cannot write {}: {e}", p.display()),
             ManageError::Parse(p, e) => write!(f, "{} is not valid TOML: {e}", p.display()),
             ManageError::BadKey(k) => write!(f, "invalid key {k:?}"),
@@ -2274,7 +2284,9 @@ fn hold_for_write(path: &Path) -> Result<WriteGuard, ManageError> {
 /// never reads the file itself, it hands the path to `$EDITOR`. What the gate refuses here is a
 /// *silent* edit of a file whose owner or mode says its content is not exclusively yours.
 fn read_or_empty(path: &Path) -> Result<DocumentMut, ManageError> {
-    match super::safety::read_safe_bytes(path) {
+    let read = super::safety::read_safe_bytes(path);
+    held_to_admission(path, &read)?;
+    match read {
         // The gate hands back bytes, so the text conversion is explicit here. TOML is UTF-8 by
         // definition, so bytes that are not text are a malformed document rather than a read
         // failure, and the message says which of the two it is.
@@ -2290,6 +2302,70 @@ fn read_or_empty(path: &Path) -> Result<DocumentMut, ManageError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DocumentMut::new()),
         Err(e) => Err(ManageError::Read(e.to_string())),
     }
+}
+
+thread_local! {
+    /// What each trust-gated write in this thread was admitted on, by path ([`admit_write`]), and
+    /// whether the write's own read has matched it since.
+    static ADMITTED: std::cell::RefCell<
+        std::collections::HashMap<PathBuf, (crate::trust::ConfigRead, bool)>,
+    > = std::cell::RefCell::default();
+}
+
+/// Holds the write that follows to what its admission read ([`admit_write`]), until it drops.
+pub(crate) struct Admission(PathBuf);
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        ADMITTED.with_borrow_mut(|admitted| {
+            admitted.remove(&self.0);
+        });
+    }
+}
+
+/// Hold the write that follows at `path` to `read`, what the admission of a trust-gated write
+/// judged ([`crate::trust::admission`]).
+///
+/// The write reads the file again, under its guard ([`read_or_empty`]), and the project tree is
+/// writable from inside a cage. A `.sbx.toml` present when a session launched is read-only there,
+/// but one absent then is not: a file the cage put in place between the two reads was written into
+/// and then attested as sbx's own text, `[network] mode = "allow"` included. The write is refused
+/// instead when its read is not `read`, and a caller blesses only a write whose read matched
+/// ([`admission_verified`]).
+pub(crate) fn admit_write(path: &Path, read: crate::trust::ConfigRead) -> Admission {
+    ADMITTED.with_borrow_mut(|admitted| {
+        admitted.insert(path.to_path_buf(), (read, false));
+    });
+    Admission(path.to_path_buf())
+}
+
+/// Whether the write admitted at `path` read what its admission judged. False when no admission is
+/// held at `path`: a caller that forgot to take one, or named the file another way, refuses to
+/// bless rather than attesting a read nothing checked.
+pub(crate) fn admission_verified(path: &Path) -> bool {
+    ADMITTED.with_borrow(|admitted| admitted.get(path).is_some_and(|(_, verified)| *verified))
+}
+
+/// Refuse a read that is not what the admission held at `path` judged ([`admit_write`]), and mark
+/// one that is. A read with no admission held passes: a write that blesses nothing needs none.
+fn held_to_admission(path: &Path, read: &std::io::Result<Vec<u8>>) -> Result<(), ManageError> {
+    use crate::trust::ConfigRead;
+    ADMITTED.with_borrow_mut(|admitted| {
+        let Some((judged, verified)) = admitted.get_mut(path) else {
+            return Ok(());
+        };
+        let same = match (&*judged, read) {
+            (ConfigRead::Absent, Err(e)) => e.kind() == std::io::ErrorKind::NotFound,
+            (ConfigRead::Bytes(judged), Ok(now)) => judged == now,
+            _ => false,
+        };
+        if same {
+            *verified = true;
+            Ok(())
+        } else {
+            Err(ManageError::ChangedSinceChecked(path.to_path_buf()))
+        }
+    })
 }
 
 /// Write the document atomically (temp sibling then rename), so a crash mid-write never leaves a
@@ -2505,6 +2581,75 @@ mod tests {
         let w = add_learned_proc_rules(&settled, None, &rules).expect("a no-op is not an error");
         assert!(w.outcome.added.is_empty() && !w.outcome.wrote_anything());
         assert_eq!(std::fs::read_to_string(&settled).unwrap(), before);
+    }
+
+    /// A trust-gated write is held to what its admission read: a file a cage put in place between
+    /// the two, or changed there, is refused, nothing written and the file as the cage left it. One
+    /// test per write that blesses, since each reads through `read_or_empty` on its own.
+    fn refused_after(
+        judged: crate::trust::ConfigRead,
+        write: impl FnOnce(&Path) -> Result<(), ManageError>,
+    ) {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join(".sbx.toml");
+        let judged = match judged {
+            crate::trust::ConfigRead::Bytes(_) => {
+                std::fs::write(&p, "[network]\nmode = \"deny\"\nallow = [\"x.example\"]\n")
+                    .unwrap();
+                crate::trust::ConfigRead::Bytes(std::fs::read(&p).unwrap())
+            }
+            other => other,
+        };
+        let _admitted = admit_write(&p, judged);
+        let hostile = "[network]\nmode = \"allow\"\n";
+        std::fs::write(&p, hostile).unwrap();
+        assert!(matches!(
+            write(&p),
+            Err(ManageError::ChangedSinceChecked(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            hostile,
+            "nothing was written"
+        );
+        assert!(!admission_verified(&p));
+    }
+
+    #[test]
+    fn a_set_is_refused_on_a_file_that_appeared_after_its_admission() {
+        refused_after(crate::trust::ConfigRead::Absent, |p| {
+            set(p, "env.X", "1").map(|_| ())
+        });
+    }
+
+    #[test]
+    fn an_egress_rule_add_is_refused_on_a_file_that_appeared_after_its_admission() {
+        refused_after(crate::trust::ConfigRead::Absent, |p| {
+            add_egress_rule(p, None, EgressList::Allow, "x.example", Inherited::Nothing).map(|_| ())
+        });
+    }
+
+    #[test]
+    fn an_egress_rule_removal_is_refused_on_a_file_changed_after_its_admission() {
+        refused_after(crate::trust::ConfigRead::Bytes(Vec::new()), |p| {
+            remove_egress_rule(p, None, EgressList::Allow, "x.example").map(|_| ())
+        });
+    }
+
+    /// The write a matching read admits goes through, and is marked so its caller may bless it;
+    /// without an admission held, nothing is marked.
+    #[test]
+    fn a_write_whose_read_matches_its_admission_is_marked_verified() {
+        use crate::trust::ConfigRead;
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join(".sbx.toml");
+        let admitted = admit_write(&p, ConfigRead::Absent);
+        set(&p, "env.X", "1").expect("the file is still absent");
+        assert!(admission_verified(&p));
+        drop(admitted);
+        assert!(!admission_verified(&p), "the admission ends with its guard");
+        set(&p, "env.Y", "2").expect("a write with no admission is not checked");
+        assert!(!admission_verified(&p), "and is not marked");
     }
 
     fn doc_at(dir: &Path, body: &str) -> PathBuf {

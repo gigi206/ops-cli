@@ -765,16 +765,55 @@ pub(crate) fn state(store_dir: &Path, config_path: &Path) -> TrustState {
 /// a verdict that is never `Trusted`: `Untrusted` for the config itself, [`unverifiable_verdict`]'s
 /// for a covered file.
 pub(crate) fn state_with_inputs(store_dir: &Path, config_path: &Path) -> (TrustState, TrustInputs) {
+    let (verdict, inputs, _) = admission(store_dir, config_path);
+    (verdict, inputs)
+}
+
+/// What one read of a config found, for a write admitted on it ([`admission`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConfigRead {
+    /// The file is not there.
+    Absent,
+    /// The file's bytes, through the safety gate.
+    Bytes(Vec<u8>),
+    /// The file is there, and could not be read through the safety gate.
+    Unreadable,
+}
+
+impl ConfigRead {
+    /// Whether the file is there, readable or not.
+    pub(crate) fn exists(&self) -> bool {
+        !matches!(self, ConfigRead::Absent)
+    }
+}
+
+/// [`state_with_inputs`], with what its one read of the config found, for a caller that admits a
+/// write on the verdict. Whether the file exists is answered by that same read, and the write that
+/// follows is held to it ([`crate::config::manage::admit_write`]): the project tree is writable
+/// from inside a cage, so a second look could answer for a file nobody admitted.
+pub(crate) fn admission(
+    store_dir: &Path,
+    config_path: &Path,
+) -> (TrustState, TrustInputs, ConfigRead) {
     let sbx_bytes = match crate::config::safety::read_safe_bytes(config_path) {
         Ok(b) => b,
-        Err(_) => return (TrustState::Untrusted, Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return (TrustState::Untrusted, Vec::new(), ConfigRead::Absent);
+        }
+        Err(_) => return (TrustState::Untrusted, Vec::new(), ConfigRead::Unreadable),
     };
     let inputs = match trust_inputs_for(config_path, &sbx_bytes) {
         Ok(m) => m,
-        Err(_) => return (unverifiable_verdict(store_dir, config_path), Vec::new()),
+        Err(_) => {
+            return (
+                unverifiable_verdict(store_dir, config_path),
+                Vec::new(),
+                ConfigRead::Bytes(sbx_bytes),
+            );
+        }
     };
     let verdict = verdict_for_hash(store_dir, config_path, &content_hash(&sbx_bytes, &inputs));
-    (verdict, inputs)
+    (verdict, inputs, ConfigRead::Bytes(sbx_bytes))
 }
 
 /// Record trust for `config_path`: hash the file's current contents — and those of
