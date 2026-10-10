@@ -6438,6 +6438,27 @@ fn config_edit_never_runs_the_file_it_opens() {
     );
 }
 
+/// An editor command line reaches `sh` as the bytes it holds. A lossy conversion turned a byte no
+/// encoding renders into `U+FFFD`, so `sh` ran a program other than the one named, or reported a
+/// file that exists as not found.
+#[test]
+fn config_edit_hands_the_shell_the_editor_line_as_its_bytes() {
+    let fx = Project::new("cfg");
+    fx.write_project("nixpkgs = \"nixos-23.11\"\n");
+    let line: &std::ffi::OsStr = std::os::unix::ffi::OsStrExt::from_bytes(&b"printf %s X\xff"[..]);
+    let out = common::output_ok(
+        fx.cmd(&["config", "edit"])
+            .env_remove("VISUAL")
+            .env("EDITOR", line),
+    );
+    assert!(
+        out.stdout.starts_with(b"X\xff")
+            && !out.stdout.windows(3).any(|w| w == "\u{fffd}".as_bytes()),
+        "the line was not handed over as its bytes: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// The golden harness behind `resolve()`: `$SBX_DEBUG_RESOLVED_DUMP` must be **stable** across runs
 /// of the same configuration and **sensitive** to a change in it. Both halves are asserted, and the
 /// second is the one that matters: a dump that wrote nothing, or wrote a constant, would satisfy
