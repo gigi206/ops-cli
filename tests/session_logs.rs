@@ -120,6 +120,51 @@ fn each_reading_prints_exactly_what_it_names() {
     assert!(out(&o).is_empty());
 }
 
+/// A registry that cannot be read leaves unknown whether the session still runs. The reading still
+/// prints the body, and its note says the state is unknown instead of "exited"; a follow is refused
+/// at exit 1 once the body is printed, rather than ended at 0 as if the session had exited. Each
+/// form names the registry once.
+///
+/// A `sessions` entry that is a plain file is the unreadable registry: reading it as a directory
+/// fails with an error that is not `NotFound`, the one failure the registry reads as no sessions.
+#[test]
+fn an_unreadable_registry_leaves_the_state_unknown_and_refuses_a_follow() {
+    let data = Data::new("unreadable");
+    two_sessions(&data);
+    std::fs::write(data.0.join("sessions"), b"not a directory").expect("write the registry");
+
+    let o = sbx_in(&data.0, &["session", "logs", "4242"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(out(&o), NEW_BODY);
+    assert!(
+        err(&o).contains("state unknown") && !err(&o).contains("exited"),
+        "{}",
+        err(&o)
+    );
+
+    let o = sbx_in(&data.0, &["session", "logs", "4242", "-f"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert_eq!(out(&o), NEW_BODY, "the body comes before the refusal");
+    assert!(
+        err(&o).contains("its log is not followed") && !err(&o).contains("nothing further"),
+        "{}",
+        err(&o)
+    );
+
+    for args in [
+        &["session", "logs", "4242"][..],
+        &["session", "logs", "4242", "-f"],
+    ] {
+        let o = sbx_in(&data.0, args);
+        assert_eq!(
+            err(&o).matches("cannot read the session registry").count(),
+            1,
+            "{args:?}: {}",
+            err(&o)
+        );
+    }
+}
+
 /// The same shapes with a session past the read window: the answers must not change, and the note
 /// must still name when the session started.
 ///
