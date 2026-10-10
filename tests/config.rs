@@ -134,7 +134,7 @@ fn config_show_writes_what_a_config_chose_as_text_that_drives_nothing() {
     let bound = fx.bind_target("F11\u{202e}X");
     let r = "\\u202eX";
     fx.write_global(
-        &r#"binds = ["BOUND"]
+        &r#"binds = [BOUND]
 
 [env]
 F08 = "F08RLO"
@@ -165,8 +165,8 @@ params = { x = "^[a-z]{1,10}$" }
 [open]
 probe = ["F05RLO"]
 "#
-        .replace("BOUND", &bound.display().to_string())
-        .replace("RLO", r),
+        .replace("RLO", r)
+        .replace("BOUND", &common::toml_str(&bound)),
     );
     fx.write_project(
         &r#"[app.probe]
@@ -615,8 +615,8 @@ fn the_global_config_is_honored_in_full() {
     let fx = Project::new("cfg");
     let shared = fx.bind_target("shared");
     fx.write_global(&format!(
-        "binds = [\"{}\"]\n[env]\nGLOBALVAR = \"g\"\n",
-        shared.display()
+        "binds = [{}]\n[env]\nGLOBALVAR = \"g\"\n",
+        common::toml_str(&shared)
     ));
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
@@ -691,8 +691,8 @@ fn trusting_the_project_applies_its_binds() {
     let fx = Project::new("cfg");
     let extra = fx.bind_target("extra");
     fx.write_project(&format!(
-        "binds = [\"{}\"]\n[env]\nPROJVAR = \"p\"\n",
-        extra.display()
+        "binds = [{}]\n[env]\nPROJVAR = \"p\"\n",
+        common::toml_str(&extra)
     ));
 
     let trusted = fx.run(&["trust", "--yes", ".sbx.toml"]);
@@ -925,8 +925,8 @@ fn a_read_write_bind_is_honored_and_marked() {
     let fx = Project::new("cfg");
     let rw = fx.bind_target("writable");
     fx.write_project(&format!(
-        "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
-        rw.display()
+        "binds = [{{ path = {}, mode = \"rw\" }}]\n",
+        common::toml_str(&rw)
     ));
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
@@ -1048,10 +1048,10 @@ fn a_bind_declared_in_both_layers_is_deduplicated_and_the_project_mode_wins() {
     let fx = Project::new("cfg");
     let shared = fx.bind_target("shared");
     let canon = shared.canonicalize().unwrap();
-    fx.write_global(&format!("binds = [\"{}\"]\n", shared.display()));
+    fx.write_global(&format!("binds = [{}]\n", common::toml_str(&shared)));
     fx.write_project(&format!(
-        "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
-        shared.display()
+        "binds = [{{ path = {}, mode = \"rw\" }}]\n",
+        common::toml_str(&shared)
     ));
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
@@ -1081,8 +1081,8 @@ fn a_read_write_bind_over_sbx_own_config_dir_is_forced_read_only() {
     fx.write_global("[env]\nGLOBALVAR = \"g\"\n");
     let sbx_config_dir = fx.config_home.path().join("sbx");
     fx.write_project(&format!(
-        "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
-        sbx_config_dir.display()
+        "binds = [{{ path = {}, mode = \"rw\" }}]\n",
+        common::toml_str(&sbx_config_dir)
     ));
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
@@ -2341,13 +2341,13 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
     fx.write_project(&format!(
         "[app.probe]\n\
          cmd = [\"id\"]\n\
-         binds = [{bind:?}]\n\
+         binds = [{bind}]\n\
          [app.probe.packages]\n\
          tool = \"nix:ripgrep\"\n\
          [app.review]\n\
          cmd = [\"id\"]\n\
          home_scope = \"project\"\n",
-        bind = bind.display().to_string()
+        bind = common::toml_str(&bind)
     ));
 
     // Untrusted: the app shows with its command, but its security fields read as the launch would
@@ -3434,8 +3434,8 @@ fn an_app_env_and_binds_show_counts_by_default_and_expand_under_details() {
     fx.write_profile(
         "demo-app",
         &format!(
-            "cmd = \"demo-app\"\nbinds = [\"{}\"]\n[env]\nSHARED = \"app\"\nAPP_ONLY = \"app\"\n",
-            bind.display()
+            "cmd = \"demo-app\"\nbinds = [{}]\n[env]\nSHARED = \"app\"\nAPP_ONLY = \"app\"\n",
+            common::toml_str(&bind)
         ),
     );
 
@@ -6303,9 +6303,9 @@ fn an_apps_own_entries_are_named_not_counted() {
         "demo",
         &format!(
             "cmd = \"demo-agent\"\n[env]\nOWN_TOKEN = \"placeholder\"\n\
-             [[binds]]\npath = \"{}\"\nmode = \"rw\"\n\
+             [[binds]]\npath = {}\nmode = \"rw\"\n\
              [packages]\nripgrep = \"nix:ripgrep\"\n",
-            target.display()
+            common::toml_str(&target)
         ),
     );
 
