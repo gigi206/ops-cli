@@ -650,7 +650,7 @@ one step:
 
 ```sh
 sbx config set packages.jq '"nix:jq"' --trust
-sbx config edit --trust               # opens $EDITOR; re-trusts on save
+sbx config edit --trust               # opens $EDITOR, then shows what to re-trust
 ```
 
 ## What attests a provisioned artefact
