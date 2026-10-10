@@ -1398,7 +1398,9 @@ pub(super) const PAGES: &[Page] = &[
             lookup would fail in exactly the case this command exists for — reading why a\n\
             background agent stopped. It works the same on a session that exited hours ago as on\n\
             a running one; `--follow` on an exited session prints and returns rather than waiting\n\
-            for output that will never come.\n\
+            for output that will never come. When the session registry cannot be read, whether\n\
+            the session still runs is not known: `--follow` prints the log and exits 1 rather\n\
+            than wait for an end it could not see.\n\
             \n\
             The log's bytes go to stdout unchanged, so redirecting captures the agent's output as\n\
             it wrote it; the context line goes to stderr. Unchanged means unescaped: a control\n\
