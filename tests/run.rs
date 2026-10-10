@@ -3206,16 +3206,12 @@ fn an_offscreen_gui_posture_provisions_fonts_without_exposing_a_display() {
     // appears in the cage at its own host path — so probing that exact path distinguishes
     // `offscreen` from `wayland`. Only meaningful on a host that has a compositor; without one
     // there is no socket either way, and the fonts half still carries the test.
-    let socket = match (
-        std::env::var("XDG_RUNTIME_DIR").ok(),
-        std::env::var("WAYLAND_DISPLAY").ok(),
-    ) {
-        (Some(dir), Some(disp)) if !dir.is_empty() && !disp.is_empty() => {
-            Some(std::path::Path::new(&dir).join(disp).display().to_string())
-        }
-        _ => None,
-    };
-    let probe_socket = socket.clone().unwrap_or_else(|| "/nonexistent".to_string());
+    let socket = wayland_socket();
+    let probe_socket = socket
+        .as_deref()
+        .unwrap_or(Path::new("/nonexistent"))
+        .display()
+        .to_string();
     let out = sbx_in(
         project.path(),
         data.path(),
@@ -3225,11 +3221,12 @@ fn an_offscreen_gui_posture_provisions_fonts_without_exposing_a_display() {
             "--",
             "sh",
             "-c",
-            &format!(
-                "fc-list; \
-                 [ -e /opt/sbx/fonts.conf ] && echo FONTS-CONF-BOUND; \
-                 [ -e '{probe_socket}' ] && echo DISPLAY-BOUND || echo DISPLAY-ABSENT"
-            ),
+            "fc-list; \
+             [ -e /opt/sbx/fonts.conf ] && echo FONTS-CONF-BOUND; \
+             echo \"PROBED=$1\"; \
+             [ -e \"$1\" ] && echo DISPLAY-BOUND || echo DISPLAY-ABSENT",
+            "sh",
+            &probe_socket,
         ],
     );
     let log = format!(
@@ -3258,6 +3255,12 @@ fn an_offscreen_gui_posture_provisions_fonts_without_exposing_a_display() {
     // The other half: renders, but no display. A future refactor that re-couples the compositor
     // socket to the rendering predicate fails right here.
     if socket.is_some() {
+        // The script names the path it looked at, so an absence is not read off a probe that was
+        // never handed the socket.
+        assert!(
+            stdout.contains(&format!("PROBED={probe_socket}\n")),
+            "the probe did not look at the host's socket `{probe_socket}`: {log}"
+        );
         assert!(
             stdout.contains("DISPLAY-ABSENT"),
             "an offscreen cage was handed the host compositor socket: {log}"
