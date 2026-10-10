@@ -3037,7 +3037,7 @@ fn a_followed_event_sent_again_with_its_status_is_marked_as_an_update() {
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = Arc::clone(&lines);
         let stdout = follower.stdout.take().expect("piped stdout");
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 sink.lock().unwrap().push(line);
@@ -3059,6 +3059,11 @@ fn a_followed_event_sent_again_with_its_status_is_marked_as_an_update() {
                 "the stand-in was asked {:?} of its two reads",
                 asked.lock().unwrap()
             )
+        });
+        // The reader ends at the end of the killed follow's output, so once it is joined the lines
+        // the assertions read are all the follow wrote.
+        join_within(reader, || {
+            "the follow's stdout stayed open after it was killed".to_string()
         });
         let lines = lines.lock().unwrap().clone();
         let all = lines.join("\n");
@@ -3164,7 +3169,7 @@ fn a_follow_names_itself_on_every_read_of_a_session() {
         let started = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&started);
         let stderr = follower.stderr.take().expect("piped stderr");
-        std::thread::spawn(move || {
+        let watcher = std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
                 if line.contains("following egress") {
@@ -3179,6 +3184,9 @@ fn a_follow_names_itself_on_every_read_of_a_session() {
         let reader = follower.id();
         let _ = follower.kill();
         let _ = follower.wait();
+        join_within(watcher, || {
+            "the follow's stderr stayed open after it was killed".to_string()
+        });
 
         let seeded_asked = seeded_asked.lock().unwrap().clone();
         let polled_asked = polled_asked.lock().unwrap().clone();
@@ -3264,7 +3272,7 @@ fn an_update_of_an_event_the_follow_never_printed_is_not_printed() {
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&lines);
     let stdout = follower.stdout.take().expect("piped stdout");
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             sink.lock().unwrap().push(line);
@@ -3280,6 +3288,9 @@ fn an_update_of_an_event_the_follow_never_printed_is_not_printed() {
     let _ = follower.wait();
     join_within(server, || {
         "the stand-in was not asked for both of its replies".to_string()
+    });
+    join_within(reader, || {
+        "the follow's stdout stayed open after it was killed".to_string()
     });
 
     let lines = lines.lock().unwrap().clone();
@@ -3427,7 +3438,7 @@ fn follow_against(
     let err = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&err);
     let mut stderr = follower.stderr.take().expect("piped stderr");
-    std::thread::spawn(move || {
+    let err_reader = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         while let Ok(n) = stderr.read(&mut buf) {
             if n == 0 {
@@ -3456,7 +3467,14 @@ fn follow_against(
     std::thread::sleep(Duration::from_millis(1500));
     let _ = follower.kill();
     let _ = follower.wait();
-    let stdout = out.join().unwrap();
+    // Each reader ends at the end of the killed follow's output, so once both are joined what the
+    // assertions read is all the follow wrote.
+    let stdout = join_within(out, || {
+        "the follow's stdout stayed open after it was killed".to_string()
+    });
+    join_within(err_reader, || {
+        "the follow's stderr stayed open after it was killed".to_string()
+    });
     let stderr = err.lock().unwrap().clone();
     // A stand-in still waiting for a read the follow never made fails the test here rather than
     // holding it in `accept`.
