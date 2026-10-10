@@ -2318,8 +2318,7 @@ fn publish_then_add_and_install_through_a_real_clone() {
     git_in(&repo, &["init", "-q"]);
     git_in(&repo, &["add", "-A"]);
     git_in(&repo, &["commit", "-q", "-m", "store"]);
-    let mut url = std::ffi::OsString::from("file://");
-    url.push(&repo);
+    let url = common::file_url(&repo);
 
     // Add via a real clone: trust-on-first-use reads the shipped `pubkey` and verifies the cloned
     // catalogue against it (so a clone that mangled the signed bytes would be refused here).
