@@ -14,25 +14,44 @@ use common::fixture::TmpDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Run `sbx <args>` with a throwaway home (data, state, config all redirected), returning stdout.
-/// The stream is a pipe, so the output is plain text and can be asserted verbatim.
-fn run(args: &[&str], home: &Path) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
-        .args(args)
+/// `sbx <args>` with a throwaway home (data, state, config all redirected). A path is added with
+/// `.arg`, as the OS string it is: the fixture root comes from the environment, and a root that is
+/// not UTF-8 has no `&str` to give.
+fn sbx(args: &[&str], home: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
+    cmd.args(args)
         .current_dir(home)
         .env("HOME", home)
         .env("XDG_DATA_HOME", home)
         .env("XDG_STATE_HOME", home)
-        .env("XDG_CONFIG_HOME", home)
-        .output()
-        .expect("spawn sbx");
+        .env("XDG_CONFIG_HOME", home);
+    cmd
+}
+
+/// Run `cmd` to completion, asserted to have succeeded, returning stdout. The stream is a pipe, so
+/// the output is plain text and can be asserted verbatim.
+fn ok(cmd: &mut Command) -> String {
+    let out = cmd.output().expect("spawn sbx");
     assert!(
         out.status.success(),
         "`sbx {}` failed: {}",
-        args.join(" "),
+        cmd.get_args()
+            .map(|a| a.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" "),
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).expect("utf-8 stdout")
+}
+
+/// Run `sbx <args>` with a throwaway home, asserted to have succeeded, returning stdout.
+fn run(args: &[&str], home: &Path) -> String {
+    ok(&mut sbx(args, home))
+}
+
+/// `sbx plugins install <source>`, asserted to have succeeded.
+fn install(source: &Path, home: &Path) -> String {
+    ok(sbx(&["plugins", "install"], home).arg(source))
 }
 
 /// A local plugin source directory: a manifest and the executable it names.
@@ -71,10 +90,7 @@ fn the_listings_say_where_each_installed_plugin_came_from() {
     // A local install records the directory it was copied from — the only thing that can tell one
     // plugin's provenance from another's, since manifests are identical whatever the source.
     let source = local_plugin(src.path(), "kp", "kp");
-    run(
-        &["plugins", "install", source.to_str().unwrap()],
-        home.path(),
-    );
+    install(&source, home.path());
     let list = run(&["plugins", "list"], home.path());
     assert!(
         list.contains(&format!(
@@ -105,10 +121,7 @@ fn a_plugin_installed_without_a_record_reads_as_unknown() {
     // A plugin placed by hand (or installed before origins were recorded) has no record. The
     // listing must say so plainly instead of guessing a source.
     let source = local_plugin(src.path(), "kp", "kp");
-    run(
-        &["plugins", "install", source.to_str().unwrap()],
-        home.path(),
-    );
+    install(&source, home.path());
     std::fs::remove_file(home.path().join("sbx/plugins/.origins/kp.toml")).unwrap();
     let list = run(&["plugins", "list"], home.path());
     assert!(
@@ -119,23 +132,26 @@ fn a_plugin_installed_without_a_record_reads_as_unknown() {
     assert!(!list.contains(".origins"), "{list}");
 }
 
-/// Run `sbx <args>` like [`run`], but tolerate any exit status and return the code with both
-/// streams — a command that reports a broken state writes to each.
-fn run_both(args: &[&str], home: &Path) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
-        .args(args)
-        .current_dir(home)
-        .env("HOME", home)
-        .env("XDG_DATA_HOME", home)
-        .env("XDG_STATE_HOME", home)
-        .env("XDG_CONFIG_HOME", home)
-        .output()
-        .expect("spawn sbx");
+/// Run `cmd` to completion whatever its exit status, returning the code with both streams — a
+/// command that reports a broken state writes to each.
+fn both(cmd: &mut Command) -> (i32, String, String) {
+    let out = cmd.output().expect("spawn sbx");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// Run `sbx <args>` like [`run`], but tolerate any exit status and return the code with both
+/// streams.
+fn run_both(args: &[&str], home: &Path) -> (i32, String, String) {
+    both(&mut sbx(args, home))
+}
+
+/// `sbx plugins install <source>`, whatever its exit status, with the code and both streams.
+fn install_both(source: &Path, home: &Path) -> (i32, String, String) {
+    both(sbx(&["plugins", "install"], home).arg(source))
 }
 
 /// Run `sbx <args>` like [`run`], but return the exit code and stderr — the streams a refusal uses.
@@ -169,26 +185,12 @@ fn adding_a_store_with_no_trust_anchor_shows_the_key_it_ships_and_configures_not
     let repo = TmpDir::new("plugins");
     // A real signed store: publish a plugin directory, then commit it so it can be cloned.
     local_plugin(&repo.path().join("plugins"), "kp", "kp");
-    let published = run(
-        &[
-            "plugins",
-            "store",
-            "publish",
-            repo.path().to_str().unwrap(),
-            "--key",
-            home.path().join("signing-key").to_str().unwrap(),
-        ],
+    let (url, key) = signed_store(
         home.path(),
+        repo.path(),
+        &home.path().join("signing-key"),
+        None,
     );
-    let key = published
-        .lines()
-        .find_map(|l| l.strip_prefix("pubkey: "))
-        .expect("the published public key")
-        .to_string();
-    git_run(repo.path(), &["init", "-q"]);
-    git_run(repo.path(), &["add", "-A"]);
-    git_run(repo.path(), &["commit", "-qm", "store"]);
-    let url = common::file_url(repo.path());
 
     // No --key and no --trust: the refusal shows the key the store ships, so the choice is made
     // with the key in view instead of after pinning it.
@@ -253,26 +255,12 @@ fn confirming_a_key_accepted_on_first_use_ends_the_standing_caution() {
     let home = TmpDir::new("plugins");
     let repo = TmpDir::new("plugins");
     local_plugin(&repo.path().join("plugins"), "kp", "kp");
-    let published = run(
-        &[
-            "plugins",
-            "store",
-            "publish",
-            repo.path().to_str().unwrap(),
-            "--key",
-            home.path().join("signing-key").to_str().unwrap(),
-        ],
+    let (url, key) = signed_store(
         home.path(),
+        repo.path(),
+        &home.path().join("signing-key"),
+        None,
     );
-    let key = published
-        .lines()
-        .find_map(|l| l.strip_prefix("pubkey: "))
-        .expect("the published public key")
-        .to_string();
-    git_run(repo.path(), &["init", "-q"]);
-    git_run(repo.path(), &["add", "-A"]);
-    git_run(repo.path(), &["commit", "-qm", "store"]);
-    let url = common::file_url(repo.path());
 
     run(
         &[
@@ -342,20 +330,13 @@ fn confirming_a_key_accepted_on_first_use_ends_the_standing_caution() {
 }
 
 /// Publish a signed store into `repo` with `key_file`, commit it, and return (url, pubkey).
-fn signed_store(home: &Path, repo: &Path, key_file: &str, rev: Option<&str>) -> (String, String) {
-    let mut args = vec![
-        "plugins",
-        "store",
-        "publish",
-        repo.to_str().unwrap(),
-        "--key",
-        key_file,
-    ];
+fn signed_store(home: &Path, repo: &Path, key_file: &Path, rev: Option<&str>) -> (String, String) {
+    let mut publish = sbx(&["plugins", "store", "publish"], home);
+    publish.arg(repo).arg("--key").arg(key_file);
     if let Some(rev) = rev {
-        args.push("--rev");
-        args.push(rev);
+        publish.args(["--rev", rev]);
     }
-    let published = run(&args, home);
+    let published = ok(&mut publish);
     let key = published
         .lines()
         .find_map(|l| l.strip_prefix("pubkey: "))
@@ -399,7 +380,7 @@ fn upgrading_follows_the_digest_and_keeps_what_is_installed_when_it_cannot() {
     let plugins = repo.path().join("plugins");
     versioned_plugin(&plugins, "kp", "kp", "1.0.0", "one");
     let key = home.path().join("signing-key");
-    let (url, pubkey) = signed_store(home.path(), repo.path(), key.to_str().unwrap(), None);
+    let (url, pubkey) = signed_store(home.path(), repo.path(), &key, None);
     run(
         &[
             "plugins", "store", "add", "--name", "mine", "--url", &url, "--key", &pubkey,
@@ -417,7 +398,7 @@ fn upgrading_follows_the_digest_and_keeps_what_is_installed_when_it_cannot() {
     // The store republishes **under the same version string** — the case no version comparison can
     // see, and the reason the digest is what decides.
     versioned_plugin(&plugins, "kp", "kp", "1.0.0", "two");
-    signed_store(home.path(), repo.path(), key.to_str().unwrap(), Some("2"));
+    signed_store(home.path(), repo.path(), &key, Some("2"));
     run(&["plugins", "store", "update", "mine"], home.path());
 
     let listing = run(&["plugins", "store", "list"], home.path());
@@ -453,7 +434,7 @@ fn upgrading_follows_the_digest_and_keeps_what_is_installed_when_it_cannot() {
     // no longer reproduces the signed digest — so the upgrade is refused, and what is installed must
     // survive it. Doing this with `rm` then install would have left nothing.
     versioned_plugin(&plugins, "kp", "kp", "2.0.0", "three");
-    signed_store(home.path(), repo.path(), key.to_str().unwrap(), Some("3"));
+    signed_store(home.path(), repo.path(), &key, Some("3"));
     run(&["plugins", "store", "update", "mine"], home.path());
     std::fs::write(
         home.path()
@@ -485,7 +466,7 @@ fn a_store_that_changes_its_key_is_named_and_rotated_only_deliberately() {
     let repo = TmpDir::new("plugins");
     local_plugin(&repo.path().join("plugins"), "kp", "kp");
     let key1 = home.path().join("key1");
-    let (url, first) = signed_store(home.path(), repo.path(), key1.to_str().unwrap(), None);
+    let (url, first) = signed_store(home.path(), repo.path(), &key1, None);
     run(
         &[
             "plugins", "store", "add", "--name", "mine", "--url", &url, "--key", &first,
@@ -495,7 +476,7 @@ fn a_store_that_changes_its_key_is_named_and_rotated_only_deliberately() {
 
     // The store re-signs under a new identity.
     let key2 = home.path().join("key2");
-    let (_, second) = signed_store(home.path(), repo.path(), key2.to_str().unwrap(), Some("2"));
+    let (_, second) = signed_store(home.path(), repo.path(), &key2, Some("2"));
 
     // `update` refuses and says exactly what happened, instead of an opaque signature failure.
     let (code, err) = run_failing(&["plugins", "store", "update", "mine"], home.path());
@@ -555,7 +536,7 @@ fn the_markers_and_the_installed_filter_agree_on_what_is_in_place() {
     local_plugin(&repo.path().join("plugins"), "kp", "kp");
     local_plugin(&repo.path().join("plugins"), "otp", "otp");
     let key_file = home.path().join("signing-key");
-    let (url, key) = signed_store(home.path(), repo.path(), key_file.to_str().unwrap(), None);
+    let (url, key) = signed_store(home.path(), repo.path(), &key_file, None);
     run(
         &[
             "plugins", "store", "add", "--name", "mine", "--url", &url, "--key", &key,
@@ -596,10 +577,7 @@ fn the_markers_and_the_installed_filter_agree_on_what_is_in_place() {
     // A local plugin taking the *name* of the store's other entry: only one can hold it, so that
     // entry names the holder instead of claiming to be installed.
     let shadow = local_plugin(src.path(), "otp", "other");
-    run(
-        &["plugins", "install", shadow.to_str().unwrap()],
-        home.path(),
-    );
+    install(&shadow, home.path());
     let listing = run(&["plugins", "store", "list"], home.path());
     let otp_line = listing
         .lines()
@@ -626,7 +604,7 @@ fn a_plugin_holding_a_stores_scheme_blocks_that_entry_visibly() {
     let src = TmpDir::new("plugins");
     local_plugin(&repo.path().join("plugins"), "kp", "kp");
     let key_file = home.path().join("signing-key");
-    let (url, key) = signed_store(home.path(), repo.path(), key_file.to_str().unwrap(), None);
+    let (url, key) = signed_store(home.path(), repo.path(), &key_file, None);
     run(
         &[
             "plugins", "store", "add", "--name", "mine", "--url", &url, "--key", &key,
@@ -637,10 +615,7 @@ fn a_plugin_holding_a_stores_scheme_blocks_that_entry_visibly() {
     // A different name, but it claims the scheme the store's entry advertises: the install would be
     // refused on the scheme, which the catalogue alone could never show.
     let squatter = local_plugin(src.path(), "my-kp", "kp");
-    run(
-        &["plugins", "install", squatter.to_str().unwrap()],
-        home.path(),
-    );
+    install(&squatter, home.path());
     let listing = run(&["plugins", "store", "list"], home.path());
     let kp_line = listing
         .lines()
@@ -702,8 +677,8 @@ fn plugins_rm_takes_several_names_and_one_failure_spares_the_rest() {
     // Two installed plugins on distinct schemes (a scheme claimed twice would disable both).
     let one = local_plugin(src.path(), "demo-one", "one");
     let two = local_plugin(src.path(), "demo-two", "two");
-    run(&["plugins", "install", one.to_str().unwrap()], home.path());
-    run(&["plugins", "install", two.to_str().unwrap()], home.path());
+    install(&one, home.path());
+    install(&two, home.path());
 
     // Three names with an absent one in the middle: each plugin is removed on its own, so the
     // failing name is reported without stopping the one after it, and the call exits non-zero.
@@ -735,7 +710,7 @@ fn plugins_rm_rejects_an_unsafe_name_before_removing_anything() {
     let home = TmpDir::new("plugins");
     let src = TmpDir::new("plugins");
     let one = local_plugin(src.path(), "demo-one", "one");
-    run(&["plugins", "install", one.to_str().unwrap()], home.path());
+    install(&one, home.path());
 
     // A path-shaped name is refused, and the valid name ahead of it is left installed: a removal is
     // destructive, so a typo at the end must not cost the names before it.
@@ -760,10 +735,7 @@ fn a_plugin_edited_after_install_is_reported_by_every_inspection_path() {
     let home = TmpDir::new("plugins");
     let src = TmpDir::new("plugins");
     let source = local_plugin(src.path(), "kp", "kp");
-    run(
-        &["plugins", "install", source.to_str().unwrap()],
-        home.path(),
-    );
+    install(&source, home.path());
 
     // Freshly installed: the tree matches the digest recorded when it was placed.
     let verified = run(&["plugins", "verify"], home.path());
@@ -799,10 +771,7 @@ fn a_plugin_edited_after_install_is_reported_by_every_inspection_path() {
 
     // Reinstalling restores a known tree, and the check goes quiet again.
     run(&["plugins", "rm", "kp"], home.path());
-    run(
-        &["plugins", "install", source.to_str().unwrap()],
-        home.path(),
-    );
+    install(&source, home.path());
     let (code, out, _err) = run_both(&["plugins", "verify"], home.path());
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("unchanged since install"), "{out}");
@@ -827,7 +796,7 @@ fn a_scheme_claimed_twice_disables_every_claimant_until_one_remains() {
     let src = TmpDir::new("plugins");
     // One plugin installed the supported way…
     let a = local_plugin(src.path(), "vault-a", "vault");
-    run(&["plugins", "install", a.to_str().unwrap()], home.path());
+    install(&a, home.path());
     // …and one placed by hand under the data directory, which is the only way to reach a conflict:
     // every install path refuses a scheme that is claimed or contested.
     let plugins_dir = home.path().join("sbx/plugins");
@@ -860,7 +829,7 @@ fn a_scheme_claimed_twice_disables_every_claimant_until_one_remains() {
     // A third claimant is refused: an ambiguous scheme resolves to nothing, so a guard that only
     // asked "does this scheme resolve?" would let the breakage deepen.
     let c = local_plugin(src.path(), "vault-c", "vault");
-    let (code, _out, err) = run_both(&["plugins", "install", c.to_str().unwrap()], home.path());
+    let (code, _out, err) = install_both(&c, home.path());
     assert_ne!(code, 0, "{err}");
     assert!(
         err.contains("claimed by more than one installed plugin"),
@@ -946,7 +915,7 @@ fn a_signer_whose_grant_names_a_socket_is_refused_by_name() {
     std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let (code, stderr) = run_failing(&["plugins", "install", dir.to_str().unwrap()], home.path());
+    let (code, _stdout, stderr) = install_both(&dir, home.path());
     assert_ne!(code, 0, "the install must refuse:\n{stderr}");
     assert!(
         stderr.contains("is a socket"),
@@ -985,7 +954,7 @@ fn a_manifest_naming_sbxs_own_directories_is_refused_by_name() {
     std::fs::write(&exec, "#!/bin/sh\necho secret\n").unwrap();
     std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let (code, stderr) = run_failing(&["plugins", "install", dir.to_str().unwrap()], home.path());
+    let (code, _stdout, stderr) = install_both(&dir, home.path());
     assert_ne!(code, 0, "the install must refuse:\n{stderr}");
     assert!(
         stderr.contains("control plane"),
@@ -1023,10 +992,7 @@ fn every_kind_of_plugin_shows_the_grant_it_declared() {
     let broker = local_broker(src.path(), "demo-broker", grant);
 
     for source in [&signer, &broker] {
-        run(
-            &["plugins", "install", source.to_str().unwrap()],
-            home.path(),
-        );
+        install(source, home.path());
     }
 
     for (name, kind) in [("demo-signer", "signer"), ("demo-broker", "broker")] {
@@ -1090,10 +1056,7 @@ fn completing_a_plugin_name_offers_every_kind_and_never_a_store() {
         local_broker(src.path(), "demo-broker", ""),
     ];
     for source in &sources {
-        run(
-            &["plugins", "install", source.to_str().unwrap()],
-            home.path(),
-        );
+        install(source, home.path());
     }
 
     for page in [
@@ -1145,10 +1108,7 @@ fn a_signer_that_asks_for_a_body_digest_says_so_on_its_page() {
         "Authorization",
         "body_digest=\"sha256\"\n",
     );
-    run(
-        &["plugins", "install", source.to_str().unwrap()],
-        home.path(),
-    );
+    install(&source, home.path());
     let info = run(&["plugins", "info", "demo-digest"], home.path());
     assert!(
         info.contains(
@@ -1165,10 +1125,7 @@ fn a_signer_installs_under_its_name_and_states_the_auth_point_it_holds() {
     let home = TmpDir::new("plugins");
     let src = TmpDir::new("plugins");
     let source = local_signer(src.path(), "demo-sigv4", "Authorization", "");
-    run(
-        &["plugins", "install", source.to_str().unwrap()],
-        home.path(),
-    );
+    install(&source, home.path());
 
     let list = run(&["plugins", "list"], home.path());
     assert!(
@@ -1268,10 +1225,7 @@ fn plugins_info_writes_what_a_manifest_or_a_config_chose_as_text_that_drives_not
     std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
     let broker = local_broker(src.path(), "demo-broker", "");
     for source in [&dir, &broker] {
-        run(
-            &["plugins", "install", source.to_str().unwrap()],
-            home.path(),
-        );
+        install(source, home.path());
     }
     std::fs::write(
         home.path().join("sbx").join("sbx.toml"),
