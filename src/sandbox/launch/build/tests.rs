@@ -188,6 +188,12 @@ fn establish_control_plane_pins_creates_each_pin_and_preserves_its_mode() {
     ];
     let binds = establish_control_plane_pins(&pins, &[], Some(&decoy)).expect("pins establish");
     assert!(inter.is_dir() && leaf.is_dir(), "each pin path is created");
+    // Owner-only, the directory above them included, whatever the umask leaves.
+    for dir in [tmp.path().join("chain"), inter.clone(), leaf.clone()] {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(format!("{mode:o}"), "700", "{}", dir.display());
+    }
     assert_eq!(binds.len(), 2);
     assert_eq!(binds[0].src, inter);
     assert_eq!(binds[0].dest, inter);
