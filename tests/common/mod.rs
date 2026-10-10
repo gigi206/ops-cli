@@ -435,15 +435,20 @@ pub fn stdout_of(out: &Output) -> String {
 /// A document that does not parse fails the test with the exit status and both streams. The parse
 /// error alone says where the document broke, which for a run that failed is the first byte of an
 /// empty stdout, while the reason sits on stderr.
+///
+/// The failure is located at the line that called this. A `match` rather than `unwrap_or_else`
+/// because `#[track_caller]` does not reach into a closure: a panic there is located here.
+#[track_caller]
 pub fn json_of(out: &Output) -> serde_json::Value {
-    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-        panic!(
+    match serde_json::from_slice(&out.stdout) {
+        Ok(document) => document,
+        Err(e) => panic!(
             "stdout is not a JSON document ({e}); sbx {}:\n{}{}",
             out.status,
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
-        )
-    })
+        ),
+    }
 }
 
 /// Whether an attached shell has printed a prompt into `out` and is ready to be driven.
