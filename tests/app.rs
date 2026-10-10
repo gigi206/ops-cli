@@ -17,7 +17,6 @@ use common::project::Project;
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 impl Project {
     /// Fabricate a global app home with a mise tool installed at `<munged>/<version>/`.
@@ -1783,32 +1782,9 @@ fn sbx_app_rm_purge_refuses_while_a_session_is_live() {
     let fx = Project::new("app");
     let sbx_dir = fx.data_home.path().join("sbx");
     touch_under(&sbx_dir.join("apps/agent/home/state"));
-
-    // A real live process to anchor a session record: the guard is decided by a start-time match
-    // against /proc, so a fabricated record must name a genuinely-running pid.
-    let mut child = Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn sleep");
-    let pid = child.id();
-    let start_ticks = common::start_ticks(pid);
-
-    // A session record tagging that live pid as `sbx app agent` (runtime `global-app:agent`); the
-    // record format is the module's `key=value` text, project hex-encoded (`/x` = 2f78).
-    let sessions = sbx_dir.join("sessions");
-    std::fs::create_dir_all(&sessions).unwrap();
-    std::fs::write(
-        sessions.join(format!("{pid}-{start_ticks}")),
-        format!(
-            "kind=run\npid={pid}\nstart={start_ticks}\nruntime=global-app:agent\nproject=2f78\n"
-        ),
-    )
-    .unwrap();
+    register_live_session(&fx, "agent");
 
     let out = fx.run(&["app", "rm", "agent", "--purge"]);
-    let _ = child.kill();
-    let _ = child.wait();
-
     assert!(
         !out.status.success(),
         "purge did not refuse a live app: {out:?}"
