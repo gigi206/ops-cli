@@ -404,7 +404,13 @@ fn versioned_plugin(root: &Path, name: &str, scheme: &str, version: &str, body: 
     )
     .unwrap();
     let exec = dir.join("resolve");
-    std::fs::write(&exec, format!("#!/bin/sh\nprintf '{body}'\n")).unwrap();
+    // The body is printed as data: written into the format, a `%` or a `\` in it would be read as
+    // a directive or an escape, and a `'` would end the quoting.
+    std::fs::write(
+        &exec,
+        format!("#!/bin/sh\nprintf '%s' {}\n", common::sh_word(body)),
+    )
+    .unwrap();
     std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
