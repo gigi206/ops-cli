@@ -215,9 +215,15 @@ impl Release {
     /// Feed `script` to `sh` on its standard input, with only the environment named here and
     /// `path_first` ahead of the system directories on `PATH`.
     fn run(&self, script: &[u8], env: &[(&str, &str)], path_first: &[&Path]) -> Run {
-        let mut path: Vec<String> = path_first.iter().map(|d| d.display().to_string()).collect();
-        path.extend(["/usr/bin".to_string(), "/bin".to_string()]);
-        let path = path.join(":");
+        // Joined as the OS strings the directories are: `display()` would replace a byte that is not
+        // UTF-8, and the stand-ins put first would then sit in a directory `PATH` does not name.
+        let path = std::env::join_paths(
+            path_first
+                .iter()
+                .copied()
+                .chain([Path::new("/usr/bin"), Path::new("/bin")]),
+        )
+        .expect("a fixture directory holds no `:`");
         let mut cmd = Command::new("sh");
         cmd.env_clear()
             .env("PATH", path)
