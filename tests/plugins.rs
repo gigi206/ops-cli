@@ -30,18 +30,29 @@ fn sbx(args: &[&str], home: &Path) -> Command {
 
 /// Run `cmd` to completion, asserted to have succeeded, returning stdout. The stream is a pipe, so
 /// the output is plain text and can be asserted verbatim.
+///
+/// Held to UTF-8 rather than read lossily: sbx writes text, and a byte that is not would be one it
+/// let through, which a lossy read would hide. A failure shows what was written on both streams.
 fn ok(cmd: &mut Command) -> String {
     let out = cmd.output().expect("spawn sbx");
+    let shown = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
         out.status.success(),
-        "`sbx {}` failed: {}",
-        cmd.get_args()
-            .map(|a| a.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" "),
+        "`sbx {shown}` failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8(out.stdout).expect("utf-8 stdout")
+    match String::from_utf8(out.stdout) {
+        Ok(text) => text,
+        Err(e) => panic!(
+            "`sbx {shown}` wrote a stdout that is not UTF-8:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(e.as_bytes()),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    }
 }
 
 /// Run `sbx <args>` with a throwaway home, asserted to have succeeded, returning stdout.
