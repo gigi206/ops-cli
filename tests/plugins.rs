@@ -61,7 +61,11 @@ fn local_plugin(root: &Path, name: &str, scheme: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("plugin.toml"),
-        format!("name=\"{name}\"\ntype=\"resolver\"\nscheme=\"{scheme}\"\nexec=\"resolve\"\n"),
+        format!(
+            "name={}\ntype=\"resolver\"\nscheme={}\nexec=\"resolve\"\n",
+            common::toml_text(name),
+            common::toml_text(scheme)
+        ),
     )
     .unwrap();
     let exec = dir.join("resolve");
@@ -359,8 +363,10 @@ fn versioned_plugin(root: &Path, name: &str, scheme: &str, version: &str, body: 
     std::fs::write(
         dir.join("plugin.toml"),
         format!(
-            "name=\"{name}\"\ntype=\"resolver\"\nscheme=\"{scheme}\"\nexec=\"resolve\"\n\
-             version=\"{version}\"\n"
+            "name={}\ntype=\"resolver\"\nscheme={}\nexec=\"resolve\"\nversion={}\n",
+            common::toml_text(name),
+            common::toml_text(scheme),
+            common::toml_text(version)
         ),
     )
     .unwrap();
@@ -855,7 +861,9 @@ fn local_signer(root: &Path, name: &str, sets: &str, extra: &str) -> PathBuf {
     std::fs::write(
         dir.join("plugin.toml"),
         format!(
-            "name=\"{name}\"\ntype=\"signer\"\nexec=\"sign\"\n[signer]\nsets_headers=[\"{sets}\"]\n{extra}"
+            "name={}\ntype=\"signer\"\nexec=\"sign\"\n[signer]\nsets_headers=[{}]\n{extra}",
+            common::toml_text(name),
+            common::toml_text(sets)
         ),
     )
     .unwrap();
@@ -873,8 +881,9 @@ fn local_broker(root: &Path, name: &str, extra: &str) -> PathBuf {
     std::fs::write(
         dir.join("plugin.toml"),
         format!(
-            "name=\"{name}\"\ntype=\"broker\"\nexec=\"broker\"\n[broker]\n\
-             cage_env=[\"DEMO_SOCK\"]\nframing=\"line\"\nmax_frame=1024\n{extra}"
+            "name={}\ntype=\"broker\"\nexec=\"broker\"\n[broker]\n\
+             cage_env=[\"DEMO_SOCK\"]\nframing=\"line\"\nmax_frame=1024\n{extra}",
+            common::toml_text(name)
         ),
     )
     .unwrap();
@@ -906,8 +915,8 @@ fn a_signer_whose_grant_names_a_socket_is_refused_by_name() {
         format!(
             "name=\"greedy\"\ntype=\"signer\"\nexec=\"sign\"\n\
              [signer]\nsets_headers=[\"Authorization\"]\n\
-             [sandbox]\nnetwork=false\nallow_paths=[\"{}\"]\n",
-            socket.display()
+             [sandbox]\nnetwork=false\nallow_paths=[{}]\n",
+            common::toml_str(&socket)
         ),
     )
     .unwrap();
