@@ -113,7 +113,7 @@ scalar values):
 
 ```sh
 sbx config edit          # add/remove bind entries
-sbx config edit --trust  # and re-trust in one step
+sbx config edit --trust  # then review what it grants and re-trust
 ```
 
 ## Layering with the structural mounts
