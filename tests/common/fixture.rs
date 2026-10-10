@@ -53,13 +53,15 @@ impl TmpDir {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut d = fixture_root();
+        std::fs::create_dir_all(&d)
+            .unwrap_or_else(|e| panic!("the fixtures' root {}: {e}", d.display()));
         let tag: String = tag.chars().take(TAG_MAX).collect();
         let pid = std::process::id();
         d.push(match prefix {
             Some(p) => format!("{p}-{tag}-{pid}-{n}"),
             None => format!("{tag}-{pid}-{n}"),
         });
-        std::fs::create_dir_all(&d).unwrap();
+        std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("the fixture {}: {e}", d.display()));
         TmpDir(d)
     }
 
