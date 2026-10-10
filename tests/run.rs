@@ -9020,10 +9020,13 @@ fn a_trusted_audio_posture_equips_a_python_portaudio_tool() {
     // `python312` + `uv` give the cage an interpreter and installer, so the e2e can install an
     // UNPATCHED PyPI `sounddevice` — the nixpkgs one is patched to hardcode the store path, which
     // would bypass the very `find_library` shim under test. A `[packages]` backend is trusted-only,
-    // so it is dropped untrusted (no python/uv on PATH there).
+    // so it is dropped untrusted (no python/uv on PATH there). The trusted cage's egress is
+    // filtered, and PyPI is allowed by name: under the default policy the index answers 403, and
+    // the install never runs.
     std::fs::write(
         project.path().join(".sbx.toml"),
-        b"audio = true\n\n[packages]\npython = \"nix:python312\"\nuv = \"nix:uv\"\n",
+        b"audio = true\n\n[packages]\npython = \"nix:python312\"\nuv = \"nix:uv\"\n\n\
+          [network]\nmode = \"deny\"\nallow = [\"pypi.org\", \"files.pythonhosted.org\"]\n",
     )
     .unwrap();
 
@@ -9034,10 +9037,12 @@ fn a_trusted_audio_posture_equips_a_python_portaudio_tool() {
 test -f /opt/sbx/audio-pyshim/sitecustomize.py && echo PYSHIM-PRESENT || echo PYSHIM-ABSENT
 test -n "$PYTHONPATH" && echo PYTHONPATH-SET || echo PYTHONPATH-UNSET
 case ":$LD_LIBRARY_PATH:" in *portaudio*) echo PORTAUDIO-ON-LDPATH;; *) echo PORTAUDIO-OFF-LDPATH;; esac
-if command -v uv >/dev/null 2>&1 && uv venv /tmp/pv >/dev/null 2>&1 && VIRTUAL_ENV=/tmp/pv uv pip install -q sounddevice==0.5.6 >/dev/null 2>&1; then
-  /tmp/pv/bin/python -c "import sounddevice as sd; print('PA-IMPORT-OK'); print('PA-DEVICES-%d' % len(sd.query_devices()))" 2>&1 | tail -4
+if ! command -v uv >/dev/null 2>&1; then
+  echo "PA-NOT-INSTALLED: no uv on PATH"
+elif ! why=$(uv venv -q /tmp/pv 2>&1 && VIRTUAL_ENV=/tmp/pv uv pip install -q sounddevice==0.5.6 2>&1); then
+  echo "PA-NOT-INSTALLED: $(printf %s "$why" | tr '\n' ' ')"
 else
-  echo PA-NOT-INSTALLED
+  /tmp/pv/bin/python -c "import sounddevice as sd; print('PA-IMPORT-OK'); print('PA-DEVICES-%d' % len(sd.query_devices()))" 2>&1 | tail -4
 fi"#;
 
     // Untrusted probe (also seeds the base userland): the posture is dropped, so the shim is unbound.
@@ -9098,8 +9103,9 @@ fi"#;
     // When PortAudio provisioned (best-effort — needs the nix cache), the whole path must hold: the
     // shim is bound, PYTHONPATH points at it, portaudio is on the loader path, and — unless offline —
     // an UNPATCHED PyPI `sounddevice` imports through the shim. These are the teeth on the PortAudio
-    // path (not the ALSA-direct one); they degrade cleanly when the cache is unreachable
-    // (PYSHIM-ABSENT) or the install is offline (PA-NOT-INSTALLED).
+    // path (not the ALSA-direct one); they degrade when the cache is unreachable (PYSHIM-ABSENT),
+    // and an install that did not run (PA-NOT-INSTALLED) is counted as a skip quoting `uv`'s own
+    // error, since its import is then unproven.
     if stdout.contains("PYSHIM-PRESENT") {
         assert!(
             stdout.contains("PYTHONPATH-SET"),
@@ -9109,12 +9115,16 @@ fi"#;
             stdout.contains("PORTAUDIO-ON-LDPATH"),
             "the shim is bound but portaudio is not on LD_LIBRARY_PATH:\n{stdout}"
         );
-        if !stdout.contains("PA-NOT-INSTALLED") {
-            assert!(
+        match stdout.lines().find(|l| l.starts_with("PA-NOT-INSTALLED")) {
+            Some(why) => skip_unreachable!(
+                "PortAudio e2e: the PyPI `sounddevice` install did not run, so its import through \
+                 the shim is unproven ({why})"
+            ),
+            None => assert!(
                 stdout.contains("PA-IMPORT-OK"),
                 "PortAudio is wired and PyPI sounddevice installed, but its import failed — the \
                  find_library shim + libportaudio integration is broken:\n{stdout}"
-            );
+            ),
         }
     }
     let devices = stdout
@@ -9131,7 +9141,7 @@ fi"#;
         if stdout.contains("PA-IMPORT-OK") {
             "OK"
         } else if stdout.contains("PA-NOT-INSTALLED") {
-            "not-installed (offline)"
+            "not installed"
         } else {
             "n/a"
         },
