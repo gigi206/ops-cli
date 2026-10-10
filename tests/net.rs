@@ -1703,34 +1703,94 @@ fn net_pending_all_save_local_refuses_an_unreadable_session_registry() {
     );
 }
 
+/// Join `thread`, which finishes on its own once what it serves or reads has ended: a stand-in
+/// session's replies spent, or a killed follow's pipe closed. One still running after a few seconds
+/// fails the test with `what` rather than holding it in `accept` or `read` for good.
+#[track_caller]
+fn join_within<T>(thread: std::thread::JoinHandle<T>, what: impl FnOnce() -> String) -> T {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !thread.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(thread.is_finished(), "{}", what());
+    thread.join().expect("the thread ended without panicking")
+}
+
+/// A stand-in for session `pid`: its egress control socket under `fx`'s data directory answers one
+/// connection per entry of `replies`, in order, and keeps the command line each connection sent.
+///
+/// Once the replies are spent the socket's file stays, with nothing listening on it, so a test can
+/// run sbx again to show that a second run is refused before it would connect.
+struct StandIn {
+    pid: u32,
+    replies: usize,
+    asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    server: std::thread::JoinHandle<()>,
+}
+
+impl StandIn {
+    fn serve(fx: &Project, pid: u32, replies: &[&str]) -> StandIn {
+        use std::io::{BufRead, BufReader, Write};
+        let egress = fx.data_home.path().join("sbx").join("egress");
+        std::fs::create_dir_all(&egress).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(egress.join(format!("control-{pid}.sock")))
+                .unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&asked);
+        let replies: Vec<String> = replies.iter().map(|r| r.to_string()).collect();
+        let count = replies.len();
+        let server = std::thread::spawn(move || {
+            for reply in replies {
+                let (stream, _) = listener.accept().unwrap();
+                let mut cmd = String::new();
+                BufReader::new(&stream).read_line(&mut cmd).unwrap();
+                seen.lock().unwrap().push(cmd.trim_end().to_string());
+                (&stream).write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        StandIn {
+            pid,
+            replies: count,
+            asked,
+            server,
+        }
+    }
+
+    /// The command line of each connection, once the sbx run that was to make them has exited. A
+    /// reply never asked for fails the test here.
+    #[track_caller]
+    fn asked(self) -> Vec<String> {
+        let StandIn {
+            pid,
+            replies,
+            asked,
+            server,
+        } = self;
+        join_within(server, || {
+            format!(
+                "session {pid} was asked {:?}, and {replies} connection(s) were expected",
+                asked.lock().unwrap()
+            )
+        });
+        asked.lock().unwrap().clone()
+    }
+}
+
 #[test]
 fn net_pending_all_save_global_drains_and_persists_each_host() {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
-
     let fx = Project::new("net");
-    let egress = fx.data_home.path().join("sbx").join("egress");
-    std::fs::create_dir_all(&egress).unwrap();
-    let pid = 55555u32; // a fake session: --global drains every socket, no registry/project filter
-    let socket = egress.join(format!("control-{pid}.sock"));
-    let listener = UnixListener::bind(&socket).unwrap();
-
-    // The fake session answers the bulk drain with one host.
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut cmd = String::new();
-        BufReader::new(&stream).read_line(&mut cmd).unwrap();
-        assert!(
-            cmd.starts_with("ALLOW *"),
-            "expected a bulk drain, got {cmd:?}"
-        );
-        (&stream)
-            .write_all(b"answered host=blocked.example\nok\n")
-            .unwrap();
-    });
+    // A fake session (--global drains every socket, no registry/project filter) answers the bulk
+    // drain with one host.
+    let session = StandIn::serve(&fx, 55555, &["answered host=blocked.example\nok\n"]);
 
     let out = fx.run(&["net", "pending", "allow", "--all", "--save", "--global"]);
-    server.join().unwrap();
+    let asked = session.asked();
+    assert!(
+        asked[0].starts_with("ALLOW *"),
+        "expected a bulk drain, got {asked:?}"
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -1763,26 +1823,12 @@ fn net_pending_all_save_global_drains_and_persists_each_host() {
 /// the same exit code, and leave the same file.
 #[test]
 fn net_pending_save_refuses_the_rule_sbx_net_allow_refuses() {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
-
     let fx = Project::new("net");
-    let egress = fx.data_home.path().join("sbx").join("egress");
-    std::fs::create_dir_all(&egress).unwrap();
-    let pid = 55556u32;
-    let socket = egress.join(format!("control-{pid}.sock"));
-    let listener = UnixListener::bind(&socket).unwrap();
-
     // The fake session answers the drain with the one destination a rule cannot be made from.
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut cmd = String::new();
-        BufReader::new(&stream).read_line(&mut cmd).unwrap();
-        (&stream).write_all(b"answered host=*\nok\n").unwrap();
-    });
+    let session = StandIn::serve(&fx, 55556, &["answered host=*\nok\n"]);
 
     let saved = fx.run(&["net", "pending", "allow", "--all", "--save", "--global"]);
-    server.join().unwrap();
+    session.asked();
     let save_err = String::from_utf8_lossy(&saved.stderr).into_owned();
 
     // The control arm: the same string typed at the verb whose grammar this must match.
@@ -1823,9 +1869,7 @@ fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_globa
     // `mode = "ask"` and every other field preserved — NOT a shadowing `[app.<name>.network]` stub in
     // the global sbx.toml (the brick bug) — and the summary must NAME the profile, never "the global
     // config under app <name>" (the stale line that lied about where the rule went).
-    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::net::UnixListener;
 
     let fx = Project::new("net");
     // A global baseline exists (so the "no inline stub" assertion is meaningful), plus the app's real
@@ -1843,10 +1887,7 @@ fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_globa
     // Register THIS process as a live GlobalApp session of `claude-code` so the `--app` filter finds
     // it (liveness pruning keeps it — the process is alive and its start_ticks match). The record
     // format is session.rs's serializer: `runtime=global-app:<name>`, filename `<pid>-<start_ticks>`.
-    let data = fx.data_home.path().join("sbx");
-    let egress = data.join("egress");
-    let sessions = data.join("sessions");
-    std::fs::create_dir_all(&egress).unwrap();
+    let sessions = fx.data_home.path().join("sbx").join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     let pid = std::process::id();
     let start_ticks = common::start_ticks(pid);
@@ -1870,20 +1911,7 @@ fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_globa
     .unwrap();
 
     // The fake session answers the bulk drain with one host to be saved into the profile.
-    let socket = egress.join(format!("control-{pid}.sock"));
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut cmd = String::new();
-        BufReader::new(&stream).read_line(&mut cmd).unwrap();
-        assert!(
-            cmd.starts_with("ALLOW *"),
-            "expected a bulk drain, got {cmd:?}"
-        );
-        (&stream)
-            .write_all(b"answered host=mcp.context7.com\nok\n")
-            .unwrap();
-    });
+    let session = StandIn::serve(&fx, pid, &["answered host=mcp.context7.com\nok\n"]);
 
     let out = fx.run(&[
         "net",
@@ -1895,7 +1923,11 @@ fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_globa
         "--app",
         "claude-code",
     ]);
-    server.join().unwrap();
+    let asked = session.asked();
+    assert!(
+        asked[0].starts_with("ALLOW *"),
+        "expected a bulk drain, got {asked:?}"
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -1948,14 +1980,8 @@ fn net_pending_all_save_local_drains_this_project_and_writes_its_config() {
     // filter. The one coupling is the registry record format (session.rs's serializer): fields
     // `kind=/pid=/start=/runtime=project/project=<canonical>`, filename `<pid>-<start_ticks>`,
     // start_ticks = `/proc/self/stat` field 22.
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
-
     let fx = Project::new("net");
-    let data = fx.data_home.path().join("sbx");
-    let egress = data.join("egress");
-    let sessions = data.join("sessions");
-    std::fs::create_dir_all(&egress).unwrap();
+    let sessions = fx.data_home.path().join("sbx").join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
 
     let pid = std::process::id();
@@ -1977,25 +2003,15 @@ fn net_pending_all_save_local_drains_this_project_and_writes_its_config() {
     )
     .unwrap();
 
-    let socket = egress.join(format!("control-{pid}.sock"));
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut cmd = String::new();
-        BufReader::new(&stream).read_line(&mut cmd).unwrap();
-        assert!(
-            cmd.starts_with("ALLOW *"),
-            "expected a bulk drain, got {cmd:?}"
-        );
-        (&stream)
-            .write_all(b"answered host=blocked.example\nok\n")
-            .unwrap();
-    });
+    let session = StandIn::serve(&fx, pid, &["answered host=blocked.example\nok\n"]);
 
     // No initial `.sbx.toml` → the precheck passes (absent is fine) and the local save bootstraps it.
     let out = fx.run(&["net", "pending", "allow", "--all", "--save", "--local"]);
-    server.join().unwrap();
-    let _ = std::fs::remove_file(&socket);
+    let asked = session.asked();
+    assert!(
+        asked[0].starts_with("ALLOW *"),
+        "expected a bulk drain, got {asked:?}"
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -2158,35 +2174,24 @@ fn net_pending_all_drains_a_live_session_through_the_socket() {
     // the control plane is just a bound Unix socket + a server thread (the same seam the in-process
     // round-trip test stands up). This closes the one path the unit tests cover only with synthetic
     // data: the CLI's glob → drain → per-session render orchestration.
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
-
     let fx = Project::new("net");
     // The control socket lives at <data>/egress/control-<pid>.sock, and <data> is $XDG_DATA_HOME/sbx
     // (the dir `fx.run` redirects). Binding it at the right place is itself the proof the path wiring
     // is correct — a wrong path yields an empty drain ("no pending requests") and the assert fails.
-    let egress = fx.data_home.path().join("sbx").join("egress");
-    std::fs::create_dir_all(&egress).unwrap();
     let pid = 33333u32; // not in the session registry → the `(unregistered)` header path
-    let socket = egress.join(format!("control-{pid}.sock"));
-    let listener = UnixListener::bind(&socket).unwrap();
-
-    // A one-shot fake session: accept one connection, assert it is the bulk drain, answer two hosts.
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut cmd = String::new();
-        BufReader::new(&stream).read_line(&mut cmd).unwrap();
-        assert!(
-            cmd.starts_with("ALLOW *"),
-            "the CLI must send a bulk drain, got: {cmd:?}"
-        );
-        (&stream)
-            .write_all(b"answered host=a.test\nanswered host=b.test\nok\n")
-            .unwrap();
-    });
+    // A one-shot fake session: one connection, which must be the bulk drain, answered with two hosts.
+    let session = StandIn::serve(
+        &fx,
+        pid,
+        &["answered host=a.test\nanswered host=b.test\nok\n"],
+    );
 
     let out = fx.run(&["net", "pending", "allow", "--all"]);
-    server.join().unwrap();
+    let asked = session.asked();
+    assert!(
+        asked[0].starts_with("ALLOW *"),
+        "the CLI must send a bulk drain, got: {asked:?}"
+    );
     assert!(
         out.status.success(),
         "{:?}",
@@ -2214,15 +2219,10 @@ fn net_pending_all_app_scoped_drains_a_registered_app_session() {
     // The app-scoped live drain — the path that was untested (the existing app-filter test covered
     // only the empty case). Register THIS process as a `global-app:claude-code` session, bind its
     // control socket, then drive `-a claude-code --all --session` and assert it actually answers.
-    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::net::UnixListener;
 
     let fx = Project::new("net");
-    let data = fx.data_home.path().join("sbx");
-    let egress = data.join("egress");
-    let sessions = data.join("sessions");
-    std::fs::create_dir_all(&egress).unwrap();
+    let sessions = fx.data_home.path().join("sbx").join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
 
     let pid = std::process::id();
@@ -2243,20 +2243,7 @@ fn net_pending_all_app_scoped_drains_a_registered_app_session() {
     )
     .unwrap();
 
-    let socket = egress.join(format!("control-{pid}.sock"));
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut cmd = String::new();
-        BufReader::new(&stream).read_line(&mut cmd).unwrap();
-        assert!(
-            cmd.starts_with("ALLOW *"),
-            "expected a bulk drain, got {cmd:?}"
-        );
-        (&stream)
-            .write_all(b"answered host=claude.ai\nok\n")
-            .unwrap();
-    });
+    let session = StandIn::serve(&fx, pid, &["answered host=claude.ai\nok\n"]);
 
     let out = fx.run_ok(&[
         "net",
@@ -2267,8 +2254,11 @@ fn net_pending_all_app_scoped_drains_a_registered_app_session() {
         "--all",
         "--session",
     ]);
-    let _ = std::fs::remove_file(&socket);
-    server.join().unwrap();
+    let asked = session.asked();
+    assert!(
+        asked[0].starts_with("ALLOW *"),
+        "expected a bulk drain, got {asked:?}"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("claude.ai") && !stdout.contains("no pending requests"),
@@ -2281,25 +2271,11 @@ fn net_pending_all_names_an_older_session_instead_of_claiming_empty() {
     // A control server speaking the OLD protocol (one predating `--all`) replies `err bad-request`
     // to a bulk drain. The CLI must NOT swallow it as "no pending requests" (the misleading field
     // symptom) — it names the older session and points at the only real fix, relaunching the agent.
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
-
     let fx = Project::new("net");
-    let egress = fx.data_home.path().join("sbx").join("egress");
-    std::fs::create_dir_all(&egress).unwrap();
-    let pid = 44444u32;
-    let socket = egress.join(format!("control-{pid}.sock"));
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut cmd = String::new();
-        BufReader::new(&stream).read_line(&mut cmd).unwrap();
-        // An old server does not understand `ALLOW *`.
-        (&stream).write_all(b"err bad-request\n").unwrap();
-    });
+    // An old server does not understand `ALLOW *`.
+    let session = StandIn::serve(&fx, 44444, &["err bad-request\n"]);
     let out = fx.run_ok(&["net", "pending", "allow", "--all"]);
-    let _ = std::fs::remove_file(&socket);
-    server.join().unwrap();
+    session.asked();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         !stdout.contains("no pending requests")
@@ -2314,25 +2290,11 @@ fn net_pending_all_names_an_older_session_instead_of_claiming_empty() {
 fn net_pending_all_save_names_an_older_session_and_saves_nothing() {
     // The `--save` drain site must surface an older session too — and, since nothing was answered,
     // persist nothing (no false "saved a rule" against a session it could not actually drain).
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
-
     let fx = Project::new("net");
-    let egress = fx.data_home.path().join("sbx").join("egress");
-    std::fs::create_dir_all(&egress).unwrap();
-    let pid = 45454u32;
-    let socket = egress.join(format!("control-{pid}.sock"));
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut cmd = String::new();
-        BufReader::new(&stream).read_line(&mut cmd).unwrap();
-        (&stream).write_all(b"err bad-request\n").unwrap();
-    });
+    let session = StandIn::serve(&fx, 45454, &["err bad-request\n"]);
     // `--global` avoids the project filter so the unsupported session is reached.
     let out = fx.run_ok(&["net", "pending", "allow", "--all", "--save", "--global"]);
-    let _ = std::fs::remove_file(&socket);
-    server.join().unwrap();
+    session.asked();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("older sbx") && stdout.contains("relaunch the agent"),
@@ -2354,15 +2316,10 @@ fn net_pending_by_id_accepts_an_app_scope_and_rejects_a_mismatch() {
     // `-a <app>` on the by-id path is a session scope (the natural carry-over from
     // `sbx net pending -a <app>`), honored without `--save`: it answers the id when the registry
     // confirms that session is that app, and refuses when the id belongs to a *different* app.
-    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::net::UnixListener;
 
     let fx = Project::new("net");
-    let data = fx.data_home.path().join("sbx");
-    let egress = data.join("egress");
-    let sessions = data.join("sessions");
-    std::fs::create_dir_all(&egress).unwrap();
+    let sessions = fx.data_home.path().join("sbx").join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
 
     let pid = std::process::id();
@@ -2382,16 +2339,8 @@ fn net_pending_by_id_accepts_an_app_scope_and_rejects_a_mismatch() {
     )
     .unwrap();
 
-    let socket = egress.join(format!("control-{pid}.sock"));
-    let listener = UnixListener::bind(&socket).unwrap();
     // Only the matching-app case reaches the socket (the mismatch is refused before any answer).
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut cmd = String::new();
-        BufReader::new(&stream).read_line(&mut cmd).unwrap();
-        assert!(cmd.starts_with(&format!("ALLOW {pid_seq}", pid_seq = 1)));
-        (&stream).write_all(b"ok host=claude.ai count=1\n").unwrap();
-    });
+    let session = StandIn::serve(&fx, pid, &["ok host=claude.ai count=1\n"]);
 
     // Matching app → answered (the rejection that prompted this fix is gone).
     let ok = fx.run(&[
@@ -2403,7 +2352,11 @@ fn net_pending_by_id_accepts_an_app_scope_and_rejects_a_mismatch() {
         &format!("{pid}.1"),
         "--session",
     ]);
-    server.join().unwrap();
+    let asked = session.asked();
+    assert!(
+        asked[0].starts_with("ALLOW 1"),
+        "expected the answer to request 1, got {asked:?}"
+    );
     assert!(
         ok.status.success() && String::from_utf8_lossy(&ok.stdout).contains("claude.ai"),
         "an app-scoped by-id answer must work:\nout={}\nerr={}",
@@ -2420,7 +2373,6 @@ fn net_pending_by_id_accepts_an_app_scope_and_rejects_a_mismatch() {
         "some-other-app",
         &format!("{pid}.1"),
     ]);
-    let _ = std::fs::remove_file(&socket);
     assert_eq!(bad.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&bad.stderr).contains("is a session of app `claude-code`"),
@@ -2436,34 +2388,15 @@ fn net_pending_list_collapses_identical_retries_in_text_and_json() {
     // fake control socket that replies with duplicate LIST rows. The same grouping holds in `--json`
     // (so a consumer is not handed individually-addressable seqs that `allow` no longer answers one
     // at a time).
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
-
     let fx = Project::new("net");
-    let egress = fx.data_home.path().join("sbx").join("egress");
-    std::fs::create_dir_all(&egress).unwrap();
-    let pid = 44444u32; // not registered → the `(unregistered)` header path; irrelevant to grouping
-    let socket = egress.join(format!("control-{pid}.sock"));
-    let listener = UnixListener::bind(&socket).unwrap();
-
     // Two LISTs are served (one per `sbx net pending` invocation below): three parked rows each — two
-    // identical retries of one URL (seqs 1 and 4) plus a different destination (seq 2).
-    let server = std::thread::spawn(move || {
-        for _ in 0..2 {
-            let (stream, _) = listener.accept().unwrap();
-            let mut cmd = String::new();
-            BufReader::new(&stream).read_line(&mut cmd).unwrap();
-            assert!(cmd.starts_with("LIST"), "expected a LIST, got {cmd:?}");
-            (&stream)
-                .write_all(
-                    b"pending seq=1 port=443 waiting=80 host=dl.test path=/latest\n\
-                      pending seq=4 port=443 waiting=20 host=dl.test path=/latest\n\
-                      pending seq=2 port=443 waiting=50 host=logs.test path=/api\n\
-                      ok\n",
-                )
-                .unwrap();
-        }
-    });
+    // identical retries of one URL (seqs 1 and 4) plus a different destination (seq 2). The session
+    // is not registered → the `(unregistered)` header path; irrelevant to grouping.
+    let rows = "pending seq=1 port=443 waiting=80 host=dl.test path=/latest\n\
+                pending seq=4 port=443 waiting=20 host=dl.test path=/latest\n\
+                pending seq=2 port=443 waiting=50 host=logs.test path=/api\n\
+                ok\n";
+    let session = StandIn::serve(&fx, 44444, &[rows, rows]);
 
     // Text: the two dl.test retries collapse to one `×2` line at the lowest seq (44444.1) with the
     // largest wait (80s); the different destination keeps its own line; the higher seq is gone.
@@ -2481,7 +2414,11 @@ fn net_pending_list_collapses_identical_retries_in_text_and_json() {
 
     // JSON: grouped the same way — one object per destination, dl.test carrying count=2.
     let json = fx.run_ok(&["net", "pending", "--json"]);
-    server.join().unwrap();
+    let asked = session.asked();
+    assert!(
+        asked.iter().all(|cmd| cmd.starts_with("LIST")),
+        "expected two LISTs, got {asked:?}"
+    );
     let v = common::json_of(&json);
     let arr = v["pending"].as_array().unwrap();
     assert_eq!(arr.len(), 2, "two destinations, not three connections: {v}");
@@ -3117,7 +3054,12 @@ fn a_followed_event_sent_again_with_its_status_is_marked_as_an_update() {
         }
         let _ = follower.kill();
         let _ = follower.wait();
-        server.join().unwrap();
+        join_within(server, || {
+            format!(
+                "the stand-in was asked {:?} of its two reads",
+                asked.lock().unwrap()
+            )
+        });
         let lines = lines.lock().unwrap().clone();
         let all = lines.join("\n");
 
@@ -3336,7 +3278,9 @@ fn an_update_of_an_event_the_follow_never_printed_is_not_printed() {
     std::thread::sleep(Duration::from_millis(1500));
     let _ = follower.kill();
     let _ = follower.wait();
-    server.join().unwrap();
+    join_within(server, || {
+        "the stand-in was not asked for both of its replies".to_string()
+    });
 
     let lines = lines.lock().unwrap().clone();
     let shape: Vec<(u64, bool)> = lines
