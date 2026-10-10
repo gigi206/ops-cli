@@ -164,8 +164,10 @@ fn run_failing(args: &[&str], home: &Path) -> (i32, String) {
     (code, stderr)
 }
 
+/// Run `git <args>` in `dir`, asserted to have succeeded. A failure shows both streams: git says
+/// why on either, `nothing to commit` on stdout and most errors on stderr.
 fn git_run(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
+    let out = Command::new("git")
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "t")
@@ -173,10 +175,14 @@ fn git_run(dir: &Path, args: &[&str]) {
         .env("GIT_COMMITTER_NAME", "t")
         .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
         .output()
-        .expect("spawn git")
-        .status
-        .success();
-    assert!(ok, "git {args:?} failed");
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed ({}):\n{}{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
