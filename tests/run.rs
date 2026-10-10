@@ -5619,7 +5619,9 @@ fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
     let state = TmpDir::prefixed("r", "tcp-splice-state");
 
     // A host-side minimal plain-HTTP upstream on loopback — the splice's destination. Detached: it
-    // answers each connection with a fixed body and closes; the process exit reaps it.
+    // answers each connection with a fixed body and closes; the process exit reaps it. The splice
+    // holds a raw tunnel with no idle bound, so a relay that stops short would leave this read and
+    // the in-cage client waiting on each other for good: the read is bounded, and the client too.
     let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = upstream.local_addr().unwrap().port();
     std::thread::spawn(move || {
@@ -5627,8 +5629,11 @@ fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
             let Ok(mut sock) = conn else { break };
             std::thread::spawn(move || {
                 use std::io::{Read, Write};
-                // read the request head up to the blank line (loop, so a fragmented head is fully
-                // consumed before replying), then reply and close
+                // Read the request head up to the blank line (loop, so a fragmented head is fully
+                // consumed before replying), then reply and close. A head that never completes is
+                // a relay that lost bytes, and the connection closes unanswered: a reply would let
+                // the exchange round-trip on it.
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(30)));
                 let mut head = Vec::new();
                 let mut buf = [0u8; 1024];
                 while !head.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -5637,9 +5642,11 @@ fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
                         Ok(n) => head.extend_from_slice(&buf[..n]),
                     }
                 }
-                let _ = sock.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nRAW-L4-OK",
-                );
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nRAW-L4-OK",
+                    );
+                }
             });
         }
     });
@@ -5673,8 +5680,10 @@ fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
     // in-cage forwarder) to the plain upstream. `--proxytunnel` forces CONNECT even for an http://
     // target; `--noproxy ''` overrides sbx's `no_proxy` (which lists 127.0.0.1) so the loopback
     // target is sent *through* the proxy rather than bypassing it.
-    let cmd =
-        format!("curl -sS --proxytunnel --noproxy '' -x 127.0.0.1:18043 http://127.0.0.1:{port}/");
+    let cmd = format!(
+        "curl -sS --max-time 60 --proxytunnel --noproxy '' -x 127.0.0.1:18043 \
+         http://127.0.0.1:{port}/"
+    );
     let out = sbx_in(
         project.path(),
         data.path(),
