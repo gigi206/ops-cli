@@ -129,32 +129,62 @@ fn parse_trust_args(args: Vec<OsString>) -> Result<TrustArgs, String> {
 }
 
 /// Record trust for a config's current contents, so its security-relevant fields are honored
-/// until the file changes again.
-///
-/// The contents are read once, shown, and those very bytes are what gets hashed
-/// ([`trust::trust_written`]): the tree is writable from the cage, so a second read after the
-/// question would attest to whatever was written while the user was reading. A config that already
-/// matches its marker grants nothing new and is re-recorded without a question.
+/// until the file changes again: [`review_and_trust`], then the line that says what came of it.
 fn record_trust(path: &Path, yes: bool) -> ExitCode {
     let store_dir = match trust_store_dir() {
         Ok(d) => d,
         Err(code) => return code,
     };
+    match review_and_trust(&store_dir, path, yes) {
+        TrustOutcome::Recorded => {
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            outln!("{}", render_trust_recorded(path, &pal));
+            ExitCode::SUCCESS
+        }
+        TrustOutcome::Declined => {
+            diag::error(&format!("sbx: not trusting {}", path.display()));
+            ExitCode::FAILURE
+        }
+        TrustOutcome::Failed(e) => {
+            crate::diag::error(&format!("sbx: cannot trust {e}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// What came of a trust a verb set out to record.
+#[derive(Debug)]
+pub(crate) enum TrustOutcome {
+    /// The marker was written.
+    Recorded,
+    /// Nobody approved what the review showed: the answer was no, or there was no terminal to ask
+    /// and no `--yes`. Nothing was written.
+    Declined,
+    /// The config or a file its trust covers could not be read, or the marker could not be
+    /// written. Nothing was written.
+    Failed(std::io::Error),
+}
+
+/// Show what trusting a config grants, ask, and record trust over the bytes that were shown.
+///
+/// The contents are read once, shown, and those very bytes are what gets hashed
+/// ([`trust::trust_written`]): the tree is writable from the cage, so a second read after the
+/// question would attest to whatever was written while the user was reading. A config that already
+/// matches its marker grants nothing new and is re-recorded without a question. The review goes to
+/// stderr; the caller says what came of it.
+pub(crate) fn review_and_trust(store_dir: &Path, path: &Path, yes: bool) -> TrustOutcome {
     let read = crate::config::safety::read_safe_bytes(path).and_then(|sbx| {
         let covered = trust::trust_inputs_for(path, &sbx)?;
         Ok((sbx, covered))
     });
     let (sbx_bytes, mise) = match read {
         Ok(read) => read,
-        Err(e) => {
-            crate::diag::error(&format!("sbx: cannot trust {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return TrustOutcome::Failed(e),
     };
     let current = trust::content_hash(&sbx_bytes, &mise);
-    if trust::verdict_for_hash(&store_dir, path, &current) != trust::TrustState::Trusted {
+    if trust::verdict_for_hash(store_dir, path, &current) != trust::TrustState::Trusted {
         let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
-        let before = trust::approved(&store_dir, path);
+        let before = trust::approved(store_dir, path);
         let now = contents_of(path, &sbx_bytes, &mise);
         let was = before
             .as_ref()
@@ -162,20 +192,12 @@ fn record_trust(path: &Path, yes: bool) -> ExitCode {
         err!("{}", render_trust_review(path, was.as_deref(), &now, &epal));
         if !yes && !crate::cli::confirm::ask("trust these contents?", "these contents are intended")
         {
-            diag::error(&format!("sbx: not trusting {}", path.display()));
-            return ExitCode::FAILURE;
+            return TrustOutcome::Declined;
         }
     }
-    match trust::trust_written(&store_dir, path, &sbx_bytes, &mise) {
-        Ok(()) => {
-            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            outln!("{}", render_trust_recorded(path, &pal));
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            crate::diag::error(&format!("sbx: cannot trust {e}"));
-            ExitCode::FAILURE
-        }
+    match trust::trust_written(store_dir, path, &sbx_bytes, &mise) {
+        Ok(()) => TrustOutcome::Recorded,
+        Err(e) => TrustOutcome::Failed(e),
     }
 }
 
