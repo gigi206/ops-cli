@@ -17,10 +17,19 @@ fn sbx() -> Command {
     // test's outcome would depend on the host. Default it to a fixed empty dir under the test
     // tree — no run.rs test writes a global config there (the profile-import test sets its own
     // XDG_CONFIG_HOME, which overrides this default), so a shared empty dir is race-free.
+    //
+    // The trust store is isolated the same way, for the same reason: a launch reads its verdict on
+    // the project's config from `$XDG_STATE_HOME/sbx/trusted`, so without this default every launch
+    // that names no state dir of its own would answer out of the developer's trust store. Nothing
+    // reaches this one to write it: a trust marker is written by `sbx trust`, by a rule-writing verb,
+    // by `sbx config set|edit --trust` and by a learning run, and every test that runs one passes its
+    // own `XDG_STATE_HOME` ([`sbx_session_in`]), which overrides this default.
     let cfg = fixture_root().join("isolated-config");
     let _ = std::fs::create_dir_all(&cfg);
+    let state = fixture_root().join("isolated-state");
+    let _ = std::fs::create_dir_all(&state);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
-    cmd.env("XDG_CONFIG_HOME", cfg);
+    cmd.env("XDG_CONFIG_HOME", cfg).env("XDG_STATE_HOME", state);
     // Pin a deterministic UTF-8 locale: the cage now honors the host locale, so a provisioned
     // tool's output (e.g. GNU `hello`) would otherwise be translated on a non-English developer
     // machine and break an assertion on its English text. `C.UTF-8` keeps messages English while
