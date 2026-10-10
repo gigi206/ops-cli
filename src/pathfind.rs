@@ -149,7 +149,8 @@ fn searched_dirs<'a>(
 
 /// `$PATH` reduced to the entries [`find_on_path`] searches, for a shell that resolves a program
 /// itself: a shell's own search reads every entry, an empty one (the working directory, which is
-/// the project) included. Empty when `PATH` is unset or leaves no entry.
+/// the project) included. Empty when `PATH` is unset or leaves no entry, and a caller must then
+/// search nothing: a shell reads an empty `PATH` as one empty entry, the working directory.
 ///
 /// What it filters is that one lookup. A link in a searched directory that leads into the project
 /// is still followed, where [`find_on_path`] refuses it, since a shell resolves a name and not
@@ -163,8 +164,8 @@ pub(crate) fn searched_path() -> std::ffi::OsString {
 
 /// Pure core of [`searched_path`], with the `PATH` value and the project handed in.
 fn searched_path_in(path: &std::ffi::OsStr, untrusted: Option<&Path>) -> std::ffi::OsString {
-    // An entry `split_paths` produced holds no separator, so this does not fail; an empty `PATH`
-    // would refuse the program rather than widen the search.
+    // An entry `split_paths` produced holds no separator, so this does not fail. Were it to, the
+    // empty value is the one [`searched_path`] says a caller must refuse.
     std::env::join_paths(searched_dirs(std::env::split_paths(path), untrusted)).unwrap_or_default()
 }
 
