@@ -146,6 +146,12 @@ The log's bytes go to **stdout** unchanged, so redirecting captures the agent's 
 wrote it; the context line goes to stderr. `--follow` on a session that has already exited prints
 what is there and returns rather than waiting for output that will never come.
 
+The registry is still what tells a running session from an exited one. When it cannot be read,
+that is not known, and the context line says `state unknown`. A plain reading names the registry
+in a warning and exits 0. `--follow` prints what is there, then names the registry in an error
+and exits **1** rather than wait for an end it could not see, and a follow already under way ends
+the same way on the first poll that cannot read it.
+
 Unchanged means unescaped. The colours, cursor moves and redraws an agent's interface is made of
 replay as it drew them, and so does any other control sequence the agent printed: your terminal
 acts on it exactly as it would have in a foreground session, where the agent writes to it directly.
