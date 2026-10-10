@@ -1560,7 +1560,12 @@ fn sbx_app_rm_purge_asks_the_registry_without_reclaiming_it() {
     .unwrap();
 
     let purged = fx.run(&["app", "rm", "claude", "--purge"]);
-    assert!(purged.status.success(), "purge failed: {purged:?}");
+    assert!(
+        purged.status.success(),
+        "purge failed ({}): {}",
+        purged.status,
+        text(&purged)
+    );
     assert!(
         !sbx_dir.join("apps/claude").exists(),
         "the purge did not do its own job, so this proves nothing about how it asked"
@@ -1586,7 +1591,12 @@ fn sbx_app_rm_purge_removes_the_installed_homes_and_lists_them() {
     // `sbx app list` shows one row per app with its installed home, so a user can see what there is
     // to purge. The unified table carries the `HOME` column header and a row for each installed app.
     let listed = fx.run(&["app", "list"]);
-    assert!(listed.status.success(), "app list failed: {listed:?}");
+    assert!(
+        listed.status.success(),
+        "app list failed ({}): {}",
+        listed.status,
+        text(&listed)
+    );
     let list_out = String::from_utf8_lossy(&listed.stdout);
     assert!(
         list_out.contains("HOME") && list_out.contains("claude") && list_out.contains("codex"),
@@ -1595,7 +1605,12 @@ fn sbx_app_rm_purge_removes_the_installed_homes_and_lists_them() {
 
     // Purge 'claude': profile absent (fine), both homes removed, everything else intact.
     let purged = fx.run(&["app", "rm", "claude", "--purge"]);
-    assert!(purged.status.success(), "purge failed: {purged:?}");
+    assert!(
+        purged.status.success(),
+        "purge failed ({}): {}",
+        purged.status,
+        text(&purged)
+    );
     let purge_out = String::from_utf8_lossy(&purged.stdout);
     assert!(
         purge_out.contains("purged"),
@@ -1623,7 +1638,8 @@ fn sbx_app_rm_purge_removes_the_installed_homes_and_lists_them() {
     assert!(!again.status.success(), "a no-op purge reported success");
     assert!(
         String::from_utf8_lossy(&again.stderr).contains("nothing to purge"),
-        "no-op purge did not explain itself: {again:?}"
+        "no-op purge did not explain itself: {}",
+        text(&again)
     );
 }
 
@@ -1649,12 +1665,15 @@ fn sbx_app_rm_purges_several_apps_in_one_call() {
     ]);
     assert!(
         !out.status.success(),
-        "an app with nothing to purge must colour the exit code: {out:?}"
+        "an app with nothing to purge must colour the exit code ({}): {}",
+        out.status,
+        text(&out)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("nothing to purge for 'absent-app'"),
-        "the failing name is not the one reported: {out:?}"
+        "the failing name is not the one reported: {}",
+        text(&out)
     );
     assert!(
         !sbx_dir.join("apps/agent-one").exists(),
@@ -1694,18 +1713,22 @@ fn sbx_app_rm_counts_a_repeated_name_once() {
     let out = fx.run(&["app", "rm", "agent-one", "agent-one", "--purge"]);
     assert!(
         out.status.success(),
-        "a repeated name reported a failure: {out:?}"
+        "a repeated name reported a failure ({}): {}",
+        out.status,
+        text(&out)
     );
     assert!(
         !String::from_utf8_lossy(&out.stderr).contains("nothing to purge"),
-        "the repeat was purged twice: {out:?}"
+        "the repeat was purged twice: {}",
+        text(&out)
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout)
             .matches("purged app")
             .count(),
         1,
-        "the repeat produced a second summary line: {out:?}"
+        "the repeat produced a second summary line: {}",
+        text(&out)
     );
     assert!(
         !sbx_dir.join("apps/agent-one").exists(),
@@ -1721,7 +1744,9 @@ fn sbx_app_rm_gc_is_skipped_when_the_call_purged_nothing() {
     let out = fx.run(&["app", "rm", "absent-app", "--purge", "--gc"]);
     assert!(
         !out.status.success(),
-        "a call that purged nothing must not report success: {out:?}"
+        "a call that purged nothing must not report success ({}): {}",
+        out.status,
+        text(&out)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -1747,11 +1772,13 @@ fn sbx_app_rm_gc_requires_purge() {
     assert_eq!(
         out.status.code(),
         Some(2),
-        "usage error should exit 2: {out:?}"
+        "usage error should exit 2: {}",
+        text(&out)
     );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("requires `--purge`"),
-        "the error should explain the --gc/--purge relationship: {out:?}"
+        "the error should explain the --gc/--purge relationship: {}",
+        text(&out)
     );
 }
 
@@ -1765,7 +1792,9 @@ fn sbx_app_rm_purge_refuses_while_a_session_is_live() {
     let out = fx.run(&["app", "rm", "agent", "--purge"]);
     assert!(
         !out.status.success(),
-        "purge did not refuse a live app: {out:?}"
+        "purge did not refuse a live app ({}): {}",
+        out.status,
+        text(&out)
     );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
