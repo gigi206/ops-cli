@@ -1580,7 +1580,8 @@ mod tests {
     /// the host's git configuration. Asserts success.
     fn git_run(git: &Path, dir: &Path, args: &[&str]) {
         let ok = Command::new(git)
-            .args(["-C", dir.to_str().unwrap()])
+            .arg("-C")
+            .arg(dir)
             .args([
                 "-c",
                 "user.email=t@t",
@@ -1764,7 +1765,12 @@ mod tests {
         let file = dir.path().join("key.hex");
         std::fs::write(&file, format!("{hex}\n")).unwrap();
         assert_eq!(
-            parse_pubkey_arg(&format!("@{}", file.to_str().unwrap())).unwrap(),
+            parse_pubkey_arg(&format!(
+                "@{}",
+                file.to_str()
+                    .expect("a fixture path is UTF-8: `--key @<file>` takes its path as text")
+            ))
+            .unwrap(),
             key
         );
 
@@ -2916,13 +2922,12 @@ mod tests {
         // does. It forks one child and records its pid, because git does the same -- the transport
         // runs in a `git-remote-https` helper, and ending git alone leaves that helper holding the
         // connection. `exec` for the last one so the shell is not a process the kill has to find.
+        // The marker's path reaches the stub through its environment, so the script names no
+        // fixture path, whatever the fixture root holds.
         let marker = base.path().join("forked.pid");
         std::fs::write(
             &git,
-            format!(
-                "#!/bin/sh\nsleep 600 &\necho $! > {}\nexec sleep 600\n",
-                marker.display()
-            ),
+            "#!/bin/sh\nsleep 600 &\necho $! > \"$SBX_TEST_MARKER\"\nexec sleep 600\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt as _;
@@ -2938,7 +2943,9 @@ mod tests {
         // spawned. `clone` does *not* ask for one, and says why: the terminal signals a group, so
         // taking git out of sbx's moves the orphan onto Ctrl-C. What is held here is that the
         // mechanism works when a caller can use it.
-        cmd.process_group(0).arg("clone");
+        cmd.process_group(0)
+            .env("SBX_TEST_MARKER", &marker)
+            .arg("clone");
         let started = std::time::Instant::now();
         let err = crate::sandbox::resolver::output_within(
             &mut cmd,
