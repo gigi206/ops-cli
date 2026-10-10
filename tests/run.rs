@@ -670,7 +670,9 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
             "--",
             "sh",
             "-c",
-            &format!("echo written-in-cage > {}", rw_target.display()),
+            "echo written-in-cage > \"$1\"",
+            "sh",
+            &rw_target.display().to_string(),
         ],
     );
     assert!(
@@ -716,7 +718,9 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
             "--",
             "sh",
             "-c",
-            &format!("echo nope > {}", ro_target.display()),
+            "echo nope > \"$1\"",
+            "sh",
+            &ro_target.display().to_string(),
         ],
     );
     assert!(
@@ -896,15 +900,23 @@ fn trust_marker(state: &Path) -> PathBuf {
     marker
 }
 
-/// `sbx run -- sh -c <script>` from `cwd`, with sbx's data, state and config homes at the given
-/// paths, in that order.
-fn sh_with_roots(cwd: &Path, [data, state, config]: [&Path; 3], script: &str) -> Output {
+/// `sbx run -- sh -c <script> sh <args…>` from `cwd`, with sbx's data, state and config homes at
+/// the given paths, in that order. The script reads each argument as `$1`, `$2`…, so a path reaches
+/// it as one word the shell never parses, whatever characters it holds.
+fn sh_with_roots(
+    cwd: &Path,
+    [data, state, config]: [&Path; 3],
+    script: &str,
+    args: &[&Path],
+) -> Output {
     sbx()
         .arg("run")
         .arg("--")
         .arg("sh")
         .arg("-c")
         .arg(script)
+        .arg("sh")
+        .args(args)
         .current_dir(cwd)
         .env("XDG_DATA_HOME", data)
         .env("XDG_STATE_HOME", state)
@@ -922,7 +934,7 @@ fn sh_with_roots(cwd: &Path, [data, state, config]: [&Path; 3], script: &str) ->
 fn probe_without_pins(cwd: &Path, data: &Path) -> Output {
     let elsewhere = TmpDir::prefixed("r", "cpq");
     let (state, config) = (elsewhere.path().join("s"), elsewhere.path().join("c"));
-    sh_with_roots(cwd, [data, &state, &config], "true")
+    sh_with_roots(cwd, [data, &state, &config], "true", &[])
 }
 
 /// The lines of `want` that `stdout` does not print, each compared whole, so one failing launch
@@ -965,13 +977,13 @@ fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     // A pre-placed trust marker whose survival proves the pin defeats path substitution.
     let sentinel = trust_marker(&state);
 
-    let run = |script: &str| sh_with_roots(&project, [&data, &state, &config], script);
+    let run = |script: &str| sh_with_roots(&project, [&data, &state, &config], script, &[&h]);
 
     // capability probe, outside the shape under test (seeds the base store); skip if incapable.
     probe_or_skip!("control-plane pin e2e", probe_without_pins(&project, &data));
 
     let script = format!(
-        r#"H="{h}"
+        r#"H=$1
 echo "A:$(touch "$H/writeprobe" 2>/dev/null && echo OK || echo FAIL)"
 echo "B:$(echo x > "$H/{s}/sbx/trusted/forged" 2>/dev/null && echo BAD || echo RO)"
 echo "C:$(mv "$H/{s}" "$H/{s}.bak" 2>/dev/null && echo BAD || echo EBUSY)"
@@ -981,7 +993,6 @@ echo "F:$(touch /nix/.sbx-store-writeprobe 2>/dev/null && echo OK || echo FAIL)"
 echo "V:$(ls -A "$H/{d}/sbx" | wc -l)"
 echo "T:$(ls -A "$H/{s}/sbx/trusted" | wc -l)"
 "#,
-        h = h.display(),
         d = DATA_REL,
         s = STATE_REL,
         c = CONFIG_REL
@@ -1054,7 +1065,7 @@ fn an_fs_mask_under_a_pinned_directory_stays_closed_when_launched_from_home() {
     )
     .unwrap();
 
-    let run = |script: &str| sh_with_roots(&h, [&data, &state, &config], script);
+    let run = |script: &str| sh_with_roots(&h, [&data, &state, &config], script, &[]);
     // The project here is the directory that holds the roots, so the probe runs from another.
     let elsewhere = TmpDir::prefixed("r", "cpmp");
     probe_or_skip!(
@@ -1124,14 +1135,13 @@ fn a_read_only_bind_under_a_read_write_home_keeps_refusing_writes_beside_the_pin
         &[(&data, "rw"), (&h, "rw"), (&state, "ro"), (&gh, "ro")],
     );
 
-    let run = |script: &str| sh_with_roots(&project, [&data, &state, &config], script);
+    let run = |script: &str| sh_with_roots(&project, [&data, &state, &config], script, &[&h]);
     probe_or_skip!(
         "read-only bind beside the pins e2e",
         probe_without_pins(&project, &data)
     );
 
-    let out = run(&format!(
-        r#"H="{h}"
+    let out = run(r#"H=$1
 echo "G:$(touch "$H/c/gh/new" 2>/dev/null && echo WRITABLE || echo RO)"
 echo "S:$(touch "$H/s/new" 2>/dev/null && echo WRITABLE || echo RO)"
 echo "V:$(ls -A "$H/d/sbx" | wc -l)"
@@ -1141,9 +1151,7 @@ if mv "$H/d/sbx" "$H/d/moved" 2>/dev/null; then echo "D:MOVED"; mv "$H/d/moved" 
 if mv .git .git.moved 2>/dev/null; then echo "GIT:MOVED"; mv .git.moved .git; else echo "GIT:HELD"; fi
 if mv "$H/c/repo" "$H/c/moved" 2>/dev/null; then echo "P:MOVED"; mv "$H/c/moved" "$H/c/repo"; else echo "P:HELD"; fi
 echo "A:$(touch "$H/new" "$H/c/new" 2>/dev/null && echo OK || echo FAIL)"
-"#,
-        h = h.display()
-    ));
+"#);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1186,23 +1194,20 @@ fn a_read_only_home_bind_shows_sbx_roots_empty() {
     let sentinel = trust_marker(&state);
     global_binds(&config, &[(&h, "ro")]);
 
-    let run = |script: &str| sh_with_roots(project.path(), [&data, &state, &config], script);
+    let run = |script: &str| sh_with_roots(project.path(), [&data, &state, &config], script, &[&h]);
     probe_or_skip!(
         "read-only home bind e2e",
         probe_without_pins(project.path(), &data)
     );
 
-    let out = run(&format!(
-        r#"H="{h}"
+    let out = run(r#"H=$1
 echo "R:$(cat "$H/readme" 2>/dev/null || echo UNREAD)"
 echo "W:$(touch "$H/new" 2>/dev/null && echo WRITABLE || echo RO)"
 echo "WC:$(touch "$H/c/new" "$H/d/new" 2>/dev/null && echo WRITABLE || echo RO)"
 echo "V:$(ls -A "$H/d/sbx" | wc -l)"
 echo "T:$(ls -A "$H/s/sbx/trusted" | wc -l)"
 echo "C:$(ls -A "$H/c/sbx" | wc -l)"
-"#,
-        h = h.display()
-    ));
+"#);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1237,22 +1242,19 @@ fn a_bind_inside_sbx_data_dir_stays_visible_under_the_pin() {
     trust_marker(&state);
     global_binds(&config, &[(&h, "rw"), (&shared, "ro")]);
 
-    let run = |script: &str| sh_with_roots(&project, [&data, &state, &config], script);
+    let run = |script: &str| sh_with_roots(&project, [&data, &state, &config], script, &[&h]);
     probe_or_skip!(
         "bind inside the data dir e2e",
         probe_without_pins(&project, &data)
     );
 
-    let out = run(&format!(
-        r#"H="{h}"
+    let out = run(r#"H=$1
 echo "B:$(cat "$H/d/sbx/shared/f" 2>/dev/null || echo UNREAD)"
 echo "BW:$(touch "$H/d/sbx/shared/new" 2>/dev/null && echo WRITABLE || echo RO)"
 echo "R:$(touch "$H/d/sbx/new" 2>/dev/null && echo WRITABLE || echo RO)"
 if mv "$H/d/sbx" "$H/d/moved" 2>/dev/null; then echo "D:MOVED"; mv "$H/d/moved" "$H/d/sbx"; else echo "D:HELD"; fi
 echo "T:$(ls -A "$H/s/sbx/trusted" | wc -l)"
-"#,
-        h = h.display()
-    ));
+"#);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1283,21 +1285,18 @@ fn a_trust_store_inside_the_config_home_launches_hidden_with_it() {
     let sentinel = trust_marker(&config);
     global_binds(&config, &[(&h, "rw")]);
 
-    let run = |script: &str| sh_with_roots(&project, [&data, &config, &config], script);
+    let run = |script: &str| sh_with_roots(&project, [&data, &config, &config], script, &[&h]);
     probe_or_skip!(
         "trust store inside the config home e2e",
         probe_without_pins(&project, &data)
     );
 
-    let out = run(&format!(
-        r#"H="{h}"
+    let out = run(r#"H=$1
 echo "C:$(ls -A "$H/c/sbx" | wc -l)"
 echo "CW:$(touch "$H/c/sbx/new" 2>/dev/null && echo WRITABLE || echo RO)"
 if mv "$H/c/sbx" "$H/c/moved" 2>/dev/null; then echo "M:MOVED"; mv "$H/c/moved" "$H/c/sbx"; else echo "M:HELD"; fi
 echo "A:$(touch "$H/new" "$H/c/new" 2>/dev/null && echo OK || echo FAIL)"
-"#,
-        h = h.display()
-    ));
+"#);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
