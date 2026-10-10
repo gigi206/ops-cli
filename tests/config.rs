@@ -6365,6 +6365,79 @@ fn config_edit_trusts_nothing_when_the_editor_never_ran() {
     );
 }
 
+/// The file `config edit` opens is an argument of the editor and never the command, whatever the
+/// editor variables hold. A cloned repository can ship its `.sbx.toml` executable, since git keeps
+/// the mode, and a command line that contributed no word made that file the command: it ran on the
+/// host, outside any cage, and `--trust` then recorded it as approved.
+#[test]
+fn config_edit_never_runs_the_file_it_opens() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Project::new("cfg");
+    let marker = fx.scratch().join("marker");
+    // A comment to TOML and to `sh` alike on its first two lines, so the file is both.
+    fx.write_project("#!/bin/sh\n# sbx\necho ran > \"$SBX_TEST_MARKER\"\n");
+    let file = fx.proj.path().join(".sbx.toml");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // `$VISUAL` empty, so `$EDITOR` is read, and `$EDITOR` a line that expands to nothing.
+    let out = fx
+        .cmd(&["config", "edit", "--trust"])
+        .env("VISUAL", "")
+        .env("EDITOR", "$UNSET")
+        .env_remove("UNSET")
+        .env("SBX_TEST_MARKER", &marker)
+        .output()
+        .expect("spawn sbx");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !marker.exists(),
+        "the config file ran as a program:\n{stderr}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("the editor names no program"),
+        "the refusal says why:\n{stderr}"
+    );
+    assert!(
+        names_in(&fx.state_home.path().join("sbx/trusted")).is_empty(),
+        "nothing may be trusted:\n{stderr}"
+    );
+
+    // An empty `$VISUAL` is unset rather than an editor, so `$EDITOR` opens the file.
+    let fx = Project::new("cfg");
+    fx.write_project("nixpkgs = \"nixos-23.11\"\n");
+    let editor = fx.stage_editor("#!/bin/sh\nprintf '\\n[env]\\nEDITED = \"yes\"\\n' >> \"$1\"\n");
+    common::output_ok(
+        fx.cmd(&["config", "edit"])
+            .env("VISUAL", "")
+            .env("EDITOR", editor),
+    );
+    assert!(
+        std::fs::read_to_string(fx.proj.path().join(".sbx.toml"))
+            .unwrap()
+            .contains("EDITED = \"yes\""),
+        "`$EDITOR` must have edited the file"
+    );
+
+    // A command line goes through `sh`, and still gets the file as its last argument, with an
+    // assignment in front of the program reaching the program.
+    let fx = Project::new("cfg");
+    fx.write_project("nixpkgs = \"nixos-23.11\"\n");
+    let editor =
+        fx.stage_editor("#!/bin/sh\nprintf '\\n[env]\\nEDITED = \"%s\"\\n' \"$VAR\" >> \"$1\"\n");
+    common::output_ok(
+        fx.cmd(&["config", "edit"])
+            .env_remove("VISUAL")
+            .env("EDITOR", format!("VAR=1 {editor}")),
+    );
+    assert!(
+        std::fs::read_to_string(fx.proj.path().join(".sbx.toml"))
+            .unwrap()
+            .contains("EDITED = \"1\""),
+        "the command line must have edited the file, with its assignment"
+    );
+}
+
 /// The golden harness behind `resolve()`: `$SBX_DEBUG_RESOLVED_DUMP` must be **stable** across runs
 /// of the same configuration and **sensitive** to a change in it. Both halves are asserted, and the
 /// second is the one that matters: a dump that wrote nothing, or wrote a constant, would satisfy
