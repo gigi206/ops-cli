@@ -7867,10 +7867,14 @@ fn describe_mise_pools(data: &Path) -> String {
 
 /// Whether `path` (a logical `/nix/store/<hash>-name`) is physically present in `store_dir`.
 fn in_store(store_dir: &Path, path: &Path) -> bool {
-    store_dir
-        .join("nix/store")
-        .join(path.file_name().expect("store path basename"))
-        .exists()
+    path.file_name()
+        .is_some_and(|name| store_dir.join("nix/store").join(name).exists())
+}
+
+#[test]
+fn a_path_with_no_basename_is_in_no_store() {
+    // A mise version entry is a link the cage wrote, so its target can be anything, `/` included.
+    assert!(!in_store(Path::new("/nonexistent"), Path::new("/")));
 }
 
 #[test]
