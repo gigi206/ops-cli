@@ -338,15 +338,13 @@ mod tests {
         );
     }
 
-    fn a_cage(store: &Path, shell: &Path, ca: &Path, bins: &[&str]) -> ResolveCage<'static> {
-        // A leaked `bwrap` path so the returned cage can be `'static` in a unit test — the spec is
-        // built purely (no exec), so the path is never run.
-        let bwrap: &'static Path = Box::leak(PathBuf::from("/run/bwrap").into_boxed_path());
+    fn a_cage<'a>(store: &Path, shell: &'a Path, ca: &'a Path, bins: &[&str]) -> ResolveCage<'a> {
         ResolveCage {
-            bwrap,
+            // The spec is built purely (no exec), so this path is never run.
+            bwrap: Path::new("/run/bwrap"),
             store_src: store.to_path_buf(),
-            shell_bin: Box::leak(shell.to_path_buf().into_boxed_path()),
-            ca_bundle: Box::leak(ca.to_path_buf().into_boxed_path()),
+            shell_bin: shell,
+            ca_bundle: ca,
             bins: bins.iter().map(PathBuf::from).collect(),
             limits: &INERT_LIMITS,
             slug: "demo-app",
@@ -413,7 +411,10 @@ mod tests {
             "no variable may reach the argument list: {argv:?}"
         );
         // the command is passed verbatim as the argv after `--`
-        let dashes = argv.iter().position(|a| a == "--").unwrap();
+        let dashes = argv
+            .iter()
+            .position(|a| a == "--")
+            .unwrap_or_else(|| panic!("the command follows a `--`: {argv:?}"));
         assert_eq!(
             &argv[dashes + 1..],
             &[
@@ -488,8 +489,8 @@ mod tests {
         std::fs::write(
             &fake,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho https://example.com/x.tar.gz\n",
-                dump.display()
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\necho https://example.com/x.tar.gz\n",
+                crate::testutil::sh_word(&dump)
             ),
         )
         .unwrap();
@@ -533,8 +534,8 @@ mod tests {
         std::fs::write(
             &fake,
             format!(
-                "#!/bin/sh\ncat /proc/self/cgroup > '{}'\necho https://example.com/x.tar.gz\n",
-                seen.display()
+                "#!/bin/sh\ncat /proc/self/cgroup > {}\necho https://example.com/x.tar.gz\n",
+                crate::testutil::sh_word(&seen)
             ),
         )
         .unwrap();
