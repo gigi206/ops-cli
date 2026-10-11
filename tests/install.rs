@@ -11,6 +11,7 @@ use common::fixture::TmpDir;
 
 use sha2::{Digest, Sha256};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -41,6 +42,29 @@ const CALLS: &str = "calls.log";
 fn script() -> Vec<u8> {
     std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
         .expect("install.sh is readable")
+}
+
+/// Write `body` at `path`, its directory made first. A failure names the path, at the line that
+/// called this.
+#[track_caller]
+fn put(path: &Path, body: impl AsRef<[u8]>) {
+    let dir = path.parent().expect("a fixture file sits in a directory");
+    // Panicked from this body: a closure would report its own line rather than the caller's.
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        panic!("create {}: {e}", dir.display());
+    }
+    if let Err(e) = std::fs::write(path, body) {
+        panic!("write {}: {e}", path.display());
+    }
+}
+
+/// [`put`] a stand-in tool, executable.
+#[track_caller]
+fn put_executable(path: &Path, body: &str) {
+    put(path, body);
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)) {
+        panic!("make {} executable: {e}", path.display());
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -80,23 +104,22 @@ impl Release {
     /// Publish `body` as `asset` under `tag`, with `checksum` as its `.sha256`, or the real one.
     fn publish(&self, tag: &str, asset: &str, body: &str, checksum: Option<&str>) {
         let dir = self.root.join("download").join(tag);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(asset), body).unwrap();
+        put(&dir.join(asset), body);
         let sum = checksum.map_or_else(|| sha256_hex(body.as_bytes()), str::to_string);
-        std::fs::write(dir.join(format!("{asset}.sha256")), format!("{sum}\n")).unwrap();
+        put(&dir.join(format!("{asset}.sha256")), format!("{sum}\n"));
     }
 
     /// Publish the macOS template and wrapper as the repository holds them at `tag`.
     fn publish_macos(&self, tag: &str) {
         let dir = self.root.join("source").join(tag).join("dist/macos");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("sbx.yaml"), FAKE_TEMPLATE).unwrap();
-        std::fs::write(dir.join("sbx"), FAKE_SBX).unwrap();
-        std::fs::write(dir.join("sbx-bridge"), FAKE_BRIDGE).unwrap();
-        std::fs::write(dir.join("sbx-notify.applescript"), FAKE_NOTIFY_SCRIPT).unwrap();
-        let assets = self.root.join("source").join(tag).join("assets");
-        std::fs::create_dir_all(&assets).unwrap();
-        std::fs::write(assets.join("sbx.png"), FAKE_ICON).unwrap();
+        put(&dir.join("sbx.yaml"), FAKE_TEMPLATE);
+        put(&dir.join("sbx"), FAKE_SBX);
+        put(&dir.join("sbx-bridge"), FAKE_BRIDGE);
+        put(&dir.join("sbx-notify.applescript"), FAKE_NOTIFY_SCRIPT);
+        put(
+            &self.root.join("source").join(tag).join("assets/sbx.png"),
+            FAKE_ICON,
+        );
     }
 
     /// A directory holding the five macOS tools the notifier is built with, each appending its
@@ -105,7 +128,6 @@ impl Release {
     /// only record. A tool named in `missing` is left out.
     fn fake_mac_tools(&self, missing: &[&str]) -> PathBuf {
         let bin = self.root.join("macbin");
-        std::fs::create_dir_all(&bin).unwrap();
         let tools = [
             (
                 "osacompile",
@@ -121,12 +143,10 @@ impl Release {
             if missing.contains(&name) {
                 continue;
             }
-            let path = bin.join(name);
             let body = format!(
                 "#!/bin/sh\necho \"{name} $*\" >> \"$(dirname \"$0\")/{CALLS}\"\n{action}\n"
             );
-            std::fs::write(&path, body).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            put_executable(&bin.join(name), &body);
         }
         bin
     }
@@ -143,11 +163,8 @@ impl Release {
     /// A directory holding a `launchctl` that appends each call to [`Release::launchctl_calls`].
     fn fake_launchctl(&self) -> PathBuf {
         let bin = self.root.join("launchbin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let path = bin.join("launchctl");
         let body = format!("#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/{CALLS}\"\n");
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        put_executable(&bin.join("launchctl"), &body);
         bin
     }
 
@@ -164,14 +181,11 @@ impl Release {
     /// lists an instance named `sbx` when `FAKE_LIMA_EXISTS` is set.
     fn fake_limactl(&self) -> PathBuf {
         let bin = self.root.join("limabin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let path = bin.join("limactl");
         let body = format!(
             "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/{CALLS}\"\n\
              case \"$1\" in list) [ -z \"${{FAKE_LIMA_EXISTS:-}}\" ] || echo sbx ;; esac\n"
         );
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        put_executable(&bin.join("limactl"), &body);
         bin
     }
 
@@ -186,25 +200,20 @@ impl Release {
 
     /// Make the releases API name `tag` as the newest stable release, in the shape GitHub prints.
     fn announce(&self, tag: &str) {
-        let api = self.root.join("api");
-        std::fs::create_dir_all(&api).unwrap();
         let body =
             format!("{{\n  \"url\": \"x\",\n  \"tag_name\": \"{tag}\",\n  \"name\": \"x\"\n}}\n");
-        std::fs::write(api.join("latest"), body).unwrap();
+        put(&self.root.join("api/latest"), body);
     }
 
     /// A directory holding a `uname` that answers `kernel` and `machine`, to put first on `PATH`.
     fn fake_uname(&self, kernel: &str, machine: &str) -> PathBuf {
         let bin = self.root.join("fakebin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let path = bin.join("uname");
         let body = format!(
             "#!/bin/sh\ncase \"$1\" in\n  -s) echo {kernel} ;;\n  -m) echo {machine} ;;\nesac\n",
             kernel = common::sh_word(kernel),
             machine = common::sh_word(machine)
         );
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        put_executable(&bin.join("uname"), &body);
         bin
     }
 
@@ -324,9 +333,7 @@ fn with_no_stable_release_nothing_is_installed_and_the_way_out_is_named() {
     assert!(!fx.installed().exists());
 
     let fx = Release::new();
-    let api = fx.root.join("api");
-    std::fs::create_dir_all(&api).unwrap();
-    std::fs::write(api.join("latest"), "{\"message\": \"odd\"}\n").unwrap();
+    put(&fx.root.join("api/latest"), "{\"message\": \"odd\"}\n");
     let run = fx.run(&script(), &[], &[]);
     assert_ne!(run.code, Some(0), "{}", run.text);
     assert!(run.text.contains("named no tag"), "{}", run.text);
@@ -657,13 +664,29 @@ fn on_macos_the_bridge_and_its_two_agents_are_installed_and_replaced() {
     assert_eq!(mode & 0o777, 0o755, "{mode:o}");
 
     let agents = fx.home().join("Library/LaunchAgents");
-    let theme = std::fs::read_to_string(agents.join("org.sbx.lima.theme.plist")).unwrap();
-    let notify = std::fs::read_to_string(agents.join("org.sbx.lima.notify.plist")).unwrap();
+    // Read as bytes: an agent names the bridge and the queue by their paths under the fixture home,
+    // which need not be UTF-8. What it says around them is read as text.
+    let read = |name: &str| {
+        let path = agents.join(name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    };
+    let names = |plist: &[u8], path: &[u8]| plist.windows(path.len()).any(|w| w == path);
+    let (theme_bytes, notify_bytes) = (
+        read("org.sbx.lima.theme.plist"),
+        read("org.sbx.lima.notify.plist"),
+    );
+    let theme = String::from_utf8_lossy(&theme_bytes);
+    let notify = String::from_utf8_lossy(&notify_bytes);
     // macOS names a background item after its program, so the program is the bridge itself.
-    let program = format!("<array><string>{}</string>", bridge.display());
-    for plist in [&theme, &notify] {
+    let program = [
+        &b"<array><string>"[..],
+        bridge.as_os_str().as_bytes(),
+        b"</string>",
+    ]
+    .concat();
+    for (bytes, plist) in [(&theme_bytes, &theme), (&notify_bytes, &notify)] {
         assert!(
-            plist.contains(&program) && !plist.contains("/bin/sh"),
+            names(bytes, &program) && !plist.contains("/bin/sh"),
             "{plist}"
         );
     }
@@ -674,10 +697,11 @@ fn on_macos_the_bridge_and_its_two_agents_are_installed_and_replaced() {
             && theme.contains("StartInterval"),
         "{theme}"
     );
+    let queue = state.join("notify/queue");
     assert!(
         notify.contains("<string>notify</string>")
             && notify.contains("QueueDirectories")
-            && notify.contains(&state.join("notify/queue").display().to_string()),
+            && names(&notify_bytes, queue.as_os_str().as_bytes()),
         "{notify}"
     );
 
