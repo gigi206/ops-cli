@@ -309,7 +309,12 @@ fn a_runtime_staged_out_of_the_store_is_restaged_once_it_stops_running() {
             .env("HOME", &home)
             .env(
                 "PATH",
-                format!("{}:/usr/bin:/bin", app.join("bin").display()),
+                std::env::join_paths([
+                    app.join("bin").as_path(),
+                    "/usr/bin".as_ref(),
+                    "/bin".as_ref(),
+                ])
+                .unwrap(),
             )
             .output()
             .expect("run the shipped wrapper");
@@ -480,7 +485,11 @@ fn a_launch_that_installs_from_its_own_command_survives_an_absent_override_and_a
             .arg("-c")
             .arg(&script)
             .env("HOME", &home)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env(
+                "PATH",
+                std::env::join_paths([bin.as_path(), "/usr/bin".as_ref(), "/bin".as_ref()])
+                    .unwrap(),
+            )
             // The override is what a refresh launch sets and an ordinary one does not.
             .env_remove("OPEN_DESIGN_SBX_UPDATE")
             .output()
@@ -1494,10 +1503,12 @@ impl KiroStep {
 
     /// Runs the shipped step, and returns what it said on stderr.
     fn run(&self, upgrade: bool, search: Search) -> String {
-        let bin = self.bin.display();
         let path = match search {
-            Search::Host => format!("{bin}:/usr/bin:/bin"),
-            Search::WriterOnly => bin.to_string(),
+            Search::Host => {
+                std::env::join_paths([self.bin.as_path(), "/usr/bin".as_ref(), "/bin".as_ref()])
+                    .unwrap()
+            }
+            Search::WriterOnly => self.bin.clone().into_os_string(),
         };
         let out = std::process::Command::new(&self.bash)
             .arg("-c")
