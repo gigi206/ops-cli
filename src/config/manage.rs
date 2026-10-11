@@ -2907,7 +2907,10 @@ mod tests {
         // A FIFO used to hang the verb in the open, with no diagnostic at all. Were the gate's open
         // blocking, this call would deadlock rather than fail.
         let fifo = tmp.join("fifo.toml");
-        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        let c = {
+            use std::os::unix::ffi::OsStrExt as _;
+            std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap()
+        };
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
         let err = get(&fifo, "network").unwrap_err().to_string();
         assert!(err.contains("not a regular file"), "{err}");
