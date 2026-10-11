@@ -18,7 +18,7 @@
 //! removed on drop, so the check leaves nothing behind on the host.
 
 use super::spec::{Mount, NetPolicy, SandboxSpec};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -51,16 +51,28 @@ impl SmokeReport {
     }
 }
 
-/// Single-quote a value for the probe's shell.
+/// What the probe runs: the kernel's view of its privilege, then whether the host home — a path
+/// that must never be visible — leaked into the sandbox.
 ///
-/// `$HOME` is interpolated into a `[ -e … ]` test, and it was interpolated between bare quotes: a
-/// home directory containing an apostrophe closed the string, and the rest of the path became shell
-/// words. The consequence is not that the probe fails loudly — it is that the test runs against
-/// some other path and answers `ABSENT`, which is this check reporting the host home did not leak
-/// into the cage when it has not looked. A hardening probe that can be made to pass by the shape of
-/// a path is not one.
-fn shell_quoted(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+/// The home is the script's one positional argument, never part of its text. Interpolated between
+/// bare quotes, a home containing an apostrophe closed the string and the rest of the path became
+/// shell words; read as text, a home that is not UTF-8 was replaced by `/root`. Either way the
+/// consequence was not a loud failure but a test run against some other path, answering `ABSENT`:
+/// this check reporting that the host home did not leak into the cage when it had not looked. A
+/// hardening probe that can be made to pass by the shape of a path is not one. As an argument the
+/// home reaches `[ -e ]` as the bytes it is. `/root` stands in only for a home that is not set.
+fn probe_argv(host_home: Option<&OsStr>) -> Vec<OsString> {
+    vec![
+        OsString::from("/bin/sh"),
+        OsString::from("-c"),
+        OsString::from(
+            "cat /proc/self/status; printf 'HOSTHOME='; \
+             if [ -e \"$1\" ]; then echo PRESENT; else echo ABSENT; fi",
+        ),
+        // `$0`, a label.
+        OsString::from("sbx-probe"),
+        host_home.unwrap_or(OsStr::new("/root")).to_os_string(),
+    ]
 }
 
 /// How long the probe launch may take before `doctor` reports it as stuck rather than waiting on it.
@@ -86,16 +98,7 @@ const PROBE_POLL: Duration = Duration::from_millis(20);
 pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
     let work = ScratchDir::new()?;
 
-    // Report the kernel's view of our privilege, then whether the host home — a
-    // path that must never be visible — leaked into the sandbox.
-    let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let script = format!(
-        "cat /proc/self/status; printf 'HOSTHOME='; \
-         if [ -e {} ]; then echo PRESENT; else echo ABSENT; fi",
-        shell_quoted(&host_home)
-    );
-
-    let spec = probe_spec(work.path(), script)?;
+    let spec = probe_spec(work.path(), probe_argv(std::env::var_os("HOME").as_deref()))?;
     // The composed list carries the mandatory seccomp filters, so `doctor` proves the real launch
     // path — hardening *and* filter — works on this host, not just the namespaces. The anonymous
     // files behind it (the filters, and the cage's environment) are the command's own, open for as
@@ -138,7 +141,7 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
 /// userland, the usual FHS symlinks, fresh proc/dev/tmpfs, and a throwaway rw
 /// workdir. The hardening itself is added unconditionally by `to_argv`, so this
 /// only supplies the userland the probe runs in.
-fn probe_spec(work: &Path, script: String) -> io::Result<SandboxSpec> {
+fn probe_spec(work: &Path, argv: Vec<OsString>) -> io::Result<SandboxSpec> {
     // The userland is the canonical minimal set; the probe adds only its throwaway rw workdir.
     let mut mounts = super::spec::minimal_userland_mounts();
     mounts.push(Mount::Bind {
@@ -150,18 +153,7 @@ fn probe_spec(work: &Path, script: String) -> io::Result<SandboxSpec> {
         ("PATH".to_string(), "/usr/bin:/bin".to_string()),
         ("TERM".to_string(), "dumb".to_string()),
     ];
-    SandboxSpec::new(
-        PathBuf::from("/work"),
-        mounts,
-        env,
-        NetPolicy::Shared,
-        vec![
-            OsString::from("/bin/sh"),
-            OsString::from("-c"),
-            OsString::from(script),
-        ],
-    )
-    .map_err(|e| {
+    SandboxSpec::new(PathBuf::from("/work"), mounts, env, NetPolicy::Shared, argv).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("invalid probe spec: {e:?}"),
@@ -221,47 +213,41 @@ mod tests {
         matches!(crate::probe_userns(), crate::Userns::Ok).then_some(bwrap)
     }
 
-    /// The probe tests `[ -e $HOME ]` inside the cage, and `$HOME` reaches that test through a
-    /// shell string. Interpolated between bare quotes, a home containing an apostrophe closed the
-    /// string and the rest became shell words — so the test ran against some other path and
-    /// answered `ABSENT`, which is this check reporting that the host home did not leak into the
-    /// cage without having looked at it.
-    ///
-    /// Run rather than read: the quoting is only correct if a shell agrees, so the shell is asked.
+    /// The probe tests `[ -e "$1" ]` inside the cage, with the host home as `$1`. A home that holds
+    /// an apostrophe, or a name that is not UTF-8, is still the path tested — run rather than read,
+    /// since only a shell can say what its test reached: `PRESENT` for each home that exists, and
+    /// `ABSENT` for one that does not, so the test does not pass on anything.
     #[test]
-    fn a_home_containing_a_quote_is_still_the_path_the_probe_tests() {
+    fn a_home_of_any_shape_is_still_the_path_the_probe_tests() {
+        use std::os::unix::ffi::OsStrExt as _;
         let dir = crate::testutil::TmpDir::new();
-        let home = dir.path().join("it's a home");
-        std::fs::create_dir_all(&home).unwrap();
-        let quoted = shell_quoted(&home.display().to_string());
-
-        // The same test the probe runs, on a path that exists: `PRESENT` is the only right answer,
-        // and unquoted this line does not even parse.
-        let out = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!(
-                "if [ -e {quoted} ]; then echo PRESENT; else echo ABSENT; fi"
-            ))
-            .output()
-            .expect("run the probe's own test");
+        let runs = |home: &Path| {
+            let argv = probe_argv(Some(home.as_os_str()));
+            assert_eq!(argv.last().map(OsString::as_os_str), Some(home.as_os_str()));
+            let out = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .output()
+                .expect("run the probe's own script");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout
+                .lines()
+                .find_map(|l| l.strip_prefix("HOSTHOME="))
+                .unwrap_or_else(|| panic!("no answer for {home:?}: {stdout}"))
+                .to_string()
+        };
+        for name in [&b"it's a home"[..], b"caf\xe9 home"] {
+            let home = dir.path().join(OsStr::from_bytes(name));
+            std::fs::create_dir_all(&home).unwrap();
+            assert_eq!(runs(&home), "PRESENT", "{home:?} reaches `[ -e ]` whole");
+        }
+        for name in [&b"no'such"[..], b"no\xffsuch"] {
+            assert_eq!(runs(&dir.path().join(OsStr::from_bytes(name))), "ABSENT");
+        }
+        // Unset is the one case answered by a stand-in.
         assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            "PRESENT",
-            "the quoted path must reach `[ -e ]` whole; stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
+            probe_argv(None).last().map(OsString::as_os_str),
+            Some(OsStr::new("/root"))
         );
-
-        // And a path that does not exist still answers ABSENT, so the quoting has not turned the
-        // test into one that passes on anything.
-        let missing = shell_quoted(&dir.path().join("no'such").display().to_string());
-        let out = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!(
-                "if [ -e {missing} ]; then echo PRESENT; else echo ABSENT; fi"
-            ))
-            .output()
-            .expect("run the probe's own test");
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ABSENT");
     }
 
     #[test]
