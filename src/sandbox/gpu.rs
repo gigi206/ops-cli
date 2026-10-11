@@ -272,8 +272,8 @@ pub(crate) fn wsl_gpu() -> Option<WslGpu> {
 ///
 /// One answer for both sites that grant it: the store is bound beside the bridge's libraries, and
 /// the node joins the device list beside [`render_nodes`]. Asked at each site instead, the two
-/// halves came from two probes, and the node was granted on a host with no bridge to load the
-/// libraries that use it.
+/// halves would come from two probes, and the node could be granted on a host with no bridge to
+/// load the libraries that use it.
 pub(crate) fn wsl_gpu_in(root: &Path) -> Option<WslGpu> {
     let bridge = wsl_bridge_in(root)?;
     Some(WslGpu {
