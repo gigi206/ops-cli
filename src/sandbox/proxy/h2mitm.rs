@@ -656,10 +656,13 @@ async fn relay(
         // `grpc-accept-encoding`, inside a body the HTTP layer calls uncompressed. Asking only for
         // `identity` on the HTTP header would leave the mask reading gzip members and finding
         // nothing, on the transport where an injected credential most often travels.
+        // Compared like the injected names just above, `_` as `-`: a server that folds
+        // `accept_encoding` onto `accept-encoding` would otherwise be offered the client's `gzip`
+        // beside sbx's `identity`, and could compress the response the mask has to read.
         if masks_reflection
             && super::IDENTITY_ENCODINGS
                 .iter()
-                .any(|(name, _)| n.eq_ignore_ascii_case(name))
+                .any(|(name, _)| header_name_eq(name, n))
         {
             continue;
         }
@@ -3514,6 +3517,9 @@ mod tests {
                 grpc_request(&[
                     ("accept-encoding", "gzip, br"),
                     ("grpc-accept-encoding", "gzip"),
+                    // The same offers under the spelling a server may fold onto the real one.
+                    ("accept_encoding", "gzip"),
+                    ("grpc_accept_encoding", "gzip"),
                 ]),
                 None,
                 &trace,
@@ -3544,6 +3550,13 @@ mod tests {
                         "and its gRPC twin is asked for the same, or the mask reads nothing on \
                          the plane that carries gRPC: {seen:?}"
                     );
+                    for folded in ["accept_encoding", "grpc_accept_encoding"] {
+                        assert!(
+                            seen_values(folded).is_empty(),
+                            "`{folded}` is the client's offer under a spelling a server may \
+                             fold onto the real header, and it reached the upstream: {seen:?}"
+                        );
+                    }
                 }
                 false => {
                     assert_eq!(
@@ -3555,6 +3568,11 @@ mod tests {
                         seen_values("grpc-accept-encoding"),
                         vec!["gzip"],
                         "on both headers: {seen:?}"
+                    );
+                    assert_eq!(
+                        seen_values("accept_encoding"),
+                        vec!["gzip"],
+                        "and in every spelling: {seen:?}"
                     );
                 }
             }
