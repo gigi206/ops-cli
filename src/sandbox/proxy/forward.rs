@@ -66,8 +66,10 @@ pub(super) fn handle_https_forward(
 ) -> io::Result<()> {
     // One credential state for the whole exchange: taken once here so the value injected and
     // the needle scanned for can never come from two different resolutions, even if a refresh
-    // lands mid-request. A later exchange picks up the newer state.
-    let creds = ctx.credentials.snapshot();
+    // lands mid-request. A later exchange picks up the newer state. The pool key's generation is
+    // read with it, for the reason
+    // [`Credentials::snapshot_with_generation`](super::Credentials::snapshot_with_generation) gives.
+    let (creds, generation) = ctx.credentials.snapshot_with_generation();
     let Some(AbsoluteForm {
         host,
         port,
@@ -319,8 +321,7 @@ pub(super) fn handle_https_forward(
     //     tunneled path: the launch has to have asked for reuse, and the request has to be HTTP/1.1.
     //     Only a request the proxy can send again takes a parked connection.
     let keep_alive = ctx.pool.is_some() && request_line_is_http11(&head.request_line);
-    let pool_key =
-        keep_alive.then(|| PoolKey::new(&host, port, &injected_ids, ctx.credentials.generation()));
+    let pool_key = keep_alive.then(|| PoolKey::new(&host, port, &injected_ids, generation));
     let replayable = chunked || body_len == 0 || held.is_some();
 
     // 7b. Take the upstream connection: a parked one whose address this request's guard passes, or a
