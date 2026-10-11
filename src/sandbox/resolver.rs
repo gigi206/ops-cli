@@ -1580,7 +1580,10 @@ mod tests {
         let fake = dir.path().join("fake-bwrap");
         std::fs::write(
             &fake,
-            format!("#!/bin/sh\ncat /proc/self/cgroup > '{}'\n", seen.display()),
+            format!(
+                "#!/bin/sh\ncat /proc/self/cgroup > {}\n",
+                crate::testutil::sh_word(&seen)
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2173,7 +2176,7 @@ mod tests {
                 "nix-store",
                 format!(
                     "#!/bin/sh\necho . >> {}\necho /nix/store/dep\n",
-                    calls.display()
+                    crate::testutil::sh_word(&calls)
                 ),
             ),
         ] {
@@ -2864,8 +2867,10 @@ printf 'run-%s' "$n""#,
         let dir = TmpDir::new();
         let marker = dir.join("survived");
         let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c")
-            .arg(format!("trap '' TERM; sleep 2; : > '{}'", marker.display()));
+        cmd.arg("-c").arg(format!(
+            "trap '' TERM; sleep 2; : > {}",
+            crate::testutil::sh_word(&marker)
+        ));
         output_within(&mut cmd, std::time::Duration::from_millis(300), "the probe")
             .expect_err("a command past its deadline must not resolve");
 
