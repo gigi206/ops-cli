@@ -6574,8 +6574,11 @@ mod tests {
     fn a_file_git_reads_a_path_from_is_read_without_waiting_or_following_a_link() {
         let tmp = TmpDir::new();
         let (fifo, link) = (tmp.path().join("fifo"), tmp.path().join("link"));
+        // Named from the fixture it runs in: the host's `mkfifo` need not take an argument that is
+        // not UTF-8, which a fixture root may make the absolute path.
         let made = std::process::Command::new("mkfifo")
-            .arg(&fifo)
+            .arg("fifo")
+            .current_dir(tmp.path())
             .status()
             .is_ok_and(|s| s.success());
         if !made {
