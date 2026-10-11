@@ -715,6 +715,11 @@ fn place_file(from: &Path, dir: &OwnedFd, name: &OsStr, reflink_ok: bool) -> io:
 /// writes it.
 const SEED_MODE: &str = "seeded-by";
 
+/// The lock [`record_seed_mode`] holds around its read and its write of [`SEED_MODE`], beside it.
+/// Not the record itself, which a write replaces by a rename: a lock taken on it would hold the file
+/// the name led to when it was opened, not the one a second seed opens.
+const SEED_MODE_LOCK: &str = "seeded-by.lock";
+
 /// How the store paths of the project tree at `tree_dir` were seeded: `Some(true)` when every file
 /// was cloned from the shared store, `Some(false)` when any was copied, `None` for a tree with no
 /// record (seeded before one was kept, or never seeded).
@@ -736,8 +741,24 @@ pub(crate) fn seed_mode(tree_dir: &Path) -> Option<bool> {
 
 /// Record how this seed placed its paths, once any copy has made the store a mix: a store that ever
 /// took a copied file stays recorded as copied, since those bytes are its own whatever later seeds
-/// clone. Written only when the record changes, so a launch that seeds nothing new writes nothing.
+/// clone. Written only when the record changes, so a launch that seeds nothing new rewrites nothing.
+///
+/// The read and the write are made under [`SEED_MODE_LOCK`]. Two launches of the project seed at
+/// once, and without it both could read the record before either wrote it, each writing what it
+/// saw: a seed that cloned every file then wrote `reflink` over the `copy` of one that had to copy,
+/// and the tree's reclaimable figure lost those bytes. Nothing else is taken while it is held.
 fn record_seed_mode(store_dir: &Path, all_cloned: bool) -> io::Result<()> {
+    let _held = flock_at(
+        &store_dir.join(SEED_MODE_LOCK),
+        true,
+        Some(&|lock| {
+            crate::diag::note(&format!(
+                "waiting for `{}`, which another launch of this project holds while it records \
+                 how the project's store was seeded",
+                lock.display()
+            ))
+        }),
+    )?;
     let path = store_dir.join(SEED_MODE);
     let before = fs::read_to_string(&path).ok();
     let now = match before.as_deref().map(str::trim) {
@@ -1699,6 +1720,40 @@ mod tests {
             Some(false),
             "a copied file stays the tree's own"
         );
+    }
+
+    /// Two seeds record their mode one after the other: the second reads the record only once the
+    /// first has written it, so a seed that cloned every file cannot write `reflink` over the `copy`
+    /// of one that read the record before it was written.
+    #[test]
+    fn the_seed_mode_record_is_read_and_written_under_its_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let tmp = TmpDir::new();
+        let store = tmp.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        // Held shared: a record taken shared would go through it, and two seeds that only share the
+        // lock do not keep each other out.
+        let held = flock_at(&store.join(SEED_MODE_LOCK), false, None).unwrap();
+
+        let (done, recorded) = mpsc::channel();
+        let at = store.clone();
+        let seed = std::thread::spawn(move || {
+            record_seed_mode(&at, false).unwrap();
+            done.send(()).unwrap();
+        });
+        assert!(
+            recorded.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the record was written while another seed held its lock"
+        );
+        assert_eq!(seed_mode(tmp.path()), None, "and nothing was written yet");
+        drop(held);
+        assert!(
+            recorded.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the record was not written once the lock was let go"
+        );
+        seed.join().unwrap();
+        assert_eq!(seed_mode(tmp.path()), Some(false));
     }
 
     /// A `(device, inode)` pair — equal across two paths iff they are the same
