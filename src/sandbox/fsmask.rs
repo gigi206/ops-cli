@@ -1955,36 +1955,28 @@ fn git_include_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>
     loop {
         let answer = match &from {
             None => host_git_config(repo, &INCLUDES),
-            Some((file, _)) => match file.to_str() {
-                Some(name) => GIT_FILE_INCLUDES
-                    .with_borrow(|known| {
-                        known
-                            .iter()
-                            .find(|(known, _)| known == file)
-                            .map(|(_, out)| out.clone())
-                    })
-                    .map_or_else(
-                        || {
-                            let answer = file_includes(repo, name, &INCLUDES);
-                            // Remembered only inside a span, whose end empties the record.
-                            if let Ok(out) = &answer
-                                && GIT_ASK_DEADLINE.get().is_some()
-                            {
-                                GIT_FILE_INCLUDES.with_borrow_mut(|known| {
-                                    known.push((file.clone(), out.clone()));
-                                });
-                            }
-                            answer
-                        },
-                        Ok,
-                    ),
-                None => Err(visible(&format!(
-                    "{GIT_CONFIG_READ}: `{}` is included as configuration, and its own includes \
-                     cannot be asked of git by a name that is not UTF-8. Rename it, then launch \
-                     again. {GIT_WRITABLE_HINT}",
-                    file.display()
-                ))),
-            },
+            Some((file, _)) => GIT_FILE_INCLUDES
+                .with_borrow(|known| {
+                    known
+                        .iter()
+                        .find(|(known, _)| known == file)
+                        .map(|(_, out)| out.clone())
+                })
+                .map_or_else(
+                    || {
+                        let answer = file_includes(repo, file, &INCLUDES);
+                        // Remembered only inside a span, whose end empties the record.
+                        if let Ok(out) = &answer
+                            && GIT_ASK_DEADLINE.get().is_some()
+                        {
+                            GIT_FILE_INCLUDES.with_borrow_mut(|known| {
+                                known.push((file.clone(), out.clone()));
+                            });
+                        }
+                        answer
+                    },
+                    Ok,
+                ),
         };
         let depth = from.as_ref().map_or(0, |(_, depth)| *depth);
         match answer {
@@ -2012,16 +2004,18 @@ fn git_include_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>
 /// and `args`: its standard output, `None` when it names none (exit status 1) or there is no
 /// trusted git, the refusal otherwise. Asked of the file alone, not of a repository, so the answer
 /// is the file's whichever repository included it ([`GIT_FILE_INCLUDES`]); `repo` only names, in a
-/// refusal, the repository the question was asked for.
-fn file_includes(repo: &GitRepo, file: &str, args: &[&str]) -> Result<Option<Vec<u8>>, String> {
+/// refusal, the repository the question was asked for. The file is handed to git as the path it
+/// is, so one whose name is not UTF-8 is asked like any other.
+fn file_includes(repo: &GitRepo, file: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, String> {
     let Some(git) = crate::store::resolve_git() else {
         return Ok(None);
     };
-    let question = format!("git config --file {file} {}", args.join(" "));
+    let question = format!("git config --file {} {}", file.display(), args.join(" "));
     let mut command = std::process::Command::new(&git);
     command
-        .arg("config")
-        .args(["--file", file, "--no-includes"])
+        .args(["config", "--file"])
+        .arg(file)
+        .arg("--no-includes")
         .args(args);
     let (status, answer) = ask_host_git(command, repo, &question)?;
     match status.code() {
@@ -8393,6 +8387,46 @@ mod tests {
         assert_eq!(refused, None);
         let held = project.join("inc.cfg");
         assert!(masks.iter().any(|m| m.path == held), "{masks:?}");
+    }
+
+    /// A file included as configuration whose path is not UTF-8 has its own includes asked of git
+    /// all the same. Included behind a condition that does not hold today, the file is not one git
+    /// reads, so only that question finds what it includes in turn: that file is held, and the
+    /// launch is not refused for where the project sits.
+    #[test]
+    fn the_includes_of_an_included_file_whose_path_is_not_utf8_are_held() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = TmpDir::new();
+        let root = tmp.path().join(OsStr::from_bytes(b"p\xffroj"));
+        if !git_repo_at(&root, &[]) {
+            skip_incapable!("skipping an included file's includes: no git on this host");
+            return;
+        }
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("inc.cfg"), "[include]\n\tpath = nested.cfg\n").unwrap();
+        std::fs::write(root.join("nested.cfg"), "").unwrap();
+        let set = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "config",
+                "includeIf.onbranch:sbx-nowhere.path",
+                "../inc.cfg",
+            ])
+            .status()
+            .expect("run git");
+        assert!(set.success());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        for name in ["inc.cfg", "nested.cfg"] {
+            let path = root.join(name);
+            assert!(
+                e.readonly.iter().any(|m| m.path == path),
+                "{}: {:?}",
+                path.display(),
+                e.readonly
+            );
+        }
     }
 
     /// A relative `GIT_CONFIG_GLOBAL` is the file git reads at the top of the work tree, and an
