@@ -14,6 +14,7 @@
 //! So the list stays written out, and this is what makes forgetting it impossible. The addition is
 //! still deliberate; only the silence is gone.
 
+use crate::testutil::files_under;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -250,37 +251,6 @@ fn read_listed(path: &Path) -> Option<String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => panic!("`{}` cannot be read: {e}", path.display()),
     }
-}
-
-/// Every regular file under `dir`, at any depth, whose extension is one of `extensions`. A
-/// directory that cannot be read fails the guard by its name, as [`read_listed`] does a file.
-///
-/// Both are told by the entry's own type, which a link does not take from what it names. A link to
-/// a directory is not descended: one pointing back up the tree would otherwise send the walk round
-/// it, listing each file once per turn until the kernel refuses the path, and two such links double
-/// that at every turn. A link is not listed either, so a dangling one, such as the lock an editor
-/// leaves beside a file it holds, is no file to read.
-fn files_under(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
-    let unreadable = |e: std::io::Error| -> ! { panic!("`{}` cannot be read: {e}", dir.display()) };
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| unreadable(e)) {
-        let entry = entry.unwrap_or_else(|e| unreadable(e));
-        let path = entry.path();
-        let kind = entry
-            .file_type()
-            .unwrap_or_else(|e| panic!("`{}` cannot be read: {e}", path.display()));
-        if kind.is_dir() {
-            out.extend(files_under(&path, extensions));
-        } else if kind.is_file()
-            && path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| extensions.contains(&e))
-        {
-            out.push(path);
-        }
-    }
-    out
 }
 
 /// A directory or a file these guards cannot read fails them by its name, rather than leaving them
