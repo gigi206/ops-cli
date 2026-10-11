@@ -903,8 +903,8 @@ mod tests {
                 _ => None,
             })
             .expect("a project under some directory");
-        let p = project.display().to_string();
-        let shapes: [(&str, Vec<String>, String, bool); 3] = [
+        let p = project.as_os_str().to_os_string();
+        let shapes: [(&str, Vec<std::ffi::OsString>, String, bool); 3] = [
             (
                 "bound",
                 vec!["--bind".into(), p.clone(), p.clone()],
