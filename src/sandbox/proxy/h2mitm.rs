@@ -7,19 +7,19 @@
 //!
 //! Security parity with the HTTP/1.1 path is the invariant, and since the verdict was folded it is
 //! no longer a parity that has to be maintained by hand: every stream goes through
-//! [`decide_https`], the same function the tunnel and the absolute-form forward
-//! call, so there is one policy decision rather than three that must be kept in step. This path
-//! passes [`AskPosture::RefuseUnsupported`](super::AskPosture), which is the single way it diverges —
-//! see the call site for why it cannot park. The `:authority`
-//! is re-verified against the CONNECT host **per stream** (h2 lets a client vary it), every stream's
-//! connection is the supervisor's as it is on the other planes (a check where the name would be
-//! resolved, the connection itself where one is opened, the address guard applied by the supervisor
-//! to both), the upstream cert is validated as [`connect_upstream`](super::connect_upstream)
-//! validates it, and gRPC is HTTP/2 end-to-end (no downgrade). The
-//! secret machinery is replicated too: the outbound tripwire ([`carries_secret`]) refuses a request
-//! whose head carries a configured secret verbatim, matching host-scoped credentials are injected
-//! (strip-and-replace) onto the upstream request, and a reflected secret is masked out of the
-//! response DATA/headers/trailers for an injection-target host ([`relay_body_redacting`]).
+//! [`decide_https`], the same function the tunnel and the absolute-form forward call, so there is
+//! one policy decision rather than three that must be kept in step. This path passes
+//! [`AskPosture::RefuseUnsupported`](super::AskPosture), which is the single way it diverges — see
+//! the call site for why it cannot park. The `:authority` is re-verified against the CONNECT host
+//! **per stream** (h2 lets a client vary it), every stream's connection is the supervisor's as it
+//! is on the other planes (a check where the name would be resolved, the connection itself where
+//! one is opened, the address guard applied by the supervisor to both), the upstream cert is
+//! validated as [`connect_upstream`](super::connect_upstream) validates it, and gRPC is HTTP/2
+//! end-to-end (no downgrade). The secret machinery is replicated too: the outbound tripwire
+//! ([`carries_secret`]) refuses a request whose head or trailers carry a configured secret
+//! verbatim, matching host-scoped credentials are injected (strip-and-replace) onto the upstream
+//! request, and a reflected secret is masked out of the response DATA/headers/trailers for an
+//! injection-target host ([`relay_body_redacting`]).
 
 #![allow(
     clippy::expect_used,
@@ -344,9 +344,9 @@ async fn stream(
     // never self-trip on an injected credential (parity with the HTTP/1.1 `carries_secret`).
     //
     // The state read here is the stream's one credential state, carried into [`relay`] rather than
-    // read again there: the head is scanned, the credential injected and the response masked under
-    // one resolution, as on the HTTP/1.1 planes, even when a re-resolution lands while the stream
-    // waits on the supervisor below.
+    // read again there: the head and its trailers are scanned, the credential injected and the
+    // response masked under one resolution, as on the HTTP/1.1 planes, even when a re-resolution
+    // lands while the stream waits on the supervisor below.
     let creds = ctx.credentials.snapshot();
     if !creds.needles.is_empty() && head_carries_secret(&req, &creds.needles, connect_host) {
         ctx.outcome(
@@ -462,7 +462,7 @@ async fn relay(
     host: &str,
     method: &str,
     path: &str,
-    creds: &CredentialSet,
+    creds: &Arc<CredentialSet>,
     ctx: &ProxyCtx,
     pool: &UpstreamPool,
 ) {
@@ -733,9 +733,16 @@ async fn relay(
         sink.expect_source_end();
         sink
     });
-    // The names sbx injected into the head, carried into the pump so the trailers of the same
-    // request are held to the same strip — see [`relay_body`].
-    let trailer_strip: Vec<String> = injected.iter().map(|(h, _)| h.clone()).collect();
+    // What the head was held to, carried into the pump so the trailers of the same request are held
+    // to it too: the strip of the names sbx injected, and the tripwire under the stream's one
+    // credential state. See [`RequestTrailers`].
+    let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let trailer_rules = RequestTrailers {
+        injected: injected.iter().map(|(h, _)| h.clone()).collect(),
+        creds: Arc::clone(creds),
+        dest: host.to_string(),
+        tripped: Arc::clone(&tripped),
+    };
     // The `up` half of the flow's byte totals. Cloned rather than borrowed because the pump outlives
     // this function on a request half that never ends; a counter the registry has already dropped is
     // simply an atomic nobody reads any more.
@@ -746,7 +753,7 @@ async fn relay(
             client_body,
             up_send_body,
             req_sink,
-            Some(trailer_strip),
+            Some(trailer_rules),
             up_bytes,
             &up_bound,
             "cage to upstream",
@@ -764,6 +771,13 @@ async fn relay(
     // process. The connection cap is the ceiling on how many such streams can be held at once.
     let resp = match resp_fut.await {
         Ok(r) => r,
+        // The pump reset the request because its trailers carried a secret, before any response
+        // came: answered as the head's tripwire answers, beside the allow already counted.
+        Err(_) if tripped.load(std::sync::atomic::Ordering::SeqCst) => {
+            trailers_refused(ctx, host, port, method, path);
+            let _ = refuse(respond, StatusCode::FORBIDDEN, "outbound-secret");
+            return;
+        }
         Err(_) => {
             refuse_upstream(respond, ctx, host, port, method, path, "upstream-closed");
             return;
@@ -844,6 +858,27 @@ async fn relay(
         )
         .await;
     }
+    // The trailers tripped while the response was relayed: the reset ended it, and only the record
+    // is left to write. A request whose trailers trip after its response has ended is reset all the
+    // same, and goes unrecorded, since this stream has nothing left to record it with.
+    if tripped.load(std::sync::atomic::Ordering::SeqCst) {
+        trailers_refused(ctx, host, port, method, path);
+    }
+}
+
+/// Record a request whose trailers carried a secret. A log line and no stat: the stream was
+/// already counted as allowed when its upstream connected, and counting it again as blocked
+/// would count one stream twice.
+fn trailers_refused(ctx: &ProxyCtx, host: &str, port: u16, method: &str, path: &str) {
+    ctx.push_log(
+        Proto::Https,
+        host,
+        port,
+        Some(method),
+        Some(path),
+        LogVerdict::Blocked,
+        "outbound-secret",
+    );
 }
 
 /// Render a client HTTP/2 request head as text for the traffic capture.
@@ -1014,6 +1049,25 @@ async fn send_granted(
     Ok(sent)
 }
 
+/// What the request direction of [`relay_body`] holds its trailers to: the strip and the tripwire
+/// its head passed.
+///
+/// Trailers are a field section like the head, delivered whole and bounded by [`MAX_HEADER_LIST`],
+/// so the reason the request body goes unscanned (a block on it would have to hold it) does not
+/// reach them. No other plane forwards them at all: the HTTP/1.1 planes re-frame a request without
+/// its trailers.
+struct RequestTrailers {
+    /// The names sbx injected into the head, which the trailers may not carry either.
+    injected: Vec<String>,
+    /// The stream's one credential state, whose needles the head was scanned for.
+    creds: Arc<CredentialSet>,
+    /// The host the request is bound for, which decides which needles apply.
+    dest: String,
+    /// Set when the trailers carried a secret and the request was reset rather than finished. The
+    /// pump runs apart from the stream and cannot reach the log, so [`relay`] records it.
+    tripped: Arc<std::sync::atomic::AtomicBool>,
+}
+
 /// Relay one h2 body (DATA frames + trailers) from `src` to `dst`, honoring flow control. Used
 /// for both the request (client → upstream) and the response (upstream → client). The trailers
 /// carry the gRPC status, so they are forwarded when present, else the stream is ended with an
@@ -1032,7 +1086,7 @@ async fn relay_body(
     mut src: h2::RecvStream,
     mut dst: h2::SendStream<Bytes>,
     cap: Option<Arc<CapBuf>>,
-    strip: Option<Vec<String>>,
+    request: Option<RequestTrailers>,
     bytes: Arc<std::sync::atomic::AtomicU64>,
     bound: &CapacityBound,
     way: &'static str,
@@ -1056,7 +1110,21 @@ async fn relay_body(
         cap.mark_source_ended();
     }
     match src.trailers().await? {
-        Some(mut trailers) => {
+        Some(trailers) => {
+            // The request head's tripwire, asked of its trailers before anything of them is sent.
+            // Blocked rather than stripped, as the head is: a request trying to carry a secret out
+            // is not one to clean up and finish. Its head and body have already gone, so what is
+            // withheld is its end: the upstream half is reset and the trailers never leave.
+            if let Some(rules) = &request
+                && !rules.creds.needles.is_empty()
+                && trailers_carry_secret(&trailers, &rules.creds.needles, &rules.dest)
+            {
+                rules
+                    .tripped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                dst.send_reset(h2::Reason::CANCEL);
+                return Ok(());
+            }
             // The request head's strip, applied to the trailers of the same request. `Some` marks
             // the **request** direction and carries the names sbx injected.
             //
@@ -1071,8 +1139,8 @@ async fn relay_body(
             // The response direction passes `None`: nothing is injected that way, so what it has
             // to drop is the connection-specific set alone. A reflected secret in a response
             // trailer is `relay_body_redacting`'s to mask, which is a different question.
-            trailers = strip_trailers(trailers, strip.as_deref());
-            dst.send_trailers(trailers)?;
+            let injected = request.as_ref().map(|rules| rules.injected.as_slice());
+            dst.send_trailers(strip_trailers(trailers, injected))?;
         }
         None => dst.send_data(Bytes::new(), true)?,
     }
@@ -1240,13 +1308,28 @@ fn head_carries_secret(
         blob.extend_from_slice(pq.as_str().as_bytes());
     }
     blob.push(b'\n');
-    for (name, value) in req.headers().iter() {
+    push_fields(&mut blob, req.headers());
+    carries_secret(&blob, needles, dest)
+}
+
+/// Whether a request's trailers carry a secret value verbatim on their way to `dest`: the head's
+/// tripwire ([`head_carries_secret`]) asked of the field section that follows the body, over the
+/// same rendering of its fields.
+fn trailers_carry_secret(trailers: &http::HeaderMap, needles: &[SecretNeedle], dest: &str) -> bool {
+    let mut blob = Vec::new();
+    push_fields(&mut blob, trailers);
+    carries_secret(&blob, needles, dest)
+}
+
+/// Append each field of `fields` to `blob` as `name: value`, one per line: the form both tripwires
+/// of this plane scan.
+fn push_fields(blob: &mut Vec<u8>, fields: &http::HeaderMap) {
+    for (name, value) in fields.iter() {
         blob.extend_from_slice(name.as_str().as_bytes());
         blob.extend_from_slice(b": ");
         blob.extend_from_slice(value.as_bytes());
         blob.push(b'\n');
     }
-    carries_secret(&blob, needles, dest)
 }
 
 /// Mask every configured secret value out of each header value in `headers` (an equal-length run
@@ -2656,6 +2739,8 @@ mod tests {
         path: String,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
+        /// the trailers that ended the request, empty when it ended otherwise
+        trailers: Vec<(String, String)>,
     }
 
     impl SeenRequest {
@@ -2863,12 +2948,19 @@ mod tests {
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_default(),
             headers: header_pairs(&parts.headers),
-            body: Vec::new(),
+            ..SeenRequest::default()
         };
+        let mut ended = true;
         while let Some(chunk) = src.data().await {
-            let Ok(chunk) = chunk else { break };
+            let Ok(chunk) = chunk else {
+                ended = false;
+                break;
+            };
             seen.body.extend_from_slice(&chunk);
             let _ = src.flow_control().release_capacity(chunk.len());
+        }
+        if ended && let Ok(Some(trailers)) = src.trailers().await {
+            seen.trailers = header_pairs(&trailers);
         }
         trace.seen.lock().unwrap().push(seen);
         // Read the live view here and nowhere else: the proxy registers the stream's flow between
@@ -3049,6 +3141,33 @@ mod tests {
         requests: Vec<(Request<()>, Option<Vec<u8>>)>,
         trace: &H2Trace,
     ) -> Vec<H2Answer> {
+        let outgoing = requests
+            .into_iter()
+            .map(|(request, body)| Outgoing {
+                request,
+                body,
+                trailers: None,
+            })
+            .collect();
+        through_h2_proxy_sending(ctx, connect_host, port, outgoing, trace)
+    }
+
+    /// One stream a test client sends: its head, then the body and the trailers that end it, when
+    /// it has either.
+    struct Outgoing {
+        request: Request<()>,
+        body: Option<Vec<u8>>,
+        trailers: Option<http::HeaderMap>,
+    }
+
+    /// [`through_h2_proxy_streams`], for streams that may end with trailers.
+    fn through_h2_proxy_sending(
+        ctx: &ProxyCtx,
+        connect_host: &str,
+        port: u16,
+        requests: Vec<Outgoing>,
+        trace: &H2Trace,
+    ) -> Vec<H2Answer> {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
         let _settle = super::super::events::Settle(ctx.events.clone());
@@ -3067,11 +3186,21 @@ mod tests {
                     let _ = conn.await;
                 });
                 let mut answers = Vec::new();
-                for (request, body) in requests {
+                for Outgoing {
+                    request,
+                    body,
+                    trailers,
+                } in requests
+                {
+                    let ends_with_the_head = body.is_none() && trailers.is_none();
                     let (resp_fut, mut send_body) =
-                        send.send_request(request, body.is_none()).unwrap();
+                        send.send_request(request, ends_with_the_head).unwrap();
                     if let Some(b) = body {
-                        send_under_flow_control(&mut send_body, Bytes::from(b), true).await;
+                        let end = trailers.is_none();
+                        send_under_flow_control(&mut send_body, Bytes::from(b), end).await;
+                    }
+                    if let Some(t) = trailers {
+                        send_body.send_trailers(t).unwrap();
                     }
                     let (parts, mut recv) = resp_fut.await.unwrap().into_parts();
                     let mut data = Vec::new();
@@ -3767,6 +3896,103 @@ mod tests {
             seen.header("authorization"),
             Some("Bearer admitted"),
             "the stream injects from the state its head was scanned under: {seen:?}"
+        );
+    }
+
+    /// A request's trailers are held to its head's tripwire: a secret in them never reaches the
+    /// upstream, and the request is refused as one carrying the secret in its head is.
+    ///
+    /// Trailers are a field section like the head, delivered whole, so the reason the body goes
+    /// unscanned does not reach them; and the HTTP/1.1 planes forward none at all, which left this
+    /// plane's trailers the one field section of a request that crossed sbx unscanned.
+    ///
+    /// The clean arm passes on the code before the scan too. It is there so the scan stays a
+    /// tripwire: dropping every request trailer would also keep the secret in, and would break the
+    /// forwarding of the ones that carry none.
+    #[test]
+    fn a_secret_in_a_requests_trailers_never_reaches_the_upstream() {
+        use crate::sandbox::proxy::Credentials;
+
+        const SECRET: &str = "sk-live-carried-in-a-trailer";
+        let run = |name: &'static str, value: &'static str| {
+            let trace = Arc::new(H2Trace::default());
+            let (addr, upstream_ca) = spawn_h2_upstream(
+                1,
+                vec![b"h2".to_vec()],
+                UpstreamReply::grpc(""),
+                Arc::clone(&trace),
+            );
+            let (ctx, stats, log, _dir) = relaying_ctx(upstream_ca);
+            let ctx = ctx.with_shared_credentials(Arc::new(Credentials::new(
+                Vec::new(),
+                vec![SecretNeedle::named("declared", SECRET.as_bytes().to_vec())],
+                crate::sandbox::redact::MIN_LEN_DEFAULT,
+                Vec::new(),
+            )));
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert(name, value.parse().unwrap());
+            let answer = through_h2_proxy_sending(
+                &ctx,
+                "grpc.test",
+                addr.port(),
+                vec![Outgoing {
+                    request: grpc_request(&[]),
+                    body: None,
+                    trailers: Some(trailers),
+                }],
+                &trace,
+            )
+            .remove(0);
+            ctx.events.as_ref().unwrap().flush();
+            let seen = trace.seen.lock().unwrap().clone();
+            let events: Vec<(LogVerdict, String)> = log
+                .snapshot(None, None, false)
+                .events
+                .iter()
+                .map(|e| (e.verdict, e.reason.clone()))
+                .collect();
+            let counts = stats
+                .snapshot()
+                .get("grpc.test")
+                .copied()
+                .unwrap_or_default();
+            (answer, seen, events, counts)
+        };
+
+        let (answer, seen, events, counts) = run("x-carried", SECRET);
+        assert!(
+            seen.iter()
+                .all(|s| s.trailers.iter().all(|(_, v)| !v.contains(SECRET))),
+            "a trailer carrying a declared secret must never reach the upstream: {seen:?}"
+        );
+        assert_eq!(
+            (answer.status, answer.header("x-sbx-egress-reason")),
+            (StatusCode::FORBIDDEN, Some("outbound-secret")),
+            "refused as the head's tripwire refuses"
+        );
+        assert_eq!(
+            events,
+            vec![
+                (LogVerdict::Allow, "allowed".to_string()),
+                (LogVerdict::Blocked, "outbound-secret".to_string()),
+            ],
+            "recorded beside the allow its upstream connection already counted"
+        );
+        assert_eq!(
+            counts,
+            Counts {
+                allow: 1,
+                ..Default::default()
+            },
+            "one stream, counted once"
+        );
+
+        let (answer, seen, _, _) = run("x-checksum", "abc123");
+        assert_eq!(answer.status, StatusCode::OK, "a clean trailer is relayed");
+        assert_eq!(
+            seen.iter().map(|s| s.trailers.clone()).collect::<Vec<_>>(),
+            vec![vec![("x-checksum".to_string(), "abc123".to_string())]],
+            "and reaches the upstream"
         );
     }
 
