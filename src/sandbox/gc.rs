@@ -473,8 +473,9 @@ fn sweep(store: &StoreAt<'_>) -> io::Result<()> {
 /// four surfaces cannot drift into describing the same gap differently; a verb prefixes it with
 /// whatever is specific to what it just counted.
 pub(crate) const SIZE_CAVEAT: &str = "a compressed volume, or blocks shared with another tree, \
-                                      returns less to the disk: `sbx storage status` reports what \
-                                      it holds.";
+                                      returns less to the disk: `sbx store --shared` reads what \
+                                      each tree holds alone, `sbx storage status` what the volume \
+                                      holds.";
 
 /// Render `bytes` as a short human figure (e.g. `412.0 MiB`), for the gc report.
 ///
@@ -1765,14 +1766,16 @@ pub(crate) struct TreeUsage {
 /// and a nix store's `.links` pool lives under its own store root.
 ///
 /// **Not reflink-aware**: a copy-on-write file reports its full block count even when it shares
-/// every extent with another tree, because no cheap syscall exposes extent sharing (`du` has the
-/// same blind spot). On a filesystem with reflink the per-tree figures are therefore an upper
-/// bound, and their sum can exceed what the filesystem reports as used.
+/// every extent with another tree, because `st_blocks` does not see extent sharing (`du` has the
+/// same blind spot) and asking the extents takes an open and a query per file. On a filesystem
+/// with reflink the per-tree figures are therefore an upper bound, and their sum can exceed what
+/// the filesystem reports as used.
 ///
 /// **Nor compression-aware**, for the same reason and with the same effect: `st_blocks` counts what
 /// a file occupies before its extents are compressed, so on a compressing volume a tree reports
 /// more than removing it frees. Neither gap is measurable from here, which is why a verb printing
-/// these figures carries [`SIZE_CAVEAT`] rather than adjusting them.
+/// these figures carries [`SIZE_CAVEAT`] rather than adjusting them. [`super::extents`] reads what
+/// a block count cannot, for the reports that ask for it.
 pub(crate) fn tree_usage(path: &Path) -> TreeUsage {
     use std::os::unix::fs::MetadataExt;
     let mut usage = TreeUsage::default();

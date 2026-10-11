@@ -134,6 +134,8 @@ mod wsl;
 
 // Session lifecycle & introspection.
 mod attach;
+// What a tree occupies extent by extent, for the reports that ask what removing it frees.
+pub(crate) mod extents;
 pub(crate) mod gc;
 pub(crate) mod inspect;
 mod observe_feed;

@@ -593,6 +593,10 @@ pub(crate) struct Space {
     pub(crate) allocated: u64,
     /// Device bytes of that reservation actually in use.
     pub(crate) used: u64,
+    /// The part of `used` held by data block groups: file contents as stored, after compression.
+    /// The rest of `used` is metadata and the system group. A mixed block group, which btrfs
+    /// builds only on very small filesystems, is counted here, since its bytes cannot be split.
+    pub(crate) data_used: u64,
 }
 
 /// Each block group the space ioctl reports is three `u64`s: profile flags, total, used.
@@ -636,6 +640,7 @@ fn tally(entries: &[u8]) -> Space {
     // A reservation btrfs holds back *within* the metadata it has already claimed, reported
     // alongside the block groups rather than as one. Adding it would count those bytes twice.
     const GLOBAL_RSV: u64 = 1 << 49;
+    const DATA: u64 = 1 << 0;
 
     let mut space = Space::default();
     #[expect(
@@ -650,7 +655,11 @@ fn tally(entries: &[u8]) -> Space {
         }
         let factor = device_factor(flags);
         space.allocated += u64::from_ne_bytes(e[8..16].try_into().unwrap()) * factor;
-        space.used += u64::from_ne_bytes(e[16..24].try_into().unwrap()) * factor;
+        let used = u64::from_ne_bytes(e[16..24].try_into().unwrap()) * factor;
+        space.used += used;
+        if flags & DATA != 0 {
+            space.data_used += used;
+        }
     }
     space
 }
@@ -2153,6 +2162,10 @@ this line has no separator at all
         let space = tally(&entries);
         assert_eq!(space.used, 12_645_679_104 + 1_944_616_960 + 32_768);
         assert_eq!(space.allocated, 17_179_869_184 + 4_294_967_296 + 16_777_216);
+        assert_eq!(
+            space.data_used, 12_645_679_104,
+            "the data groups alone, metadata and system left out"
+        );
         // The logical sums, which counting a mirror once (or adding the reservation) would give.
         assert_ne!(space.used, 13_618_003_968);
         assert_ne!(space.allocated, 19_387_695_104);

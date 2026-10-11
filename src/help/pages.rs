@@ -2183,9 +2183,15 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["store"],
-        synopsis: "sbx store [--json]",
+        synopsis: "sbx store [--shared] [--json]",
         summary: "report what sbx occupies on disk, subtree by subtree",
-        options: &[("--json", "emit the report as a JSON document")],
+        options: &[
+            (
+                "--shared",
+                "read every file's extents: what each subtree holds alone, and what is shared",
+            ),
+            ("--json", "emit the report as a JSON document"),
+        ],
         details: "The footprint of sbx's whole data directory, largest subtree first, each with its\n\
             size and its inode count. `sbx app list` accounts for the app homes and `sbx projects\n\
             list` for the per-project runtime trees; this covers everything, including the shared\n\
@@ -2202,15 +2208,26 @@ pub(super) const PAGES: &[Page] = &[
             which case this one is. A filesystem that shares storage between files (copy-on-write)\n\
             reports a store's full size even though a store seeded by a clone shares most of its\n\
             storage with the store it came from — and the real footprint is smaller still where\n\
-            the filesystem compresses. No per-file measurement can see either saving, so the\n\
-            sizes are stated as upper bounds rather than guessed at; where the filesystem shares\n\
-            nothing, they are exact.\n\
+            the filesystem compresses. A block count sees neither saving, so the sizes are stated\n\
+            as upper bounds rather than guessed at; where the filesystem shares nothing, they are\n\
+            exact.\n\
+            \n\
+            `--shared` asks the filesystem instead. It reads every file's extents (FIEMAP, which\n\
+            needs no privilege), adds an `exclusive` column — the file data no other subtree\n\
+            references, which is what removing that subtree alone frees inside the filesystem —\n\
+            and closes with a breakdown: the data every file references, what sharing saves, and\n\
+            the distinct data left. Those figures are before compression, which no per-file query\n\
+            reports. On a storage volume the breakdown goes on to what the filesystem stores, data\n\
+            and metadata; the step between distinct and stored data holds compression and\n\
+            allocation together, so it is given as a difference, never as a ratio. Every file is\n\
+            opened, so it takes several times longer than the plain report, and an entry that\n\
+            cannot be read is counted and named rather than left out in silence.\n\
             \n\
             When sbx's data is in a storage volume, a line under the header reports the image's\n\
             real on-host cost — after btrfs compression and sharing, the concrete number those\n\
             upper bounds only allude to.\n\
             \n\
-            Read-only, and free: a filesystem walk, no nix, no network, no sandbox. Nothing is\n\
+            Read-only: a filesystem walk, no nix, no network, no sandbox. Nothing is\n\
             reclaimed here — that is `sbx gc --all --prune` for store closures, `sbx projects rm\n\
             <id>` for a runtime tree, and `sbx app rm <name> --purge` for an app's home.",
     },

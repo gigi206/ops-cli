@@ -5,7 +5,7 @@ description: "Report what sbx occupies on disk, per project and in the shared st
 # `sbx store`
 
 ```
-sbx store [--json]
+sbx store [--shared] [--json]
 ```
 
 Reports what sbx occupies **on disk**: every top-level subtree of its data directory, largest
@@ -16,7 +16,7 @@ per-project runtime trees. This covers *everything*: including the **shared nix 
 the largest tree, which [`sbx gc`](gc) describes only in terms of what is *reclaimable*, never
 what is actually there.
 
-Read-only and free: a filesystem walk. No nix, no network, no sandbox, and nothing is reclaimed.
+Read-only: a filesystem walk. No nix, no network, no sandbox, and nothing is reclaimed.
 
 See also: [`sbx gc`](gc) · [`sbx projects`](projects) · [`sbx app`](app) · [Directory layout](../concepts/directory-layout).
 
@@ -54,6 +54,64 @@ the `btrfs volume` line is the *real* figure: the same `on host` number
 `--json` emits the same data as a document, with the raw `bytes` and `inodes` alongside the
 rendered size; on a volume it carries a `volume` object (`image`, `host_bytes`, `host_size`).
 
+## What each subtree holds alone: `--shared`
+
+The plain report counts blocks, which cannot tell a block a tree owns from one it shares (see
+[below](#how-the-sizes-are-counted)). `--shared` asks the filesystem instead: it opens every file
+and reads its extents with `FIEMAP`, the ioctl `btrfs filesystem du` uses, which needs no
+privilege. On a storage volume holding a project store seeded from the shared one:
+
+```
+sbx store — /run/media/you/sbx-storage (103.1 GiB, 2 085 890 inodes)
+  apps/              55.9 GiB  1 053 917 inodes   48.0 GiB exclusive  global app homes (one per app, shared across projects)
+  projects/          24.1 GiB    318 903 inodes    1.5 GiB exclusive  per-project runtime trees (store, home, locks)
+  store/             23.1 GiB    711 592 inodes  448.8 MiB exclusive  shared daemonless nix store (the `nix --store` target)
+  …
+
+  extents, read from the filesystem:
+   99.6 GiB  file data, every reference counted
+  −27.6 GiB  shared between files, counted once
+   71.9 GiB  distinct file data, before compression
+  −28.4 GiB  compression and allocation: the difference to what is stored
+   43.5 GiB  data on disk
+   +2.6 GiB  metadata on disk, inline file contents included
+```
+
+**`exclusive`** is the file data no other subtree references: what removing that subtree alone
+frees inside the filesystem. Here the project store and the shared store report 23 GiB each, and
+together hold under 2 GiB of their own: the rest is one copy, referenced from both.
+
+The **breakdown** walks from what the files reference to what the filesystem stores:
+
+- **file data, every reference counted** is `btrfs filesystem du`'s total: a block shared by two
+  files counts twice.
+- **shared between files** is what counting each extent once saves, and **distinct file data** what
+  is left. These figures are **before compression**: a file's extents report their logical length,
+  never their compressed size.
+- On a [storage volume](storage), the breakdown goes on to what the filesystem stores, from its
+  own accounting: **data** and **metadata** on disk. The step between distinct and stored data is
+  a **difference**, not a compression ratio: it also holds allocation effects, such as an extent
+  that stays whole on disk after a file stopped referencing part of it. Off a volume these lines
+  are left out, because the filesystem's accounting then covers whatever else it holds.
+
+Small files whose contents the filesystem keeps inline, in its metadata, are counted apart, as a
+number of files and their size: they occupy metadata, not data.
+
+Three limits, stated rather than hidden:
+
+- **Exclusive is before compression**, and is space freed *inside* the filesystem. On a volume the
+  host gets it back only once that space is discarded: see [Releasing it](storage#releasing-it).
+- **References from outside the data directory are invisible.** An extent shared with a file the
+  walk never visits counts as the subtree's own. A storage volume holds nothing else, so this
+  concerns a data directory on a filesystem shared with other data.
+- **It costs a query per file.** On a volume of two million inodes it took about 35 seconds with a
+  warm cache, against a few for the plain report. An entry that cannot be read is counted and
+  named under the breakdown, since its bytes are missing from every figure.
+
+With `--json`, each subtree carries `exclusive_bytes` and the document an `extents` object:
+`referenced_bytes`, `distinct_bytes`, `inline_files`, `inline_bytes`, `unreadable`, and on a volume
+`data_on_disk_bytes` and `metadata_on_disk_bytes`.
+
 ## Examples
 
 ```sh
@@ -62,6 +120,8 @@ sbx store --json                 # the same, machine-readable
 sbx store --json | jq -r '.size, .inodes'                       # the totals alone
 sbx store --json | jq -r '.subtrees[] | "\(.size)\t\(.label)"'  # a two-column report
 sbx store --json | jq '.volume'  # the real host cost, on a storage volume (null otherwise)
+sbx store --shared               # …and what each subtree holds alone
+sbx store --shared --json | jq -r '.subtrees[] | "\(.exclusive_bytes)\t\(.label)"'
 ```
 
 Two questions this answers that no other verb does:
@@ -107,9 +167,10 @@ the report says which case yours is:
   the sizes are **exact**.
 - Where it **does** (copy-on-write), a per-project store reports its full size even though it was
   seeded by a clone that shares most of its storage with the store it came from, and the real
-  footprint is smaller still where the filesystem compresses. No per-file measurement can see
-  either saving (`du` has the same blind spot), so the sizes are honest **upper bounds**: the true
-  on-disk total is smaller, and can be well below what the report shows.
+  footprint is smaller still where the filesystem compresses. A block count sees neither saving
+  (`du` has the same blind spot), so the sizes are honest **upper bounds**: the true on-disk total
+  is smaller, and can be well below what the report shows. [`--shared`](#what-each-subtree-holds-alone---shared)
+  reads the sharing itself.
 - Where the sharing probe itself fails, the report says so: every size may then be an upper
   bound, claimed as neither exact nor CoW-measured.
 

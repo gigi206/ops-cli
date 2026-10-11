@@ -13,7 +13,7 @@
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::{diag, help, layout_or_fail, paths, print_json, sandbox, storage, store, style};
@@ -30,6 +30,13 @@ struct SubtreeView {
     /// What the subtree is for, when it is one of the directories sbx documents.
     #[serde(skip_serializing_if = "Option::is_none")]
     purpose: Option<&'static str>,
+    /// With `--shared`: the bytes of file data no other subtree references, before compression —
+    /// what removing this subtree alone frees inside the filesystem.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exclusive_bytes: Option<u64>,
+    /// The entry itself, which `--shared` hands to the extent walk as an owner.
+    #[serde(skip)]
+    path: PathBuf,
 }
 
 /// The whole report.
@@ -59,6 +66,34 @@ struct StoreView {
     /// this is the sparse image's actual on-disk footprint, after btrfs compression and sharing.
     #[serde(skip_serializing_if = "Option::is_none")]
     volume: Option<VolumeView>,
+    /// With `--shared`: the data directory read extent by extent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extents: Option<ExtentView>,
+}
+
+/// The data directory read extent by extent (`--shared`): from what the files reference to what
+/// the filesystem stores. Every byte figure is file data, before compression, unless named
+/// otherwise.
+#[derive(serde::Serialize)]
+struct ExtentView {
+    /// What the files' data extents add up to, every reference counted: `btrfs filesystem du`'s
+    /// total.
+    referenced_bytes: u64,
+    /// The same extents, each counted once.
+    distinct_bytes: u64,
+    /// Files whose contents the filesystem holds inline, in its metadata.
+    inline_files: u64,
+    /// Their apparent size.
+    inline_bytes: u64,
+    /// Entries that could not be read, whose bytes are missing from every figure.
+    unreadable: u64,
+    /// On a volume: the data as stored, after compression, from the filesystem's own accounting.
+    /// Absent elsewhere, where that accounting covers a filesystem shared with other data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_on_disk_bytes: Option<u64>,
+    /// On a volume: the metadata as stored, inline file contents included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_on_disk_bytes: Option<u64>,
 }
 
 /// The storage volume backing the data directory, when there is one.
@@ -88,9 +123,11 @@ pub(crate) fn store_cmd(args: &[OsString]) -> ExitCode {
         return code;
     }
     let mut json = false;
+    let mut shared = false;
     for a in args {
         match a.to_str() {
             Some("--json") => json = true,
+            Some("--shared") => shared = true,
             Some(other) => {
                 diag::error(&format!("sbx: store: unknown argument `{other}`"));
                 diag::hint("       run `sbx help store` for usage.");
@@ -108,6 +145,23 @@ pub(crate) fn store_cmd(args: &[OsString]) -> ExitCode {
     };
     let mut view = build(layout.data_dir(), &layout.store_dir());
     view.volume = volume_view();
+    if shared {
+        let owners: Vec<PathBuf> = view.subtrees.iter().map(|t| t.path.clone()).collect();
+        let report = match sandbox::extents::measure(layout.data_dir(), &owners) {
+            Ok(r) => r,
+            Err(e) => {
+                diag::error(&format!("sbx: store: --shared: {e}"));
+                return ExitCode::FAILURE;
+            }
+        };
+        // The filesystem's own accounting describes this data only when the data directory is the
+        // volume sbx follows; anywhere else it covers whatever else that filesystem holds.
+        let space = view
+            .volume
+            .as_ref()
+            .and_then(|_| storage::space(layout.data_dir()).ok());
+        apply_extents(&mut view, &report, space);
+    }
 
     if json {
         if let Err(code) = print_json("store", &view) {
@@ -135,6 +189,8 @@ fn build(data_dir: &Path, store_dir: &Path) -> StoreView {
                     size: sandbox::human_bytes(usage.bytes),
                     inodes: usage.inodes,
                     purpose: paths::data_entry_purpose(&e.file_name().to_string_lossy()),
+                    exclusive_bytes: None,
+                    path: e.path(),
                 }
             })
             .collect(),
@@ -159,7 +215,120 @@ fn build(data_dir: &Path, store_dir: &Path) -> StoreView {
         shared_store: shared_store_view(store_dir),
         // Filled in by the caller, which has the environment `build` deliberately does not touch.
         volume: None,
+        extents: None,
     }
+}
+
+/// Restate the report from an extent walk whose owners are `view`'s subtrees, in order.
+///
+/// The sizes and inode counts are replaced by the walk's own, which count every hardlinked inode
+/// once across the whole data directory, so the header, the rows and the breakdown below them
+/// share one base rather than two block counts that differ by whatever crosses a subtree.
+fn apply_extents(
+    view: &mut StoreView,
+    report: &sandbox::extents::ExtentReport,
+    space: Option<storage::Space>,
+) {
+    for (t, usage) in view.subtrees.iter_mut().zip(&report.owners) {
+        t.bytes = usage.blocks;
+        t.size = sandbox::human_bytes(usage.blocks);
+        t.inodes = usage.inodes;
+        t.exclusive_bytes = Some(usage.exclusive_bytes);
+    }
+    view.subtrees
+        .sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.label.cmp(&b.label)));
+    let total = report.total();
+    view.bytes = total.blocks;
+    view.size = sandbox::human_bytes(total.blocks);
+    view.inodes = total.inodes;
+    view.extents = Some(ExtentView {
+        referenced_bytes: total.extent_bytes,
+        distinct_bytes: report.distinct_bytes,
+        inline_files: total.inline_files,
+        inline_bytes: total.inline_bytes,
+        unreadable: report.unreadable,
+        data_on_disk_bytes: space.map(|s| s.data_used),
+        metadata_on_disk_bytes: space.map(|s| s.used - s.data_used),
+    });
+}
+
+/// A difference between two figures, signed, in the units the report uses.
+fn signed_bytes(from: u64, to: u64) -> String {
+    if to <= from {
+        format!("−{}", sandbox::human_bytes(from - to))
+    } else {
+        format!("+{}", sandbox::human_bytes(to - from))
+    }
+}
+
+/// The breakdown `--shared` prints under the rows: from what the files reference to what the
+/// filesystem stores, each line the difference from the one above.
+fn render_extents(x: &ExtentView, pal: &style::Palette) -> String {
+    use std::fmt::Write as _;
+    let (dim, r) = (pal.dim, pal.reset);
+    let mut rows: Vec<(String, String)> = vec![
+        (
+            sandbox::human_bytes(x.referenced_bytes),
+            "file data, every reference counted".to_string(),
+        ),
+        (
+            signed_bytes(x.referenced_bytes, x.distinct_bytes),
+            "shared between files, counted once".to_string(),
+        ),
+        (
+            sandbox::human_bytes(x.distinct_bytes),
+            "distinct file data, before compression".to_string(),
+        ),
+    ];
+    if let (Some(data), Some(meta)) = (x.data_on_disk_bytes, x.metadata_on_disk_bytes) {
+        rows.push((
+            signed_bytes(x.distinct_bytes, data),
+            "compression and allocation: the difference to what is stored".to_string(),
+        ));
+        rows.push((sandbox::human_bytes(data), "data on disk".to_string()));
+        rows.push((
+            format!("+{}", sandbox::human_bytes(meta)),
+            "metadata on disk, inline file contents included".to_string(),
+        ));
+    }
+    let w = rows
+        .iter()
+        .map(|(n, _)| n.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut s = String::new();
+    let _ = writeln!(s, "\n  {dim}extents, read from the filesystem:{r}");
+    for (n, what) in &rows {
+        let pad = w - n.chars().count();
+        let _ = writeln!(s, "  {:pad$}{n}  {dim}{what}{r}", "");
+    }
+    let _ = writeln!(
+        s,
+        "  {dim}{} file(s) held inline in the metadata ({}), counted there rather than as data.{r}",
+        thousands(x.inline_files),
+        sandbox::human_bytes(x.inline_bytes),
+    );
+    let _ = writeln!(
+        s,
+        "  {dim}`exclusive` is what removing that subtree alone frees inside the filesystem, before\n  \
+         compression; the host gets it back once that space is discarded (`sbx storage status`).{r}"
+    );
+    if x.unreadable > 0 {
+        let _ = writeln!(
+            s,
+            "  {}",
+            style::prose(
+                &format!(
+                    "{} entr{} could not be read; {} bytes are missing from these figures.",
+                    thousands(x.unreadable),
+                    if x.unreadable == 1 { "y" } else { "ies" },
+                    if x.unreadable == 1 { "its" } else { "their" },
+                ),
+                pal
+            )
+        );
+    }
+    s
 }
 
 /// The storage volume sbx is currently following, if any — for the real host cost of its image.
@@ -239,12 +408,32 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
         .map(|t| thousands(t.inodes).len())
         .max()
         .unwrap_or(0);
-    for t in &v.subtrees {
+    // With `--shared`, a column of what each subtree holds alone, between the counts and the
+    // purpose.
+    let exclusive: Vec<Option<String>> = v
+        .subtrees
+        .iter()
+        .map(|t| {
+            t.exclusive_bytes
+                .map(|b| format!("{} exclusive", sandbox::human_bytes(b)))
+        })
+        .collect();
+    let excl_w = exclusive
+        .iter()
+        .flatten()
+        .map(|e| e.len())
+        .max()
+        .unwrap_or(0);
+    for (t, excl) in v.subtrees.iter().zip(&exclusive) {
         let purpose = t.purpose.unwrap_or("");
         let unit = if t.inodes == 1 { "inode " } else { "inodes" };
+        let excl = match excl {
+            Some(e) => format!("{e:>excl_w$}  "),
+            None => String::new(),
+        };
         let _ = writeln!(
             s,
-            "  {n}{label:<label_w$}{r}  {size:>size_w$}  {dim}{inodes:>inode_w$} {unit}{r}  {dim}{purpose}{r}",
+            "  {n}{label:<label_w$}{r}  {size:>size_w$}  {dim}{inodes:>inode_w$} {unit}{r}  {excl}{dim}{purpose}{r}",
             label = t.label,
             size = t.size,
             inodes = thousands(t.inodes),
@@ -266,13 +455,18 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
         );
     }
 
+    if let Some(x) = &v.extents {
+        s.push_str(&render_extents(x, pal));
+    }
+
     // How honest the sizes are depends on the filesystem, so say only what is true of this one. A
     // hardlinked file is always counted once (essential for a nix store, which deduplicates into
     // `.links`). Whether a size is exact or an upper bound depends on whether the filesystem shares
     // storage between files: where it does, a store seeded by a copy-on-write clone reports its full
     // size though it shares most of its storage with the store it was seeded from — and the true
-    // footprint is smaller still if the filesystem compresses. No per-file measurement can see
-    // either saving, so the honest thing is to state the bound, not invent a number. And where the
+    // footprint is smaller still if the filesystem compresses. A block count cannot see either
+    // saving, so the honest thing is to state the bound and name `--shared`, which reads the
+    // extents, rather than invent a number. And where the
     // probe could not run at all, the honest thing is to say that rather than pick a side: the two
     // definite sentences are the strongest claims this report makes about its own numbers.
     match v.shares_storage {
@@ -281,7 +475,12 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
                 s,
                 "{dim}sizes count allocated blocks and a hardlinked file once. this filesystem shares\n  \
                  storage between files, so each size is an upper bound — the real footprint is smaller\n  \
-                 (more so if the filesystem compresses).{r}"
+                 (more so if the filesystem compresses).{}{r}",
+                if v.extents.is_some() {
+                    ""
+                } else {
+                    " `sbx store --shared` reads what is shared."
+                }
             );
         }
         Some(false) => {
@@ -374,6 +573,8 @@ mod tests {
             size: "4.0 KiB".into(),
             inodes: 1,
             purpose: None,
+            exclusive_bytes: None,
+            path: PathBuf::new(),
         };
         let exact = StoreView {
             data_dir: "/d".into(),
@@ -384,6 +585,7 @@ mod tests {
             subtrees: vec![one],
             shared_store: None,
             volume: None,
+            extents: None,
         };
         let out = render(&exact, &style::Palette::plain());
         assert!(out.contains("exact"), "{out}");
@@ -430,6 +632,8 @@ mod tests {
             size: "4.0 KiB".into(),
             inodes: 1,
             purpose: None,
+            exclusive_bytes: None,
+            path: PathBuf::new(),
         };
         let base = StoreView {
             data_dir: "/run/media/you/sbx-storage".into(),
@@ -440,6 +644,7 @@ mod tests {
             subtrees: vec![one],
             shared_store: None,
             volume: None,
+            extents: None,
         };
 
         // Without a volume, no such line.
@@ -460,6 +665,131 @@ mod tests {
             out.contains("/home/you/.local/share/sbx-storage.btrfs"),
             "the image path is named so the number is traceable: {out}"
         );
+    }
+
+    fn row(label: &str, bytes: u64) -> SubtreeView {
+        SubtreeView {
+            label: label.into(),
+            bytes,
+            size: sandbox::human_bytes(bytes),
+            inodes: 1,
+            purpose: None,
+            exclusive_bytes: None,
+            path: PathBuf::from(format!("/d/{label}")),
+        }
+    }
+
+    fn usage(blocks: u64, exclusive_bytes: u64) -> sandbox::extents::OwnerUsage {
+        sandbox::extents::OwnerUsage {
+            blocks,
+            inodes: 10,
+            extent_bytes: blocks,
+            exclusive_bytes,
+            inline_files: 1,
+            inline_bytes: 56,
+        }
+    }
+
+    /// `--shared` restates every size from the extent walk, so the header, the rows and the
+    /// breakdown share one base, and ranks again by those sizes. The rows are matched to the walk's
+    /// owners by position, which is the order the walk was handed them in.
+    #[test]
+    fn shared_restates_the_sizes_from_the_walk_and_adds_what_each_subtree_holds_alone() {
+        let mut v = StoreView {
+            data_dir: "/d".into(),
+            bytes: 300,
+            size: String::new(),
+            inodes: 2,
+            shares_storage: Some(true),
+            subtrees: vec![row("store/", 200), row("apps/", 100)],
+            shared_store: None,
+            volume: None,
+            extents: None,
+        };
+        let report = sandbox::extents::ExtentReport {
+            // The rest of the tree comes last and has no row.
+            owners: vec![usage(1000, 10), usage(5000, 4000), usage(4, 0)],
+            distinct_bytes: 4500,
+            unreadable: 0,
+        };
+        apply_extents(&mut v, &report, None);
+
+        let rows: Vec<(&str, u64, Option<u64>)> = v
+            .subtrees
+            .iter()
+            .map(|t| (t.label.as_str(), t.bytes, t.exclusive_bytes))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("apps/", 5000, Some(4000)), ("store/", 1000, Some(10))],
+            "the walk's figures, ranked again"
+        );
+        assert_eq!(
+            (v.bytes, v.inodes),
+            (6004, 30),
+            "the header is the walk's total"
+        );
+        let x = v.extents.as_ref().expect("the breakdown");
+        assert_eq!((x.referenced_bytes, x.distinct_bytes), (6004, 4500));
+        assert_eq!((x.inline_files, x.inline_bytes), (3, 168));
+        assert!(
+            x.data_on_disk_bytes.is_none() && x.metadata_on_disk_bytes.is_none(),
+            "off a volume the filesystem's own accounting describes more than this data"
+        );
+
+        let out = render(&v, &style::Palette::plain());
+        assert!(out.contains("3.9 KiB exclusive"), "{out}");
+        assert!(
+            out.contains("distinct file data, before compression"),
+            "{out}"
+        );
+        assert!(!out.contains("data on disk"), "{out}");
+        assert!(
+            !out.contains("--shared` reads"),
+            "the note does not point at the option the report already used: {out}"
+        );
+    }
+
+    /// On the volume the breakdown runs on to what the filesystem stores. The step between the
+    /// distinct data and the stored data is a difference, signed, and named as one: it holds
+    /// compression and allocation together, and is never presented as a ratio.
+    #[test]
+    fn on_a_volume_the_breakdown_reaches_what_is_stored() {
+        let x = ExtentView {
+            referenced_bytes: 100 << 30,
+            distinct_bytes: 72 << 30,
+            inline_files: 2,
+            inline_bytes: 100,
+            unreadable: 3,
+            data_on_disk_bytes: Some(43 << 30),
+            metadata_on_disk_bytes: Some(3 << 30),
+        };
+        let out = render_extents(&x, &style::Palette::plain());
+        for line in [
+            "100.0 GiB  file data, every reference counted",
+            "−28.0 GiB  shared between files, counted once",
+            "72.0 GiB  distinct file data, before compression",
+            "−29.0 GiB  compression and allocation: the difference to what is stored",
+            "43.0 GiB  data on disk",
+            "+3.0 GiB  metadata on disk",
+            "3 entries could not be read",
+        ] {
+            assert!(out.contains(line), "{line:?} missing:\n{out}");
+        }
+        assert!(!out.contains('%'), "no ratio: {out}");
+
+        // Allocation can leave more on disk than the extents reference; the sign says so.
+        let grown = ExtentView {
+            data_on_disk_bytes: Some(80 << 30),
+            unreadable: 0,
+            ..x
+        };
+        let out = render_extents(&grown, &style::Palette::plain());
+        assert!(
+            out.contains("+8.0 GiB  compression and allocation"),
+            "{out}"
+        );
+        assert!(!out.contains("could not be read"), "{out}");
     }
 
     /// Before anything is provisioned the report is empty rather than an error, and it never
