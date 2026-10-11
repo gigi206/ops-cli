@@ -33,6 +33,10 @@ const FAKE_NOTIFY_SCRIPT: &str = "on open theFiles\nend open\n";
 /// The notifier's icon a fake release publishes. The script hands it to `sips`.
 const FAKE_ICON: &str = "png";
 
+/// The file a stand-in tool appends its calls to, beside it. The stand-in reaches it from its own
+/// path, so its script names no fixture path, whatever the fixture root holds.
+const CALLS: &str = "calls.log";
+
 /// The script as it ships, read from the checkout.
 fn script() -> Vec<u8> {
     std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
@@ -102,7 +106,6 @@ impl Release {
     fn fake_mac_tools(&self, missing: &[&str]) -> PathBuf {
         let bin = self.root.join("macbin");
         std::fs::create_dir_all(&bin).unwrap();
-        let log = self.root.join("tools.log");
         let tools = [
             (
                 "osacompile",
@@ -120,8 +123,7 @@ impl Release {
             }
             let path = bin.join(name);
             let body = format!(
-                "#!/bin/sh\necho \"{name} $*\" >> {log}\n{action}\n",
-                log = log.display()
+                "#!/bin/sh\necho \"{name} $*\" >> \"$(dirname \"$0\")/{CALLS}\"\n{action}\n"
             );
             std::fs::write(&path, body).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -131,22 +133,19 @@ impl Release {
 
     /// Every call the fake macOS tools received, one per line.
     fn tool_calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.root.join("tools.log"))
+        std::fs::read_to_string(self.root.join("macbin").join(CALLS))
             .unwrap_or_default()
             .lines()
             .map(str::to_string)
             .collect()
     }
 
-    /// A directory holding a `launchctl` that appends each call to `launchctl.log`.
+    /// A directory holding a `launchctl` that appends each call to [`Release::launchctl_calls`].
     fn fake_launchctl(&self) -> PathBuf {
         let bin = self.root.join("launchbin");
         std::fs::create_dir_all(&bin).unwrap();
         let path = bin.join("launchctl");
-        let body = format!(
-            "#!/bin/sh\necho \"$*\" >> {}\n",
-            self.root.join("launchctl.log").display()
-        );
+        let body = format!("#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/{CALLS}\"\n");
         std::fs::write(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         bin
@@ -154,36 +153,31 @@ impl Release {
 
     /// Every `launchctl` call the script made, one per line.
     fn launchctl_calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.root.join("launchctl.log"))
+        std::fs::read_to_string(self.root.join("launchbin").join(CALLS))
             .unwrap_or_default()
             .lines()
             .map(str::to_string)
             .collect()
     }
 
-    /// A directory holding a `limactl` that appends each call to [`Release::lima_log`], and lists
-    /// an instance named `sbx` when `FAKE_LIMA_EXISTS` is set.
+    /// A directory holding a `limactl` that appends each call to [`Release::lima_calls`], and
+    /// lists an instance named `sbx` when `FAKE_LIMA_EXISTS` is set.
     fn fake_limactl(&self) -> PathBuf {
         let bin = self.root.join("limabin");
         std::fs::create_dir_all(&bin).unwrap();
         let path = bin.join("limactl");
         let body = format!(
-            "#!/bin/sh\necho \"$*\" >> {log}\n\
-             case \"$1\" in list) [ -z \"${{FAKE_LIMA_EXISTS:-}}\" ] || echo sbx ;; esac\n",
-            log = self.lima_log().display()
+            "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/{CALLS}\"\n\
+             case \"$1\" in list) [ -z \"${{FAKE_LIMA_EXISTS:-}}\" ] || echo sbx ;; esac\n"
         );
         std::fs::write(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         bin
     }
 
-    fn lima_log(&self) -> PathBuf {
-        self.root.join("limactl.log")
-    }
-
     /// Every `limactl` call the script made, one per line.
     fn lima_calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.lima_log())
+        std::fs::read_to_string(self.root.join("limabin").join(CALLS))
             .unwrap_or_default()
             .lines()
             .map(str::to_string)
@@ -205,7 +199,9 @@ impl Release {
         std::fs::create_dir_all(&bin).unwrap();
         let path = bin.join("uname");
         let body = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  -s) echo {kernel} ;;\n  -m) echo {machine} ;;\nesac\n"
+            "#!/bin/sh\ncase \"$1\" in\n  -s) echo {kernel} ;;\n  -m) echo {machine} ;;\nesac\n",
+            kernel = common::sh_word(kernel),
+            machine = common::sh_word(machine)
         );
         std::fs::write(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
