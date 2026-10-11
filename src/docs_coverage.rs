@@ -1257,6 +1257,88 @@ fn the_guide_writes_no_em_dash_outside_the_output_it_quotes() {
     );
 }
 
+/// The text of each string literal a source line holds whole, its escapes as written: plain ones
+/// (`"…"`, a `\"` inside included) and raw ones (`r"…"`, `r#"…"#`). Read one by one, so the code
+/// between two literals on the line is never taken for one, and a `\n` in one exempts that literal
+/// alone. A character literal (`'"'`) holds no string, a `//` outside a literal ends the line's
+/// code, and a literal the line opens without closing, the head of one that runs on, ends the scan.
+///
+/// Each line is read on its own, with no memory of the one before: the last line of a literal that
+/// runs on is read from its closing quote as though that quote opened one.
+fn line_literals(line: &str) -> Vec<&str> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => break,
+            b'r' if (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+                && matches!(b.get(i + 1), Some(b'#' | b'"')) =>
+            {
+                let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
+                let open = i + 1 + hashes;
+                if b.get(open) != Some(&b'"') {
+                    i += 1;
+                    continue;
+                }
+                let close = format!("\"{}", "#".repeat(hashes));
+                let Some(len) = line[open + 1..].find(&close) else {
+                    break;
+                };
+                out.push(&line[open + 1..open + 1 + len]);
+                i = open + 1 + len + close.len();
+            }
+            b'\'' => {
+                // `'"'` and `'\"'` are characters; any other quote (a lifetime) is passed over.
+                i += match (b.get(i + 1), b.get(i + 2), b.get(i + 3)) {
+                    (Some(b'\\'), _, Some(b'\'')) => 4,
+                    (Some(_), Some(b'\''), _) => 3,
+                    _ => 1,
+                };
+            }
+            b'"' => {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                if j >= b.len() {
+                    break;
+                }
+                out.push(&line[i + 1..j]);
+                i = j + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// A line's literals are read one by one: never the code between two of them, an escaped quote and
+/// a raw string's own quotes kept inside theirs, a character literal no string at all.
+#[test]
+fn each_literal_of_a_line_is_read_on_its_own() {
+    // The gap is built rather than written, so this file's own lines carry none for the guard.
+    let gap = " ".repeat(4);
+    let line = format!(r#"println!("a\n{{}}", "first part of a sentence{gap}lost");"#);
+    assert_eq!(
+        line_literals(&line),
+        [
+            r"a\n{}".to_string(),
+            format!("first part of a sentence{gap}lost")
+        ]
+    );
+    assert_eq!(
+        line_literals(r#"let q = '"'; let s = "x \" y"; let e = '\"';"#),
+        [r#"x \" y"#]
+    );
+    assert_eq!(
+        line_literals(r###"let r = r#"raw "inner" text"#; fn f<'a>(x: &'a str) {}"###),
+        [r#"raw "inner" text"#]
+    );
+    assert_eq!(line_literals(r#"let s = "runs on \"#), Vec::<&str>::new());
+    assert_eq!(line_literals(r#"f("said"); // "a comment""#), ["said"]);
+}
+
 /// A message literal does not run its own indentation through the middle of a sentence.
 ///
 /// A long literal is wrapped with a trailing `\`, which makes Rust drop the newline **and** the
@@ -1279,7 +1361,8 @@ fn the_guide_writes_no_em_dash_outside_the_output_it_quotes() {
 ///   has a whole clause behind it.
 ///
 /// What it does not see, named rather than implied: a message assembled from several literals by
-/// concatenation, and a gap whose sentence is shorter than four words.
+/// concatenation, a gap whose sentence is shorter than four words, and a literal on the line that
+/// closes one an earlier line opened ([`line_literals`] reads each line on its own).
 #[test]
 fn no_message_literal_runs_its_indentation_through_a_sentence() {
     let paths = crate::testutil::crate_sources();
@@ -1297,20 +1380,15 @@ fn no_message_literal_runs_its_indentation_through_a_sentence() {
             if line.trim_start().starts_with("//") {
                 continue;
             }
-            let (Some(open), Some(close)) = (line.find('"'), line.rfind('"')) else {
-                continue;
-            };
-            if close <= open {
-                continue;
-            }
-            let literal = &line[open + 1..close];
-            if literal.contains("\\n") {
-                continue;
-            }
-            for m in gap.find_iter(literal) {
-                if literal[..m.start() + 1].split_whitespace().count() >= 4 {
-                    let at = path.display().to_string().replace(&manifest, "");
-                    offenders.push(format!("{at}:{}  {}", n + 1, line.trim()));
+            for literal in line_literals(line) {
+                if literal.contains("\\n") {
+                    continue;
+                }
+                for m in gap.find_iter(literal) {
+                    if literal[..m.start() + 1].split_whitespace().count() >= 4 {
+                        let at = path.display().to_string().replace(&manifest, "");
+                        offenders.push(format!("{at}:{}  {}", n + 1, line.trim()));
+                    }
                 }
             }
         }
