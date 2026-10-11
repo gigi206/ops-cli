@@ -519,27 +519,41 @@ impl std::io::Read for Trickle<'_> {
     }
 }
 
-/// Every `.rs` source under `dir`, sorted, subdirectories included. The walk descends because a
-/// module that outgrew one file keeps its root in `<name>.rs` and everything else in a `<name>/`
-/// beside it: a flat listing would read the root, skip the children, and report the silence as a
-/// pass. A directory that cannot be listed fails the test for the same reason.
-fn rs_sources_under(dir: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let entries =
-            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("listing {}: {e}", dir.display()));
-        for entry in entries {
-            let path = entry
-                .unwrap_or_else(|e| panic!("listing {}: {e}", dir.display()))
-                .path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
+/// Every regular file under `dir` whose extension is one of `extensions`, sorted, subdirectories
+/// included. The walk descends because a module that outgrew one file keeps its root in `<name>.rs`
+/// and everything else in a `<name>/` beside it: a flat listing would read the root, skip the
+/// children, and report the silence as a pass. An entry that cannot be read fails the test by its
+/// path for the same reason.
+///
+/// Directories and files are told by the entry's own type, which a link does not take from what it
+/// names. A link to a directory is not descended: one pointing back up the tree would otherwise send
+/// the walk round it, listing each file once per turn until the kernel refuses the path, and two
+/// such links double that at every turn. A link is not listed either, so a dangling one, such as the
+/// lock an editor leaves beside a file it holds, is no file to read.
+pub(crate) fn files_under(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
+    fn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
+        let unreadable =
+            |e: std::io::Error| -> ! { panic!("`{}` cannot be read: {e}", dir.display()) };
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| unreadable(e)) {
+            let entry = entry.unwrap_or_else(|e| unreadable(e));
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .unwrap_or_else(|e| panic!("`{}` cannot be read: {e}", path.display()));
+            if kind.is_dir() {
+                walk(&path, extensions, out);
+            } else if kind.is_file()
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| extensions.contains(&e))
+            {
                 out.push(path);
             }
         }
     }
     let mut out = Vec::new();
-    walk(dir, &mut out);
+    walk(dir, extensions, &mut out);
     out.sort();
     out
 }
@@ -821,7 +835,10 @@ fn closing_brace(text: &[u8], open: usize) -> Option<usize> {
 /// Two guards read the dispatcher sources — the routed-subcommand check in [`crate::cli`] and the
 /// alias check in [`crate::help`] — and both must see the same corpus.
 pub(crate) fn cli_sources() -> Vec<PathBuf> {
-    rs_sources_under(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli"))
+    files_under(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli"),
+        &["rs"],
+    )
 }
 
 /// Every `.rs` source in the crate, sorted, subdirectories included.
@@ -830,7 +847,7 @@ pub(crate) fn cli_sources() -> Vec<PathBuf> {
 /// command named in a diagnostic, a comment, or a doc — where restricting the sweep to the module
 /// that happens to hold today's instance would let tomorrow's land anywhere else unguarded.
 pub(crate) fn crate_sources() -> Vec<PathBuf> {
-    rs_sources_under(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+    files_under(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &["rs"])
 }
 
 /// A sorted `(relative path, size)` fingerprint of a tree — sensitive to any
