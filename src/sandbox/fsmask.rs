@@ -4543,7 +4543,23 @@ fn entry_names(project: &Path, entry: &str, path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+    use std::ffi::{OsStr, OsString};
     use std::os::unix::fs::PermissionsExt;
+
+    /// The arguments of a `git` command as OS strings, so a literal and a fixture path stand side by
+    /// side and the path reaches git as the bytes it is, whatever the fixture root is called.
+    macro_rules! git_args {
+        ($($arg:expr),* $(,)?) => {
+            [$(AsRef::<OsStr>::as_ref($arg)),*]
+        };
+    }
+
+    /// `prefix`, the bytes of `path`, then a newline: a line of a git file that names a path (a
+    /// `.git` file's `gitdir:`, a `commondir`, a worktree's `gitdir`), as the bytes git writes.
+    fn path_line(prefix: &str, path: &Path) -> Vec<u8> {
+        use std::os::unix::ffi::OsStrExt as _;
+        [prefix.as_bytes(), path.as_os_str().as_bytes(), b"\n"].concat()
+    }
 
     /// A project with a key, a certificate directory and an ordinary file.
     fn project(tmp: &TmpDir) -> PathBuf {
@@ -5079,19 +5095,19 @@ mod tests {
     fn the_directory_core_hooks_path_names_inside_the_project_is_read_only() {
         let tmp = TmpDir::new();
         let root = project(&tmp);
-        let git = |args: &[&str]| {
+        let git = |args: &[&OsStr]| {
             std::process::Command::new("git")
                 .args(args)
                 .current_dir(&root)
                 .output()
         };
-        let Ok(init) = git(&["init", "-q"]) else {
+        let Ok(init) = git(&git_args!["init", "-q"]) else {
             return; // no git on this host: no hook can run on it either
         };
         assert!(init.status.success());
         std::fs::create_dir_all(root.join(".husky/_")).unwrap();
         assert!(
-            git(&["config", "core.hooksPath", ".husky/_"])
+            git(&git_args!["config", "core.hooksPath", ".husky/_"])
                 .unwrap()
                 .status
                 .success()
@@ -5116,9 +5132,9 @@ mod tests {
 
         // Outside the project: the cage does not hold it, so nothing is added.
         let outside = tmp.path().join("hooks-elsewhere");
-        let value = outside.display().to_string();
+        let value = outside.as_os_str();
         assert!(
-            git(&["config", "core.hooksPath", &value])
+            git(&git_args!["config", "core.hooksPath", value])
                 .unwrap()
                 .status
                 .success()
@@ -5134,13 +5150,13 @@ mod tests {
     fn a_file_git_includes_as_configuration_is_read_only_or_the_launch_refuses() {
         let tmp = TmpDir::new();
         let root = project(&tmp);
-        let git = |args: &[&str]| {
+        let git = |args: &[&OsStr]| {
             std::process::Command::new("git")
                 .args(args)
                 .current_dir(&root)
                 .output()
         };
-        let Ok(init) = git(&["init", "-q"]) else {
+        let Ok(init) = git(&git_args!["init", "-q"]) else {
             return; // no git on this host: no configuration to read either
         };
         assert!(init.status.success());
@@ -5153,19 +5169,23 @@ mod tests {
         std::fs::write(root.join("nested.cfg"), "[core]\n").unwrap();
         // Relative to the file that declares it: `.git/config` is in `.git`.
         assert!(
-            git(&["config", "include.path", "../inc.gitconfig"])
+            git(&git_args!["config", "include.path", "../inc.gitconfig"])
                 .unwrap()
                 .status
                 .success()
         );
         let outside = tmp.path().join("outside.cfg");
         std::fs::write(&outside, "").unwrap();
-        let cond = format!("{}", outside.display());
+        let cond = outside.as_os_str();
         assert!(
-            git(&["config", "includeIf.gitdir:/nowhere/.path", &cond])
-                .unwrap()
-                .status
-                .success()
+            git(&git_args![
+                "config",
+                "includeIf.gitdir:/nowhere/.path",
+                cond
+            ])
+            .unwrap()
+            .status
+            .success()
         );
 
         let e = expand(&root, &FsPolicy::default(), &[], None);
@@ -5192,10 +5212,15 @@ mod tests {
 
         // An include of a project file that is not there: refused, named, nothing created.
         assert!(
-            git(&["config", "--add", "include.path", "../later.cfg"])
-                .unwrap()
-                .status
-                .success()
+            git(&git_args![
+                "config",
+                "--add",
+                "include.path",
+                "../later.cfg"
+            ])
+            .unwrap()
+            .status
+            .success()
         );
         let e = expand(&root, &FsPolicy::default(), &[], None);
         let why = e
@@ -5230,10 +5255,10 @@ mod tests {
     /// run, so the developer's own configuration writes nothing into the fixture. Automatic
     /// maintenance is off: from git 2.54 its default strategy prunes the worktree entries a test
     /// writes by hand, from a process the commit leaves running in the background.
-    fn git_project(tmp: &TmpDir) -> Option<(PathBuf, impl Fn(&[&str]) -> bool)> {
+    fn git_project(tmp: &TmpDir) -> Option<(PathBuf, impl Fn(&[&OsStr]) -> bool)> {
         let root = project(tmp);
         let dir = root.clone();
-        let git = move |args: &[&str]| {
+        let git = move |args: &[&OsStr]| {
             std::process::Command::new("git")
                 .args(["-c", "user.name=t", "-c", "user.email=t@t"])
                 .args(["-c", "maintenance.auto=false"])
@@ -5242,10 +5267,10 @@ mod tests {
                 .output()
                 .is_ok_and(|o| o.status.success())
         };
-        if !git(&["init", "-q"]) {
+        if !git(&git_args!["init", "-q"]) {
             return None;
         }
-        assert!(git(&[
+        assert!(git(&git_args![
             "commit",
             "-q",
             "--no-verify",
@@ -5268,8 +5293,8 @@ mod tests {
         };
         // A repository git accepts as the common directory, or it would answer nothing at all and
         // the assertion below would hold whatever the order.
-        assert!(git(&["init", "-q", "--bare", "other.git"]));
-        assert!(git(&[
+        assert!(git(&git_args!["init", "-q", "--bare", "other.git"]));
+        assert!(git(&git_args![
             "--git-dir",
             "other.git",
             "config",
@@ -5353,7 +5378,7 @@ mod tests {
             return;
         };
         std::fs::create_dir_all(root.join(".husky/_")).unwrap();
-        assert!(git(&["config", "core.hooksPath", ".husky/_"]));
+        assert!(git(&git_args!["config", "core.hooksPath", ".husky/_"]));
         let held = |e: &Expanded| e.readonly.iter().any(|m| m.path == root.join(".husky/_"));
         let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
@@ -5436,8 +5461,10 @@ mod tests {
             return;
         };
         std::fs::create_dir_all(root.join("hk")).unwrap();
-        let value = format!("~{user}/{}/hk", below.display());
-        assert!(git(&["config", "core.hooksPath", &value]));
+        let mut value = OsString::from(format!("~{user}/"));
+        value.push(below);
+        value.push("/hk");
+        assert!(git(&git_args!["config", "core.hooksPath", &value]));
         let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
         assert!(
@@ -5464,7 +5491,7 @@ mod tests {
         std::fs::write(root.join("f1.cfg"), "[include]\n\tpath = f2.cfg\n").unwrap();
         std::fs::write(root.join("f2.cfg"), "[include]\n\tpath = f3.cfg\n").unwrap();
         std::fs::write(root.join("f3.cfg"), "").unwrap();
-        assert!(git(&[
+        assert!(git(&git_args![
             "config",
             "includeIf.onbranch:feature.path",
             "../f1.cfg"
@@ -5496,7 +5523,7 @@ mod tests {
             return;
         };
         std::fs::write(root.join(".githooks"), "not hooks").unwrap();
-        assert!(git(&["config", "core.hooksPath", ".githooks"]));
+        assert!(git(&git_args!["config", "core.hooksPath", ".githooks"]));
         let e = expand(&root, &FsPolicy::default(), &[], None);
         let why = e
             .refused
@@ -5532,7 +5559,7 @@ mod tests {
             "[extensions]\n\tworktreeConfig = true\n",
         )
         .unwrap();
-        assert!(git(&["config", "include.path", "../inc.cfg"]));
+        assert!(git(&git_args!["config", "include.path", "../inc.cfg"]));
         assert!(
             expand(&root, &FsPolicy::default(), &[], None)
                 .refused
@@ -5540,7 +5567,11 @@ mod tests {
             "git honors the setting from `.git/config` only"
         );
 
-        assert!(git(&["config", "extensions.worktreeConfig", "true"]));
+        assert!(git(&git_args![
+            "config",
+            "extensions.worktreeConfig",
+            "true"
+        ]));
         let e = expand(&root, &FsPolicy::default(), &[], None);
         let why = e.refused.as_deref().expect("read by git and absent");
         assert!(
@@ -5559,15 +5590,19 @@ mod tests {
             skip_incapable!("skipping linked worktree protection: no git on this host");
             return;
         };
-        assert!(git(&["config", "extensions.worktreeConfig", "true"]));
+        assert!(git(&git_args![
+            "config",
+            "extensions.worktreeConfig",
+            "true"
+        ]));
         std::fs::write(root.join(".git/config.worktree"), "").unwrap();
         let linked = tmp.path().join("linked");
-        assert!(git(&[
+        assert!(git(&git_args![
             "worktree",
             "add",
             "-q",
             "--detach",
-            linked.to_str().unwrap()
+            linked.as_os_str()
         ]));
         // git turns such a name into `w-t` for a worktree it makes; one made by hand keeps it.
         let odd = root.join(".git/worktrees/w*t");
@@ -5798,30 +5833,42 @@ mod tests {
 
         std::fs::create_dir_all(root.join("tools-husky/_")).unwrap();
         std::os::unix::fs::symlink("tools-husky", root.join(".husky")).unwrap();
-        assert!(git(&["config", "core.hooksPath", ".husky/_"]));
+        assert!(git(&git_args!["config", "core.hooksPath", ".husky/_"]));
         refused_at(&root.join(".husky"));
-        assert!(git(&["config", "--unset", "core.hooksPath"]));
+        assert!(git(&git_args!["config", "--unset", "core.hooksPath"]));
 
         std::fs::create_dir_all(root.join("realcfg")).unwrap();
         std::fs::write(root.join("realcfg/inc.cfg"), "").unwrap();
         std::os::unix::fs::symlink("realcfg", root.join("cfgdir")).unwrap();
-        assert!(git(&["config", "include.path", "../cfgdir/inc.cfg"]));
+        assert!(git(&git_args![
+            "config",
+            "include.path",
+            "../cfgdir/inc.cfg"
+        ]));
         refused_at(&root.join("cfgdir"));
 
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(root.join("cfgdir/inc.cfg"), outside.join("back-in")).unwrap();
         let back_in = outside.join("back-in");
-        assert!(git(&["config", "include.path", back_in.to_str().unwrap()]));
+        assert!(git(&git_args![
+            "config",
+            "include.path",
+            back_in.as_os_str()
+        ]));
         refused_at(&root.join("cfgdir"));
 
         // git refuses to read an include it cannot resolve, so the loop is met by the hooks path,
         // whose value git reports without resolving it.
-        assert!(git(&["config", "--unset", "include.path"]));
+        assert!(git(&git_args!["config", "--unset", "include.path"]));
         std::os::unix::fs::symlink("loop-b", outside.join("loop-a")).unwrap();
         std::os::unix::fs::symlink("loop-a", outside.join("loop-b")).unwrap();
         let looped = outside.join("loop-a");
-        assert!(git(&["config", "core.hooksPath", looped.to_str().unwrap()]));
+        assert!(git(&git_args![
+            "config",
+            "core.hooksPath",
+            looped.as_os_str()
+        ]));
         let why = expand(&root, &FsPolicy::default(), &[], None)
             .refused
             .expect("a loop refuses");
@@ -5840,8 +5887,12 @@ mod tests {
         };
         std::fs::create_dir_all(root.join(".githooks")).unwrap();
         std::fs::write(root.join("repo.gitconfig"), "").unwrap();
-        assert!(git(&["config", "core.hooksPath", ".githooks"]));
-        assert!(git(&["config", "include.path", "../repo.gitconfig"]));
+        assert!(git(&git_args!["config", "core.hooksPath", ".githooks"]));
+        assert!(git(&git_args![
+            "config",
+            "include.path",
+            "../repo.gitconfig"
+        ]));
         let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
         for held in [".githooks", ".git/hooks", ".git/config", "repo.gitconfig"] {
@@ -5855,13 +5906,13 @@ mod tests {
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("inc.cfg"), "").unwrap();
-        assert!(git(&[
+        assert!(git(&git_args![
             "config",
             "core.hooksPath",
-            outside.to_str().unwrap()
+            outside.as_os_str()
         ]));
         let inc = outside.join("inc.cfg");
-        assert!(git(&["config", "include.path", inc.to_str().unwrap()]));
+        assert!(git(&git_args!["config", "include.path", inc.as_os_str()]));
         let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
     }
@@ -5987,8 +6038,12 @@ mod tests {
             shared.join("tools/team.gitconfig"),
         );
         std::fs::write(&inc, "").unwrap();
-        assert!(git(&["config", "core.hooksPath", hooks.to_str().unwrap()]));
-        assert!(git(&["config", "include.path", inc.to_str().unwrap()]));
+        assert!(git(&git_args![
+            "config",
+            "core.hooksPath",
+            hooks.as_os_str()
+        ]));
+        assert!(git(&git_args!["config", "include.path", inc.as_os_str()]));
 
         let e = expand(&root, &FsPolicy::default(), &[rw_bind(&shared)], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
@@ -6056,7 +6111,11 @@ mod tests {
         std::fs::create_dir_all(shared.join("real/hooks")).unwrap();
         std::os::unix::fs::symlink("real", shared.join("tools")).unwrap();
         let named = shared.join("tools/hooks");
-        assert!(git(&["config", "core.hooksPath", named.to_str().unwrap()]));
+        assert!(git(&git_args![
+            "config",
+            "core.hooksPath",
+            named.as_os_str()
+        ]));
         let why = expand(&root, &FsPolicy::default(), &[rw_bind(&shared)], None)
             .refused
             .expect("a link in the bind refuses");
@@ -6095,28 +6154,32 @@ mod tests {
             );
         };
         let hooks = home.join("hooks");
-        assert!(git(&["config", "core.hooksPath", hooks.to_str().unwrap()]));
+        assert!(git(&git_args![
+            "config",
+            "core.hooksPath",
+            hooks.as_os_str()
+        ]));
         refused_at(&hooks);
-        assert!(git(&["config", "--unset", "core.hooksPath"]));
+        assert!(git(&git_args!["config", "--unset", "core.hooksPath"]));
 
         let inc = home.join("team.gitconfig");
-        assert!(git(&["config", "include.path", inc.to_str().unwrap()]));
+        assert!(git(&git_args!["config", "include.path", inc.as_os_str()]));
         refused_at(&inc);
         std::fs::write(&inc, "").unwrap();
         refused_at(&inc);
         let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
-        assert!(git(&["config", "--unset", "include.path"]));
+        assert!(git(&git_args!["config", "--unset", "include.path"]));
 
         std::fs::create_dir_all(data.join("modules")).unwrap();
         let repo = data.join("modules/sub");
-        let separate = ["--separate-git-dir", repo.to_str().unwrap()];
-        assert!(git_repo_at(&root.join("sub"), &separate) && git(&["add", "sub"]));
+        let separate = git_args!["--separate-git-dir", repo.as_os_str()];
+        assert!(git_repo_at(&root.join("sub"), &separate) && git(&git_args!["add", "sub"]));
         refused_at(&repo);
 
         let worktree = tmp.path().join("linked");
         let repo = data.join("linked.git");
-        let separate = ["--separate-git-dir", repo.to_str().unwrap()];
+        let separate = git_args!["--separate-git-dir", repo.as_os_str()];
         assert!(git_repo_at(&worktree, &separate));
         let why = expand(&worktree, &FsPolicy::default(), &[], Some(&data))
             .refused
@@ -6147,8 +6210,8 @@ mod tests {
         }
         let repo = shared.join("modules/sub");
         std::fs::create_dir_all(shared.join("modules")).unwrap();
-        let separate = ["--separate-git-dir", repo.to_str().unwrap()];
-        assert!(git_repo_at(&root.join("sub"), &separate) && git(&["add", "sub"]));
+        let separate = git_args!["--separate-git-dir", repo.as_os_str()];
+        assert!(git_repo_at(&root.join("sub"), &separate) && git(&git_args!["add", "sub"]));
         let binds = [rw_bind(&shared)];
 
         let e = expand(&root, &FsPolicy::default(), &binds, None);
@@ -6166,14 +6229,14 @@ mod tests {
 
         let watch = GitWatch::start(&root, false, &binds, None).expect("a protected `.git`");
         assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
-        let in_sub = |args: &[&str]| {
+        let in_sub = |args: &[&OsStr]| {
             std::process::Command::new("git")
-                .args(["-C", root.join("sub").to_str().unwrap()])
+                .args(git_args!["-C", root.join("sub").as_os_str()])
                 .args(args)
                 .output()
                 .is_ok_and(|o| o.status.success())
         };
-        assert!(git_repo_at(&root.join("sub/inner"), &[]) && in_sub(&["add", "inner"]));
+        assert!(git_repo_at(&root.join("sub/inner"), &[]) && in_sub(&git_args!["add", "inner"]));
         let found = watch.findings();
         assert!(
             found
@@ -6186,18 +6249,18 @@ mod tests {
     /// A main repository with a linked worktree `feat` beside it, both canonical, with a git
     /// runner in the main repository; `None` where there is no git to make them or the fixture
     /// root is a cage mount, which a bind of the main repository would not reach.
-    fn linked_worktree(tmp: &TmpDir) -> Option<(PathBuf, PathBuf, impl Fn(&[&str]) -> bool)> {
+    fn linked_worktree(tmp: &TmpDir) -> Option<(PathBuf, PathBuf, impl Fn(&[&OsStr]) -> bool)> {
         let (main, git) = git_project(tmp)?;
         let feat = tmp.path().canonicalize().unwrap().join("feat");
         if !crate::sandbox::binds::bind_reaches_the_cage(&main, Some(&feat)) {
             return None;
         }
-        assert!(git(&[
+        assert!(git(&git_args![
             "worktree",
             "add",
             "-q",
             "--detach",
-            feat.to_str().unwrap()
+            feat.as_os_str()
         ]));
         Some((main, feat, git))
     }
@@ -6216,9 +6279,15 @@ mod tests {
             skip_incapable!("skipping a linked worktree's repository: no git, or a cage mount");
             return;
         };
-        assert!(git(&["config", "core.hooksPath", ".husky/_"]));
-        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/sib"]));
-        assert!(git(&["config", "extensions.worktreeConfig", "true"]));
+        assert!(git(&git_args!["config", "core.hooksPath", ".husky/_"]));
+        assert!(git(&git_args![
+            "worktree", "add", "-q", "--detach", ".wt/sib"
+        ]));
+        assert!(git(&git_args![
+            "config",
+            "extensions.worktreeConfig",
+            "true"
+        ]));
         let common = main.join(".git");
         let own = common.join("worktrees/feat");
         let sib = common.join("worktrees/sib");
@@ -6300,7 +6369,9 @@ mod tests {
             skip_incapable!("skipping a linked worktree's commondir: no git, or a cage mount");
             return;
         };
-        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/sib"]));
+        assert!(git(&git_args![
+            "worktree", "add", "-q", "--detach", ".wt/sib"
+        ]));
         let other = tmp.path().canonicalize().unwrap().join("other");
         assert!(git_repo_at(&other, &[]));
         let refused = |project: &Path, binds: &[crate::config::Bind]| {
@@ -6308,7 +6379,7 @@ mod tests {
         };
         let sib = main.join(".git/worktrees/sib/commondir");
         for commondir in [main.join(".git/worktrees/feat/commondir"), sib.clone()] {
-            std::fs::write(&commondir, format!("{}\n", other.join(".git").display())).unwrap();
+            std::fs::write(&commondir, path_line("", &other.join(".git"))).unwrap();
             let why = refused(&main, &[]).expect("another repository");
             assert!(
                 why.contains(&format!("{}` does not name", commondir.display())),
@@ -6328,7 +6399,7 @@ mod tests {
         std::fs::remove_file(&sib).unwrap();
         assert_eq!(refused(&feat, &[]), None, "not the cage's to write");
         assert!(refused(&feat, &[rw_bind(&main)]).is_some());
-        std::fs::write(&sib, format!("{}\n", other.join(".git").display())).unwrap();
+        std::fs::write(&sib, path_line("", &other.join(".git"))).unwrap();
         assert_eq!(refused(&feat, &[]), None, "not the cage's to write");
         assert!(refused(&feat, &[rw_bind(&main)]).is_some());
     }
@@ -6345,7 +6416,9 @@ mod tests {
             return;
         };
         let watch = GitWatch::start(&main, false, &[], None).expect("a carried repository");
-        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/sib"]));
+        assert!(git(&git_args![
+            "worktree", "add", "-q", "--detach", ".wt/sib"
+        ]));
         let gitdir = main.join(".git/worktrees/sib/gitdir");
         std::fs::remove_file(&gitdir).unwrap();
         std::fs::create_dir(&gitdir).unwrap();
@@ -6392,14 +6465,14 @@ mod tests {
         };
         assert!(refused(&binds).is_some_and(|why| why.contains(".git/commondir` is present")));
         assert_eq!(refused(&[]), None, "not the cage's to write");
-        let in_feat = |args: &[&str]| {
+        let in_feat = |args: &[&OsStr]| {
             std::process::Command::new("git")
-                .args(["-C", feat.to_str().unwrap()])
+                .args(git_args!["-C", feat.as_os_str()])
                 .args(args)
                 .output()
                 .is_ok_and(|o| o.status.success())
         };
-        assert!(git_repo_at(&feat.join("emb"), &[]) && in_feat(&["add", "emb"]));
+        assert!(git_repo_at(&feat.join("emb"), &[]) && in_feat(&git_args!["add", "emb"]));
         let named = |found: &[String], what: &str| found.iter().any(|f| f.contains(what));
         let appeared = format!("{}` appeared", commondir.display());
         let found = watch.findings();
@@ -6427,20 +6500,17 @@ mod tests {
             std::fs::create_dir_all(dir).unwrap();
         }
         let point_at = |dir: &Path| {
-            std::fs::write(root.join(".git"), format!("gitdir: {}\n", dir.display())).unwrap();
+            std::fs::write(root.join(".git"), path_line("gitdir: ", dir)).unwrap();
         };
         let refused = |binds: &[crate::config::Bind]| {
             expand(&root, &FsPolicy::default(), binds, None).refused
         };
         point_at(&own);
-        for named in [
-            "../..\n".to_string(),
-            format!("{}\n", base.join("main/.git").display()),
-        ] {
+        for named in [b"../..\n".to_vec(), path_line("", &base.join("main/.git"))] {
             std::fs::write(own.join("commondir"), named).unwrap();
             assert_eq!(refused(&[]), None);
         }
-        std::fs::write(own.join("commondir"), format!("{}\n", other.display())).unwrap();
+        std::fs::write(own.join("commondir"), path_line("", &other)).unwrap();
         let why = refused(&[]).expect("another directory");
         assert!(why.contains("commondir` does not name"), "{why}");
         std::fs::remove_file(own.join("commondir")).unwrap();
@@ -6507,12 +6577,12 @@ mod tests {
             skip_incapable!("skipping a worktree inside the project: no git on this host");
             return;
         };
-        assert!(git(&["config", "core.hooksPath", ".husky/_"]));
+        assert!(git(&git_args!["config", "core.hooksPath", ".husky/_"]));
         for name in [".wt/inner", ".wt/gone"] {
-            assert!(git(&["worktree", "add", "-q", "--detach", name]));
+            assert!(git(&git_args!["worktree", "add", "-q", "--detach", name]));
         }
         let mut trees = vec!["inner"];
-        if git(&[
+        if git(&git_args![
             "worktree",
             "add",
             "-q",
@@ -6545,7 +6615,11 @@ mod tests {
         assert!(!e.pins.iter().any(|p| p.starts_with(&gone)), "{:?}", e.pins);
 
         // An absolute value names the same directory for every work tree, and is said once.
-        assert!(git(&["config", "core.hooksPath", root.to_str().unwrap()]));
+        assert!(git(&git_args![
+            "config",
+            "core.hooksPath",
+            root.as_os_str()
+        ]));
         let e = expand(&root, &FsPolicy::default(), &[], None);
         let said = e
             .warnings
@@ -6566,25 +6640,30 @@ mod tests {
         };
         let source = tmp.path().join("source");
         assert!(git_repo_at(&source, &[]));
-        let file = ["-c", "protocol.file.allow=always"];
-        let add = ["submodule", "add", "-q", source.to_str().unwrap(), "sub"];
+        let file = git_args!["-c", "protocol.file.allow=always"];
+        let add = git_args!["submodule", "add", "-q", source.as_os_str(), "sub"];
         assert!(git(&[&file[..], &add[..]].concat()));
-        assert!(git(&["commit", "-q", "--no-verify", "-m", "sub"]));
-        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/inner"]));
+        assert!(git(&git_args!["commit", "-q", "--no-verify", "-m", "sub"]));
+        assert!(git(&git_args![
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            ".wt/inner"
+        ]));
         let inner = root.join(".wt/inner");
-        let at_inner = ["-C", inner.to_str().unwrap()];
-        let update = ["submodule", "update", "-q", "--init"];
+        let at_inner = git_args!["-C", inner.as_os_str()];
+        let update = git_args!["submodule", "update", "-q", "--init"];
         assert!(git(&[&at_inner[..], &file[..], &update[..]].concat()));
-        assert!(git(&["config", "extensions.worktreeConfig", "true"]));
+        assert!(git(&git_args![
+            "config",
+            "extensions.worktreeConfig",
+            "true"
+        ]));
         std::fs::write(root.join(".git/config.worktree"), "").unwrap();
         let included = root.join("inc.cfg");
         std::fs::write(&included, "").unwrap();
-        let include = [
-            "config",
-            "--worktree",
-            "include.path",
-            included.to_str().unwrap(),
-        ];
+        let include = git_args!["config", "--worktree", "include.path", included.as_os_str(),];
         assert!(git(&[&at_inner[..], &include[..]].concat()));
         let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
@@ -6620,13 +6699,19 @@ mod tests {
             skip_incapable!("skipping a worktree's `.git` file: no git on this host");
             return;
         };
-        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/inner"]));
+        assert!(git(&git_args![
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            ".wt/inner"
+        ]));
         let dot_git = root.join(".wt/inner/.git");
         let other = tmp.path().canonicalize().unwrap().join("other.git");
         std::fs::create_dir_all(&other).unwrap();
         let refused = || expand(&root, &FsPolicy::default(), &[], None).refused;
         assert_eq!(refused(), None);
-        std::fs::write(&dot_git, format!("gitdir: {}\n", other.display())).unwrap();
+        std::fs::write(&dot_git, path_line("gitdir: ", &other)).unwrap();
         let why = refused().expect("another repository");
         assert!(why.contains(".wt/inner/.git` does not name"), "{why}");
         std::fs::remove_file(&dot_git).unwrap();
@@ -6646,22 +6731,12 @@ mod tests {
         // Beside the project, named by a `gitdir` relative to the worktree's directory, which
         // climbs out of the project on its way there.
         let beside = tmp.path().canonicalize().unwrap().join("beside");
-        let add = [
-            "worktree",
-            "add",
-            "-q",
-            "--detach",
-            beside.to_str().unwrap(),
-        ];
-        if !git(&[&add[..], &["--relative-paths"][..]].concat()) {
+        let add = git_args!["worktree", "add", "-q", "--detach", beside.as_os_str(),];
+        if !git(&[&add[..], &git_args!["--relative-paths"][..]].concat()) {
             skip_incapable!("skipping a relative `gitdir`: git has no --relative-paths");
             assert!(git(&add));
         }
-        std::fs::write(
-            beside.join(".git"),
-            format!("gitdir: {}\n", other.display()),
-        )
-        .unwrap();
+        std::fs::write(beside.join(".git"), path_line("gitdir: ", &other)).unwrap();
         assert_eq!(refused(), None, "not the cage's to write");
     }
 
@@ -6677,17 +6752,17 @@ mod tests {
         };
         let base = tmp.path().canonicalize().unwrap();
         let (bare, project) = (base.join("bare.git"), base.join("bw"));
-        let (main, bare_s) = (main.to_str().unwrap(), bare.to_str().unwrap());
-        assert!(git(&["clone", "-q", "--bare", main, bare_s]));
-        assert!(git(&["-C", bare_s, "config", "core.hooksPath", ".husky/_"]));
-        let add = [
-            "worktree",
-            "add",
-            "-q",
-            "--detach",
-            project.to_str().unwrap(),
-        ];
-        assert!(git(&[&["-C", bare_s][..], &add[..]].concat()));
+        let (main, bare_s) = (main.as_os_str(), bare.as_os_str());
+        assert!(git(&git_args!["clone", "-q", "--bare", main, bare_s]));
+        assert!(git(&git_args![
+            "-C",
+            bare_s,
+            "config",
+            "core.hooksPath",
+            ".husky/_"
+        ]));
+        let add = git_args!["worktree", "add", "-q", "--detach", project.as_os_str(),];
+        assert!(git(&[&git_args!["-C", bare_s][..], &add[..]].concat()));
         let held = |e: &Expanded, path: &Path| e.readonly.iter().any(|m| m.path == path);
         let e = expand(&project, &FsPolicy::default(), &[rw_bind(&bare)], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
@@ -6709,20 +6784,34 @@ mod tests {
             skip_incapable!("skipping the watch of the worktrees: no git on this host");
             return;
         };
-        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/inner"]));
+        assert!(git(&git_args![
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            ".wt/inner"
+        ]));
         let watch = GitWatch::start(&root, false, &[], None).expect("a carried repository");
         assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
-        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/added"]));
+        assert!(git(&git_args![
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            ".wt/added"
+        ]));
         let inner = root.join(".wt/inner");
-        let at_inner = ["-C", inner.to_str().unwrap()];
+        let at_inner = git_args!["-C", inner.as_os_str()];
         assert!(git_repo_at(&inner.join("emb"), &[]));
-        assert!(git(&[&at_inner[..], &["add", "emb"][..]].concat()));
+        assert!(git(&[&at_inner[..], &git_args!["add", "emb"][..]].concat()));
         let found = watch.findings();
         let named = |what: &str| found.iter().any(|f| f.contains(what));
         assert!(named(".wt/added` became a worktree"), "{found:#?}");
         assert!(!named(".wt/inner` became a worktree"), "{found:#?}");
         assert!(!named("`commondir` is missing"), "{found:#?}");
-        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/evil"]));
+        assert!(git(&git_args![
+            "worktree", "add", "-q", "--detach", ".wt/evil"
+        ]));
         std::fs::write(root.join(".git/worktrees/evil/commondir"), "../../../x\n").unwrap();
         let found = watch.findings();
         let evil = found
@@ -6749,16 +6838,22 @@ mod tests {
         };
         let commit = |name: &str, text: &str| {
             std::fs::write(root.join(name), text).unwrap();
-            assert!(git(&["add", name]) && git(&["commit", "-q", "--no-verify", "-m", text]));
+            assert!(
+                git(&git_args!["add", name])
+                    && git(&git_args!["commit", "-q", "--no-verify", "-m", text])
+            );
         };
         commit("f", "a");
-        assert!(git(&["checkout", "-q", "-b", "side"]));
+        assert!(git(&git_args!["checkout", "-q", "-b", "side"]));
         commit("f", "b");
         commit("g", "c");
-        assert!(git(&["checkout", "-q", "@{-1}"]));
+        assert!(git(&git_args!["checkout", "-q", "@{-1}"]));
         commit("f", "z");
-        assert!(git(&["checkout", "-q", "side"]));
-        assert!(!git(&["rebase", "-q", "@{-1}"]), "stops on the conflict");
+        assert!(git(&git_args!["checkout", "-q", "side"]));
+        assert!(
+            !git(&git_args!["rebase", "-q", "@{-1}"]),
+            "stops on the conflict"
+        );
         let todo = root.join(".git/rebase-merge/git-rebase-todo");
         assert!(todo.is_file());
         let append = |file: &Path, line: &str| {
@@ -6791,7 +6886,7 @@ mod tests {
             "{rebase}"
         );
 
-        assert!(git_repo_at(&root.join("emb"), &[]) && git(&["add", "emb"]));
+        assert!(git_repo_at(&root.join("emb"), &[]) && git(&git_args!["add", "emb"]));
         let emb = root.join("emb/.git/rebase-merge");
         std::fs::create_dir_all(&emb).unwrap();
         append(
@@ -6821,7 +6916,7 @@ mod tests {
             skip_incapable!("skipping a held git: no git on this host");
             return;
         };
-        assert!(git(&["config", "include.path", "held"]));
+        assert!(git(&git_args!["config", "include.path", "held"]));
         crate::testutil::make_fifo(&root.join(".git/held"));
         let budget = GIT_ASK_BUDGET;
         let started = std::time::Instant::now();
@@ -6927,7 +7022,7 @@ mod tests {
         assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
 
         let worked = root.join("worked");
-        let in_worked = |args: &[&str]| {
+        let in_worked = |args: &[&OsStr]| {
             std::process::Command::new("git")
                 .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
                 .arg(&worked)
@@ -6936,13 +7031,16 @@ mod tests {
                 .is_ok_and(|o| o.status.success())
         };
         std::fs::write(worked.join("f"), "f").unwrap();
-        assert!(in_worked(&["add", "f"]) && in_worked(&["commit", "-q", "--no-verify", "-m", "f"]));
-        assert!(in_worked(&["status", "--short"]));
+        assert!(
+            in_worked(&git_args!["add", "f"])
+                && in_worked(&git_args!["commit", "-q", "--no-verify", "-m", "f"])
+        );
+        assert!(in_worked(&git_args!["status", "--short"]));
         assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
 
         assert!(git_repo_at(&root.join("sub"), &[]));
         let bare = root.join("deep/er/bare");
-        assert!(git(&["init", "-q", "--bare", bare.to_str().unwrap()]));
+        assert!(git(&git_args!["init", "-q", "--bare", bare.as_os_str()]));
         append_in_place(
             &root.join("vendor/x/.git/config"),
             "[core]\n\tfsmonitor = planted\n",
@@ -6956,12 +7054,8 @@ mod tests {
         assert!(git_repo_at(&other, &[]));
         let pointed = root.join("pointed/.git");
         std::fs::remove_dir_all(&pointed).unwrap();
-        std::fs::write(
-            &pointed,
-            format!("gitdir: {}\n", other.join(".git").display()),
-        )
-        .unwrap();
-        assert!(git_repo_at(&root.join("emb"), &[]) && git(&["add", "emb"]));
+        std::fs::write(&pointed, path_line("gitdir: ", &other.join(".git"))).unwrap();
+        assert!(git_repo_at(&root.join("emb"), &[]) && git(&git_args!["add", "emb"]));
 
         let found = watch.findings();
         let holds = |dir: &str| {
@@ -7088,9 +7182,9 @@ mod tests {
             std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
             std::fs::create_dir_all(&tree).unwrap();
             std::fs::write(dir.join("commondir"), "../..\n").unwrap();
-            let listed = format!("{}\n", tree.join(".git").display());
+            let listed = path_line("", &tree.join(".git"));
             std::fs::write(dir.join("gitdir"), listed).unwrap();
-            std::fs::write(tree.join(".git"), format!("gitdir: {}\n", dir.display())).unwrap();
+            std::fs::write(tree.join(".git"), path_line("gitdir: ", &dir)).unwrap();
         };
         (0..20).for_each(worktree);
         let e = expand(&root, &FsPolicy::default(), &[], None);
@@ -7109,17 +7203,17 @@ mod tests {
 
     /// A repository at `dir` with one empty commit, made by the host's git; `false` when git is
     /// not there to make it.
-    fn git_repo_at(dir: &Path, args: &[&str]) -> bool {
-        let git = |extra: &[&str]| {
+    fn git_repo_at(dir: &Path, args: &[&OsStr]) -> bool {
+        let git = |extra: &[&OsStr]| {
             std::process::Command::new("git")
                 .args(["-c", "user.name=t", "-c", "user.email=t@t"])
                 .args(extra)
                 .output()
                 .is_ok_and(|o| o.status.success())
         };
-        let dir = dir.to_str().unwrap();
-        git(&[&["init", "-q"], args, &[dir]].concat())
-            && git(&[
+        let dir = dir.as_os_str();
+        git(&[&git_args!["init", "-q"][..], args, &[dir]].concat())
+            && git(&git_args![
                 "-C",
                 dir,
                 "commit",
@@ -7143,8 +7237,8 @@ mod tests {
         };
         let (inner, mid) = (tmp.path().join("inner"), tmp.path().join("mid"));
         assert!(git_repo_at(&inner, &[]) && git_repo_at(&mid, &[]));
-        let file = ["-c", "protocol.file.allow=always"];
-        let in_mid = |args: &[&str]| {
+        let file = git_args!["-c", "protocol.file.allow=always"];
+        let in_mid = |args: &[&OsStr]| {
             std::process::Command::new("git")
                 .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
                 .arg(&mid)
@@ -7154,20 +7248,20 @@ mod tests {
         };
         let add_inner = [
             &file[..],
-            &["submodule", "add", "-q", inner.to_str().unwrap(), "in"],
+            &git_args!["submodule", "add", "-q", inner.as_os_str(), "in"][..],
         ];
-        assert!(in_mid(&add_inner.concat()) && in_mid(&["commit", "-q", "-m", "in"]));
+        assert!(in_mid(&add_inner.concat()) && in_mid(&git_args!["commit", "-q", "-m", "in"]));
         let add_mid = [
             &file[..],
-            &["submodule", "add", "-q", mid.to_str().unwrap(), "sub"],
+            &git_args!["submodule", "add", "-q", mid.as_os_str(), "sub"][..],
         ];
         assert!(git(&add_mid.concat()));
         let update = [
             &file[..],
-            &["submodule", "update", "-q", "--init", "--recursive"],
+            &git_args!["submodule", "update", "-q", "--init", "--recursive"][..],
         ];
         assert!(git(&update.concat()));
-        assert!(git_repo_at(&root.join("emb"), &[]) && git(&["add", "emb"]));
+        assert!(git_repo_at(&root.join("emb"), &[]) && git(&git_args!["add", "emb"]));
 
         let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
@@ -7211,16 +7305,22 @@ mod tests {
                 skip_incapable!("skipping a split index: no git on this host");
                 return;
             };
-            assert!(git(&["config", "index.version", version]));
-            assert!(git(&["config", "splitIndex.maxPercentChange", "100"]));
+            assert!(git(&git_args!["config", "index.version", version]));
+            assert!(git(&git_args![
+                "config",
+                "splitIndex.maxPercentChange",
+                "100"
+            ]));
             for i in 0..12 {
                 std::fs::write(root.join(format!("f{i}")), "x").unwrap();
             }
             assert!(git_repo_at(&root.join("in_shared"), &[]));
-            assert!(git(&["add", "."]) && git(&["update-index", "--split-index"]));
-            assert!(git_repo_at(&root.join("added"), &[]) && git(&["add", "added"]));
+            assert!(
+                git(&git_args!["add", "."]) && git(&git_args!["update-index", "--split-index"])
+            );
+            assert!(git_repo_at(&root.join("added"), &[]) && git(&git_args!["add", "added"]));
             std::fs::remove_file(root.join("f3")).unwrap();
-            assert!(git_repo_at(&root.join("f3"), &[]) && git(&["add", "f3"]));
+            assert!(git_repo_at(&root.join("f3"), &[]) && git(&git_args!["add", "f3"]));
 
             let index = std::fs::read(root.join(".git/index")).unwrap();
             let blob = parse_git_index_entries(&index, SHA1_LEN).expect("a split index parses");
@@ -7331,7 +7431,7 @@ mod tests {
             SHA1_LEN
         );
         assert_eq!(repository_hash_len(&base.join("none")).unwrap(), SHA1_LEN);
-        if git_repo_at(&base.join("sha256"), &["--object-format=sha256"]) {
+        if git_repo_at(&base.join("sha256"), &git_args!["--object-format=sha256"]) {
             let len = repository_hash_len(&base.join("sha256/.git")).unwrap();
             assert_eq!(len, SHA256_LEN);
         } else {
@@ -7402,16 +7502,16 @@ mod tests {
         };
         let source = tmp.path().join("source");
         assert!(git_repo_at(&source, &[]));
-        let file = ["-c", "protocol.file.allow=always"];
+        let file = git_args!["-c", "protocol.file.allow=always"];
         for name in ["lib", "old"] {
             let add = [
                 &file[..],
-                &["submodule", "add", "-q", source.to_str().unwrap(), name],
+                &git_args!["submodule", "add", "-q", source.as_os_str(), name][..],
             ];
             assert!(git(&add.concat()));
         }
-        assert!(git(&["commit", "-q", "--no-verify", "-m", "subs"]));
-        assert!(git(&["submodule", "deinit", "-q", "-f", "old"]));
+        assert!(git(&git_args!["commit", "-q", "--no-verify", "-m", "subs"]));
+        assert!(git(&git_args!["submodule", "deinit", "-q", "-f", "old"]));
         let modules = root.join(".git/modules");
         assert!(
             modules.join("old/config").exists(),
@@ -7500,7 +7600,12 @@ mod tests {
         let head = String::from_utf8(head.stdout).unwrap();
         let gitlink = |path: &str| {
             let info = format!("160000,{},{path}", head.trim());
-            assert!(git(&["update-index", "--add", "--cacheinfo", &info]));
+            assert!(git(&git_args![
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &info
+            ]));
             std::fs::create_dir_all(root.join(path)).unwrap();
         };
         let refused = || {
@@ -7522,7 +7627,7 @@ mod tests {
         let outside = tmp.path().join("outside-repo");
         assert!(git_repo_at(&outside, &[]));
         gitlink("out");
-        let pointer = format!("gitdir: {}/.git\n", outside.display());
+        let pointer = path_line("gitdir: ", &outside.join(".git"));
         std::fs::write(root.join("out/.git"), pointer).unwrap();
         let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
@@ -7534,7 +7639,7 @@ mod tests {
     }
 
     /// Gitlinks at each of `paths`, on the project's current commit, written into its index.
-    fn add_gitlinks(root: &Path, git: impl Fn(&[&str]) -> bool, paths: &[String]) {
+    fn add_gitlinks(root: &Path, git: impl Fn(&[&OsStr]) -> bool, paths: &[String]) {
         let head = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(root)
@@ -7545,9 +7650,9 @@ mod tests {
             .iter()
             .map(|path| format!("160000,{},{path}", head.trim()))
             .collect();
-        let mut args = vec!["update-index", "--add"];
+        let mut args = git_args!["update-index", "--add"].to_vec();
         for info in &infos {
-            args.extend(["--cacheinfo", info.as_str()]);
+            args.extend(git_args!["--cacheinfo", info.as_str()]);
         }
         assert!(git(&args));
     }
@@ -7599,7 +7704,7 @@ mod tests {
         let sub = root.join("z");
         assert!(git_repo_at(&sub, &[]));
         let below: Vec<String> = (0..half).map(|i| format!("n/{i:04}")).collect();
-        let in_sub = |args: &[&str]| {
+        let in_sub = |args: &[&OsStr]| {
             std::process::Command::new("git")
                 .args(args)
                 .current_dir(&sub)
@@ -7642,7 +7747,7 @@ mod tests {
             std::fs::create_dir_all(root.join(path)).unwrap();
             std::fs::write(
                 root.join(path).join(".git"),
-                format!("gitdir: {}\n", elsewhere.display()),
+                path_line("gitdir: ", &elsewhere),
             )
             .unwrap();
         }
@@ -7668,8 +7773,10 @@ mod tests {
         };
         let source = tmp.path().join("source");
         assert!(git_repo_at(&source, &[]));
-        let add = ["-c", "protocol.file.allow=always", "submodule", "add", "-q"];
-        assert!(git(&[&add[..], &[source.to_str().unwrap(), "sub"]].concat()));
+        let add = git_args!["-c", "protocol.file.allow=always", "submodule", "add", "-q"];
+        assert!(git(
+            &[&add[..], &git_args![source.as_os_str(), "sub"][..]].concat()
+        ));
         let held = |root: &Path| {
             let e = expand(root, &FsPolicy::default(), &[], None);
             e.refused.is_none()
@@ -7677,9 +7784,9 @@ mod tests {
                     .iter()
                     .any(|m| m.path == root.join(".git/modules/sub/config"))
         };
-        assert!(git(&["update-index", "--index-version", "4"]));
+        assert!(git(&git_args!["update-index", "--index-version", "4"]));
         assert!(held(&root), "version 4");
-        assert!(git(&["update-index", "--split-index"]));
+        assert!(git(&git_args!["update-index", "--split-index"]));
         assert!(held(&root), "split");
         remove_shared_indexes(&root.join(".git"));
         let why = expand(&root, &FsPolicy::default(), &[], None)
@@ -7688,14 +7795,17 @@ mod tests {
         assert!(why.contains("not an index sbx reads in full"), "{why}");
 
         let sha = tmp.path().join("sha");
-        if !git_repo_at(&sha, &["--object-format=sha256"]) {
+        if !git_repo_at(&sha, &git_args!["--object-format=sha256"]) {
             skip_incapable!("skipping a SHA-256 index: this git does not make one");
             return;
         }
         let sha = sha.canonicalize().unwrap();
-        assert!(git_repo_at(&sha.join("emb"), &["--object-format=sha256"]));
+        assert!(git_repo_at(
+            &sha.join("emb"),
+            &git_args!["--object-format=sha256"]
+        ));
         let add = std::process::Command::new("git")
-            .args(["-C", sha.to_str().unwrap(), "add", "emb"])
+            .args(git_args!["-C", sha.as_os_str(), "add", "emb"])
             .output()
             .unwrap();
         assert!(add.status.success());
@@ -7719,11 +7829,11 @@ mod tests {
             skip_incapable!("skipping an unreadable index: no git on this host");
             return;
         };
-        assert!(git_repo_at(&root.join("emb"), &[]) && git(&["add", "emb"]));
+        assert!(git_repo_at(&root.join("emb"), &[]) && git(&git_args!["add", "emb"]));
         assert!(!root.join(".gitmodules").exists() && !root.join(".git/modules").exists());
         let refused = || expand(&root, &FsPolicy::default(), &[], None).refused;
         assert_eq!(refused(), None);
-        assert!(git(&["update-index", "--split-index"]));
+        assert!(git(&git_args!["update-index", "--split-index"]));
         remove_shared_indexes(&root.join(".git"));
         let why = refused().expect("a missing shared index refuses");
         assert!(why.contains("not an index sbx reads in full"), "{why}");
@@ -7745,13 +7855,13 @@ mod tests {
             skip_incapable!("skipping the submodule watch: no git on this host");
             return;
         };
-        assert!(git_repo_at(&root.join("kept"), &[]) && git(&["add", "kept"]));
+        assert!(git_repo_at(&root.join("kept"), &[]) && git(&git_args!["add", "kept"]));
         let watch =
             GitWatch::start(&root, false, &[], None).expect("a protected `.git` is watched");
         assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
 
-        assert!(git(&["update-index", "--index-version", "4"]));
-        assert!(git_repo_at(&root.join("emb"), &[]) && git(&["add", "emb"]));
+        assert!(git(&git_args!["update-index", "--index-version", "4"]));
+        assert!(git_repo_at(&root.join("emb"), &[]) && git(&git_args!["add", "emb"]));
         let found = watch.findings();
         assert!(
             found
@@ -7765,14 +7875,14 @@ mod tests {
         );
 
         // A gitlink added inside a submodule held at launch is followed there too.
-        let in_kept = |args: &[&str]| {
+        let in_kept = |args: &[&OsStr]| {
             std::process::Command::new("git")
-                .args(["-C", root.join("kept").to_str().unwrap()])
+                .args(git_args!["-C", root.join("kept").as_os_str()])
                 .args(args)
                 .output()
                 .is_ok_and(|o| o.status.success())
         };
-        assert!(git_repo_at(&root.join("kept/inner"), &[]) && in_kept(&["add", "inner"]));
+        assert!(git_repo_at(&root.join("kept/inner"), &[]) && in_kept(&git_args!["add", "inner"]));
         let found = watch.findings();
         assert!(
             found
@@ -7781,8 +7891,8 @@ mod tests {
             "{found:#?}"
         );
 
-        assert!(git(&["update-index", "--split-index"]));
-        assert!(git_repo_at(&root.join("late"), &[]) && git(&["add", "late"]));
+        assert!(git(&git_args!["update-index", "--split-index"]));
+        assert!(git_repo_at(&root.join("late"), &[]) && git(&git_args!["add", "late"]));
         let found = watch.findings();
         assert!(
             found
@@ -7935,8 +8045,8 @@ mod tests {
         };
 
         for pointer in [
-            format!("gitdir: {}\n", outside.display()),
-            "gitdir: ../main/.git/worktrees/w\r\n".to_string(),
+            path_line("gitdir: ", &outside),
+            b"gitdir: ../main/.git/worktrees/w\r\n".to_vec(),
         ] {
             std::fs::write(&git, pointer).unwrap();
             held_alone(&expand(&root, &FsPolicy::default(), &[], None));
@@ -8178,16 +8288,20 @@ mod tests {
             include_masks(&reach, out, &mut masks, &mut refused);
             refused
         };
-        let origin = format!("file:{}/.git/config", root.display());
-        let mut bytes = format!("{origin}\0include.path\n{}/inc-", root.display()).into_bytes();
+        let root_bytes = {
+            use std::os::unix::ffi::OsStrExt as _;
+            root.as_os_str().as_bytes()
+        };
+        let origin = [b"file:", root_bytes, b"/.git/config"].concat();
+        let mut bytes = [&origin[..], b"\0include.path\n", root_bytes, b"/inc-"].concat();
         bytes.extend_from_slice(b"\xff.cfg\0");
         let why = refusal(&bytes).expect("a name that is not UTF-8 refuses");
         assert!(why.contains("not UTF-8"), "{why}");
-        let why = refusal(format!("{origin}\0include.path\0").as_bytes())
+        let why = refusal(&[&origin[..], b"\0include.path\0"].concat())
             .expect("an entry with no value refuses");
         assert!(why.contains("with no value"), "{why}");
         assert_eq!(
-            refusal(format!("{origin}\0include.path\n/elsewhere/inc.cfg\0").as_bytes()),
+            refusal(&[&origin[..], b"\0include.path\n/elsewhere/inc.cfg\0"].concat()),
             None
         );
     }
