@@ -2177,9 +2177,8 @@ fn existing_parent_mut<'d>(
 /// in that thread would wait for itself forever. Sharing is sound there because the edits of this
 /// module never call one another, so one thread never has two of them between read and write.
 ///
-/// `None` when no guard could be named: no trust store directory, or a config path that is not
-/// UTF-8 ([`crate::trust::marker_path`]). The edit then proceeds unguarded, as every edit did
-/// before the guard existed.
+/// `None` when no guard could be named, which is when there is no trust store directory to place
+/// it under. The edit then proceeds unguarded, as every edit did before the guard existed.
 pub(crate) struct WriteGuard(
     // Held only for its `Drop`: closing the fd is what releases the `flock`. Never read.
     #[allow(dead_code)] Option<std::rc::Rc<std::fs::File>>,
@@ -2213,8 +2212,13 @@ impl PartialEq for WriteGuard {
 impl Eq for WriteGuard {}
 
 /// Where the writer guard of the config file `config` lives under `root`: `write-locks/` and the
-/// trust marker's own key for that file ([`crate::trust::marker_path`]), so every spelling of one
-/// file — relative, through a linked directory — names one guard, and two files never share one.
+/// hash of the file's canonical location ([`crate::trust::canonical_path`]), so every spelling of
+/// one file — relative, through a linked directory — names one guard, and two files never share
+/// one.
+///
+/// The hash is over the path's bytes. For a UTF-8 path those are the bytes the trust marker hashes,
+/// so the guard keeps the marker's key; a path that is not UTF-8, which no marker can name, still
+/// names a guard of its own rather than leaving its edits unguarded.
 ///
 /// Under the trust store and never beside the file: a project's `.sbx.toml` sits in a tree its cage
 /// writes, where a guard file could be planted or held by the cage to stall every write, while the
@@ -2222,8 +2226,11 @@ impl Eq for WriteGuard {}
 /// security model names for every root: a bind declared at or inside the trust store shows it,
 /// read-only, and a `flock` needs no more than a read-only open, so such a cage can hold a guard
 /// and keep an edit of that file waiting.
-fn guard_path(root: &Path, config: &Path) -> Option<PathBuf> {
-    crate::trust::marker_path(&root.join("write-locks"), config)
+fn guard_path(root: &Path, config: &Path) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+    let canonical = crate::trust::canonical_path(config);
+    root.join("write-locks")
+        .join(crate::trust::hash_bytes(canonical.as_os_str().as_bytes()))
 }
 
 /// The root [`guard_path`] places guards under: the trust store directory.
@@ -2242,9 +2249,10 @@ fn guard_root(config: &Path) -> Option<PathBuf> {
 /// Take the writer guard of the config file at `path` ([`WriteGuard`]), waiting while another sbx
 /// holds it, after saying so.
 fn hold_for_write(path: &Path) -> Result<WriteGuard, ManageError> {
-    let Some(guard) = guard_root(path).and_then(|root| guard_path(&root, path)) else {
+    let Some(root) = guard_root(path) else {
         return Ok(WriteGuard(None));
     };
+    let guard = guard_path(&root, path);
     if let Some(file) = HELD.with_borrow(|held| held.get(&guard).and_then(std::rc::Weak::upgrade)) {
         return Ok(WriteGuard(Some(file)));
     }
@@ -4918,22 +4926,23 @@ mod tests {
         std::os::unix::fs::symlink(&project, &linked).unwrap();
         let file = project.join(".sbx.toml");
 
-        let guard = guard_path(&root, &file).expect("a UTF-8 path names a guard");
+        let guard = guard_path(&root, &file);
         assert!(
             guard.starts_with(root.join("write-locks")),
             "{}",
             guard.display()
         );
+        // A UTF-8 path keeps the key the trust marker gives it, so a guard already in place is the
+        // one an edit takes. A fixed path, only computed with, so the fixture root's name has no say.
+        let utf8 = Path::new("/nonexistent/project/.sbx.toml");
         assert_eq!(
-            guard_path(&root, &linked.join(".sbx.toml")),
-            Some(guard.clone())
+            crate::trust::marker_path(&root.join("write-locks"), utf8),
+            Some(guard_path(&root, utf8))
         );
+        assert_eq!(guard_path(&root, &linked.join(".sbx.toml")), guard);
         std::fs::create_dir(project.join("sub")).unwrap();
-        assert_eq!(
-            guard_path(&root, &project.join("sub/../.sbx.toml")),
-            Some(guard.clone())
-        );
-        assert_ne!(guard_path(&root, &project.join("other.toml")), Some(guard));
+        assert_eq!(guard_path(&root, &project.join("sub/../.sbx.toml")), guard);
+        assert_ne!(guard_path(&root, &project.join("other.toml")), guard);
     }
 
     /// A writer that still holds the outcome of its edit keeps another thread's edit of the same
@@ -4985,10 +4994,31 @@ mod tests {
     #[test]
     fn two_writers_of_one_config_file_lose_none_of_each_others_entries() {
         let tmp = crate::testutil::TmpDir::new();
-        let p = doc_at(tmp.path(), "");
+        two_writers_lose_nothing(&doc_at(tmp.path(), ""));
+    }
+
+    /// The guard holds for a config file whose directory's name is not UTF-8, which no trust marker
+    /// can name: its writers still lose none of each other's entries, and two such names that a
+    /// lossy conversion would read as one keep a guard each.
+    #[test]
+    fn a_config_file_whose_path_is_not_utf8_is_guarded_like_any_other() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = crate::testutil::TmpDir::new();
+        let dir = |byte: u8| tmp.path().join(std::ffi::OsStr::from_bytes(&[b'p', byte]));
+        let root = tmp.path().join("state");
+        assert_ne!(
+            guard_path(&root, &dir(0xff).join(".sbx.toml")),
+            guard_path(&root, &dir(0xfe).join(".sbx.toml"))
+        );
+        std::fs::create_dir(dir(0xff)).unwrap();
+        two_writers_lose_nothing(&doc_at(&dir(0xff), ""));
+    }
+
+    /// Two threads each add 25 entries to the file at `p`; every one of the 50 must be there after.
+    fn two_writers_lose_nothing(p: &Path) {
         let writers: Vec<_> = (0..2)
             .map(|w| {
-                let p = p.clone();
+                let p = p.to_path_buf();
                 std::thread::spawn(move || {
                     for i in 0..25 {
                         add(&p, "fs.deny", &format!("w{w}-{i}/")).expect("an edit");
@@ -4999,7 +5029,7 @@ mod tests {
         for writer in writers {
             writer.join().unwrap();
         }
-        let body = std::fs::read_to_string(&p).unwrap();
+        let body = std::fs::read_to_string(p).unwrap();
         let lost: Vec<String> = (0..2)
             .flat_map(|w| (0..25).map(move |i| format!("w{w}-{i}/")))
             .filter(|e| !body.contains(&format!("\"{e}\"")))
