@@ -10,11 +10,13 @@ mod common;
 use common::fixture::TmpDir;
 
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// The binary a fake release publishes. It answers `--version`, and `doctor` exits with the code
 /// `FAKE_DOCTOR_RC` asks for.
@@ -33,6 +35,11 @@ const FAKE_NOTIFY_SCRIPT: &str = "on open theFiles\nend open\n";
 
 /// The notifier's icon a fake release publishes. The script hands it to `sips`.
 const FAKE_ICON: &str = "png";
+
+/// How long one run of the script may take. Every address it fetches is a `file://` one and every
+/// tool it runs either the system's or a stand-in that returns at once, so a run takes well under a
+/// second; one still going at this bound waits on something no case set up, and is killed.
+const RUN_WITHIN: Duration = Duration::from_secs(60);
 
 /// The file a stand-in tool appends its calls to, beside it. The stand-in reaches it from its own
 /// path, so its script names no fixture path, whatever the fixture root holds.
@@ -65,6 +72,16 @@ fn put_executable(path: &Path, body: &str) {
     if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)) {
         panic!("make {} executable: {e}", path.display());
     }
+}
+
+/// Everything `pipe` carries until it closes, read on a thread of its own, as text.
+fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes)
+            .expect("read what the script wrote");
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -231,6 +248,7 @@ impl Release {
     ///
     /// `TMPDIR` names a directory of the fixture: with none set, the script's `mktemp -d` would
     /// make its working directory in the machine's `/tmp`, outside what the fixture removes.
+    #[track_caller]
     fn run(&self, script: &[u8], env: &[(&str, &str)], path_first: &[&Path]) -> Run {
         // Joined as the OS strings the directories are: `display()` would replace a byte that is not
         // UTF-8, and the stand-ins put first would then sit in a directory `PATH` does not name.
@@ -266,6 +284,9 @@ impl Release {
         for (key, value) in env {
             cmd.env(key, value);
         }
+        // A process group of its own, so that a run past its bound is killed whole: a `curl` or a
+        // stand-in the script started would outlive a `sh` killed alone, and hold the pipes.
+        cmd.process_group(0);
         let mut child = cmd.spawn().expect("spawn sh");
         child
             .stdin
@@ -273,14 +294,36 @@ impl Release {
             .expect("a piped stdin")
             .write_all(script)
             .expect("feed the script to sh");
-        let out = child.wait_with_output().expect("wait for sh");
+        // Read from the start: a script that filled a pipe nothing read would wait on it, and be
+        // taken for one that hangs.
+        let stdout = drain(child.stdout.take().expect("a piped stdout"));
+        let stderr = drain(child.stderr.take().expect("a piped stderr"));
+        let deadline = Instant::now() + RUN_WITHIN;
+        let status = loop {
+            match child.try_wait().expect("poll sh") {
+                Some(status) => break Some(status),
+                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                None => {
+                    let group = libc::pid_t::try_from(child.id()).expect("a pid is a pid_t");
+                    // SAFETY: a signal sent to the group this run made, which `sh` leads and which
+                    // still exists, since `sh` has not been reaped.
+                    unsafe { libc::kill(-group, libc::SIGKILL) };
+                    child.wait().expect("reap sh");
+                    break None;
+                }
+            }
+        };
+        let text = format!(
+            "{}{}",
+            stdout.join().expect("the stdout reader"),
+            stderr.join().expect("the stderr reader")
+        );
+        let Some(status) = status else {
+            panic!("the script did not end within {RUN_WITHIN:?}, and was killed:\n{text}");
+        };
         Run {
-            code: out.status.code(),
-            text: format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            ),
+            code: status.code(),
+            text,
         }
     }
 }
