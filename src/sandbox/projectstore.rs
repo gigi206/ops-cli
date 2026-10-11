@@ -526,6 +526,12 @@ fn seed_path(
 /// process-local, so two processes reuse temp names, and a leftover store-path temp is a
 /// *directory tree*. So it goes through the recursive `discard` (a no-op when absent), or
 /// `copy_recursive`'s exclusive `mkdir` would fail EEXIST.
+///
+/// A copy that fails part-way is discarded too, as a placement that fails is: a seed that ran out
+/// of space would otherwise leave the half-copied tree taking that space under a name no later
+/// launch reuses, until `sbx gc`. Except where the copy met an entry already at a name it creates:
+/// that entry is one the cage made, and the error says it is left for the user to see
+/// ([`already_there`]).
 fn copy_into_place(
     src: &Path,
     dir: &OwnedFd,
@@ -534,7 +540,11 @@ fn copy_into_place(
     reflink_ok: bool,
 ) -> io::Result<bool> {
     discard(dir, tmp);
-    let cloned = copy_recursive(src, dir, tmp, reflink_ok)?;
+    let cloned = copy_recursive(src, dir, tmp, reflink_ok).inspect_err(|e| {
+        if e.kind() != io::ErrorKind::AlreadyExists {
+            discard(dir, tmp);
+        }
+    })?;
     place_atomically(dir, tmp, dest)?;
     Ok(cloned)
 }
@@ -2440,6 +2450,32 @@ mod tests {
         .expect("a sealed stale temp must be cleared, not fail EEXIST");
         assert_eq!(std::fs::read(dest.join("sub/file")).unwrap(), b"content");
         assert!(!tmp.exists(), "the temp was consumed by the atomic rename");
+    }
+
+    /// A copy that fails part-way leaves no half-copied tree behind: its temporary carries a name
+    /// no later launch reuses, so nothing but `sbx gc` would ever take the space back.
+    #[test]
+    fn copy_into_place_discards_a_copy_that_failed_part_way() {
+        let base = TmpDir::new();
+        let src = base.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/file"), b"content").unwrap();
+        crate::testutil::make_fifo(&src.join("sub/fifo"));
+
+        let err = copy_into_place(
+            &src,
+            &hold(base.path()),
+            OsStr::new("dest"),
+            OsStr::new(".tmp-failed-dest"),
+            false,
+        )
+        .expect_err("a FIFO fails the copy");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            std::fs::symlink_metadata(base.join(".tmp-failed-dest")).is_err(),
+            "the half-copied temp was left behind"
+        );
+        assert!(!base.join("dest").exists(), "a failed copy was placed");
     }
 
     #[test]
