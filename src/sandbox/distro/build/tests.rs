@@ -191,7 +191,7 @@ fn a_build_cage_cannot_see_the_project() {
     let network = crate::config::NetworkPolicy::Isolated;
     let probe = vec![format!(
         "/bin/busybox ls {} > /seen 2>&1; true",
-        project.path().display()
+        crate::testutil::sh_word(project.path())
     )];
     run(
         &rootfs,
@@ -202,6 +202,12 @@ fn a_build_cage_cannot_see_the_project() {
     assert!(
         !seen.contains("SECRET"),
         "the project is visible to a build cage: {seen}"
+    );
+    // And the probe asked about the project itself: a path the shell split, or a probe that never
+    // ran, sees no `SECRET` whatever the cage shows.
+    assert!(
+        seen.contains(&*project.path().to_string_lossy()),
+        "the probe did not ask about the project: {seen}"
     );
 }
 
