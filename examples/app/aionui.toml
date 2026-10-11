@@ -44,11 +44,10 @@
 # evaluating it host-side is safe), seeded into the store, and offline-reusable after the first
 # launch.
 #
-# WHERE THE `.deb` COMES FROM, and why it is not a GitHub release. Upstream stopped attaching assets
-# to its releases after `v2.1.47-final` (2026-08-05) — the ones published since carry none at all,
-# so `deb:github:iOfficeAI/AionUi` resolves to nothing. It did not stop publishing for Linux: it
-# moved distribution to its own release store at `static.aionui.com`, which is where the vendor's
-# site sends every download and which also serves the in-app update feed (muted below). The
+# WHERE THE `.deb` COMES FROM, and why it is not a GitHub release. Upstream attaches no assets to
+# its releases after `v2.1.47-final`, so `deb:github:iOfficeAI/AionUi` resolves to nothing. It still
+# publishes for Linux, from its own release store at `static.aionui.com`, which is where the
+# vendor's site sends every download and which also serves the in-app update feed (muted below). The
 # `resolve` command at the end of this file reads the version off the release upstream tags,
 # composes that store's URL for the machine sbx runs on, and confirms the object is there before
 # handing it over, so a tagged release with no build published yet fails by name instead of pinning
