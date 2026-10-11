@@ -23,7 +23,7 @@
 
 #![allow(
     clippy::expect_used,
-    reason = "both `expect`s build a response from a status this module chose and an ASCII reason token from its own table, which is the whole of what `Response::builder` validates"
+    reason = "both `expect`s build a response from a `StatusCode` and a reason token compiled into sbx (`&'static str`: this module's literals and the shared refusal tables' `tag()`s), each a lowercase ASCII word, which is the whole of what `Response::builder` validates"
 )]
 
 use super::capture::CapBuf;
@@ -1682,7 +1682,7 @@ fn refuse_upstream(
     port: u16,
     method: &str,
     path: &str,
-    reason: &str,
+    reason: &'static str,
 ) {
     ctx.push_log(
         Proto::Https,
@@ -1718,7 +1718,7 @@ fn handshake_reason(e: &io::Error) -> &'static str {
 fn refuse(
     mut respond: h2::server::SendResponse<Bytes>,
     status: StatusCode,
-    reason: &str,
+    reason: &'static str,
 ) -> Result<(), h2::Error> {
     let resp = Response::builder()
         .status(status)
@@ -1745,7 +1745,7 @@ fn refuse(
 fn refuse_with_detail(
     mut respond: h2::server::SendResponse<Bytes>,
     status: StatusCode,
-    reason: &str,
+    reason: &'static str,
     detail: &str,
 ) -> Result<(), h2::Error> {
     let body = Bytes::from(super::refusal_body(detail));
