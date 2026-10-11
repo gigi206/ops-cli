@@ -651,6 +651,18 @@ fn resolve_existing_prefix(
 
 /// Canonicalized path string used as the marker key, or `None` when that path is not valid UTF-8.
 ///
+/// The conversion is `into_string`, not `to_string_lossy`: this string is what tells one config
+/// apart from another, and a lossy one does not — see [`marker_path`] for what that costs.
+fn canonical_string(config_path: &Path) -> Option<String> {
+    canonical_path(config_path)
+        .into_os_string()
+        .into_string()
+        .ok()
+}
+
+/// The canonical location of the config file at `config_path`, which [`canonical_string`] keys a
+/// trust marker on. Kept as a path, so a name that is not UTF-8 reaches a caller whole.
+///
 /// The **final component is never resolved**: only the directories above it are canonicalized, and
 /// the file name is re-appended verbatim. That is a security property rather than a convenience.
 /// `realpath(3)` resolves the leaf too, and the config's bytes are read through the same leaf — so
@@ -663,17 +675,13 @@ fn resolve_existing_prefix(
 /// The parent is canonicalized as far as it exists ([`canonicalize_existing_prefix`]), so `sbx
 /// trust` (file present) and a later `sbx untrust` (file deleted) still derive the same key, and a
 /// relative path still keys by its absolute location. Never panics.
-///
-/// The conversion is `into_string`, not `to_string_lossy`: this string is what tells one config
-/// apart from another, and a lossy one does not — see [`marker_path`] for what that costs.
-fn canonical_string(config_path: &Path) -> Option<String> {
-    let resolved = match (config_path.parent(), config_path.file_name()) {
+pub(crate) fn canonical_path(config_path: &Path) -> PathBuf {
+    match (config_path.parent(), config_path.file_name()) {
         (Some(parent), Some(name)) => canonicalize_existing_prefix(parent).join(name),
         // No file name to hold apart from its directory (a root, a trailing `..`): there is no leaf
         // to protect, so resolve what was given.
         _ => canonicalize_existing_prefix(config_path),
-    };
-    resolved.into_os_string().into_string().ok()
+    }
 }
 
 /// Marker file path: `store_dir/<sha256 of the canonical config-path string>`, or `None` when that
