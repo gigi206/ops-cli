@@ -69,7 +69,8 @@ chromium = "nix:chromium"
 socket *file*, `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`: never `$XDG_RUNTIME_DIR` itself,
 which holds other agents' sockets), sets `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`, and
 provisions fonts + a fontconfig so text renders. A graphical app can then map a window
-on the host compositor.
+on the host compositor. A `WAYLAND_DISPLAY` that names anything but a socket, such as `.`
+(the runtime directory itself), gets no display and a warning.
 
 The GUI hole composes with a [network allowlist](../networking/modes): a desktop
 agent can have a display *and* filtered egress at once.
