@@ -27,7 +27,7 @@
 )]
 
 use super::capture::CapBuf;
-use super::inject::{HeaderLookup, RequestFacts, pairs_for as injection_values};
+use super::inject::{CredentialSet, HeaderLookup, RequestFacts, pairs_for as injection_values};
 use super::link::{Asked, Checked};
 use super::ssrf::{ConnectRefusal, ip_refusal};
 use super::{
@@ -342,6 +342,11 @@ async fn stream(
     // configured secret value verbatim, refuse it — a secret must not leave the cage, whatever
     // the verdict. Scanned on the client's head *before* sbx's own injection is added, so it can
     // never self-trip on an injected credential (parity with the HTTP/1.1 `carries_secret`).
+    //
+    // The state read here is the stream's one credential state, carried into [`relay`] rather than
+    // read again there: the head is scanned, the credential injected and the response masked under
+    // one resolution, as on the HTTP/1.1 planes, even when a re-resolution lands while the stream
+    // waits on the supervisor below.
     let creds = ctx.credentials.snapshot();
     if !creds.needles.is_empty() && head_carries_secret(&req, &creds.needles, connect_host) {
         ctx.outcome(
@@ -409,6 +414,7 @@ async fn stream(
         connect_host,
         method.as_str(),
         &path,
+        &creds,
         ctx,
         pool,
     )
@@ -456,6 +462,7 @@ async fn relay(
     host: &str,
     method: &str,
     path: &str,
+    creds: &CredentialSet,
     ctx: &ProxyCtx,
     pool: &UpstreamPool,
 ) {
@@ -479,9 +486,6 @@ async fn relay(
         let _ = refuse(respond, StatusCode::BAD_REQUEST, "bad-request");
         return;
     };
-    // One credential state for the whole stream's relay: the injection applied below and the reflection
-    // masking decided further down must come from the same resolution.
-    let creds = ctx.credentials.snapshot();
     // Asked once for the stream, as on the HTTP/1.1 planes. It decides two things that must agree:
     // whether the response is scanned for a reflected credential, and whether the request asks for a
     // response the scan can read at all (`Accept-Encoding: identity`).
@@ -505,7 +509,7 @@ async fn relay(
     // where the HTTP/1.1 paths settle it too. Left where the injection used to sit — after the
     // allow — a refused stream would have been counted twice, once allowed and once blocked, which
     // is the same asymmetry between the plans that once made an h2 refusal invisible, inverted.
-    let injected_ids = matching_injection_ids(&creds, host, port, path);
+    let injected_ids = matching_injection_ids(creds, host, port, path);
     // What a signer asking for a body digest is told here. A stream that ended with its headers has
     // no body, and the digest of nothing is exact and free. Anything else is **stated as unheld**:
     // this plan relays DATA frames as they arrive, and an h2 request half may legitimately never end
@@ -522,7 +526,7 @@ async fn relay(
         }
     });
     let injected = match injection_values(
-        &creds,
+        creds,
         &injected_ids,
         &RequestFacts {
             method,
@@ -768,7 +772,7 @@ async fn relay(
     let (mut rparts, up_body) = resp.into_parts();
     // The h2 response's `:status` is already final, so it goes straight to the decision the two
     // HTTP/1.1 planes reach through their own status-line parse.
-    note_final_status(ctx, seq, &creds, &injected_ids, rparts.status.as_u16());
+    note_final_status(ctx, seq, creds, &injected_ids, rparts.status.as_u16());
     // Stop sharing a connection the upstream has just bound an identity to — see
     // [`binds_identity_to_the_connection`].
     if binds_identity_to_the_connection(&rparts.headers) {
@@ -3681,6 +3685,88 @@ mod tests {
             run(StatusCode::UNAUTHORIZED, "other.test:*"),
             (0, "Bearer stale".to_string()),
             "a 401 from a host sbx injects nothing into must not reach the resolver"
+        );
+    }
+
+    /// One credential state serves a whole h2 stream, as one serves a whole HTTP/1.1 exchange.
+    ///
+    /// The tripwire scans a stream's head under the state taken when the stream arrived, and the
+    /// relay read the state again after the supervisor's check. A re-resolution landing while the
+    /// stream waited on that check — a `401` on a sibling stream is the ordinary way — split one
+    /// stream across two resolutions: scanned under one, injected and masked under the other, which
+    /// is what `Credentials::snapshot` is taken once to rule out, and what the three HTTP/1.1 planes
+    /// rule out by taking theirs once.
+    ///
+    /// The supervisor's resolver installs the new state here, so it lands inside that window.
+    #[test]
+    fn a_re_resolution_during_the_supervisors_check_does_not_split_the_stream() {
+        use crate::allowlist::classify;
+        use crate::sandbox::proxy::inject::CredentialSet;
+        use crate::sandbox::proxy::{Credentials, HeaderInjection};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let bearer = |value: &str| {
+            vec![HeaderInjection::fixed(
+                classify("grpc.test:*").unwrap(),
+                "authorization".to_string(),
+                value.to_string(),
+            )]
+        };
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            1,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc(""),
+            Arc::clone(&trace),
+        );
+        let credentials = Arc::new(Credentials::new(
+            bearer("Bearer admitted"),
+            Vec::new(),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            Vec::new(),
+        ));
+        let resolved = Arc::new(AtomicUsize::new(0));
+        let (installs, count) = (Arc::clone(&credentials), Arc::clone(&resolved));
+        let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+        let ctx = ctx
+            .with_shared_credentials(Arc::clone(&credentials))
+            .with_resolver(Box::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                installs.replace(CredentialSet {
+                    injections: bearer("Bearer re-resolved"),
+                    needles: Vec::new(),
+                });
+                Ok(vec![IpAddr::from([127, 0, 0, 1])])
+            }));
+
+        let answer = through_h2_proxy(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            grpc_request(&[]),
+            None,
+            &trace,
+        );
+        assert_eq!(
+            answer.status,
+            StatusCode::OK,
+            "the stream was relayed: {}",
+            trace.render()
+        );
+        assert!(
+            resolved.load(Ordering::SeqCst) > 0,
+            "precondition: the supervisor resolved the host for this stream"
+        );
+        assert_eq!(
+            credentials.snapshot().injections[0].value(),
+            "Bearer re-resolved",
+            "precondition: the new state was installed while the stream ran"
+        );
+        let seen = trace.seen_one();
+        assert_eq!(
+            seen.header("authorization"),
+            Some("Bearer admitted"),
+            "the stream injects from the state its head was scanned under: {seen:?}"
         );
     }
 
