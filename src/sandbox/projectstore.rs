@@ -355,29 +355,17 @@ pub(crate) fn lock_project_store(
 
 /// Record the project's canonical path in a durable marker beside its store, so a later `sbx gc`
 /// can recognise this tree (`<id>` alone is a one-way hash) and reclaim it once the project
-/// directory is gone. Atomic (temp + rename) and owner-only; overwritten each launch — the path is
-/// stable, so the write is idempotent. The path is stored as raw bytes, no newline, so even a
-/// non-UTF-8 path round-trips exactly.
+/// directory is gone. Written by [`super::atomicfile::write_atomic_mode`]: atomic, owner-only from
+/// its first byte, and through a temporary created exclusively, never through a link at its name.
+/// Overwritten each launch — the path is stable, so the write is idempotent. The path is stored as
+/// raw bytes, no newline, so even a non-UTF-8 path round-trips exactly.
 pub(crate) fn write_marker(layout: &Layout, project_id: &str, canonical: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
-    let dir = project_dir(layout, project_id);
-    DirBuilder::new()
-        .recursive(true)
-        .mode(DIR_MODE)
-        .create(&dir)?;
-    let marker = dir.join(PROJECT_MARKER);
-    let tmp = dir.join(format!(".{PROJECT_MARKER}.tmp-{}", unique()));
-    let _ = fs::remove_file(&tmp);
-    fs::write(&tmp, canonical.as_os_str().as_bytes())?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    match fs::rename(&tmp, &marker) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    super::atomicfile::write_atomic_mode(
+        &project_dir(layout, project_id).join(PROJECT_MARKER),
+        canonical.as_os_str().as_bytes(),
+        Some(0o600),
+    )
 }
 
 /// Seed (or top up) `project_id`'s own store with the closure of `roots` from the
