@@ -4847,7 +4847,9 @@ fn an_override_bind_inside_the_project_is_named() {
     let project = tmp.path().join("proj");
     let inside = project.join("vendor");
     std::fs::create_dir_all(&inside).unwrap();
-    let inside = inside.to_str().unwrap();
+    let inside = inside
+        .to_str()
+        .expect("a `--bind` value is text: the CLI refuses one that is not");
 
     let mut r = resolve_no_plugins(RawConfig::default(), None);
     r.apply_override(Override::for_test(raw(&[], &[inside])), Some(&project))
