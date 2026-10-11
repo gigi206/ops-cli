@@ -1554,6 +1554,27 @@ fn a_mount_this_process_cannot_see_is_never_taken_for_one_it_can() {
     );
 }
 
+/// A cage's table may list a mount whose path is not UTF-8 — the project's own bind, under such a
+/// directory. Its ids are still read, every one of them: the line with the odd path, and the lines
+/// around it.
+#[test]
+fn a_mount_table_naming_a_path_that_is_not_utf8_still_yields_its_ids() {
+    let table = b"\
+25 30 0:22 / /proc rw,nosuid - proc proc rw
+41 30 7:60 / /home/u/caf\xe9 rw - ext4 /dev/sda2 rw
+42 41 0:23 / /tmp rw - tmpfs tmpfs rw
+";
+    assert_eq!(
+        CageMounts::ids(table),
+        Some([25, 41, 42].into_iter().collect())
+    );
+    assert_eq!(
+        CageMounts::ids(b""),
+        None,
+        "a table listing nothing answers nothing"
+    );
+}
+
 #[test]
 fn a_process_that_cannot_be_read_answers_no_rather_than_yes() {
     // The fail direction, which is the branch no host here exercises by accident. A target
