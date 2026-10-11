@@ -735,15 +735,9 @@ impl Credentials {
         self.min_len
     }
 
-    /// Which generation of the declared set is in force. Read where a pool key is built, so two
-    /// requests separated by a refresh cannot be offered one another's parked connection.
-    ///
-    /// Read *after* the snapshot the rest of the key comes from, not with it. A refresh landing
-    /// between the two builds a key whose injection positions are the older set's and whose
-    /// generation is the newer one — a key nothing else will ever match, so the connection it parks
-    /// is simply never reused. That is the conservative direction, and it is the whole of what the
-    /// gap costs; carrying the generation inside [`CredentialSet`] would remove it, at the price of
-    /// a field every construction site would have to fill.
+    /// Which generation of the declared set is in force. A pool key reads it only through
+    /// [`Self::snapshot_with_generation`]: read on its own, it can describe a set other than the one
+    /// the caller holds.
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -753,6 +747,20 @@ impl Credentials {
     /// force, for the reason given at [`Self::current`].
     pub(crate) fn snapshot(&self) -> std::sync::Arc<CredentialSet> {
         crate::sandbox::locks::read_locked(&self.current).clone()
+    }
+
+    /// [`Self::snapshot`], with the generation that set belongs to: what an exchange whose upstream
+    /// connection may be pooled takes, so that two requests separated by a refresh cannot be
+    /// offered one another's parked connection.
+    ///
+    /// Read together, under the lock [`Self::replace`] installs a set and counts it under. A pool
+    /// key is exact in injection positions, and positions are equal across a re-resolution, so a
+    /// generation read apart from the set, after a replacement had landed, is the generation every
+    /// request under the new set reads as well: the key of a request carrying the old value was the
+    /// key of every request carrying the new one, and the connection it parked was offered to them.
+    pub(crate) fn snapshot_with_generation(&self) -> (std::sync::Arc<CredentialSet>, u64) {
+        let current = crate::sandbox::locks::read_locked(&self.current);
+        (current.clone(), self.generation())
     }
 
     /// The needle set a traffic capture is masked with: every value this state has carried, not
