@@ -313,34 +313,43 @@ pub(crate) fn parse_mount(out: &str) -> Option<PathBuf> {
 
 /// Find where a device is mounted, and with which options, by reading a `mountinfo` table.
 ///
-/// Pure over the table's text so it is testable without a mount.
+/// Pure over the table's bytes so it is testable without a mount. Bytes rather than text: the
+/// kernel writes each mount point as the path it is, escaping only a blank, a tab, a newline and a
+/// backslash, so one mount anywhere on the host whose path is not UTF-8 makes the whole table one a
+/// text read refuses, and [`state`] and [`up`] propagate that refusal.
 ///
 /// The format is `id parent maj:min root mountpoint options ... - fstype source superopts`;
 /// the source after the separator is what names the device.
-pub(crate) fn mount_of(device: &str, mountinfo: &str) -> Option<(PathBuf, String)> {
-    for line in mountinfo.lines() {
+pub(crate) fn mount_of(device: &str, mountinfo: &[u8]) -> Option<(PathBuf, String)> {
+    use std::os::unix::ffi::OsStringExt as _;
+    for line in mountinfo.split(|&b| b == b'\n') {
         // A line that does not parse is skipped, never fatal: the table is the kernel's and
         // carries whatever else is mounted, so one unexpected line must not end the search
         // before the device we are looking for is reached.
-        let Some((head, tail)) = line.split_once(" - ") else {
+        let Some(at) = memchr::memmem::find(line, b" - ") else {
             continue;
         };
-        let mut fields = head.split(' ');
+        let (head, tail) = (&line[..at], &line[at + 3..]);
+        let mut fields = head.split(|&b| b == b' ');
         let (Some(mount_point), Some(options)) = (fields.nth(4), fields.next()) else {
             continue;
         };
-        let Some(source) = tail.split(' ').nth(1) else {
+        let mut tail = tail.split(|&b| b == b' ');
+        let Some(source) = tail.nth(1) else {
             continue;
         };
-        if source == device {
-            return Some((PathBuf::from(unescape_mountinfo(mount_point)), {
-                let super_opts = tail.split(' ').nth(2).unwrap_or("");
+        if source == device.as_bytes() {
+            // The options are flags the kernel spells in ASCII, read only for `noexec`.
+            let options = String::from_utf8_lossy(options);
+            let super_opts = String::from_utf8_lossy(tail.next().unwrap_or_default());
+            return Some((
+                PathBuf::from(OsString::from_vec(unescape_mountinfo(mount_point))),
                 if super_opts.is_empty() {
-                    options.to_string()
+                    options.into_owned()
                 } else {
                     format!("{options},{super_opts}")
-                }
-            }));
+                },
+            ));
         }
     }
     None
@@ -383,10 +392,9 @@ fn refuse_noexec(mount_point: PathBuf, options: &str) -> Result<PathBuf, String>
 /// Decoded through bytes rather than chars, and reassembled once at the end. Pushing each input
 /// byte as a `char` re-encoded everything above ASCII: a path under `/media/josé` came back as
 /// `/media/josÃ©`, which matches no mount point, so `state` reported a mounted volume as detached
-/// and `up` would try to mount it again. Only the escapes are ASCII; the rest of the line is UTF-8
-/// that must be carried through untouched.
-fn unescape_mountinfo(s: &str) -> String {
-    let b = s.as_bytes();
+/// and `up` would try to mount it again. Only the escapes are ASCII; every other byte of the path,
+/// UTF-8 or not, is carried through untouched.
+fn unescape_mountinfo(b: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
@@ -404,7 +412,7 @@ fn unescape_mountinfo(s: &str) -> String {
         out.push(b[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// The loop device currently backed by `image`, if any.
@@ -503,7 +511,7 @@ pub(crate) fn state(image: &Path) -> io::Result<State> {
     // function's word for "attached but not mounted" — so a read that failed would be reported as a
     // *state*, and the `noexec` guard keyed on `State::Mounted`'s options would never run. A table
     // that cannot be read is not a volume that is unmounted.
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let mountinfo = std::fs::read("/proc/self/mountinfo")?;
     match mount_of(&loop_dev, &mountinfo) {
         Some((mount_point, options)) => Ok(State::Mounted {
             loop_dev,
@@ -1382,7 +1390,7 @@ pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
     // Read errors are fatal here for the reason [`state`] states: an empty table answers `None`,
     // which is indistinguishable from "this mount is not noexec" and would wave the volume through
     // on the one call that performs the transition.
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+    let mountinfo = std::fs::read("/proc/self/mountinfo")
         .map_err(|e| format!("cannot read /proc/self/mountinfo: {e}"))?;
     if let Some((_, options)) = mount_of(&loop_dev, &mountinfo)
         && mount_is_noexec(&options)
@@ -1772,13 +1780,14 @@ mod tests {
 25 30 0:22 / /proc rw,nosuid - proc proc rw
 41 30 7:60 / /run/media/u/sbx-storage rw,nosuid,nodev - btrfs /dev/loop60 rw,compress=zstd:3,discard=async
 ";
-        let (mp, opts) = mount_of("/dev/loop60", table).expect("the device is in the table");
+        let (mp, opts) =
+            mount_of("/dev/loop60", table.as_bytes()).expect("the device is in the table");
         assert_eq!(mp, PathBuf::from("/run/media/u/sbx-storage"));
         // Both the per-mount and the superblock options matter: `noexec` is per-mount,
         // `compress` is a superblock option, and the check below reads the same string.
         assert!(opts.contains("nosuid"), "{opts}");
         assert!(opts.contains("compress=zstd:3"), "{opts}");
-        assert_eq!(mount_of("/dev/loop61", table), None);
+        assert_eq!(mount_of("/dev/loop61", table.as_bytes()), None);
     }
 
     #[test]
@@ -1804,14 +1813,14 @@ this line has no separator at all
 25 30 0:22 / /proc rw,nosuid - proc proc rw
 41 30 7:60 / /run/media/u/sbx-storage rw - btrfs /dev/loop60 rw,compress=zstd:3
 ";
-        let (mp, _) = mount_of("/dev/loop60", table).expect("found past the bad line");
+        let (mp, _) = mount_of("/dev/loop60", table.as_bytes()).expect("found past the bad line");
         assert_eq!(mp, PathBuf::from("/run/media/u/sbx-storage"));
     }
 
     #[test]
     fn a_mount_point_containing_a_space_is_unescaped() {
         let table = "41 30 7:60 / /run/media/u/my\\040vol rw - btrfs /dev/loop3 rw\n";
-        let (mp, _) = mount_of("/dev/loop3", table).expect("present");
+        let (mp, _) = mount_of("/dev/loop3", table.as_bytes()).expect("present");
         assert_eq!(mp, PathBuf::from("/run/media/u/my vol"));
     }
 
@@ -1822,16 +1831,34 @@ this line has no separator at all
     #[test]
     fn a_mount_point_outside_ascii_survives_unescaping() {
         let table = "41 30 7:60 / /run/media/josé/my\\040vol rw - btrfs /dev/loop3 rw\n";
-        let (mp, _) = mount_of("/dev/loop3", table).expect("present");
+        let (mp, _) = mount_of("/dev/loop3", table.as_bytes()).expect("present");
         assert_eq!(mp, PathBuf::from("/run/media/josé/my vol"));
         // Every escape the kernel writes, alongside the multi-byte text.
         assert_eq!(
-            unescape_mountinfo("/tmp/日本\\040a\\011b\\012c\\134d"),
-            "/tmp/日本 a\tb\nc\\d"
+            unescape_mountinfo("/tmp/日本\\040a\\011b\\012c\\134d".as_bytes()),
+            "/tmp/日本 a\tb\nc\\d".as_bytes()
         );
         // A backslash that begins no escape is a byte like any other.
-        assert_eq!(unescape_mountinfo("/tmp/a\\9b"), "/tmp/a\\9b");
-        assert_eq!(unescape_mountinfo("/tmp/trailing\\"), "/tmp/trailing\\");
+        assert_eq!(unescape_mountinfo(b"/tmp/a\\9b"), b"/tmp/a\\9b");
+        assert_eq!(unescape_mountinfo(b"/tmp/trailing\\"), b"/tmp/trailing\\");
+    }
+
+    /// A table that carries a mount whose path is not UTF-8 — someone else's, before the volume's
+    /// line, or the volume's own — is read past and read whole: the device is still found, at the
+    /// path it is mounted on.
+    #[test]
+    fn a_mount_point_that_is_not_utf8_neither_hides_the_device_nor_loses_its_path() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let table = b"\
+50 30 0:61 / /media/caf\xe9\\040usb rw - vfat /dev/sdb1 rw
+41 30 7:60 / /run/media/u/vol\xff rw,nosuid - btrfs /dev/loop60 rw,compress=zstd:3
+";
+        let (mp, opts) = mount_of("/dev/loop60", table).expect("found past the foreign mount");
+        assert_eq!(
+            mp,
+            Path::new(std::ffi::OsStr::from_bytes(b"/run/media/u/vol\xff"))
+        );
+        assert!(opts.contains("compress=zstd:3"), "{opts}");
     }
 
     /// The kernel records a backing file as *it* resolved it, while the image path is built from
