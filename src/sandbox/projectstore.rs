@@ -176,7 +176,10 @@ pub(crate) fn store_exists(layout: &Layout, project_id: &str) -> bool {
 /// (so concurrent seeds never block each other); the collector holds it **exclusive** around the
 /// whole `nix-store --gc`. Both sides call the same `flock`, so they serialise regardless of which
 /// primitive nix uses internally (`flock` and POSIX `fcntl` locks occupy separate lock spaces and
-/// do not interoperate). Dropping the guard closes the fd, releasing the lock.
+/// do not interoperate). A cage launched from inside sbx's data directory, or given a bind there,
+/// sees the file read-only and can hold it too, as it can a project's store lock
+/// ([`ProjectStoreLock`]), so a side that waits names the file rather than guessing who holds it.
+/// Dropping the guard closes the fd, releasing the lock.
 pub(crate) struct SharedGcLock(
     // Held only for its `Drop`: closing the fd is what releases the `flock`. Never read.
     #[allow(dead_code)] std::fs::File,
@@ -188,8 +191,12 @@ fn shared_gc_lock_path(layout: &Layout) -> PathBuf {
     layout.data_dir().join("store-gc.lock")
 }
 
-fn acquire_shared_gc_lock(layout: &Layout, exclusive: bool) -> io::Result<SharedGcLock> {
-    flock_at(&shared_gc_lock_path(layout), exclusive, None).map(SharedGcLock)
+fn acquire_shared_gc_lock(
+    layout: &Layout,
+    exclusive: bool,
+    waiting: &dyn Fn(&Path),
+) -> io::Result<SharedGcLock> {
+    flock_at(&shared_gc_lock_path(layout), exclusive, Some(waiting)).map(SharedGcLock)
 }
 
 /// Open the lock file `path`, creating it owner-only and its parent with it, and `flock` it shared
@@ -259,16 +266,18 @@ fn lock_op(exclusive: bool) -> libc::c_int {
 }
 
 /// Take the shared-store gc lock **shared** — for a seed's read of the shared store. Many seeds may
-/// hold it at once; only the exclusive collector blocks them.
-pub(crate) fn lock_shared(layout: &Layout) -> io::Result<SharedGcLock> {
-    acquire_shared_gc_lock(layout, false)
+/// hold it at once; only the exclusive collector blocks them, after `waiting` is given the lock
+/// file.
+pub(crate) fn lock_shared(layout: &Layout, waiting: &dyn Fn(&Path)) -> io::Result<SharedGcLock> {
+    acquire_shared_gc_lock(layout, false, waiting)
 }
 
 /// Take the shared-store gc lock **exclusive** — for the shared-store collector, around the whole
 /// gcroot prune and `nix-store --gc`. Blocks until every in-flight seed has released its shared
-/// hold, and blocks new seeds until the collection finishes.
-pub(crate) fn lock_exclusive(layout: &Layout) -> io::Result<SharedGcLock> {
-    acquire_shared_gc_lock(layout, true)
+/// hold, after `waiting` is given the lock file, and blocks new seeds until the collection
+/// finishes.
+pub(crate) fn lock_exclusive(layout: &Layout, waiting: &dyn Fn(&Path)) -> io::Result<SharedGcLock> {
+    acquire_shared_gc_lock(layout, true, waiting)
 }
 
 /// An advisory lock on one project's store, between the sbx runs that use it: a launch of the
@@ -417,7 +426,13 @@ pub(crate) fn prepare(
     // mid-copy — and leave this store with paths registered but truncated. Held shared, so
     // concurrent same-project (and cross-project) seeds never block each other; only the exclusive
     // collector does. Released when `_shared` drops at the end of this function.
-    let _shared = lock_shared(layout)?;
+    let _shared = lock_shared(layout, &|lock| {
+        crate::diag::note(&format!(
+            "waiting for the shared store's lock `{}`, which `sbx gc` takes while it collects the \
+             shared store",
+            lock.display()
+        ))
+    })?;
     let shared_store = layout.store_dir();
     let closure = closure_of(engine.nix_store, &shared_store, roots)?;
 
@@ -1695,6 +1710,9 @@ mod tests {
         );
     }
 
+    /// The collector's exclusive hold waits for a seed's shared one, and says so with the lock
+    /// file: a cage that sees the data directory can hold that file too, and a wait that names
+    /// nothing leaves the user guessing what holds it.
     #[test]
     fn shared_gc_lock_serialises_a_shared_hold_against_an_exclusive_acquire() {
         use std::sync::mpsc;
@@ -1703,21 +1721,28 @@ mod tests {
         let layout = Layout::under(data.path());
 
         // hold the lock shared (as a seed does)
-        let held = lock_shared(&layout).unwrap();
+        let held = lock_shared(&layout, &|_| panic!("nothing else holds it")).unwrap();
 
         // a second actor's exclusive acquire (as the collector does) must block while the shared
         // hold is live, then proceed once it is released.
+        let (said, waiting) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
         let path = data.path().to_path_buf();
         let handle = std::thread::spawn(move || {
             let layout = Layout::under(&path);
-            let guard = lock_exclusive(&layout).unwrap();
+            let guard =
+                lock_exclusive(&layout, &|lock| said.send(lock.to_path_buf()).unwrap()).unwrap();
             tx.send(()).unwrap();
             // hold briefly so the release is observable, then drop
             std::thread::sleep(Duration::from_millis(50));
             drop(guard);
         });
 
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).ok(),
+            Some(shared_gc_lock_path(&layout)),
+            "the collector did not name the lock it waits for"
+        );
         assert!(
             rx.recv_timeout(Duration::from_millis(300)).is_err(),
             "the exclusive acquire completed while a shared hold was live — the guard released \
@@ -1729,6 +1754,43 @@ mod tests {
             "the exclusive acquire did not proceed after the shared hold was released"
         );
         handle.join().unwrap();
+    }
+
+    /// And a seed waits for a collection of the shared store, naming the lock file the same way.
+    #[test]
+    fn a_seed_waits_for_the_shared_store_collection_and_says_so() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let gc = lock_exclusive(&layout, &|_| panic!("nothing else holds it")).unwrap();
+
+        let (said, waiting) = mpsc::channel();
+        let (got, granted) = mpsc::channel();
+        let path = data.path().to_path_buf();
+        let seed = std::thread::spawn(move || {
+            let layout = Layout::under(&path);
+            let lock =
+                lock_shared(&layout, &|lock| said.send(lock.to_path_buf()).unwrap()).unwrap();
+            got.send(()).unwrap();
+            drop(lock);
+        });
+
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).ok(),
+            Some(shared_gc_lock_path(&layout)),
+            "the seed did not name the lock it waits for"
+        );
+        assert!(
+            granted.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the seed went on while the collection held the lock"
+        );
+        drop(gc);
+        assert!(
+            granted.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the seed did not go on once the collection let go"
+        );
+        seed.join().unwrap();
     }
 
     #[test]

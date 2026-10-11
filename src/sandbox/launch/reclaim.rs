@@ -198,7 +198,13 @@ pub(in crate::sandbox) fn shared_store_gc(
 
     // Exclusive across the whole prune + `nix-store --gc`: it waits for in-flight seeds to release
     // their shared hold, and blocks new seeds until the collection finishes.
-    let _lock = match crate::sandbox::projectstore::lock_exclusive(layout) {
+    let _lock = match crate::sandbox::projectstore::lock_exclusive(layout, &|lock| {
+        crate::diag::note(&format!(
+            "waiting for the shared store's lock `{}`, which a launch holds while it copies from \
+             the shared store into its project's",
+            lock.display()
+        ))
+    }) {
         Ok(guard) => guard,
         Err(e) => {
             crate::diag::error(&format!(
