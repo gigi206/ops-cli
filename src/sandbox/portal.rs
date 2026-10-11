@@ -242,15 +242,22 @@ pub(super) const BUS_MESSAGE_MAX: usize = 4 << 20;
 /// The private session-bus configuration: listen on the cage-tmpfs socket, activate the portal
 /// services from the two portal packages' `share/dbus-1/services`, default-allow (every peer on
 /// this bus is the same uid inside the same cage — one trust domain), and refuse a message over
-/// [`BUS_MESSAGE_MAX`]. Every interpolated value is an sbx-controlled store path, a constant or a
-/// fixed literal, so the document carries nothing to escape. Pure.
+/// [`BUS_MESSAGE_MAX`]. Pure.
+///
+/// The socket is written as a D-Bus address, which escapes every byte the address grammar reserves:
+/// `dbus-daemon` refuses a space or a quote there, and decodes a `%`. The service directories are
+/// written as XML text, with `&`, `<` and `>` escaped. XML holds UTF-8 only, so a directory whose
+/// name is not UTF-8 is written with U+FFFD in place of its invalid bytes, which names another
+/// directory. The launch passes a constant and two store paths, which hold none of these bytes.
 pub(super) fn session_conf(sock: &str, xdp_root: &Path, gtk_root: &Path) -> String {
+    use zbus::address::transport::{Transport, Unix, UnixSocket};
+    let listen = Transport::Unix(Unix::new(UnixSocket::File(PathBuf::from(sock))));
     format!(
         "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" \
          \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n\
          <busconfig>\n\
          \x20 <type>session</type>\n\
-         \x20 <listen>unix:path={sock}</listen>\n\
+         \x20 <listen>{listen}</listen>\n\
          \x20 <servicedir>{xdp}/share/dbus-1/services</servicedir>\n\
          \x20 <servicedir>{gtk}/share/dbus-1/services</servicedir>\n\
          \x20 <policy context=\"default\">\n\
@@ -260,9 +267,23 @@ pub(super) fn session_conf(sock: &str, xdp_root: &Path, gtk_root: &Path) -> Stri
          \x20 </policy>\n\
          \x20 <limit name=\"max_message_size\">{BUS_MESSAGE_MAX}</limit>\n\
          </busconfig>\n",
-        xdp = xdp_root.display(),
-        gtk = gtk_root.display(),
+        xdp = xml_text(&xdp_root.display().to_string()),
+        gtk = xml_text(&gtk_root.display().to_string()),
     )
+}
+
+/// `text` as XML character data: `&`, `<` and `>` escaped, every other character as it is.
+fn xml_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The portal front-end's backend selection: prefer the GTK backend for every interface. This is
@@ -462,6 +483,30 @@ mod tests {
         // well-formed enough to be a single busconfig document
         assert!(conf.trim_start().starts_with("<!DOCTYPE busconfig"));
         assert!(conf.trim_end().ends_with("</busconfig>"));
+    }
+
+    /// The socket is written as a D-Bus address and each service directory as XML text, so a byte
+    /// either grammar reserves reaches `dbus-daemon` as itself: unescaped, a space or a quote makes
+    /// the daemon refuse the address, and a `%` names another path once decoded.
+    #[test]
+    fn session_conf_escapes_the_socket_as_an_address_and_the_servicedirs_as_xml() {
+        let conf = session_conf(
+            "/r/a b/\"q\"/%41/x&y/bus",
+            Path::new("/s/x&y<z>"),
+            Path::new("/s/plain"),
+        );
+        assert!(
+            conf.contains("<listen>unix:path=/r/a%20b/%22q%22/%2541/x%26y/bus</listen>"),
+            "{conf}"
+        );
+        assert!(
+            conf.contains("<servicedir>/s/x&amp;y&lt;z&gt;/share/dbus-1/services</servicedir>"),
+            "{conf}"
+        );
+        assert!(
+            conf.contains("<servicedir>/s/plain/share/dbus-1/services</servicedir>"),
+            "{conf}"
+        );
     }
 
     #[test]
