@@ -1547,23 +1547,10 @@ struct ItemDoc {
 /// `#[test]` or `#[cfg(test)]`. Files named `tests.rs` / `*_tests.rs` are skipped whole, being
 /// test-only modules.
 fn module_level_items() -> Vec<ItemDoc> {
-    let item = regex::Regex::new(
-        r#"^(?:pub(?:\([a-z(): ]+\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?(?:fn|struct|enum|trait|union)\s+([A-Za-z_][A-Za-z0-9_]*)"#,
-    )
-    .expect("the item pattern compiles");
-    let trait_impl = regex::Regex::new(r"^\s*impl(?:<[^>]*>)?\s+.*\s+for\s+")
-        .expect("the impl pattern compiles");
-    let mod_tests = regex::Regex::new(r"^\s*(?:#\[cfg\(test\)\]\s*)?mod\s+tests\s*\{")
-        .expect("the tests pattern compiles");
-
+    let patterns = ItemPatterns::new();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let paths = crate::testutil::crate_sources();
-
-    let is_attr = |l: &str| l.trim_start().starts_with("#[") || l.trim_start().starts_with("#![");
-    let is_doc = |l: &str| l.trim_start().starts_with("///");
-
     let mut out = Vec::new();
-    for path in paths {
+    for path in crate::testutil::crate_sources() {
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -1576,45 +1563,107 @@ fn module_level_items() -> Vec<ItemDoc> {
             .unwrap_or(&path)
             .display()
             .to_string();
-        let Some(text) = crate::testutil::read_listed(&path) else {
-            continue;
-        };
-        let lines: Vec<&str> = text.lines().collect();
-        let mut depth: i32 = 0;
-        let mut skip: Vec<i32> = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if (trait_impl.is_match(line) && line.trim_end().ends_with('{'))
-                || mod_tests.is_match(line)
-            {
-                skip.push(depth);
-            }
-            if skip.is_empty()
-                && !line.starts_with([' ', '\t'])
-                && let Some(caps) = item.captures(line)
-            {
-                let mut j = i;
-                let mut in_test = false;
-                while j > 0 && is_attr(lines[j - 1]) {
-                    if lines[j - 1].contains("#[test") || lines[j - 1].contains("#[cfg(test)") {
-                        in_test = true;
-                    }
-                    j -= 1;
+        if let Some(text) = crate::testutil::read_listed(&path) {
+            out.extend(items_in(&text, &rel, &patterns));
+        }
+    }
+    out
+}
+
+/// The three line shapes [`items_in`] reads: an item declaration, the head of an
+/// `impl Trait for Type` block, and the head of a `mod tests` block.
+struct ItemPatterns {
+    item: regex::Regex,
+    trait_impl: regex::Regex,
+    mod_tests: regex::Regex,
+}
+
+impl ItemPatterns {
+    fn new() -> Self {
+        Self {
+            item: regex::Regex::new(
+                r#"^(?:pub(?:\([a-z(): ]+\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?(?:fn|struct|enum|trait|union)\s+([A-Za-z_][A-Za-z0-9_]*)"#,
+            )
+            .expect("the item pattern compiles"),
+            trait_impl: regex::Regex::new(r"^\s*impl(?:<[^>]*>)?\s+.*\s+for\s+")
+                .expect("the impl pattern compiles"),
+            mod_tests: regex::Regex::new(r"^\s*(?:#\[cfg\(test\)\]\s*)?mod\s+tests\s*\{")
+                .expect("the tests pattern compiles"),
+        }
+    }
+}
+
+/// The module-level items of one source file, `text`, named for `file`, as
+/// [`module_level_items`] describes.
+fn items_in(text: &str, file: &str, patterns: &ItemPatterns) -> Vec<ItemDoc> {
+    let is_attr = |l: &str| l.trim_start().starts_with("#[") || l.trim_start().starts_with("#![");
+    let is_doc = |l: &str| l.trim_start().starts_with("///");
+    let lines: Vec<&str> = text.lines().collect();
+    let starts: Vec<usize> = text
+        .split_inclusive('\n')
+        .scan(0, |at, line| {
+            let start = *at;
+            *at += line.len();
+            Some(start)
+        })
+        .collect();
+    let mut out = Vec::new();
+    // The last line of the region being skipped. Its end is the brace that closes the one the
+    // region opens with, counting only the braces that are code: one in a string, such as the
+    // `{{` a `Display` impl writes, would otherwise hold the region open past its end and pass over
+    // every item after it.
+    let mut skip_until: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if skip_until.is_some_and(|end| i > end) {
+            skip_until = None;
+        }
+        if skip_until.is_none()
+            && ((patterns.trait_impl.is_match(line) && line.trim_end().ends_with('{'))
+                || patterns.mod_tests.is_match(line))
+        {
+            let open = starts[i] + line.rfind('{').unwrap_or(0);
+            skip_until = Some(
+                crate::testutil::closing_brace(text.as_bytes(), open)
+                    .map_or(lines.len(), |at| starts.partition_point(|&s| s <= at) - 1),
+            );
+        }
+        if skip_until.is_none()
+            && !line.starts_with([' ', '\t'])
+            && let Some(caps) = patterns.item.captures(line)
+        {
+            let mut j = i;
+            let mut in_test = false;
+            while j > 0 && is_attr(lines[j - 1]) {
+                if lines[j - 1].contains("#[test") || lines[j - 1].contains("#[cfg(test)") {
+                    in_test = true;
                 }
-                if !in_test {
-                    out.push(ItemDoc {
-                        file: rel.clone(),
-                        name: caps[1].to_string(),
-                        documented: j > 0 && is_doc(lines[j - 1]),
-                    });
-                }
+                j -= 1;
             }
-            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
-            while skip.last().is_some_and(|d| depth <= *d) {
-                skip.pop();
+            if !in_test {
+                out.push(ItemDoc {
+                    file: file.to_string(),
+                    name: caps[1].to_string(),
+                    documented: j > 0 && is_doc(lines[j - 1]),
+                });
             }
         }
     }
     out
+}
+
+/// A skipped region ends at the brace that closes it, whatever braces the strings inside it hold,
+/// and the items after it are read.
+#[test]
+fn a_brace_in_a_string_does_not_hold_a_skipped_region_open() {
+    let text = "impl std::fmt::Display for X {\n    fn fmt(&self, f: &mut Formatter) -> Result {\n        f.write_str(\"{{\")\n    }\n}\nfn after() {}\n/// Documented.\nfn kept() {}\n";
+    let names: Vec<(String, bool)> = items_in(text, "x.rs", &ItemPatterns::new())
+        .into_iter()
+        .map(|it| (it.name, it.documented))
+        .collect();
+    assert_eq!(
+        names,
+        [("after".to_string(), false), ("kept".to_string(), true)]
+    );
 }
 
 /// Every module-level item carries a doc comment, or is a named pre-existing gap.
