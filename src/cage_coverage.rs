@@ -242,6 +242,11 @@ fn walk_sources_with_paths() -> Vec<(PathBuf, String)> {
 }
 
 /// Every file under `dir`, at any depth, whose extension is one of `extensions`.
+///
+/// A directory is told by the entry's own type, which a link does not take from what it names, so a
+/// link to a directory is not descended: one pointing back up the tree would otherwise send the walk
+/// round it, listing each file once per turn until the kernel refuses the path, and two such links
+/// double that at every turn.
 fn files_under(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -249,7 +254,7 @@ fn files_under(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             out.extend(files_under(&path, extensions));
         } else if path
             .extension()
@@ -260,6 +265,23 @@ fn files_under(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// A link back up the tree is not followed: the walk lists each file once and ends.
+#[test]
+fn the_walk_does_not_follow_a_link_back_up_the_tree() {
+    let tmp = crate::testutil::TmpDir::new();
+    std::fs::write(tmp.join("f.rs"), "").unwrap();
+    for name in ["up", "again"] {
+        std::os::unix::fs::symlink(".", tmp.join(name)).unwrap();
+    }
+    let dir = tmp.path().to_path_buf();
+    let found = crate::testutil::returns_within(
+        std::time::Duration::from_secs(15),
+        "a walk of a tree with two links back up it",
+        move || files_under(&dir, &["rs"]),
+    );
+    assert_eq!(found, [tmp.join("f.rs")]);
 }
 
 #[test]
