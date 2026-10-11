@@ -13,7 +13,9 @@ See also: [`sbx gc`](../cli/gc) · [`sbx store`](../cli/store) · [`sbx projects
 ## Dry run by default
 
 Reclamation is **irreversible**, so `sbx gc` is a **dry run by default**: it lists what
-*would* be reclaimed and touches nothing. Pass `--prune` to actually reclaim:
+*would* be reclaimed, and removes nothing from a store but what nix removes on any collection
+(see [`sbx gc`](../cli/gc#when-the-store-holds-an-entry-nix-did-not-make)). Pass `--prune` to
+actually reclaim:
 
 ```sh
 sbx gc                    # dry run: what this project's store would reclaim
