@@ -337,10 +337,7 @@ fn a_longer_key_does_not_show_the_field_it_ends_with() {
 fn every_root_config_field_has_a_row_in_the_field_map() {
     let page = std::fs::read_to_string(guide().join("configuration/index.md"))
         .expect("docs-site/docs/guide/configuration/index.md must exist");
-    let map = page
-        .split_once("## The fields")
-        .and_then(|(_, rest)| rest.split_once("\n## "))
-        .map(|(map, _)| map.to_string())
+    let map = section_of(&page, "## The fields")
         .expect("the configuration overview must carry a `## The fields` map");
 
     let missing: Vec<String> = schema_fields()
@@ -615,6 +612,40 @@ fn every_named_table_example_uses_real_keys() {
         "these worked examples name keys the schema has no field for, so a reader who copies one \
          gets a declaration that parses and does nothing: {offenders:?}"
     );
+}
+
+/// The body of the section a heading line opens on a guide page: from the line after `heading`
+/// (the whole line, `### Scope`) to the next heading of its level or above, or to the end of the
+/// page; `None` when the page has no such line. A check confined to a section reads nothing past
+/// it, so a mention further down the page cannot satisfy it.
+fn section_of<'a>(page: &'a str, heading: &str) -> Option<&'a str> {
+    let level = heading.len() - heading.trim_start_matches('#').len();
+    let (_, body) = page.split_once(&format!("\n{heading}\n"))?;
+    let mut at = 0usize;
+    for line in body.split_inclusive('\n') {
+        let hashes = line.len() - line.trim_start_matches('#').len();
+        if (2..=level).contains(&hashes) && line[hashes..].starts_with(' ') {
+            return Some(&body[..at.saturating_sub(1)]);
+        }
+        at += line.len();
+    }
+    Some(body)
+}
+
+/// A section ends at the next heading of its level or above, and holds the deeper ones.
+#[test]
+fn a_section_ends_at_the_next_heading_of_its_level() {
+    let page = "# Page\n## A\nx\n### Scope\nin\n##no-space\n#### Deeper\nkept\n## B\nout\n";
+    assert_eq!(
+        section_of(page, "### Scope"),
+        Some("in\n##no-space\n#### Deeper\nkept")
+    );
+    assert_eq!(
+        section_of(page, "## A"),
+        Some("x\n### Scope\nin\n##no-space\n#### Deeper\nkept")
+    );
+    assert_eq!(section_of(page, "## B"), Some("out\n"));
+    assert_eq!(section_of(page, "### Missing"), None);
 }
 
 /// Every fenced `toml` block of a page, as its own string. The opening fence is `toml` as its
@@ -905,10 +936,8 @@ fn the_app_subcommand_enumeration_is_the_real_set_in_both_places() {
 fn every_unwatched_tree_is_named_in_the_file_feed_page() {
     let page = std::fs::read_to_string(guide().join("cli/fs.md"))
         .expect("docs-site/docs/guide/cli/fs.md must exist");
-    let scope = page
-        .split_once("\n### Scope\n")
-        .expect("the page must keep a `### Scope` section stating what is not watched")
-        .1;
+    let scope = section_of(&page, "### Scope")
+        .expect("the page must keep a `### Scope` section stating what is not watched");
     let missing: Vec<&str> = crate::sandbox::fs_watch::IGNORED_COMPONENTS
         .iter()
         .copied()
@@ -1000,10 +1029,8 @@ fn every_refusal_category_the_proxy_documents_is_named_in_the_guide() {
 
     let page = std::fs::read_to_string(guide().join("networking/architecture.md"))
         .expect("docs-site/docs/guide/networking/architecture.md must exist");
-    let list = page
-        .split_once("\n## Refusal reasons\n")
-        .expect("the page must keep a `## Refusal reasons` section")
-        .1;
+    let list = section_of(&page, "## Refusal reasons")
+        .expect("the page must keep a `## Refusal reasons` section");
     let missing: Vec<&String> = categories
         .iter()
         .filter(|token| !list.contains(&format!("`{token}`")))
@@ -1035,14 +1062,9 @@ fn every_refusal_category_the_proxy_documents_is_named_in_the_guide() {
 fn every_source_path_the_trusted_computing_base_cites_exists() {
     let page = std::fs::read_to_string(guide().join("concepts/architecture.md"))
         .expect("docs-site/docs/guide/concepts/architecture.md must exist");
-    let section = page
-        .split_once("\n## The trusted computing base\n")
-        .expect("the page must keep a `## The trusted computing base` section")
-        .1;
     // The section runs to the next heading of its own level; its `### ` tables stay inside it.
-    let section = section
-        .split_once("\n## ")
-        .map_or(section, |(inside, _)| inside);
+    let section = section_of(&page, "## The trusted computing base")
+        .expect("the page must keep a `## The trusted computing base` section");
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let (mut cited, mut missing, mut unanchored) = (0, Vec::new(), Vec::new());
