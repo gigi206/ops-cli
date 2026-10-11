@@ -279,8 +279,10 @@ fn running_the_equip_script_gives_mise_the_pinned_dir_and_the_command_the_ambien
     for (pin, expected_mise) in [(Some(pinned.as_str()), pinned.as_str()), (None, ambient)] {
         let record = dir.path().join("record");
         let _ = std::fs::remove_file(&record);
+        // `mise` is named from the fixture the script runs in, the way a launch names a store path:
+        // the fixture root never enters the script.
         let argv = wrap_mise_equip(
-            &mise,
+            Path::new("./mise"),
             &bash,
             "use -g",
             &tokens,
@@ -289,6 +291,7 @@ fn running_the_equip_script_gives_mise_the_pinned_dir_and_the_command_the_ambien
         );
         let out = std::process::Command::new(&argv[0])
             .args(&argv[1..])
+            .current_dir(dir.path())
             .env("SBX_TEST_RECORD", &record)
             .env("MISE_DATA_DIR", ambient)
             .output()
@@ -366,11 +369,13 @@ fn running_the_equip_script_reinstalls_a_pipx_tool_whose_python_is_gone() {
         "aqua:example/demo-tool".to_string(),
     ];
 
-    for pin in [Some(pool.to_str().unwrap()), None] {
+    // `mise` and the pinned pool are named from the fixture the script runs in, as a launch names a
+    // store path and a constant: the fixture root never enters the script.
+    for pin in [Some("pool"), None] {
         let record = dir.path().join("record");
         let _ = std::fs::remove_file(&record);
         let argv = wrap_mise_equip(
-            &mise,
+            Path::new("./mise"),
             &bash,
             "use -g --pin",
             &tokens,
@@ -379,6 +384,7 @@ fn running_the_equip_script_reinstalls_a_pipx_tool_whose_python_is_gone() {
         );
         let out = std::process::Command::new(&argv[0])
             .args(&argv[1..])
+            .current_dir(dir.path())
             .env("SBX_TEST_RECORD", &record)
             .env("MISE_DATA_DIR", &pool)
             .output()
