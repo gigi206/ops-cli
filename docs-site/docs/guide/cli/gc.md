@@ -10,7 +10,8 @@ sbx gc [--all] [--prune] [--optimise|--optimize]
 
 Reclaim `sbx`'s nix store space. By default it sweeps the **current project's**
 store. Reclamation is irreversible, so the destructive form is opt-in: without
-`--prune` it is a **dry run**, which removes only what nix removes on any collection (see
+`--prune` it is a **dry run**, which removes nothing from a store but what nix removes on any
+collection (see
 [When the store holds an entry nix did not make](#when-the-store-holds-an-entry-nix-did-not-make)).
 
 | Option | Meaning |
