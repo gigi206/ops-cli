@@ -2026,10 +2026,7 @@ pub(super) const PAGES: &[Page] = &[
                 "also collect the shared store across every project (orphaned closures), and\n\
                  sweep the runtime files of launches that are gone",
             ),
-            (
-                "--prune",
-                "actually reclaim (default is a dry run that touches nothing)",
-            ),
+            ("--prune", "actually reclaim (default is a dry run)"),
             (
                 "--optimise, --optimize",
                 "deduplicate the store afterwards: replace identical files by hardlinks to one\n\
