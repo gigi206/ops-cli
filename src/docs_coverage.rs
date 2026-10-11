@@ -35,10 +35,7 @@ fn guide() -> PathBuf {
 fn guide_pages() -> Vec<(PathBuf, String)> {
     crate::testutil::files_under(&guide(), &["md"])
         .into_iter()
-        .map(|path| {
-            let text = std::fs::read_to_string(&path).unwrap_or_default();
-            (path, text)
-        })
+        .filter_map(|path| Some((path.clone(), crate::testutil::read_listed(&path)?)))
         .collect()
 }
 
@@ -1074,8 +1071,10 @@ const QUOTED_WINDOW: usize = 12;
 fn rust_sources() -> String {
     let mut out = String::new();
     for path in crate::testutil::crate_sources() {
-        out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
-        out.push('\n');
+        if let Some(text) = crate::testutil::read_listed(&path) {
+            out.push_str(&text);
+            out.push('\n');
+        }
     }
     out
 }
@@ -1227,7 +1226,9 @@ fn no_message_literal_runs_its_indentation_through_a_sentence() {
     let manifest = format!("{}/", env!("CARGO_MANIFEST_DIR"));
     let mut offenders = Vec::new();
     for path in paths {
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let Some(text) = crate::testutil::read_listed(&path) else {
+            continue;
+        };
         for (n, line) in text.lines().enumerate() {
             if line.trim_start().starts_with("//") {
                 continue;
@@ -1383,7 +1384,9 @@ fn module_level_items() -> Vec<ItemDoc> {
             .unwrap_or(&path)
             .display()
             .to_string();
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let Some(text) = crate::testutil::read_listed(&path) else {
+            continue;
+        };
         let lines: Vec<&str> = text.lines().collect();
         let mut depth: i32 = 0;
         let mut skip: Vec<i32> = Vec::new();
@@ -1493,10 +1496,9 @@ fn crate_and_test_sources() -> Vec<(String, String)> {
     paths.sort();
     paths
         .into_iter()
-        .map(|p| {
+        .filter_map(|p| {
             let rel = p.strip_prefix(root).unwrap_or(&p).display().to_string();
-            let text = std::fs::read_to_string(&p).unwrap_or_default();
-            (rel, text)
+            Some((rel, crate::testutil::read_listed(&p)?))
         })
         .collect()
 }
