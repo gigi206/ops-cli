@@ -61,7 +61,9 @@ ones instead:
 Those two go together or not at all, and that is the point worth knowing. Under WSL `libcuda.so.1`
 is a stub that reaches the real driver through the driver store, so a cage holding the node and the
 stub alone enumerates no device, and a cage holding the store without the node has no device to
-enumerate. Either way a CUDA workload initializes against nothing. sbx grants them as one answer.
+enumerate. Either way a CUDA workload initializes against nothing. sbx grants them as one answer,
+and only beside the bridge libraries of the first item: without those, nothing in the cage could
+load what drives the node.
 
 `/dev/dxg` is granted on the same terms as a render node and not on a `card*` primary node's: it
 carries no modesetting and no display, because a WSL desktop reaches its screen over RDP and never
