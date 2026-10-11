@@ -2743,18 +2743,24 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
             .replace(GST_SEARCH_PATH, "/gst")
             .replace(GIO_SEARCH_PATH, "/gio")
             .replace(XDG_DATA_SEARCH_PATH, "/share");
-        let script = format!(
-            "set -e\nout={}\nmakeWrapper() {{ echo \"WRAPPED $1\"; }}\n{snippet}\n",
-            tree.display()
-        );
+        // `$out` is `.`, and the snippet runs from the tree. The snippet expands `$out` unquoted,
+        // which the store path a build is given makes safe, since it holds no blank and no quote; a
+        // fixture root may hold either, and `.` holds neither wherever the tree sits. `find` then
+        // names what it finds below `.`, while `readlink -f` names its answer absolutely, so a
+        // wrapped `./` is read back as the tree's own path and the expectations name the tree.
+        std::fs::create_dir_all(tree).unwrap();
+        let script =
+            format!("set -e\nout=.\nmakeWrapper() {{ echo \"WRAPPED $1\"; }}\n{snippet}\n");
         // Under the builder's own `set -eo pipefail`, so the count's cut-off producer is covered.
         let out = std::process::Command::new("bash")
             .arg("-c")
             .arg(&script)
+            .current_dir(tree)
             .output()
             .expect("bash runs");
         if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            let wrapped = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Ok(wrapped.replace("WRAPPED ./", &format!("WRAPPED {}/", tree.display())))
         } else {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
         }
