@@ -108,8 +108,10 @@ pub(super) fn serve_tunneled_request(
     let _ = br.get_ref().sock.set_read_timeout(Some(ctx.timeout));
     // One credential state for the whole request: taken once here so the value injected and the
     // needle scanned for can never come from two different resolutions, even if a refresh lands
-    // mid-request. The next request on this tunnel takes its own, as a later connection would.
-    let creds = ctx.credentials.snapshot();
+    // mid-request. The next request on this tunnel takes its own, as a later connection would. The
+    // pool key's generation is read with it, for the reason
+    // [`Credentials::snapshot_with_generation`](super::Credentials::snapshot_with_generation) gives.
+    let (creds, generation) = ctx.credentials.snapshot_with_generation();
 
     // 4. Read this request's head (on the first turn that also drives the handshake to completion,
     //    so the SNI is known afterwards); keep the SAME buffered reader for the body.
@@ -505,14 +507,7 @@ pub(super) fn serve_tunneled_request(
     //     secret is only ever offered to a request that receives the same secret.
     let keep_alive =
         ctx.pool.is_some() && !ws_upgrade && request_line_is_http11(&inner.request_line);
-    let pool_key = keep_alive.then(|| {
-        PoolKey::new(
-            connect_host,
-            port,
-            &injected_ids,
-            ctx.credentials.generation(),
-        )
-    });
+    let pool_key = keep_alive.then(|| PoolKey::new(connect_host, port, &injected_ids, generation));
     // Taking a parked connection is limited to a request the proxy can send a second time, because a
     // connection the upstream closed while it was parked only shows up after the write. That means a
     // request with no body, a chunked one whose body the de-chunker buffers before forwarding, or one
