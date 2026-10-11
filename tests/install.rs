@@ -701,8 +701,10 @@ fn on_macos_without_lima_or_with_a_bad_projects_directory_nothing_is_installed()
             run.text
         );
         assert!(!fx.installed().exists(), "{bad:?}");
+        // Asked at each value: the log only grows, so the first value that reached `limactl` is
+        // the one named.
+        assert!(fx.lima_calls().is_empty(), "{bad:?}: {:?}", fx.lima_calls());
     }
-    assert!(fx.lima_calls().is_empty(), "{:?}", fx.lima_calls());
 }
 
 #[test]
