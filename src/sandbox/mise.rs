@@ -519,7 +519,10 @@ mod tests {
         let fake = dir.path().join("fake-bwrap");
         std::fs::write(
             &fake,
-            format!("#!/bin/sh\ncat /proc/self/cgroup > '{}'\n", seen.display()),
+            format!(
+                "#!/bin/sh\ncat /proc/self/cgroup > {}\n",
+                crate::testutil::sh_word(&seen)
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
