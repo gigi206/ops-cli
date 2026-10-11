@@ -1092,8 +1092,11 @@ mod tests {
     /// one, where a session's belongs — is refused before anything is written to it.
     #[test]
     fn a_control_socket_served_from_another_pid_namespace_is_refused() {
-        const SERVE: &str = "import socket,sys\n\
-            s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(4)\n\
+        // The socket's path reaches the listener as bytes in its environment: the host's `unshare`
+        // may refuse an argument that is not UTF-8, which the fixture root can make it, and a
+        // working directory under that root can stop the `python3` a host resolves.
+        const SERVE: &str = "import os,socket\n\
+            s=socket.socket(socket.AF_UNIX); s.bind(os.environb[b'SBX_TEST_SOCKET']); s.listen(4)\n\
             while True:\n    c,_=s.accept(); c.sendall(b'ok\\n'); c.close()\n";
         let data = crate::testutil::TmpDir::new();
         let socket = data.path().join("control-1.sock");
@@ -1107,7 +1110,7 @@ mod tests {
                 "-c",
                 SERVE,
             ])
-            .arg(&socket)
+            .env("SBX_TEST_SOCKET", &socket)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
