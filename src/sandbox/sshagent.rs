@@ -1715,9 +1715,8 @@ mod tests {
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\nprintf '%s' \"$1\" >> {}\nprintf '|%s|' \"$SSH_ASKPASS_PROMPT\" >> {}\nexit {exit}\n",
-                log.display(),
-                log.display()
+                "#!/bin/sh\nprintf '%s' \"$1\" >> {0}\nprintf '|%s|' \"$SSH_ASKPASS_PROMPT\" >> {0}\nexit {exit}\n",
+                crate::testutil::sh_word(&log)
             ),
         )
         .expect("the helper is writable");
