@@ -1472,7 +1472,7 @@ impl KiroStep {
             Writer::States => (
                 format!(
                     "printf '{{\"telemetry.enabled\": false}}\\n' > {}\n",
-                    self.settings.display()
+                    crate::testutil::sh_word(&self.settings)
                 ),
                 0,
             ),
@@ -1485,7 +1485,7 @@ impl KiroStep {
             format!(
                 "#!{}\nprintf '%s\\n' \"$*\" >> {}\n{states}exit {code}\n",
                 self.bash.display(),
-                self.called.display()
+                crate::testutil::sh_word(&self.called)
             ),
         )
         .unwrap();
