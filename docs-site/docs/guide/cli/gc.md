@@ -68,8 +68,10 @@ The other way round, `sbx gc` waits for a launch that is still preparing the sto
 finds its session and refuses, as above. It also waits for an [`sbx upgrade`](upgrade)
 step running in a cage of the project, which records no session. Launches of one project
 do not wait for each other. The side that waits names the lock file,
-`<data>/projects/<id>/store.lock`: a cage whose project holds sbx's data directory sees it
-read-only, which is enough to hold it, and would keep both sides waiting while it runs.
+`<data>/projects/<id>/store.lock`: a cage whose project or a configured bind lies at or under
+sbx's data directory sees read-only what that shows of it, which is enough to hold the file
+when it is shown, and would keep both sides waiting while it runs. A project that only
+contains the data directory sees an empty directory in its place.
 
 The shared store takes turns the same way, on `<data>/store-gc.lock`. A launch holds it while
 it copies paths from the shared store into its project's, and the collection of the shared
