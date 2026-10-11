@@ -49,8 +49,8 @@ set -eo pipefail
 # Guard on the VERSION, not merely on the launcher's existence. The vendor installs a small launcher
 # script beside a versioned payload (`muse-bin-<version>`), and its own `.muse-version` records which
 # payload is active — so a guard keyed on the launcher stops firing after the first install while the
-# payload stays where it was. Measured: a launcher dated 2026-08-06 was still running a 0.1.0-R708.1
-# payload on 2026-09-04, when the channel had long served 1.0.2-R2040.1.
+# payload stays where it was, and an old launcher keeps running an old payload however far the
+# channel has moved on.
 #
 # The channel is read through the SAME variable the vendor launcher reads, so what this compares
 # against is what an install would fetch. `grep`+`cut` rather than a JSON parser, because the cage
