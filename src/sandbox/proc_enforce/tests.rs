@@ -2388,8 +2388,8 @@ fn a_vanished_notification_does_not_end_supervision_for_the_rest_of_the_run() {
 fn the_poll_tells_a_hang_up_apart_from_something_to_read() {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `fds` is a live two-element array, which is what `pipe2` fills. `O_CLOEXEC`, or a
-    // child a neighbouring test starts would hold the write end past its `exec`, and the hang-up
-    // this test closes it to raise would not come.
+    // child a neighbouring test starts would hold the write end past its `exec`, for as long as it
+    // runs, and the hang-up this test closes it to raise would not come.
     assert_eq!(
         unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
         0,
@@ -2410,7 +2410,14 @@ fn the_poll_tells_a_hang_up_apart_from_something_to_read() {
     // SAFETY: writes one byte from a live local into this test's own descriptor.
     assert_eq!(unsafe { libc::write(write_end, one.as_ptr().cast(), 1) }, 1);
     close_owned(write_end);
-    let both = poll_events(read_end, 0);
+    // Waited for rather than read once: a neighbouring test's fork may still hold a copy of the
+    // write end ([`crate::testutil::FORK_WINDOW`]). Once every copy is gone the hang-up stays, so
+    // the check after the drain below reads it once.
+    let mut both = 0;
+    crate::testutil::once_forks_let_go(|| {
+        both = poll_events(read_end, 0);
+        both & libc::POLLHUP != 0
+    });
     assert_ne!(both & libc::POLLIN, 0, "the byte is still there to be read");
     assert_ne!(
         both & libc::POLLHUP,
