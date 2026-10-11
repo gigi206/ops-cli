@@ -1077,8 +1077,6 @@ fn fd_of_stream(s: &UnixStream) -> libc::c_int {
     s.as_raw_fd()
 }
 
-/// How many descriptors this process holds. The `read_dir` handle is open during the walk, so it is
-/// counted identically on either side of a comparison.
 /// The descriptors of this process that name `file`, matched by device and inode so that a path
 /// spelled another way still counts. One that closes between the listing and its look-up names
 /// nothing any more, and is not counted.
