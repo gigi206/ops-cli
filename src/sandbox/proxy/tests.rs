@@ -10551,8 +10551,11 @@ fn a_response_that_will_be_scanned_is_asked_for_uncompressed() {
             "host.test",
             "host.test",
             addr.port(),
+            // The same offers under the spelling a server may fold onto the real header ride
+            // along: stripped beside the real ones, or they reach the upstream as a `gzip`.
             b"GET /p HTTP/1.1\r\nHost: host.test\r\nAccept-Encoding: gzip, br\r\n\
-              Grpc-Accept-Encoding: gzip\r\n\r\n",
+              Grpc-Accept-Encoding: gzip\r\nAccept_Encoding: gzip\r\n\
+              Grpc_Accept_Encoding: gzip\r\n\r\n",
         )
         .unwrap();
         assert!(resp.contains("200"), "the exchange must complete: {resp:?}");
