@@ -196,6 +196,11 @@ pub(crate) fn write_script(path: &Path, body: &str) {
         .expect("the stand-in is executable");
 }
 
+/// `path` as one word of a `/bin/sh` script, whatever the fixture root it sits under is called.
+pub(crate) fn sh_word(path: &Path) -> String {
+    crate::sandbox::shell_quote(path.to_str().expect("utf-8 fixture path"))
+}
+
 /// A program's standard error that tries each thing a relayed diagnostic can do to the line it is
 /// shown on: break it, return over it, drive the terminal with an escape and a title-setting
 /// sequence, and reorder it with a right-to-left override.

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::proc_policy::ProcMode;
 use crate::sandbox::locks::{locked, write_locked};
-use crate::testutil::TmpDir;
+use crate::testutil::{TmpDir, sh_word};
 
 /// Hold `path`'s inode the way the lens holds a probe: an `O_PATH` descriptor, opened by the
 /// syscall.
@@ -70,11 +70,6 @@ macro_rules! need_host_programs {
             }
         )+
     };
-}
-
-/// `path` as one word of a `/bin/sh` script, whatever the fixture root it sits under is called.
-fn sh_word(path: &std::path::Path) -> String {
-    crate::sandbox::launch::shell_quote(path.to_str().expect("utf-8 fixture path"))
 }
 
 /// Close a descriptor this test owns. A number that does not close was closed already or never
