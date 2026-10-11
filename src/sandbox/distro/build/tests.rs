@@ -227,8 +227,8 @@ fn a_build_cage_carries_the_mandatory_seccomp_filters() {
     std::fs::write(
         &fake,
         format!(
-            "#!/bin/sh\nprintf 'CAGE\\n' >> '{0}'\nprintf '%s\\n' \"$@\" >> '{0}'\n",
-            dump.display()
+            "#!/bin/sh\nprintf 'CAGE\\n' >> {0}\nprintf '%s\\n' \"$@\" >> {0}\n",
+            crate::testutil::sh_word(&dump)
         ),
     )
     .unwrap();
@@ -269,7 +269,10 @@ fn a_build_cage_runs_inside_the_resource_limit_scope() {
     let fake = tmp.join("fake-bwrap");
     std::fs::write(
         &fake,
-        format!("#!/bin/sh\ncat /proc/self/cgroup > '{}'\n", seen.display()),
+        format!(
+            "#!/bin/sh\ncat /proc/self/cgroup > {}\n",
+            crate::testutil::sh_word(&seen)
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
