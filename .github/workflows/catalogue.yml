@@ -1,10 +1,10 @@
 # Catalogue — asks the shipped profiles' vendors whether their packages can still be found.
 #
 # WHAT PROBLEM THIS SOLVES. A shipped profile can name a package its vendor no longer publishes: a
-# `deb:github:<owner>/<repo>` source resolves through the latest release's linux-amd64 asset, and a
-# vendor that stops attaching assets leaves the app impossible to launch or upgrade. Nothing else in
-# this repository asks a vendor anything: the `every_shipped_*` guards read files, and a file cannot
-# say that the thing it points at is gone.
+# `deb:github:<owner>/<repo>` source resolves through the latest release's `.deb` asset for the
+# host's architecture, and a vendor that stops attaching assets leaves the app impossible to launch
+# or upgrade. Nothing else in this repository asks a vendor anything: the `every_shipped_*` guards
+# read files, and a file cannot say that the thing it points at is gone.
 #
 # WHY IT IS NOT PART OF `ci.yml`. Every check is a network call to a third party. `cargo test` runs
 # offline, on contributors' machines and in a hosted job that has no business being red because a
