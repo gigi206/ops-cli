@@ -1829,47 +1829,9 @@ fn crate_and_test_sources() -> Vec<(String, String)> {
 fn a_paragraph_break_inside_a_doc_comment_is_written_as_one() {
     let list_item = regex::Regex::new(r"^([*+-] |[0-9]+[.)] )").expect("the list pattern compiles");
     let mut offenders = Vec::new();
-
     for (path, text) in crate_and_test_sources() {
-        let lines: Vec<&str> = text.lines().collect();
-        let body = |l: &str| -> Option<String> {
-            let t = l.trim_start();
-            t.strip_prefix("/// ").map(|b| b.to_string())
-        };
-        let mut fenced = false;
-        let mut in_fence = Vec::with_capacity(lines.len());
-        for line in &lines {
-            if body(line).is_some_and(|b| b.starts_with("```")) {
-                fenced = !fenced;
-            }
-            in_fence.push(fenced);
-        }
-
-        for i in 0..lines.len().saturating_sub(1) {
-            let (Some(cur), Some(next)) = (body(lines[i]), body(lines[i + 1])) else {
-                continue;
-            };
-            if in_fence[i] || in_fence[i + 1] {
-                continue;
-            }
-            if [&cur, &next]
-                .iter()
-                .any(|b| list_item.is_match(b) || b.starts_with(char::is_whitespace))
-            {
-                continue;
-            }
-            if !cur.ends_with(['.', '!', '?'])
-                || DOC_ABBREVIATIONS.iter().any(|a| cur.ends_with(a))
-                || lines[i].chars().count() >= DOC_WRAP
-            {
-                continue;
-            }
-            if next.starts_with(|c: char| c.is_uppercase() || "`[*".contains(c)) {
-                offenders.push(format!("{path}:{}  {}", i + 1, cur));
-            }
-        }
+        offenders.extend(unseparated_paragraphs(&text, &path, &list_item));
     }
-
     assert!(
         offenders.is_empty(),
         "a paragraph ends on each of these lines and the next one opens another, with no `///` \
@@ -1877,5 +1839,81 @@ fn a_paragraph_break_inside_a_doc_comment_is_written_as_one() {
          below it belongs to an item that moved, it is documenting the wrong thing now — put it \
          back rather than separating it:\n{}",
         offenders.join("\n")
+    );
+}
+
+/// The lines of one source file, `text`, named for `path`, where a doc paragraph ends and the next
+/// opens with no bare `///` between them, as
+/// [`a_paragraph_break_inside_a_doc_comment_is_written_as_one`] describes.
+///
+/// A doc line is `///` followed by its text, with or without the space the crate writes: a
+/// `///Text` line is text too: read as a separator, it would hide a merge. Only a bare `///`
+/// separates, and `////` is a plain comment.
+fn unseparated_paragraphs(text: &str, path: &str, list_item: &regex::Regex) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let body = |l: &str| -> Option<String> {
+        let rest = l.trim_start().strip_prefix("///")?;
+        if rest.starts_with('/') {
+            return None;
+        }
+        Some(rest.strip_prefix(' ').unwrap_or(rest).to_string())
+    };
+    let mut fenced = false;
+    let mut in_fence = Vec::with_capacity(lines.len());
+    for line in &lines {
+        if body(line).is_some_and(|b| b.starts_with("```")) {
+            fenced = !fenced;
+        }
+        in_fence.push(fenced);
+    }
+
+    let mut offenders = Vec::new();
+    for i in 0..lines.len().saturating_sub(1) {
+        let (Some(cur), Some(next)) = (body(lines[i]), body(lines[i + 1])) else {
+            continue;
+        };
+        if in_fence[i] || in_fence[i + 1] {
+            continue;
+        }
+        if [&cur, &next]
+            .iter()
+            .any(|b| list_item.is_match(b) || b.starts_with(char::is_whitespace))
+        {
+            continue;
+        }
+        if !cur.ends_with(['.', '!', '?'])
+            || DOC_ABBREVIATIONS.iter().any(|a| cur.ends_with(a))
+            || lines[i].chars().count() >= DOC_WRAP
+        {
+            continue;
+        }
+        if next.starts_with(|c: char| c.is_uppercase() || "`[*".contains(c)) {
+            offenders.push(format!("{path}:{}  {}", i + 1, cur));
+        }
+    }
+    offenders
+}
+
+/// A doc line written without its space is still text, so a merge it opens is found; a bare `///`
+/// is the separator, and `////` no doc line at all.
+#[test]
+fn a_doc_line_without_its_space_is_still_text() {
+    let list_item = regex::Regex::new(r"^([*+-] |[0-9]+[.)] )").expect("the list pattern compiles");
+    let text = [
+        "/// A first paragraph.",
+        "///A second one, merged.",
+        "fn a() {}",
+        "/// Kept apart.",
+        "///",
+        "/// By its separator.",
+        "fn b() {}",
+        "//// A plain comment.",
+        "/// Documents c.",
+        "fn c() {}",
+    ]
+    .join("\n");
+    assert_eq!(
+        unseparated_paragraphs(&text, "x.rs", &list_item),
+        ["x.rs:1  A first paragraph."]
     );
 }
