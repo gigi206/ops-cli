@@ -1957,7 +1957,7 @@ fn display_binds(
         let display = std::env::var("WAYLAND_DISPLAY").ok();
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
         match resolve_wayland_hole(display.as_deref(), runtime_dir.as_deref()) {
-            Ok((socket, socket_env)) if socket.exists() => {
+            Ok((socket, socket_env)) if names_a_socket(&socket) => {
                 mounts.push(binds::ExtraBind {
                     src: socket.clone(),
                     dest: socket,
@@ -1966,8 +1966,8 @@ fn display_binds(
                 env.extend(socket_env);
             }
             Ok((socket, _)) => crate::diag::warn(&format!(
-                "`gui = \"wayland\"` but the compositor socket `{}` does not exist — \
-                 running without a display",
+                "`gui = \"wayland\"` but the compositor socket `{}` does not exist or is not a \
+                 socket — running without a display",
                 socket.display()
             )),
             Err(reason) => crate::diag::warn(&format!(
@@ -2028,10 +2028,9 @@ fn gpu_binds(prep: &Prepared, hw: &HardwareLayers) -> GuiWiring {
     // seeded above) and read-only-bind the minimal `/sys` DRM subtree the driver reads to enumerate
     // the device. The render node itself is granted through the device-bind mechanism below. Mostly
     // best-effort: a failed mesa provision or an absent render node degrades to software rendering.
-    // The `/sys` paths are checked for existence at enumeration (`drm_sys_paths`) and bound firmly —
-    // the same firm-`--ro-bind`-after-`.exists()` shape the Wayland socket uses — so a device
-    // vanishing between enumeration and exec (a GPU hot-unplug) would fail the launch, an accepted
-    // rarity, not "never fails".
+    // The `/sys` paths are checked for existence at enumeration (`drm_sys_paths`) and bound firmly
+    // after that check, so a device vanishing between enumeration and exec (a GPU hot-unplug) would
+    // fail the launch, an accepted rarity, not "never fails".
     // The driver-path env vars mesa `dlopen`s from are sbx-controlled *and* reserved against an
     // untrusted `[env]` (they load code, so `is_reserved_env_key` denylists them alongside `LD_*`);
     // a *trusted* config may still override them — self-harm on its own cage, not an escape.
@@ -2147,7 +2146,7 @@ fn audio_binds(prep: &Prepared, hw: &HardwareLayers) -> GuiWiring {
             std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
             crate::sandbox::wsl::host_is_wsl(),
         );
-        match candidates.iter().find(|p| p.exists()).cloned() {
+        match candidates.iter().find(|p| names_a_socket(p)).cloned() {
             Some(sock) => {
                 // The socket bind + `PULSE_SERVER` are firm (independent of the userspace provision);
                 // the client libraries, the ALSA→pulse shim's `asound.conf`, and its env are added
@@ -3434,13 +3433,16 @@ pub(crate) const RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
 
 /// Resolve the host's Wayland compositor socket and the cage environment that points a
 /// graphical app at it, from the host `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`. Pure: the impure
-/// existence check and the bind are the caller's, so the path/env computation is unit-tested.
+/// check that the path is a socket ([`names_a_socket`]) and the bind are the caller's, so the
+/// path/env computation is unit-tested.
 ///
 /// Per the Wayland convention an absolute `WAYLAND_DISPLAY` is the socket path verbatim;
-/// otherwise it is a name resolved under `XDG_RUNTIME_DIR`. The returned path is always the
-/// socket **file** — never the runtime directory, which also holds the dbus session bus, pulse,
-/// and the gpg/ssh agents; the caller binds exactly this file read-only, so none of those is
-/// exposed (the whole point of gating the GUI hole trusted-only). The returned env carries
+/// otherwise it is a name resolved under `XDG_RUNTIME_DIR`. The returned path is where the
+/// convention puts the socket **file**, and a value can name something else (`.` resolves to the
+/// runtime directory itself, which also holds the dbus session bus, pulse, and the gpg/ssh
+/// agents). The caller binds it read-only only when it is a socket, so the runtime directory and
+/// what it holds are never exposed (the whole point of gating the GUI hole trusted-only). The
+/// returned env carries
 /// `WAYLAND_DISPLAY` and, when known, `XDG_RUNTIME_DIR`, so the in-cage client finds the same
 /// socket at the same path (the cage runs same-uid, so a read-only bind is enough to connect).
 fn resolve_wayland_hole(
@@ -3465,6 +3467,16 @@ fn resolve_wayland_hole(
         env.push((RUNTIME_DIR_ENV.to_string(), dir.to_string()));
         Ok((Path::new(dir).join(display), env))
     }
+}
+
+/// Whether `path` names a socket, following a link to one (WSLg publishes its sockets through
+/// links): the only thing the GUI and audio holes bind. Anything else there is a variable naming
+/// something other than a server, and binding it would show the cage what the hole was never meant
+/// to carry: `WAYLAND_DISPLAY=.` names `$XDG_RUNTIME_DIR` itself, which holds the other agents'
+/// sockets.
+fn names_a_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt as _;
+    std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_socket())
 }
 
 /// The store paths this launch's own in-cage plumbing runs from, re-bound **read-only** from the
