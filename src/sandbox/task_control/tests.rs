@@ -1752,8 +1752,16 @@ fn a_hidden_stream_and_an_empty_one_stay_distinguishable() {
         }
     });
     let script = dir.path().join("client");
-    super::super::task_shim::write(&script, &bash, &socat, &head, socket.to_str().unwrap())
-        .expect("write the client");
+    super::super::task_shim::write(
+        &script,
+        &bash,
+        &socat,
+        &head,
+        socket
+            .to_str()
+            .expect("the client names its socket as text: a launch passes a constant"),
+    )
+    .expect("write the client");
     let out = run_client(&script, &["task", "run", "probe"]);
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert!(out.stdout.is_empty(), "{out:?}");
