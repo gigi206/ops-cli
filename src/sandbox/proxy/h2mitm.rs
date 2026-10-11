@@ -1438,7 +1438,9 @@ async fn ready_upstream(
     ctx: &ProxyCtx,
 ) -> Result<h2::client::SendRequest<Bytes>, Unopened> {
     // `[network] pool = false` means what it says on this plane too: a launch that asked for no
-    // upstream reuse gets a connection per stream, as it did before this pool existed.
+    // upstream reuse gets a connection per stream, as it did before this pool existed. The opening
+    // turn is taken all the same, because it is not about sharing: it holds the tunnel to one
+    // opening at a time, which is what the supervisor sizes its room for questions on.
     if ctx.pool.is_none() {
         let _turn = pool.opening.lock().await;
         return open_upstream(checked, ctx).await.map(|(send, _)| send);
