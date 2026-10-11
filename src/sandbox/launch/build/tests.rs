@@ -1278,6 +1278,43 @@ fn a_gui_or_audio_hole_binds_only_a_socket() {
     );
 }
 
+/// The merged loader path names no empty element, which the loader would read as the working
+/// directory: the project, in a cage whose preambles load with this value before the `[proc]` shim.
+///
+/// Every producer names a directory today, so each shape here is one a producer could come to
+/// emit: an empty value, a value with a doubled, leading or trailing `:`, and nothing but empties.
+#[test]
+fn the_merged_loader_path_names_no_empty_element() {
+    let entry = |v: &str| ("LD_LIBRARY_PATH".to_string(), v.to_string());
+    for (shape, given) in [
+        ("an empty value", vec![entry(""), entry("/a")]),
+        ("a doubled colon", vec![entry("/a::/b")]),
+        ("a leading colon", vec![entry(":/a"), entry("/b")]),
+        ("a trailing colon", vec![entry("/a:"), entry("/b")]),
+    ] {
+        let mut env = given;
+        super::merge_loader_path(&mut env);
+        let value = &env[0].1;
+        assert!(
+            !value.split(':').any(str::is_empty),
+            "{shape}: no empty element survives the merge: {env:?}"
+        );
+        assert_eq!(env.len(), 1, "{shape}: one entry: {env:?}");
+    }
+
+    let mut empties = vec![
+        entry(""),
+        entry(":"),
+        ("HOME".to_string(), "/h".to_string()),
+    ];
+    super::merge_loader_path(&mut empties);
+    assert_eq!(
+        empties,
+        vec![("HOME".to_string(), "/h".to_string())],
+        "a loader path left with no directory is removed rather than set to an empty element"
+    );
+}
+
 /// Two grants contribute to the loader path, and a cage with both must keep the directories of
 /// each. The union is what a path list means; the last-writer rule that governs every other shared
 /// key would drop one grant's libraries with no message, which is how a caged app loses its audio
