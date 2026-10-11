@@ -176,10 +176,9 @@ pub(crate) fn store_exists(layout: &Layout, project_id: &str) -> bool {
 /// (so concurrent seeds never block each other); the collector holds it **exclusive** around the
 /// whole `nix-store --gc`. Both sides call the same `flock`, so they serialise regardless of which
 /// primitive nix uses internally (`flock` and POSIX `fcntl` locks occupy separate lock spaces and
-/// do not interoperate). A cage launched from inside sbx's data directory, or given a bind there,
-/// sees the file read-only and can hold it too, as it can a project's store lock
-/// ([`ProjectStoreLock`]), so a side that waits names the file rather than guessing who holds it.
-/// Dropping the guard closes the fd, releasing the lock.
+/// do not interoperate). A cage can hold it too, as it can a project's store lock
+/// ([`ProjectStoreLock`]) and under the same condition, so a side that waits names the file rather
+/// than guessing who holds it. Dropping the guard closes the fd, releasing the lock.
 pub(crate) struct SharedGcLock(
     // Held only for its `Drop`: closing the fd is what releases the `flock`. Never read.
     #[allow(dead_code)] std::fs::File,
@@ -304,11 +303,12 @@ pub(crate) fn lock_exclusive(layout: &Layout, waiting: &dyn Fn(&Path)) -> io::Re
 /// runs in it. `sbx gc` then reads the session as over and collects a store that cage still uses.
 ///
 /// The file is beside the store in the project's runtime tree, where the project's marker is. No
-/// cage writes there, but one whose project holds sbx's data directory sees it read-only (the
-/// control-plane pins), and `flock` asks no write access: such a cage can hold the lock and keep
-/// the project's launches and its collection waiting, as it can the shared store's. So the side
-/// that waits names the file rather than guessing who holds it. Dropping the guard closes the
-/// file, releasing the lock.
+/// cage writes there, but one whose project or a configured bind lies at or under sbx's data
+/// directory sees read-only what that shows of it (the control-plane pins; a bind that only
+/// contains the data directory shows an empty decoy in its place), and `flock` asks no write
+/// access: a cage shown the file can hold the lock and keep the project's launches and its
+/// collection waiting, as it can the shared store's. So the side that waits names the file rather
+/// than guessing who holds it. Dropping the guard closes the file, releasing the lock.
 pub(crate) struct ProjectStoreLock(
     // Held only for its `Drop`: closing the fd is what releases the `flock`. Never read.
     #[allow(dead_code)] fs::File,
