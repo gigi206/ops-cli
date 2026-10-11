@@ -145,7 +145,10 @@ mod tests {
         use std::ffi::CString;
         let tmp = TmpDir::new();
         let p = tmp.join("cfg");
-        let c = CString::new(p.to_str().unwrap()).unwrap();
+        let c = {
+            use std::os::unix::ffi::OsStrExt as _;
+            CString::new(p.as_os_str().as_bytes()).unwrap()
+        };
         assert_eq!(
             unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
             0,
