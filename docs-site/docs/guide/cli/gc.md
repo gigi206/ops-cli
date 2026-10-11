@@ -10,7 +10,8 @@ sbx gc [--all] [--prune] [--optimise|--optimize]
 
 Reclaim `sbx`'s nix store space. By default it sweeps the **current project's**
 store. Reclamation is irreversible, so the destructive form is opt-in: without
-`--prune` it is a **dry run** that touches nothing.
+`--prune` it is a **dry run**, which removes only what nix removes on any collection (see
+[When the store holds an entry nix did not make](#when-the-store-holds-an-entry-nix-did-not-make)).
 
 | Option | Meaning |
 |---|---|
@@ -114,7 +115,9 @@ root's target that is a link on the host, one on the way to what the cage mounts
 a directory on the host, one whose target the host cannot look at, roots
 leading to more than 1024 places outside the store, and root directories holding more than
 65 536 entries or nested more than 16 deep. Like nix
-on the host, even a dry run removes a `gcroots/auto` link whose target is gone. The
+on the host, even a dry run removes a `gcroots/auto` link whose target is gone, and an entry
+of the store directory nix has no record of, such as the half-copied tree a seed killed
+part-way leaves. The
 collection reads none of the host's nix configuration (`/etc/nix/nix.conf`, `NIX_CONFIG`),
 so a setting there such as `keep-outputs` applies to the shared store and not to a
 project's.
