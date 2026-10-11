@@ -1,9 +1,9 @@
 //! Asks every shipped profile's vendor whether the package it names can still be resolved.
 //!
 //! **The problem this exists for.** A shipped profile can name a package its vendor no longer
-//! publishes: a `deb:github:<owner>/<repo>` source resolves through the latest release's
-//! linux-amd64 asset, and a vendor that stops attaching assets leaves the app impossible to launch
-//! or upgrade. Nothing else in this repository asks a vendor anything: the `every_shipped_*` guards
+//! publishes: a `deb:github:<owner>/<repo>` source resolves through the latest release's `.deb`
+//! asset for the host's architecture, and a vendor that stops attaching assets leaves the app
+//! impossible to launch or upgrade. Nothing else in this repository asks a vendor anything: the `every_shipped_*` guards
 //! read files, and a file cannot say that the thing it points at is gone.
 //!
 //! **Why it cannot live in the ordinary suite.** Every check here is a network call to a third
