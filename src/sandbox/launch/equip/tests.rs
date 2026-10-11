@@ -536,27 +536,31 @@ fn wrap_flake_equip_passes_quads_and_command_positionally() {
 /// Every path the wrap interpolates reaches the shell as one word, whatever it holds: the out-link
 /// parent, `nix` and the coreutils it runs are read back as written even when their names carry a
 /// quote, a double quote or a blank.
+///
+/// The paths are relative to the fixture, which the script runs from: a launch passes store paths
+/// and a constant, and the names below are the whole of what is under test, whatever the fixture
+/// root is called.
 #[test]
 fn wrap_flake_equip_quotes_every_path_it_interpolates() {
     let tmp = crate::testutil::TmpDir::new();
-    let tools = tmp.join("co'reutils \"bin\"");
-    std::fs::create_dir_all(&tools).unwrap();
+    let (tools, flake) = ("co'reutils \"bin\"", "it's \"flake\"");
+    std::fs::create_dir_all(tmp.join(tools)).unwrap();
     let host = host_env_bin();
     for name in ["env", "mkdir", "touch", "rm", "readlink", "ln"] {
-        std::os::unix::fs::symlink(host.with_file_name(name), tools.join(name)).unwrap();
+        std::os::unix::fs::symlink(host.with_file_name(name), tmp.join(tools).join(name)).unwrap();
     }
-    let flake = tmp.join("it's \"flake\"");
     let argv = wrap_flake_equip(
-        &tmp.join("ni'x"),
+        Path::new("ni'x"),
         &PathBuf::from("bash"),
-        &tools.join("env"),
-        &flake,
+        &Path::new(tools).join("env"),
+        Path::new(flake),
         &[],
         vec![OsString::from("true")],
     );
 
     let out = std::process::Command::new(&argv[0])
         .args(&argv[1..])
+        .current_dir(tmp.path())
         .output()
         .expect("run the flake-equip script");
     assert!(
@@ -565,7 +569,7 @@ fn wrap_flake_equip_quotes_every_path_it_interpolates() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        flake.is_dir(),
+        tmp.join(flake).is_dir(),
         "the out-link parent is made at the path it was given"
     );
 }
@@ -639,11 +643,13 @@ fn wrap_flake_equip_falls_back_to_the_last_good_build_when_a_pinned_build_fails(
     )];
     // The command the wrap execs once equip is done — reaching it proves we did NOT exit 1.
     let cmd = vec![OsString::from("echo"), OsString::from("FELL-BACK")];
+    // `nix` and the out-link parent are named from the fixture the script runs in, the way a
+    // launch names them from store paths and a constant: the fixture root never enters the script.
     let argv = wrap_flake_equip(
-        &fake_nix,
+        Path::new("./nix"),
         &PathBuf::from("bash"),
         &host_env_bin(),
-        &flake,
+        Path::new("flake"),
         &quads,
         cmd,
     );
@@ -651,6 +657,7 @@ fn wrap_flake_equip_falls_back_to_the_last_good_build_when_a_pinned_build_fails(
     let run = || {
         std::process::Command::new(&argv[0])
             .args(&argv[1..])
+            .current_dir(tmp.path())
             .output()
             .expect("run the flake-equip script")
     };
@@ -706,17 +713,19 @@ fn wrap_flake_equip_hard_fails_when_a_build_fails_and_no_good_build_exists() {
         "tool".to_string(),
     )];
     let cmd = vec![OsString::from("echo"), OsString::from("SHOULD-NOT-RUN")];
+    // Named from the fixture the script runs in, as the fallback test above says.
     let argv = wrap_flake_equip(
-        &fake_nix,
+        Path::new("./nix"),
         &PathBuf::from("bash"),
         &host_env_bin(),
-        &flake,
+        Path::new("flake"),
         &quads,
         cmd,
     );
 
     let out = std::process::Command::new(&argv[0])
         .args(&argv[1..])
+        .current_dir(tmp.path())
         .output()
         .expect("run the flake-equip script");
     assert!(!out.status.success(), "no good build → must hard-fail");
