@@ -4158,15 +4158,11 @@ mod tests {
             .count();
         // Composed as one string rather than pushed component by component: nothing is written
         // through this path — it is a `PATH` entry, and the planted file lives in the fixture — and
-        // the sweep that keeps a test's writes inside its own fixture reads the pushing form.
-        let relative = PathBuf::from(format!(
-            "{}{}",
-            "../".repeat(depth),
-            dir.path()
-                .strip_prefix("/")
-                .expect("an absolute temp dir")
-                .display()
-        ));
+        // the sweep that keeps a test's writes inside its own fixture reads the pushing form. An OS
+        // string, so the fixture's bytes are kept whatever its root is called.
+        let mut relative = std::ffi::OsString::from("../".repeat(depth));
+        relative.push(dir.path().strip_prefix("/").expect("an absolute temp dir"));
+        let relative = PathBuf::from(relative);
         assert!(
             relative.join("sops").symlink_metadata().is_ok(),
             "the relative spelling really does reach the planted binary"
