@@ -74,6 +74,25 @@ fn put_executable(path: &Path, body: &str) {
     }
 }
 
+/// The names in `dir`; none when there is no such directory. A directory that is there and cannot
+/// be listed, or an entry of it that cannot be read, fails the test at the line that asked.
+#[track_caller]
+fn entries(dir: &Path) -> Vec<std::ffi::OsString> {
+    let listing = match std::fs::read_dir(dir) {
+        Ok(listing) => listing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => panic!("list {}: {e}", dir.display()),
+    };
+    let mut names = Vec::new();
+    for entry in listing {
+        match entry {
+            Ok(entry) => names.push(entry.file_name()),
+            Err(e) => panic!("an entry of {}: {e}", dir.display()),
+        }
+    }
+    names
+}
+
 /// Everything `pipe` carries until it closes, read on a thread of its own, as text.
 fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
@@ -352,10 +371,7 @@ fn the_newest_stable_release_is_installed_by_default_and_checked() {
         "a directory off PATH is named with the line to add:\n{}",
         run.text
     );
-    let leftovers: Vec<_> = std::fs::read_dir(installed.parent().unwrap())
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
+    let leftovers = entries(installed.parent().unwrap());
     assert_eq!(
         leftovers,
         ["sbx"],
@@ -465,10 +481,10 @@ fn a_download_that_does_not_match_its_checksum_installs_nothing() {
         run.text
     );
     assert!(!fx.installed().exists());
-    let bin = fx.home().join(".local/bin");
+    let left = entries(&fx.home().join(".local/bin"));
     assert!(
-        !bin.exists() || std::fs::read_dir(&bin).unwrap().next().is_none(),
-        "no partial file is left in the directory"
+        left.is_empty(),
+        "no partial file is left in the directory: {left:?}"
     );
 
     for malformed in ["abc", &"G".repeat(64), ""] {
@@ -822,10 +838,11 @@ fn on_macos_the_bridge_and_its_two_agents_are_installed_and_replaced() {
         &paths,
     );
     assert_eq!(run.code, Some(0), "{}", run.text);
+    let installed_agents = entries(&agents);
     assert_eq!(
-        std::fs::read_dir(&agents).unwrap().count(),
+        installed_agents.len(),
         2,
-        "two agents, whatever the number of runs"
+        "two agents, whatever the number of runs: {installed_agents:?}"
     );
 }
 
@@ -903,12 +920,9 @@ fn on_macos_the_notifier_is_built_with_sbxs_identity_and_replaced() {
         !app.join("sbx.app").exists(),
         "a reinstall replaces, never nests"
     );
-    let share: Vec<_> = std::fs::read_dir(app.parent().unwrap())
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-        .collect();
+    let share = entries(app.parent().unwrap());
     assert!(
-        !share.iter().any(|n| n.starts_with(".sbx.app")),
+        !share.iter().any(|n| n.as_bytes().starts_with(b".sbx.app")),
         "no partial copy left: {share:?}"
     );
 }
