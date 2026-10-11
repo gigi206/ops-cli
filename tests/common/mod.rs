@@ -380,8 +380,26 @@ use std::process::{Command, Output};
 /// `path` as one word of a shell script: single-quoted, each quote inside closed, escaped and
 /// reopened. The fixture root comes from the environment, so it may hold a blank or a quote, and an
 /// unquoted path in a driven script would then split or run as code.
+///
+/// It may also hold a byte that is not UTF-8, which the `String` a script is written in cannot
+/// carry. Each such byte is spliced into the word by a `printf` command substitution, so the word
+/// still names the path's own bytes rather than the replacement character `display()` would put.
 pub fn sh(path: &std::path::Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut word = String::new();
+    for chunk in path.as_os_str().as_bytes().utf8_chunks() {
+        if !chunk.valid().is_empty() {
+            let _ = write!(word, "'{}'", chunk.valid().replace('\'', r"'\''"));
+        }
+        for byte in chunk.invalid() {
+            let _ = write!(word, "\"$(printf '\\{byte:03o}')\"");
+        }
+    }
+    if word.is_empty() {
+        word.push_str("''");
+    }
+    word
 }
 
 /// A word of a driven command line, quoted the same way.
