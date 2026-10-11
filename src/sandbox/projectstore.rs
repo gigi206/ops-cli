@@ -435,9 +435,7 @@ pub(crate) fn prepare(
     let shared_paths = shared_store.join("nix").join("store");
     let mut all_cloned = reflink_ok;
     for path in &closure {
-        let Some(name) = path.file_name() else {
-            continue;
-        };
+        let name = store_path_name(path)?;
         all_cloned &= seed_path(&shared_paths, &project_paths, name, reflink_ok)?;
     }
     record_seed_mode(&store_dir, all_cloned)?;
@@ -461,6 +459,10 @@ pub(crate) fn prepare(
 /// (`/nix/store/<hash>-name`). `nix-store -qR` returns each root and every path it
 /// references, so the result is closed under references — the property that makes
 /// the registration in [`load_db`] internally consistent.
+///
+/// Read as bytes, and each line held to that shape ([`store_path_name`]) before anything is copied:
+/// the copy and the registration both take the closure, and a line one of them passed over while
+/// the other took it would leave the two disagreeing.
 fn closure_of(
     nix_store: &Path,
     shared_store: &Path,
@@ -481,12 +483,35 @@ fn closure_of(
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .map(PathBuf::from)
-        .collect())
+    use std::os::unix::ffi::OsStrExt;
+    out.stdout
+        .split(|&byte| byte == b'\n')
+        .map(<[u8]>::trim_ascii)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let path = Path::new(OsStr::from_bytes(line));
+            store_path_name(path).map(|_| path.to_path_buf())
+        })
+        .collect()
+}
+
+/// The name of the store path `path`, `/nix/store/<name>`, which is what the seed copies, roots and
+/// registers it by; a path of any other shape is refused.
+fn store_path_name(path: &Path) -> io::Result<&OsStr> {
+    use std::path::Component;
+    let parts: Vec<Component<'_>> = path.components().collect();
+    match parts.as_slice() {
+        [
+            Component::RootDir,
+            Component::Normal(nix),
+            Component::Normal(store),
+            Component::Normal(name),
+        ] if *nix == "nix" && *store == "store" => Ok(name),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("`{}` is not a store path", path.display()),
+        )),
+    }
 }
 
 /// Place one store path `name` from `shared_paths` into the store directory
@@ -1594,7 +1619,8 @@ fn refuse_unless_file(path: &Path) -> io::Result<()> {
 /// `store_dir`'s store, so `nix-store --gc` keeps it and its closure. A root is a symlink
 /// `gcroots/<hash-name> -> /nix/store/<hash-name>` — the relocated store interprets that
 /// logical target as one of its own paths. The store-path name is unique per content, so
-/// it is the root's stable, collision-free file name.
+/// it is the root's stable, collision-free file name. A root with no name to link by is refused
+/// rather than passed over, which would leave its closure unrooted while the seed reported success.
 ///
 /// Idempotent and race-tolerant: a root already pointing at the right target is left
 /// alone, and a concurrent same-project seed racing on the same name resolves to the same
@@ -1607,9 +1633,12 @@ fn gcroot_roots(store_dir: &Path, roots: &[PathBuf]) -> io::Result<()> {
     // its root symlinks wherever that led, and the links go through the descriptor it reached.
     let dir = hold_dir_chain(store_dir, "var/nix/gcroots")?;
     for root in roots {
-        let Some(name) = root.file_name() else {
-            continue;
-        };
+        let name = root.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("`{}` names no store path to root", root.display()),
+            )
+        })?;
         let link = super::cagedir::entry(&dir, name)?;
         // Already the right root: nothing to do (the common warm re-seed).
         if fs::read_link(&link).is_ok_and(|t| t == *root) {
@@ -2004,18 +2033,21 @@ mod tests {
         );
     }
 
-    /// A stand-in for `nix-store` that appends each run's arguments to `ran` and prints nothing,
-    /// which [`prepare`] reads as an empty closure. It tells whether `nix-store` was started at all.
-    fn fake_nix_store(dir: &Path, ran: &Path) -> PathBuf {
+    /// A stand-in for `nix-store` that appends each run's arguments to `ran` and answers a
+    /// `--query` with the lines of `closure`, printing nothing otherwise, which [`prepare`] reads
+    /// as an empty closure. It tells whether `nix-store` was started at all, and with what.
+    fn fake_nix_store(dir: &Path, ran: &Path, closure: &[&str]) -> PathBuf {
+        use crate::testutil::sh_word;
         let path = dir.join("nix-store");
-        std::fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\necho \"$*\" >> {}\n",
-                crate::testutil::sh_word(ran)
-            ),
-        )
-        .unwrap();
+        let mut script = format!("#!/bin/sh\necho \"$*\" >> {}\n", sh_word(ran));
+        if !closure.is_empty() {
+            let lines: Vec<String> = closure.iter().map(|l| sh_word(Path::new(l))).collect();
+            script.push_str(&format!(
+                "case \"$*\" in *--query*) printf '%s\\n' {} ;; esac\n",
+                lines.join(" ")
+            ));
+        }
+        std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -2023,7 +2055,7 @@ mod tests {
     /// [`prepare`] with the fake `nix_store`, waiting out the `ETXTBSY` a just-written executable
     /// meets under the parallel runner, which says nothing about `prepare` itself. The
     /// registration's cage is given a bwrap that does not exist: every caller expects a refusal
-    /// before any `nix-store` starts, so reaching it is already a failure.
+    /// before the registration starts, so reaching it is already a failure.
     fn prepare_past_etxtbsy(
         nix_store: &Path,
         layout: &Layout,
@@ -2083,7 +2115,7 @@ mod tests {
             let layout = Layout::under(&base.join("data"));
             let store_dir = store_dir_for(&layout, "p");
             let ran = base.join("ran");
-            let nix_store = fake_nix_store(base.path(), &ran);
+            let nix_store = fake_nix_store(base.path(), &ran, &[]);
             let elsewhere = base.join("elsewhere");
             std::fs::create_dir_all(&elsewhere).unwrap();
             std::fs::write(elsewhere.join("held"), b"held\n").unwrap();
@@ -2127,7 +2159,7 @@ mod tests {
             let base = TmpDir::new();
             let layout = Layout::under(&base.join("data"));
             let ran = base.join("ran");
-            let nix_store = fake_nix_store(base.path(), &ran);
+            let nix_store = fake_nix_store(base.path(), &ran, &[]);
             let planted = store_dir_for(&layout, "p").join("nix").join(rel);
             std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
             if make == "file" {
@@ -2247,6 +2279,51 @@ mod tests {
             before, after,
             "idempotent re-seed replaced an unchanged root"
         );
+    }
+
+    /// A root with no name to link it by is refused, not passed over while the seed reports its
+    /// closure rooted.
+    #[test]
+    fn gcroot_roots_refuses_a_root_with_no_name() {
+        let base = TmpDir::new();
+        let store_dir = base.join("store");
+        let err = gcroot_roots(&store_dir, &[PathBuf::from("/")])
+            .expect_err("`/` has no name to root it by");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            err.to_string().contains("`/` names no store path to root"),
+            "the refusal must name the root: {err}"
+        );
+    }
+
+    /// A line of the closure that is no store path is refused by its text before the seed uses it.
+    /// The copy passed over a line with no name while the registration took it, so the two
+    /// disagreed on what the store holds, and a line outside the store was looked for inside it.
+    #[test]
+    fn a_closure_line_that_is_no_store_path_is_refused_before_the_seed_uses_it() {
+        let roots = [PathBuf::from(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-base",
+        )];
+        for line in ["/nix/store/..", "/etc/hostname"] {
+            let base = TmpDir::new();
+            let layout = Layout::under(&base.join("data"));
+            let ran = base.join("ran");
+            let nix_store = fake_nix_store(base.path(), &ran, &[line]);
+
+            let err = prepare_past_etxtbsy(&nix_store, &layout, &roots)
+                .expect_err("a closure line that is no store path is refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{line}: {err}");
+            assert!(
+                err.to_string()
+                    .contains(&format!("`{line}` is not a store path")),
+                "{line}: the refusal must name the line: {err}"
+            );
+            let runs = std::fs::read_to_string(&ran).unwrap_or_default();
+            assert!(
+                !runs.contains("--dump-db"),
+                "{line}: the registration ran on that closure: {runs}"
+            );
+        }
     }
 
     #[test]
