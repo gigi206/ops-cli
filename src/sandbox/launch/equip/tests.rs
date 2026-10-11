@@ -618,7 +618,10 @@ fn wrap_flake_equip_falls_back_to_the_last_good_build_when_a_pinned_build_fails(
     let fake_nix = tmp.path().join("nix");
     write_exec(
         &fake_nix,
-        &format!("#!/bin/sh\necho call >> '{}'\nexit 1\n", calls.display()),
+        &format!(
+            "#!/bin/sh\necho call >> {}\nexit 1\n",
+            crate::testutil::sh_word(&calls)
+        ),
     );
 
     // A pre-existing good build (the previous version) the fallback resolves to.
