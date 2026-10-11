@@ -1,5 +1,21 @@
 use super::cagepath::*;
 use super::*;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
+
+/// A pipe whose ends close with the test however it ends, and which no child of a neighbouring
+/// test inherits: the test binary runs its cases on parallel threads, and an end opened without
+/// `O_CLOEXEC` lives on in such a child past its `exec`, for as long as that child runs.
+fn pipe() -> (OwnedFd, OwnedFd) {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a live two-element array, which is what `pipe2` fills.
+    assert_eq!(
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "the pipe opens"
+    );
+    // SAFETY: both descriptors were just created by `pipe2` and are owned by nothing else.
+    unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+}
 
 #[test]
 fn each_open_form_is_read_from_its_own_registers() {
@@ -50,20 +66,17 @@ fn ending_supervision_denies_what_is_still_parked_before_closing_their_descripto
     // a decision outstanding. Closing first left those entries pointing at a number the process
     // may since have reissued, and left a target parked at teardown with no verdict from sbx at
     // all. Draining first is the fail-closed order.
-    let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `fds` is a live two-element array, which is what `pipe` fills.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "the pipe opens");
-    let (read_end, write_end) = (fds[0], fds[1]);
+    let (read_end, write_end) = pipe();
 
     let pending = PendingExec::new();
-    pending.park(read_end, 1, 4242, "/bin/ls");
-    pending.park(read_end, 2, 4243, "/bin/cat");
+    pending.park(read_end.as_raw_fd(), 1, 4242, "/bin/ls");
+    pending.park(read_end.as_raw_fd(), 2, 4243, "/bin/cat");
     assert_eq!(pending.list().len(), 2, "both parks are registered");
 
     // Answering a pipe is not answering a seccomp listener: `notif_id_valid` refuses it, so no
     // response is written. What is under test is the registry being emptied, and the descriptor
     // being closed only after it is.
-    close_supervision(read_end, &pending);
+    close_supervision(read_end.into_raw_fd(), &pending);
     assert!(
         pending.list().is_empty(),
         "nothing may outlive the descriptor it answers through: {:?}",
@@ -77,7 +90,7 @@ fn ending_supervision_denies_what_is_still_parked_before_closing_their_descripto
     // `close_supervision` closed are all of them — which Linux reports on the write end as
     // `POLLERR`, and which no descriptor reuse elsewhere can forge.
     let mut pfd = libc::pollfd {
-        fd: write_end,
+        fd: write_end.as_raw_fd(),
         events: libc::POLLOUT,
         revents: 0,
     };
@@ -91,8 +104,6 @@ fn ending_supervision_denies_what_is_still_parked_before_closing_their_descripto
         "the teardown closed every reader of the pipe, so the write end has no peer: revents {:#x}",
         pfd.revents
     );
-    // SAFETY: `write_end` is this test's own descriptor, closed exactly once.
-    unsafe { libc::close(write_end) };
 }
 
 /// The parked registry is the third producer on the line-based control wire that
@@ -109,11 +120,8 @@ fn a_parked_path_carries_no_byte_that_could_forge_a_row_on_the_wire() {
     // A real descriptor, because a park now takes a `dup` of the one it is answered through and
     // an entry it cannot duplicate is refused rather than registered. Nothing is ever answered
     // here: the registry is under its cap, so `park` only inserts.
-    let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `fds` is a live two-element array, which is what `pipe` fills.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "the pipe opens");
-    let (read_end, write_end) = (fds[0], fds[1]);
-    pending.park(read_end, 1, 4242, forged);
+    let (read_end, _write_end) = pipe();
+    pending.park(read_end.as_raw_fd(), 1, 4242, forged);
 
     let listed = pending.list();
     assert_eq!(listed.len(), 1, "the park is registered");
@@ -126,13 +134,6 @@ fn a_parked_path_carries_no_byte_that_could_forge_a_row_on_the_wire() {
         path, "/tmp/a pending id=99 pid=1 waiting=0 path=/bin/ls ok",
         "replaced rather than dropped, so what the cage asked to run is still legible"
     );
-
-    // SAFETY: both are this test's own descriptors, each closed exactly once; the entry's own
-    // dup is closed when the registry drops with this scope.
-    unsafe {
-        libc::close(read_end);
-        libc::close(write_end);
-    }
 }
 
 #[test]
