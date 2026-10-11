@@ -1798,11 +1798,10 @@ SHA256: 3333333333333333333333333333333333333333333333333333333333333333
         // (its own test pins that, and it is the correct behaviour: only the hash input is
         // canonicalised). So the padding an attacker adds reaches this module intact, and what makes
         // it harmless is here rather than there — `signed_digest` splits on whitespace and trims its
-        // section headers, `valid_until` trims its value. Nothing tested that until this test, and
-        // the two halves of the property live in two files, which is how one of them gets
-        // "simplified" away. Measured against GnuPG on 2026-08-21: gpg strips the padding from its
-        // output and sbx keeps it, so the two disagree about the message and agree about what it
-        // attests. This asserts the second half.
+        // section headers, `valid_until` trims its value. The two halves of the property live in
+        // two files, which is how one of them gets "simplified" away. GnuPG strips the padding from
+        // its output and sbx keeps it, so the two disagree about the message and agree about what
+        // it attests. This asserts the second half.
         let armored = include_str!("openpgp/clearsigned.txt");
         let key = openpgp::parse_public_key(include_str!("openpgp/key.asc")).expect("key parses");
         let padded = padded_on_the_right(armored);
