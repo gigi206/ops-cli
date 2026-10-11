@@ -152,12 +152,27 @@ impl Release {
     }
 
     /// Every call the fake macOS tools received, one per line.
+    #[track_caller]
     fn tool_calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.root.join("macbin").join(CALLS))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect()
+        self.calls_in("macbin")
+    }
+
+    /// Every call the stand-ins in `dir` logged, one per line; none when none of them ran.
+    ///
+    /// Read as bytes, then as text line by line: a call carries fixture paths, which need not be
+    /// UTF-8, while what a test looks for in it is plain text. A log that is there and cannot be
+    /// read fails the test, rather than reading as no call.
+    #[track_caller]
+    fn calls_in(&self, dir: &str) -> Vec<String> {
+        let log = self.root.join(dir).join(CALLS);
+        match std::fs::read(&log) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => panic!("read {}: {e}", log.display()),
+        }
     }
 
     /// A directory holding a `launchctl` that appends each call to [`Release::launchctl_calls`].
@@ -169,12 +184,9 @@ impl Release {
     }
 
     /// Every `launchctl` call the script made, one per line.
+    #[track_caller]
     fn launchctl_calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.root.join("launchbin").join(CALLS))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect()
+        self.calls_in("launchbin")
     }
 
     /// A directory holding a `limactl` that appends each call to [`Release::lima_calls`], and
@@ -190,12 +202,9 @@ impl Release {
     }
 
     /// Every `limactl` call the script made, one per line.
+    #[track_caller]
     fn lima_calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.root.join("limabin").join(CALLS))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect()
+        self.calls_in("limabin")
     }
 
     /// Make the releases API name `tag` as the newest stable release, in the shape GitHub prints.
