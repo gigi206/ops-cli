@@ -533,6 +533,43 @@ fn wrap_flake_equip_passes_quads_and_command_positionally() {
     assert_eq!(argv[13], OsString::from("-z"));
 }
 
+/// Every path the wrap interpolates reaches the shell as one word, whatever it holds: the out-link
+/// parent, `nix` and the coreutils it runs are read back as written even when their names carry a
+/// quote, a double quote or a blank.
+#[test]
+fn wrap_flake_equip_quotes_every_path_it_interpolates() {
+    let tmp = crate::testutil::TmpDir::new();
+    let tools = tmp.join("co'reutils \"bin\"");
+    std::fs::create_dir_all(&tools).unwrap();
+    let host = host_env_bin();
+    for name in ["env", "mkdir", "touch", "rm", "readlink", "ln"] {
+        std::os::unix::fs::symlink(host.with_file_name(name), tools.join(name)).unwrap();
+    }
+    let flake = tmp.join("it's \"flake\"");
+    let argv = wrap_flake_equip(
+        &tmp.join("ni'x"),
+        &PathBuf::from("bash"),
+        &tools.join("env"),
+        &flake,
+        &[],
+        vec![OsString::from("true")],
+    );
+
+    let out = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .output()
+        .expect("run the flake-equip script");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        flake.is_dir(),
+        "the out-link parent is made at the path it was given"
+    );
+}
+
 /// The host's coreutils `env`, whose siblings the wrap invokes by absolute path.
 ///
 /// The tests below really run the emitted script, so the helper paths baked into it have to name
