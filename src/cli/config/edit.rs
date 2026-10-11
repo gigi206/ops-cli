@@ -1351,7 +1351,12 @@ mod tests {
 
         // A program on an absolute entry is found, a builtin stays itself, and a first word holding
         // a `/` is taken as written; each still gets the file as its last argument.
-        let file_line = file.to_str().expect("a fixture path is UTF-8");
+        // Compared as bytes: the file is an argument, and its path need not be UTF-8.
+        let file_line = [
+            std::os::unix::ffi::OsStrExt::as_bytes(file.as_os_str()),
+            b":",
+        ]
+        .concat();
         for line in [
             "env printf %s:",
             "exec printf %s:",
@@ -1359,11 +1364,8 @@ mod tests {
         ] {
             let out = run(line);
             assert_eq!(
-                (
-                    out.status.code(),
-                    String::from_utf8_lossy(&out.stdout).into_owned()
-                ),
-                (Some(0), format!("{file_line}:")),
+                (out.status.code(), out.stdout.as_slice()),
+                (Some(0), file_line.as_slice()),
                 "{line}: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
@@ -1440,44 +1442,39 @@ mod tests {
         std::fs::create_dir(&own).unwrap();
         let sh = crate::pathfind::find_on_path("sh").expect("an `sh` on PATH");
         std::os::unix::fs::symlink(sh.canonicalize().unwrap(), own.join("sbx-own-sh")).unwrap();
-        let own = crate::sandbox::shell_quote(own.to_str().expect("a fixture path is UTF-8"));
-        let record = crate::sandbox::shell_quote(record.to_str().expect("a fixture path is UTF-8"));
-        let file_line = file.to_str().expect("a fixture path is UTF-8");
+        let own = crate::testutil::sh_word(&own);
+        let record = crate::testutil::sh_word(&record);
+        // What the record holds is compared as bytes: the file is an argument, and its path need
+        // not be UTF-8.
+        let file_bytes = std::os::unix::ffi::OsStrExt::as_bytes(file.as_os_str());
+        let with_file =
+            |before: &str, after: &str| [before.as_bytes(), file_bytes, after.as_bytes()].concat();
         for (line, expected) in [
             (
                 format!("sh {record} --flag"),
-                format!("--flag\n{file_line}\nunset\n"),
+                with_file("--flag\n", "\nunset\n"),
             ),
             (
                 format!("sh {record} \"a b\""),
-                format!("a b\n{file_line}\nunset\n"),
+                with_file("a b\n", "\nunset\n"),
             ),
             (
                 format!("sh {record} 2>/dev/null"),
-                format!("{file_line}\nunset\n"),
+                with_file("", "\nunset\n"),
             ),
-            (
-                format!("sh {record}; true"),
-                format!("{file_line}\nunset\n"),
-            ),
-            (format!("VAR=1 sh {record}"), format!("{file_line}\n1\n")),
-            (
-                format!("VAR=\"a b\" sh {record}"),
-                format!("{file_line}\na b\n"),
-            ),
+            (format!("sh {record}; true"), with_file("", "\nunset\n")),
+            (format!("VAR=1 sh {record}"), with_file("", "\n1\n")),
+            (format!("VAR=\"a b\" sh {record}"), with_file("", "\na b\n")),
             (
                 format!("PATH={own} sbx-own-sh {record}"),
-                format!("{file_line}\nunset\n"),
+                with_file("", "\nunset\n"),
             ),
         ] {
             let _ = std::fs::remove_file(&args);
             let (code, stderr) = run_editor_line(&line, &file, &[("SBX_TEST_ARGS", &args)]);
             assert_eq!(code, Some(0), "{line}: {stderr}");
-            assert_eq!(
-                std::fs::read_to_string(&args).unwrap_or_default(),
-                expected,
-                "{line}"
-            );
+            let got = std::fs::read(&args).unwrap_or_default();
+            assert_eq!(got, expected, "{line}: {}", String::from_utf8_lossy(&got));
         }
     }
 
