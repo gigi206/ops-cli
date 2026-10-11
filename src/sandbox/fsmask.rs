@@ -1886,30 +1886,36 @@ impl Drop for GitAsking {
 /// A path from git's configuration, as git answered it with `--type=path`, which has already
 /// expanded `~/`, `~user/` and `%(prefix)/`: a relative one against `base`, or `None` when it is
 /// relative and there is no base to read it against.
-fn git_config_path(value: &str, base: Option<&Path>) -> Option<PathBuf> {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        Some(path)
+fn git_config_path(value: &Path, base: Option<&Path>) -> Option<PathBuf> {
+    if value.is_absolute() {
+        Some(value.to_path_buf())
     } else {
-        base.map(|b| b.join(path))
+        base.map(|b| b.join(value))
     }
 }
 
 /// The host git's `core.hooksPath` for `repo`, resolved the way git resolves it for a working tree
 /// (a relative value against the top of the tree), or `None` when it is unset or cannot be asked
 /// ([`host_git_config`]).
+///
+/// The value is a path, taken as the bytes git answered. Read as text, a value that is not UTF-8
+/// was taken for an unset one, so the directory git runs hooks from was neither held nor refused.
 fn git_hooks_path(repo: &GitRepo) -> Result<Option<PathBuf>, String> {
+    use std::os::unix::ffi::OsStrExt as _;
     let Some(out) = host_git_config(repo, &["--type=path", "--get", "core.hooksPath"])? else {
         return Ok(None);
     };
-    let Ok(value) = String::from_utf8(out) else {
-        return Ok(None);
-    };
-    let value = value.trim_end_matches('\n');
+    let mut value = &out[..];
+    while let Some(rest) = value.strip_suffix(b"\n") {
+        value = rest;
+    }
     if value.is_empty() {
         return Ok(None);
     }
-    Ok(git_config_path(value, Some(&repo.work_tree)))
+    Ok(git_config_path(
+        Path::new(std::ffi::OsStr::from_bytes(value)),
+        Some(&repo.work_tree),
+    ))
 }
 
 /// The files the cage writes ([`Reach`]) that an `include.path` or `includeIf.<condition>.path`
@@ -2066,7 +2072,7 @@ fn include_masks(
         let base = origin
             .strip_prefix("file:")
             .and_then(|f| Path::new(f).parent().map(Path::to_path_buf));
-        let Some(path) = git_config_path(value, base.as_deref()) else {
+        let Some(path) = git_config_path(Path::new(value), base.as_deref()) else {
             continue;
         };
         let pattern = format!("{key} = {value}");
@@ -5425,6 +5431,35 @@ mod tests {
             );
             mend();
         }
+    }
+
+    /// A `core.hooksPath` whose name is not UTF-8 is still the directory git runs hooks from: held
+    /// read-only like any other, never read as unset.
+    #[test]
+    fn a_hooks_path_whose_name_is_not_utf8_is_held() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping a hooks path that is not UTF-8: no git on this host");
+            return;
+        };
+        let hooks = root
+            .canonicalize()
+            .unwrap()
+            .join(OsStr::from_bytes(b"ho\xffks"));
+        std::fs::create_dir_all(&hooks).unwrap();
+        assert!(git(&git_args![
+            "config",
+            "core.hooksPath",
+            hooks.as_os_str()
+        ]));
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        assert!(
+            e.readonly.iter().any(|m| m.path == hooks && m.is_dir),
+            "{:?}",
+            e.readonly
+        );
     }
 
     /// A path in git's configuration is read as git reads it: `~user/` against that user's home,
