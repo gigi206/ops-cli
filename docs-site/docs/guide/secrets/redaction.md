@@ -78,6 +78,16 @@ fails-closed on large uploads or is beaten by padding. Scanning the head covers
 where a leaked credential naturally lands (a header, a query string); the body is
 left to the structural boundary below.
 
+The fields a request sends after its body are held to the head's scan. An
+HTTP/2 request may end with **trailers**, and those arrive whole, so the reason
+the body goes unscanned does not reach them. A trailer carrying a secret is not
+forwarded. The head and body are upstream by then, so the proxy resets the
+request there rather than finishing it, answers `403 outbound-secret` if no
+response has started, and logs the refusal beside the request's allow. A request
+whose response ended before its trailers arrived is reset all the same, with no
+log line. An HTTP/1.1 request's trailers never leave: the proxy re-frames a
+chunked body without them.
+
 ## Inbound: mask a secret a target reflects back
 
 The one place a configured secret can legitimately re-enter the cage is a
