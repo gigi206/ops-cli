@@ -272,8 +272,9 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         write_exec(&dir.join("outside"));
         let dirs = || std::iter::once(bin.clone());
-        let absolute = dir.join("outside");
-        for name in [absolute.to_str().unwrap(), "../outside", "", ".", ".."] {
+        // An absolute name is a host program that exists, so a search that joined it would find it;
+        // a name is text, and the fixture's own path need not be.
+        for name in ["/bin/sh", "../outside", "", ".", ".."] {
             assert_eq!(find_in_dirs(name, dirs(), None), None, "{name:?} was found");
             assert!(
                 find_all_in_dirs(name, dirs(), None).is_empty(),
