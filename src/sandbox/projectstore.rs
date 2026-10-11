@@ -875,29 +875,15 @@ fn load_db_once(
     nix_dir: &OwnedFd,
     closure: &[PathBuf],
 ) -> io::Result<()> {
-    use std::process::{Command, Stdio};
-    let mut dump = Command::new(engine.nix_store)
-        .env("NIX_REMOTE", "")
+    let mut dump = std::process::Command::new(engine.nix_store);
+    dump.env("NIX_REMOTE", "")
         .arg("--store")
         .arg(shared_store)
         .arg("--dump-db")
-        .args(closure)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    #[expect(
-        clippy::expect_used,
-        reason = "the child was spawned with `stdout(Stdio::piped())` three lines above and \
-                  nothing takes the handle first"
-    )]
-    let dump_out = dump.stdout.take().expect("stdout was requested as a pipe");
-    // The reader child consumes the pipe directly, so a large dump never blocks on
-    // a full pipe buffer; reap the writer only once the reader has finished.
-    let load = load_command(engine, nix_dir)?
-        .stdin(Stdio::from(dump_out))
-        .stderr(Stdio::piped())
-        .output()?;
-    let dump_status = dump.wait()?;
+        .args(closure);
+    // Built before the dump starts, so a registration cage that cannot be built leaves nothing
+    // running.
+    let (dump_status, load) = run_piped(dump, load_command(engine, nix_dir)?)?;
     // Attribute the failure to the LOAD half first, with its captured stderr — it is the consumer,
     // and every real failure is best explained by its reason: a lock loss makes `load` exit
     // non-zero after draining (dump exits 0), and a `load` that dies *early* makes `dump` then hit
@@ -921,6 +907,43 @@ fn load_db_once(
         return Err(io::Error::other("nix-store --dump-db failed"));
     }
     Ok(())
+}
+
+/// Run `load` reading what `dump` writes, its stderr captured, and return how `dump` exited and what
+/// `load` left. `dump`'s stderr is the caller's.
+///
+/// The reader consumes the pipe directly, so a large dump never blocks on a full pipe buffer, and
+/// the writer is waited for once the reader has finished. It is waited for on every path: a `load`
+/// that cannot be started reads nothing, so `dump` is killed and then reaped rather than left
+/// running, or unreaped once it ends.
+fn run_piped(
+    mut dump: std::process::Command,
+    mut load: std::process::Command,
+) -> io::Result<(std::process::ExitStatus, std::process::Output)> {
+    use std::process::Stdio;
+    let mut dump = dump
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    #[expect(
+        clippy::expect_used,
+        reason = "the child was spawned with `stdout(Stdio::piped())` just above and nothing \
+                  takes the handle first"
+    )]
+    let dump_out = dump.stdout.take().expect("stdout was requested as a pipe");
+    let load = match load
+        .stdin(Stdio::from(dump_out))
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(load) => load,
+        Err(e) => {
+            let _ = dump.kill();
+            let _ = dump.wait();
+            return Err(e);
+        }
+    };
+    Ok((dump.wait()?, load))
 }
 
 /// Where the registration's cage sees the project's store: the `--store` it names, with the
@@ -2542,6 +2565,41 @@ mod tests {
             b"payload",
             "the path did not land in the directory the walk checked"
         );
+    }
+
+    /// A dump whose reader cannot be started is killed and reaped, not left running, or unreaped
+    /// once it ends, for as long as sbx runs.
+    #[test]
+    fn a_dump_whose_reader_cannot_start_is_reaped() {
+        let base = TmpDir::new();
+        // The kernel names a process after the file it was started from, a link included, which
+        // tells this dump apart from every other child of the test process.
+        let name = "unreaped-dump";
+        let shell = base.join(name);
+        symlink("/bin/sh", &shell).unwrap();
+        let mut dump = std::process::Command::new(&shell);
+        dump.args(["-c", "echo dump"]);
+
+        let err = run_piped(dump, std::process::Command::new(base.join("no-such-load")))
+            .expect_err("a reader that does not exist cannot be started");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        let left = children_named(name);
+        assert!(left.is_empty(), "the dump is still a child, pid {left:?}");
+    }
+
+    /// The pids of this process's children named `comm`, a child that has ended and is not reaped
+    /// included.
+    fn children_named(comm: &str) -> Vec<u32> {
+        let me = std::process::id();
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|&pid| super::super::attach::read_ppid(pid) == Some(me))
+            .filter(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .is_ok_and(|name| name.trim_end() == comm)
+            })
+            .collect()
     }
 
     #[test]
