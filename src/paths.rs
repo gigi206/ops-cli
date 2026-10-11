@@ -936,7 +936,7 @@ mod tests {
         std::fs::create_dir_all(projects.join("idleid")).unwrap();
         std::fs::write(
             projects.join("idleid").join(crate::sandbox::PROJECT_MARKER),
-            real_proj.to_string_lossy().as_bytes(),
+            std::os::unix::ffi::OsStrExt::as_bytes(real_proj.as_os_str()),
         )
         .unwrap();
         // dead: marker points at a gone path whose parent still exists (the parent-exists guard
@@ -946,7 +946,7 @@ mod tests {
         std::fs::create_dir_all(projects.join("deadid")).unwrap();
         std::fs::write(
             projects.join("deadid").join(crate::sandbox::PROJECT_MARKER),
-            workspace.join("gone-proj").to_string_lossy().as_bytes(),
+            std::os::unix::ffi::OsStrExt::as_bytes(workspace.join("gone-proj").as_os_str()),
         )
         .unwrap();
         // markerless: no marker file.
@@ -1018,7 +1018,7 @@ mod tests {
         std::fs::create_dir_all(projects.join("hereid")).unwrap();
         std::fs::write(
             projects.join("hereid").join(crate::sandbox::PROJECT_MARKER),
-            here.to_string_lossy().as_bytes(),
+            std::os::unix::ffi::OsStrExt::as_bytes(here.as_os_str()),
         )
         .unwrap();
         // An unrelated tree, so the test is discriminating: only `hereid` should be `current`.
