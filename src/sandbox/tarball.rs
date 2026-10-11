@@ -301,7 +301,8 @@ mod tests {
     ///
     /// The text assertions elsewhere pin the expression; this runs the half of it that decides
     /// where the program ends up. `makeWrapper` is a shell function printing its source, `$out` is
-    /// a plain directory and nix's `${…}` interpolations are flattened to a literal path —
+    /// a plain directory named relative to `work`, which the phase runs from, and nix's `${…}`
+    /// interpolations are flattened to a literal path —
     /// everything else (the hoist, the `find` passes, the refusals) is the shipped snippet
     /// verbatim, so a layout that breaks here breaks a real build.
     fn install_on(work: &Path, files: &[(&str, bool)]) -> Result<String, String> {
@@ -341,14 +342,18 @@ mod tests {
             .split_once("\n  '';")
             .expect("the installPhase is terminated")
             .0;
+        // `$out` is relative, `out` below `work`, and the phase runs from `work`. The phase
+        // expands `$out` unquoted, which the store path a build is given makes safe, since it
+        // holds no blank and no quote; a fixture root may hold either, and `out` holds neither
+        // wherever `work` sits. The phase itself never changes directory.
         let script = format!(
-            "set -e\ncd {}\nout=$PWD/out\nmakeWrapper() {{ echo \"WRAPPED $1\"; }}\n{}\n",
-            work.display(),
+            "set -e\nout=out\nmakeWrapper() {{ echo \"WRAPPED $1\"; }}\n{}\n",
             flatten_nix_interpolations(body),
         );
         let out = std::process::Command::new("bash")
             .arg("-c")
             .arg(&script)
+            .current_dir(work)
             .output()
             .expect("bash runs");
         let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
