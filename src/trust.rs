@@ -1308,8 +1308,11 @@ mod tests {
             &cfg,
             format!(
                 "[secret.\"api.example.com\"]\nfrom = \"sops://secrets/prod.enc.yaml#tok\"\n\
-                 [task.t]\ncmd = [\"true\"]\n[task.t.secret]\nX = \"sops://{}#k\"\n",
-                outside.join("far.enc.yaml").display()
+                 [task.t]\ncmd = [\"true\"]\n[task.t.secret]\nX = {}\n",
+                toml::Value::String(format!(
+                    "sops://{}#k",
+                    outside.join("far.enc.yaml").display()
+                ))
             ),
         )
         .unwrap();
