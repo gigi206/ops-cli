@@ -1916,7 +1916,10 @@ mod tests {
         let path = dir.join("nix-store");
         std::fs::write(
             &path,
-            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", ran.display()),
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {}\n",
+                crate::testutil::sh_word(ran)
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
