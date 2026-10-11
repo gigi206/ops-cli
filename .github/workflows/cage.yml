@@ -42,13 +42,11 @@
 # ask, and answers it the reassuring way.
 #
 # WHEN IT RUNS. `schedule` and `workflow_dispatch` only exist once a workflow is on the repository's
-# DEFAULT branch, so on a development branch neither fires. That left `push` as the only live
-# trigger, and it was narrowed to this file alone -- enough to measure the run while it was being
-# built, and nothing after. Measured on 2026-08-21: nine runs, all of them on 2026-08-20, none
-# since. A run that never fires provides no coverage, whatever it would provide if it did, and the
-# suites it exists for were being exercised on exactly one machine: the author's.
+# DEFAULT branch, so on a development branch neither fires and `push` is the only live trigger. A
+# run that never fires provides no coverage, whatever it would provide if it did, and the suites it
+# exists for would then be exercised on exactly one machine: the author's.
 #
-# So `push` now names the paths that can change what these suites measure: what `ci.yml` calls a
+# So `push` names the paths that can change what these suites measure: what `ci.yml` calls a
 # core change (`src/**`, `proc-shim/**`, `Cargo.toml`, `Cargo.lock`, `build.rs`, and the shared
 # test helpers under `tests/`), and the suites themselves. A push wide enough to make `ci.yml` run
 # its full selection is wide enough to deserve a cage run, and so is one that changes a suite:
@@ -56,9 +54,9 @@
 # meet a cage only on the nightly `schedule`, which fires on the default branch alone. `concurrency`
 # above cancels a superseded run, so a burst of pushes costs one run and not one per commit.
 #
-# What that costs, measured rather than estimated: a green run took 31 to 37 minutes (2026-08-20,
-# both arms). This is a signal, not a gate -- nothing waits on it, and its value is the skip count
-# it reports, which is the only place in this repository where that number is measured at all.
+# What that costs: a green run takes about an hour. This is a signal, not a gate -- nothing waits
+# on it, and its value is the skip count it reports, which is the only place in this repository
+# where that number is measured at all.
 
 name: Cage
 
@@ -129,17 +127,15 @@ jobs:
         # binds. `dbus-user-session` brings the user manager's own bus, which the resource-limit
         # path gates on -- see the session step below.
         #
-        # `socat` was added on 2026-08-21, and it is the cheapest line in this file: the previous
-        # green run reported 25 tests that returned without running, and **15 of them named this one
-        # tool** (`task_control.rs`, the task-plane client fixture, which wants `bash`, `socat` and
-        # `head` together -- only `socat` is absent from a runner image). Read from that run's own
-        # skip report, not guessed: the report exists so a number like that is visible instead of
-        # being carried in someone's head.
+        # `socat` is the cheapest line in this file: the task-plane client fixture
+        # (`task_control/tests.rs`) wants `bash`, `socat` and `head` together, only `socat` is
+        # absent from a runner image, and without it every test built on that fixture returns
+        # without running.
         #
         # `nftables` brings `nft`, which installs the capture tap's redirect. Without it a launch
         # wires no tap and says nothing, and the tap's two tests (in `netns`, and the tap e2e in
-        # `run`) return without running. Added on 2026-09-25 ahead of any skip report: whether the
-        # image already carries `nft` could not be read, and the package costs nothing if it does.
+        # `run`) return without running. It is installed unconditionally: the package costs
+        # nothing on an image that already carries `nft`.
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -333,11 +329,10 @@ jobs:
   # A host that restricts unprivileged user namespaces, kept that way. Ubuntu 24.04 and later ship
   # `kernel.apparmor_restrict_unprivileged_userns=1`, and the `sbx` binary carries no AppArmor
   # profile. Whether the host's `bwrap` carries one depends on the release: 26.04 ships
-  # `bwrap-userns-restrict`, the 24.04 image does not (measured on 2026-09-29). Every other job
-  # here lifts the knob, so neither shape was ever launched by any run, and on 2026-09-29 it turned
-  # out that on the first one no cage started at all while `doctor` reported "prerequisites OK":
-  # the launch gate asked a user namespace of sbx's own, and the netns holder after it stopped the
-  # launch with rc 125.
+  # `bwrap-userns-restrict`, the 24.04 image does not. Every other job here lifts the knob, so this
+  # job is the only one that launches either shape. The failure it guards against is a host where no
+  # cage starts while `doctor` reports "prerequisites OK": a launch gate that asks for a user
+  # namespace of sbx's own is answered, and the netns holder after it stops the launch with rc 125.
   #
   # So this job keeps the knob at 1 and asserts what each image owes, keyed on the matrix rather
   # than on what the run finds, so an image that changes shape fails here instead of switching to
