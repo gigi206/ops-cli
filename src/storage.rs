@@ -428,7 +428,11 @@ fn unescape_mountinfo(s: &str) -> String {
 /// function cannot answer, and `Ok(None)` is the one answer it may not invent: [`state`] turns it
 /// into [`State::Detached`], the invitation to attach a second time. This is the stance the
 /// `mountinfo` read in [`state`] already takes.
+///
+/// A backing file is read as the bytes the kernel wrote, a path, which need not be UTF-8: read as
+/// text, one loop device backed by such a path, sbx's or anyone's, failed the whole scan.
 pub(crate) fn loop_for(image: &Path, sys_block: &Path) -> io::Result<Option<String>> {
+    use std::os::unix::ffi::OsStrExt as _;
     let entries = match std::fs::read_dir(sys_block) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -442,7 +446,7 @@ pub(crate) fn loop_for(image: &Path, sys_block: &Path) -> io::Result<Option<Stri
             continue;
         }
         let backing = e.path().join("loop/backing_file");
-        let target = match std::fs::read_to_string(&backing) {
+        let target = match std::fs::read(&backing) {
             Ok(target) => target,
             // `loop/` exists only for a bound device, so a free `loopN` has no `backing_file`.
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -454,16 +458,25 @@ pub(crate) fn loop_for(image: &Path, sys_block: &Path) -> io::Result<Option<Stri
         // `same_file` canonicalized a name that does not exist. The name as recorded is therefore
         // tried before the name with the marker removed, and a missed match here is the second
         // attachment this function exists to prevent.
-        let target = target.trim_end_matches('\n');
-        let candidates = [target, target.trim_end_matches(" (deleted)")];
-        if candidates
-            .iter()
-            .any(|t| Path::new(t) == image || same_file(Path::new(t), &canonical_image))
-        {
+        let target = trim_end_all(&target, b"\n");
+        let candidates = [target, trim_end_all(target, b" (deleted)")];
+        if candidates.iter().any(|t| {
+            let t = Path::new(std::ffi::OsStr::from_bytes(t));
+            t == image || same_file(t, &canonical_image)
+        }) {
             return Ok(Some(format!("/dev/{}", name.to_string_lossy())));
         }
     }
     Ok(None)
+}
+
+/// `bytes` with every trailing repetition of `suffix` taken off, as `str::trim_end_matches` takes
+/// them off a string.
+fn trim_end_all<'a>(mut bytes: &'a [u8], suffix: &[u8]) -> &'a [u8] {
+    while let Some(rest) = bytes.strip_suffix(suffix) {
+        bytes = rest;
+    }
+    bytes
 }
 
 /// Whether a backing-file path resolves to the same file as `canonical_image`, the image's
@@ -1883,6 +1896,35 @@ this line has no separator at all
             loop_for(Path::new("/nowhere.img"), &sys).unwrap(),
             None,
             "an unbacked image must report no device, or `up` would mount someone else's"
+        );
+    }
+
+    /// A loop device backed by a path that is not UTF-8 — another user's, or sbx's own under such a
+    /// home — is read as the path it is: it does not fail the scan, and it does not hide the image,
+    /// whose own name here is not UTF-8 either.
+    #[test]
+    fn a_backing_file_that_is_not_utf8_neither_fails_the_scan_nor_hides_the_image() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let base = crate::testutil::TmpDir::new();
+        let sys = base.path().join("block");
+        let image = base
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"vol\xff.btrfs"));
+        let foreign = sys.join("loop0").join("loop");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("backing_file"), b"/media/caf\xe9/disk.img\n").unwrap();
+        // Alone first, so the scan cannot have answered from the image's device before it reached
+        // this one: what is pinned is that such an entry does not fail the scan.
+        assert_eq!(loop_for(&image, &sys).unwrap(), None);
+
+        let ours = sys.join("loop9").join("loop");
+        std::fs::create_dir_all(&ours).unwrap();
+        let mut backing = image.as_os_str().as_encoded_bytes().to_vec();
+        backing.push(b'\n');
+        std::fs::write(ours.join("backing_file"), backing).unwrap();
+        assert_eq!(
+            loop_for(&image, &sys).unwrap().as_deref(),
+            Some("/dev/loop9")
         );
     }
 
