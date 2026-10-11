@@ -3785,7 +3785,7 @@ mod tests {
                 // `printf '%s'` rather than `echo -n`: the `-n` flag is not POSIX, and this
                 // script now runs under `/bin/sh`.
                 "printf '%s\\n' \"$*\" > {}\nprintf '%s' 'ghp-the-secret-value'",
-                args_log.display()
+                crate::testutil::sh_word(&args_log)
             ),
         );
         let file = dir.join("prod.enc.yaml");
@@ -3870,11 +3870,11 @@ mod tests {
         fake_sops(
             dir,
             &format!(
-                "for a; do last=$a; done\nprintf %s \"$last\" > '{}'\ncat \"$last\" > '{}'\n\
-                 pwd > '{}'\necho value",
-                arg.display(),
-                seen.display(),
-                cwd.display()
+                "for a; do last=$a; done\nprintf %s \"$last\" > {}\ncat \"$last\" > {}\n\
+                 pwd > {}\necho value",
+                crate::testutil::sh_word(&arg),
+                crate::testutil::sh_word(&seen),
+                crate::testutil::sh_word(&cwd)
             ),
         )
     }
