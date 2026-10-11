@@ -108,7 +108,7 @@ fn test_paths_named_by_ci() -> Vec<(String, String)> {
 
     let mut found = Vec::new();
     for file in files {
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        let Some(text) = read_listed(&file) else {
             continue;
         };
         let name = file
@@ -237,34 +237,98 @@ fn walk_sources_with_paths() -> Vec<(PathBuf, String)> {
     ["src", "tests"]
         .iter()
         .flat_map(|dir| files_under(&root().join(dir), &["rs"]))
-        .filter_map(|path| Some((path.clone(), std::fs::read_to_string(&path).ok()?)))
+        .filter_map(|path| Some((path.clone(), read_listed(&path)?)))
         .collect()
 }
 
-/// Every file under `dir`, at any depth, whose extension is one of `extensions`.
+/// The text of `path`, a file a walk listed, or `None` when it has gone since. Any other error fails
+/// the guard by the file's name: a file these guards cannot read is one they would pass over, and a
+/// guard that reads less than the tree passes on what it did not see.
+fn read_listed(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("`{}` cannot be read: {e}", path.display()),
+    }
+}
+
+/// Every regular file under `dir`, at any depth, whose extension is one of `extensions`. A
+/// directory that cannot be read fails the guard by its name, as [`read_listed`] does a file.
 ///
-/// A directory is told by the entry's own type, which a link does not take from what it names, so a
-/// link to a directory is not descended: one pointing back up the tree would otherwise send the walk
-/// round it, listing each file once per turn until the kernel refuses the path, and two such links
-/// double that at every turn.
+/// Both are told by the entry's own type, which a link does not take from what it names. A link to
+/// a directory is not descended: one pointing back up the tree would otherwise send the walk round
+/// it, listing each file once per turn until the kernel refuses the path, and two such links double
+/// that at every turn. A link is not listed either, so a dangling one, such as the lock an editor
+/// leaves beside a file it holds, is no file to read.
 fn files_under(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
+    let unreadable = |e: std::io::Error| -> ! { panic!("`{}` cannot be read: {e}", dir.display()) };
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| unreadable(e)) {
+        let entry = entry.unwrap_or_else(|e| unreadable(e));
         let path = entry.path();
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+        let kind = entry
+            .file_type()
+            .unwrap_or_else(|e| panic!("`{}` cannot be read: {e}", path.display()));
+        if kind.is_dir() {
             out.extend(files_under(&path, extensions));
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| extensions.contains(&e))
+        } else if kind.is_file()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| extensions.contains(&e))
         {
             out.push(path);
         }
     }
     out
+}
+
+/// A directory or a file these guards cannot read fails them by its name, rather than leaving them
+/// to pass on the part of the tree they read.
+#[test]
+fn what_the_walk_cannot_read_fails_it_by_name() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root reads either regardless of its mode.
+    // SAFETY: `geteuid` takes no argument and only reads this process's effective uid.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let tmp = crate::testutil::TmpDir::new();
+    let shut = tmp.join("shut");
+    std::fs::create_dir(&shut).unwrap();
+    let sealed = tmp.join("sealed.rs");
+    std::fs::write(&sealed, "").unwrap();
+    for path in [&shut, &sealed] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let message = |outcome: std::thread::Result<()>| -> String {
+        let payload = outcome.expect_err("an unreadable entry must fail the walk");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default()
+    };
+    let dir = tmp.path().to_path_buf();
+    let walked = std::panic::catch_unwind(|| drop(files_under(&dir, &["rs"])));
+    let read = std::panic::catch_unwind(|| drop(read_listed(&sealed)));
+    // Given back before anything is asserted, so a failing run leaves a fixture it can remove.
+    for path in [&shut, &sealed] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let (walked, read) = (message(walked), message(read));
+    assert!(
+        walked.contains(&format!("`{}` cannot be read", shut.display())),
+        "{walked}"
+    );
+    assert!(
+        read.contains(&format!("`{}` cannot be read", sealed.display())),
+        "{read}"
+    );
+    assert_eq!(
+        read_listed(&tmp.join("gone.rs")),
+        None,
+        "a file gone since it was listed is no failure"
+    );
 }
 
 /// A link back up the tree is not followed: the walk lists each file once and ends.
