@@ -33,23 +33,13 @@ fn guide() -> PathBuf {
 /// and the resulting check would be wrong in a way that looks like a documentation gap. The path
 /// rides along so a check that finds a bad line can name where it is.
 fn guide_pages() -> Vec<(PathBuf, String)> {
-    fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "md") {
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
-                out.push((path, text));
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(&guide(), &mut out);
-    out
+    crate::testutil::files_under(&guide(), &["md"])
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            (path, text)
+        })
+        .collect()
 }
 
 /// The `.md` stems of one guide directory, without their extension.
@@ -61,8 +51,10 @@ fn page_stems(subdir: &str) -> BTreeSet<String> {
             guide().display()
         );
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|e| panic!("the guide's `{subdir}/` cannot be listed: {e}"))
+            .path();
         if path.extension().is_some_and(|e| e == "md")
             && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
         {
@@ -639,11 +631,8 @@ fn every_shipped_app_profile_is_in_the_catalogue() {
 
     let mut missing = Vec::new();
     let mut seen = 0usize;
-    for entry in std::fs::read_dir(&dir)
-        .expect("the shipped profiles are readable")
-        .flatten()
-    {
-        let path = entry.path();
+    for entry in std::fs::read_dir(&dir).expect("the shipped profiles are readable") {
+        let path = entry.expect("a shipped profile's entry is readable").path();
         if !path.extension().is_some_and(|e| e == "toml") {
             continue;
         }
@@ -1083,22 +1072,11 @@ const QUOTED_WINDOW: usize = 12;
 
 /// Every `.rs` file under `src/`, concatenated: the corpus a quoted guide line is checked against.
 fn rust_sources() -> String {
-    fn walk(dir: &Path, out: &mut String) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
-                out.push('\n');
-            }
-        }
-    }
     let mut out = String::new();
-    walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+    for path in crate::testutil::crate_sources() {
+        out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+        out.push('\n');
+    }
     out
 }
 
@@ -1241,25 +1219,7 @@ fn the_guide_writes_no_em_dash_outside_the_output_it_quotes() {
 /// concatenation, and a gap whose sentence is shorter than four words.
 #[test]
 fn no_message_literal_runs_its_indentation_through_a_sentence() {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-    let mut paths = Vec::new();
-    walk(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut paths,
-    );
-    paths.sort();
+    let paths = crate::testutil::crate_sources();
 
     // The crate's regex has no look-around, so the letters bounding the gap are part of the match
     // and the prefix is taken one byte past its start.
@@ -1403,23 +1363,8 @@ fn module_level_items() -> Vec<ItemDoc> {
     let mod_tests = regex::Regex::new(r"^\s*(?:#\[cfg\(test\)\]\s*)?mod\s+tests\s*\{")
         .expect("the tests pattern compiles");
 
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut paths = Vec::new();
-    walk(&root, &mut paths);
-    paths.sort();
+    let paths = crate::testutil::crate_sources();
 
     let is_attr = |l: &str| l.trim_start().starts_with("#[") || l.trim_start().starts_with("#![");
     let is_doc = |l: &str| l.trim_start().starts_with("///");
@@ -1542,23 +1487,9 @@ const DOC_ABBREVIATIONS: &[&str] = &["e.g.", "i.e.", "etc.", "vs.", "cf."];
 
 /// Every `.rs` file under `src/` and `tests/`, as its repo-relative path and its contents.
 fn crate_and_test_sources() -> Vec<(String, String)> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut paths = Vec::new();
-    walk(&root.join("src"), &mut paths);
-    walk(&root.join("tests"), &mut paths);
+    let mut paths = crate::testutil::crate_sources();
+    paths.extend(crate::testutil::files_under(&root.join("tests"), &["rs"]));
     paths.sort();
     paths
         .into_iter()
