@@ -1,10 +1,10 @@
 //! Asks every shipped profile's vendor whether the package it names can still be resolved.
 //!
-//! **The problem this exists for, with its cost.** `aionui` named `deb:github:iOfficeAI/AionUi`,
-//! which resolves through the latest release's linux-amd64 asset. Upstream stopped attaching assets
-//! on 2026-08-05, and the app could be neither launched nor upgraded from that day. It was found on
-//! 2026-08-21, by launching it. Nothing in this repository asks a vendor anything: the six
-//! `every_shipped_*` guards read files, and a file cannot say that the thing it points at is gone.
+//! **The problem this exists for.** A shipped profile can name a package its vendor no longer
+//! publishes: a `deb:github:<owner>/<repo>` source resolves through the latest release's
+//! linux-amd64 asset, and a vendor that stops attaching assets leaves the app impossible to launch
+//! or upgrade. Nothing else in this repository asks a vendor anything: the `every_shipped_*` guards
+//! read files, and a file cannot say that the thing it points at is gone.
 //!
 //! **Why it cannot live in the ordinary suite.** Every check here is a network call to a third
 //! party. `cargo test` runs offline, on contributors' machines and in a hosted job that has no
