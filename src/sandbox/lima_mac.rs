@@ -208,8 +208,8 @@ mod tests {
         std::fs::write(
             &stand_in,
             format!(
-                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\n",
-                recorded.display()
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > {}\n",
+                crate::testutil::sh_word(&recorded)
             ),
         )
         .unwrap();
@@ -222,7 +222,7 @@ mod tests {
         );
         std::fs::write(
             &bridge,
-            script.replace("/usr/bin/osascript", stand_in.to_str().unwrap()),
+            script.replace("/usr/bin/osascript", &crate::testutil::sh_word(&stand_in)),
         )
         .unwrap();
         let state = dir.path().join("state");
