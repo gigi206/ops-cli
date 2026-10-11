@@ -38,11 +38,29 @@ fn quote(value: &Path) -> String {
     format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"))
 }
 
+/// `path` as socat reads it in an address: its separators `:` and `,`, the `!` of its `!!`, the
+/// quotes and brackets it pairs, and `\` itself, each escaped with a `\`, so the address names the
+/// path as it is. The launch passes a constant that holds none of them.
+fn socat_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(
+            c,
+            '\\' | '"' | '\'' | ':' | ',' | '!' | '(' | ')' | '[' | ']' | '{' | '}'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Render the in-cage task client.
 ///
 /// Every external command is named by absolute path: the agent owns `PATH` inside the cage, and a
 /// client that resolved `head` through it would break — or behave differently — for reasons that
-/// have nothing to do with the task plane.
+/// have nothing to do with the task plane. The socket is used only inside socat addresses, so it is
+/// written as one ([`socat_path`]).
 pub(crate) fn render(bash: &Path, socat: &Path, head: &Path, socket: &str) -> String {
     format!(
         r##"#!{bash}
@@ -377,7 +395,7 @@ case ${{1-}} in
 esac
 "##,
         bash = bash.display(),
-        socket = quote(Path::new(socket)),
+        socket = quote(Path::new(&socat_path(socket))),
         socat = quote(socat),
         head = quote(head),
     )
@@ -496,6 +514,23 @@ mod tests {
     fn an_interpolated_path_cannot_escape_its_quoting() {
         let quoted = quote(&PathBuf::from("/store/it's/bin/socat"));
         assert_eq!(quoted, r"'/store/it'\''s/bin/socat'");
+    }
+
+    // The socket reaches socat through its address grammar, which splits on `:` and `,`, stops at
+    // `!!`, and pairs quotes and brackets: each of those, and `\`, is escaped, and nothing else is.
+    #[test]
+    fn the_socket_is_written_as_socat_reads_an_address() {
+        assert_eq!(
+            socat_path(r#"/r/a b/q"b\s/it's/c:o,m!!(x)[y]{z}%41/sock"#),
+            r#"/r/a b/q\"b\\s/it\'s/c\:o\,m\!\!\(x\)\[y\]\{z\}%41/sock"#
+        );
+        let script = render(
+            Path::new("/store/bash/bin/bash"),
+            Path::new("/store/socat/bin/socat"),
+            Path::new("/store/coreutils/bin/head"),
+            "/r/c:o/sock",
+        );
+        assert!(script.contains(r"sock='/r/c\:o/sock'"), "{script}");
     }
 
     /// Render the client with a **stub** in place of `socat` — a script that ignores its arguments
