@@ -1778,10 +1778,7 @@ mod tests {
         // not the path.
         let resolver = cage_spec_for(&plan_for(&p, "test://x")).expect("a resolver may name one");
         let argv = super::super::argv::to_argv(&resolver);
-        assert!(
-            argv.iter().any(|a| *a == *socket.to_string_lossy()),
-            "{argv:?}"
-        );
+        assert!(argv.iter().any(|a| a == socket.as_os_str()), "{argv:?}");
     }
 
     /// The ordering that makes this grant a *replacement*: a manifest which also binds the raw
@@ -1921,7 +1918,7 @@ mod tests {
             ]
         );
         // the plugin directory is bound read-only, the allow_path read-only (try)
-        assert!(contains_pair(&argv, "--ro-bind", &p.dir.to_string_lossy()));
+        assert!(contains_pair(&argv, "--ro-bind", &p.dir));
         assert!(contains_pair(&argv, "--ro-bind-try", "/home/u/.gnupg"));
         // the pass-through env is present, and structural HOME/PATH are set
         assert!(contains_pair(&env, "--setenv", "GNUPGHOME"));
@@ -2024,8 +2021,9 @@ mod tests {
 
     // --- helpers over the bwrap argv ------------------------------------------------
 
-    fn contains_pair(argv: &[OsString], flag: &str, first: &str) -> bool {
-        argv.windows(2).any(|w| w[0] == flag && w[1] == first)
+    fn contains_pair(argv: &[OsString], flag: &str, first: impl AsRef<std::ffi::OsStr>) -> bool {
+        argv.windows(2)
+            .any(|w| w[0] == flag && w[1] == first.as_ref())
     }
     fn contains_setenv(argv: &[OsString], key: &str, val: &str) -> bool {
         argv.windows(3)
@@ -2579,7 +2577,13 @@ printf 'run-%s' "$n""#,
         );
 
         // The control: an absolute configured value is both bound and passed.
-        p.host.env = vec![(VAR.to_string(), store.path().display().to_string())];
+        // A configured value is TOML text, so the control needs a fixture path that is text too.
+        let configured = store
+            .path()
+            .to_str()
+            .expect("a configured path is TOML text, which a path that is not UTF-8 cannot be")
+            .to_string();
+        p.host.env = vec![(VAR.to_string(), configured.clone())];
         std::fs::write(store.join("entry"), "the-fixture-wrote-this").unwrap();
         let (_dir2, mut reader) = fake_resolver_with(
             &format!("cat \"${VAR}/entry\""),
@@ -2588,7 +2592,7 @@ printf 'run-%s' "$n""#,
                 ..SandboxGrant::default()
             },
         );
-        reader.host.env = vec![(VAR.to_string(), store.path().display().to_string())];
+        reader.host.env = vec![(VAR.to_string(), configured)];
         assert_eq!(
             run(&bwrap, &reader, "test://x", &[]).expect("the resolver should run"),
             "the-fixture-wrote-this"
