@@ -284,7 +284,7 @@ fn every_config_field_is_shown_in_the_guide() {
                     format!("`{name}`"),
                 ]
                 .iter()
-                .any(|form| surface.contains(form))
+                .any(|form| shows(&surface, form))
             }
         })
         .map(|(name, _, _)| name.clone())
@@ -294,6 +294,33 @@ fn every_config_field_is_shown_in_the_guide() {
         "these config fields are never shown in a code block or a field table in the guide, so a \
          reader is never told how to write them: {missing:?}"
     );
+}
+
+/// Whether `text` holds `form` as a key would be written: a form that begins with a key's own
+/// characters must not be the tail of a longer key, so `rename = ` does not show `name`, nor
+/// `my-env = ` show `env`. A form that begins with punctuation (`[name]`, `.name.`) carries its
+/// own boundary.
+fn shows(text: &str, form: &str) -> bool {
+    let is_key_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    if !form.starts_with(is_key_char) {
+        return text.contains(form);
+    }
+    text.match_indices(form)
+        .any(|(at, _)| !text[..at].ends_with(is_key_char))
+}
+
+/// A field's assignment is shown only by its own key, never as the tail of a longer one.
+#[test]
+fn a_longer_key_does_not_show_the_field_it_ends_with() {
+    assert!(shows("name = \"x\"", "name ="));
+    assert!(shows("[app]\nname = 1", "name ="));
+    assert!(shows("app.name = 1", "name ="));
+    assert!(!shows("rename = 1", "name ="));
+    assert!(!shows("my-env = 1", "env ="));
+    assert!(!shows("allow_env = 1", "env ="));
+    assert!(!shows("v2env = 1", "env ="));
+    assert!(shows("rename = 1\nname = 2", "name ="));
+    assert!(shows("[plugin.vault]", "[plugin."));
 }
 
 /// Every root-level config field has a row in the configuration overview's field map.
