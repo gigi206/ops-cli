@@ -2103,8 +2103,14 @@ mod tests {
         let dir = TmpDir::new();
         let f = dir.join("val");
         std::fs::write(&f, b"1\n").unwrap();
-        assert_eq!(read_sysctl(f.to_str().unwrap()).as_deref(), Some("1"));
-        assert_eq!(read_sysctl(dir.join("nope").to_str().unwrap()), None);
+        // `read_sysctl` takes the `/proc/sys` paths sbx spells as text, so the fixture's must be too.
+        let text = |p: &std::path::Path| {
+            p.to_str()
+                .expect("read_sysctl reads a /proc/sys path, which sbx names as text")
+                .to_string()
+        };
+        assert_eq!(read_sysctl(&text(&f)).as_deref(), Some("1"));
+        assert_eq!(read_sysctl(&text(&dir.join("nope"))), None);
     }
 
     /// A path on Linux is bytes, which is why the entry point reads `args_os`. So a `--bind` on a
