@@ -90,11 +90,12 @@ pub(super) fn reserialize_upgrade(
         }
         // The client's own content codings, dropped so sbx's `identity` below is the only offer the
         // upstream sees — leaving the client's beside it would let the upstream honour `gzip` and
-        // hand the response mask bytes it cannot match.
+        // hand the response mask bytes it cannot match. Matched as the injected names are, `_` as
+        // `-`, so an `Accept_Encoding` a server folds onto the real header goes with them.
         if force_identity_encoding
             && IDENTITY_ENCODINGS
                 .iter()
-                .any(|(name, _)| k.eq_ignore_ascii_case(name))
+                .any(|(name, _)| header_name_eq(k, name))
         {
             continue;
         }
@@ -1183,6 +1184,9 @@ mod tests {
                 ("Connection".to_string(), "Upgrade".to_string()),
                 ("Accept-Encoding".to_string(), "gzip, br".to_string()),
                 ("Grpc-Accept-Encoding".to_string(), "gzip".to_string()),
+                // The same offers under the spelling a server may fold onto the real header.
+                ("Accept_Encoding".to_string(), "gzip".to_string()),
+                ("Grpc_Accept_Encoding".to_string(), "gzip".to_string()),
             ],
         };
         for scanned in [true, false] {
