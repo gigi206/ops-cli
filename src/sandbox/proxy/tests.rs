@@ -5569,6 +5569,162 @@ fn two_requests_carrying_the_same_credential_share_a_connection() {
     assert_eq!(upstream.connections(), 1);
 }
 
+/// A re-resolution landing while a request waits on the supervisor's check does not let the
+/// connection that request parks be offered to one carrying the value the re-resolution installed.
+///
+/// The pool key pairs the injection positions with the credential generation, because positions
+/// are equal across a re-resolution. Both have to describe the state the request carries: a key
+/// whose positions come from the request's snapshot and whose generation was read later, after a
+/// replacement, is the key every request under the new state builds too.
+///
+/// The supervisor's resolver installs the new state on its first call, during the first request's
+/// check: after that request took its snapshot and before its key is built.
+#[test]
+fn a_re_resolution_during_a_requests_check_does_not_share_its_connection_across_values() {
+    use super::inject::CredentialSet;
+
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) = reuse_ctx(
+        upstream_ca,
+        true,
+        vec![injection(
+            "upstream.test:*",
+            "Authorization",
+            "Bearer before",
+        )],
+    );
+    let installs = Arc::clone(&ctx.credentials);
+    let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    ctx.link
+        .judge()
+        .expect("a test proxy carries its own judge")
+        .set_resolver(Arc::new(move |_| {
+            if first.swap(false, Ordering::SeqCst) {
+                installs.replace(CredentialSet {
+                    injections: vec![injection(
+                        "upstream.test:*",
+                        "Authorization",
+                        "Bearer after",
+                    )],
+                    needles: Vec::new(),
+                });
+            }
+            Ok(vec![IpAddr::from([127, 0, 0, 1])])
+        }));
+    through_proxy_repeatedly(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[
+            b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        ],
+    )
+    .unwrap();
+    let heads: Vec<String> = upstream
+        .heads()
+        .iter()
+        .map(|h| h.to_ascii_lowercase())
+        .collect();
+    assert_eq!(
+        heads.len(),
+        2,
+        "both requests reached the upstream: {heads:?}"
+    );
+    assert!(
+        heads[0].contains("authorization: bearer before"),
+        "precondition: the first request carries the value it was admitted under: {heads:?}"
+    );
+    assert!(
+        heads[1].contains("authorization: bearer after"),
+        "precondition: the second carries the re-resolved one: {heads:?}"
+    );
+    assert_eq!(
+        upstream.connections(),
+        2,
+        "a connection that carried one value is not offered to a request carrying another"
+    );
+}
+
+/// [`a_re_resolution_during_a_requests_check_does_not_share_its_connection_across_values`], on the
+/// absolute-form plane, whose pool key is built the same way from its own snapshot.
+#[test]
+fn a_re_resolution_during_a_forwarded_requests_check_does_not_share_its_connection_across_values() {
+    use super::inject::CredentialSet;
+
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, _) = reuse_ctx(
+        upstream_ca,
+        true,
+        vec![injection(
+            "upstream.test:*",
+            "Authorization",
+            "Bearer before",
+        )],
+    );
+    let installs = Arc::clone(&ctx.credentials);
+    let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    ctx.link
+        .judge()
+        .expect("a test proxy carries its own judge")
+        .set_resolver(Arc::new(move |_| {
+            if first.swap(false, Ordering::SeqCst) {
+                installs.replace(CredentialSet {
+                    injections: vec![injection(
+                        "upstream.test:*",
+                        "Authorization",
+                        "Bearer after",
+                    )],
+                    needles: Vec::new(),
+                });
+            }
+            Ok(vec![IpAddr::from([127, 0, 0, 1])])
+        }));
+    for path in ["one", "two"] {
+        let port = addr.port();
+        let request = format!(
+            "GET https://upstream.test:{port}/{path} HTTP/1.1\r\nHost: upstream.test:{port}\r\n\r\n"
+        );
+        let bytes = request.into_bytes();
+        let head = parse_head(&bytes).unwrap();
+        let (method, target) = request_line_parts(&head.request_line).unwrap();
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        handle_https_forward(client, &head, &bytes, &method, &target, &ctx).unwrap();
+        let mut got = String::new();
+        peer.read_to_string(&mut got).unwrap();
+        assert!(
+            got.ends_with("hello"),
+            "the {path} request was answered: {got:?}"
+        );
+    }
+    let heads: Vec<String> = upstream
+        .heads()
+        .iter()
+        .map(|h| h.to_ascii_lowercase())
+        .collect();
+    assert_eq!(
+        heads.len(),
+        2,
+        "both requests reached the upstream: {heads:?}"
+    );
+    assert!(
+        heads[0].contains("authorization: bearer before"),
+        "precondition: the first request carries the value it was admitted under: {heads:?}"
+    );
+    assert!(
+        heads[1].contains("authorization: bearer after"),
+        "precondition: the second carries the re-resolved one: {heads:?}"
+    );
+    assert_eq!(
+        upstream.connections(),
+        2,
+        "a connection that carried one value is not offered to a request carrying another"
+    );
+}
+
 /// A response head only sbx can read must not become a connection both sides think they agree on.
 ///
 /// `Content-Length : 5` is malformed -- RFC 9112 §5.1 admits no whitespace before the colon -- and
