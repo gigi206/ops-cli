@@ -1156,8 +1156,35 @@ mod tests {
             rx.recv_timeout(FOLLOW_POLL * 4).is_err(),
             "a session the registry holds as running is followed"
         );
-        std::fs::remove_dir_all(data.join("sessions")).unwrap();
-        std::fs::write(data.join("sessions"), b"not a directory").unwrap();
+        // Exchanged for the file in one step: removing the directory and then writing the file
+        // leaves a moment in which the registry is absent, which reads as no session at all, and a
+        // follow that polls then ends at 0 as if the session had exited.
+        let unreadable = data.join("sessions.file");
+        std::fs::write(&unreadable, b"not a directory").unwrap();
+        let c_path = |p: &std::path::Path| {
+            use std::os::unix::ffi::OsStrExt as _;
+            std::ffi::CString::new(p.as_os_str().as_bytes()).expect("a path without NUL")
+        };
+        let (from, to) = (c_path(&unreadable), c_path(&data.join("sessions")));
+        // SAFETY: the raw `renameat2` is given its documented argument list, two
+        // `AT_FDCWD`-relative paths and the `RENAME_EXCHANGE` flag; both `CString`s outlive the
+        // call and the kernel only reads them.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "exchange the registry for a file: {}",
+            std::io::Error::last_os_error()
+        );
         let ended = rx.recv_timeout(Duration::from_secs(10));
         assert!(ended == Ok(ExitCode::FAILURE), "{ended:?}");
     }
