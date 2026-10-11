@@ -2281,7 +2281,12 @@ mod tests {
         let dir = crate::testutil::TmpDir::new();
         let file = dir.join("ov.toml");
         std::fs::write(&file, b"network = \"none\"\n").unwrap();
-        let arg = format!("@{}", file.display());
+        let arg = format!(
+            "@{}",
+            file.to_str().expect(
+                "`--config @<file>` takes its path as text: the CLI refuses one that is not"
+            )
+        );
         let ov = collect_cli(Cli {
             config: &[&arg],
             ..Default::default()
@@ -2350,7 +2355,12 @@ mod tests {
         let file = dir.join("loose.toml");
         std::fs::write(&file, b"network = \"none\"\n").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
-        let arg = format!("@{}", file.display());
+        let arg = format!(
+            "@{}",
+            file.to_str().expect(
+                "`--config @<file>` takes its path as text: the CLI refuses one that is not"
+            )
+        );
 
         let err = collect_cli(Cli {
             config: &[&arg],
