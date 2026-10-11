@@ -16,8 +16,9 @@
 //! `nix-store --gc` against the project store sweeps: every live build carries a root whose target is
 //! a `/nix/store/<hash>` path, which the relocated store resolves as one of its own, so the sweep
 //! keeps the live set and collects the rest — no per-home enumeration. The default is a dry run: it
-//! reports what would be freed with `--print-dead`, summed by `--query --size`, and only changes
-//! anything when the caller asks.
+//! reports what would be freed with `--print-dead`, summed by `--query --size`, and collects only
+//! when the caller asks. `--print-dead` itself still deletes an entry of the store directory nix has
+//! no record of (nix 2.34), as every collection does.
 //!
 //! A project's store is the project's cage's to write, so `nix-store` runs on it in a cage of its
 //! own ([`StoreAt::Project`]); the shared store, which no cage writes, is collected on the host.
@@ -373,7 +374,8 @@ pub(crate) fn collect(store: &StoreAt<'_>, prune: bool) -> io::Result<GcReport> 
     })
 }
 
-/// The store paths `nix-store --gc` would collect, without deleting them. Only lines that are
+/// The store paths `nix-store --gc` would collect, without collecting them: nix still deletes an
+/// entry of the store directory it has no record of, as on any collection. Only lines that are
 /// store paths are kept; nix prints its progress ("finding roots…") on stderr.
 fn print_dead(store: &StoreAt<'_>) -> io::Result<Vec<String>> {
     let out = store
