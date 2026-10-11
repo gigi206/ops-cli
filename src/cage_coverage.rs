@@ -14,7 +14,7 @@
 //! So the list stays written out, and this is what makes forgetting it impossible. The addition is
 //! still deliberate; only the silence is gone.
 
-use crate::testutil::files_under;
+use crate::testutil::{files_under, read_listed};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -315,17 +315,6 @@ fn walk_sources_with_paths() -> Vec<(PathBuf, String)> {
         .flat_map(|dir| files_under(&root().join(dir), &["rs"]))
         .filter_map(|path| Some((path.clone(), read_listed(&path)?)))
         .collect()
-}
-
-/// The text of `path`, a file a walk listed, or `None` when it has gone since. Any other error fails
-/// the guard by the file's name: a file these guards cannot read is one they would pass over, and a
-/// guard that reads less than the tree passes on what it did not see.
-fn read_listed(path: &Path) -> Option<String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Some(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => panic!("`{}` cannot be read: {e}", path.display()),
-    }
 }
 
 /// A directory or a file these guards cannot read fails them by its name, rather than leaving them

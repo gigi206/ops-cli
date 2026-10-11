@@ -519,6 +519,17 @@ impl std::io::Read for Trickle<'_> {
     }
 }
 
+/// The text of `path`, a file a walk listed ([`files_under`]), or `None` when it has gone since.
+/// Any other error fails the guard reading it by the file's name: a file a guard cannot read is one
+/// it would pass over, and a guard that reads less than the tree passes on what it did not see.
+pub(crate) fn read_listed(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("`{}` cannot be read: {e}", path.display()),
+    }
+}
+
 /// Every regular file under `dir` whose extension is one of `extensions`, sorted, subdirectories
 /// included. The walk descends because a module that outgrew one file keeps its root in `<name>.rs`
 /// and everything else in a `<name>/` beside it: a flat listing would read the root, skip the
