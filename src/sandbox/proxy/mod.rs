@@ -107,7 +107,7 @@
 //! | `403` | `ssrf-blocked`           | the host resolved only to private / metadata addresses |
 //! | `403` | `supervisor-denied`      | the supervisor's own copy of the policy refused a connection the proxy had admitted. The proxy asks the supervisor for every upstream connection ([`link::Judge`]), and the two copies differ only while a `--session` rule the supervisor has sent is not yet in force in the proxy: refused in the safe direction, and counted as a denial |
 //! | `403` | `ip-literal`             | the CONNECT target was an IP literal on the inspected path (allow it raw with a `tcp://` rule) |
-//! | `403` | `outbound-secret`        | the request head carried a configured secret value verbatim (leak refused) |
+//! | `403` | `outbound-secret`        | the request head, or an HTTP/2 request's trailers, carried a configured secret value verbatim (leak refused) |
 //! | `403` | `signer-refused`         | a signer plugin would not form this request's credential; the body carries the plugin's own reason, scrubbed of every declared credential |
 //! | `413` | `signer-body-too-large`  | a signer asked to be told a digest over the request body, and the request declares a `Content-Length` above what the proxy holds. No plugin refused: sbx did, from the head, before the body was invited. An over-cap `chunked` body declares no length and is discovered while being read, so it keeps the `bad-request:chunked` above |
 //! | `503` | `splice-cap`             | the concurrent raw (`tcp://`) tunnel cap was reached (retry when one closes) |
@@ -157,14 +157,15 @@
 //! *head* for any configured secret's value ([`SecretNeedle`]) and **refuses** the request
 //! (`outbound-secret`) — block, never strip — when it carries one verbatim, so a secret the agent
 //! *did* obtain (a reflection, an out-of-band leak) cannot be re-sent in the clear to any allowed
-//! host. It is deliberately a *tripwire, not a wall*: it inspects the head only (not the streamed
-//! body) and matches the value byte-for-byte (any encoding evades it), so the load-bearing boundary
-//! stays the empty netns plus the egress allowlist — this only catches naive verbatim re-exfil. Two
-//! named residuals: the distinct `outbound-secret` reason is a weak *confirmation oracle* (it tells
-//! a prober that an exact byte string is a configured secret), defanged by a high-entropy value plus
-//! the resolution-side minimum length — kept distinct deliberately so a legitimately-confused agent
-//! is not blinded; and a secret value that happens to be a substring of legitimate traffic on the
-//! always-on built-in lane would refuse that request (low-probability, length-mitigated, nonzero).
+//! host. It is deliberately a *tripwire, not a wall*: it inspects the head (and an HTTP/2 request's
+//! trailers, which arrive whole), not the streamed body, and matches the value byte-for-byte (any
+//! encoding evades it), so the load-bearing boundary stays the empty netns plus the egress
+//! allowlist — this only catches naive verbatim re-exfil. Two named residuals: the distinct
+//! `outbound-secret` reason is a weak *confirmation oracle* (it tells a prober that an exact byte
+//! string is a configured secret), defanged by a high-entropy value plus the resolution-side
+//! minimum length — kept distinct deliberately so a legitimately-confused agent is not blinded; and
+//! a secret value that happens to be a substring of legitimate traffic on the always-on built-in
+//! lane would refuse that request (low-probability, length-mitigated, nonzero).
 //!
 //! An **inbound** tripwire closes the reflection itself: when the response comes from a host an
 //! injection targets — the only place a configured secret can re-enter the cage by reflection — the
@@ -1484,8 +1485,9 @@ fn signer_refusal_message(refusal: &SignRefusal, needles: &[SecretNeedle]) -> St
 /// Whether the decrypted client request head carries any secret value verbatim on its way to
 /// `dest` — the outbound leak tripwire. Scans the raw head bytes (request line + every client
 /// header, before sbx's own injection is added), so it can never self-trip on an injected
-/// credential. A backstop, not a boundary: it catches a *verbatim* secret in the *head* only — an
-/// encoded value, or one in the streamed body, is out of scope (see the module doc).
+/// credential. A backstop, not a boundary: it catches a *verbatim* secret in the *head*, and on the
+/// HTTP/2 plane in a request's trailers, only — an encoded value, or one in the streamed body, is
+/// out of scope (see the module doc).
 ///
 /// `dest` is the host the request is bound for, and it decides which needles apply
 /// ([`SecretNeedle::scanned_for`]): a declared secret is scanned for everywhere, while one the cage
