@@ -489,17 +489,30 @@ fn every_bundle_field_is_named_in_the_bundles_field_table() {
     );
 }
 
+/// A struct the schema does not declare under the name asked for is a failure, not a struct with no
+/// fields.
+#[test]
+#[should_panic(expected = "the schema no longer declares `struct RawGone {`")]
+fn a_struct_the_schema_no_longer_declares_fails_the_check() {
+    struct_fields(
+        "pub(crate) struct RawKept {\n    pub(crate) a: u8,\n}\n",
+        "RawGone",
+    );
+}
+
 /// The TOML spellings of `struct <name>`'s fields, read out of `source`.
 ///
 /// Shared by the two checks that hold a page to a struct: one reads the keys an example may use,
 /// the other the fields a table must name. Both would otherwise hand-list them, which is the drift
-/// they exist to catch.
+/// they exist to catch. A struct `source` does not declare as `struct <name> {` fails the check
+/// that asked for it: read as no fields, it would hold the page to nothing, and a caller that joins
+/// two structs' fields would pass on the other's alone.
 fn struct_fields(source: &str, name: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    let Some(rest) = source.split_once(&format!("struct {name} {{")) else {
-        return out;
-    };
-    let body = rest.1.split("\n}").next().unwrap_or("");
+    let (_, rest) = source
+        .split_once(&format!("struct {name} {{"))
+        .unwrap_or_else(|| panic!("the schema no longer declares `struct {name} {{`"));
+    let body = rest.split("\n}").next().unwrap_or("");
     let mut renamed: Option<String> = None;
     for line in body.lines() {
         let line = line.trim();
