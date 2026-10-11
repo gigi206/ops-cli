@@ -287,14 +287,10 @@ mod tests {
     /// The *function*, not the file: `apply_override` — one of the exhaustive destructurings that
     /// already name every field — lives in `config/mod.rs` beside the engine, so a whole-file
     /// search is satisfied by the very list this test must not read, and would pass over any
-    /// omission. Measured: with a probe field added to `RawConfig`, the file-wide form stayed
-    /// green.
+    /// omission: a field added to `RawConfig` and read nowhere leaves the file-wide form green.
     ///
     /// The counter is sound only while no literal carries an unbalanced brace inside either body.
-    /// Checked when this was written: the two `{{`/`}}` sequences in these files
-    /// (`apps.rs:194`'s `{{GET,HEAD}}` and `mod.rs:4602`'s `{{500}}`) are balanced *and* sit
-    /// outside both bodies, and neither file holds a `'{'` or `'}'` char literal. An unbalanced one
-    /// added later would truncate a body early rather than fail, which is what the size floor at
+    /// One that does truncates the body early rather than failing, which is what the size floor at
     /// the call site is for.
     fn body_of(source: &str, signature: &str) -> String {
         let at = source
@@ -333,9 +329,9 @@ mod tests {
     #[test]
     fn the_layering_engine_names_every_field_a_layer_can_carry() {
         // Floors per body, not on the pair: a truncation in one would otherwise hide behind the
-        // other's size. Measured 2026-09-11 at 52,020 and 31,633 bytes; the floors sit near half,
-        // low enough that an honest shrink of either function passes and high enough that a brace
-        // counter that stopped early does not.
+        // other's size. Each floor sits a little under half its body, low enough that an honest
+        // shrink of either function passes and high enough that a brace counter that stopped early
+        // does not.
         let resolve = body_of(&config_source("mod.rs"), "fn resolve(");
         let resolve_app = body_of(&config_source("apps.rs"), "fn resolve_app(");
         for (what, body, floor) in [
