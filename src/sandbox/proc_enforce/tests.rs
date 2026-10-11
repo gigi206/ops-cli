@@ -976,36 +976,34 @@ fn the_handoff_control_buffer_is_aligned_for_the_header_it_is_read_as() {
 /// looking at `cmsg_len`. The extras stayed open for the life of the session; repeated, that is the
 /// supervisor running out of descriptors.
 ///
-/// Measured over many rounds rather than one, and the reason is the harness: `/proc/self/fd` counts
-/// the whole process, and cargo runs these tests as threads of one binary, so a neighbour opening a
-/// file between two counts moves the number. A leak of two per round is *systematic* — four hundred
-/// rounds leak eight hundred descriptors — while that interference is incidental and bounded by what
-/// a handful of concurrent tests hold at once. The band below sits an order of magnitude above the
-/// noise and at half of what a refusal that kept only **one** of the two would leak, so neither
-/// reading can be mistaken for the other.
+/// Counted by what the descriptors name rather than by how many the process holds. Cargo runs
+/// these tests as threads of one binary, so `/proc/self/fd` moves with whatever a neighbour opens,
+/// and no band on that count stays clear of the noise. The two descriptors sent are opened on a
+/// file of this test's own, which nothing else opens: once the sender's copies are closed, a
+/// descriptor of this process that still names it is one the refusal left installed.
 #[test]
 fn a_handoff_carrying_two_descriptors_is_refused_and_leaks_neither() {
-    const ROUNDS: usize = 400;
-
-    let before = open_fd_count();
-    for _ in 0..ROUNDS {
-        let (recv, send) = UnixStream::pair().unwrap();
-        let a = std::fs::File::open("/dev/null").unwrap();
-        let b = std::fs::File::open("/dev/null").unwrap();
+    let dir = TmpDir::new();
+    let sent = dir.join("sent");
+    std::fs::write(&sent, b"").expect("the file the sent descriptors name");
+    let (recv, send) = UnixStream::pair().expect("socketpair");
+    {
+        let a = std::fs::File::open(&sent).expect("open it once");
+        let b = std::fs::File::open(&sent).expect("open it twice");
         send_scm_rights(&send, &[fd_of(&a), fd_of(&b)]);
-
-        let err = recv_fd_raw(&recv).unwrap_err();
-        assert!(
-            err.to_string().contains("more than one descriptor"),
-            "{err}"
-        );
     }
-    let after = open_fd_count();
 
+    let err = recv_fd_raw(&recv).unwrap_err();
     assert!(
-        after < before + ROUNDS / 2,
+        err.to_string().contains("more than one descriptor"),
+        "{err}"
+    );
+    let left = descriptors_naming(&sent);
+    assert!(
+        left.is_empty(),
         "a refusal that returns before closing what the kernel installed leaks exactly what it \
-         refuses: {before} descriptors before {ROUNDS} refused handoffs, {after} after"
+         refuses: descriptors {left:?} still name {}",
+        sent.display()
     );
 }
 
@@ -1081,10 +1079,21 @@ fn fd_of_stream(s: &UnixStream) -> libc::c_int {
 
 /// How many descriptors this process holds. The `read_dir` handle is open during the walk, so it is
 /// counted identically on either side of a comparison.
-fn open_fd_count() -> usize {
+/// The descriptors of this process that name `file`, matched by device and inode so that a path
+/// spelled another way still counts. One that closes between the listing and its look-up names
+/// nothing any more, and is not counted.
+fn descriptors_naming(file: &std::path::Path) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let want = std::fs::metadata(file).expect("the file is there");
     std::fs::read_dir("/proc/self/fd")
         .expect("/proc/self/fd is readable on Linux")
-        .count()
+        .map(|entry| entry.expect("an entry of /proc/self/fd"))
+        .filter(|entry| {
+            std::fs::metadata(entry.path())
+                .is_ok_and(|m| m.dev() == want.dev() && m.ino() == want.ino())
+        })
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect()
 }
 
 fn fd_of(f: &std::fs::File) -> libc::c_int {
