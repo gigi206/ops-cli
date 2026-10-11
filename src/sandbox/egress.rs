@@ -2121,6 +2121,7 @@ mod tests {
     use super::*;
     use crate::sandbox::control::Plane;
     use crate::testutil::{EnvVar, TmpDir, env_lock};
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -3794,13 +3795,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got, "ghp-the-secret-value");
-        let args = std::fs::read_to_string(&args_log).unwrap();
+        // Read as bytes: the recorded arguments name the fixture file, whose path need not be UTF-8.
+        let args = std::fs::read(&args_log).unwrap();
+        let has = |needle: &[u8]| memchr::memmem::find(&args, needle).is_some();
         assert!(
-            args.contains("--decrypt")
-                && args.contains("--extract")
-                && args.contains("[\"github\"][\"token\"]")
-                && args.contains(&file.display().to_string()),
-            "sops was invoked with decrypt+extract+file: {args:?}"
+            has(b"--decrypt")
+                && has(b"--extract")
+                && has(br#"["github"]["token"]"#)
+                && has(file.as_os_str().as_bytes()),
+            "sops was invoked with decrypt+extract+file: {:?}",
+            String::from_utf8_lossy(&args)
         );
     }
 
@@ -4041,8 +4045,11 @@ mod tests {
         std::fs::write(&file, "sops: {}\n").unwrap();
         let value = read_sops_with(&sops, &file, project.path(), store.path());
         assert_eq!(value.unwrap().as_deref(), Some("value"));
+        // Read as bytes: the path handed to `sops` is the fixture's, which need not be UTF-8.
         assert_eq!(
-            PathBuf::from(std::fs::read_to_string(bin.join("arg")).unwrap()),
+            PathBuf::from(std::ffi::OsString::from_vec(
+                std::fs::read(bin.join("arg")).unwrap()
+            )),
             file
         );
     }
