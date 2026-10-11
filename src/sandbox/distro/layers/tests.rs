@@ -17,7 +17,7 @@ fn apply(blob: &Path, media_type: &str, root: &Path, budget: &mut Budget) -> io:
 enum Member<'a> {
     File(&'a str),
     Dir,
-    Symlink(&'a str),
+    Symlink(&'a Path),
     /// A member written with an explicit entry type, for the shapes an archiver picks and this
     /// unpacker has to recognise as files.
     Typed(tar::EntryType, &'a str),
@@ -324,7 +324,7 @@ fn a_layer_lands_with_its_files_directories_and_links() {
             ("usr/", Member::Dir),
             ("usr/bin/", Member::Dir),
             ("usr/bin/tool", Member::File("#!/bin/sh\n")),
-            ("bin", Member::Symlink("usr/bin")),
+            ("bin", Member::Symlink(Path::new("usr/bin"))),
         ]),
     )
     .expect("the layer applies");
@@ -393,7 +393,7 @@ fn a_member_is_never_written_through_a_symlink_an_earlier_layer_planted() {
     apply_tar(
         tmp.path(),
         &root,
-        &tar_of(&[("etc", Member::Symlink(outside.to_str().unwrap()))]),
+        &tar_of(&[("etc", Member::Symlink(&outside))]),
     )
     .expect("a symlink is data, so the first layer applies");
 
@@ -735,9 +735,9 @@ fn an_opaque_marker_never_empties_through_a_symlink_an_earlier_layer_planted() {
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("keep"), "keep").unwrap();
         let link = if target.starts_with("an absolute") {
-            outside.to_str().unwrap().to_string()
+            outside.clone()
         } else {
-            "../outside".to_string()
+            PathBuf::from("../outside")
         };
 
         apply_tar(
@@ -852,7 +852,7 @@ fn a_directory_member_never_chmods_through_a_link_an_earlier_layer_planted() {
     apply_tar(
         tmp.path(),
         &root,
-        &tar_of(&[("etc", Member::Symlink(outside.to_str().unwrap()))]),
+        &tar_of(&[("etc", Member::Symlink(&outside))]),
     )
     .expect("a symlink is data, so the first layer applies");
     apply_tar(tmp.path(), &root, &tar_of(&[("etc", Member::Dir)]))
@@ -879,7 +879,7 @@ fn a_member_spelled_with_a_current_directory_component_lands_where_it_names() {
     apply_tar(
         tmp.path(),
         &root,
-        &tar_of(&[("bin", Member::Symlink("usr/bin"))]),
+        &tar_of(&[("bin", Member::Symlink(Path::new("usr/bin")))]),
     )
     .unwrap();
     apply_tar(
@@ -1158,7 +1158,7 @@ fn a_member_keeps_the_date_the_image_gives_it() {
             &[
                 ("lib/", Member::Dir),
                 ("lib/mod.py", Member::File("x = 1\n")),
-                ("lib/link", Member::Symlink("mod.py")),
+                ("lib/link", Member::Symlink(Path::new("mod.py"))),
             ],
             date,
         ),
@@ -1194,7 +1194,7 @@ fn a_directory_is_dated_only_if_it_is_still_the_one_the_layer_made() {
             &[
                 ("a/", Member::Dir),
                 ("a/b/", Member::Dir),
-                ("a", Member::Symlink(outside.to_str().unwrap())),
+                ("a", Member::Symlink(&outside)),
             ],
             1_000_000_000,
         ),
