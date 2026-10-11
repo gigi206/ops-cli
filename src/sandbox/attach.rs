@@ -903,7 +903,7 @@ mod tests {
                 _ => None,
             })
             .expect("a project under some directory");
-        let (p, f) = (project.display().to_string(), first.display().to_string());
+        let p = project.display().to_string();
         let shapes: [(&str, Vec<String>, String, bool); 3] = [
             (
                 "bound",
@@ -911,11 +911,16 @@ mod tests {
                 String::new(),
                 true,
             ),
-            ("made", Vec::new(), format!("mkdir -p '{p}' && "), false),
+            (
+                "made",
+                Vec::new(),
+                format!("mkdir -p {} && ", crate::testutil::sh_word(&project)),
+                false,
+            ),
             (
                 "linked",
                 Vec::new(),
-                format!("ln -s '{f}' '{f}' && "),
+                format!("ln -s {0} {0} && ", crate::testutil::sh_word(&first)),
                 false,
             ),
         ];
