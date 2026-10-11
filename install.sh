@@ -171,7 +171,9 @@ install_linux() {
         *) die "the published checksum of $asset names another file: $named" ;;
     esac
     [ "${#expected}" -eq 64 ] || die "the published checksum of $asset is not a SHA-256"
-    actual=$(sha256sum "$tmp/sbx" | cut -d ' ' -f 1)
+    # Hashed from its standard input: given a name holding a backslash, `sha256sum` escapes it and
+    # starts the line with `\`, which would then lead the digest. `$tmp` is under `TMPDIR`.
+    actual=$(sha256sum <"$tmp/sbx" | cut -d ' ' -f 1)
     [ "$actual" = "$expected" ] || die "checksum mismatch for $asset: expected $expected, got \
 $actual; nothing was installed"
 
