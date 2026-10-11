@@ -459,6 +459,26 @@ async fn relay(
     ctx: &ProxyCtx,
     pool: &UpstreamPool,
 ) {
+    // The URI the upstream request is rebuilt from, settled before anything is spent on the stream:
+    // the signer, the upstream connection, the allow. A URI that cannot be rebuilt is refused as the
+    // request it is and counted once, as blocked; settled after the allow, the same stream would be
+    // counted allowed and blocked both. It is a backstop rather than a live path: `stream` refuses a
+    // request with no `:authority`, and `h2` resets one with a `:scheme` and no `:path` before it is
+    // accepted, which leaves no URI this rebuild refuses. `:scheme` is the client's to write and the
+    // transport's to be; see [`upstream_uri`].
+    let Ok(upstream_uri) = upstream_uri(req.uri().clone()) else {
+        ctx.outcome(
+            Proto::Https,
+            host,
+            port,
+            Some(method),
+            Some(path),
+            StatKind::Blocked,
+            "bad-request",
+        );
+        let _ = refuse(respond, StatusCode::BAD_REQUEST, "bad-request");
+        return;
+    };
     // One credential state for the whole stream's relay: the injection applied below and the reflection
     // masking decided further down must come from the same resolution.
     let creds = ctx.credentials.snapshot();
@@ -618,20 +638,6 @@ async fn relay(
     // pseudo-headers), copying regular headers minus the connection-specific ones h2 forbids and
     // minus any header sbx is injecting (stripped so its value is the only one upstream).
     let (parts, client_body) = req.into_parts();
-    // `:scheme` is the client's to write and the transport's to be; see [`upstream_uri`].
-    let Ok(upstream_uri) = upstream_uri(parts.uri) else {
-        ctx.outcome(
-            Proto::Https,
-            host,
-            port,
-            Some(parts.method.as_str()),
-            Some(path),
-            StatKind::Blocked,
-            "bad-request",
-        );
-        let _ = refuse(respond, StatusCode::BAD_REQUEST, "bad-request");
-        return;
-    };
     let mut builder = Request::builder()
         .method(parts.method)
         .uri(upstream_uri)
