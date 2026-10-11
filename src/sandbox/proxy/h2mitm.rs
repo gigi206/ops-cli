@@ -1604,7 +1604,11 @@ async fn handshaken(
         .max_concurrent_streams(MAX_STREAMS)
         .handshake::<_, Bytes>(upstream_tls)
         .await
-        .map_err(|_| "upstream-http2-unsupported")?;
+        // ALPN has already settled on `h2` above, and all this handshake puts on the wire is the
+        // client preface, so what fails here is the connection closing under that write rather
+        // than a host that does not speak HTTP/2: named as the close it is, as `ready` names its
+        // own.
+        .map_err(|_| "upstream-closed")?;
     // The connection driver owns only the TLS stream + h2 state (it does not borrow `ctx`), so it is
     // `'static` and can be spawned on this tunnel's runtime; it is cancelled when the runtime is
     // dropped, which is what bounds a pooled connection's life to its tunnel.
