@@ -581,7 +581,8 @@ pub(crate) fn compression(dir: &Path) -> Option<String> {
 /// counted as they occupy the device.
 ///
 /// btrfs keeps its accounting in *logical* bytes: a block group whose profile writes two copies
-/// of everything — `DUP`, the default for metadata on a single device — reports one. That answers
+/// of everything — `DUP`, which a volume's metadata carries when created with
+/// [`MetadataProfile::Dup`] — reports one. That answers
 /// "how much information did I store", where every question asked here is about blocks: what the
 /// image costs on the host, and what a discard would return. So each block group is counted as
 /// its profile writes it, which makes both figures directly comparable with the image's size on
@@ -1187,6 +1188,33 @@ pub(crate) fn resolve_mkfs() -> Result<Mkfs, String> {
     })
 }
 
+/// How many copies of each metadata block the new filesystem writes.
+///
+/// `mkfs.btrfs` defaults to `DUP` on a single device, which writes every metadata block twice so a
+/// block that goes bad is repaired from its twin. The volume defaults to `Single` instead: its two
+/// copies would land in the same image file on the same disk, where an SSD may merge them anyway,
+/// and they cost a metadata-sized share of the volume. `Dup` remains available for whoever prefers
+/// the redundancy. The profile is always passed explicitly, so the result never depends on the
+/// default of whichever `btrfs-progs` performs the format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MetadataProfile {
+    /// One copy of each metadata block. `-m single` also makes the system block group single.
+    #[default]
+    Single,
+    /// Two copies of each metadata block, on the same device.
+    Dup,
+}
+
+impl MetadataProfile {
+    /// The value `mkfs.btrfs -m` takes for this profile.
+    fn mkfs_arg(self) -> &'static str {
+        match self {
+            MetadataProfile::Single => "single",
+            MetadataProfile::Dup => "dup",
+        }
+    }
+}
+
 /// Build the command that formats `image`, taking its root's ownership from `seed`. A caged one
 /// holds the descriptors its bwrap reads, and hands them to that exec.
 pub(crate) fn mkfs_command(
@@ -1194,9 +1222,12 @@ pub(crate) fn mkfs_command(
     image: &Path,
     seed: &Path,
     label: &str,
+    metadata: MetadataProfile,
 ) -> Result<Command, String> {
     let args: Vec<OsString> = vec![
         OsString::from("-q"),
+        OsString::from("-m"),
+        OsString::from(metadata.mkfs_arg()),
         OsString::from("-L"),
         OsString::from(label),
         OsString::from("--rootdir"),
@@ -1277,8 +1308,15 @@ fn run(cmd: &mut Command) -> Result<String, String> {
 }
 
 /// Create the volume: a sparse image carrying an empty btrfs filesystem whose root belongs to
-/// the invoking user. Refuses to touch an existing image, so it can never destroy a store.
-pub(crate) fn init(image: &Path, size_bytes: u64, label: &str, mkfs: &Mkfs) -> Result<(), String> {
+/// the invoking user, its metadata written as `metadata` says. Refuses to touch an existing image,
+/// so it can never destroy a store.
+pub(crate) fn init(
+    image: &Path,
+    size_bytes: u64,
+    label: &str,
+    metadata: MetadataProfile,
+    mkfs: &Mkfs,
+) -> Result<(), String> {
     if !is_valid_label(label) {
         return Err(format!(
             "invalid label {label:?} — letters, digits, '-' and '_', at most 32"
@@ -1339,7 +1377,7 @@ pub(crate) fn init(image: &Path, size_bytes: u64, label: &str, mkfs: &Mkfs) -> R
         f.set_len(size_bytes)
             .map_err(|e| format!("cannot size image: {e}"))?;
         drop(f);
-        let mut cmd = mkfs_command(mkfs, image, &seed, label)?;
+        let mut cmd = mkfs_command(mkfs, image, &seed, label, metadata)?;
         run(&mut cmd).map(|_| ())
     });
     let _ = std::fs::remove_dir_all(&seed);
@@ -2674,13 +2712,18 @@ this line has no separator at all
             image,
             seed,
             "l",
+            MetadataProfile::default(),
         )
         .expect("the host's command");
+        // The default profile is named on the command line rather than left to `mkfs.btrfs`, whose
+        // own default on a single device is `dup`.
         assert_eq!(
             args(&host),
             vec![
                 "/usr/bin/mkfs.btrfs",
                 "-q",
+                "-m",
+                "single",
                 "-L",
                 "l",
                 "--rootdir",
@@ -2698,6 +2741,7 @@ this line has no separator at all
             image,
             seed,
             "l",
+            MetadataProfile::Dup,
         )
         .expect("the caged command");
         let a = args(&owned);
@@ -2765,9 +2809,11 @@ this line has no separator at all
         );
         // The command still ends with the real invocation, arguments intact.
         assert_eq!(
-            &a[a.len() - 6..],
+            &a[a.len() - 8..],
             &[
                 "-q",
+                "-m",
+                "dup",
                 "-L",
                 "l",
                 "--rootdir",
@@ -2831,7 +2877,14 @@ this line has no separator at all
         let image = base.path().join("vol.btrfs");
         std::fs::write(&image, b"a store lives here").unwrap();
         let nowhere = Mkfs::Host(PathBuf::from("/nonexistent-by-construction"));
-        let err = init(&image, DEFAULT_SIZE_BYTES, DEFAULT_LABEL, &nowhere).unwrap_err();
+        let err = init(
+            &image,
+            DEFAULT_SIZE_BYTES,
+            DEFAULT_LABEL,
+            MetadataProfile::default(),
+            &nowhere,
+        )
+        .unwrap_err();
         assert!(err.contains("already exists"), "{err}");
         // Untouched.
         assert_eq!(std::fs::read(&image).unwrap(), b"a store lives here");
@@ -2865,7 +2918,13 @@ this line has no separator at all
 
         // SAFETY: `umask` is a per-process scalar syscall; the previous value is restored below.
         let previous = unsafe { libc::umask(0o022) };
-        let made = init(&image, DEFAULT_SIZE_BYTES, DEFAULT_LABEL, &noop);
+        let made = init(
+            &image,
+            DEFAULT_SIZE_BYTES,
+            DEFAULT_LABEL,
+            MetadataProfile::default(),
+            &noop,
+        );
         // SAFETY: restoring the value the call above returned.
         unsafe { libc::umask(previous) };
         made.expect("a no-op mkfs leaves init on its success path");
@@ -2893,7 +2952,16 @@ this line has no separator at all
         // Stand in for the racing writer by creating the image the `exists()` check did not see:
         // calling `init` on a path that already holds a store must fail without writing to it.
         std::fs::write(&image, b"a store lives here").unwrap();
-        assert!(init(&image, DEFAULT_SIZE_BYTES, DEFAULT_LABEL, &nowhere).is_err());
+        assert!(
+            init(
+                &image,
+                DEFAULT_SIZE_BYTES,
+                DEFAULT_LABEL,
+                MetadataProfile::default(),
+                &nowhere
+            )
+            .is_err()
+        );
         assert_eq!(std::fs::read(&image).unwrap(), b"a store lives here");
     }
 
@@ -2913,7 +2981,16 @@ this line has no separator at all
             !image.exists(),
             "the existence check must not see the path, so the open is what refuses"
         );
-        assert!(init(&image, DEFAULT_SIZE_BYTES, DEFAULT_LABEL, &nowhere).is_err());
+        assert!(
+            init(
+                &image,
+                DEFAULT_SIZE_BYTES,
+                DEFAULT_LABEL,
+                MetadataProfile::default(),
+                &nowhere
+            )
+            .is_err()
+        );
         assert!(
             image.symlink_metadata().is_ok(),
             "a path this call did not create must survive the refusal"
@@ -2925,7 +3002,16 @@ this line has no separator at all
         let base = crate::testutil::TmpDir::new();
         let image = base.path().join("vol.btrfs");
         let nowhere = Mkfs::Host(PathBuf::from("/nonexistent-by-construction"));
-        assert!(init(&image, DEFAULT_SIZE_BYTES, "../escape", &nowhere).is_err());
+        assert!(
+            init(
+                &image,
+                DEFAULT_SIZE_BYTES,
+                "../escape",
+                MetadataProfile::default(),
+                &nowhere
+            )
+            .is_err()
+        );
         assert!(
             !image.exists(),
             "nothing may be created for a refused label"

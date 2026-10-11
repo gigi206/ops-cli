@@ -2110,6 +2110,10 @@ pub(super) const PAGES: &[Page] = &[
                 "--label <fs-label>",
                 "filesystem label, which names the mount point",
             ),
+            (
+                "--metadata-dup",
+                "at init, write every metadata block twice (default: once)",
+            ),
             ("--json", "emit `status` as a JSON document"),
         ],
         details: "sbx's data directory is the one tree that grows without bound — the shared nix store,\n\
@@ -2163,6 +2167,14 @@ pub(super) const PAGES: &[Page] = &[
             has no `mkfs.btrfs`, sbx provisions `btrfs-progs` into its own store and runs it in a\n\
             sandbox, so creating a volume depends on no distribution package. Using one needs no\n\
             `btrfs` binary at all.\n\
+            \n\
+            `init` writes the filesystem's metadata once (the `single` profile), where `mkfs.btrfs`\n\
+            on its own writes it twice (`dup`). The second copy would sit in the same image file on\n\
+            the same disk, which an SSD may merge into one anyway, and it costs a metadata-sized\n\
+            share of the volume. `--metadata-dup` keeps the two copies, so a metadata block that\n\
+            goes bad is repaired from its twin rather than taking part of the volume with it. The\n\
+            profile is fixed when the volume is created; changing it later is a privileged\n\
+            `btrfs balance`.\n\
             \n\
             Freed space returns to the host in the background rather than the instant a file is\n\
             deleted, so the host figure `status` reports can lag a deletion by a moment. `status`\n\

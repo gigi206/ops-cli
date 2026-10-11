@@ -5,7 +5,7 @@ description: "Give sbx's data directory a compressed, self-growing filesystem of
 # `sbx storage`
 
 ```
-sbx storage init [--image <path>] [--size <n>] [--label <name>]
+sbx storage init [--image <path>] [--size <n>] [--label <name>] [--metadata-dup]
 sbx storage migrate [--image <path>] [--force]
 sbx storage use [--image <path>] [--force]
 sbx storage status [--image <path>] [--json]
@@ -210,6 +210,47 @@ sbx supplies `btrfs-progs` for its own use but cannot supply the privilege, so t
 manual escape hatch it never runs for you. Not every host even carries `losetup` or a host
 `btrfs` binary: one more reason to size the volume right at `init` instead.
 
+## One copy of the metadata, or two
+
+`init` writes the filesystem's metadata **once**, the `single` profile. `mkfs.btrfs` on its own
+writes it twice on a single device, the `DUP` profile, so that a metadata block that goes bad is
+repaired from its twin instead of taking part of the filesystem with it. sbx does not take that
+default, for two reasons:
+
+- **The two copies share every point of failure but one.** They land in the same image file, on the
+  same disk; they guard against a single bad block, never against the disk. An SSD may even merge
+  the two identical writes into one, which `mkfs.btrfs` itself names as the case where the second
+  copy protects nothing.
+- **They cost a metadata-sized share of the volume.** A nix store is inode-heavy, and its metadata
+  runs on the order of 8% of its data.
+
+`--metadata-dup` keeps the two copies, for whoever prefers the redundancy over the space:
+
+```console
+$ sbx storage init --metadata-dup
+```
+
+`init` always names the profile it uses on the `mkfs.btrfs` command line, so the result is the same
+whichever `btrfs-progs` performs the format. The volume sbx creates by itself on
+[first launch](#a-one-time-suggestion-on-first-launch) takes the default, `single`.
+
+Like the size, the profile is settled **at `init`**. Converting an existing volume is a
+`btrfs balance`, which requires root, and which sbx never runs for you:
+
+```console
+$ sudo btrfs balance start -mconvert=single -sconvert=single -f /run/media/you/sbx-storage  # two copies to one
+$ sudo btrfs balance start -mconvert=dup -sconvert=dup -f /run/media/you/sbx-storage        # one copy to two
+```
+
+`-f` is required to act on the system block group, and to reduce redundancy. Only the metadata is
+rewritten, so the balance is short. `btrfs filesystem df` on the mount point shows the profile
+before and after, and needs no privilege.
+
+**The image grows before it shrinks.** The balance writes the metadata into fresh block groups and
+frees the old ones inside the filesystem, but the blocks those occupied stay in the image file:
+`inside` drops while `on host` rises. They are part of [**reclaimable**](#status) from then on, and
+return the way any freed space does: see [Releasing it](#releasing-it).
+
 ## Mounting is automatic
 
 `udisks` mounts under `/run`, which is cleared on reboot: so a volume is unmounted every time
@@ -259,12 +300,13 @@ into block groups to hold it. The two are counted **the same way, as blocks on t
 the subtraction between them is the third line, and whenever there is something to reclaim you can
 check it yourself.
 
-That last point is worth spelling out, because btrfs itself counts differently. It writes every
-metadata block twice, the `DUP` profile, its default on a single device, so a block that goes bad
-is repaired from its twin instead of taking a part of the filesystem with it, and reports the pair
-as one. `inside` counts them as they are written, which is why it can exceed what you think you
-stored. A nix store's metadata runs on the order of 8% of its data, so expect that much overhead
-and no surprise in it. **Compression is not visible here**: `used` is
+That last point is worth spelling out, because btrfs itself counts differently. A volume created
+with [`--metadata-dup`](#one-copy-of-the-metadata-or-two) writes every metadata block twice, and
+btrfs reports the pair as one. `inside` counts them as they are written, which is why on such a
+volume it can exceed what you think you stored: a nix store's metadata runs on the order of 8% of
+its data, so expect that much overhead and no surprise in it. A volume created without the flag
+writes its metadata once, and the figure carries no such overhead. **Compression is not visible
+here**: `used` is
 already the compressed size. To see what compression and block sharing win you, compare `on host`
 with the logical total [`sbx store`](store) reports.
 
@@ -343,6 +385,7 @@ Starting fresh, with nothing yet in the data directory:
 sbx storage init                  # create the image (200 GiB logical, sparse)
 sbx storage init --size 500G      # …or a different ceiling; it costs nothing until filled
 sbx storage init --image /mnt/ssd/sbx.btrfs   # …on another disk
+sbx storage init --metadata-dup   # …keeping two copies of every metadata block
 sbx storage use                   # adopt it; mounted automatically from now on
 ```
 

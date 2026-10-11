@@ -96,13 +96,14 @@ struct Opts {
     image: Option<PathBuf>,
     size: Option<String>,
     label: Option<String>,
+    metadata_dup: bool,
     json: bool,
     force: bool,
 }
 
 /// Parse the options of one `storage` verb, admitting only the ones that verb reads.
 ///
-/// The five options are shared by the parser and were accepted by every verb, so `sbx storage use
+/// The options are shared by the parser and were accepted by every verb, so `sbx storage use
 /// --size 50G` exited 0 having ignored the size, and `sbx storage status --force` was taken for a
 /// command. An option a verb never reads is a question about a different verb, and answering it
 /// with silence reads as agreement.
@@ -112,6 +113,7 @@ fn parse_opts_for(args: Vec<OsString>, verb: &str, permitted: &[&str]) -> Result
         ("--image", opts.image.is_some()),
         ("--size", opts.size.is_some()),
         ("--label", opts.label.is_some()),
+        ("--metadata-dup", opts.metadata_dup),
         ("--json", opts.json),
         ("--force", opts.force),
     ] {
@@ -135,6 +137,7 @@ fn parse_opts(args: Vec<OsString>) -> Result<Opts, String> {
         image: None,
         size: None,
         label: None,
+        metadata_dup: false,
         json: false,
         force: false,
     };
@@ -150,6 +153,7 @@ fn parse_opts(args: Vec<OsString>) -> Result<Opts, String> {
         match a.to_str() {
             Some("--json") => o.json = true,
             Some("--force") => o.force = true,
+            Some("--metadata-dup") => o.metadata_dup = true,
             Some("--image") => {
                 o.image = Some(PathBuf::from(
                     it.next().ok_or("--image needs a path".to_string())?,
@@ -191,7 +195,11 @@ fn ensure_mountable(image: &Path) -> Result<(), String> {
 }
 
 fn init(args: Vec<OsString>) -> ExitCode {
-    let opts = match parse_opts_for(args, "init", &["--image", "--size", "--label"]) {
+    let opts = match parse_opts_for(
+        args,
+        "init",
+        &["--image", "--size", "--label", "--metadata-dup"],
+    ) {
         Ok(o) => o,
         Err(e) => return fail_usage(e),
     };
@@ -204,6 +212,11 @@ fn init(args: Vec<OsString>) -> ExitCode {
         Err(e) => return fail(e),
     };
     let label = opts.label.as_deref().unwrap_or(storage::DEFAULT_LABEL);
+    let metadata = if opts.metadata_dup {
+        storage::MetadataProfile::Dup
+    } else {
+        storage::MetadataProfile::Single
+    };
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     // A volume that cannot be mounted here is still worth creating on request — the user may know
@@ -230,7 +243,7 @@ fn init(args: Vec<OsString>) -> ExitCode {
         Err(e) => return fail(e),
     };
     outln!("  formatting with {}", mkfs.origin());
-    if let Err(e) = storage::init(&image, size, label, &mkfs) {
+    if let Err(e) = storage::init(&image, size, label, metadata, &mkfs) {
         return fail(e);
     }
     outln!(
@@ -1351,6 +1364,7 @@ fn adopt_empty(default_dir: &Path) -> Result<PathBuf, String> {
             &image,
             storage::DEFAULT_SIZE_BYTES,
             storage::DEFAULT_LABEL,
+            storage::MetadataProfile::default(),
             &mkfs,
         )?;
     }
@@ -1583,13 +1597,19 @@ mod tests {
             "50G".into(),
             "--label".into(),
             "mine".into(),
+            "--metadata-dup".into(),
             "--json".into(),
         ])
         .expect("well-formed");
         assert_eq!(o.image.as_deref(), Some(Path::new("/vol/a.btrfs")));
         assert_eq!(o.size.as_deref(), Some("50G"));
         assert_eq!(o.label.as_deref(), Some("mine"));
+        assert!(o.metadata_dup);
         assert!(o.json);
+        assert!(
+            !parse_opts(Vec::new()).expect("empty").metadata_dup,
+            "metadata is single unless `--metadata-dup` asks otherwise"
+        );
 
         assert!(parse_opts(vec!["--nope".into()]).is_err());
         // An option that swallows the next argument must not silently take nothing.
@@ -1597,7 +1617,7 @@ mod tests {
         assert!(parse_opts(vec!["--size".into()]).is_err());
     }
 
-    /// The five options are shared by one parser, so every verb accepted every one of them: `sbx
+    /// The options are shared by one parser, so every verb accepted every one of them: `sbx
     /// storage use --size 50G` exited 0 having ignored the size, and `sbx storage status --force`
     /// was taken for a command. An option a verb never reads is a question about a different verb,
     /// and silence reads as agreement.
@@ -1619,17 +1639,21 @@ mod tests {
             parse_opts_for(v(&["--image", "/vol/a"]), "unuse", &[]).is_err(),
             "`unuse` reads no option at all"
         );
+        assert!(
+            parse_opts_for(v(&["--metadata-dup"]), "use", &["--image", "--force"]).is_err(),
+            "the metadata profile is chosen when a volume is formatted, which `use` never does"
+        );
 
         // Witness: each verb still takes its own, and the values still arrive.
         let o = parse_opts_for(
-            v(&["--image", "/vol/a", "--size", "50G"]),
+            v(&["--image", "/vol/a", "--size", "50G", "--metadata-dup"]),
             "init",
-            &["--image", "--size", "--label"],
+            &["--image", "--size", "--label", "--metadata-dup"],
         )
-        .expect("`init` reads all three");
+        .expect("`init` reads all four");
         assert_eq!(
-            (o.image.as_deref(), o.size.as_deref()),
-            (Some(Path::new("/vol/a")), Some("50G"))
+            (o.image.as_deref(), o.size.as_deref(), o.metadata_dup),
+            (Some(Path::new("/vol/a")), Some("50G"), true)
         );
         assert!(parse_opts_for(v(&["--json"]), "status", &["--image", "--json"]).is_ok());
     }
