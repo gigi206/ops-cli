@@ -40,7 +40,7 @@
 #  - **`/auth` interactive (OAuth / Coding Plan / third-party)**: run `sbx app run qwen-code`,
 #    then `/auth` inside the cage. The Coding Plan (Alibaba Cloud) and third-party providers
 #    (OpenRouter, Requesty, ModelScope, …) authenticate with a key you paste; the Qwen OAuth
-#    free tier was discontinued on 2026-04-15, so there is no browser OAuth loopback to forward.
+#    free tier is discontinued, so there is no browser OAuth loopback to forward.
 #    The bundle opens the Dashscope host; a Coding Plan key needs its own host, commented in
 #    `allow` below.
 #
