@@ -1458,9 +1458,9 @@ async fn ready_upstream(
     ctx: &ProxyCtx,
 ) -> Result<h2::client::SendRequest<Bytes>, Unopened> {
     // `[network] pool = false` means what it says on this plane too: a launch that asked for no
-    // upstream reuse gets a connection per stream, as it did before this pool existed. The opening
-    // turn is taken all the same, because it is not about sharing: it holds the tunnel to one
-    // opening at a time, which is what the supervisor sizes its room for questions on.
+    // upstream reuse gets a connection per stream. The opening turn is taken all the same, because
+    // it is not about sharing: it holds the tunnel to one opening at a time, which is what the
+    // supervisor sizes its room for questions on.
     if ctx.pool.is_none() {
         let _turn = pool.opening.lock().await;
         return open_upstream(checked, ctx).await.map(|(send, _)| send);
@@ -2148,14 +2148,14 @@ mod tests {
     /// A frame the relay took and could not forward still gives its window back.
     ///
     /// A DATA frame's size is drawn from its connection's window as well as its stream's, and the
-    /// connection's is the one every stream of the tunnel shares. The relay returned a frame's window
-    /// only once the frame was forwarded, so a send that failed (a peer granting nothing until the
-    /// bound ran out, a reset) left that frame's bytes withheld. h2 gives back what a dropped stream
+    /// connection's is the one every stream of the tunnel shares. A relay that returns a frame's
+    /// window only once the frame is forwarded leaves a failed send's bytes (a peer granting
+    /// nothing until the bound runs out, a reset) withheld. h2 gives back what a dropped stream
     /// never released only once nothing holds the stream any more, and the other half of the
-    /// exchange holds it for as long as it runs, so each such stream shrank the window every stream
-    /// of the connection sends on.
+    /// exchange holds it for as long as it runs, so each such stream shrinks the window every
+    /// stream of the connection sends on.
     ///
-    /// Both relays, since both returned the window after a send that can fail, and both ways a
+    /// Both relays, since both return the window after a send that can fail, and both ways a
     /// send ends early: a peer that grants nothing until the bound runs out, which is an error, and
     /// one that resets the stream, which ends the relay quietly. The cage's stream is held open
     /// throughout, as the live response half of an exchange holds it.
@@ -4073,11 +4073,11 @@ mod tests {
     /// Two streams of one tunnel that carry different values of the same credential do not share
     /// an upstream connection, a re-resolution between them notwithstanding.
     ///
-    /// The pool was keyed by injection positions alone, and positions are equal across a
-    /// re-resolution, so the connection that carried the old value was offered to the stream
-    /// carrying the new one. A generation read apart from the stream's snapshot does no better: the
-    /// supervisor's resolver installs the new state during the first stream's check, after its
-    /// snapshot, and a generation read then is the one the second stream reads too.
+    /// Positions are equal across a re-resolution, so a pool keyed by injection positions alone
+    /// offers the connection that carried the old value to the stream carrying the new one. A
+    /// generation read apart from the stream's snapshot does no better: the supervisor's resolver
+    /// installs the new state during the first stream's check, after its snapshot, and a generation
+    /// read then is the one the second stream reads too.
     #[test]
     fn streams_carrying_two_values_of_one_credential_do_not_share_an_upstream() {
         use crate::allowlist::classify;
