@@ -38,6 +38,8 @@ the ordinary lookup reaches it; that link is created by a third party, though, s
 before the first WSLg client runs and on a distro that never publishes it. sbx therefore tries the
 runtime-dir path first, and falls back to WSLg's own path when the kernel is a WSL one. A distro
 publishing its own socket still answers for itself, because the runtime-dir candidate comes first.
+A candidate path that holds anything but a socket, reached directly or through a link, is passed
+over.
 
 Under a Lima guest on macOS the guest created from the template this repository ships runs
 PipeWire with `pipewire-pulse` behind a virtio-sound device played through the Mac's default
