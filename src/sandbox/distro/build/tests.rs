@@ -167,6 +167,7 @@ fn the_commands_run_in_order_on_the_tree_and_a_failure_names_the_one_that_failed
 fn a_build_cage_cannot_see_the_project() {
     // A build is not a launch. A command that could read the project could carry it into an image
     // every other project on that digest then reads.
+    use std::os::unix::ffi::OsStrExt as _;
     let Some(bwrap) = bwrap() else {
         skip_incapable!("skipping the build isolation check: need bwrap and a usable userns");
         return;
@@ -198,16 +199,18 @@ fn a_build_cage_cannot_see_the_project() {
         &inert(&probe, &bwrap, &ca, &layout, project.path(), &network),
     )
     .expect("the probe itself succeeds");
-    let seen = std::fs::read_to_string(rootfs.join("seen")).unwrap();
+    // Read as bytes: the probe's answer names the project, whose path need not be UTF-8.
+    let seen = std::fs::read(rootfs.join("seen")).unwrap();
+    let shown = String::from_utf8_lossy(&seen);
     assert!(
-        !seen.contains("SECRET"),
-        "the project is visible to a build cage: {seen}"
+        memchr::memmem::find(&seen, b"SECRET").is_none(),
+        "the project is visible to a build cage: {shown}"
     );
     // And the probe asked about the project itself: a path the shell split, or a probe that never
     // ran, sees no `SECRET` whatever the cage shows.
     assert!(
-        seen.contains(&*project.path().to_string_lossy()),
-        "the probe did not ask about the project: {seen}"
+        memchr::memmem::find(&seen, project.path().as_os_str().as_bytes()).is_some(),
+        "the probe did not ask about the project: {shown}"
     );
 }
 
@@ -245,13 +248,16 @@ fn a_build_cage_carries_the_mandatory_seccomp_filters() {
     )
     .expect("both recorded cages run");
 
-    let dumped = std::fs::read_to_string(&dump).unwrap();
-    let cages: Vec<&str> = dumped.split("CAGE\n").skip(1).collect();
-    assert_eq!(cages.len(), 2, "both commands stand a cage up: {dumped}");
+    // Read as bytes: the recorded arguments carry fixture paths, which need not be UTF-8.
+    let dumped = std::fs::read(&dump).unwrap();
+    let lines: Vec<&[u8]> = dumped.split(|&b| b == b'\n').collect();
+    let cages: Vec<&[&[u8]]> = lines.split(|&l| l == b"CAGE").skip(1).collect();
+    let shown = String::from_utf8_lossy(&dumped);
+    assert_eq!(cages.len(), 2, "both commands stand a cage up: {shown}");
     for argv in cages {
         assert!(
-            argv.lines().any(|l| l == "--add-seccomp-fd"),
-            "a build cage is handed no seccomp filter: {argv}"
+            argv.contains(&&b"--add-seccomp-fd"[..]),
+            "a build cage is handed no seccomp filter: {shown}"
         );
     }
 }
