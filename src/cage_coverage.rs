@@ -83,9 +83,8 @@ fn named_suites(relative: &str) -> BTreeSet<String> {
         let Some(rest) = line.trim().strip_prefix("for suite in ") else {
             continue;
         };
-        let Some(names) = rest.split(';').next() else {
-            continue;
-        };
+        // The names end at the `;` before `do`, or with the line when the loop is written without one.
+        let names = rest.split_once(';').map_or(rest, |(names, _)| names);
         let set: BTreeSet<String> = names.split_whitespace().map(str::to_string).collect();
         assert!(
             found.is_none(),
