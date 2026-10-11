@@ -2380,8 +2380,14 @@ fn a_vanished_notification_does_not_end_supervision_for_the_rest_of_the_run() {
 #[test]
 fn the_poll_tells_a_hang_up_apart_from_something_to_read() {
     let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `fds` is a live two-element array, which is what `pipe` fills.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "the pipe opens");
+    // SAFETY: `fds` is a live two-element array, which is what `pipe2` fills. `O_CLOEXEC`, or a
+    // child a neighbouring test starts would hold the write end past its `exec`, and the hang-up
+    // this test closes it to raise would not come.
+    assert_eq!(
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "the pipe opens"
+    );
     let (read_end, write_end) = (fds[0], fds[1]);
 
     assert_eq!(
@@ -2599,8 +2605,14 @@ fn the_open_lens_flag_rides_before_the_separator() {
 fn a_descriptor_received_over_the_handoff_socket_is_close_on_exec() {
     let (tx, rx) = UnixStream::pair().expect("socketpair");
     let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `fds` is a live two-element array, which is what `pipe` writes.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    // SAFETY: `fds` is a live two-element array, which is what `pipe2` writes. `O_CLOEXEC` on the
+    // ends sent is the sender's own flag, which `SCM_RIGHTS` does not carry: the received number's
+    // flag is the receiver's alone.
+    assert_eq!(
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "pipe"
+    );
     let (r, w) = (fds[0], fds[1]);
 
     send_fd(&tx, r);
@@ -2674,8 +2686,12 @@ fn a_handoff_that_is_not_the_shims_is_refused_without_ending_the_wait() {
 
     // What the cage can do: connect first, and hand over a descriptor of its choosing.
     let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: a two-element array is what `pipe` writes into.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "make a pipe");
+    // SAFETY: a two-element array is what `pipe2` writes into.
+    assert_eq!(
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "make a pipe"
+    );
     let (read_end, write_end) = (fds[0], fds[1]);
     assert!(
         !is_notif_listener(read_end),
