@@ -63,6 +63,7 @@ privilege. On a storage volume holding a project store seeded from the shared on
 
 ```
 sbx store — /run/media/you/sbx-storage (103.1 GiB, 2 085 890 inodes)
+  btrfs volume — 46.0 GiB on host (/home/you/.local/share/sbx-storage.btrfs)
   apps/              55.9 GiB  1 053 917 inodes   48.0 GiB exclusive  global app homes (one per app, shared across projects)
   projects/          24.1 GiB    318 903 inodes    1.5 GiB exclusive  per-project runtime trees (store, home, locks)
   store/             23.1 GiB    711 592 inodes  448.8 MiB exclusive  shared daemonless nix store (the `nix --store` target)
@@ -105,8 +106,8 @@ Three limits, stated rather than hidden:
   walk never visits counts as the subtree's own. A storage volume holds nothing else, so this
   concerns a data directory on a filesystem shared with other data.
 - **It costs a query per file.** On a volume of two million inodes it took about 35 seconds with a
-  warm cache, against a few for the plain report. An entry that cannot be read is counted and
-  named under the breakdown, since its bytes are missing from every figure.
+  warm cache, against a few for the plain report. An entry that cannot be read is counted under
+  the breakdown, since its bytes are missing from every figure.
 
 With `--json`, each subtree carries `exclusive_bytes` and the document an `extents` object:
 `referenced_bytes`, `distinct_bytes`, `inline_files`, `inline_bytes`, `unreadable`, and on a volume

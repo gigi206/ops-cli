@@ -309,9 +309,11 @@ struct Walk<'a> {
 /// (the deepest such path, should they nest), else to the rest. An owner may hold several trees:
 /// an app's global home and its per-project ones are removed together, so they own together.
 ///
-/// Symlinks are not followed and a hardlinked file counts once, wherever it is first met. Fails
-/// only when the filesystem does not implement FIEMAP: then there is no extent to report, and
-/// zeros would read as a measurement.
+/// Symlinks are not followed and a hardlinked file counts once, under the owner it is first met
+/// in: sbx's trees do not hardlink across one another (a store's `.links` pool stays under its own
+/// root), so the owner is the one it belongs to. Fails when the root cannot be read, and when the
+/// filesystem does not implement FIEMAP: there is then no extent to report, and zeros would read
+/// as a measurement.
 pub(crate) fn measure(root: &Path, owners: &[Vec<PathBuf>]) -> io::Result<ExtentReport> {
     let roots: HashMap<PathBuf, usize> = owners
         .iter()
@@ -604,10 +606,10 @@ mod tests {
         assert!(measure(&base.join("absent"), &[]).is_err());
     }
 
-    /// An app's global home and its per-project home are removed together by `--purge`, so a
-    /// block they share is that app's own, and both trees' bytes add up under the one owner.
+    /// An app's global home and its per-project home are removed together by `--purge`, so both
+    /// trees' bytes and inodes add up under the one owner that holds them.
     #[test]
-    fn an_owner_of_several_trees_holds_what_they_share_between_them() {
+    fn an_owner_of_several_trees_adds_them_up_as_one() {
         let base = crate::testutil::TmpDir::new();
         let global = base.join("apps/demo");
         let project = base.join("projects/p1/apps/demo");

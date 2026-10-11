@@ -969,18 +969,19 @@ fn app_list_shared_reports_what_purging_each_app_frees() {
     fx.write_cache_entry("demo-app", "mise", 256 * 1024);
 
     let out = fx.run(&["app", "list", "--shared", "--json"]);
-    // A filesystem without FIEMAP has no extents to report, and the listing says so rather than
-    // printing zeros that would read as a measurement: that is the other outcome, and it is held to
-    // its own contract here instead of being waved through.
-    if !out.status.success() {
-        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("does not report file extents (FIEMAP)"),
-            "a failure is only the refusal of a filesystem without FIEMAP: {}",
+    // A filesystem without FIEMAP has no extents to report, and the listing refuses rather than
+    // printing zeros that would read as a measurement. That is a host the measurement cannot run
+    // on, so it is a skip, counted as one; any other failure is a failure.
+    if !out.status.success()
+        && String::from_utf8_lossy(&out.stderr).contains("does not report file extents (FIEMAP)")
+    {
+        skip_incapable!(
+            "skipping: the fixtures' filesystem has no FIEMAP: {}",
             text(&out)
         );
         return;
     }
+    assert!(out.status.success(), "{}", text(&out));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("a JSON document");
     assert_eq!(v["unreadable"], 0, "{v}");
     let demo = array(&v, "apps")

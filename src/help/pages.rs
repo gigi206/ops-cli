@@ -2221,7 +2221,7 @@ pub(super) const PAGES: &[Page] = &[
             and metadata; the step between distinct and stored data holds compression and\n\
             allocation together, so it is given as a difference, never as a ratio. Every file is\n\
             opened, so it takes several times longer than the plain report, and an entry that\n\
-            cannot be read is counted and named rather than left out in silence.\n\
+            cannot be read is counted rather than left out in silence.\n\
             \n\
             When sbx's data is in a storage volume, a line under the header reports the image's\n\
             real on-host cost — after btrfs compression and sharing, the concrete number those\n\
@@ -2480,7 +2480,7 @@ pub(super) const PAGES: &[Page] = &[
             frees inside the filesystem. That figure is before compression, leaves the shared\n\
             per-project nix store to `sbx gc`, and reaches the host only once the space is\n\
             discarded. Every file is opened, so it takes several times longer than the plain\n\
-            listing, and an entry that cannot be read is counted and named.\n\
+            listing, and an entry that cannot be read is counted.\n\
             \n\
             `sbx app ls` is the same command. The full resolved app set —\n\
             inline, project, and profile apps with their gating — is `sbx config show`.",
