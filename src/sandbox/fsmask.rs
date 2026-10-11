@@ -1193,7 +1193,11 @@ const REBASE_LINE_SHOWN: usize = 120;
 /// its first word past the blanks that open it is `exec` or its abbreviation `x`, followed by a
 /// blank. A cherry-pick or a revert that stops keeps its list elsewhere, and git refuses any command
 /// there but its own.
-fn rebase_exec_lines(reach: &Reach, git_dir: &Path) -> io::Result<Option<BTreeSet<String>>> {
+///
+/// Each line is kept as the bytes git will run. Two lines a lossy conversion reads as one, which
+/// differ only in bytes that are not UTF-8, must stay two, or one written during the session could
+/// pass for one that was there at launch.
+fn rebase_exec_lines(reach: &Reach, git_dir: &Path) -> io::Result<Option<BTreeSet<Vec<u8>>>> {
     let todo = git_dir.join(REBASE_TODO);
     if !reach.holds(&todo) {
         return Ok(None);
@@ -1211,7 +1215,7 @@ fn rebase_exec_lines(reach: &Reach, git_dir: &Path) -> io::Result<Option<BTreeSe
                 rest.and_then(|rest| rest.first())
                     .is_some_and(|b| matches!(b, b' ' | b'\t'))
             })
-            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .map(<[u8]>::to_vec)
             .collect(),
     ))
 }
@@ -3001,7 +3005,7 @@ pub(crate) struct RepoWatch {
     configs: BTreeSet<PathBuf>,
     submodules: GitlinkScan,
     /// The `exec` lines of each stopped rebase's todo list at launch, by git directory.
-    rebases: BTreeMap<PathBuf, BTreeSet<String>>,
+    rebases: BTreeMap<PathBuf, BTreeSet<Vec<u8>>>,
 }
 
 impl RepoWatch {
@@ -3060,11 +3064,14 @@ impl RepoWatch {
                 }
             };
             let before = self.rebases.get(dir).unwrap_or(&none);
-            let added: Vec<&String> = lines.difference(before).collect();
+            let added: Vec<&Vec<u8>> = lines.difference(before).collect();
             let Some(first) = added.first() else {
                 continue;
             };
-            let first: String = first.chars().take(REBASE_LINE_SHOWN).collect();
+            let first: String = String::from_utf8_lossy(first)
+                .chars()
+                .take(REBASE_LINE_SHOWN)
+                .collect();
             out.push(format!(
                 "`{}` holds {} `exec` line{} written during the session, which `git rebase \
                  --continue` runs on your host, the first `{first}`: check them (`git rebase \
@@ -6937,6 +6944,51 @@ mod tests {
             found
                 .iter()
                 .any(|f| f.contains("emb/.git/rebase-merge/git-rebase-todo` holds 1 `exec` line")),
+            "{found:#?}"
+        );
+    }
+
+    /// An `exec` line written during the session that differs from one there at launch only in bytes
+    /// that are not UTF-8 is still a line that was not there: it is named, not taken for the old one.
+    #[test]
+    fn an_exec_line_that_differs_only_in_bytes_that_are_not_utf8_is_named() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping a stopped rebase: no git on this host");
+            return;
+        };
+        let commit = |name: &str, text: &str| {
+            std::fs::write(root.join(name), text).unwrap();
+            assert!(
+                git(&git_args!["add", name])
+                    && git(&git_args!["commit", "-q", "--no-verify", "-m", text])
+            );
+        };
+        commit("f", "a");
+        assert!(git(&git_args!["checkout", "-q", "-b", "side"]));
+        commit("f", "b");
+        assert!(git(&git_args!["checkout", "-q", "@{-1}"]));
+        commit("f", "z");
+        assert!(git(&git_args!["checkout", "-q", "side"]));
+        assert!(
+            !git(&git_args!["rebase", "-q", "@{-1}"]),
+            "stops on the conflict"
+        );
+        let todo = root.join(".git/rebase-merge/git-rebase-todo");
+        let mut body = std::fs::read(&todo).unwrap();
+        body.extend_from_slice(b"exec ./run\xff\n");
+        std::fs::write(&todo, &body).unwrap();
+
+        let watch = GitWatch::start(&root, false, &[], None).expect("a carried repository");
+        assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
+        let len = body.len();
+        body[len - 2] = 0xfe;
+        std::fs::write(&todo, &body).unwrap();
+        let found = watch.findings();
+        assert!(
+            found
+                .iter()
+                .any(|f| f.contains("git-rebase-todo` holds 1 `exec` line written")),
             "{found:#?}"
         );
     }
