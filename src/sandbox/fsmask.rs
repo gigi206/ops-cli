@@ -2050,7 +2050,10 @@ fn include_masks(
     refused: &mut Option<String>,
 ) -> Vec<PathBuf> {
     // `-z` records: `file:<origin>` NUL `<key>` LF `<value>` NUL. Read exactly or not at all: a
-    // name taken approximately would protect some other file than the one git includes.
+    // name taken approximately would protect some other file than the one git includes. The origin
+    // is the path of a config file and is read as the bytes it is, since it only places a relative
+    // value; the entry is text, and a value that is not UTF-8 is refused for itself.
+    use std::os::unix::ffi::OsStrExt as _;
     let unread = |why: &str| {
         visible(&format!(
             "{GIT_CONFIG_READ}: git lists an include {why}, which sbx cannot hold for certain. \
@@ -2058,20 +2061,21 @@ fn include_masks(
              then launch again. {GIT_WRITABLE_HINT}"
         ))
     };
-    let Ok(text) = std::str::from_utf8(out) else {
-        refused.get_or_insert_with(|| unread("by a name that is not UTF-8"));
-        return Vec::new();
-    };
-    let mut fields = text.split('\0');
+    let mut fields = out.split(|&b| b == b'\0');
     let mut found: Vec<PathBuf> = Vec::new();
     while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
+        let Ok(entry) = std::str::from_utf8(entry) else {
+            refused.get_or_insert_with(|| unread("by a name that is not UTF-8"));
+            return Vec::new();
+        };
         let Some((key, value)) = entry.split_once('\n') else {
             refused.get_or_insert_with(|| unread(&format!("entry `{entry}` with no value")));
             continue;
         };
         let base = origin
-            .strip_prefix("file:")
-            .and_then(|f| Path::new(f).parent().map(Path::to_path_buf));
+            .strip_prefix(b"file:")
+            .and_then(|f| Path::new(std::ffi::OsStr::from_bytes(f)).parent())
+            .map(Path::to_path_buf);
         let Some(path) = git_config_path(Path::new(value), base.as_deref()) else {
             continue;
         };
@@ -8339,6 +8343,56 @@ mod tests {
             refusal(&[&origin[..], b"\0include.path\n/elsewhere/inc.cfg\0"].concat()),
             None
         );
+    }
+
+    /// The origin of an include entry is the path of a config file, which need not be UTF-8. Each
+    /// entry is still read for itself: one that sbx can hold is not refused for where the config
+    /// sits, and one that it cannot is refused for its own reason.
+    #[test]
+    fn an_include_listed_from_a_config_whose_path_is_not_utf8_is_read_for_itself() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp).canonicalize().unwrap();
+        let reach = Reach::of(&root, &[], None);
+        let refusal = |out: &[u8]| {
+            let (mut masks, mut refused) = (Vec::new(), None);
+            include_masks(&reach, out, &mut masks, &mut refused);
+            refused
+        };
+        let origin = b"file:/nowhere/pr\xffoj/.git/config";
+        assert_eq!(
+            refusal(&[&origin[..], b"\0include.path\n/elsewhere/inc.cfg\0"].concat()),
+            None
+        );
+        let why = refusal(&[&origin[..], b"\0include.path\0"].concat())
+            .expect("an entry with no value refuses");
+        assert!(why.contains("with no value"), "{why}");
+        let why = refusal(&[&origin[..], b"\0include.path\n/elsewhere/inc-\xff.cfg\0"].concat())
+            .expect("a name that is not UTF-8 refuses");
+        assert!(why.contains("not UTF-8"), "{why}");
+    }
+
+    /// A relative include is placed against the directory of the config that declares it, which is
+    /// the origin's: a project whose path is not UTF-8 still has the file it includes held.
+    #[test]
+    fn a_relative_include_of_a_project_whose_path_is_not_utf8_is_held() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = TmpDir::new();
+        let project = tmp.path().join(OsStr::from_bytes(b"p\xff"));
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::write(project.join("inc.cfg"), "").unwrap();
+        let project = project.canonicalize().unwrap();
+        let reach = Reach::of(&project, &[], None);
+        let origin = [b"file:", project.as_os_str().as_bytes(), b"/.git/config"].concat();
+        let (mut masks, mut refused) = (Vec::new(), None);
+        include_masks(
+            &reach,
+            &[&origin[..], b"\0include.path\n../inc.cfg\0"].concat(),
+            &mut masks,
+            &mut refused,
+        );
+        assert_eq!(refused, None);
+        let held = project.join("inc.cfg");
+        assert!(masks.iter().any(|m| m.path == held), "{masks:?}");
     }
 
     /// A relative `GIT_CONFIG_GLOBAL` is the file git reads at the top of the work tree, and an
