@@ -755,9 +755,10 @@ impl Credentials {
     ///
     /// Read together, under the lock [`Self::replace`] installs a set and counts it under. A pool
     /// key is exact in injection positions, and positions are equal across a re-resolution, so a
-    /// generation read apart from the set, after a replacement had landed, is the generation every
-    /// request under the new set reads as well: the key of a request carrying the old value was the
-    /// key of every request carrying the new one, and the connection it parked was offered to them.
+    /// generation read apart from the set, after a replacement has landed, is the generation every
+    /// request under the new set reads as well: the key of a request carrying the old value is then
+    /// the key of every request carrying the new one, and the connection it parks is offered to
+    /// them.
     pub(crate) fn snapshot_with_generation(&self) -> (std::sync::Arc<CredentialSet>, u64) {
         let current = crate::sandbox::locks::read_locked(&self.current);
         (current.clone(), self.generation())
