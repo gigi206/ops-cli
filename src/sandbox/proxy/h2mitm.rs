@@ -1098,12 +1098,20 @@ async fn relay_body(
         if let Some(cap) = &cap {
             cap.push(&chunk);
         }
-        if len > 0 && send_granted(&mut dst, chunk, bound, way).await? < len {
+        let forwarded = match len {
+            0 => Ok(0),
+            _ => send_granted(&mut dst, chunk, bound, way).await,
+        };
+        // Return the consumed window to the sender so it can keep sending, whether or not the
+        // frame went on. Its size was drawn from the connection's window as well as the stream's,
+        // which every stream of the connection shares, and what a stream took and never released
+        // h2 gives back only once nothing holds the stream any more: the other half of the
+        // exchange can hold it for as long as it runs.
+        let _ = src.flow_control().release_capacity(len);
+        if forwarded? < len {
             // The downstream reset/closed part-way: stop relaying.
             return Ok(());
         }
-        // Return the consumed window to the sender so it can keep sending.
-        let _ = src.flow_control().release_capacity(len);
     }
     // The DATA stream ended on its own: everything this direction will ever carry has been captured.
     if let Some(cap) = &cap {
@@ -1235,13 +1243,16 @@ async fn relay_body_redacting(
         let sent = if needles.iter().any(|n| n.find_in(&chunk, 0).is_some()) {
             let mut buf = chunk.to_vec();
             redact_in_place(&mut buf, needles);
-            send_masked(&mut dst, buf, bound, way).await?
+            send_masked(&mut dst, buf, bound, way).await
         } else {
-            send_granted(&mut dst, chunk, bound, way).await? == len
+            send_granted(&mut dst, chunk, bound, way)
+                .await
+                .map(|sent| sent == len)
         };
-        // Return the consumed receive-window for the original chunk so the sender keeps sending.
+        // Return the consumed receive-window for the original chunk so the sender keeps sending,
+        // whether or not the frame went on, for the reason [`relay_body`] gives.
         let _ = src.flow_control().release_capacity(len);
-        if !sent {
+        if !sent? {
             return Ok(());
         }
     }
@@ -2101,6 +2112,135 @@ mod tests {
             "a send that gave up on its bound reports it, so the stream is reset rather than \
              quietly relaying nothing: {answered:?}"
         );
+    }
+
+    /// A frame the relay took and could not forward still gives its window back.
+    ///
+    /// A DATA frame's size is drawn from its connection's window as well as its stream's, and the
+    /// connection's is the one every stream of the tunnel shares. The relay returned a frame's window
+    /// only once the frame was forwarded, so a send that failed (a peer granting nothing until the
+    /// bound ran out, a reset) left that frame's bytes withheld. h2 gives back what a dropped stream
+    /// never released only once nothing holds the stream any more, and the other half of the
+    /// exchange holds it for as long as it runs, so each such stream shrank the window every stream
+    /// of the connection sends on.
+    ///
+    /// Both relays, since both returned the window after a send that can fail, and both ways a
+    /// send ends early: a peer that grants nothing until the bound runs out, which is an error, and
+    /// one that resets the stream, which ends the relay quietly. The cage's stream is held open
+    /// throughout, as the live response half of an exchange holds it.
+    #[test]
+    fn a_frame_the_relay_could_not_forward_still_returns_its_window() {
+        use std::time::Duration;
+        // Just under the default 65 535-byte window, which the client sends in 16 KiB frames.
+        const SENT: usize = 64_000;
+        const WINDOW: usize = 65_535;
+
+        for (redacting, resets) in [(false, false), (true, false), (false, true), (true, true)] {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let regained = rt.block_on(async {
+                let (cage_io, proxy_io) = tokio::io::duplex(1 << 20);
+                let (up_io, server_io) = tokio::io::duplex(1 << 20);
+
+                // The upstream: every stream's window shut, nothing ever read, and each stream
+                // either held so or reset.
+                tokio::spawn(async move {
+                    let mut conn = h2::server::Builder::new()
+                        .initial_window_size(0)
+                        .handshake::<_, Bytes>(server_io)
+                        .await
+                        .unwrap();
+                    let mut held = Vec::new();
+                    while let Some(Ok((req, mut respond))) = conn.accept().await {
+                        if resets {
+                            respond.send_reset(h2::Reason::CANCEL);
+                        }
+                        held.push((req, respond));
+                    }
+                });
+                let (mut up_send, up_conn) = h2::client::handshake(up_io).await.unwrap();
+                tokio::spawn(async move {
+                    let _ = up_conn.await;
+                });
+                let (_up_response, mut dst) = up_send
+                    .send_request(Request::builder().body(()).unwrap(), false)
+                    .unwrap();
+                // A reset the relay is to meet is one it meets: seen here first, so the bound below
+                // cannot run out ahead of it however the two are scheduled.
+                if resets {
+                    let _ = std::future::poll_fn(|cx| dst.poll_reset(cx)).await;
+                }
+
+                // The cage: one stream carrying a body, then a second to read the window from.
+                let (cage, proxy) = tokio::join!(
+                    h2::client::handshake(cage_io),
+                    h2::server::handshake(proxy_io)
+                );
+                let (mut cage_send, cage_conn) = cage.unwrap();
+                tokio::spawn(async move {
+                    let _ = cage_conn.await;
+                });
+                let mut proxy_conn = proxy.unwrap();
+                let (_carried_response, mut carried) = cage_send
+                    .send_request(Request::builder().body(()).unwrap(), false)
+                    .unwrap();
+                send_under_flow_control(&mut carried, Bytes::from(vec![b'x'; SENT]), false).await;
+                let (req, _held) = proxy_conn.accept().await.unwrap().unwrap();
+                // Every stream accepted from here on is held, or dropping it would reset the probe.
+                tokio::spawn(async move {
+                    let mut held = Vec::new();
+                    while let Some(Ok(stream)) = proxy_conn.accept().await {
+                        held.push(stream);
+                    }
+                });
+
+                let bound = CapacityBound {
+                    within: match resets {
+                        true => Duration::from_secs(30),
+                        false => Duration::from_millis(100),
+                    },
+                    dest: Arc::from("upstream.test:443"),
+                };
+                let counted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let src = req.into_body();
+                let ended = match redacting {
+                    true => {
+                        relay_body_redacting(src, dst, &[], None, counted, &bound, "test").await
+                    }
+                    false => relay_body(src, dst, None, None, counted, &bound, "test").await,
+                };
+                assert_eq!(
+                    ended.is_err(),
+                    !resets,
+                    "precondition: a send that ran out its bound ends in an error, and one the peer \
+                     reset ends quietly (redacting: {redacting}, resets: {resets})"
+                );
+
+                let (_probe_response, mut probe) = cage_send
+                    .send_request(Request::builder().body(()).unwrap(), false)
+                    .unwrap();
+                probe.reserve_capacity(WINDOW);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while probe.capacity() < WINDOW {
+                    let grew = tokio::time::timeout_at(
+                        deadline,
+                        std::future::poll_fn(|cx| probe.poll_capacity(cx)),
+                    )
+                    .await;
+                    if !matches!(grew, Ok(Some(Ok(_)))) {
+                        break;
+                    }
+                }
+                probe.capacity()
+            });
+            assert_eq!(
+                regained, WINDOW,
+                "the connection's whole window is back for the cage's other streams \
+                 (redacting: {redacting}, resets: {resets})"
+            );
+        }
     }
 
     /// A secret the cage writes into `:method` must trip the outbound tripwire, exactly as one in a
