@@ -290,7 +290,7 @@ pub(crate) fn host_sockets(runtime_dir: Option<&str>, is_wsl: bool) -> Vec<PathB
     out
 }
 
-/// What to say when [`host_sockets`] named candidates and none of them existed.
+/// What to say when [`host_sockets`] named candidates and none of them held a socket.
 ///
 /// Built from the very list that was searched rather than from a literal, so it can neither name a
 /// path this launch did not try nor omit one it did. The two spellings each carried a hand-written
