@@ -346,8 +346,10 @@ async fn stream(
     // The state read here is the stream's one credential state, carried into [`relay`] rather than
     // read again there: the head and its trailers are scanned, the credential injected and the
     // response masked under one resolution, as on the HTTP/1.1 planes, even when a re-resolution
-    // lands while the stream waits on the supervisor below.
-    let creds = ctx.credentials.snapshot();
+    // lands while the stream waits on the supervisor below. The generation the pool keys this
+    // stream's connection by is read with it, for the reason
+    // [`Credentials::snapshot_with_generation`](super::Credentials::snapshot_with_generation) gives.
+    let (creds, generation) = ctx.credentials.snapshot_with_generation();
     if !creds.needles.is_empty() && head_carries_secret(&req, &creds.needles, connect_host) {
         ctx.outcome(
             Proto::Https,
@@ -415,6 +417,7 @@ async fn stream(
         method.as_str(),
         &path,
         &creds,
+        generation,
         ctx,
         pool,
     )
@@ -463,6 +466,7 @@ async fn relay(
     method: &str,
     path: &str,
     creds: &Arc<CredentialSet>,
+    generation: u64,
     ctx: &ProxyCtx,
     pool: &UpstreamPool,
 ) {
@@ -580,18 +584,19 @@ async fn relay(
     // all ran above, per stream, and a stream that any of them refuses never reaches this line.
     // What is reused is the handshake, and only to an address this stream's own connection could
     // have reached.
-    let send_req = match ready_upstream(pool, &injected_ids, checked, deciding, ctx).await {
-        Ok(send) => send,
-        // Recorded where the supervisor's answer came in; only the answer is written here.
-        Err(Unopened::Refused(refusal)) => {
-            let _ = refuse(respond, refusal.status(), refusal.tag());
-            return;
-        }
-        Err(Unopened::Failed(reason)) => {
-            refuse_upstream(respond, ctx, host, port, method, path, reason);
-            return;
-        }
-    };
+    let send_req =
+        match ready_upstream(pool, &injected_ids, generation, checked, deciding, ctx).await {
+            Ok(send) => send,
+            // Recorded where the supervisor's answer came in; only the answer is written here.
+            Err(Unopened::Refused(refusal)) => {
+                let _ = refuse(respond, refusal.status(), refusal.tag());
+                return;
+            }
+            Err(Unopened::Failed(reason)) => {
+                refuse_upstream(respond, ctx, host, port, method, path, reason);
+                return;
+            }
+        };
 
     // The upstream is connected and validated (this is the HTTP/1.1 path's `connect_upstream`
     // success point), so record the allow now — a verdict-passing request that failed to reach
@@ -790,7 +795,9 @@ async fn relay(
     // Stop sharing a connection the upstream has just bound an identity to — see
     // [`binds_identity_to_the_connection`].
     if binds_identity_to_the_connection(&rparts.headers) {
-        pool.open.borrow_mut().retain(|p| p.ids != injected_ids);
+        pool.open
+            .borrow_mut()
+            .retain(|p| !p.serves(&injected_ids, generation));
     }
 
     // Capture the response head, rendered from the framed status + headers. Teed ahead of the
@@ -1404,12 +1411,24 @@ struct UpstreamPool {
     opening: futures_util::lock::Mutex<()>,
 }
 
-/// A connection a tunnel keeps: the credential set it was opened for, the address it reached, and
-/// the handle its streams are sent on.
+/// A connection a tunnel keeps: the credential set it was opened for and that set's generation,
+/// the address it reached, and the handle its streams are sent on.
 struct Pooled {
     ids: Vec<usize>,
+    /// The credential generation the set was resolved under. The positions in `ids` are equal
+    /// across a re-resolution, so without it a connection that carried one value stayed on offer to
+    /// a stream carrying the value that replaced it, which the HTTP/1.1 pool keys out the same way.
+    generation: u64,
     peer: IpAddr,
     send: h2::client::SendRequest<Bytes>,
+}
+
+impl Pooled {
+    /// Whether this connection was opened for the credential set `ids` under `generation`: the key
+    /// a stream is offered it by, and the one it is let go by.
+    fn serves(&self, ids: &[usize], generation: u64) -> bool {
+        self.ids == ids && self.generation == generation
+    }
 }
 
 /// Why a stream has no upstream connection. The supervisor's refusals are recorded where its answer
@@ -1433,6 +1452,7 @@ enum Unopened {
 async fn ready_upstream(
     pool: &UpstreamPool,
     ids: &[usize],
+    generation: u64,
     checked: &Checked,
     deciding: Option<&Rule>,
     ctx: &ProxyCtx,
@@ -1446,11 +1466,11 @@ async fn ready_upstream(
         return open_upstream(checked, ctx).await.map(|(send, _)| send);
     }
     let host = checked.asked.host.as_str();
-    if let Some(send) = pooled(pool, ids, host, deciding).await {
+    if let Some(send) = pooled(pool, ids, generation, host, deciding).await {
         return Ok(send);
     }
     let _turn = pool.opening.lock().await;
-    if let Some(send) = pooled(pool, ids, host, deciding).await {
+    if let Some(send) = pooled(pool, ids, generation, host, deciding).await {
         return Ok(send);
     }
     let (send, peer) = open_upstream(checked, ctx).await?;
@@ -1461,6 +1481,7 @@ async fn ready_upstream(
         if open.len() < MAX_POOLED {
             open.push(Pooled {
                 ids: ids.to_vec(),
+                generation,
                 peer,
                 send: send.clone(),
             });
@@ -1469,13 +1490,15 @@ async fn ready_upstream(
     Ok(send)
 }
 
-/// The tunnel's connection for the credential set `ids`, ready for a stream to `host` its policy
+/// The tunnel's connection for the credential set `ids` under `generation`, ready for a stream to
+/// `host` its policy
 /// permitted by `deciding`: one whose address passes the guard this stream's own connection would,
 /// so a connection opened under a rule naming the host exactly is not handed to a stream a wildcard
 /// admitted. A kept connection that turns out closed is let go.
 async fn pooled(
     pool: &UpstreamPool,
     ids: &[usize],
+    generation: u64,
     host: &str,
     deciding: Option<&Rule>,
 ) -> Option<h2::client::SendRequest<Bytes>> {
@@ -1484,12 +1507,14 @@ async fn pooled(
         .open
         .borrow()
         .iter()
-        .find(|p| p.ids == ids && ip_refusal(p.peer, host, deciding).is_none())
+        .find(|p| p.serves(ids, generation) && ip_refusal(p.peer, host, deciding).is_none())
         .map(|p| p.send.clone())?;
     match send.ready().await {
         Ok(ready) => Some(ready),
         Err(_) => {
-            pool.open.borrow_mut().retain(|p| p.ids != ids);
+            pool.open
+                .borrow_mut()
+                .retain(|p| !p.serves(ids, generation));
             None
         }
     }
@@ -4042,6 +4067,89 @@ mod tests {
             seen.header("authorization"),
             Some("Bearer admitted"),
             "the stream injects from the state its head was scanned under: {seen:?}"
+        );
+    }
+
+    /// Two streams of one tunnel that carry different values of the same credential do not share
+    /// an upstream connection, a re-resolution between them notwithstanding.
+    ///
+    /// The pool was keyed by injection positions alone, and positions are equal across a
+    /// re-resolution, so the connection that carried the old value was offered to the stream
+    /// carrying the new one. A generation read apart from the stream's snapshot does no better: the
+    /// supervisor's resolver installs the new state during the first stream's check, after its
+    /// snapshot, and a generation read then is the one the second stream reads too.
+    #[test]
+    fn streams_carrying_two_values_of_one_credential_do_not_share_an_upstream() {
+        use crate::allowlist::classify;
+        use crate::sandbox::proxy::inject::CredentialSet;
+        use crate::sandbox::proxy::{Credentials, HeaderInjection};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let bearer = |value: &str| {
+            vec![HeaderInjection::fixed(
+                classify("grpc.test:*").unwrap(),
+                "authorization".to_string(),
+                value.to_string(),
+            )]
+        };
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            2,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc(""),
+            Arc::clone(&trace),
+        );
+        let credentials = Arc::new(Credentials::new(
+            bearer("Bearer before"),
+            Vec::new(),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            Vec::new(),
+        ));
+        let (installs, first) = (Arc::clone(&credentials), AtomicBool::new(true));
+        let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+        let ctx = ctx
+            .with_shared_credentials(Arc::clone(&credentials))
+            .with_resolver(Box::new(move |_| {
+                if first.swap(false, Ordering::SeqCst) {
+                    installs.replace(CredentialSet {
+                        injections: bearer("Bearer after"),
+                        needles: Vec::new(),
+                    });
+                }
+                Ok(vec![IpAddr::from([127, 0, 0, 1])])
+            }));
+
+        let answers = through_h2_proxy_streams(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            vec![(grpc_request(&[]), None), (grpc_request(&[]), None)],
+            &trace,
+        );
+        assert!(
+            answers.iter().all(|a| a.status == StatusCode::OK),
+            "both streams were relayed: {}",
+            trace.render()
+        );
+        let carried: Vec<Option<String>> = trace
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.header("authorization").map(str::to_string))
+            .collect();
+        assert_eq!(
+            carried,
+            vec![
+                Some("Bearer before".to_string()),
+                Some("Bearer after".to_string())
+            ],
+            "precondition: the streams carry the two values"
+        );
+        assert_eq!(
+            trace.upstream_tcp.load(Ordering::Relaxed),
+            2,
+            "a connection that carried one value is not offered to a stream carrying another"
         );
     }
 
