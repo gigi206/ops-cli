@@ -1251,9 +1251,9 @@ fn resolve_wayland_hole_binds_the_socket_file_never_the_runtime_dir() {
 /// The GUI and audio holes bind a socket and nothing else, whatever the variable names.
 ///
 /// `resolve_wayland_hole` takes `WAYLAND_DISPLAY` as the convention defines it, so `.` resolves to
-/// `$XDG_RUNTIME_DIR` itself and an absolute value to any path at all. The bind used to follow on
-/// the path merely existing, which put the whole runtime directory, the other agents' sockets with
-/// it, where the guide promises the socket file alone.
+/// `$XDG_RUNTIME_DIR` itself and an absolute value to any path at all. A bind that followed on the
+/// path merely existing would put the whole runtime directory, the other agents' sockets with it,
+/// where the guide promises the socket file alone.
 #[test]
 fn a_gui_or_audio_hole_binds_only_a_socket() {
     let dir = TmpDir::new();
