@@ -1248,6 +1248,36 @@ fn resolve_wayland_hole_binds_the_socket_file_never_the_runtime_dir() {
     assert!(resolve_wayland_hole(Some("wayland-0"), None).is_err());
 }
 
+/// The GUI and audio holes bind a socket and nothing else, whatever the variable names.
+///
+/// `resolve_wayland_hole` takes `WAYLAND_DISPLAY` as the convention defines it, so `.` resolves to
+/// `$XDG_RUNTIME_DIR` itself and an absolute value to any path at all. The bind used to follow on
+/// the path merely existing, which put the whole runtime directory, the other agents' sockets with
+/// it, where the guide promises the socket file alone.
+#[test]
+fn a_gui_or_audio_hole_binds_only_a_socket() {
+    let dir = TmpDir::new();
+    let socket = dir.join("wayland-0");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let linked = dir.join("linked");
+    std::os::unix::fs::symlink(&socket, &linked).unwrap();
+    let file = dir.join("file");
+    std::fs::write(&file, b"not a server").unwrap();
+
+    assert!(names_a_socket(&socket), "a listening socket is bound");
+    assert!(
+        names_a_socket(&linked),
+        "a link to one too, as WSLg publishes them"
+    );
+    assert!(!names_a_socket(&file), "a regular file is not");
+    assert!(!names_a_socket(&dir.join("missing")), "nor a missing path");
+    let (runtime, _) = resolve_wayland_hole(Some("."), Some(dir.path().to_str().unwrap())).unwrap();
+    assert!(
+        !names_a_socket(&runtime),
+        "nor the runtime directory a display of `.` resolves to"
+    );
+}
+
 /// Two grants contribute to the loader path, and a cage with both must keep the directories of
 /// each. The union is what a path list means; the last-writer rule that governs every other shared
 /// key would drop one grant's libraries with no message, which is how a caged app loses its audio
