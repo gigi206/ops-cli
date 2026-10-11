@@ -752,7 +752,7 @@ pub(crate) fn production_half(text: &str) -> Cow<'_, str> {
 /// Where the brace that `text[open]` opens is closed, counting only the braces that are code: a
 /// brace inside a string, a raw string, a character literal or a comment — a fixture's JSON, a
 /// shell function a test runs — opens nothing.
-fn closing_brace(text: &[u8], open: usize) -> Option<usize> {
+pub(crate) fn closing_brace(text: &[u8], open: usize) -> Option<usize> {
     let ident = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
     let mut depth = 0usize;
     let mut i = open;
