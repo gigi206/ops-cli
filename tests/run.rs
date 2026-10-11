@@ -4824,6 +4824,20 @@ fn a_word_quoted_for_sh_reaches_the_script_as_it_was() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), word);
 }
 
+#[test]
+fn a_path_quoted_for_sh_keeps_its_bytes_that_are_not_utf8() {
+    // A fixture root may hold such a byte, here beside a blank and a quote; a word that put the
+    // replacement character in its place would name another path.
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    let path = PathBuf::from(std::ffi::OsString::from_vec(b"/a\xffb/c'd \x80".to_vec()));
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("printf %s {}", common::sh(&path)))
+        .output()
+        .expect("run /bin/sh");
+    assert_eq!(out.stdout, path.as_os_str().as_bytes());
+}
+
 /// Run `command` with a fresh terminal as its stdin, stdout and stderr, which is what makes a
 /// launch interactive (`isatty(0)`), and drain the terminal until the command has exited and the
 /// terminal has gone quiet, or `limit` passes. Returns the exit code, `None` for a signal or for a
