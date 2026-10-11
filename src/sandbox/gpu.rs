@@ -16,7 +16,7 @@
 //! 3. the minimal `/sys` DRM subtree the driver reads to enumerate the device,
 //!    read-only and scoped to the GPU device directories (not all of `/sys`);
 //! 4. under WSL only, the bridge libraries the `d3d12` driver reaches the GPU through
-//!    ([`wsl_bridge`]) — Windows provides those, not nixpkgs, so a hermetic cage would
+//!    ([`wsl_bridge_in`]) — Windows provides those, not nixpkgs, so a hermetic cage would
 //!    otherwise hold the render node and render in software regardless.
 //!
 //! 5. where the host carries an NVIDIA driver, that driver's own userspace
@@ -175,7 +175,7 @@ pub(crate) const WSL_LIB_DIR: &str = "/usr/lib/wsl/lib";
 /// loader stub it goes through, so a directory without it is not the bridge whatever else it holds.
 const WSL_BRIDGE_LIB: &str = "libdxcore.so";
 
-/// The WSL GPU bridge directory to bind, when this host has one.
+/// The WSL GPU bridge directory to bind, when the host under `root` (`/`, but in a test) has one.
 ///
 /// mesa's `d3d12` driver reaches the GPU through `libdxcore.so`/`libd3d12core.so`, which Windows
 /// provides here rather than nixpkgs. A hermetic cage carries neither, so it falls back to
@@ -190,17 +190,12 @@ const WSL_BRIDGE_LIB: &str = "libdxcore.so";
 /// all — no `/dev/dri`, only the `dxgkrnl` character device `/dev/dxg` — so [`render_nodes`] finds
 /// nothing there and this bridge names no device of its own. Binding `/dev/dxg` moves no
 /// **renderer**, because that host answers `swrast` outside any cage as well; for rendering the
-/// grant buys nothing. **Compute is the other answer**, and [`wsl_compute`] carries it: CUDA needs
+/// grant buys nothing. **Compute is the other answer**, and [`wsl_compute_in`] carries it: CUDA needs
 /// the node, and the node is not enough on its own. Whether another WSL publishes a `renderD*` is
 /// untested.
 ///
 /// `None` on any host without it, which is every host that is not WSL — the GPU hole is then
 /// exactly what it was.
-pub(crate) fn wsl_bridge() -> Option<PathBuf> {
-    wsl_bridge_in(Path::new("/"))
-}
-
-/// [`wsl_bridge`] under a named root, so both answers are testable without the host's own `/usr`.
 pub(crate) fn wsl_bridge_in(root: &Path) -> Option<PathBuf> {
     let dir = root.join(WSL_LIB_DIR.trim_start_matches('/'));
     dir.join(WSL_BRIDGE_LIB).exists().then_some(dir)
@@ -216,15 +211,17 @@ pub(crate) const WSL_DRIVER_STORE: &str = "/usr/lib/wsl/drivers";
 /// through this device.
 pub(crate) const WSL_COMPUTE_NODE: &str = "/dev/dxg";
 
-/// The two halves a WSL cage needs to reach the GPU for **compute**, or `None`.
+/// The two halves a WSL cage needs to reach the GPU for **compute** on the host under `root` (`/`,
+/// but in a test), or `None`.
 ///
 /// They are returned together because neither is worth anything alone, and a caller handed two
 /// separate options could grant one and believe it had granted access. The node is the device
 /// half. The store is the code half: `libcuda.so.1` under WSL is a stub that reaches the real
 /// driver through the Windows driver store, so a cage holding the node and the stub alone still
 /// enumerates no device, and a cage holding the store without the node has no device to enumerate.
-/// Either way CUDA initialises against nothing. The libraries of [`wsl_bridge`] are needed on top
-/// of both and are granted there, which is why this answer is only consulted beside it.
+/// Either way CUDA initialises against nothing. The libraries of [`wsl_bridge_in`] are needed on
+/// top of both and are granted there, which is why this answer is only consulted beside it
+/// ([`wsl_gpu`]).
 ///
 /// The whole store is granted rather than the subdirectory that serves a given card, and that is a
 /// deliberate limit. The store holds a package per Windows driver, typically a single one of which
@@ -236,18 +233,20 @@ pub(crate) const WSL_COMPUTE_NODE: &str = "/dev/dxg";
 /// drivers and no secret of the user's.
 ///
 /// The store half is keyed on the directory existing and not on it holding driver code, which is
-/// the one place this differs from [`wsl_bridge`] and its single named library. Proving the
+/// the one place this differs from [`wsl_bridge_in`] and its single named library. Proving the
 /// content would mean walking a large tree on a network filesystem at every launch, to answer a
 /// question the bridge beside it has already answered for the host as a whole. The residue is
 /// narrow and worth naming: on a WSL host whose store carries no Linux libraries, the node is
 /// granted against nothing, and CUDA then fails inside the cage exactly as it fails outside one.
 /// Nothing is opened that such a host could not already reach.
-pub(crate) fn wsl_compute() -> Option<WslCompute> {
-    wsl_compute_in(Path::new("/"))
+pub(crate) fn wsl_compute_in(root: &Path) -> Option<WslCompute> {
+    let store = root.join(WSL_DRIVER_STORE.trim_start_matches('/'));
+    let node = root.join(WSL_COMPUTE_NODE.trim_start_matches('/'));
+    (store.is_dir() && node.exists()).then_some(WslCompute { store, node })
 }
 
 /// The device node and the driver store a WSL cage needs for compute, granted as one or not
-/// at all. See [`wsl_compute`] for why they are inseparable.
+/// at all. See [`wsl_compute_in`] for why they are inseparable.
 pub(crate) struct WslCompute {
     /// The Windows driver store to bind read-only, the code half.
     pub(crate) store: PathBuf,
@@ -255,15 +254,32 @@ pub(crate) struct WslCompute {
     pub(crate) node: PathBuf,
 }
 
-/// [`wsl_compute`] under a named root, so a host without either half is testable.
+/// What this host offers a `gpu = true` cage under WSL: the bridge libraries, and beside them the
+/// compute halves when the host has both. See [`wsl_gpu_in`].
+pub(crate) struct WslGpu {
+    /// The bridge directory, bound read-only and put on the loader path; see [`wsl_bridge_in`].
+    pub(crate) bridge: PathBuf,
+    /// The compute halves, only ever beside the bridge whose libraries they are inert without.
+    pub(crate) compute: Option<WslCompute>,
+}
+
+/// What the host offers a `gpu = true` cage under WSL, asked once per launch.
+pub(crate) fn wsl_gpu() -> Option<WslGpu> {
+    wsl_gpu_in(Path::new("/"))
+}
+
+/// [`wsl_gpu`] under a named root, so the composition is testable without the host's own `/usr`.
 ///
-/// The two halves are granted at two sites: the store is bound beside [`wsl_bridge`]'s libraries,
-/// the node joins the device list beside [`render_nodes`]. One answer feeds both, which is what
-/// keeps them from drifting apart.
-pub(crate) fn wsl_compute_in(root: &Path) -> Option<WslCompute> {
-    let store = root.join(WSL_DRIVER_STORE.trim_start_matches('/'));
-    let node = root.join(WSL_COMPUTE_NODE.trim_start_matches('/'));
-    (store.is_dir() && node.exists()).then_some(WslCompute { store, node })
+/// One answer for both sites that grant it: the store is bound beside the bridge's libraries, and
+/// the node joins the device list beside [`render_nodes`]. Asked at each site instead, the two
+/// halves came from two probes, and the node was granted on a host with no bridge to load the
+/// libraries that use it.
+pub(crate) fn wsl_gpu_in(root: &Path) -> Option<WslGpu> {
+    let bridge = wsl_bridge_in(root)?;
+    Some(WslGpu {
+        bridge,
+        compute: wsl_compute_in(root),
+    })
 }
 
 /// The fixed cage path the host's NVIDIA driver userspace is bound under (parity with the other
@@ -727,6 +743,45 @@ mod tests {
         assert!(
             wsl_compute_in(root.path()).is_none(),
             "the store half is a directory to bind, so a plain file at that path grants nothing"
+        );
+    }
+
+    /// The compute halves are offered only beside the bridge, in the one answer both grant sites
+    /// read.
+    ///
+    /// The device site asked for compute on its own, so a host with the node and the store but no
+    /// bridge library had `/dev/dxg` granted with nothing in the cage to load what drives it, which
+    /// the compute doc rules out ("only consulted beside it").
+    #[test]
+    fn compute_is_offered_only_beside_the_bridge() {
+        let root = crate::testutil::TmpDir::new();
+        std::fs::create_dir_all(root.join("usr/lib/wsl/drivers")).expect("stage the store");
+        std::fs::create_dir_all(root.join("dev")).expect("stage /dev");
+        std::fs::write(root.join("dev/dxg"), b"").expect("stage the node");
+
+        assert!(
+            wsl_gpu_in(root.path()).is_none(),
+            "both compute halves and no bridge: nothing is offered, the node least of all"
+        );
+
+        let bridge = root.join("usr/lib/wsl/lib");
+        std::fs::create_dir_all(&bridge).expect("stage the bridge directory");
+        std::fs::write(bridge.join("libdxcore.so"), b"").expect("stage the loader stub");
+        let offered = wsl_gpu_in(root.path()).expect("the bridge is there");
+        assert_eq!(offered.bridge, bridge);
+        assert_eq!(
+            offered.compute.map(|c| (c.store, c.node)),
+            Some((root.join("usr/lib/wsl/drivers"), root.join("dev/dxg"))),
+            "beside the bridge, the compute halves come with it"
+        );
+
+        std::fs::remove_file(root.join("dev/dxg")).expect("unstage the node");
+        assert!(
+            wsl_gpu_in(root.path())
+                .expect("the bridge is still there")
+                .compute
+                .is_none(),
+            "the bridge alone is offered without compute"
         );
     }
 

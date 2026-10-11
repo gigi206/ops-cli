@@ -836,6 +836,10 @@ struct HardwareLayers {
     /// GPU layer's provisioning, the binds and env, and the device grant — because it walks the
     /// host's driver directories and `/dev`, and three walks would be three chances to disagree.
     nvidia: Option<crate::sandbox::gpu::NvidiaBridge>,
+    /// What a WSL host offers, under `gpu = true`: the bridge libraries and, beside them, the
+    /// compute halves. Resolved once for its two readers, the binds and the device grant, for the
+    /// reason the NVIDIA bridge is.
+    wsl: Option<crate::sandbox::gpu::WslGpu>,
     /// mesa's DRI drivers, under `gpu = true`.
     gpu: Option<crate::sandbox::gpu::GpuLayer>,
     /// The PulseAudio client userspace, under `audio = true`.
@@ -885,6 +889,7 @@ fn hardware_layers(prep: &Prepared) -> HardwareLayers {
         .gpu
         .then(crate::sandbox::gpu::nvidia_bridge)
         .flatten();
+    let wsl = prep.cfg.gpu.then(crate::sandbox::gpu::wsl_gpu).flatten();
     let gpu_layer = optional_layer(
         prep,
         prep.cfg.gpu,
@@ -919,6 +924,7 @@ fn hardware_layers(prep: &Prepared) -> HardwareLayers {
     HardwareLayers {
         ca_trust,
         nvidia,
+        wsl,
         gpu: gpu_layer,
         audio: audio_layer,
     }
@@ -2051,23 +2057,26 @@ fn gpu_binds(prep: &Prepared, hw: &HardwareLayers) -> GuiWiring {
         // open shared object file`; on the path and not bound, there is nothing to open.
         // `LD_LIBRARY_PATH` is in the same reserved class as the driver-path variables above, for
         // the same reason — it loads code, so it is sbx's to set and an untrusted `[env]` may not.
-        if let Some(bridge) = crate::sandbox::gpu::wsl_bridge() {
-            env.push(("LD_LIBRARY_PATH".to_string(), bridge.display().to_string()));
+        if let Some(wsl) = &hw.wsl {
+            env.push((
+                "LD_LIBRARY_PATH".to_string(),
+                wsl.bridge.display().to_string(),
+            ));
             mounts.push(binds::ExtraBind {
-                src: bridge.clone(),
-                dest: bridge,
+                src: wsl.bridge.clone(),
+                dest: wsl.bridge.clone(),
                 writable: false,
             });
             // The compute half, nested here because a driver store without the bridge libraries
             // is inert: `libcuda.so.1` under WSL is a stub that reaches the real driver through
             // the Windows driver store, so a cage holding the stub and the device node but not
             // the store still enumerates no device. Its companion device grant, `/dev/dxg`, is
-            // made where the `[devices]` list is resolved, from the same `wsl_compute` answer:
-            // one answer, two sites, so the halves cannot be granted apart.
-            if let Some(compute) = crate::sandbox::gpu::wsl_compute() {
+            // made where the `[devices]` list is resolved, from the same `hw.wsl` answer: one
+            // answer, two sites, so the halves cannot be granted apart.
+            if let Some(compute) = &wsl.compute {
                 mounts.push(binds::ExtraBind {
                     src: compute.store.clone(),
-                    dest: compute.store,
+                    dest: compute.store.clone(),
                     writable: false,
                 });
             }
@@ -3029,10 +3038,11 @@ pub(super) fn build(
     // Under WSL there are no DRM nodes at all and `/dev/dxg` is the whole of the guest's access to
     // the GPU, so it joins this list on the same terms as a render node rather than on a `card*`'s:
     // it carries no modesetting and no display, a WSL desktop reaching its screen over RDP and
-    // never through this device. It is granted only where its driver store is too, which is the
-    // condition [`crate::sandbox::gpu::wsl_compute`] answers, because either half alone leaves the
-    // cage with no device to enumerate. The store half of that same answer is bound in
-    // `gpu_binds`, beside the WSL bridge libraries it is inert without.
+    // never through this device. It is granted only where its driver store is too, because either
+    // half alone leaves the cage with no device to enumerate, and only beside the bridge libraries
+    // both are inert without: the condition `hw.wsl` answers once
+    // ([`crate::sandbox::gpu::wsl_gpu_in`]). The store half of that same answer is bound in
+    // `gpu_binds`.
     // Deduped: a trusted `[devices] allow = [...]` alongside `gpu = true` must not emit a bind twice.
     // The rule stops here and does not carry over to the `ExtraBind` list, which is not an
     // oversight: a device grant is a set of paths, so two entries naming one path are the same
@@ -3044,9 +3054,11 @@ pub(super) fn build(
     let mut devices = prep.cfg.devices.clone();
     if prep.cfg.gpu {
         let nvidia_nodes = hw.nvidia.iter().flat_map(|nv| nv.devices.iter().cloned());
-        let wsl_node = crate::sandbox::gpu::wsl_compute()
-            .into_iter()
-            .map(|compute| compute.node);
+        let wsl_node = hw
+            .wsl
+            .iter()
+            .filter_map(|wsl| wsl.compute.as_ref())
+            .map(|compute| compute.node.clone());
         for node in crate::sandbox::gpu::render_nodes()
             .into_iter()
             .chain(nvidia_nodes)
