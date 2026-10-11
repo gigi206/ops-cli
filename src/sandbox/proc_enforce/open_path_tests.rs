@@ -89,22 +89,39 @@ fn ending_supervision_denies_what_is_still_parked_before_closing_their_descripto
     // instead is whether the pipe still has a reader — the dup each park held and the number
     // `close_supervision` closed are all of them — which Linux reports on the write end as
     // `POLLERR`, and which no descriptor reuse elsewhere can forge.
-    let mut pfd = libc::pollfd {
-        fd: write_end.as_raw_fd(),
-        events: libc::POLLOUT,
-        revents: 0,
+    //
+    // Waited for within a bound rather than read once. A neighbouring test that forks holds a copy
+    // of every descriptor of this process, close-on-exec or not, until its child calls `exec`, so
+    // the last reader can outlive the teardown by that long. The teardown closes synchronously, so
+    // a reader it left open is still there at the bound, and fails the test.
+    let deadline = std::time::Instant::now() + PEER_GONE_WITHIN;
+    let revents = loop {
+        let mut pfd = libc::pollfd {
+            fd: write_end.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a live single-element array, and `write_end` is this test's own
+        // descriptor.
+        assert!(
+            unsafe { libc::poll(&mut pfd, 1, 0) } >= 0,
+            "the write end polls"
+        );
+        if pfd.revents & libc::POLLERR != 0 || std::time::Instant::now() >= deadline {
+            break pfd.revents;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    // SAFETY: `pfd` is a live single-element array, and `write_end` is this test's own descriptor.
     assert!(
-        unsafe { libc::poll(&mut pfd, 1, 0) } >= 0,
-        "the write end polls"
-    );
-    assert!(
-        pfd.revents & libc::POLLERR != 0,
-        "the teardown closed every reader of the pipe, so the write end has no peer: revents {:#x}",
-        pfd.revents
+        revents & libc::POLLERR != 0,
+        "the teardown closed every reader of the pipe, so the write end has no peer: revents \
+         {revents:#x} after {PEER_GONE_WITHIN:?}"
     );
 }
+
+/// How long a forked neighbour may hold the pipe's read end after the teardown closed its own: the
+/// span between its `fork` and its `exec`, which is milliseconds.
+const PEER_GONE_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The parked registry is the third producer on the line-based control wire that
 /// `ExecRing::push_verdict` guards, and it was the one written apart. `dispatch_enforced` renders
