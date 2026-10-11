@@ -6,10 +6,9 @@
 //! in a written-out list rather than globbing the directory. That choice is deliberate and stated in
 //! both files: a new suite should be a deliberate addition, not a silent inclusion.
 //!
-//! What the choice does not do by itself is notice an **omission**. The lists were hand-kept in two
-//! places with a comment asking they be held in step, which is the shape every drift in this
-//! repository has taken. Measured on 2026-08-21: fifteen suites carry a host-capability skip and
-//! both lists named fourteen, `projects` having been added after the lists were written.
+//! What the choice does not do by itself is notice an **omission**. The lists are hand-kept in two
+//! places, and a comment asking that they be held in step does not stop a suite added after them
+//! from being left out of both, silently.
 //!
 //! So the list stays written out, and this is what makes forgetting it impossible. The addition is
 //! still deliberate; only the silence is gone.
@@ -39,13 +38,12 @@ fn root() -> &'static Path {
 /// reading only the inner spelling would drop four suites and then report the omission against the
 /// runs rather than against itself.
 ///
-/// **The distinction has no subject in today's tree, and that is written here rather than left to be
-/// rediscovered.** Measured on 2026-08-31: only `run` carries an off-host skip (7
-/// `skip_unreachable!` and 57 `need_reachable!`), and it carries 28 `skip_incapable!` and 78
-/// `probe_or_skip!` besides, so relaxing this predicate to any skip at all selects the same fifteen
-/// suites and a mutation doing so survives. The rule is still the right one — it is the one both
-/// runs state — and it starts to bite the day a suite carries only the unenforceable kind. Until
-/// then this test cannot tell the two apart, and a reader should not assume it can.
+/// **The distinction selects nothing different in the current tree.** Every suite that carries an
+/// off-host skip (`skip_unreachable!`, `need_reachable!`) carries host-capability skips besides, so
+/// relaxing this predicate to any skip at all selects the same suites and a mutation doing so
+/// survives. The rule is still the right one — it is the one both runs state — and it starts to
+/// bite once a suite carries only the off-host kind. Until then this test cannot tell the two
+/// apart, and a reader should not assume it can.
 fn suites_carrying_a_cage_skip() -> BTreeSet<String> {
     let dir = root().join("tests");
     let mut out = BTreeSet::new();
