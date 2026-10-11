@@ -708,8 +708,11 @@ A transport failure is also *recorded*, not only answered, and where it fell is 
 reader sees. A host that was never reached leaves one `error` line carrying the reason
 and no allow at all, since nothing was allowed to leave. A host that was reached and
 then closed before answering leaves the allow standing, its status blank, with an
-`upstream-closed` beside it. The two reasons are the difference between a host that is
-down and a call that was lost mid-flight, so they are never used for each other.
+`upstream-closed` beside it. On an `http2` host the allow is recorded once a connection
+is ready to carry the stream, so one that closes after TLS has settled on HTTP/2 but
+before the stream goes out leaves `upstream-closed` alone, with no allow: nothing was
+sent. The two reasons are the difference between a host that is down and a call that was
+lost mid-flight, so they are never used for each other.
 
 `interim-head-cap` is the other one an upstream earns rather than a request. A server may
 put interim `1xx` responses in front of its answer, `100 Continue` or `103 Early Hints`,
