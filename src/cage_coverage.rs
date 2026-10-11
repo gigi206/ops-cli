@@ -149,18 +149,16 @@ fn test_paths_named_by_ci() -> Vec<(String, String)> {
 /// declared path because a module written as `<name>/tests.rs` spells that segment in the tree.
 #[test]
 fn every_test_a_ci_file_names_exists() {
-    // Every `fn` a source declares, with the module its file spells. `mod.rs` names the directory
+    // Every test a source declares, with the module its file spells. `mod.rs` names the directory
     // it sits in; any other file names itself.
     let mut declared: Vec<(String, String)> = Vec::new();
     for (path, text) in walk_sources_with_paths() {
         let module = module_path_of(&path);
-        for (i, _) in text.match_indices("fn ") {
-            let rest = &text[i + 3..];
-            let Some(end) = rest.find(['(', '<', ' ', '\n']) else {
-                continue;
-            };
-            declared.push((module.clone(), rest[..end].to_string()));
-        }
+        declared.extend(
+            declared_tests(&text)
+                .into_iter()
+                .map(|name| (module.clone(), name.to_string())),
+        );
     }
 
     let mut missing = Vec::new();
@@ -205,6 +203,84 @@ fn every_test_a_ci_file_names_exists() {
         missing.is_empty(),
         "a CI file filters on a test that does not exist, so the filter excludes nothing:\n{}",
         missing.join("\n")
+    );
+}
+
+/// The names of the tests `text` declares: each `fn` a `#[test]` line stands over, past the other
+/// attributes, comments and blank lines between them. A filter that names a function no attribute
+/// makes a test excludes nothing, so a helper of that name answers nothing here, and neither does
+/// `fn ` met in a comment or in a string on one line. A `proptest!` block writes its `#[test]` the
+/// same way. The scan reads lines, not tokens: a string spanning lines, one reading `#[test]` and a
+/// later one `fn x(`, would declare `x`.
+fn declared_tests(text: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut marked = false;
+    for line in text.lines() {
+        let code = line.trim();
+        if code == "#[test]" {
+            marked = true;
+        } else if code.is_empty() || code.starts_with("#[") || code.starts_with("//") {
+            continue;
+        } else {
+            if marked && let Some(name) = declared_fn(code) {
+                names.push(name);
+            }
+            marked = false;
+        }
+    }
+    names
+}
+
+/// The name of the function `code`, one line of source, declares, past its visibility and its
+/// qualifiers; `None` when the line declares none.
+fn declared_fn(code: &str) -> Option<&str> {
+    // A restricted visibility first, whole: `pub(in crate::x)` holds a space of its own.
+    let mut rest = match code.strip_prefix("pub(") {
+        Some(scope) => scope.split_once(')')?.1.trim_start(),
+        None => code,
+    };
+    loop {
+        rest = match rest.split_once(' ') {
+            Some((word, after))
+                if word.starts_with("pub")
+                    || ["const", "async", "unsafe", "extern", "\"C\""].contains(&word) =>
+            {
+                after
+            }
+            _ => break,
+        };
+    }
+    let rest = rest.strip_prefix("fn ")?;
+    let end = rest.find(['(', '<'])?;
+    Some(&rest[..end])
+}
+
+/// Only a function a `#[test]` line stands over is a test the filters can name, whatever lies
+/// between the two, and `fn ` in a comment or a string declares nothing.
+#[test]
+fn only_a_function_a_test_attribute_stands_over_is_a_test() {
+    // One line of source per line of text, so that this module's own scan reads no test in it.
+    let text = [
+        "/// Calls `fn ghost()`.",
+        "fn helper() {}",
+        "const S: &str = \"fn quoted() {}\";",
+        "#[test]",
+        "fn plain() {}",
+        "",
+        "#[test]",
+        "#[ignore = \"run by hand\"]",
+        "/// A measurement.",
+        "pub(crate) async fn qualified<T>() {}",
+        "    #[test]",
+        "    fn in_a_block(a in 0u8..) {}",
+        "#[test]",
+        "pub(in crate::sandbox) unsafe fn scoped() {}",
+        "// fn other(",
+    ]
+    .join("\n");
+    assert_eq!(
+        declared_tests(&text),
+        ["plain", "qualified", "in_a_block", "scoped"]
     );
 }
 
