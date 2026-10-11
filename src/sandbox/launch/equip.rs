@@ -287,9 +287,10 @@ pub(super) fn wrap_mise_equip(
 /// --out-link <out-link>` unless the out-link is already realised, registers a host-resolvable gc
 /// root for the build,
 /// then `exec`s the real command (which stays the cage's main process, leaving an interactive `sbx run`'s pty
-/// job control unchanged). Only the absolute `nix` path, the out-link parent directory, and the
-/// integer triple count are interpolated into the script — the refs, out-links, and keys ride
-/// `"$@"` positionally, so a value from config can never inject shell. The short-circuit
+/// job control unchanged). Only the absolute `nix` path, the coreutils paths, the out-link parent
+/// directory, and the integer triple count are interpolated into the script, each path through
+/// [`shell_quote`] — the refs, out-links, and keys ride `"$@"` positionally, so a value from config
+/// can never inject shell. The short-circuit
 /// `[ -e "$out/bin" ]` dereferences the out-link symlink into the cage's `/nix` (the per-project
 /// store): a path already present skips the build (a warm no-op that also works offline), while a
 /// dangling cross-project out-link (the `home_scope = "global"` residual) rebuilds.
@@ -333,38 +334,38 @@ pub(super) fn wrap_flake_equip(
     // target *is* its good — it has no second key to clear the marker, so it retries as before).
     // The hard-fail (exit 1) is reserved for the case where no prior good build exists at all.
     let script = format!(
-        "'{mkdir}' -p '{dir}'\n\
+        "{mkdir} -p {dir}\n\
          n={n}\n\
          while [ \"$n\" -gt 0 ]; do\n\
          ref=\"$1\"; target=\"$2\"; good=\"$3\"; key=\"$4\"\n\
          if [ ! -e \"$target/bin\" ] && [ ! -e \"$target.failed\" ]; then\n\
-         '{nix}' build \"$ref\" --no-write-lock-file --out-link \"$target\" 1>&2\n\
-         [ -e \"$target/bin\" ] || [ \"$target\" = \"$good\" ] || '{touch}' \"$target.failed\"\n\
+         {nix} build \"$ref\" --no-write-lock-file --out-link \"$target\" 1>&2\n\
+         [ -e \"$target/bin\" ] || [ \"$target\" = \"$good\" ] || {touch} \"$target.failed\"\n\
          fi\n\
          if [ -e \"$target/bin\" ]; then\n\
-         '{rm}' -f \"$target.failed\"\n\
-         sp=$('{readlink}' -f \"$target\")\n\
-         [ \"$target\" != \"$good\" ] && '{ln}' -sfn \"$sp\" \"$good\"\n\
+         {rm} -f \"$target.failed\"\n\
+         sp=$({readlink} -f \"$target\")\n\
+         [ \"$target\" != \"$good\" ] && {ln} -sfn \"$sp\" \"$good\"\n\
          elif [ -e \"$good/bin\" ]; then\n\
-         sp=$('{readlink}' -f \"$good\")\n\
+         sp=$({readlink} -f \"$good\")\n\
          echo \"sbx: flake '$key': build failed — falling back to the last good build; a new revision (or, for an inline flake, an edit) triggers a fresh build\" 1>&2\n\
          else\n\
          echo \"sbx: flake '$key': the build failed and there is no prior build to fall back to\" 1>&2\n\
          exit 1\n\
          fi\n\
-         [ -n \"$sp\" ] && '{mkdir}' -p /nix/var/nix/gcroots \
-         && '{ln}' -sfn \"$sp\" \"/nix/var/nix/gcroots/sbx-flake-$key\"\n\
+         [ -n \"$sp\" ] && {mkdir} -p /nix/var/nix/gcroots \
+         && {ln} -sfn \"$sp\" \"/nix/var/nix/gcroots/sbx-flake-$key\"\n\
          shift 4\n\
          n=$((n - 1))\n\
          done\n\
          exec \"$@\"",
-        dir = flake_dir.to_string_lossy(),
-        nix = nix.to_string_lossy(),
-        mkdir = mkdir.to_string_lossy(),
-        touch = touch.to_string_lossy(),
-        rm = rm.to_string_lossy(),
-        readlink = readlink.to_string_lossy(),
-        ln = ln.to_string_lossy(),
+        dir = shell_quote(&flake_dir.to_string_lossy()),
+        nix = shell_quote(&nix.to_string_lossy()),
+        mkdir = shell_quote(&mkdir.to_string_lossy()),
+        touch = shell_quote(&touch.to_string_lossy()),
+        rm = shell_quote(&rm.to_string_lossy()),
+        readlink = shell_quote(&readlink.to_string_lossy()),
+        ln = shell_quote(&ln.to_string_lossy()),
     );
     let mut out = vec![
         bash.as_os_str().to_os_string(),
