@@ -617,13 +617,20 @@ fn every_named_table_example_uses_real_keys() {
     );
 }
 
-/// Every fenced `toml` block of a page, as its own string.
+/// Every fenced `toml` block of a page, as its own string. The opening fence is `toml` as its
+/// whole language word, with or without what follows it (a `title=` the site renders, a trailing
+/// space): a block the scan did not open is one whose keys no check reads.
 fn toml_blocks(page: &str) -> Vec<String> {
+    let opens = |fence: &str| {
+        fence
+            .strip_prefix("```toml")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    };
     let mut out = Vec::new();
     let mut current: Option<String> = None;
     for line in page.lines() {
         match (&mut current, line.trim_start()) {
-            (None, "```toml") => current = Some(String::new()),
+            (None, fence) if opens(fence) => current = Some(String::new()),
             (Some(_), fence) if fence.starts_with("```") => {
                 out.push(current.take().unwrap_or_default());
             }
@@ -635,6 +642,14 @@ fn toml_blocks(page: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// A `toml` fence opens a block whatever follows its language word, and only that language does.
+#[test]
+fn a_toml_fence_with_a_title_still_opens_a_block() {
+    let page =
+        "```toml title=\"a.toml\"\nx = 1\n```\n```toml \ny = 2\n```\n```tomlish\nz = 3\n```\n";
+    assert_eq!(toml_blocks(page), ["x = 1\n", "y = 2\n"]);
 }
 
 /// Every shipped app profile appears in the catalogue page.
