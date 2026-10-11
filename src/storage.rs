@@ -1861,6 +1861,13 @@ this line has no separator at all
         assert!(opts.contains("compress=zstd:3"), "{opts}");
     }
 
+    /// A `loop/backing_file` as the kernel writes it: the path's bytes, then `tail`. Written from the
+    /// bytes, so a path that is not UTF-8 reaches the scan as itself.
+    fn backing_line(path: &Path, tail: &str) -> Vec<u8> {
+        use std::os::unix::ffi::OsStrExt as _;
+        [path.as_os_str().as_bytes(), tail.as_bytes()].concat()
+    }
+
     /// The kernel records a backing file as *it* resolved it, while the image path is built from
     /// whatever data directory the caller was handed. One symlink along the way and the two spell
     /// the same bytes differently — and a `loop_for` that misses the match does not merely miss an
@@ -1879,7 +1886,7 @@ this line has no separator at all
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
             d.join("backing_file"),
-            format!("{}\n", std::fs::canonicalize(&image).unwrap().display()),
+            backing_line(&std::fs::canonicalize(&image).unwrap(), "\n"),
         )
         .unwrap();
         // The caller's side: the same image through a symlinked data directory.
@@ -1906,13 +1913,13 @@ this line has no separator at all
         let sys = base.path().join("block");
         let image = base.path().join("vol.btrfs");
         for (name, backing) in [
-            ("loop0", "/some/other.img"),
-            ("loop9", image.to_str().unwrap()),
-            ("sda", image.to_str().unwrap()),
+            ("loop0", Path::new("/some/other.img")),
+            ("loop9", image.as_path()),
+            ("sda", image.as_path()),
         ] {
             let d = sys.join(name).join("loop");
             std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(d.join("backing_file"), format!("{backing}\n")).unwrap();
+            std::fs::write(d.join("backing_file"), backing_line(backing, "\n")).unwrap();
         }
         // Found by its backing file, and a non-loop block device is never considered.
         assert_eq!(
@@ -1946,9 +1953,7 @@ this line has no separator at all
 
         let ours = sys.join("loop9").join("loop");
         std::fs::create_dir_all(&ours).unwrap();
-        let mut backing = image.as_os_str().as_encoded_bytes().to_vec();
-        backing.push(b'\n');
-        std::fs::write(ours.join("backing_file"), backing).unwrap();
+        std::fs::write(ours.join("backing_file"), backing_line(&image, "\n")).unwrap();
         assert_eq!(
             loop_for(&image, &sys).unwrap().as_deref(),
             Some("/dev/loop9")
@@ -1970,7 +1975,7 @@ this line has no separator at all
         std::fs::write(&image, b"x").unwrap();
         let d = sys.join("loop5").join("loop");
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("backing_file"), format!("{}\n", image.display())).unwrap();
+        std::fs::write(d.join("backing_file"), backing_line(&image, "\n")).unwrap();
         assert_eq!(
             loop_for(&image, &sys).unwrap().as_deref(),
             Some("/dev/loop5")
@@ -1984,11 +1989,7 @@ this line has no separator at all
         let image = base.path().join("vol.btrfs");
         let d = sys.join("loop4").join("loop");
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(
-            d.join("backing_file"),
-            format!("{} (deleted)\n", image.display()),
-        )
-        .unwrap();
+        std::fs::write(d.join("backing_file"), backing_line(&image, " (deleted)\n")).unwrap();
         assert_eq!(
             loop_for(&image, &sys).unwrap().as_deref(),
             Some("/dev/loop4")
@@ -2008,7 +2009,7 @@ this line has no separator at all
         let image = base.path().join("vol.btrfs");
         let d = sys.join("loop7").join("loop");
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("backing_file"), format!("{}\n", image.display())).unwrap();
+        std::fs::write(d.join("backing_file"), backing_line(&image, "\n")).unwrap();
         // A free `loopN` has no `loop/` at all: the ordinary case, skipped without hiding loop7.
         std::fs::create_dir_all(sys.join("loop8")).unwrap();
 
