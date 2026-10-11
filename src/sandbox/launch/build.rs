@@ -3758,26 +3758,38 @@ enum EnvLayer {
 
 /// Layer the cage's extra environment by [`EnvLayer`] precedence, lowest first.
 ///
-/// Fold repeated `LD_LIBRARY_PATH` entries into one, joined in the order they were added.
+/// Fold repeated `LD_LIBRARY_PATH` entries into one, joined in the order they were added, with no
+/// empty element.
 ///
 /// Only that key. It names a *list* of directories, so two producers of it both have something to
 /// say and the answer is their union; every other shared key names one value, where the last
 /// writer winning is the intended rule and merging would produce something neither meant.
+///
+/// The loader reads an empty element (a leading, trailing or doubled `:`) as the working directory,
+/// which in a cage is the project, and the cage's whole process tree inherits this value, sbx's own
+/// preambles included, which run before the `[proc]` shim. Every producer names a directory today;
+/// dropping empty elements here keeps that a property of the merge rather than of each producer.
+/// A key left with no directory at all is removed rather than set empty.
 fn merge_loader_path(env: &mut Vec<(String, String)>) {
     const KEY: &str = "LD_LIBRARY_PATH";
+    if !env.iter().any(|(k, _)| k == KEY) {
+        return;
+    }
     let joined = env
         .iter()
         .filter(|(k, _)| k == KEY)
-        .map(|(_, v)| v.as_str())
+        .flat_map(|(_, v)| v.split(':'))
+        .filter(|dir| !dir.is_empty())
         .collect::<Vec<_>>()
         .join(":");
-    if joined.is_empty() {
-        return;
-    }
     let mut first = true;
     env.retain(|(k, _)| k != KEY || std::mem::replace(&mut first, false));
-    if let Some(slot) = env.iter_mut().find(|(k, _)| k == KEY) {
-        slot.1 = joined;
+    match env.iter().position(|(k, _)| k == KEY) {
+        Some(slot) if joined.is_empty() => {
+            env.remove(slot);
+        }
+        Some(slot) => env[slot].1 = joined,
+        None => {}
     }
 }
 
