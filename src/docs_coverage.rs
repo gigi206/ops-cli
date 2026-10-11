@@ -1129,7 +1129,32 @@ fn every_source_path_the_trusted_computing_base_cites_exists() {
     let section = section_of(&page, "## The trusted computing base")
         .expect("the page must keep a `## The trusted computing base` section");
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let (cited, missing, unanchored) =
+        cited_sources(section, Path::new(env!("CARGO_MANIFEST_DIR")));
+    assert!(
+        cited > 30,
+        "the trusted-computing-base section of docs-site/docs/guide/concepts/architecture.md no \
+         longer reads as a list of modules: {cited} source paths found"
+    );
+    assert!(
+        unanchored.is_empty(),
+        "these relative source paths in the trusted-computing-base section have no `src/` path \
+         before them on their line to resolve against: {unanchored:?}"
+    );
+    assert!(
+        missing.is_empty(),
+        "the trusted-computing-base section of docs-site/docs/guide/concepts/architecture.md \
+         cites paths that name no source file under `src/`: {missing:?}"
+    );
+}
+
+/// The source paths `section` cites, resolved against `root` as
+/// [`every_source_path_the_trusted_computing_base_cites_exists`] describes: how many, the ones that
+/// name nothing, and the relative ones with no `src/` path before them on their line. A path that
+/// climbs (`..`) or is absolute names nothing here: `src/../Cargo.toml` is a file of the repository
+/// and no source, and one that leaves `src/` is no module of the trusted computing base.
+fn cited_sources(section: &str, root: &Path) -> (usize, Vec<String>, Vec<String>) {
+    use std::path::Component;
     let (mut cited, mut missing, mut unanchored) = (0, Vec::new(), Vec::new());
     for line in section.lines() {
         let mut base: Option<&str> = None;
@@ -1153,36 +1178,59 @@ fn every_source_path_the_trusted_computing_base_cites_exists() {
                 continue;
             };
             cited += 1;
+            let climbs = path
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir));
             let target = root.join(&path);
-            let found = if span.ends_with('/') {
-                target.is_dir()
-            } else {
-                target.is_file()
-            };
+            let found = !climbs
+                && if span.ends_with('/') {
+                    target.is_dir()
+                } else {
+                    target.is_file()
+                };
             if !found {
-                missing.push(if path == Path::new(span) {
+                let resolved = if path == Path::new(span) {
                     span.to_string()
                 } else {
                     format!("{span} (resolved as {})", path.display())
+                };
+                missing.push(if climbs {
+                    format!("{resolved} (climbs out of `src/`)")
+                } else {
+                    resolved
                 });
             }
         }
     }
-    assert!(
-        cited > 30,
-        "the trusted-computing-base section of docs-site/docs/guide/concepts/architecture.md no \
-         longer reads as a list of modules: {cited} source paths found"
+    (cited, missing, unanchored)
+}
+
+/// A cited path that climbs out of `src/`, or is absolute, names nothing, even where it leads to a
+/// file that exists.
+#[test]
+fn a_cited_source_path_that_climbs_out_names_nothing() {
+    let root = crate::testutil::TmpDir::new();
+    std::fs::create_dir_all(root.join("src/proxy")).unwrap();
+    std::fs::write(root.join("src/proxy/link.rs"), "").unwrap();
+    std::fs::write(root.join("Cargo.toml"), "").unwrap();
+    std::fs::write(root.join("outside.rs"), "").unwrap();
+    // An absolute path that exists wherever the tests run: this crate's own entry point.
+    let absolute = format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"));
+    let section = format!(
+        "| `src/proxy/link.rs` |\n| `src/../Cargo.toml` |\n| `src/proxy/link.rs`, `../../outside.rs` |\n| `src/proxy/link.rs`, `{absolute}` |\n"
     );
-    assert!(
-        unanchored.is_empty(),
-        "these relative source paths in the trusted-computing-base section have no `src/` path \
-         before them on their line to resolve against: {unanchored:?}"
+    let (cited, missing, unanchored) = cited_sources(&section, root.path());
+    assert_eq!(cited, 6);
+    assert_eq!(
+        missing,
+        [
+            "src/../Cargo.toml (climbs out of `src/`)".to_string(),
+            "../../outside.rs (resolved as src/proxy/../../outside.rs) (climbs out of `src/`)"
+                .to_string(),
+            format!("{absolute} (climbs out of `src/`)"),
+        ]
     );
-    assert!(
-        missing.is_empty(),
-        "the trusted-computing-base section of docs-site/docs/guide/concepts/architecture.md \
-         cites source paths that do not exist: {missing:?}"
-    );
+    assert!(unanchored.is_empty(), "{unanchored:?}");
 }
 
 /// How wide a slice around an em dash must be found under `src/` for the dash to count as a
