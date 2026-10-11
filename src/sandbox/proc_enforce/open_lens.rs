@@ -293,11 +293,27 @@ impl CageMounts {
 
     /// The mount ids `pid` can see, as its own `mountinfo` numbers them.
     fn read(pid: u32) -> Option<BTreeSet<u64>> {
-        let text = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).ok()?;
-        let ids: BTreeSet<u64> = text
-            .lines()
-            .filter_map(|line| line.split_whitespace().next())
-            .filter_map(|id| id.parse().ok())
+        Self::ids(&std::fs::read(format!("/proc/{pid}/mountinfo")).ok()?)
+    }
+
+    /// The mount ids a `mountinfo` table lists, the first field of each line, or `None` when it
+    /// lists none.
+    ///
+    /// Read from the bytes. A mount point further along a line is a path, written as the bytes it
+    /// is, and one that is not UTF-8 made the whole table one a text read refuses: [`holds`] then
+    /// answered `false` for every open in that namespace, re-reading the table each time since
+    /// only an answer is remembered, which is the refresh on every miss [`CageMounts`] exists to
+    /// avoid.
+    ///
+    /// [`holds`]: CageMounts::holds
+    pub(super) fn ids(table: &[u8]) -> Option<BTreeSet<u64>> {
+        let ids: BTreeSet<u64> = table
+            .split(|&b| b == b'\n')
+            .filter_map(|line| {
+                line.split(u8::is_ascii_whitespace)
+                    .find(|field| !field.is_empty())
+            })
+            .filter_map(|id| std::str::from_utf8(id).ok()?.parse().ok())
             .collect();
         (!ids.is_empty()).then_some(ids)
     }
