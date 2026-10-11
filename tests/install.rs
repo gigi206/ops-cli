@@ -443,6 +443,31 @@ fn a_download_that_does_not_match_its_checksum_installs_nothing() {
     }
 }
 
+/// The download is checked whatever the user's `TMPDIR` is called: `sha256sum`, given a file name
+/// holding a backslash, starts its line with `\`, which a digest read off that line would carry.
+#[test]
+fn a_temporary_directory_named_with_a_backslash_still_checks_the_download() {
+    let fx = Release::new();
+    fx.announce("v2.0.0");
+    fx.publish("v2.0.0", "sbx-linux-x86_64", FAKE_SBX, None);
+    // Relative to the fixture root, where the script runs, so the word is the same whatever the
+    // root is called.
+    let tmp = "t\\mp";
+    put(&fx.root.join(tmp).join(".keep"), "");
+    let run = fx.run(
+        &script(),
+        &[("TMPDIR", tmp)],
+        &[&fx.fake_uname("Linux", "x86_64")],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.text);
+    assert_eq!(
+        std::fs::read_to_string(fx.installed()).unwrap(),
+        FAKE_SBX,
+        "{}",
+        run.text
+    );
+}
+
 #[test]
 fn plain_http_a_relative_directory_and_a_malformed_repository_are_refused() {
     let fx = Release::new();
