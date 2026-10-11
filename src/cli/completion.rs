@@ -2413,12 +2413,12 @@ mod tests {
         let asked = tmp.join("asked");
         std::fs::write(&script, BASH).expect("the emitted script");
         let driver = r#"
-sbx() { printf '%s\n' "$@" > "@asked@"; printf 'api.example.com:443\tan egress rule\n'; }
-source "@script@"
+sbx() { printf '%s\n' "$@" > @asked@; printf 'api.example.com:443\tan egress rule\n'; }
+source @script@
 run() {
     COMPREPLY=()
     _sbx_complete
-    printf 'ASKED:%s\n' "$(tr '\n' '|' < "@asked@")"
+    printf 'ASKED:%s\n' "$(tr '\n' '|' < @asked@)"
     printf 'REPLY:%s\n' "${COMPREPLY[*]}"
 }
 # The default breaks: bash hands `api.example.com:44` over as three words.
@@ -2432,8 +2432,8 @@ COMP_WORDS=(sbx net unallow api.example.com:44)
 COMP_CWORD=3
 run
 "#
-        .replace("@script@", &script.display().to_string())
-        .replace("@asked@", &asked.display().to_string());
+        .replace("@script@", &crate::testutil::sh_word(&script))
+        .replace("@asked@", &crate::testutil::sh_word(&asked));
 
         let out = std::process::Command::new("bash")
             .arg("-c")
