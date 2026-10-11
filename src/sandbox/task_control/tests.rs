@@ -1037,6 +1037,36 @@ fn the_crossing_socket_does_not_know_how_to_detach() {
     assert_eq!(refused.id, 0, "and must not have admitted anything");
 }
 
+/// A plane that refuses a request on its first line answers and closes without reading the rest,
+/// and the client returns that answer rather than the broken pipe the rest of its request meets.
+/// A payload larger than the socket's buffer holds the client's write until the close, so the pipe
+/// breaks on every run rather than when the scheduler lets the plane close first.
+#[test]
+fn an_answer_given_before_the_request_was_read_is_the_one_returned() {
+    let dir = TmpDir::new();
+    let socket = dir.path().join("refusing.sock");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let plane = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut verb = String::new();
+        BufReader::new(stream.try_clone().expect("clone"))
+            .read_line(&mut verb)
+            .expect("the verb line");
+        writeln!(stream, "err unknown command").expect("the answer");
+        verb
+    });
+
+    let refused = client::run_detached(
+        &socket,
+        "probe",
+        &BTreeMap::from([("sql".to_string(), "x".repeat(1 << 20))]),
+        &BTreeMap::new(),
+    )
+    .expect("the plane's answer, not the broken pipe");
+    assert_eq!(refused.error.as_deref(), Some("unknown command"));
+    assert_eq!(plane.join().expect("the plane"), "DETACH probe\n");
+}
+
 /// Past the concurrency cap, a further detached invocation is refused rather than queued.
 ///
 /// The session's call quota does not cover this: it bounds how many invocations are ever started,
