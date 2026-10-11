@@ -103,21 +103,7 @@ fn named_suites(relative: &str) -> BTreeSet<String> {
 /// Read from `.github/` and `mise.toml` together because a filter and the prose describing it have
 /// drifted apart before, and a reader looking for one finds the other.
 fn test_paths_named_by_ci() -> Vec<(String, String)> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
-                out.push(path);
-            }
-        }
-    }
-    let mut files = Vec::new();
-    walk(&root().join(".github"), &mut files);
+    let mut files = files_under(&root().join(".github"), &["yml", "yaml"]);
     files.push(root().join("mise.toml"));
 
     let mut found = Vec::new();
@@ -248,24 +234,31 @@ fn module_path_of(path: &Path) -> String {
 
 /// Every `.rs` file under `src/` and `tests/`, with its path.
 fn walk_sources_with_paths() -> Vec<(PathBuf, String)> {
-    fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs")
-                && let Ok(text) = std::fs::read_to_string(&path)
-            {
-                out.push((path, text));
-            }
+    ["src", "tests"]
+        .iter()
+        .flat_map(|dir| files_under(&root().join(dir), &["rs"]))
+        .filter_map(|path| Some((path.clone(), std::fs::read_to_string(&path).ok()?)))
+        .collect()
+}
+
+/// Every file under `dir`, at any depth, whose extension is one of `extensions`.
+fn files_under(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(files_under(&path, extensions));
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| extensions.contains(&e))
+        {
+            out.push(path);
         }
     }
-    let mut out = Vec::new();
-    walk(&root().join("src"), &mut out);
-    walk(&root().join("tests"), &mut out);
     out
 }
 
