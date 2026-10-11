@@ -197,8 +197,24 @@ pub(crate) fn write_script(path: &Path, body: &str) {
 }
 
 /// `path` as one word of a `/bin/sh` script, whatever the fixture root it sits under is called.
+///
+/// A byte that is not UTF-8 cannot sit in the Rust string the script is, so it is spliced in by a
+/// `printf` octal escape inside double quotes, which keeps the word whole.
 pub(crate) fn sh_word(path: &Path) -> String {
-    crate::sandbox::shell_quote(path.to_str().expect("utf-8 fixture path"))
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut word = String::new();
+    for chunk in path.as_os_str().as_bytes().utf8_chunks() {
+        if !chunk.valid().is_empty() {
+            word.push_str(&crate::sandbox::shell_quote(chunk.valid()));
+        }
+        for byte in chunk.invalid() {
+            word.push_str(&format!("\"$(printf '\\{byte:03o}')\""));
+        }
+    }
+    if word.is_empty() {
+        word.push_str("''");
+    }
+    word
 }
 
 /// How long a descriptor a test closed may still be held by a neighbouring test's forked child.
@@ -1750,6 +1766,30 @@ fn the_cage_suites_are_the_same_list_in_the_task_and_the_workflow() {
 #[cfg(test)]
 mod helper_tests {
     use super::*;
+
+    #[test]
+    fn a_shell_word_reads_back_as_the_bytes_of_its_path() {
+        use std::os::unix::ffi::OsStrExt as _;
+        for bytes in [
+            &b"/r/sp ace/q\"b\\s/it's/pc%41"[..],
+            b"/r/nu\xff8/\xc3\xa9\xfe",
+            b"\x80",
+            b"",
+        ] {
+            let path = Path::new(OsStr::from_bytes(bytes));
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", sh_word(path)))
+                .output()
+                .expect("/bin/sh runs");
+            assert_eq!(
+                (out.status.success(), out.stdout.as_slice()),
+                (true, bytes),
+                "{path:?} read back otherwise, stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
 
     #[test]
     fn a_variable_is_pinned_only_under_the_lock() {
