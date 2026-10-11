@@ -90,12 +90,11 @@ fn ending_supervision_denies_what_is_still_parked_before_closing_their_descripto
     // `close_supervision` closed are all of them — which Linux reports on the write end as
     // `POLLERR`, and which no descriptor reuse elsewhere can forge.
     //
-    // Waited for within a bound rather than read once. A neighbouring test that forks holds a copy
-    // of every descriptor of this process, close-on-exec or not, until its child calls `exec` or
-    // exits, so the last reader can outlive the teardown by that long. The teardown closes synchronously, so
-    // a reader it left open is still there at the bound, and fails the test.
-    let deadline = std::time::Instant::now() + PEER_GONE_WITHIN;
-    let revents = loop {
+    // Waited for rather than read once: a neighbouring test's fork may still hold a copy of the
+    // read end ([`crate::testutil::FORK_WINDOW`]). The teardown closes synchronously, so a reader
+    // it left open is still there when the wait ends, and fails the test.
+    let mut revents = 0;
+    crate::testutil::once_forks_let_go(|| {
         let mut pfd = libc::pollfd {
             fd: write_end.as_raw_fd(),
             events: libc::POLLOUT,
@@ -107,22 +106,16 @@ fn ending_supervision_denies_what_is_still_parked_before_closing_their_descripto
             unsafe { libc::poll(&mut pfd, 1, 0) } >= 0,
             "the write end polls"
         );
-        if pfd.revents & libc::POLLERR != 0 || std::time::Instant::now() >= deadline {
-            break pfd.revents;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
+        revents = pfd.revents;
+        revents & libc::POLLERR != 0
+    });
     assert!(
         revents & libc::POLLERR != 0,
         "the teardown closed every reader of the pipe, so the write end has no peer: revents \
-         {revents:#x} after {PEER_GONE_WITHIN:?}"
+         {revents:#x} after {:?}",
+        crate::testutil::FORK_WINDOW
     );
 }
-
-/// How long a forked neighbour may hold the pipe's read end after the teardown closed its own: the
-/// span between its `fork` and its `exec` or its exit. Every test that forks in this process execs
-/// or exits at once; those whose child lingers, `pty`'s, run alone, in a process of their own.
-const PEER_GONE_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The parked registry is the third producer on the line-based control wire that
 /// `ExecRing::push_verdict` guards, and it was the one written apart. `dispatch_enforced` renders

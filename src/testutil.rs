@@ -201,6 +201,25 @@ pub(crate) fn sh_word(path: &Path) -> String {
     crate::sandbox::shell_quote(path.to_str().expect("utf-8 fixture path"))
 }
 
+/// How long a descriptor a test closed may still be held by a neighbouring test's forked child.
+///
+/// The test binary runs its cases as threads of one process, and a fork copies every descriptor the
+/// process holds, close-on-exec or not, into a child that keeps them until it calls `exec` or
+/// exits. Every test that forks in that process execs or exits at once; those whose child lingers,
+/// `pty`'s, run alone, in a process of their own.
+pub(crate) const FORK_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ask `settled` until it answers yes or [`FORK_WINDOW`] has passed: for a test that closed a
+/// descriptor and asks whether every copy of it is gone. A copy a neighbour's fork holds goes
+/// within the window; one the code under test left open is still there when it ends, and the
+/// test's own assertion, made after this returns, fails on it.
+pub(crate) fn once_forks_let_go(mut settled: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + FORK_WINDOW;
+    while !settled() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// A program's standard error that tries each thing a relayed diagnostic can do to the line it is
 /// shown on: break it, return over it, drive the terminal with an escape and a title-setting
 /// sequence, and reorder it with a right-to-left override.
