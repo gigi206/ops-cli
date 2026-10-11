@@ -950,6 +950,60 @@ fn every_unwatched_tree_is_named_in_the_file_feed_page() {
     );
 }
 
+/// The names `doctor`'s `check(status, name, detail)` calls in `source` give their checks, each
+/// read as the call's second argument when that is a literal of lowercase letters, digits, spaces
+/// and dashes; or, as the error, the start of every call whose name is not one. A call this cannot
+/// read is never passed over: its check would be one the page is never held to, and the guard
+/// would pass on the calls it could read.
+fn check_labels(source: &str) -> Result<Vec<String>, Vec<String>> {
+    let (mut labels, mut unread) = (Vec::new(), Vec::new());
+    for rest in source.split(".check(").skip(1) {
+        // `check("ok", "storage", …)`: the status, then the name.
+        let name = rest.split('"').nth(3).map(str::trim).unwrap_or_default();
+        let literal_second = rest
+            .split('"')
+            .take(3)
+            .collect::<String>()
+            .matches(',')
+            .count()
+            == 1;
+        if literal_second
+            && !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '-')
+        {
+            labels.push(name.to_string());
+        } else {
+            unread.push(format!(
+                "  .check({}",
+                rest.lines().next().unwrap_or_default()
+            ));
+        }
+    }
+    if unread.is_empty() {
+        Ok(labels)
+    } else {
+        Err(unread)
+    }
+}
+
+/// A `check` call is read only by its literal name, and one whose name is not a literal is
+/// reported rather than passed over.
+#[test]
+fn a_check_named_by_anything_but_a_literal_is_reported() {
+    let source = r#"r.check("ok", "storage", &d); r.check("warn", "cgroup v2-unified", "");"#;
+    assert_eq!(
+        check_labels(source),
+        Ok(vec!["storage".to_string(), "cgroup v2-unified".to_string()])
+    );
+    let unread = check_labels(r#"r.check("ok", label, "x"); r.check("ok", "nix", "")"#)
+        .expect_err("a check named by a variable cannot be read");
+    // Read as the old scrape did, this call named a check `x`: the third literal stood in for the
+    // name, and a letter is on every page.
+    assert_eq!(unread, [r#"  .check("ok", label, "x"); r"#]);
+}
+
 /// Every check `sbx doctor` can print is named on the page that explains its output.
 ///
 /// `doctor`'s lines are the first thing a new user reads, and the page carries both a sample run
@@ -969,18 +1023,14 @@ fn every_check_doctor_prints_is_named_on_its_page() {
     // had to be enumerated, and a fifth would have gone unseen. A named argument cannot drift that
     // way. What has not changed is the direction: this reads the source that prints, so it cannot
     // pass by agreeing with a stale copy.
-    let source = include_str!("cli/doctor.rs");
-    let labels: Vec<String> = source
-        .split(".check(")
-        .skip(1)
-        .filter_map(|rest| {
-            // `check("ok", "storage", …)` — the status, then the name.
-            let mut args = rest.split('"').skip(3);
-            let name = args.next()?.trim().to_string();
-            (!name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == ' '))
-                .then_some(name)
-        })
-        .collect();
+    let labels = check_labels(include_str!("cli/doctor.rs")).unwrap_or_else(|unread| {
+        panic!(
+            "these `check` calls in src/cli/doctor.rs name their check with something this guard \
+             cannot read, so the page is never held to them: give each a literal name of lowercase \
+             letters, digits, spaces and dashes\n{}",
+            unread.join("\n")
+        )
+    });
     assert!(
         labels.len() > 5,
         "the check lines in src/cli/doctor.rs no longer read as ones: {labels:?}"
