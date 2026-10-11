@@ -1580,11 +1580,13 @@ fn reserialize_request(
         }
         // The client's own content codings, dropped so sbx's `identity` below is the only offer the
         // upstream sees. Leaving the client's beside it is the same dodge the injected headers
-        // close: the upstream would be free to honour `gzip` and the mask would read nothing.
+        // close: the upstream would be free to honour `gzip` and the mask would read nothing. So
+        // they are matched the same way, `_` as `-`, or `Accept_Encoding: gzip` would reach a
+        // server that folds it onto the real header.
         if force_identity_encoding
             && IDENTITY_ENCODINGS
                 .iter()
-                .any(|(name, _)| k.eq_ignore_ascii_case(name))
+                .any(|(name, _)| header_name_eq(k, name))
         {
             continue;
         }
