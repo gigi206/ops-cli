@@ -34,9 +34,10 @@ pub(crate) fn app_cmd(args: &[OsString]) -> ExitCode {
         Some("rm") => app_rm(&args[1..]),
         Some("list" | "ls") => {
             let (json, rest) = crate::split_json_flag(&args[1..]);
+            let (shared, rest) = crate::split_flag(&rest, "--shared");
             match crate::cli::reject_extra(&["app", "list"], &rest) {
                 Err(code) => code,
-                Ok(()) => app_list(json),
+                Ok(()) => app_list(json, shared),
             }
         }
         Some("show") => app_show(&args[1..]),
@@ -1403,7 +1404,11 @@ fn app_rm_purge_one(
 /// inline/project app, or a profile since removed) — so a name may carry a profile, a home, or both.
 /// The full resolved app set — inline, project, and profile apps with their gating — is
 /// `sbx config show`.
-fn app_list(json: bool) -> ExitCode {
+///
+/// With `shared`, the data directory is read extent by extent ([`sandbox::extents`]) with each app
+/// owning the trees a purge removes, and every row gains what removing that app frees inside the
+/// filesystem.
+fn app_list(json: bool, shared: bool) -> ExitCode {
     use std::collections::{BTreeMap, BTreeSet};
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
@@ -1439,6 +1444,33 @@ fn app_list(json: bool) -> ExitCode {
     let homes: BTreeMap<&str, &sandbox::InstalledApp> =
         installed.iter().map(|a| (a.name.as_str(), a)).collect();
 
+    // What each installed app holds alone, and how many entries the walk could not read.
+    let mut exclusive: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut unreadable = 0;
+    if shared && let Some(layout) = store::Layout::from_env() {
+        let data_dir = layout.data_dir();
+        let owned: Vec<&sandbox::InstalledApp> = installed
+            .iter()
+            .filter(|a| sandbox::gc::is_safe_tree_id(&a.name))
+            .collect();
+        let owners: Vec<Vec<std::path::PathBuf>> = owned
+            .iter()
+            .map(|a| sandbox::app_trees(data_dir, &a.name))
+            .collect();
+        match sandbox::extents::measure(data_dir, &owners) {
+            Ok(report) => {
+                for (app, usage) in owned.iter().zip(&report.owners) {
+                    exclusive.insert(app.name.as_str(), usage.exclusive_bytes);
+                }
+                unreadable = report.unreadable;
+            }
+            Err(e) => {
+                diag::error(&format!("sbx: app list: --shared: {e}"));
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     // One row per app: the union of profile names and installed-home names.
     let mut names: BTreeSet<&str> = profiles.iter().map(String::as_str).collect();
     names.extend(homes.keys().copied());
@@ -1456,6 +1488,7 @@ fn app_list(json: bool) -> ExitCode {
                     "profile": profiles.contains(*name),
                     "home_bytes": home.map(|a| a.total_bytes()),
                     "home_locations": home.map(|a| describe_home_locations(a)),
+                    "exclusive_bytes": exclusive.get(name),
                 })
             })
             .collect();
@@ -1465,6 +1498,7 @@ fn app_list(json: bool) -> ExitCode {
                 "apps": rows,
                 "total_bytes": installed.iter().map(sandbox::InstalledApp::total_bytes).sum::<u64>(),
                 "profiles_dir": profiles_dir.as_ref().map(|d| d.display().to_string()),
+                "unreadable": shared.then_some(unreadable),
             }),
         ) {
             return code;
@@ -1517,11 +1551,17 @@ fn app_list(json: bool) -> ExitCode {
             "—"
         };
         let home_cell = match homes.get(name) {
-            Some(app) => format!(
-                "{} ({})",
-                sandbox::human_bytes(app.total_bytes()),
-                describe_home_locations(app),
-            ),
+            Some(app) => {
+                let mut cell = format!(
+                    "{} ({})",
+                    sandbox::human_bytes(app.total_bytes()),
+                    describe_home_locations(app),
+                );
+                if let Some(bytes) = exclusive.get(name) {
+                    cell.push_str(&format!(", {} exclusive", sandbox::human_bytes(*bytes)));
+                }
+                cell
+            }
             None => "—".to_string(),
         };
         let name_pad = format!("{name:<name_w$}");
@@ -1534,8 +1574,33 @@ fn app_list(json: bool) -> ExitCode {
          sbx app rm <name> --purge){r}"
     );
     // The sizes above are what each home reads, which is not what removing it returns. Printed
-    // whenever a size was, so the figure and its caveat are never read apart.
-    if !installed.is_empty() {
+    // whenever a size was, so the figure and its caveat are never read apart. With `--shared` the
+    // `exclusive` figure is that return, inside the filesystem, and the caveat says what it is not.
+    if shared && !installed.is_empty() {
+        outln!(
+            "{}",
+            style::dim_prose(
+                "`exclusive` is what `sbx app rm <name> --purge` frees inside the filesystem, \
+                 before compression and leaving the shared nix store to `sbx gc`; the host gets it \
+                 back once that space is discarded (`sbx storage status`).",
+                &pal
+            )
+        );
+        if unreadable > 0 {
+            outln!(
+                "{}",
+                style::prose(
+                    &format!(
+                        "{unreadable} entr{} could not be read; {} bytes are missing from the \
+                         `exclusive` figures.",
+                        if unreadable == 1 { "y" } else { "ies" },
+                        if unreadable == 1 { "its" } else { "their" },
+                    ),
+                    &pal
+                )
+            );
+        }
+    } else if !installed.is_empty() {
         outln!(
             "{}",
             style::dim_prose(

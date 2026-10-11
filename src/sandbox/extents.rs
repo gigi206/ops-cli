@@ -305,17 +305,18 @@ struct Walk<'a> {
     refused: bool,
 }
 
-/// Measure `root`, attributing each entry to the owner whose path in `owners` it lies under (the
-/// deepest one, should they nest), else to the rest.
+/// Measure `root`, attributing each entry to the owner one of whose paths in `owners` it lies under
+/// (the deepest such path, should they nest), else to the rest. An owner may hold several trees:
+/// an app's global home and its per-project ones are removed together, so they own together.
 ///
 /// Symlinks are not followed and a hardlinked file counts once, wherever it is first met. Fails
 /// only when the filesystem does not implement FIEMAP: then there is no extent to report, and
 /// zeros would read as a measurement.
-pub(crate) fn measure(root: &Path, owners: &[PathBuf]) -> io::Result<ExtentReport> {
+pub(crate) fn measure(root: &Path, owners: &[Vec<PathBuf>]) -> io::Result<ExtentReport> {
     let roots: HashMap<PathBuf, usize> = owners
         .iter()
         .enumerate()
-        .map(|(i, p)| (p.clone(), i))
+        .flat_map(|(i, paths)| paths.iter().map(move |p| (p.clone(), i)))
         .collect();
     let rest = owners.len();
     let mut walk = Walk {
@@ -571,7 +572,7 @@ mod tests {
         let _ = std::fs::File::open(app.join("big")).and_then(|f| f.sync_all());
         let _ = std::fs::File::open(base.join("store/other")).and_then(|f| f.sync_all());
 
-        let report = match measure(base.path(), &[app.clone(), base.join("store")]) {
+        let report = match measure(base.path(), &[vec![app.clone()], vec![base.join("store")]]) {
             Ok(r) => r,
             Err(e) if e.kind() == io::ErrorKind::Unsupported => {
                 skip_incapable!("skipping: the fixtures' filesystem has no FIEMAP: {e}");
@@ -601,5 +602,30 @@ mod tests {
     fn a_missing_root_is_an_error_not_an_empty_report() {
         let base = crate::testutil::TmpDir::new();
         assert!(measure(&base.join("absent"), &[]).is_err());
+    }
+
+    /// An app's global home and its per-project home are removed together by `--purge`, so a
+    /// block they share is that app's own, and both trees' bytes add up under the one owner.
+    #[test]
+    fn an_owner_of_several_trees_holds_what_they_share_between_them() {
+        let base = crate::testutil::TmpDir::new();
+        let global = base.join("apps/demo");
+        let project = base.join("projects/p1/apps/demo");
+        for d in [&global, &project] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("data"), vec![1u8; 128 * 1024]).unwrap();
+        }
+        let report = match measure(base.path(), &[vec![global, project]]) {
+            Ok(r) => r,
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                skip_incapable!("skipping: the fixtures' filesystem has no FIEMAP: {e}");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(report.owners.len(), 2, "the one owner, then the rest");
+        assert_eq!(report.owners[0].extent_bytes, 2 * 128 * 1024, "{report:?}");
+        assert_eq!(report.owners[0].exclusive_bytes, 2 * 128 * 1024);
+        assert_eq!(report.owners[0].inodes, 4, "two directories, two files");
     }
 }

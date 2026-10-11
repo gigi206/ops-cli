@@ -797,6 +797,24 @@ impl AppPurgeReport {
     }
 }
 
+/// The directories [`purge_app_homes`] removes for app `name`, those that exist: the global
+/// `<data>/apps/<name>/` and every `<data>/projects/<id>/apps/<name>/`. One definition, so a report
+/// of what a purge frees measures the very trees the purge deletes.
+///
+/// `name` must already have passed [`is_safe_tree_id`]: it is joined as given.
+pub(crate) fn app_trees(data_dir: &Path, name: &str) -> Vec<PathBuf> {
+    let mut candidates = vec![data_dir.join("apps").join(name)];
+    if let Ok(entries) = std::fs::read_dir(data_dir.join("projects")) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                candidates.push(entry.path().join("apps").join(name));
+            }
+        }
+    }
+    candidates.retain(|dir| dir.is_dir());
+    candidates
+}
+
 /// Remove app `name`'s isolated runtime directories — the global home `<data>/apps/<name>/` (shared
 /// across projects) and each per-project directory `<data>/projects/<id>/apps/<name>/`. The whole
 /// `apps/<name>/` subtree is removed at each site, so it reclaims everything an app keeps there: a
@@ -821,18 +839,7 @@ pub(crate) fn purge_app_homes(data_dir: &Path, name: &str) -> AppPurgeReport {
         return AppPurgeReport { removed, failed };
     }
     // The global home, then each per-project home under an existing project tree.
-    let mut candidates = vec![data_dir.join("apps").join(name)];
-    if let Ok(entries) = std::fs::read_dir(data_dir.join("projects")) {
-        for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                candidates.push(entry.path().join("apps").join(name));
-            }
-        }
-    }
-    for dir in candidates {
-        if !dir.is_dir() {
-            continue;
-        }
+    for dir in app_trees(data_dir, name) {
         let bytes = tree_size(&dir);
         let carried_home = dir.join("home").is_dir();
         match force_remove_dir_all(&dir) {

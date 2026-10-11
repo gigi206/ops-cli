@@ -146,7 +146,8 @@ pub(crate) fn store_cmd(args: &[OsString]) -> ExitCode {
     let mut view = build(layout.data_dir(), &layout.store_dir());
     view.volume = volume_view();
     if shared {
-        let owners: Vec<PathBuf> = view.subtrees.iter().map(|t| t.path.clone()).collect();
+        let owners: Vec<Vec<PathBuf>> =
+            view.subtrees.iter().map(|t| vec![t.path.clone()]).collect();
         let report = match sandbox::extents::measure(layout.data_dir(), &owners) {
             Ok(r) => r,
             Err(e) => {

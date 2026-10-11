@@ -434,18 +434,24 @@ fn split_session_flags(args: &[OsString]) -> (bool, bool, Vec<OsString>) {
 /// `sbx net rules`) the loop keeps reading its own `--json` arm: this is for the ones that have no
 /// loop, where the alternative is an `any()` and a `filter()` written out per verb.
 fn split_json_flag(args: &[OsString]) -> (bool, Vec<OsString>) {
+    split_flag(args, "--json")
+}
+
+/// Split one boolean `flag` off a verb's arguments, with the terminator rule
+/// [`split_json_flag`] states: an argument after a bare `--` is never taken for it.
+fn split_flag(args: &[OsString], flag: &str) -> (bool, Vec<OsString>) {
     let upto = args
         .iter()
         .position(|a| a.to_str() == Some("--"))
         .unwrap_or(args.len());
-    let json = args[..upto].iter().any(|a| a.to_str() == Some("--json"));
+    let found = args[..upto].iter().any(|a| a.to_str() == Some(flag));
     let rest = args
         .iter()
         .enumerate()
-        .filter(|(i, a)| *i >= upto || a.to_str() != Some("--json"))
+        .filter(|(i, a)| *i >= upto || a.to_str() != Some(flag))
         .map(|(_, a)| a.clone())
         .collect();
-    (json, rest)
+    (found, rest)
 }
 
 /// The single-rule front that `sbx net allow|deny|mute` and `sbx proc allow|deny` share, on both
@@ -2751,6 +2757,25 @@ mod tests {
         let (session, all, rest) = split_session_flags(&v(&["--session", "--", "--all"]));
         assert!(session && !all);
         assert_eq!(rest, v(&["--", "--all"]));
+    }
+
+    /// A boolean flag is read up to a bare `--` and no further, so a positional spelled like it after
+    /// the terminator reaches the verb intact.
+    #[test]
+    fn split_flag_stops_at_the_terminator() {
+        let osv = |parts: &[&str]| -> Vec<OsString> { parts.iter().map(OsString::from).collect() };
+
+        let (found, rest) = split_flag(&osv(&["a", "--shared", "b"]), "--shared");
+        assert!(found);
+        assert_eq!(rest, osv(&["a", "b"]));
+
+        let (found, rest) = split_flag(&osv(&["a", "--", "--shared"]), "--shared");
+        assert!(!found, "after `--` it is an argument, not the flag");
+        assert_eq!(rest, osv(&["a", "--", "--shared"]));
+
+        let (found, rest) = split_flag(&osv(&["--json"]), "--shared");
+        assert!(!found);
+        assert_eq!(rest, osv(&["--json"]), "another flag is left in place");
     }
 
     #[test]

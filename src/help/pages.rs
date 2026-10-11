@@ -2448,9 +2448,15 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "list"],
-        synopsis: "sbx app list  (alias: sbx app ls) [--json]",
+        synopsis: "sbx app list  (alias: sbx app ls) [--shared] [--json]",
         summary: "list apps with their profile and installed home",
-        options: &[("--json", "emit the apps as JSON (home sizes in bytes)")],
+        options: &[
+            (
+                "--shared",
+                "read every file's extents and add what purging each app frees inside the filesystem",
+            ),
+            ("--json", "emit the apps as JSON (home sizes in bytes)"),
+        ],
         details: "One row per app: whether it has an imported profile (the `import`/`rm` artifact) and\n\
             whether it has an installed home on disk (with its disk size; `sbx app show` says what\n\
             that home is made of)\n\
@@ -2467,6 +2473,14 @@ pub(super) const PAGES: &[Page] = &[
             returns: a compressing volume stored those bytes smaller, and a block shared with\n\
             another tree survives until its last reference goes. `sbx storage status` reports what\n\
             the volume actually holds.\n\
+            \n\
+            `--shared` reads every file's extents in the data directory (FIEMAP, no privilege\n\
+            needed), with each app owning the trees `--purge` removes, and adds to each row its\n\
+            `exclusive` bytes: the file data no other tree references, which is what the purge\n\
+            frees inside the filesystem. That figure is before compression, leaves the shared\n\
+            per-project nix store to `sbx gc`, and reaches the host only once the space is\n\
+            discarded. Every file is opened, so it takes several times longer than the plain\n\
+            listing, and an entry that cannot be read is counted and named.\n\
             \n\
             `sbx app ls` is the same command. The full resolved app set —\n\
             inline, project, and profile apps with their gating — is `sbx config show`.",

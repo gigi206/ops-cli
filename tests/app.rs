@@ -959,6 +959,57 @@ fn the_size_reporting_verbs_say_the_figure_is_data_not_reclaimed_space() {
     );
 }
 
+/// `--shared` replaces the caveat with the measurement: each app's `exclusive` bytes, read from the
+/// file extents of the trees a purge removes. An app whose data no other tree references holds all
+/// of it alone, and the plain listing carries no such figure, since it never read the extents.
+#[test]
+fn app_list_shared_reports_what_purging_each_app_frees() {
+    let fx = fixture_with_a_leftover();
+    // Large enough to sit in a data extent rather than inline in the metadata.
+    fx.write_cache_entry("demo-app", "mise", 256 * 1024);
+
+    let out = fx.run(&["app", "list", "--shared", "--json"]);
+    // A filesystem without FIEMAP has no extents to report, and the listing says so rather than
+    // printing zeros that would read as a measurement: that is the other outcome, and it is held to
+    // its own contract here instead of being waved through.
+    if !out.status.success() {
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("does not report file extents (FIEMAP)"),
+            "a failure is only the refusal of a filesystem without FIEMAP: {}",
+            text(&out)
+        );
+        return;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("a JSON document");
+    assert_eq!(v["unreadable"], 0, "{v}");
+    let demo = array(&v, "apps")
+        .iter()
+        .find(|a| a["name"] == "demo-app")
+        .expect("demo-app is listed");
+    let exclusive = demo["exclusive_bytes"].as_u64().expect("measured");
+    assert!(
+        exclusive >= 256 * 1024,
+        "the blob is the app's alone, so its bytes are in the figure: {demo}"
+    );
+
+    let plain = fx.run(&["app", "list", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&plain.stdout).expect("a JSON document");
+    assert!(
+        array(&v, "apps")
+            .iter()
+            .all(|a| a["exclusive_bytes"].is_null()),
+        "without --shared nothing was measured: {v}"
+    );
+
+    let human = fx.run(&["app", "list", "--shared"]);
+    let s = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        s.contains("exclusive") && s.contains("frees inside the filesystem"),
+        "the row carries the figure and the footer says what it is:\n{s}"
+    );
+}
+
 /// A global app's install pool is per project, so a version it equipped there stays behind when the
 /// app's own activation record moves on: the tool is still declared and still current, and an older
 /// copy of it sits in a pool nothing reaches. `--stale` is the only thing that reaches it, since

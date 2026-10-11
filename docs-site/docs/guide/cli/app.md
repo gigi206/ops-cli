@@ -10,7 +10,7 @@ sbx app upgrade <name> [-n]
 sbx app import <file> [--as <new-name>] [-f|--force] [--with-deps]
 sbx app export <name> [--out <file>]
 sbx app rm <name>... [--purge] [--gc]
-sbx app list
+sbx app list [--shared] [--json]
 sbx app show <name> [--json]
 sbx app prune <name>|--all [--stale] [--drop <entry>]... [--reset] [-y|--yes]
 ```
@@ -342,6 +342,23 @@ and, on an image, how much is waiting on a discard to return to the host.
 The same applies to [`sbx app show`](#inspecting-an-app), [`sbx app prune`](#pruning-undeclared-tools)
 and [`sbx projects`](projects).
 
+`--shared` measures the sharing instead of warning about it. It reads every file's extents in the
+data directory, the way [`sbx store --shared`](store#what-each-subtree-holds-alone---shared) does,
+with each app owning the trees `--purge` removes, and adds to each row what that app holds alone:
+
+```
+  freebuff-desktop     —        7.9 GiB (global + 1 project mise pool), 7.7 GiB exclusive
+  open-design          —        5.1 GiB (global), 3.2 GiB exclusive
+```
+
+`exclusive` is the file data no other tree references: what `sbx app rm <name> --purge` frees
+**inside the filesystem**. Here `open-design` holds 5.1 GiB, of which 1.9 GiB is shared with other
+trees and stays after a purge. The figure is before compression, it leaves the shared nix store to
+[`sbx gc`](gc), and on a volume the host gets it back once the space is discarded (see
+[Releasing it](storage#releasing-it)). It takes a query per file, about half a minute on a data
+directory of two million inodes; with `--json` each app carries `exclusive_bytes` and the document
+an `unreadable` count.
+
 | Reads | Means |
 |---|---|
 | `global` | the app's single shared home `<data>/apps/<name>/home`: a `home_scope = "global"` app (the default) |
@@ -593,6 +610,7 @@ sbx app run claude-code --net-learn    # learn the egress rules it actually need
 sbx app run claude-code --net-learn=exact --dry-run   # preview its exact endpoints
 sbx app run claude-code --proc-learn   # learn the programs it runs, and move to `ask`
 sbx app list                           # imported profiles + installed homes
+sbx app list --shared                  # …and what purging each one frees
 sbx app show claude-code               # what this app has actually installed on disk
 sbx app prune hermes                    # preview undeclared mise tools in hermes' home
 sbx app prune hermes --yes              # …and remove them
