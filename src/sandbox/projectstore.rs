@@ -563,9 +563,11 @@ fn place_atomically(dir: &OwnedFd, tmp: &OsStr, dest: &OsStr) -> io::Result<()> 
 /// Recursively copy `from` to a fresh entry `name` of the directory `dir` holds: directories are
 /// created owner-writable, filled through their own descriptor, then sealed to the mode of the
 /// directory they were copied from; symlinks are recreated (never dereferenced); and regular files
-/// are copied as physically independent copies ([`place_file`]). The entry must not exist yet: the
-/// caller copies into a unique temporary, and in this tree an entry already at a name is one the
-/// cage made, so it fails the copy rather than being written through.
+/// are copied as physically independent copies ([`place_file`]). Anything else is refused rather
+/// than opened: nix puts nothing else in a store path, and opening a FIFO would wait for a writer
+/// that never comes. The entry must not exist yet: the caller copies into a unique temporary, and
+/// in this tree an entry already at a name is one the cage made, so it fails the copy rather than
+/// being written through.
 ///
 /// Sealing is what gives a seeded path the shape nix gives its own (`0555`), so a stray
 /// recursive delete meets the same refusal in a project's store as in the shared one,
@@ -602,8 +604,17 @@ fn copy_recursive(from: &Path, dir: &OwnedFd, name: &OsStr, reflink_ok: bool) ->
         std::os::unix::fs::symlink(fs::read_link(from)?, &to)
             .map_err(|e| already_there(dir, name, e))?;
         Ok(true)
-    } else {
+    } else if file_type.is_file() {
         place_file(from, dir, name, reflink_ok)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "`{}` is not a file, a directory or a symlink, which is all a store path holds, so \
+                 the seed does not copy it",
+                from.display()
+            ),
+        ))
     }
 }
 
@@ -2299,6 +2310,32 @@ mod tests {
                 "the copy of `{d}` kept the mode it was built at instead of its source's"
             );
         }
+    }
+
+    /// An entry that is not a file, a directory or a symlink is refused by its path, not opened:
+    /// nix puts nothing else in a store path, and a FIFO opened for its content waits for a writer
+    /// for good, holding the launch with it.
+    #[test]
+    fn copy_recursive_refuses_what_a_store_path_never_holds() {
+        let base = TmpDir::new();
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("data"), b"payload").unwrap();
+        crate::testutil::make_fifo(&src.join("fifo"));
+
+        let (from, at) = (src.clone(), base.path().to_path_buf());
+        let err = crate::testutil::returns_within(
+            std::time::Duration::from_secs(10),
+            "a copy of a tree holding a FIFO",
+            move || copy_recursive(&from, &hold(&at), OsStr::new("dst"), false),
+        )
+        .expect_err("a FIFO is no store path's content");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            err.to_string()
+                .contains(&format!("`{}` is not a file", src.join("fifo").display())),
+            "the refusal must name the entry: {err}"
+        );
     }
 
     #[test]
