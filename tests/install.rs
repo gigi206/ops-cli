@@ -605,12 +605,21 @@ fn a_script_cut_short_in_the_pipe_runs_nothing() {
     fx.announce("v2.0.0");
     fx.publish("v2.0.0", "sbx-linux-x86_64", FAKE_SBX, None);
     let whole = script();
-    let text = String::from_utf8(whole.clone()).unwrap();
-    let marker = "mv -f \"$partial\" \"$dir/sbx\"\n";
-    let cut = text
-        .find(marker)
-        .expect("the install line is in the script")
-        + marker.len();
+    // Looked for in the bytes the script is, and found once: a second such line would leave the
+    // cut ambiguous, and one earlier than this would cut short of what the test means.
+    let marker: &[u8] = b"mv -f \"$partial\" \"$dir/sbx\"\n";
+    let found: Vec<usize> = whole
+        .windows(marker.len())
+        .enumerate()
+        .filter_map(|(at, window)| (window == marker).then_some(at))
+        .collect();
+    let &[at] = found.as_slice() else {
+        panic!(
+            "the install line is in the script once, not {} times",
+            found.len()
+        );
+    };
+    let cut = at + marker.len();
     let run = fx.run(&whole[..cut], &[], &[&fx.fake_uname("Linux", "x86_64")]);
 
     assert_ne!(run.code, Some(0), "{}", run.text);
