@@ -71,6 +71,12 @@ do not wait for each other. The side that waits names the lock file,
 `<data>/projects/<id>/store.lock`: a cage whose project holds sbx's data directory sees it
 read-only, which is enough to hold it, and would keep both sides waiting while it runs.
 
+The shared store takes turns the same way, on `<data>/store-gc.lock`. A launch holds it while
+it copies paths from the shared store into its project's, and the collection of the shared
+store (`--all`) holds it for the whole collection: a launch waits for a collection that has
+started, the collection waits for the launches still copying, and the side that waits names
+that file too.
+
 A session counts as live for as long as the process its record names runs: the sbx that
 supervises the cage, or bubblewrap itself when sbx handed the launch over to it. A cage that
 outlives that process, its launcher killed while the cage runs on, holds no session and no
