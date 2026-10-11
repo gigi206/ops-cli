@@ -549,10 +549,12 @@ mod tests {
         .expect("write the stub");
         std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let path = dir.path().join("task-client");
+        // The stand-in is named from the directory the client runs in (`run_client`), the way a
+        // launch names a store path: the fixture root never enters the script.
         write(
             &path,
             Path::new("/usr/bin/bash"),
-            &socat,
+            Path::new("./socat"),
             Path::new("/usr/bin/head"),
             "/tmp/sbx-task.sock",
         )
@@ -568,7 +570,11 @@ mod tests {
     fn run_client(path: &Path, args: &[&str]) -> (i32, String, String) {
         // Through the shared wait, because the client was written by this same test binary a moment
         // ago: see `testutil::output_past_etxtbsy`.
-        let out = crate::testutil::output_past_etxtbsy(std::process::Command::new(path).args(args));
+        let out = crate::testutil::output_past_etxtbsy(
+            std::process::Command::new(path)
+                .args(args)
+                .current_dir(path.parent().expect("the client sits in its fixture")),
+        );
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),
