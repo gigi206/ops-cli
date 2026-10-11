@@ -1814,6 +1814,14 @@ pub(crate) mod client {
 
     /// Send one invocation request and parse the answer. `RUN` and `DETACH` differ in the verb, in
     /// the socket they are sent to, and in how much of the answer is filled in — not in their framing.
+    ///
+    /// A plane that refuses a request on its first line (a verb that socket does not serve) answers
+    /// and closes without reading the rest, so the rest of the request can meet a closed socket. Its
+    /// answer is waiting to be read by then, and it is the reason the caller needs, where the broken
+    /// pipe alone names none: the answer is read, and the write's error stands only when there is
+    /// none. The read can then end on a reset rather than an end of stream (`ECONNRESET`, which the
+    /// kernel reports when a peer closed with part of the request unread), after the answer, which
+    /// stays read.
     fn invoke(
         socket: &Path,
         verb: &str,
@@ -1822,6 +1830,32 @@ pub(crate) mod client {
         env: &BTreeMap<String, String>,
     ) -> io::Result<RunResult> {
         let mut stream = UnixStream::connect(socket)?;
+        let sent = send_invocation(&mut stream, verb, name, params, env);
+        let mut raw = Vec::new();
+        match sent {
+            Ok(()) => {
+                BufReader::new(stream).read_to_end(&mut raw)?;
+            }
+            Err(unsent) if unsent.kind() == io::ErrorKind::BrokenPipe => {
+                let _reset = BufReader::new(stream).read_to_end(&mut raw);
+                if raw.is_empty() {
+                    return Err(unsent);
+                }
+            }
+            Err(unsent) => return Err(unsent),
+        }
+        parse_run(&raw)
+    }
+
+    /// Write [`invoke`]'s request: the verb line, each length-prefixed `param` and `env` payload,
+    /// and the `run` terminator.
+    fn send_invocation(
+        stream: &mut UnixStream,
+        verb: &str,
+        name: &str,
+        params: &BTreeMap<String, String>,
+        env: &BTreeMap<String, String>,
+    ) -> io::Result<()> {
         writeln!(stream, "{verb} {name}")?;
         for (kind, map) in [("param", params), ("env", env)] {
             for (key, value) in map {
@@ -1831,10 +1865,7 @@ pub(crate) mod client {
             }
         }
         writeln!(stream, "run")?;
-        stream.flush()?;
-        let mut raw = Vec::new();
-        BufReader::new(stream).read_to_end(&mut raw)?;
-        parse_run(&raw)
+        stream.flush()
     }
 
     /// Collect what a detached invocation produced, in the same shape [`run`] returns.
