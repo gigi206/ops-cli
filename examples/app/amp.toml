@@ -25,9 +25,8 @@
 # ELF, and `amp` runs it directly. sbx installs it in-cage with mise's npm backend over a node
 # runtime; `sbx upgrade mise` rolls it forward.
 #
-# The previous package name `@sourcegraph/amp` was an alias to `@ampcode/cli` and was removed on
-# 2026-06-15 (per `ampcode.com/news/npm-package-changes`); this profile only refers to the new
-# name.
+# The former package name `@sourcegraph/amp`, an alias to `@ampcode/cli`, is withdrawn (per
+# `ampcode.com/news/npm-package-changes`); this profile refers only to the new name.
 #
 # WHY `cmd` IS A WRAPPER, NOT A BARE `amp`. mise's npm backend installs with
 # `--ignore-scripts=true` — a deliberate security default: it will not run arbitrary package
