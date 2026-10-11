@@ -1741,27 +1741,31 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        let file = cfg.to_str().unwrap();
-        let argv = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        // `-c` takes a path, so the file goes in as its bytes, whatever the fixture root is called.
+        let with_file = |rest: &[&str]| {
+            let mut argv = vec![OsString::from("-c"), cfg.clone().into_os_string()];
+            argv.extend(rest.iter().map(OsString::from));
+            argv
+        };
 
         // Without the flag both verbs do their work, so what is refused below is the flag itself.
         assert!(same_exit_code(
-            config_get(&argv(&["-c", file, "network"])),
+            config_get(&with_file(&["network"])),
             ExitCode::SUCCESS
         ));
         assert!(same_exit_code(
-            config_path_cmd(&argv(&["-c", file])),
+            config_path_cmd(&with_file(&[])),
             ExitCode::SUCCESS
         ));
 
         // With it, both exit 2 with the verb's usage — the treatment an inapplicable `--app`
         // already gets.
         assert!(same_exit_code(
-            config_get(&argv(&["-c", file, "--trust", "network"])),
+            config_get(&with_file(&["--trust", "network"])),
             ExitCode::from(2)
         ));
         assert!(same_exit_code(
-            config_path_cmd(&argv(&["-c", file, "--trust"])),
+            config_path_cmd(&with_file(&["--trust"])),
             ExitCode::from(2)
         ));
     }
