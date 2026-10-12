@@ -169,7 +169,18 @@ fn pointer_value(file: &Path, value: &str) -> io::Result<Option<PathBuf>> {
     if path.contains('\\') {
         return malformed("carries an escape, which this reader does not decode");
     }
-    Ok((!path.is_empty()).then(|| PathBuf::from(path)))
+    if path.is_empty() {
+        return Ok(None);
+    }
+    // Every command reads the pointer, from whatever directory it runs in: a relative path would
+    // name a different image in each, and under `sbx run` one the project chose.
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return malformed(
+            "names a relative path, which would resolve against each command's working directory",
+        );
+    }
+    Ok(Some(path))
 }
 
 /// Whether the pointer file can name `image` — the one rule [`write_pointer`] writes by and the
@@ -198,7 +209,18 @@ fn pointer_value(file: &Path, value: &str) -> io::Result<Option<PathBuf>> {
 /// neither `"` nor `\`. Refusing is right rather than escaping — an escape needs a decoder, and
 /// [`read_pointer`] runs before everything else sbx does, on the resolution path, where a
 /// round-trip bug would point the whole installation at the wrong data directory in silence.
+///
+/// And the path is absolute, which [`read_pointer`] requires of what it reads back: every command
+/// reads the pointer from whatever directory it runs in, and a relative path would name a different
+/// image in each.
 pub(crate) fn pointer_can_name(image: &Path) -> Result<(), String> {
+    if !image.is_absolute() {
+        return Err(format!(
+            "the volume image path cannot be recorded: {} is relative, and every command reads \
+             `{POINTER}` from its own working directory — give the image's absolute path",
+            image.display()
+        ));
+    }
     let refuse = |what: &str| {
         Err(format!(
             "the volume image path cannot be recorded: it {what}, and `{POINTER}` cannot carry that \
@@ -2864,6 +2886,34 @@ this line has no separator at all
             std::fs::write(dir.join(POINTER), junk).unwrap();
             assert_eq!(read_pointer(&dir).unwrap(), None, "{junk:?}");
         }
+    }
+
+    /// The pointer is read by every command, from whatever directory it runs in, so a relative
+    /// image would resolve against each one's working directory — for `sbx run`, the project, the
+    /// untrusted side. An image file found there is the one `up` would attach, and a missing one
+    /// still gets its lock file created beside it. Refused both when it is recorded and when it is
+    /// read, the second for a pointer edited by hand.
+    #[test]
+    fn a_relative_image_is_neither_recorded_nor_followed() {
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("sbx");
+        let mut wrong = Vec::new();
+        for relative in ["vol/a.btrfs", "./a.btrfs"] {
+            match write_pointer(&dir, Path::new(relative)) {
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
+                other => wrong.push(format!("recording {relative:?}: {other:?}")),
+            }
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(POINTER), format!("image = \"{relative}\"\n")).unwrap();
+            let read = read_pointer(&dir);
+            if !read
+                .as_ref()
+                .is_err_and(|e| e.kind() == io::ErrorKind::InvalidData)
+            {
+                wrong.push(format!("reading {relative:?}: {read:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// The pointer promises to be valid TOML for anything that reads it as such, so a person
