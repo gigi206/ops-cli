@@ -356,3 +356,24 @@ fn a_live_sessions_log_survives_the_ceiling_however_old_it_is() {
         "the finished sessions are still trimmed to the ceiling; the live one sits beside it"
     );
 }
+
+/// A daemon a signal ended before it was ready is named by that signal: it printed nothing, so the
+/// generic "see the error above" would point at an empty terminal. One that exited on its own
+/// printed its cause, and is pointed to it.
+#[test]
+fn a_daemon_a_signal_ended_is_reported_by_its_signal() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let ended = |script: &str| {
+        std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .status()
+            .expect("the shell runs")
+            .into_raw()
+    };
+    let killed = super::failed_start(Some(ended("kill -9 $$")));
+    assert!(killed.contains("killed by signal 9"), "{killed}");
+    let failed = super::failed_start(Some(ended("exit 1")));
+    assert!(failed.contains("see the error above"), "{failed}");
+    let unreaped = super::failed_start(None);
+    assert!(unreaped.contains("see the error above"), "{unreaped}");
+}
