@@ -194,7 +194,10 @@ fn registry_or_note(
 /// id — the shared core of `sbx projects [list]` (text or JSON). Live ids come from the session
 /// registry (the same self-healing housekeep `sbx session ls` runs), so a tree in use reads `live`. Pure
 /// host-side filesystem work — no sandbox, no nix.
-fn collect_project_trees(layout: &crate::store::Layout) -> Vec<ProjectTreeView> {
+///
+/// A data directory with no `projects/` yet holds no tree, and answers with none. One that cannot
+/// be read is an error: an empty listing would say there is nothing to reclaim.
+fn collect_project_trees(layout: &crate::store::Layout) -> std::io::Result<Vec<ProjectTreeView>> {
     // A listing answers rather than deletes, so an unreadable registry is reported and the rows are
     // still rendered — with the liveness column saying `unknown` instead of claiming `idle`, which
     // is what nothing checked. The error goes to stderr, where `sbx projects --json | jq` does not
@@ -229,10 +232,11 @@ fn collect_project_trees(layout: &crate::store::Layout) -> Vec<ProjectTreeView> 
                 }
             })
             .collect(),
-        Err(_) => Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
     };
     rows.sort_by(|a, b| a.id.cmp(&b.id));
-    rows
+    Ok(rows)
 }
 
 /// The realized nix store roots of a project tree, grouped by backend, for `sbx projects show`.
@@ -647,7 +651,16 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
         Ok(l) => l,
         Err(code) => return code,
     };
-    let rows = collect_project_trees(&layout);
+    let rows = match collect_project_trees(&layout) {
+        Ok(rows) => rows,
+        Err(e) => {
+            crate::diag::error(&format!(
+                "sbx projects: cannot read {} ({e}), so the trees in it cannot be listed.",
+                layout.data_dir().join("projects").display()
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
 
     if json {
         if let Err(code) = crate::print_json("projects", &rows) {
@@ -1006,6 +1019,37 @@ mod projects_rm_tests {
             !tree.exists(),
             "the removal went ahead once the launch let go"
         );
+    }
+}
+
+#[cfg(test)]
+mod projects_list_tests {
+    /// A `projects/` directory that cannot be read fails the listing, rather than reading as a data
+    /// directory with no trees in it; one that does not exist yet still lists none.
+    #[test]
+    fn an_unreadable_projects_directory_fails_the_listing() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        use std::os::unix::fs::PermissionsExt as _;
+        let data = TmpDir::new();
+        let _lock = env_lock();
+        let _data = EnvVar::set("SBX_DATA_DIR", data.path());
+        let layout = crate::store::Layout::from_env().expect("a layout under the fixture root");
+        let pal = crate::style::Palette::plain();
+        assert_eq!(
+            super::projects_list(true, &pal),
+            std::process::ExitCode::SUCCESS
+        );
+        let projects = layout.data_dir().join("projects");
+        std::fs::create_dir_all(projects.join("0123456789abcdef")).unwrap();
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&projects).is_ok() {
+            std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipping: this user reads a directory its mode refuses (root)");
+            return;
+        }
+        let listed = super::projects_list(true, &pal);
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(listed, std::process::ExitCode::FAILURE);
     }
 }
 
