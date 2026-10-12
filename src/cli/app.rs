@@ -1352,6 +1352,17 @@ fn app_rm_purge_one(
             &format!("sbx: could not remove {}: {e}", path.display()),
         );
     }
+    // Every per-project home of the app is under the projects directory: one that cannot be read
+    // hides them, so none was found or removed, and the purge cannot say the app's state is gone.
+    if let Some(e) = &report.unlisted {
+        diag::error_in(
+            diag::Hue::Warn,
+            &format!(
+                "sbx: {e}, so the per-project homes of '{name}' there could not be found, and \
+                 any it has are left"
+            ),
+        );
+    }
 
     // 3. Nothing found across either source → a no-op (likely a typo); do not report success.
     //    A profile that refused to be *deleted* is not "nothing found": the line above has just
@@ -1359,7 +1370,11 @@ fn app_rm_purge_one(
     //    leaves the reader with two verdicts that contradict each other — the second one reading
     //    as the answer. It is still a no-op (nothing came off disk), so the outcome is unchanged.
     if !profile_removed && report.found_nothing() {
-        diag::error(&nothing_purged_message(name, profile_failed));
+        // With the projects directory unread, nothing was found where the homes would be, which
+        // is not finding that there are none: the line above is the answer.
+        if report.unlisted.is_none() {
+            diag::error(&nothing_purged_message(name, profile_failed));
+        }
         return AppPurgeOutcome {
             ok: false,
             acted: false,
@@ -1378,7 +1393,7 @@ fn app_rm_purge_one(
     };
     // A partial failure (a home that would not delete) is not a clean purge — say so, so the green
     // summary never contradicts the non-zero exit the batch will carry.
-    let clean = report.failed.is_empty() && !profile_failed;
+    let clean = report.failed.is_empty() && report.unlisted.is_none() && !profile_failed;
     let verb = if clean {
         format!("{ok}purged{r}")
     } else {
@@ -1453,10 +1468,19 @@ fn app_list(json: bool, shared: bool) -> ExitCode {
             .iter()
             .filter(|a| sandbox::gc::is_safe_tree_id(&a.name))
             .collect();
-        let owners: Vec<Vec<std::path::PathBuf>> = owned
+        // A projects directory that cannot be read would leave each app's per-project trees out of
+        // what it owns, and the figure would be part of the app read as all of it.
+        let owners: Vec<Vec<std::path::PathBuf>> = match owned
             .iter()
             .map(|a| sandbox::app_trees(data_dir, &a.name))
-            .collect();
+            .collect()
+        {
+            Ok(owners) => owners,
+            Err(e) => {
+                diag::error(&format!("sbx: app list: --shared: {e}"));
+                return ExitCode::FAILURE;
+            }
+        };
         match sandbox::extents::measure(data_dir, &owners) {
             Ok(report) => {
                 for (app, usage) in owned.iter().zip(&report.owners) {
