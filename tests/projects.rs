@@ -596,6 +596,28 @@ fn a_tree_whose_marker_cannot_be_read_is_never_swept() {
     assert!(!dir.exists(), "the removal by id left the tree");
 }
 
+/// A marker holding a NUL byte names no path a launch could record. Read as a path, it named a file
+/// that cannot exist, so a tree whose project is there read as dead and the sweep removed it.
+#[test]
+fn a_marker_naming_no_usable_path_is_never_swept() {
+    let fx = Project::new("projects");
+    let dir = fx.make_tree("1234567890abcdef", Some(fx.proj.path()));
+    let mut bytes = fx.proj.path().as_os_str().as_bytes().to_vec();
+    bytes.extend_from_slice(b"\0x");
+    std::fs::write(dir.join("project"), &bytes).unwrap();
+
+    let list = fx.run(&["projects", "list", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&list.stdout).expect("valid JSON");
+    assert_eq!(v[0]["state"], "unreadable", "{}", text(&list));
+    let out = fx.run(&["projects", "rm", "--dead", "--yes"]);
+    assert!(
+        dir.exists(),
+        "the sweep removed a tree whose project is there: {}",
+        text(&out)
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+}
+
 /// The project path a tree's marker records names a directory whatever its creator called it: the
 /// listing and the dead-tree sweep write it as text that drives nothing, and `--json` keeps it.
 #[test]
