@@ -93,9 +93,11 @@ fn reap_dead_trees(
         } else {
             format!("{warn}reclaimable unless a session holds it{r}")
         };
+        // The project path is read from the tree's marker, and a directory name is any bytes:
+        // written escaped, as `sbx config show` writes a value.
         outln!(
             "  {verb}: {n}{}{r} ({})",
-            tree.path.display(),
+            crate::diag::visible(&tree.path.to_string_lossy()),
             super::gc::human_bytes(tree.bytes)
         );
     }
@@ -587,8 +589,10 @@ fn render_project_show(v: &ProjectShowView, pal: &crate::style::Palette) -> Stri
     let mut s = String::new();
     let _ = writeln!(s, "{h}project{r} {n}{}{r}  {}", v.id, v.state);
     match &v.project {
+        // Read from the tree's marker: a directory name is any bytes, so it is written escaped, as
+        // `sbx config show` writes a value. `--json` keeps the bytes.
         Some(p) => {
-            let _ = writeln!(s, "  path:     {p}");
+            let _ = writeln!(s, "  path:     {}", crate::diag::visible(p));
         }
         None => {
             let _ = writeln!(s, "  path:     {dim}(no marker — project path unknown){r}");
@@ -745,7 +749,12 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
         } else {
             String::new()
         };
-        let path = row.project.as_deref().unwrap_or("(no marker)");
+        // Read from the tree's marker: a directory name is any bytes, so it is written escaped, as
+        // `sbx config show` writes a value. `--json` keeps the bytes.
+        let path = row
+            .project
+            .as_deref()
+            .map_or_else(|| "(no marker)".to_string(), crate::diag::visible);
         outln!(
             "  {n}{id}{r}  {state}  {size}  {dim}{last}{r}  {path}{mark}",
             id = row.id,
@@ -1207,9 +1216,9 @@ mod projects_show_tests {
     // built yet whether or not the project is trusted. A `[tools]` key is a quoted TOML key, any
     // string, so it reaches the view carrying whatever the project wrote; the listing writes it as
     // text that drives nothing, as `sbx config show` writes a config's values.
-    #[test]
-    fn a_tool_the_project_names_is_listed_as_text_that_drives_nothing() {
-        let view = ProjectShowView {
+    /// A view with nothing in it, for a test to fill the one field it is about.
+    fn a_view() -> ProjectShowView {
+        ProjectShowView {
             id: "p1".into(),
             state: "live",
             project: None,
@@ -1222,20 +1231,22 @@ mod projects_show_tests {
             store_built_here_bytes: 0,
             own_bytes: 0,
             nixpkgs: None,
-            store_roots: StoreRootsView {
-                nix: vec![],
-                deb: vec![],
-                appimage: vec![],
-                tarball: vec![],
-                binary: vec![],
-            },
+            store_roots: StoreRootsView::default(),
             mise_tools: vec![],
+            unbuilt: vec![],
+            config_available: true,
+        }
+    }
+
+    #[test]
+    fn a_tool_the_project_names_is_listed_as_text_that_drives_nothing() {
+        let view = ProjectShowView {
             unbuilt: vec![UnbuiltView {
                 kind: "mise tool".into(),
                 locator: "npm:P01\u{1b}[7m\nforged\u{202e}X = 1.0".into(),
                 withheld: false,
             }],
-            config_available: true,
+            ..a_view()
         };
         let text = render_project_show(&view, &crate::style::Palette::plain());
         assert!(
@@ -1251,6 +1262,27 @@ mod projects_show_tests {
         assert!(
             line.contains("forged") && line.contains("= 1.0"),
             "the whole value stays on its own line: {text:?}"
+        );
+    }
+
+    /// The project path comes from the tree's marker, and the directory it names was called
+    /// whatever its creator chose: `show` writes it as text that drives nothing.
+    #[test]
+    fn the_project_path_is_shown_as_text_that_drives_nothing() {
+        let view = ProjectShowView {
+            project: Some("/work/proj\u{1b}[2J\u{202e}x".into()),
+            ..a_view()
+        };
+        let text = render_project_show(&view, &crate::style::Palette::plain());
+        assert!(
+            !text
+                .chars()
+                .any(|c| (c.is_control() && c != '\n') || crate::diag::reorders(c)),
+            "{text:?}"
+        );
+        assert!(
+            text.contains("path:     /work/proj\\x1b[2J\\u{202e}x"),
+            "{text:?}"
         );
     }
 
