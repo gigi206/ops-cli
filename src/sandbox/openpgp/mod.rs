@@ -450,23 +450,28 @@ fn issuer_of(body: &[u8]) -> Result<Fingerprint, String> {
     ]) as usize;
     let mut at = 6;
     let end = 6 + hashed_len;
+    // The issuer is read from the hashed area alone, so a subpacket that starts inside it is held to
+    // its end rather than read on into what follows.
+    let hashed = body
+        .get(..end)
+        .ok_or("hashed subpackets run past the end of the signature")?;
     while at < end {
         // Subpacket framing: a length (one, two or five bytes) then a type byte and its data.
-        let first = *body.get(at).ok_or("truncated subpacket")? as usize;
+        let first = *hashed.get(at).ok_or("truncated subpacket")? as usize;
         let (len, header) = match first {
             0..=191 => (first, 1),
             192..=254 => (
                 ((first - 192) << 8)
-                    + *body.get(at + 1).ok_or("truncated subpacket")? as usize
+                    + *hashed.get(at + 1).ok_or("truncated subpacket")? as usize
                     + 192,
                 2,
             ),
             _ => {
-                let b = body.get(at + 1..at + 5).ok_or("truncated subpacket")?;
+                let b = hashed.get(at + 1..at + 5).ok_or("truncated subpacket")?;
                 (u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize, 5)
             }
         };
-        let data = body
+        let data = hashed
             .get(at + header..at + header + len)
             .ok_or("subpacket runs past the hashed area")?;
         // Type 33 is `issuer fingerprint`, whose first byte is the key version.
