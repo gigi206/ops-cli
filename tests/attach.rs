@@ -15,18 +15,12 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn sbx() -> Command {
-    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/sbx` so an e2e never depends on
-    // the developer's global sbx config; default it to a fixed empty dir under the test tree
-    // (no test here writes a global config, so a shared empty dir is race-free).
-    let cfg = fixture_root().join("isolated-config");
-    let _ = std::fs::create_dir_all(&cfg);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
-    cmd.env("XDG_CONFIG_HOME", cfg);
-    cmd
+    // The global config and the trust store come from fixed empty directories under the test tree
+    // ([`common::isolated_sbx`]), so an e2e never depends on the developer's `~/.config/sbx` or on
+    // their trust markers, which the app launch below looks its project config up in. No test here
+    // writes either, so the shared directories are race-free.
+    common::isolated_sbx("")
 }
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
 
 #[test]
 fn attach_to_an_unknown_id_reports_and_exits_two() {
