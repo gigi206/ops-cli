@@ -1869,8 +1869,6 @@ fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_globa
     // `mode = "ask"` and every other field preserved — NOT a shadowing `[app.<name>.network]` stub in
     // the global sbx.toml (the brick bug) — and the summary must NAME the profile, never "the global
     // config under app <name>" (the stale line that lied about where the rule went).
-    use std::os::unix::ffi::OsStrExt;
-
     let fx = Project::new("net");
     // A global baseline exists (so the "no inline stub" assertion is meaningful), plus the app's real
     // profile: a cmd and an ask-mode allowlist the drain must preserve.
@@ -1885,30 +1883,14 @@ fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_globa
     );
 
     // Register THIS process as a live GlobalApp session of `claude-code` so the `--app` filter finds
-    // it (liveness pruning keeps it — the process is alive and its start_ticks match). The record
-    // format is session.rs's serializer: `runtime=global-app:<name>`, filename `<pid>-<start_ticks>`.
-    let sessions = fx.data_home.path().join("sbx").join("sessions");
-    std::fs::create_dir_all(&sessions).unwrap();
+    // it (liveness pruning keeps it — the process is alive and its start_ticks match).
     let pid = std::process::id();
-    let start_ticks = common::start_ticks(pid);
-    let project_hex: String = fx
-        .proj
-        .path()
-        .canonicalize()
-        .unwrap()
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    std::fs::write(
-        sessions.join(format!("{pid}-{start_ticks}")),
-        format!(
-            "kind=run\npid={pid}\nstart={start_ticks}\nruntime=global-app:claude-code\n\
-             project={project_hex}\n"
-        ),
-    )
-    .unwrap();
+    common::write_session_record(
+        fx.data_home.path(),
+        pid,
+        "global-app:claude-code",
+        &fx.proj.path().canonicalize().unwrap(),
+    );
 
     // The fake session answers the bulk drain with one host to be saved into the profile.
     let session = StandIn::serve(&fx, pid, &["answered host=mcp.context7.com\nok\n"]);
@@ -1977,31 +1959,16 @@ fn net_pending_all_save_local_drains_this_project_and_writes_its_config() {
     // persists the host to THIS project's `.sbx.toml`. The project filter needs a *live* registered
     // session, so register THIS test process (alive → survives liveness pruning) as a project session
     // of fx.proj, and bind its control socket; the child `fx.run` then drains it via the project
-    // filter. The one coupling is the registry record format (session.rs's serializer): fields
-    // `kind=/pid=/start=/runtime=project/project=<canonical>`, filename `<pid>-<start_ticks>`,
-    // start_ticks = `/proc/self/stat` field 22.
+    // filter. The one coupling is the registry record format, which `common::write_session_record`
+    // writes, the project canonical.
     let fx = Project::new("net");
-    let sessions = fx.data_home.path().join("sbx").join("sessions");
-    std::fs::create_dir_all(&sessions).unwrap();
-
     let pid = std::process::id();
-    let start_ticks = common::start_ticks(pid);
-    // The project path is hex-encoded in the record (so a non-UTF-8/newline path round-trips).
-    use std::os::unix::ffi::OsStrExt;
-    let project = fx.proj.path().canonicalize().unwrap();
-    let project_hex: String = project
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    std::fs::write(
-        sessions.join(format!("{pid}-{start_ticks}")),
-        format!(
-            "kind=run\npid={pid}\nstart={start_ticks}\nruntime=project\nproject={project_hex}\n"
-        ),
-    )
-    .unwrap();
+    common::write_session_record(
+        fx.data_home.path(),
+        pid,
+        "project",
+        &fx.proj.path().canonicalize().unwrap(),
+    );
 
     let session = StandIn::serve(&fx, pid, &["answered host=blocked.example\nok\n"]);
 
@@ -2219,29 +2186,15 @@ fn net_pending_all_app_scoped_drains_a_registered_app_session() {
     // The app-scoped live drain — the path that was untested (the existing app-filter test covered
     // only the empty case). Register THIS process as a `global-app:claude-code` session, bind its
     // control socket, then drive `-a claude-code --all --session` and assert it actually answers.
-    use std::os::unix::ffi::OsStrExt;
-
     let fx = Project::new("net");
-    let sessions = fx.data_home.path().join("sbx").join("sessions");
-    std::fs::create_dir_all(&sessions).unwrap();
-
     let pid = std::process::id();
-    let start_ticks = common::start_ticks(pid);
-    let project = fx.proj.path().canonicalize().unwrap();
-    let project_hex: String = project
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
     // The crux: an APP session (`global-app:claude-code`), so `session.app() == Some("claude-code")`.
-    std::fs::write(
-        sessions.join(format!("{pid}-{start_ticks}")),
-        format!(
-            "kind=run\npid={pid}\nstart={start_ticks}\nruntime=global-app:claude-code\nproject={project_hex}\n"
-        ),
-    )
-    .unwrap();
+    common::write_session_record(
+        fx.data_home.path(),
+        pid,
+        "global-app:claude-code",
+        &fx.proj.path().canonicalize().unwrap(),
+    );
 
     let session = StandIn::serve(&fx, pid, &["answered host=claude.ai\nok\n"]);
 
@@ -2316,28 +2269,14 @@ fn net_pending_by_id_accepts_an_app_scope_and_rejects_a_mismatch() {
     // `-a <app>` on the by-id path is a session scope (the natural carry-over from
     // `sbx net pending -a <app>`), honored without `--save`: it answers the id when the registry
     // confirms that session is that app, and refuses when the id belongs to a *different* app.
-    use std::os::unix::ffi::OsStrExt;
-
     let fx = Project::new("net");
-    let sessions = fx.data_home.path().join("sbx").join("sessions");
-    std::fs::create_dir_all(&sessions).unwrap();
-
     let pid = std::process::id();
-    let start_ticks = common::start_ticks(pid);
-    let project = fx.proj.path().canonicalize().unwrap();
-    let project_hex: String = project
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    std::fs::write(
-        sessions.join(format!("{pid}-{start_ticks}")),
-        format!(
-            "kind=run\npid={pid}\nstart={start_ticks}\nruntime=global-app:claude-code\nproject={project_hex}\n"
-        ),
-    )
-    .unwrap();
+    common::write_session_record(
+        fx.data_home.path(),
+        pid,
+        "global-app:claude-code",
+        &fx.proj.path().canonicalize().unwrap(),
+    );
 
     // Only the matching-app case reaches the socket (the mismatch is refused before any answer).
     let session = StandIn::serve(&fx, pid, &["ok host=claude.ai count=1\n"]);
