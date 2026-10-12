@@ -1767,6 +1767,41 @@ fn sbx_app_rm_purge_over_an_unreadable_projects_directory_is_not_clean() {
     );
 }
 
+/// An app whose only home is per-project is found under `projects/`: a listing, or a prune of
+/// every installed app, that cannot read that directory fails rather than saying the app has
+/// nothing on disk.
+#[test]
+fn sbx_app_list_and_prune_fail_over_an_unreadable_projects_directory() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fx = Project::new("app");
+    let sbx_dir = fx.data_home.path().join("sbx");
+    touch_under(&sbx_dir.join("projects/testproj/apps/claude/home/state"));
+    let projects = sbx_dir.join("projects");
+    let mode = |m| std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(m));
+    mode(0o000).unwrap();
+    if std::fs::read_dir(&projects).is_ok() {
+        mode(0o700).unwrap();
+        skip_incapable!("running as root, which reads a directory its mode refuses");
+        return;
+    }
+    let shapes = [
+        &["app", "list"][..],
+        &["app", "list", "--shared"][..],
+        &["app", "prune", "--all"][..],
+    ];
+    let outs: Vec<_> = shapes.iter().map(|args| fx.run(args)).collect();
+    mode(0o700).unwrap();
+
+    for (args, out) in shapes.iter().zip(&outs) {
+        assert!(
+            out.status.code() == Some(1)
+                && String::from_utf8_lossy(&out.stderr).contains("cannot read"),
+            "{args:?} read an unreadable projects/ as holding no home: {}",
+            text(out)
+        );
+    }
+}
+
 #[test]
 fn sbx_app_rm_purges_several_apps_in_one_call() {
     let fx = Project::new("app");
