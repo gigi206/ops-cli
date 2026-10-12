@@ -866,17 +866,18 @@ fn dropped_path(notice: &str) -> &str {
 /// WHOLE layer with only a warning, silently reverting every security field it carried, so a write
 /// is validated before it commits.
 ///
-/// The question is asked the way the loader asks it, over `before` — the document as it read
-/// before the edit — and the edited one. Every loader path reads a layer through
+/// The question is asked the way the loader asks it, over `before` — the document as it read before
+/// the edit — and the edited one. Every loader path reads a layer through
 /// [`super::schema::parse_layer`], which recovers from a mistyped value by dropping that one key
-/// and applying the rest; judging an edit with the all-or-nothing [`super::schema::parse`] instead
-/// put the two planes at odds, and a file already carrying one recoverable type error — a file the
-/// loader loads and `sbx config show` prints — had every write verb refuse, naming the key just
-/// typed rather than the pre-existing one. So what is refused here is a document that no longer
-/// parses at all, or a key the edit itself newly costs; a drop the layer already carried is the
-/// loader's to warn about, not this gate's to block on. A mistyped restriction is not such a drop:
-/// the loader refuses the whole layer over it (see [`super::schema::parse_layer`]), so this gate
-/// refuses every edit to that file but the one that repairs it, and the message names the value.
+/// and applying the rest. Judging an edit with the all-or-nothing [`super::schema::parse`] instead
+/// would put the two planes at odds: a file already carrying one recoverable type error — a file
+/// the loader loads and `sbx config show` prints — would have every write verb refuse, naming the
+/// key just typed rather than the pre-existing one. So what is refused here is a document that no
+/// longer parses at all, or a key the edit itself newly costs; a drop the layer already carried is
+/// the loader's to warn about, not this gate's to block on. A mistyped restriction is not such a
+/// drop: the loader refuses the whole layer over it (see [`super::schema::parse_layer`]), so this
+/// gate refuses every edit to that file but the one that repairs it, and the message names the
+/// value.
 ///
 /// Parsing alone is not the whole gate. A field whose schema type is broad enough to hold a
 /// malformed value — `forward`, where a `"host:cage"` remap is a string and so any string parses —
@@ -888,18 +889,17 @@ fn dropped_path(notice: &str) -> &str {
 /// The coverage is a list rather than a property of the gate, so the list is written out: what
 /// follows is the fields it holds, and, at the end, the ones it does not yet reach.
 ///
-/// `forward` was for a while the only field on the list, though the rule above was already stated
-/// in the general. `[fs]` is the second, and the one where the gap cost the most: its lists are
-/// plain strings too, so `sbx config add fs.deny /etc/shadow` parsed, committed, and was dropped by
-/// [`super::apply_fs`] at the next load — a mask the user was told had been written, over a path
-/// the cage goes on reading.
+/// `forward` is the first field on the list. `[fs]` is the second, and the one where a gap costs
+/// the most: its lists are plain strings too, so without the check `sbx config add fs.deny
+/// /etc/shadow` would parse, commit, and be dropped by [`super::apply_fs`] at the next load — a
+/// mask the user is told has been written, over a path the cage goes on reading.
 ///
 /// The rule lists are the third: `network.allow`/`deny`/`mute` and `proc.allow`/`deny` hold plain
 /// strings the resolver drops entry by entry, and the verbs that write one rule admit it first, so
-/// a whole list written at once meets the same grammar. `[seccomp] allow` is the fourth, and the
-/// only list `sbx config add` reaches that had no admission at all: `sbx config add seccomp.allow
-/// 'bad!!!'` reported the entry as added, and the launch then dropped it, leaving a cage the config
-/// says reopened a syscall and the kernel says did not.
+/// a whole list written at once meets the same grammar. `[seccomp] allow` is the fourth: without an
+/// admission, `sbx config add seccomp.allow 'bad!!!'` would report the entry as added and the
+/// launch would then drop it, leaving a cage the config says reopened a syscall and the kernel says
+/// did not.
 ///
 /// `[devices] allow`, `[ssh_agent] allow` and the `[network]` table's `http2` and
 /// `shared_credential` are the fifth: each is a list the schema types broadly enough to hold what
@@ -909,12 +909,13 @@ fn dropped_path(notice: &str) -> &str {
 /// reason, so no copy of those rules lives here either.
 ///
 /// The values the resolver reads out of a fixed set are the sixth ([`admit_known_values`]): a
-/// `network`, `proc`, `gui` or `notify` posture and an app's `home_scope`. `sbx config set
-/// network.mode bogus` answered `set`, and the next launch refused to start over it.
+/// `network`, `proc`, `gui` or `notify` posture and an app's `home_scope`. Without it, `sbx config
+/// set network.mode bogus` would answer `set` and the next launch would refuse to start over it.
 ///
-/// A global app's profile is the seventh ([`admit_profile`]): the loader reads it as one app,
-/// whole or not at all, so it is also read that way here. `sbx config set contract bogus --app
-/// <name> -g` answered `set`, and the loader then dropped the profile and the app with it.
+/// A global app's profile is the seventh ([`admit_profile`]): the loader reads it as one app, whole
+/// or not at all, so it is also read that way here. Without it, `sbx config set contract bogus
+/// --app <name> -g` would answer `set`, and the loader would then drop the profile and the app with
+/// it.
 ///
 /// What the list does not yet reach, so that the next field added is added knowingly rather than
 /// assumed covered: a `binds` entry is checked below for the command line's `:ro`/`:rw` spelling
@@ -956,8 +957,8 @@ fn validate_layer(before: &str, doc: &DocumentMut, profile: bool) -> Result<(), 
 /// The half of [`validate_layer`] for a profile, which the loader reads as one app, whole or not at
 /// all ([`super::schema::parse_app`]), where the rest of this check reads a config layer. A field
 /// only an app has (`cmd`, `contract`, `use`) means nothing to that reading, so a value of the
-/// wrong shape in one was written and the loader then dropped the whole profile, the app with it;
-/// and `home_scope`, the one such field read out of a fixed set, is held to it here.
+/// wrong shape in one would be written and the loader would then drop the whole profile, the app
+/// with it; and `home_scope`, the one such field read out of a fixed set, is held to it here.
 fn admit_profile(doc: &DocumentMut) -> Result<(), String> {
     let app = super::schema::parse_app(doc.to_string().as_bytes()).map_err(|e| {
         format!("the profile would no longer read as an app, and the loader would drop it: {e}")
@@ -975,9 +976,10 @@ fn admit_profile(doc: &DocumentMut) -> Result<(), String> {
 fn admit_entries(raw: &super::schema::RawConfig) -> Result<(), String> {
     // The rule lists, baseline and per app. `sbx net allow` and `sbx proc allow` admit a rule
     // against the resolver's own grammar before writing it; `sbx config set network.allow '[…]'`
-    // writes the same list in one go and went through neither, so `"*"`, an uncompilable `re:[`
-    // or a control byte was written, reported as set, blessed by `--trust`, and then dropped at
-    // load with a warning about a file the user had just been told was written.
+    // writes the same list in one go, so it is held to the same grammar here. Admitted unread,
+    // `"*"`, an uncompilable `re:[` or a control byte would be written, reported as set, blessed by
+    // `--trust`, and then dropped at load with a warning about a file the user had just been told
+    // was written.
     let app_nets = raw.app.values().filter_map(|a| a.network.as_ref());
     for field in raw.network.iter().chain(app_nets) {
         let super::schema::NetworkField::Table(t) = field else {
@@ -1035,9 +1037,10 @@ fn admit_entries(raw: &super::schema::RawConfig) -> Result<(), String> {
         }
     }
     // `[devices] allow` and `[ssh_agent] allow`, baseline and per app, through the two resolvers
-    // that read them. Both grant host access and both drop a malformed entry with a warning, so a
-    // device the cage never gets and a key it can never sign with were written, reported, and — for
-    // a `--local` file — re-trusted, with nothing to show for it at the next launch.
+    // that read them. Both grant host access and both drop a malformed entry with a warning, so
+    // without this a device the cage never gets and a key it can never sign with would be written,
+    // reported, and — for a `--local` file — re-trusted, with nothing to show for it at the next
+    // launch.
     let app_devices = raw.app.values().filter_map(|a| a.devices.as_ref());
     for devices in raw.devices.iter().chain(app_devices) {
         let mut dropped = Vec::new();
@@ -1064,11 +1067,12 @@ fn admit_entries(raw: &super::schema::RawConfig) -> Result<(), String> {
         }
     }
     // A bare-string `binds` entry carrying `:ro`/`:rw`. That suffix is the *command line's*
-    // spelling — `sbx run --bind /data:rw` takes it apart — and a config file has never read it: a
-    // bare string is a path, whole. So `sbx config add binds /data:rw` wrote a path literally named
-    // `/data:rw`, reported it as added, and the launch dropped it as a path that is not there,
-    // while the user's directory stayed unbound. Refused with the shape a file does read, rather
-    // than translated, because a config's two forms are already the whole grammar.
+    // spelling — `sbx run --bind /data:rw` takes it apart — and a config file does not read it: a
+    // bare string is a path, whole. Admitted, `sbx config add binds /data:rw` would write a path
+    // literally named `/data:rw` and report it as added, and the launch would drop it as a path
+    // that is not there while the user's directory stays unbound. Refused with the shape a file
+    // does read, rather than translated, because a config's two forms are already the whole
+    // grammar.
     let app_binds = raw.app.values().map(|a| &a.binds);
     for entry in std::iter::once(&raw.binds).chain(app_binds).flatten() {
         let super::schema::RawBind::Path(path) = entry else {
@@ -1137,9 +1141,10 @@ fn admit_entries(raw: &super::schema::RawConfig) -> Result<(), String> {
 ///
 /// A `network`, `proc` or `gui` posture the resolver does not know stops a launch, and a `notify`
 /// mode, event or period it cannot read, or an app's `home_scope`, is dropped for the layer below.
-/// Either way the write reported a value that never applied. Each is read against a default layer
-/// below, which none of these refusals depends on, and only what the resolver refuses or drops
-/// counts: its notes on a value it does apply are not this check's business.
+/// Either way a write that admitted it would report a value that never applies. Each is read
+/// against a default layer below, which none of these refusals depends on, and only what the
+/// resolver refuses or drops counts: its notes on a value it does apply are not this check's
+/// business.
 fn admit_known_values(raw: &super::schema::RawConfig) -> Result<(), String> {
     let mut refused = Vec::new();
     let mut dropped = Vec::new();
@@ -1193,14 +1198,13 @@ fn admit_known_values(raw: &super::schema::RawConfig) -> Result<(), String> {
 /// never an error.
 ///
 /// Validated before it commits, like [`set`], [`add`] and [`remove`] — [`validate_layer`]'s own doc
-/// names "a `set`/`unset` that leaves the layer unparseable" as the thing it exists to prevent, and
-/// this was the one of the four that did not ask. A removal can make a layer unparseable as readily
-/// as a bad value can: a schema table carrying a required field with no `#[serde(default)]` stops
-/// parsing when that field is taken away, and the loader then drops the whole layer with only a
-/// warning. `RawInlineFlake.flake` and `RawServiceReady.tcp` are the two such fields; the tables
-/// that used to join them — `RawServiceTable.cmd` and `RawOpenTable.cmd` — were given defaults
-/// precisely so a hand-edited file costs its own entry rather than the file, which is the same
-/// tolerance this guard extends to an edit sbx makes itself.
+/// names "a `set`/`unset` that leaves the layer unparseable" as the thing it exists to prevent. A
+/// removal can make a layer unparseable as readily as a bad value can: a schema table carrying a
+/// required field with no `#[serde(default)]` stops parsing when that field is taken away, and the
+/// loader then drops the whole layer with only a warning. `RawInlineFlake.flake` and
+/// `RawServiceReady.tcp` are the two such fields; `RawServiceTable.cmd` and `RawOpenTable.cmd`
+/// carry defaults precisely so a hand-edited file costs its own entry rather than the file, which
+/// is the same tolerance this guard extends to an edit sbx makes itself.
 ///
 /// The check is the layer's own parser rather than a list of field names, so it stays right as the
 /// schema's required set changes.
@@ -1242,9 +1246,10 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<Written<bool>, ManageError
 ///
 /// The writer sees one file. For an app that is not the whole story: `[app.<name>.network]` may be
 /// absent from the project `.sbx.toml` and yet the app's *profile* declare a posture and a set of
-/// rules one layer down. Told nothing, the writer read that as "no posture anywhere" and bootstrapped
-/// a `mode` of its own — which turned the overlay into a replacing table and took the profile's
-/// rules with it: three allow rules became one, and the command reported success.
+/// rules one layer down. Told nothing, the writer would read that as "no posture anywhere" and
+/// bootstrap a `mode` of its own — which turns the overlay into a replacing table and takes the
+/// profile's rules with it: three allow rules would become one, and the command would report
+/// success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Inherited {
     /// Nothing a rule can attach to. `allow` bootstraps the deny-by-default posture, `deny` and
@@ -2037,19 +2042,19 @@ fn split_key(key: &str) -> Result<Vec<String>, ManageError> {
     }
     // A quoted segment keeps its dots, which is the only way to address a key that contains one —
     // and every secret does, since it is keyed by host: `secret."api.example.com".from`. Splitting
-    // on every dot used to walk straight through the quotes and build `secret.'"api'.example…`,
-    // a nonsense table the schema happened to accept, so the write was reported as a success.
+    // on every dot would walk straight through the quotes and build `secret.'"api'.example…`, a
+    // nonsense table the schema happens to accept, so the write would be reported as a success.
     //
     // TOML spells a quoted key two ways — basic (`"…"`) and literal (`'…'`) — so the state is which
-    // quote opened the segment, not merely whether one did. Tracking the basic form alone sent
-    // `secret.'api.example.com'.from` down the very path described above, splitting it into
+    // quote opened the segment, not merely whether one did. Tracking the basic form alone would
+    // send `secret.'api.example.com'.from` down the very path described above, splitting it into
     // `secret`, `'api`, `example`, `com'`, `from` and writing a table the schema accepts while the
     // credential the user named stays undeclared.
     //
-    // A quote opens a segment and closes it, as in TOML, and nowhere else: `network"."allow` used to
-    // read as the one key `network.allow` at the root, a key nothing reads, written and reported
-    // as set while the `[network]` list it spells stayed as it was. TOML has no such key, so it is
-    // refused, as is a segment that goes on past its closing quote.
+    // A quote opens a segment and closes it, as in TOML, and nowhere else. Read otherwise,
+    // `network"."allow` would be the one key `network.allow` at the root, a key nothing reads,
+    // written and reported as set while the `[network]` list it spells stays as it was. TOML has no
+    // such key, so it is refused, as is a segment that goes on past its closing quote.
     let bad = || ManageError::BadKey(key.to_string());
     let mut segments = Vec::new();
     let mut chars = key.chars().peekable();
@@ -2282,11 +2287,11 @@ fn hold_for_write(path: &Path) -> Result<WriteGuard, ManageError> {
 /// can create it and a `get`/`unset` simply finds nothing).
 ///
 /// The bytes come through [`super::safety::read_safe_bytes`], the gate a launch applies to every
-/// config file, so the edit plane and the launch plane agree on which files exist to be acted on.
-/// They used not to: a plain `read_to_string` here meant `sbx config set` rewrote a world-writable
-/// `.sbx.toml` and reported success on a file the loader then refused, `sbx config get` printed a
-/// value no launch would use, and a non-regular target stalled the verb in the open with no
-/// diagnostic at all (`-c <fifo>` hung until killed).
+/// config file, so the edit plane and the launch plane agree on which files exist to be acted on. A
+/// plain `read_to_string` here would let `sbx config set` rewrite a world-writable `.sbx.toml` and
+/// report success on a file the loader then refuses, let `sbx config get` print a value no launch
+/// would use, and let a non-regular target stall the verb in the open with no diagnostic at all
+/// (`-c <fifo>` hanging until killed).
 ///
 /// `sbx config edit` is unaffected and remains the way to open a file that has not been vetted: it
 /// never reads the file itself, it hands the path to `$EDITOR`. What the gate refuses here is a
@@ -2336,10 +2341,10 @@ impl Drop for Admission {
 ///
 /// The write reads the file again, under its guard ([`read_or_empty`]), and the project tree is
 /// writable from inside a cage. A `.sbx.toml` present when a session launched is read-only there,
-/// but one absent then is not: a file the cage put in place between the two reads was written into
-/// and then attested as sbx's own text, `[network] mode = "allow"` included. The write is refused
-/// instead when its read is not `read`, and a caller blesses only a write whose read matched
-/// ([`admission_verified`]).
+/// but one absent then is not: a file the cage put in place between the two reads would be written
+/// into and then attested as sbx's own text, `[network] mode = "allow"` included. The write is
+/// refused instead when its read is not `read`, and a caller blesses only a write whose read
+/// matched ([`admission_verified`]).
 pub(crate) fn admit_write(path: &Path, read: crate::trust::ConfigRead) -> Admission {
     ADMITTED.with_borrow_mut(|admitted| {
         admitted.insert(path.to_path_buf(), (read, false));
@@ -2767,10 +2772,10 @@ mod tests {
     /// unlinks it and creates its own, which is what lets the mode on the open apply and what keeps
     /// a symlink at that name from being followed (pinned separately below).
     ///
-    /// What this does not reach is the composition: a `write_restricted` that went back to writing
-    /// through the path would still pass, since the file it leaves behind is the same one. That
-    /// half is held by the build instead — the helper would then have no caller outside this
-    /// module, and `clippy -D warnings` refuses an unused function.
+    /// What this does not reach is the composition: a `write_restricted` that wrote through the
+    /// path would still pass, since the file it leaves behind is the same one. That half is held by
+    /// the build instead — the helper would then have no caller outside this module, and `clippy -D
+    /// warnings` refuses an unused function.
     #[test]
     fn the_content_never_lands_in_a_file_wider_than_its_caller_asked_for() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2904,8 +2909,8 @@ mod tests {
             "a refused edit must not have written"
         );
 
-        // A FIFO used to hang the verb in the open, with no diagnostic at all. Were the gate's open
-        // blocking, this call would deadlock rather than fail.
+        // A FIFO must not hang the verb in the open: were the gate's open blocking, this call would
+        // deadlock rather than fail, with no diagnostic at all.
         let fifo = tmp.join("fifo.toml");
         let c = {
             use std::os::unix::ffi::OsStrExt as _;
@@ -3047,11 +3052,10 @@ mod tests {
     #[test]
     fn set_refuses_a_rule_list_entry_the_resolver_would_drop() {
         // `sbx net allow` and `sbx proc allow` admit a rule against the resolver's own grammar
-        // before writing it. `sbx config set network.allow '[…]'` writes the same list in one go,
-        // and it went through neither: the entry was written, reported as set, blessed by a
-        // `--trust`, and then dropped at the next load with a warning about a file the user had
-        // just been told was written. The last two arms are the witness: a list of well-formed
-        // rules still writes.
+        // before writing it. `sbx config set network.allow '[…]'` writes the same list in one go;
+        // unadmitted, the entry would be written, reported as set, blessed by a `--trust`, and then
+        // dropped at the next load with a warning about a file the user had just been told was
+        // written. The last two arms are the witness: a list of well-formed rules still writes.
         let tmp = crate::testutil::TmpDir::new();
         for (key, value) in [
             ("network.allow", r#"["*"]"#),
@@ -3084,10 +3088,10 @@ mod tests {
         }
     }
 
-    /// `:ro`/`:rw` is the command line's bind spelling, and a config file has never read it: a
-    /// bare string there is a path, whole. `sbx config add binds /data:rw` wrote a path literally
-    /// named `/data:rw`, reported it as added, and the launch dropped it as a path that is not
-    /// there, leaving the directory unbound and the user told otherwise.
+    /// `:ro`/`:rw` is the command line's bind spelling, and a config file does not read it: a bare
+    /// string there is a path, whole. Admitted, `sbx config add binds /data:rw` would write a path
+    /// literally named `/data:rw` and report it as added, and the launch would drop it as a path
+    /// that is not there, leaving the directory unbound and the user told otherwise.
     #[test]
     fn a_bind_written_the_command_lines_way_is_refused_with_the_shape_a_file_reads() {
         let tmp = crate::testutil::TmpDir::new();
@@ -3117,12 +3121,11 @@ mod tests {
         }
     }
 
-    /// `[seccomp] allow` was the one list `sbx config add` reaches with no admission of its own.
-    /// `sbx config add seccomp.allow 'bad!!!'` answered `added \`bad!!!\` to \`seccomp.allow\``,
-    /// and the next launch dropped the entry with a warning, leaving a config that says a syscall
-    /// was reopened and a kernel that says it was not. Every other broad-typed list here has been
-    /// held to the loader's own parser for exactly this reason; this one had been left out of the
-    /// sentence that says so.
+    /// `[seccomp] allow` is held to the loader's own parser at the write, like every other
+    /// broad-typed list here. Without that, `sbx config add seccomp.allow 'bad!!!'` would answer
+    /// `added \`bad!!!\` to \`seccomp.allow\``, and the next launch would drop the entry with a
+    /// warning, leaving a config that says a syscall was reopened and a kernel that says it was
+    /// not.
     #[test]
     fn a_seccomp_allowance_the_launch_would_drop_is_refused_at_the_write() {
         let tmp = crate::testutil::TmpDir::new();
@@ -3159,11 +3162,11 @@ mod tests {
         }
     }
 
-    /// A value the resolver reads out of a fixed set was written whatever it was. `sbx config set
-    /// network.mode bogus` answered `set`, and the next launch refused to start over it; a
-    /// misspelled `notify` mode or `home_scope` was dropped with a warning and the layer below
-    /// applied, so `home_scope = "projet"` left the app's home shared between projects. Each is
-    /// held at the write to the resolver's own reading of it, as the lists above are.
+    /// A value the resolver reads out of a fixed set is held at the write to the resolver's own
+    /// reading of it, as the lists above are. Written whatever it was, `sbx config set network.mode
+    /// bogus` would answer `set` and the next launch would refuse to start over it, and a
+    /// misspelled `notify` mode or `home_scope` would be dropped with a warning and the layer below
+    /// applied, so `home_scope = "projet"` would leave the app's home shared between projects.
     #[test]
     fn a_value_outside_the_set_the_resolver_reads_is_refused_at_the_write() {
         let tmp = crate::testutil::TmpDir::new();
@@ -3232,9 +3235,9 @@ mod tests {
 
     #[test]
     fn setting_a_list_reports_created_only_when_the_key_was_absent() {
-        // The bool `set` returns is what `sbx config set` turns into "set" vs "updated". The array
-        // path used to answer `true` unconditionally, so replacing an existing list read as if the
-        // key had just been created — the one word that tells the user whether they overwrote
+        // The bool `set` returns is what `sbx config set` turns into "set" vs "updated". An array
+        // path answering `true` unconditionally would make replacing an existing list read as if
+        // the key had just been created — the one word that tells the user whether they overwrote
         // something.
         let tmp = crate::testutil::TmpDir::new();
         let fresh = doc_at(tmp.path(), "[fs]\n");
@@ -3447,14 +3450,14 @@ mod tests {
         );
     }
 
-    /// `[fs]` is the second field whose schema type is too broad to catch a bad value, and
-    /// `validate_layer` claimed to check "every such field" while checking only `forward`.
+    /// `[fs]` is a field whose schema type is too broad to catch a bad value, so `validate_layer`
+    /// checks it against the resolver.
     ///
-    /// Every entry below parses as a string, is committed, and is then dropped by `apply_fs` at the
+    /// Every entry below parses as a string and, committed, would be dropped by `apply_fs` at the
     /// next load with a warning on stderr that nobody reads back — so `sbx config add fs.deny
-    /// /etc/shadow` reported a success over a mask that never closed anything, and `scan_max_kb =
-    /// 0` reported one over a scanner that reads nothing and passes every file while `sbx config
-    /// show` goes on listing the shapes.
+    /// /etc/shadow` would report a success over a mask that never closes anything, and `scan_max_kb
+    /// = 0` one over a scanner that reads nothing and passes every file while `sbx config show`
+    /// goes on listing the shapes.
     #[test]
     fn an_fs_entry_the_resolver_would_drop_is_refused_before_it_commits() {
         let tmp = crate::testutil::TmpDir::new();
@@ -3622,10 +3625,10 @@ mod tests {
 
     #[test]
     fn a_quoted_key_segment_keeps_its_dots() {
-        // Every secret is keyed by host, so every secret key contains dots — and splitting on all of
-        // them walked straight through the quotes and built `secret.'"api'.example.'com"'`, a
-        // nonsense table the schema accepted, so the write was *reported as a success*. A silent
-        // wrong write on a credential is the worst shape a bug can take here.
+        // Every secret is keyed by host, so every secret key contains dots — and splitting on all
+        // of them would walk straight through the quotes and build `secret.'"api'.example.'com"'`,
+        // a nonsense table the schema accepts, so the write would be *reported as a success*. A
+        // silent wrong write on a credential is the worst shape a bug can take here.
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".sbx.toml");
         assert!(set(&p, r#"secret."api.example.com".from"#, "env://K").is_ok());
@@ -3769,14 +3772,14 @@ mod tests {
         assert_eq!(get(&p, "env.BAZ").unwrap().as_deref(), Some("qux"));
     }
 
-    /// `validate_layer`'s doc names "a `set`/`unset` that leaves the layer unparseable" as the thing
-    /// it exists to prevent — because the loader drops the WHOLE layer with only a warning, silently
-    /// reverting every security field it carried. `set`, `add` and `remove` asked; `unset` did not,
-    /// and a removal invalidates a layer as readily as a bad value does: a table whose required
-    /// field is taken away stops parsing, and takes the document with it.
+    /// `validate_layer`'s doc names "a `set`/`unset` that leaves the layer unparseable" as the
+    /// thing it exists to prevent — because the loader drops the WHOLE layer with only a warning,
+    /// silently reverting every security field it carried. `unset` asks as `set`, `add` and
+    /// `remove` do, since a removal invalidates a layer as readily as a bad value does: a table
+    /// whose required field is taken away stops parsing, and takes the document with it.
     ///
-    /// The CLI reported such a write as a success and exited 0, so the revert was invisible on both
-    /// sides.
+    /// Unasked, the CLI would report such a write as a success and exit 0, so the revert would be
+    /// invisible on both sides.
     #[test]
     fn unset_refuses_a_removal_that_would_make_the_loader_drop_the_layer() {
         let tmp = crate::testutil::TmpDir::new();
@@ -3805,11 +3808,11 @@ mod tests {
         assert_eq!(get(&p, "network").unwrap().as_deref(), Some("deny"));
     }
 
-    /// The gate has to ask the question the loader asks. It used to parse the edited document with
-    /// the all-or-nothing `schema::parse` while every loader path reads a layer through the
-    /// recovering `schema::parse_layer`, so a file already carrying one mistyped value loaded fine —
-    /// that key dropped with a warning, the rest applied — and yet refused every write verb, naming
-    /// whichever key had just been typed instead of the one at fault.
+    /// The gate has to ask the question the loader asks. Parsing the edited document with the
+    /// all-or-nothing `schema::parse` while every loader path reads a layer through the recovering
+    /// `schema::parse_layer` would leave a file already carrying one mistyped value loading fine —
+    /// that key dropped with a warning, the rest applied — and yet refusing every write verb,
+    /// naming whichever key had just been typed instead of the one at fault.
     #[test]
     fn a_write_is_judged_the_way_the_loader_reads_the_layer() {
         let tmp = crate::testutil::TmpDir::new();
@@ -4073,7 +4076,8 @@ mod tests {
             "and it does not send the reader to write that very table: {text}"
         );
         // The remedy has to be a command that works. `--global` on this verb amends the app's own
-        // profile, measured; pointing at an editor instead left the reader to find that themselves.
+        // profile, measured; pointing at an editor instead would leave the reader to find that
+        // themselves.
         assert!(
             text.contains("--global"),
             "it names the command that writes where the posture lives: {text}"
@@ -4309,9 +4313,9 @@ mod tests {
     /// The fifth group `validate_layer` checks, and the last of the fields whose schema type is
     /// broad enough to hold what the resolver drops: a device outside `/dev/`, an ssh grant spelled
     /// as a wildcard or a truncated fingerprint, an `http2` entry naming no host or no port a port
-    /// number can hold. Each parsed, committed and was reported as added, and the next launch
-    /// dropped it with a warning on stderr — a device the cage never got, a key it could never sign
-    /// with, a host that stayed on HTTP/1.1.
+    /// number can hold. Unchecked, each would parse, commit and be reported as added, and the next
+    /// launch would drop it with a warning on stderr — a device the cage never gets, a key it can
+    /// never sign with, a host that stays on HTTP/1.1.
     #[test]
     fn a_device_ssh_or_http2_entry_the_resolver_would_drop_is_refused_before_it_commits() {
         let tmp = crate::testutil::TmpDir::new();
@@ -4356,10 +4360,10 @@ mod tests {
         );
     }
 
-    /// `sbx fs deny|readonly` writes the same list `sbx config add fs.deny` does, and reached it
-    /// without the gate: the mask was committed, reported as added and (for a project file)
-    /// re-trusted, and `apply_fs` dropped it at the next load — the user was told a path was closed
-    /// that stayed open to the cage.
+    /// `sbx fs deny|readonly` writes the same list `sbx config add fs.deny` does, and goes through
+    /// the same gate. Without it, the mask would be committed, reported as added and (for a project
+    /// file) re-trusted, and `apply_fs` would drop it at the next load — the user told a path is
+    /// closed that stays open to the cage.
     #[test]
     fn add_fs_mask_refuses_an_entry_the_resolver_would_drop() {
         let tmp = crate::testutil::TmpDir::new();
@@ -4667,9 +4671,9 @@ mod tests {
         );
     }
 
-    /// The single-line shape is the one `add` was originally written for, and it must not change:
-    /// `toml_edit` renders an element whose decor is unset with its own `, ` separator, so the
-    /// list a `sbx config add` builds from nothing still reads `["a", "b"]`.
+    /// The single-line shape is the one `add` builds from nothing, and it must not change:
+    /// `toml_edit` renders an element whose decor is unset with its own `, ` separator, so that
+    /// list reads `["a", "b"]`.
     #[test]
     fn a_single_line_list_keeps_its_shape_when_an_entry_is_appended_or_taken_out() {
         let tmp = crate::testutil::TmpDir::new();
@@ -4705,11 +4709,11 @@ mod tests {
         );
     }
 
-    /// `set` must name the *parent* that blocks the descent, as `rm` already does. On
-    /// `network = "deny"`, `sbx config set network.stats false` answered "network.stats is not a
-    /// single value (it is an array or table)" — about a key that is not in the file, and is
-    /// neither of those things — while `sbx config rm network.allow x` on the same file correctly
-    /// said the posture is in its bare form. The remedy only helps if it names the obstacle.
+    /// `set` must name the *parent* that blocks the descent, as `rm` does. On `network = "deny"`,
+    /// `sbx config set network.stats false` must not answer "network.stats is not a single value
+    /// (it is an array or table)" — about a key that is not in the file, and is neither of those
+    /// things — when `sbx config rm network.allow x` on the same file says the posture is in its
+    /// bare form. The remedy only helps if it names the obstacle.
     #[test]
     fn set_names_the_parent_that_holds_a_single_value_as_rm_already_does() {
         let tmp = crate::testutil::TmpDir::new();
@@ -4729,8 +4733,9 @@ mod tests {
 
     /// A literal-quoted key segment is the other spelling TOML gives a key that carries a dot, and
     /// it must address the same table the basic-quoted one does. Splitting on every dot inside it
-    /// built `secret."'api".example."com'"` — a table the schema accepts, so the write was reported
-    /// as a success while the credential the user named stayed undeclared and was never injected.
+    /// would build `secret."'api".example."com'"` — a table the schema accepts, so the write would
+    /// be reported as a success while the credential the user named stays undeclared and is never
+    /// injected.
     #[test]
     fn a_literal_quoted_key_segment_keeps_its_dots_like_a_basic_quoted_one() {
         let tmp = crate::testutil::TmpDir::new();
