@@ -1826,6 +1826,43 @@ fn sbx_app_list_and_prune_fail_over_an_unreadable_projects_directory() {
     }
 }
 
+/// The verbs that name one app look for its homes under `apps/` and `projects/` too: a directory
+/// of them that cannot be read stops `app prune <name>` and `app show <name>`, rather than sweep or
+/// show part of the app as all of it, as `--all` already does.
+#[test]
+fn sbx_app_named_verbs_fail_over_an_unreadable_home_directory() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fx = Project::new("app");
+    let sbx_dir = fx.data_home.path().join("sbx");
+    touch_under(&sbx_dir.join("apps/claude/home/state"));
+    touch_under(&sbx_dir.join("projects/testproj/apps/claude/home/state"));
+    for hidden in ["projects", "apps"] {
+        let dir = sbx_dir.join(hidden);
+        let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m));
+        mode(0o000).unwrap();
+        if std::fs::read_dir(&dir).is_ok() {
+            mode(0o700).unwrap();
+            skip_incapable!("running as root, which reads a directory its mode refuses");
+            return;
+        }
+        let shapes = [
+            &["app", "prune", "claude"][..],
+            &["app", "show", "claude"][..],
+        ];
+        let outs: Vec<_> = shapes.iter().map(|args| fx.run(args)).collect();
+        mode(0o700).unwrap();
+
+        for (args, out) in shapes.iter().zip(&outs) {
+            assert!(
+                out.status.code() == Some(1)
+                    && String::from_utf8_lossy(&out.stderr).contains("cannot read"),
+                "{args:?} read an unreadable {hidden}/ as holding no home: {}",
+                text(out)
+            );
+        }
+    }
+}
+
 #[test]
 fn sbx_app_rm_purges_several_apps_in_one_call() {
     let fx = Project::new("app");
