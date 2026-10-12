@@ -1452,10 +1452,20 @@ fn app_list(json: bool, shared: bool) -> ExitCode {
         }
     }
 
-    // Installed homes under the data dir (an app can have one with no profile).
-    let installed = store::Layout::from_env()
-        .map(|l| sandbox::installed_app_homes(l.data_dir()))
-        .unwrap_or_default();
+    // Installed homes under the data dir (an app can have one with no profile). A directory of them
+    // that cannot be read fails the listing: the homes in it hold login state, and a list without
+    // them says the app has none.
+    let installed =
+        match store::Layout::from_env().map(|l| sandbox::installed_app_homes(l.data_dir())) {
+            Some(Ok(installed)) => installed,
+            Some(Err(e)) => {
+                diag::error(&format!(
+                    "sbx: app list: {e}, so the installed app homes cannot be listed"
+                ));
+                return ExitCode::FAILURE;
+            }
+            None => Vec::new(),
+        };
     let homes: BTreeMap<&str, &sandbox::InstalledApp> =
         installed.iter().map(|a| (a.name.as_str(), a)).collect();
 
@@ -2385,10 +2395,17 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         Some(n) => vec![n.clone()],
         // Only apps with an installed home: an app is nothing to prune until it has one, and a
         // profile with no home would report an empty sweep for every app the user ever imported.
-        None => sandbox::installed_app_homes(layout.data_dir())
-            .into_iter()
-            .map(|a| a.name)
-            .collect(),
+        // A directory of homes that cannot be read hides the apps in it, and a sweep of the others
+        // would read as a sweep of all of them.
+        None => match sandbox::installed_app_homes(layout.data_dir()) {
+            Ok(installed) => installed.into_iter().map(|a| a.name).collect(),
+            Err(e) => {
+                diag::error(&format!(
+                    "sbx: app prune: {e}, so the apps with an installed home cannot be listed"
+                ));
+                return ExitCode::FAILURE;
+            }
+        },
     };
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());

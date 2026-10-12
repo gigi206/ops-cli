@@ -1012,13 +1012,25 @@ fn pool_holds_a_tool(pool: &Path) -> bool {
 /// as disk a purge would reclaim.
 ///
 /// [`app_home_dirs`]: super::inspect::app_home_dirs
-pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
+///
+/// A data directory with no `apps/` or no `projects/` yet holds no home there. One that cannot be
+/// read is an error, which names it: the homes in it are installed too, and a list without them
+/// would say an app has nothing on disk while its login state is still there.
+pub(crate) fn installed_app_homes(data_dir: &Path) -> io::Result<Vec<InstalledApp>> {
     use std::collections::BTreeMap;
     // name -> (global_bytes, project_homes, project_pools, project_bytes)
     let mut apps: BTreeMap<String, (Option<u64>, usize, usize, u64)> = BTreeMap::new();
+    let listed = |dir: PathBuf| match std::fs::read_dir(&dir) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("cannot read {}: {e}", dir.display()),
+        )),
+    };
 
     // Global homes: <data>/apps/<name>/, when it actually carries one.
-    if let Ok(entries) = std::fs::read_dir(data_dir.join("apps")) {
+    if let Some(entries) = listed(data_dir.join("apps"))? {
         for entry in entries.flatten() {
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
@@ -1035,7 +1047,7 @@ pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
 
     // Per-project trees: <data>/projects/<id>/apps/<name>/ — a home only when it carries `home/`,
     // otherwise the global app's mise pool for that project.
-    if let Ok(projects) = std::fs::read_dir(data_dir.join("projects")) {
+    if let Some(projects) = listed(data_dir.join("projects"))? {
         for project in projects.flatten() {
             if !project.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
@@ -1062,7 +1074,8 @@ pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
         }
     }
 
-    apps.into_iter()
+    Ok(apps
+        .into_iter()
         .map(
             |(name, (global_bytes, project_homes, project_pools, project_bytes))| InstalledApp {
                 name,
@@ -1072,7 +1085,7 @@ pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
                 project_bytes,
             },
         )
-        .collect()
+        .collect())
 }
 
 /// `candidate`'s real path, or `None` when it does not exist or resolves outside `root`.
@@ -4859,7 +4872,7 @@ mod tests {
         // scratch: a single per-project home, no global one
         mk_home(&d.join("projects/p1/apps/scratch/home"));
 
-        let apps = installed_app_homes(d);
+        let apps = installed_app_homes(d).expect("read the fixture's homes");
         let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["demo-app", "demo-tool", "scratch"]); // sorted
 
@@ -4893,7 +4906,7 @@ mod tests {
         mk_home(&d.join("projects/p2/apps/demo-app/home"));
         mk_home(&d.join("projects/p2/apps/demo-app/mise"));
 
-        let apps = installed_app_homes(d);
+        let apps = installed_app_homes(d).expect("read the fixture's homes");
         assert_eq!(apps.len(), 1);
         let demo_app = &apps[0];
         assert_eq!(demo_app.project_homes, 1);
@@ -4919,7 +4932,7 @@ mod tests {
         // An app that does carry a home is listed, so this is not "the listing went blind".
         mk_home(&d.join("apps/demo-app/home"));
 
-        let apps = installed_app_homes(d);
+        let apps = installed_app_homes(d).expect("read the fixture's homes");
         assert_eq!(
             apps.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
             vec!["demo-app"]
@@ -4941,7 +4954,7 @@ mod tests {
         mk_home(&d.join("projects/p2/apps/demo-app/mise"));
         std::fs::create_dir_all(d.join("projects/p2/apps/demo-app/mise/installs")).unwrap();
 
-        let apps = installed_app_homes(d);
+        let apps = installed_app_homes(d).expect("read the fixture's homes");
         assert_eq!(apps.len(), 1);
         let demo_app = &apps[0];
         assert_eq!(demo_app.project_homes, 0);
@@ -4953,7 +4966,11 @@ mod tests {
     #[test]
     fn installed_app_homes_is_empty_without_a_data_tree() {
         let data = TmpDir::new();
-        assert!(installed_app_homes(data.path()).is_empty());
+        assert!(
+            installed_app_homes(data.path())
+                .expect("read the fixture's homes")
+                .is_empty()
+        );
     }
     /// A tree keyed by a digest, with a marker for each holder.
     fn distro_tree(data: &Path, digest: &str, holders: &[&str]) -> PathBuf {
