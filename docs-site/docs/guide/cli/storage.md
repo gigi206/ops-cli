@@ -21,8 +21,9 @@ above for it: a flag belonging to another verb is refused with a usage error rat
 accepted and ignored, so `sbx storage use --size 50G` says the size is not read there
 instead of exiting 0 having thrown it away.
 
-Optional. Without it sbx behaves exactly as it always has: see
-[Directory layout](../concepts/directory-layout).
+Adopted by default on a fresh install that can mount it (see
+[Adopted on first launch](#adopted-on-first-launch)); everywhere else sbx keeps its data in a plain
+directory: see [Directory layout](../concepts/directory-layout).
 
 See also: [`sbx store`](store) · [`sbx gc`](gc) · [`SBX_DATA_DIR`](../reference/environment-variables#sbx_data_dir).
 
@@ -58,7 +59,8 @@ The whole chain runs **without root**, for two reasons:
 
 That second point is the boundary. In a **remote (SSH), headless, CI or inactive** session,
 the same policy requires administrator authentication, so the mount cannot happen unattended.
-This is why the feature is opt-in and never a prerequisite.
+This is why a volume is never a prerequisite: sbx adopts one by itself only from a terminal on a
+host that can mount it, and keeps a plain directory everywhere else.
 
 The one requirement is **`udisks2`**, and it is unavoidable: it is a system daemon, and the
 privilege lives with it rather than with any binary sbx could ship.
@@ -82,31 +84,38 @@ already redundant (the data is on a copy-on-write filesystem such as btrfs or ZF
 (and why). And `up`/`use` **fail early with a single message** naming every missing
 prerequisite, rather than surfacing the first obstacle deep in the mount.
 
-## A one-time suggestion on first launch
+## Adopted on first launch
 
-On the **first interactive launch** (`sbx run`, `sbx app run …`) of an eligible host, sbx offers
-to adopt a volume, **once**. It is shown only when connected to a **terminal**, so an agent, a
-pipe or CI never meets it; sbx has no other blocking prompt, and the autonomous-agent path keeps
-none. Whatever you answer, it is recorded and never shown again: [`sbx doctor`](doctor)
-remains the standing reminder.
+On the **first interactive launch** (`sbx run`, `sbx app run …`) of an eligible host, a fresh
+install adopts a volume **by default**, without asking, and keeps the plain directory only when the
+volume cannot be set up. It happens **once**, recorded so it never runs again, not at all once
+`init`, `use`, `unuse` or `migrate` has settled where the data lives, and only when connected to a
+**terminal**: an agent, a pipe, CI, a cron job or a service unit never has its
+storage decided for it, and the autonomous-agent path meets no prompt at all.
+[`sbx doctor`](doctor) remains the standing reminder for a data directory that kept the plain
+layout.
 
-What it offers depends on what is already there:
+What happens depends on what is already there:
 
-- **A fresh install (empty data directory)**: a yes/no question. *Yes* creates and mounts a
-  volume on the spot (instant, nothing to copy) and uses it from that launch on. *No* keeps the
-  plain directory. The directory is checked again after you answer, so a launch from another
-  terminal that filled it in the meantime makes *yes* stop short of adopting.
-- **An existing data directory**, a single, non-blocking line pointing at `sbx storage migrate`,
+- **A fresh install (empty data directory)**: sbx creates and mounts a volume on the spot (there is
+  nothing to copy) and uses it from that launch on. It says where the volume is mounted, that after
+  a reboot the first sbx command has to come from your desktop session (see
+  [Mounting is automatic](#mounting-is-automatic)), and that `sbx storage unuse` goes back to a
+  plain directory, whose store is then downloaded again. When the volume cannot be set up, sbx says
+  why, removes the image it had just created, and carries on with the plain directory. The
+  directory is checked again right before the volume is recorded, so a launch from another terminal
+  that filled it in the meantime makes sbx stop short of adopting.
+- **An existing data directory**: a single, non-blocking line pointing at `sbx storage migrate`,
   never an inline copy: migrating is slow and can fail its own checks, and it should not hijack
   the command you actually ran.
 
-The offer appears only where a volume is genuinely worth it: a mountable host (btrfs, loop devices
-and udisks2 present), a **local active session**, and a filesystem that does not already give sbx
-what a volume would. A volume brings two things: it **shares blocks** between files, so seeding a
+A volume is adopted only where it is genuinely worth it: a mountable host (btrfs, loop devices
+and udisks2 present), a **local session**, and a filesystem that does not already give sbx what a
+volume would. A volume brings two things: it **shares blocks** between files, so seeding a
 per-project store from the shared one costs almost nothing, and it **compresses**: so the question
 is whether either is missing:
 
-| Data directory on | shares blocks | compresses | offered? |
+| Data directory on | shares blocks | compresses | adopted? |
 |---|---|---|---|
 | btrfs, ZFS, bcachefs | yes | yes | no, and nesting one copy-on-write filesystem in another only compounds fragmentation |
 | XFS | yes (`reflink=1`) | no | yes, for the compression |
@@ -115,9 +124,9 @@ is whether either is missing:
 | anything else | measured | unknown | only if it turns out not to share blocks |
 
 For a filesystem sbx does not recognize there is no table to consult, so it **measures** block
-sharing by attempting one in the data directory, and offers a volume only on a definite "cannot",
+sharing by attempting one in the data directory, and adopts a volume only on a definite "cannot",
 rather than guessing about compression. Set
-[`SBX_DATA_DIR`](../reference/environment-variables#sbx_data_dir) and the offer is skipped
+[`SBX_DATA_DIR`](../reference/environment-variables#sbx_data_dir) and this step is skipped
 entirely: that is the invoker's explicit choice.
 
 ## Adopting a volume
@@ -239,7 +248,7 @@ $ sbx storage init --metadata-dup
 
 `init` always names the profile it uses on the `mkfs.btrfs` command line, so the result is the same
 whichever `btrfs-progs` performs the format. The volume sbx creates by itself on
-[first launch](#a-one-time-suggestion-on-first-launch) takes the default, `single`.
+[first launch](#adopted-on-first-launch) takes the default, `single`.
 
 Like the size, the profile is settled **at `init`**. Converting an existing volume is a
 `btrfs balance`, which requires root, and which sbx never runs for you:
@@ -261,7 +270,10 @@ return the way any freed space does: see [Releasing it](#releasing-it).
 ## Mounting is automatic
 
 `udisks` mounts under `/run`, which is cleared on reboot: so a volume is unmounted every time
-you log in. sbx mounts it on demand, so this is invisible.
+you log in. sbx mounts it on demand, so from your desktop session this is invisible. That is also
+where the first sbx command after a reboot has to come from: udisks mounts without a password only
+in a local active session, and from an SSH login, a cron job or a service unit its policy asks for
+administrator authentication instead.
 
 `sbx storage up` exists for the rare case where you want the mount without waiting for the
 next command; it is idempotent. `sbx storage down` unmounts, but while the volume is adopted
@@ -269,7 +281,9 @@ the next sbx command simply mounts it again, and `down` says so.
 
 **If an adopted volume cannot be mounted, sbx stops** rather than carrying on. This is
 deliberate: the mount point exists only while mounted and lives on a tmpfs, so continuing
-would provision gigabytes into RAM and report an empty store as the truth.
+would provision gigabytes into RAM and report an empty store as the truth. The refusal says how
+out: [`sbx doctor`](doctor), or any launch, run from your desktop session mounts the volume, and
+`sbx storage unuse` goes back to the plain directory, leaving the volume's data in it.
 
 The mount point is read back from `udisks` rather than assumed: it varies by version
 (`/run/media` or `/media`) and gains a suffix if the label collides: so always take it from
@@ -439,6 +453,6 @@ For a one-off run somewhere else entirely, bypass the whole mechanism:
 SBX_DATA_DIR=/tmp/sbx-scratch sbx run -- ./build.sh
 ```
 
-That also suppresses the first-launch suggestion: an explicit
+That also skips the first-launch adoption: an explicit
 [`SBX_DATA_DIR`](../reference/environment-variables#sbx_data_dir) is the invoker's own
 choice about where data lives.

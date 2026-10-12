@@ -25,14 +25,16 @@ A project's `.sbx.toml` lives in the project directory itself, not here, and is
 
 ## Data: what sbx provisions and runs
 
-`$SBX_DATA_DIR`, else a volume adopted with [`sbx storage use`](../cli/storage), else
-`$XDG_DATA_HOME/sbx/` (else `$HOME/.local/share/sbx/`). Owner-only.
+`$SBX_DATA_DIR`, else a volume adopted on first launch or with
+[`sbx storage use`](../cli/storage), else `$XDG_DATA_HOME/sbx/` (else `$HOME/.local/share/sbx/`).
+Owner-only.
 
 This is the tree that grows: the store, the per-project runtime trees and the app homes
 all live here. [`sbx store`](../cli/store) reports its size and inode count.
-[`sbx storage`](../cli/storage) moves it whole into a compressed volume that sbx mounts
-by itself; [`SBX_DATA_DIR`](../reference/environment-variables#sbx_data_dir) relocates it
-for a one-off.
+On a fresh install that can mount one, the first interactive launch puts it in a compressed
+volume that sbx mounts by itself, and [`sbx storage`](../cli/storage) moves an existing one there
+whole; [`SBX_DATA_DIR`](../reference/environment-variables#sbx_data_dir) relocates it for a
+one-off.
 
 The important subtrees:
 

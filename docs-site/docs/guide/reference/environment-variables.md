@@ -140,7 +140,7 @@ requires an absolute base), and `sbx` falls back to `$HOME`.
 
 | Variable | Selects | Fallback |
 |---|---|---|
-| `SBX_DATA_DIR` | the data directory itself | a volume adopted with [`sbx storage use`](../cli/storage), else `$XDG_DATA_HOME/sbx` |
+| `SBX_DATA_DIR` | the data directory itself | a volume adopted on first launch or with [`sbx storage use`](../cli/storage), else `$XDG_DATA_HOME/sbx` |
 
 The data directory is the one sbx tree that grows without bound: the shared nix store,
 the per-project runtime trees and the app homes all live there, and it is routinely tens

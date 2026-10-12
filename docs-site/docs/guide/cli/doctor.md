@@ -24,7 +24,7 @@ it finds (`safe.bareRepository`, with the command that makes it refuse one), the
 location and channel revision, and the **storage posture**: whether the data directory lives in an encapsulated
 [volume](storage), or, when it does not, whether one is worth adopting on this host
 (the filesystem it sits on, and whether btrfs, loop devices and udisks2 are present).
-That line is always informational, never a failure: a volume is opt-in. It does flag one
+That line is always informational, never a failure: a volume is never a prerequisite. It does flag one
 thing no volume would fix: a data directory on a **tmpfs**, where nothing survives a
 reboot.
 

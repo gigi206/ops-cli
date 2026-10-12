@@ -2130,10 +2130,13 @@ pub(super) const PAGES: &[Page] = &[
             its root belongs to you, and `udisks` performs the attach and the mount over D-Bus,\n\
             which its shipped policy grants to a locally active session without authentication.\n\
             That bounds where this works — a remote, headless or inactive session falls under a\n\
-            rule requiring administrator authentication and cannot mount unattended. The feature\n\
-            is therefore opt-in, and sbx without a volume behaves exactly as before.\n\
+            rule requiring administrator authentication and cannot mount unattended. A volume is\n\
+            therefore never a prerequisite: the first interactive launch of a fresh install adopts\n\
+            one without asking where it can be mounted, keeps the plain directory when it cannot\n\
+            be set up, and points a data directory that already holds data at `migrate`, once.\n\
+            An agent, a pipe or CI never has its storage decided for it.\n\
             \n\
-            Adopting a volume is one deliberate act — `sbx storage use` — and everything follows\n\
+            Adopting a volume by hand is one act — `sbx storage use` — and everything follows\n\
             from it: sbx records the volume and mounts it whenever it needs it, including after a\n\
             reboot, with no variable to carry and nothing to run by hand. `up` exists for the rare\n\
             time you want the mount without waiting for the next command. `unuse` reverses the\n\
@@ -2160,7 +2163,9 @@ pub(super) const PAGES: &[Page] = &[
             If a volume sbx is set to use cannot be mounted, sbx stops rather than carrying on\n\
             with an empty directory — the mount point exists only while mounted and lives on a\n\
             tmpfs, so continuing would provision into RAM and report an empty store as the truth.\n\
-            `SBX_DATA_DIR` overrides all of this for a one-off.\n\
+            The refusal names the way out: `sbx doctor` run from your desktop session mounts it,\n\
+            and `unuse` goes back to the plain directory. `SBX_DATA_DIR` overrides all of this for\n\
+            a one-off.\n\
             \n\
             The one thing sbx cannot ship is `udisks`: it is a system daemon, and the privilege\n\
             lives with it rather than with any binary. Everything else it provides — if the host\n\
