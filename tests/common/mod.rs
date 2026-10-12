@@ -645,6 +645,8 @@ pub fn walk() -> Vec<Vec<String>> {
 
 /// The walk [`walk`] runs once: from the root, into each path the oracle offers that names a page.
 fn walk_from_root() -> Vec<Vec<String>> {
+    use std::collections::HashMap;
+
     /// Whether a path names a page, and so is command tree rather than a value.
     ///
     /// A leading `help` is stripped before asking, because it is exactly what the page tree does
@@ -656,36 +658,42 @@ fn walk_from_root() -> Vec<Vec<String>> {
     /// shows under its header, or a name `sbx help` refuses as having none: any other answer is a
     /// fault, and fails the test. Read as "not a page", it would take the name's whole subtree out
     /// of the sweeps without a word.
-    fn is_page(path: &[String]) -> bool {
+    ///
+    /// Each question is asked once, and `answered` keeps the answers: a path under `help` asks what
+    /// the same path without it asks, so one half of the tree reads what the other half was told.
+    fn is_page(path: &[String], answered: &mut HashMap<Vec<String>, bool>) -> bool {
         if path.last().is_some_and(|w| w.starts_with('-')) {
             return false;
         }
         let under_help = path.first().is_some_and(|w| w == "help");
-        let probed: Vec<&str> = path
-            .iter()
-            .skip(usize::from(under_help))
-            .map(String::as_str)
-            .collect();
+        let probed = &path[usize::from(under_help)..];
         // `sbx help` itself: a real verb, and the root of the mirror.
         if probed.is_empty() {
             return under_help;
         }
+        if let Some(&page) = answered.get(probed) {
+            return page;
+        }
         let mut argv = vec!["help"];
-        argv.extend(probed.iter().copied());
+        argv.extend(probed.iter().map(String::as_str));
         let out = sbx(&argv);
         let (stdout, stderr) = (stdout_of(&out), String::from_utf8_lossy(&out.stderr));
-        if out.status.success() && stdout.contains(&format!("sbx {} —", probed.join(" "))) {
-            return true;
-        }
-        if out.status.code() == Some(2) && stderr.starts_with("sbx: no help for ") {
-            return false;
-        }
-        panic!(
-            "`sbx {}` neither showed a page nor said there is none ({}):\n{stdout}{stderr}",
-            argv.join(" "),
-            out.status
-        );
+        let page =
+            if out.status.success() && stdout.contains(&format!("sbx {} —", probed.join(" "))) {
+                true
+            } else if out.status.code() == Some(2) && stderr.starts_with("sbx: no help for ") {
+                false
+            } else {
+                panic!(
+                    "`sbx {}` neither showed a page nor said there is none ({}):\n{stdout}{stderr}",
+                    argv.join(" "),
+                    out.status
+                );
+            };
+        answered.insert(probed.to_vec(), page);
+        page
     }
+    let mut answered = HashMap::new();
     let mut found: Vec<Vec<String>> = Vec::new();
     let mut pending: Vec<Vec<String>> = vec![Vec::new()];
     while let Some(path) = pending.pop() {
@@ -695,7 +703,7 @@ fn walk_from_root() -> Vec<Vec<String>> {
         for child in oracle(&path, "") {
             let mut deeper = path.clone();
             deeper.push(child);
-            if !is_page(&deeper) {
+            if !is_page(&deeper, &mut answered) {
                 continue;
             }
             pending.push(deeper.clone());
