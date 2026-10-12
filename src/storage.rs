@@ -108,9 +108,11 @@ pub(crate) const POINTER: &str = "storage.toml";
 /// where sbx's data lives, so reading an unreadable pointer as an absent one provisions a fresh
 /// empty store in the default directory while the adopted volume still holds everything. A parse
 /// that finds no `image` line is `Ok(None)` and not an error — the file may be a leftover comment
-/// block, which is what `sbx storage unuse` is entitled to leave.
+/// block, which is what `sbx storage unuse` is entitled to leave. An `image` line this reader
+/// cannot take back is an `Err` for the same reason as an unreadable file: see [`pointer_value`].
 pub(crate) fn read_pointer(default_data_dir: &Path) -> io::Result<Option<PathBuf>> {
-    let text = match std::fs::read_to_string(default_data_dir.join(POINTER)) {
+    let file = default_data_dir.join(POINTER);
+    let text = match std::fs::read_to_string(&file) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -123,31 +125,69 @@ pub(crate) fn read_pointer(default_data_dir: &Path) -> io::Result<Option<PathBuf
         let Some(value) = rest.trim_start().strip_prefix('=') else {
             continue;
         };
-        let value = value.trim().trim_matches('"');
-        if !value.is_empty() {
-            return Ok(Some(PathBuf::from(value)));
+        if let Some(image) = pointer_value(&file, value.trim())? {
+            return Ok(Some(image));
         }
     }
     Ok(None)
+}
+
+/// The path an `image =` value names, read as the TOML basic string [`write_pointer`] writes — one
+/// that carries no escape, which [`pointer_can_name`] guarantees — optionally followed by a
+/// comment, which TOML allows and a person editing the file may add. `Ok(None)` for an empty value,
+/// which names no image.
+///
+/// Any other shape is an error rather than a path. Taken whole, a comment would come back as part
+/// of the path, and an unclosed or single-quoted value as a path the file does not name in TOML's
+/// reading of it: the file promises to be valid TOML, so sbx and any other reader of it must agree
+/// on where the data lives, and a line this reader cannot take back the way they would is one it
+/// refuses. An escape is refused for the same reason: TOML decodes it and this reader does not.
+fn pointer_value(file: &Path, value: &str) -> io::Result<Option<PathBuf>> {
+    let malformed = |why: &str| {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: the `image` line {why} — write it as `image = \"/path/to/image\"`, or run \
+                 `sbx storage unuse` to stop following a volume",
+                file.display()
+            ),
+        ))
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let Some((path, after)) = value
+        .strip_prefix('"')
+        .and_then(|quoted| quoted.split_once('"'))
+    else {
+        return malformed("is not one double-quoted path");
+    };
+    let after = after.trim_start();
+    if !(after.is_empty() || after.starts_with('#')) {
+        return malformed("carries more than a comment after the quoted path");
+    }
+    if path.contains('\\') {
+        return malformed("carries an escape, which this reader does not decode");
+    }
+    Ok((!path.is_empty()).then(|| PathBuf::from(path)))
 }
 
 /// Whether the pointer file can name `image` — the one rule [`write_pointer`] writes by and the
 /// command that parses `--image` refuses by, so a path that cannot be recorded is rejected before a
 /// volume is mounted rather than after.
 ///
-/// The value goes into the file as a TOML basic string on one line, and [`read_pointer`] takes it
-/// back with `trim`/`trim_matches('"')` and no unescaping at all. Three kinds of character break
-/// that, each in its own way, and none of them loudly:
+/// The value goes into the file as a TOML basic string on one line, and [`read_pointer`] takes back
+/// the text between its first two quotes, with no unescaping at all, refusing a line of any other
+/// shape ([`pointer_value`]). Three kinds of character break that round trip:
 ///
-/// - a **line break** ends the line, so what comes back is the *prefix* before it and sbx follows a
-///   path that is not the one recorded. The reader keeps the first `image` line it can read, so a
-///   second one written past the break is dead — except where the break is the value's first
-///   character, which leaves that first line empty and hands the reader the injected one instead;
-/// - a **quote** is eaten by `trim_matches`, which strips every one it finds at either end, so a
-///   path that begins or ends with one comes back short;
+/// - a **line break** ends the line before its closing quote, so the pointer reads as an error and
+///   every launch refuses to follow the volume adopted a moment before;
+/// - a **quote** closes the value early. What follows it is an error too, except where it goes on
+///   with a `#`, which reads as a comment and hands back the path cut short, in silence;
 /// - a **backslash**, and any other control character, leaves the file no longer valid TOML, which
-///   the file promises to be for anything that reads it as such. This hand parser would return the
-///   backslash unharmed; the promise is what it breaks.
+///   the file promises to be for anything that reads it as such. The reader refuses a backslash, an
+///   escape it does not decode; a control character it returns unharmed, and the promise is what
+///   that breaks.
 ///
 /// A fourth is not a character at all. A Linux path is bytes, and one that is not valid UTF-8 is a
 /// path like any other, which `--image` takes from argv unchanged; but the file is text, written
@@ -2541,20 +2581,22 @@ this line has no separator at all
 
     /// The pointer names the data directory of the whole installation, and it is read back with no
     /// unescaping at all — so a path the one line cannot carry is refused when it is given, not
-    /// written and misread later. Each refused character is shown here alongside what it would have
-    /// cost, since none of them fails loudly on their own.
+    /// written and misread, or found unreadable, later. Each refused character is shown here
+    /// alongside what it would have cost, since none of them fails at the moment it is given.
     #[test]
     fn a_path_the_pointer_cannot_carry_is_refused_rather_than_misread() {
         let base = crate::testutil::TmpDir::new();
         let dir = base.path().join("sbx");
 
         for bad in [
-            // A line break: what comes back is the prefix before it, so sbx would follow
-            // `/vol/a.btrfs` — a volume nobody adopted.
+            // A line break ends the line before its closing quote: the pointer would read as an
+            // error, and every launch would refuse the volume just adopted.
             "/vol/a.btrfs\nimage = \"/vol/elsewhere.btrfs\"",
-            // A quote at either end is eaten by `trim_matches`, so the path comes back short.
+            // A quote closes the value early. What follows it reads as an error...
             "/vol/a.btrfs\"",
             "\"/vol/a.btrfs",
+            // ...or, going on with `#`, as a comment, handing back `/vol/a` in silence.
+            "/vol/a\" #b.btrfs",
             // A backslash leaves the file no longer valid TOML, which it promises to be.
             "/vol/a\\b.btrfs",
             // Any other control character, for the same reason.
@@ -2812,10 +2854,62 @@ this line has no separator at all
         let base = crate::testutil::TmpDir::new();
         let dir = base.path().join("sbx");
         std::fs::create_dir_all(&dir).unwrap();
-        for junk in ["", "# only a comment\n", "image =\n", "nothing here\n"] {
+        for junk in [
+            "",
+            "# only a comment\n",
+            "image =\n",
+            "image = \"\"\n",
+            "nothing here\n",
+        ] {
             std::fs::write(dir.join(POINTER), junk).unwrap();
             assert_eq!(read_pointer(&dir).unwrap(), None, "{junk:?}");
         }
+    }
+
+    /// The pointer promises to be valid TOML for anything that reads it as such, so a person
+    /// editing it by hand may write what TOML allows. A comment after the value is TOML, and is
+    /// read past. Any other shape around the quoted path is not one [`write_pointer`] writes, and
+    /// is an error rather than a path: taken whole, `image = "/vol/a.btrfs" # moved` would name
+    /// `/vol/a.btrfs" # moved`, which nobody adopted, and every TOML reader would disagree with
+    /// sbx about where its data lives.
+    #[test]
+    fn a_hand_edited_pointer_is_read_as_toml_or_refused() {
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("sbx");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Every shape is tried before anything is asserted, so a failure names all of them.
+        let mut wrong = Vec::new();
+        for (line, want) in [
+            (
+                "image = \"/vol/a.btrfs\" # moved here\n",
+                Some("/vol/a.btrfs"),
+            ),
+            ("image = \"/vol/a.btrfs\"#moved\n", Some("/vol/a.btrfs")),
+            // More than a comment after the closing quote.
+            ("image = \"/vol/a.btrfs\" junk\n", None),
+            // No closing quote.
+            ("image = \"/vol/a.btrfs\n", None),
+            // Not quoted at all, or quoted as a TOML literal string: neither is what is written.
+            ("image = /vol/a.btrfs\n", None),
+            ("image = '/vol/a.btrfs'\n", None),
+            // An escape, which TOML decodes (`\t` is a tab) and this reader does not.
+            ("image = \"/vol/a\\tb.btrfs\"\n", None),
+        ] {
+            std::fs::write(dir.join(POINTER), line).unwrap();
+            let read = read_pointer(&dir);
+            let as_wanted = match want {
+                Some(path) => {
+                    read.as_ref().ok().and_then(|p| p.as_deref()) == Some(Path::new(path))
+                }
+                None => read
+                    .as_ref()
+                    .is_err_and(|e| e.kind() == io::ErrorKind::InvalidData),
+            };
+            if !as_wanted {
+                wrong.push(format!("{line:?} read as {read:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// Build a tree with the two shapes a nix store actually has: files deduplicated into
