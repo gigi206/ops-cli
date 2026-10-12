@@ -587,14 +587,21 @@ pub fn shell_prompt_seen(out: &[u8]) -> bool {
 /// A process's start-time ticks — field 22 of `/proc/<pid>/stat`.
 ///
 /// This is what pairs with a pid to name one *incarnation* of a process across pid reuse, so it is
-/// what a fabricated session record has to carry for sbx to accept the record as live. Seven
-/// suites fabricate such records; they read the field through here.
+/// what a fabricated session record has to carry for sbx to accept the record as live, and what
+/// [`write_session_record`] reads.
 ///
 /// Field 2 (`comm`) is the process name in parentheses and may itself contain spaces and `)`, so
 /// splitting the whole line on whitespace is wrong. Everything after the *final* `)` is clean, and
 /// field 3 (state) is the first token there — which puts field 22 twentieth.
+///
+/// A failure is located at the line that called this. A `match` rather than `unwrap_or_else`
+/// because `#[track_caller]` does not reach into a closure.
+#[track_caller]
 pub fn start_ticks(pid: u32) -> u64 {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read /proc stat");
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(e) => panic!("cannot read /proc/{pid}/stat: {e}"),
+    };
     let after = &stat[stat.rfind(')').expect("a stat line carries a comm field") + 1..];
     after
         .split_whitespace()
@@ -602,6 +609,43 @@ pub fn start_ticks(pid: u32) -> u64 {
         .expect("a stat line carries field 22")
         .parse()
         .expect("start ticks are a number")
+}
+
+/// Register a session of `pid` in the registry under `data`, an `XDG_DATA_HOME`: the record a
+/// launch writes, its `runtime` as written there (`project`, `global-app:<name>`) and `project`'s
+/// raw bytes hex-encoded, so a path that is not UTF-8 or carries a newline reads back as itself.
+/// A fabricated record keeps what a test is about apart from the registration machinery, which is
+/// exercised elsewhere.
+///
+/// sbx accepts the record as live while `pid` is still the process whose start ticks it carries,
+/// so `pid` is one the test keeps running: its own, or a child it holds. `detached` is left out,
+/// which the registry reads as a session in the foreground.
+///
+/// A failure is located at the line that called this.
+#[track_caller]
+pub fn write_session_record(
+    data: &std::path::Path,
+    pid: u32,
+    runtime: &str,
+    project: &std::path::Path,
+) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let start = start_ticks(pid);
+    let dir = data.join("sbx").join("sessions");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        panic!("cannot create the session registry {}: {e}", dir.display());
+    }
+    let hex: String = project
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let record = dir.join(format!("{pid}-{start}"));
+    let text = format!("kind=run\npid={pid}\nstart={start}\nruntime={runtime}\nproject={hex}\n");
+    if let Err(e) = std::fs::write(&record, text) {
+        panic!("cannot write the session record {}: {e}", record.display());
+    }
 }
 
 /// The candidate names the completion oracle offers after `path`, for the given cursor word.
