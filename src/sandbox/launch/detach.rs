@@ -255,23 +255,40 @@ fn detach_parent(
         ));
         ExitCode::SUCCESS
     } else {
-        // The daemon closed the pipe without signalling success: it failed before launch (the
-        // error is already on this terminal). Reap it.
+        // The daemon closed the pipe without signalling success: it failed before launch. Reap it,
+        // and keep how it ended, which says where the cause is ([`failed_start`]).
         //
         // Retried on `EINTR`, in the form `pty::supervise` uses: a signal arriving while this waits
         // — a `SIGWINCH` from a resized terminal is enough — returns without reaping, and the
         // daemon then stays a zombie for as long as this shell lives. The child has already exited,
         // so the loop turns at most once more.
-        loop {
-            // SAFETY: `waitpid` on our own child, which nothing else in this process reaps.
-            let r = unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        let mut status: libc::c_int = 0;
+        let reaped = loop {
+            // SAFETY: `waitpid` on our own child, which nothing else in this process reaps, into a
+            // status word this frame owns.
+            let r = unsafe { libc::waitpid(child, &mut status, 0) };
             if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            break;
-        }
-        crate::diag::error("sbx: the detached session failed to start (see the error above).");
+            break r == child;
+        };
+        crate::diag::error(&failed_start(reaped.then_some(status)));
         ExitCode::FAILURE
+    }
+}
+
+/// What the parent says of a daemon that closed the readiness pipe without the ready byte, given the
+/// wait status it was reaped with (`None` when it could not be reaped).
+///
+/// A daemon that failed on its own printed the cause to this terminal before closing the pipe. One a
+/// signal ended printed nothing, and the signal is then the only cause there is to report.
+fn failed_start(status: Option<libc::c_int>) -> String {
+    match status {
+        Some(status) if libc::WIFSIGNALED(status) => format!(
+            "sbx: the detached session was killed by signal {} before it was ready.",
+            libc::WTERMSIG(status)
+        ),
+        _ => "sbx: the detached session failed to start (see the error above).".to_string(),
     }
 }
 
