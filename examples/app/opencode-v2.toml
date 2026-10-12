@@ -35,7 +35,43 @@
 # allowlist host, the [secret] block and the env var (e.g. OpenAI: allow "api.openai.com",
 # header "Authorization", type "bearer", env OPENAI_API_KEY). If a request is blocked, the
 # proxy reports the host it refused — add it to `allow` (or check with `sbx test net <url>`).
-cmd = "opencode"
+# The command hands opencode the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as its global instructions file,
+# `~/.config/opencode/AGENTS.md`, which v2 loads beside the `AGENTS.md` files from the project root
+# down to the working directory. That file is yours to keep, so the command writes it only while
+# you have none: a copy marked as sbx's, rewritten at every launch and removed by a launch without
+# a summary. Once you write your own there, it is left untouched and the summary is no longer
+# added. The file lives in the app's isolated home, which only this app's cages read.
+# `XDG_CONFIG_HOME` moves it and `OPENCODE_CONFIG_DIR` replaces its directory; the command follows
+# both, but only while the path they give stays under that home: a variable pointed at a host
+# path (such as a bind below) leaves the file there alone, and the summary is not added, rather
+# than written where your host opencode would read it. No option is used: `AGENTS.md` is the only
+# instruction file v2 reads, and its config accepts an `instructions` list but loads no file named
+# there, so an `OPENCODE_CONFIG_CONTENT` layer would never reach the model. Arguments after
+# `sbx app run opencode-v2 --` reach opencode verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+f="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}/AGENTS.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+case "$f" in
+  "$HOME"/*)
+    if [ -r "$s" ]; then
+      if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+        mkdir -p "${f%/*}" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+      fi
+    elif grep -qsF "$m" "$f"; then
+      rm -f "$f"
+    fi
+    ;;
+esac
+exec opencode "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "opencode",
+]
 
 # Your host opencode config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
@@ -105,12 +141,8 @@ allow = [
 # `{*} https://openrouter.ai` — and keep this block; for Anthropic/OpenAI change the host,
 # header, and env var instead.)
 [env]
-# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects,
-# which operations it offers) added to opencode's instructions, so a refused host or a read-only file
-# reads as the sandbox rather than as a fault to work around. opencode merges this inline config over
-# the others and concatenates `instructions`, so the summary comes next to your `AGENTS.md` and the
-# `instructions` of your `opencode.json`, never in place of them.
-OPENCODE_CONFIG_CONTENT = '{"instructions":["/opt/sbx/contract-summary.md"]}'
+# No `OPENCODE_CONFIG_CONTENT` here: v2 loads no file named by an `instructions` list, so the
+# cage's summary reaches opencode through the global `AGENTS.md` that `cmd` writes (see above).
 #OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]
