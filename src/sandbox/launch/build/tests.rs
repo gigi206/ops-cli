@@ -1357,3 +1357,39 @@ fn the_loader_path_is_the_union_of_what_each_grant_contributed() {
     super::merge_loader_path(&mut none);
     assert_eq!(none, before, "a cage with neither grant is untouched");
 }
+
+/// The spec dump is created owner-only, whatever the umask: past its redacted credentials it still
+/// carries the cage's environment, mounts and command.
+#[cfg(debug_assertions)]
+#[test]
+fn the_spec_dump_is_created_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TmpDir::new();
+    let dump = dir.join("spec.dump");
+    let spec = crate::sandbox::spec::SandboxSpec::new(
+        "/".into(),
+        Vec::new(),
+        vec![("HOME".to_string(), "/home/a".to_string())],
+        crate::sandbox::spec::NetPolicy::Shared,
+        vec![std::ffi::OsString::from("/bin/true")],
+    )
+    .expect("a spec");
+    let _lock = crate::testutil::env_lock();
+    let _dump = crate::testutil::EnvVar::set("SBX_DEBUG_SPEC_DUMP", &dump);
+    // A permissive umask, so a file created without a mode of its own is visibly wider than 0600
+    // rather than accidentally equal to it.
+    let previous = unsafe { libc::umask(0o022) };
+    super::debug_dump_spec(&spec, None);
+    unsafe { libc::umask(previous) };
+
+    let mode = std::fs::metadata(&dump)
+        .expect("the dump is written")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the spec dump is owner-only");
+    let text = std::fs::read_to_string(&dump).expect("the dump reads back");
+    assert!(
+        text.contains("guard: none"),
+        "the dump holds the spec: {text}"
+    );
+}
