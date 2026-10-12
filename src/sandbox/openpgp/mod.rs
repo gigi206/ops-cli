@@ -216,7 +216,12 @@ pub(crate) fn parse_public_key(armored: &str) -> Result<PublicKey, String> {
         return Err("only an RSA public key is read".to_string());
     }
     let (modulus, at) = mpi(body, 6)?;
-    let (exponent, _) = mpi(body, at)?;
+    let (exponent, end) = mpi(body, at)?;
+    // A v4 RSA public-key packet ends with its exponent. Bytes after it are no shape a key holder
+    // emits; the fingerprint would bind them too, but they are refused rather than carried.
+    if end != body.len() {
+        return Err("the public-key packet carries bytes past its RSA exponent".to_string());
+    }
     // SHA-1 is reached for through `ring`'s legacy handle rather than a new dependency: the v4
     // fingerprint *is* this construction, it names a key rather than attesting anything, and the
     // signature verified above it is what carries the security.
