@@ -567,6 +567,12 @@ fn a_tree_whose_marker_cannot_be_read_is_never_swept() {
     let list = fx.run(&["projects", "list", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&list.stdout).expect("valid JSON");
     assert_eq!(v[0]["state"], "unreadable", "{}", text(&list));
+    let list = fx.run(&["projects", "list"]);
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("(marker unreadable)"),
+        "the listing read an unreadable marker as an absent one: {}",
+        text(&list)
+    );
     for args in [
         &["projects", "rm", "--markerless", "--yes"][..],
         &["projects", "rm", "--dead", "--yes"][..],
@@ -584,6 +590,10 @@ fn a_tree_whose_marker_cannot_be_read_is_never_swept() {
             text(&out)
         );
     }
+    // The removal the sweeps point at needs no marker.
+    let by_id = fx.run(&["projects", "rm", "1234567890abcdef"]);
+    assert!(by_id.status.success(), "{}", text(&by_id));
+    assert!(!dir.exists(), "the removal by id left the tree");
 }
 
 /// The project path a tree's marker records names a directory whatever its creator called it: the
