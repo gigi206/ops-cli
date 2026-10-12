@@ -440,8 +440,9 @@ fn identity_userns_bears_capabilities() -> bool {
 ///
 /// Two things here need it. `setns` into a user namespace fails with `EINVAL` in a multithreaded
 /// process, and the holder forks a configurer that runs ordinary code — allocation included — which
-/// is sound only when no other thread could have held a lock at the fork.
-fn single_threaded() -> io::Result<()> {
+/// is sound only when no other thread could have held a lock at the fork. The detached launch forks
+/// a daemon that does the same, and asks the same question first.
+pub(super) fn single_threaded() -> io::Result<()> {
     let threads = std::fs::read_dir("/proc/self/task")?.count();
     if threads != 1 {
         return Err(io::Error::other(format!(
