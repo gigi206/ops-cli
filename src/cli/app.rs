@@ -2575,7 +2575,9 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         // `-g` writes. Reading only the first would call stale a version the project asks for.
         for pool in sandbox::inspect::app_per_project_mise_pools(layout.data_dir(), app_name) {
             let tree = layout.data_dir().join("projects").join(&pool.project_id);
-            let Some(project) = sandbox::read_marker(&tree) else {
+            // A tree with no marker, or one that cannot be read, belongs to a project this cannot
+            // name: its pool is left alone, the safe side for a sweep that deletes.
+            let Ok(Some(project)) = sandbox::read_marker(&tree) else {
                 continue;
             };
             // The project directory is gone, so its mise file cannot be read and what it asked for

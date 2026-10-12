@@ -32,8 +32,9 @@ use std::process::ExitCode;
 /// all — with the flag set, the trees are reaped and the list it reads is empty.
 ///
 /// Returns whether the sweep did what it set out to do: false when `<data>/projects/` cannot be
-/// read, or when a tree it was to remove is still there. Either is named on stderr and makes the
-/// verb fail, as a named tree's failure does.
+/// read, when a tree it was to remove is still there, or when a tree's marker cannot be read, so
+/// the sweep cannot tell whether it is gone. Each is named on stderr and makes the verb fail, as a
+/// named tree's failure does.
 ///
 /// `live_ids` is `None` when a preview could not read the session registry: the trees are still
 /// named, and none of them as free.
@@ -77,6 +78,7 @@ fn reap_dead_trees(
         && report.unidentified.is_empty()
         && report.reaped_unidentified.is_empty()
         && report.failed.is_empty()
+        && report.unreadable.is_empty()
     {
         outln!("{h}sbx projects rm:{r} {dim}no dead project trees to reclaim.{r}");
         return true;
@@ -186,7 +188,17 @@ fn reap_dead_trees(
             dir.display()
         ));
     }
-    report.failed.is_empty()
+    // Which project such a tree belongs to, and so whether it is gone, is unknown: every sweep
+    // leaves it alone, and the line names the removal that needs no marker.
+    for (dir, error) in &report.unreadable {
+        let id = dir.file_name().unwrap_or_default().to_string_lossy();
+        crate::diag::error(&format!(
+            "sbx projects rm: cannot read the marker of {} ({error}), so which project it belongs \
+             to is unknown and no sweep removes it — `sbx projects rm {id}` removes it by name.",
+            dir.display()
+        ));
+    }
+    report.failed.is_empty() && report.unreadable.is_empty()
 }
 
 /// One per-project runtime tree, classified and sized, for `sbx projects [list]`.
@@ -195,8 +207,9 @@ struct ProjectTreeView {
     /// The tree's directory name under `<data>/projects/` — the id `sbx projects rm` takes.
     id: String,
     /// `live` (a running session holds it), `idle` (its project still exists), `dead` (the project
-    /// directory is gone), `markerless` (a legacy tree pre-dating marker recording), or `unknown`
-    /// (the session registry could not be read, so no tree's liveness was established).
+    /// directory is gone), `markerless` (a legacy tree pre-dating marker recording), `unknown`
+    /// (the session registry could not be read, so no tree's liveness was established), or
+    /// `unreadable` (its marker is there and cannot be read, so its project is unknown).
     state: &'static str,
     /// On-disk size in bytes (an upper bound — reflinked content shared with another tree counts
     /// per file).

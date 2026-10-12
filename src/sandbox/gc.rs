@@ -520,6 +520,11 @@ pub(crate) struct ReapReport {
     /// hides the one tree that keeps failing, since it is named as reclaimed on every run. Always
     /// empty in a dry run, where nothing was attempted.
     pub(crate) failed: Vec<(PathBuf, io::Error)>,
+    /// Trees whose marker is there and cannot be read (the tree directory, and the reason). Which
+    /// project such a tree belongs to is unknown, and so is whether it is gone: no sweep removes
+    /// it, neither as dead nor under the `--markerless` opt-in, which covers trees that predate the
+    /// marker rather than ones whose marker failed to read.
+    pub(crate) unreadable: Vec<(PathBuf, io::Error)>,
 }
 
 /// A reclaimable dead project tree: the recorded project path that is gone, and the tree's size.
@@ -595,6 +600,7 @@ fn reap_dead_projects_with(
     let mut unidentified = Vec::new();
     let mut reaped_unidentified = Vec::new();
     let mut failed = Vec::new();
+    let mut unreadable = Vec::new();
     let entries = match std::fs::read_dir(projects_dir) {
         Ok(e) => e,
         // No projects tree yet — nothing to reap.
@@ -604,6 +610,7 @@ fn reap_dead_projects_with(
                 unidentified,
                 reaped_unidentified,
                 failed,
+                unreadable,
             });
         }
         Err(e) => return Err(e),
@@ -621,7 +628,13 @@ fn reap_dead_projects_with(
             continue;
         }
         // Read before the match rather than in its scrutinee, so an arm is free to consume `dir`.
-        let marker = read_marker(&dir);
+        let marker = match read_marker(&dir) {
+            Ok(marker) => marker,
+            Err(e) => {
+                unreadable.push((dir, e));
+                continue;
+            }
+        };
         match marker {
             // Identified, and the project is gone with its parent still present — reclaimable.
             Some(path) if project_is_gone(&path) => {
@@ -658,20 +671,29 @@ fn reap_dead_projects_with(
         unidentified,
         reaped_unidentified,
         failed,
+        unreadable,
     })
 }
 
 /// The canonical project path recorded in `<dir>/project`, if the marker is present and holds an
-/// absolute path. An absent, unreadable, empty, or non-absolute marker yields `None` — the tree is
+/// absolute path. An absent marker, and an empty or non-absolute one, yield `None`: the tree is
 /// then treated as unidentified, never reaped on a path that cannot be trusted.
-pub(crate) fn read_marker(dir: &Path) -> Option<PathBuf> {
+///
+/// A marker that is there and cannot be read is an error. Read as absent, it would make a tree
+/// whose project is known look like one that predates the marker, which `--markerless` removes
+/// without a deadness proof.
+pub(crate) fn read_marker(dir: &Path) -> io::Result<Option<PathBuf>> {
     use std::os::unix::ffi::OsStrExt;
-    let bytes = std::fs::read(dir.join(super::projectstore::PROJECT_MARKER)).ok()?;
+    let bytes = match std::fs::read(dir.join(super::projectstore::PROJECT_MARKER)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     if bytes.is_empty() {
-        return None;
+        return Ok(None);
     }
     let path = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
-    path.is_absolute().then_some(path)
+    Ok(path.is_absolute().then_some(path))
 }
 
 /// The outcome of [`reap_one`] — a targeted reap of a single named project tree. The caller names
@@ -1605,6 +1627,9 @@ pub(crate) enum TreeState {
     /// which is a *finding* — that no session holds this tree — and would be a claim nothing
     /// checked. A verb that deletes on this distinction refuses instead of acting on it.
     Unknown,
+    /// The tree's marker is there and cannot be read, so which project it belongs to is unknown.
+    /// Distinct from `Markerless`, a tree that predates the marker: no sweep removes this one.
+    Unreadable,
 }
 
 impl TreeState {
@@ -1616,6 +1641,7 @@ impl TreeState {
             TreeState::Dead => "dead",
             TreeState::Markerless => "markerless",
             TreeState::Unknown => "unknown",
+            TreeState::Unreadable => "unreadable",
         }
     }
 }
@@ -1644,18 +1670,20 @@ pub(crate) fn classify_tree(dir: &Path, live_ids: Option<&BTreeSet<String>>) -> 
     let last_used = mtime_of(&marker)
         .or_else(|| mtime_of(dir))
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    let project_path = read_marker(dir);
+    let recorded = read_marker(dir);
     // `None` is not an empty set. Without the registry every branch below would report a tree as
     // unheld, which is the one thing that was never checked.
     let state = match live_ids {
         None => TreeState::Unknown,
         Some(live) if id.is_some_and(|id| live.contains(id)) => TreeState::Live,
-        Some(_) => match &project_path {
-            Some(path) if project_is_gone(path) => TreeState::Dead,
-            Some(_) => TreeState::Idle,
-            None => TreeState::Markerless,
+        Some(_) => match &recorded {
+            Err(_) => TreeState::Unreadable,
+            Ok(Some(path)) if project_is_gone(path) => TreeState::Dead,
+            Ok(Some(_)) => TreeState::Idle,
+            Ok(None) => TreeState::Markerless,
         },
     };
+    let project_path = recorded.ok().flatten();
     TreeClassification {
         state,
         last_used,
