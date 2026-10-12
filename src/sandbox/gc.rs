@@ -2619,9 +2619,11 @@ fn sweep_runtime_dirs_with(
             if prune {
                 // A directory entry (the portal's runtime dir, the forwarder's socket dir) needs the
                 // recursive removal; a socket or the CA file is a plain unlink. Try the file form
-                // first — the common case — and fall back rather than stat'ing every entry.
-                if std::fs::remove_file(&path).is_err() {
-                    let _ = force_remove_dir_all(&path);
+                // first — the common case — and fall back rather than stat'ing every entry. Reported
+                // only when it went, as [`prune_rev_dirs`] reports: an entry that stays would be
+                // counted removed again on every pass.
+                if std::fs::remove_file(&path).is_err() && force_remove_dir_all(&path).is_err() {
+                    continue;
                 }
             }
             removed.push(path);
@@ -3801,6 +3803,32 @@ mod tests {
 
         // Idempotent: a second sweep finds nothing left.
         assert!(sweep_runtime_dirs_with(root, true, &live).is_empty());
+    }
+
+    /// An entry the sweep cannot remove stays, and is not counted among those removed: the count
+    /// `sbx gc` prints is what went.
+    #[test]
+    fn sweep_runtime_dirs_reports_only_what_it_removed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let data = TmpDir::new();
+        let egress = data.path().join("egress");
+        std::fs::create_dir_all(&egress).unwrap();
+        std::fs::write(egress.join("ca-4242.pem"), b"x").unwrap();
+        // An entry cannot be unlinked from a directory its mode keeps read-only.
+        let mode = |m| std::fs::set_permissions(&egress, std::fs::Permissions::from_mode(m));
+        mode(0o555).unwrap();
+        if std::fs::File::create(egress.join("probe")).is_ok() {
+            mode(0o700).unwrap();
+            skip_incapable!("running as root, which writes into a directory its mode refuses");
+            return;
+        }
+        let removed = sweep_runtime_dirs_with(data.path(), true, &|_| false);
+        mode(0o700).unwrap();
+        assert!(
+            egress.join("ca-4242.pem").exists(),
+            "the fixture's removal was expected to fail"
+        );
+        assert!(removed.is_empty(), "{removed:?}");
     }
 
     #[test]
