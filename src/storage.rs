@@ -2542,9 +2542,10 @@ this line has no separator at all
     /// The number of block groups is the kernel's, and the buffer the second ioctl writes into is
     /// sized from it: a count that cannot size a buffer is refused instead of multiplied.
     ///
-    /// Teeth: `count as usize * ENTRY` on `u64::MAX` panics in a debug build and, in the release
-    /// build that ships, wraps to a small number — a buffer the ioctl then writes past, under a
-    /// SAFETY comment claiming it writes within it.
+    /// Teeth: `count as usize * ENTRY` on `u64::MAX` overflows. The shipped build keeps overflow
+    /// checks on, so that panics in every build; without them it would wrap to a small number, a
+    /// buffer the ioctl then writes past under a SAFETY comment claiming it writes within it, which
+    /// is why the count is refused here rather than left to the checks.
     #[test]
     fn a_block_group_count_a_buffer_cannot_be_sized_from_is_refused() {
         let header = |count: u64| {
