@@ -511,28 +511,14 @@ fn prune_previews_the_undeclared_tool_by_provider_and_removes_nothing() {
 
 /// Register a live session of `app` in the fixture's registry: a record for *this* process, which
 /// is alive, so it survives the liveness pruning the registry does on every read.
+#[track_caller]
 fn register_live_session(fx: &Project, app: &str) {
-    let sessions = fx.data_home.path().join("sbx/sessions");
-    std::fs::create_dir_all(&sessions).unwrap();
-    let pid = std::process::id();
-    let start = common::start_ticks(pid);
-    // The record's `project` is hex-encoded raw bytes, as the registry writes it.
-    let project: String = fx
-        .proj
-        .path()
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    std::fs::write(
-        sessions.join(format!("{pid}-{start}")),
-        format!(
-            "kind=run\npid={pid}\nstart={start}\nruntime=global-app:{app}\ndetached=false\n\
-             project={project}\n"
-        ),
-    )
-    .unwrap();
+    common::write_session_record(
+        fx.data_home.path(),
+        std::process::id(),
+        &format!("global-app:{app}"),
+        fx.proj.path(),
+    );
 }
 
 #[test]
