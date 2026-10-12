@@ -384,6 +384,12 @@ global one and any per-project ones: which hold the tools installed by the app's
 `mise:` backends, its config, and its login/session state, freed immediately. A running
 session of the app is a hard stop (stop it first with [`sbx session stop`](session#stop)).
 
+The per-project homes are found under the data directory's `projects/`. When that directory
+cannot be read, the purge still removes the global home, names the directory, reports the
+app `purged with errors` and fails: any per-project home, and the login state in it, is
+left. `sbx app list --shared` fails the same way, since what an app holds alone counts
+those homes.
+
 `--purge` on its own does **not** touch the shared per-project nix store, which backs
 every app in a project. Add **`--gc`** (which requires `--purge`) to sweep the **current
 project's** store in the same command: equivalent to running [`sbx gc --prune`](gc)
