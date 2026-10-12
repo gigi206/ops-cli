@@ -360,7 +360,12 @@ fn parse_signature(bytes: &[u8], pinned: &Fingerprint) -> Result<Signature, Stri
     ]) as usize;
     // Past the unhashed subpackets and the two-byte digest prefix lies the signature MPI. The
     // prefix is a transmission check the verifier does not need: `ring` recomputes the digest.
-    let (value, _) = mpi(body, at + 2 + unhashed_len + 2)?;
+    let (value, end) = mpi(body, at + 2 + unhashed_len + 2)?;
+    // An RSA signature packet ends with its MPI. Bytes after it are no shape a signer emits, and
+    // they are covered by nothing the verification hashes, so they are refused rather than carried.
+    if end != body.len() {
+        return Err("the signature packet carries bytes past its signature".to_string());
+    }
     let mut trailer = body[0..6].to_vec();
     trailer.extend_from_slice(hashed);
     let hashed_count =
