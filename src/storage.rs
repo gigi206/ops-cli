@@ -566,9 +566,34 @@ fn same_file(target: &Path, canonical_image: &Option<PathBuf>) -> bool {
 }
 
 /// Report where the volume stands, without changing anything.
+///
+/// [`State::Absent`] only where nothing can be at `image`: no entry, or a path under one that is
+/// not a directory. It sends `up` to suggest `sbx storage init` and `status` to report no image,
+/// so a path that cannot be read, or that holds something other than a file, is an error naming
+/// it instead. A symlink to the image is followed.
 pub(crate) fn state(image: &Path) -> io::Result<State> {
-    if !image.is_file() {
-        return Ok(State::Absent);
+    match std::fs::metadata(image) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return Err(io::Error::other(format!(
+                "{} is not a regular file, so it is no volume image",
+                image.display()
+            )));
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(State::Absent);
+        }
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("{}: {e}", image.display()),
+            ));
+        }
     }
     let Some(loop_dev) = loop_for(image, Path::new("/sys/block"))? else {
         return Ok(State::Detached);
@@ -3415,6 +3440,49 @@ this line has no separator at all
         let dir = free_bytes(base.path()).expect("a mounted filesystem reports its free space");
         assert!(dir > 0);
         assert_eq!(free_bytes(Path::new("/nonexistent-by-construction")), None);
+    }
+
+    /// `Absent` is what sends `up` to suggest `sbx storage init` and `status` to report no image, so
+    /// it means nothing can be at the image path. Something there that cannot be read, or that is
+    /// not a file, is not that: a symlink loop fails the read for any uid, and a directory is no
+    /// image. A path under a regular file cannot exist, so it stays absent, and a symlink to the
+    /// image is followed.
+    #[test]
+    fn only_a_path_where_nothing_can_be_reads_as_an_absent_image() {
+        let base = crate::testutil::TmpDir::new();
+        let looped = base.path().join("loop.btrfs");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        let dir = base.path().join("dir.btrfs");
+        std::fs::create_dir(&dir).unwrap();
+        let file = base.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let image = base.path().join("vol.btrfs");
+        std::fs::write(&image, b"").unwrap();
+        let link = base.path().join("link.btrfs");
+        std::os::unix::fs::symlink(&image, &link).unwrap();
+
+        let read = |p: &Path| match state(p) {
+            Ok(State::Absent) => "absent".to_string(),
+            Ok(_) => "present".to_string(),
+            Err(e) => format!("an error ({e})"),
+        };
+        let mut wrong = Vec::new();
+        for (shape, path, wanted) in [
+            ("a symlink loop", looped.clone(), "an error"),
+            ("a directory", dir.clone(), "an error"),
+            (
+                "a path under a regular file",
+                file.join("vol.btrfs"),
+                "absent",
+            ),
+            ("a symlink to the image", link.clone(), "present"),
+        ] {
+            let got = read(&path);
+            if !got.starts_with(wanted) {
+                wrong.push(format!("{shape}: {got}, where {wanted} was wanted"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     #[test]
