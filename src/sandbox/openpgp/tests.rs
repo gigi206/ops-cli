@@ -6,9 +6,10 @@ use super::*;
 
 /// A clearsigned `Release`-shaped document and the RSA-4096 key that signed it, produced by GnuPG
 /// with SHA-512 so the fixtures are a real implementation's output rather than this module's own
-/// encoder read back. The key is exported twice: as a certificate carrying its user ID (the old
-/// packet framing, which is what an export gives) and as the bare primary key packet (the new
-/// framing, which is what a keyserver serves) — both must read to the same fingerprint.
+/// encoder read back. The key is exported twice: as a certificate carrying its user ID and as the
+/// bare primary key packet, both in the old packet framing (`0x99`), which is what GnuPG's export
+/// gives. A keyserver serves the new framing (`0xc6`); [`new_framing`] derives that form from the bare
+/// key, so both framings are read.
 const CLEARSIGNED: &str = include_str!("clearsigned.txt");
 const KEY: &str = include_str!("key.asc");
 const KEY_BARE: &str = include_str!("key_bare.asc");
@@ -27,15 +28,45 @@ fn pinned() -> Fingerprint {
         .fingerprint
 }
 
+/// `bytes` as an armored public-key block, for a test that has to change a key's packets.
+fn armored_key(bytes: &[u8]) -> String {
+    format!(
+        "{}\n\n{}\n-----END PGP PUBLIC KEY BLOCK-----\n",
+        KEY_ARMOR.0,
+        crate::config::base64_encode(bytes)
+    )
+}
+
+/// The one old-framing public-key packet `old` (`0x99`, a two-byte length) in the new framing
+/// (`0xc6`), whose length a body of 192 to 8383 bytes spells in two octets — the form a keyserver
+/// serves.
+fn new_framing(old: &[u8]) -> Vec<u8> {
+    assert_eq!(old[0], 0x99, "an old-framing public-key packet");
+    let len = usize::from(u16::from_be_bytes([old[1], old[2]]));
+    assert_eq!(old.len(), 3 + len, "one packet");
+    let over = len - 192;
+    let mut out = vec![
+        0xc6,
+        u8::try_from((over >> 8) + 192).unwrap(),
+        u8::try_from(over & 0xff).unwrap(),
+    ];
+    out.extend_from_slice(&old[3..]);
+    out
+}
+
 #[test]
 fn a_key_reads_to_its_published_fingerprint_in_either_packet_framing() {
     let cert = parse_public_key(KEY).expect("the exported certificate parses");
     let bare = parse_public_key(KEY_BARE).expect("the bare primary key parses");
     // Derived from the packet bytes, so it holds against the value GnuPG prints for the same key.
     assert_eq!(hex(&cert.fingerprint), FINGERPRINT);
+    assert_eq!(cert.fingerprint, bare.fingerprint);
     // The two framings — old (`0x99`) and new (`0xc6`) — must not read to different keys, or which
     // form a keyserver happened to serve would decide whether a pin matches.
-    assert_eq!(cert.fingerprint, bare.fingerprint);
+    let served = new_framing(&dearmor(KEY_BARE, KEY_ARMOR.0).unwrap());
+    assert_eq!(served[0], 0xc6);
+    let served = parse_public_key(&armored_key(&served)).expect("the new framing parses");
+    assert_eq!(served.fingerprint, bare.fingerprint);
     assert_eq!(
         hex(&parse_public_key(KEY_OTHER).unwrap().fingerprint).len(),
         40
@@ -281,13 +312,6 @@ fn a_signature_packet_with_bytes_past_its_signature_is_refused() {
 /// test above reads `KEY`, which carries them.
 #[test]
 fn a_key_packet_with_bytes_past_its_exponent_is_refused() {
-    let armored = |bytes: &[u8]| {
-        format!(
-            "{}\n\n{}\n-----END PGP PUBLIC KEY BLOCK-----\n",
-            KEY_ARMOR.0,
-            crate::config::base64_encode(bytes)
-        )
-    };
     let bare = dearmor(KEY_BARE, KEY_ARMOR.0).unwrap();
     // The bare key is one packet in the old framing with a two-byte length: grow the body by one
     // byte and the length with it.
@@ -301,9 +325,9 @@ fn a_key_packet_with_bytes_past_its_exponent_is_refused() {
     let mut grown = bare.clone();
     grown[1..3].copy_from_slice(&(len + 1).to_be_bytes());
     grown.push(0);
-    let err = parse_public_key(&armored(&grown))
+    let err = parse_public_key(&armored_key(&grown))
         .err()
         .expect("a byte past the exponent must be refused");
     assert!(err.contains("past its RSA exponent"), "{err}");
-    assert!(parse_public_key(&armored(&bare)).is_ok());
+    assert!(parse_public_key(&armored_key(&bare)).is_ok());
 }
