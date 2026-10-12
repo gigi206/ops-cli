@@ -227,8 +227,11 @@ fn proc_logs_reports_an_unobserved_session() {
     // pointing at a plain live process (a `sleep`) — no cage, no socket — to isolate the
     // socket-missing path from the launch machinery. No sandbox needed.
     let (data, project) = (TmpDir::new("p"), TmpDir::new("p"));
+    // The sweep is the backstop for a panic before the kill below: a fingerprint unique across
+    // the suites ([`common::procs`]), so nothing but this test's `sleep` is signalled.
+    let _sweep = common::procs::FingerprintCleanup(vec!["31363"]);
     let mut child = Command::new("sleep")
-        .arg("30")
+        .arg("31363")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -278,9 +281,20 @@ fn detached_observe_records_exec_events_for_proc_logs() {
         sandbox_probe(project.path(), data.path())
     );
 
-    // Detached + observed: spawns `sleep 30`, which lives well past the poll tick and our reads.
+    // Detached + observed: spawns a `sleep` that lives well past the poll tick and our reads. Its
+    // duration is a fingerprint unique across the suites ([`common::procs`]), so the sweep that
+    // backs the `session stop` below, for a panic before it, signals nothing but this cage's.
+    let _sweep = common::procs::FingerprintCleanup(vec!["31361"]);
     let started = sbx_isolated()
-        .args(["run", "--detach", "--observe", "--", "sh", "-c", "sleep 30"])
+        .args([
+            "run",
+            "--detach",
+            "--observe",
+            "--",
+            "sh",
+            "-c",
+            "sleep 31361",
+        ])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .stdin(Stdio::null())
@@ -340,8 +354,11 @@ fn proc_ls_shows_a_real_cage_process_tree() {
         sandbox_probe(project.path(), data.path())
     );
 
+    // A fingerprint unique across the suites ([`common::procs`]): the sweep backs the kill below
+    // for a panic before it, and signals nothing but this cage's `sleep`.
+    let _sweep = common::procs::FingerprintCleanup(vec!["31362"]);
     let mut cage = sbx_isolated()
-        .args(["run", "--", "sleep", "300"])
+        .args(["run", "--", "sleep", "31362"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .stdin(Stdio::null())
@@ -1098,8 +1115,11 @@ fn deny_session_loads_a_rule_into_a_running_enforcing_cage() {
     );
 
     // A long-running detached enforce cage: it registers a session and binds its proc control socket.
+    // Its `sleep` carries a fingerprint unique across the suites ([`common::procs`]), so the sweep
+    // that backs the teardown below, for a panic before it, signals nothing but this cage's.
+    let _sweep = common::procs::FingerprintCleanup(vec!["31364"]);
     let launched = sbx_isolated()
-        .args(["run", "--detach", "--", "sleep", "30"])
+        .args(["run", "--detach", "--", "sleep", "31364"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", data.path())
