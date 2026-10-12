@@ -1044,7 +1044,7 @@ mod projects_list_tests {
         std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read_dir(&projects).is_ok() {
             std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o700)).unwrap();
-            eprintln!("skipping: this user reads a directory its mode refuses (root)");
+            skip_incapable!("running as root, which reads a directory its mode refuses");
             return;
         }
         let listed = super::projects_list(true, &pal);
