@@ -10,8 +10,10 @@
 use super::schema;
 use crate::testutil::TmpDir;
 
-/// Every `*.toml` file directly under `dir`, a directory of the repository, in name order.
-fn shipped_files(dir: &str) -> Vec<std::path::PathBuf> {
+/// Every `*.toml` file directly under `dir`, a directory of the repository, in name order — the one
+/// population the catalogue's guards read, and the freshness check
+/// ([`crate::sandbox::catalogue_freshness`]) with them.
+pub(crate) fn shipped_files(dir: &str) -> Vec<std::path::PathBuf> {
     toml_files_in(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir))
 }
 
