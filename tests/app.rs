@@ -806,6 +806,28 @@ fn prune_leaves_the_tools_alone_while_the_file_that_declares_them_is_refused() {
     assert!(fx.installs_dir("demo-app").join("aqua-demo-keep").is_dir());
 }
 
+/// An app whose profile is there and could not be loaded is missing from the configuration, and
+/// would read as declaring nothing: its sweep is left alone, by name and with `--all`, rather than
+/// take the tools the profile declares.
+#[test]
+fn prune_leaves_alone_an_app_whose_profile_cannot_be_loaded() {
+    let fx = fixture_with_a_leftover();
+    fx.write_profile("demo-app", "cmd = \"demo\"\n\n[packages\n");
+    for args in [
+        &["app", "prune", "demo-app", "--yes"][..],
+        &["app", "prune", "--all", "--yes"][..],
+    ] {
+        let out = fx.run(args);
+        let s = text(&out);
+        assert!(!out.status.success(), "{args:?}: {s}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("could not be loaded")
+                && fx.installs_dir("demo-app").join("aqua-demo-keep").is_dir(),
+            "{args:?} pruned the tools of an app it could not read: {s}"
+        );
+    }
+}
+
 /// An app whose bundle cannot be resolved is missing the tools the bundle declares, so its sweep is
 /// left alone, while `--all` still sweeps the apps whose configuration reads whole.
 #[test]

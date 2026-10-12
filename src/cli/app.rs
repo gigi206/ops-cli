@@ -2452,7 +2452,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     // not be read, each with the reason.
     let mut unread: Vec<String> = Vec::new();
     // The apps whose undeclared tools are left alone because the configuration that declares them
-    // is one a launch refuses as it stands.
+    // cannot be read whole as it stands.
     let mut held: Vec<String> = Vec::new();
     let mut had_error = false;
 
@@ -2535,11 +2535,10 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         // declared tool would read as undeclared. The sweep is left alone rather than run on that
         // reading, in the preview as with `--yes`, as `--stale` leaves a pool whose file it could
         // not read.
+        // An app whose profile is there and could not be loaded is missing from the configuration
+        // altogether, and would read as declaring nothing at all.
         let refused = !resolved.refusals.is_empty()
-            || resolved
-                .apps
-                .get(app_name)
-                .is_some_and(|app| !app.refusals.is_empty());
+            || crate::config::undeclarable_app(&resolved, app_name).is_some();
         let sweep = !reset && !refused;
         if !reset && refused {
             held.push(app_name.clone());
@@ -2736,18 +2735,22 @@ fn app_prune(args: &[OsString]) -> ExitCode {
             diag::note(&format!("sbx: app prune: {why}"));
         }
         for app_name in &held {
-            for why in resolved
-                .apps
-                .get(app_name)
-                .into_iter()
-                .flat_map(|a| &a.refusals)
-            {
-                diag::note(&format!("sbx: app prune: {app_name}: {why}"));
+            match resolved.apps.get(app_name) {
+                Some(app) => {
+                    for why in &app.refusals {
+                        diag::note(&format!("sbx: app prune: {app_name}: {why}"));
+                    }
+                }
+                None => {
+                    if let Some(why) = crate::config::undeclarable_app(&resolved, app_name) {
+                        diag::note(&format!("sbx: app prune: {why}"));
+                    }
+                }
             }
         }
         diag::note(&format!(
             "sbx: app prune: the undeclared mise tools of {} are left alone, since the \
-             configuration that declares them is one a launch refuses as it stands",
+             configuration that declares them cannot be read whole as it stands",
             held.join(", ")
         ));
         had_error = true;
