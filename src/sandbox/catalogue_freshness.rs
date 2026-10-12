@@ -40,15 +40,9 @@
 //! its green from being read as a wider one.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::schema;
-
-/// The repository root, so a run reads the same files a reader would open.
-fn root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-}
 
 /// One thing to ask a vendor about: where it was declared, and what to ask.
 #[derive(Debug)]
@@ -71,14 +65,9 @@ enum Check {
 fn shipped_checks() -> Vec<(String, Check)> {
     let mut out = Vec::new();
     for dir in ["examples/bundle", "examples/app"] {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(root().join(dir))
-            .expect("the examples directory is readable")
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
-            .collect();
-        files.sort();
-        for path in files {
+        // The catalogue's own walk: loud on an entry it cannot read, so a profile cannot drop out
+        // of the run in silence.
+        for path in crate::config::catalogue_tests::shipped_files(dir) {
             let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
             let raw = schema::parse(&std::fs::read(&path).expect("read the profile"))
                 .unwrap_or_else(|e| panic!("{} does not parse: {e}", path.display()));
