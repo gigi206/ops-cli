@@ -292,22 +292,30 @@ fn a_runtime_staged_out_of_the_store_is_restaged_once_it_stops_running() {
     write_exec(&src.join("node"), "#!/bin/sh\necho v24.0.0\n", 0o555);
 
     let launch = || {
-        let out = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .env("HOME", &home)
-            .env(
-                "PATH",
-                std::env::join_paths([
-                    app.join("bin").as_path(),
-                    "/usr/bin".as_ref(),
-                    "/bin".as_ref(),
-                ])
-                .unwrap(),
-            )
-            .output()
-            .expect("run the shipped wrapper");
-        assert!(out.status.success(), "the wrapper failed: {out:?}");
+        let out = crate::testutil::run_within(
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .env("HOME", &home)
+                .env(
+                    "PATH",
+                    std::env::join_paths([
+                        app.join("bin").as_path(),
+                        "/usr/bin".as_ref(),
+                        "/bin".as_ref(),
+                    ])
+                    .unwrap(),
+                )
+                .stdin(std::process::Stdio::null()),
+            "the shipped wrapper",
+        );
+        assert!(
+            out.status.success(),
+            "the wrapper failed ({}): {}{}",
+            out.status,
+            out.stdout,
+            out.stderr
+        );
     };
     let node = dest.join("bin/node");
     let runs = || {
@@ -470,20 +478,22 @@ fn a_launch_that_installs_from_its_own_command_survives_an_absent_override_and_a
     );
 
     let launch = || {
-        let out = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .env("HOME", &home)
-            .env(
-                "PATH",
-                std::env::join_paths([bin.as_path(), "/usr/bin".as_ref(), "/bin".as_ref()])
-                    .unwrap(),
-            )
-            // The override is what a refresh launch sets and an ordinary one does not.
-            .env_remove("OPEN_DESIGN_SBX_UPDATE")
-            .output()
-            .expect("run the shipped wrapper");
-        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        let out = crate::testutil::run_within(
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .env("HOME", &home)
+                .env(
+                    "PATH",
+                    std::env::join_paths([bin.as_path(), "/usr/bin".as_ref(), "/bin".as_ref()])
+                        .unwrap(),
+                )
+                // The override is what a refresh launch sets and an ordinary one does not.
+                .env_remove("OPEN_DESIGN_SBX_UPDATE")
+                .stdin(std::process::Stdio::null()),
+            "the shipped wrapper",
+        );
+        let err = out.stderr;
         assert!(out.status.success(), "an ordinary launch failed: {err}");
         let saw = std::fs::read_to_string(home.join("corepack-saw"))
             .expect("the wrapper did not reach Corepack at all");
@@ -1288,14 +1298,22 @@ fn the_hermes_desktop_install_step_writes_its_marker_and_yields_to_a_roll() {
     let marker = home.join(".hermes/.install_method");
 
     let run = |upgrade: bool| {
-        let out = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .env("HOME", &home)
-            .env("SBX_UPGRADE", if upgrade { "1" } else { "" })
-            .output()
-            .expect("run the shipped step");
-        assert!(out.status.success(), "the step failed: {out:?}");
+        let out = crate::testutil::run_within(
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .env("HOME", &home)
+                .env("SBX_UPGRADE", if upgrade { "1" } else { "" })
+                .stdin(std::process::Stdio::null()),
+            "the shipped step",
+        );
+        assert!(
+            out.status.success(),
+            "the step failed ({}): {}{}",
+            out.status,
+            out.stdout,
+            out.stderr
+        );
     };
 
     // 1. A first launch declares the install method.
@@ -1429,16 +1447,24 @@ impl KiroStep {
             }
             Search::WriterOnly => self.bin.clone().into_os_string(),
         };
-        let out = std::process::Command::new(&self.bash)
-            .arg("-c")
-            .arg(&self.script)
-            .env("HOME", &self.home)
-            .env("PATH", path)
-            .env("SBX_UPGRADE", if upgrade { "1" } else { "" })
-            .output()
-            .expect("run the shipped step");
-        assert!(out.status.success(), "the step failed: {out:?}");
-        String::from_utf8_lossy(&out.stderr).into_owned()
+        let out = crate::testutil::run_within(
+            std::process::Command::new(&self.bash)
+                .arg("-c")
+                .arg(&self.script)
+                .env("HOME", &self.home)
+                .env("PATH", path)
+                .env("SBX_UPGRADE", if upgrade { "1" } else { "" })
+                .stdin(std::process::Stdio::null()),
+            "the shipped step",
+        );
+        assert!(
+            out.status.success(),
+            "the step failed ({}): {}{}",
+            out.status,
+            out.stdout,
+            out.stderr
+        );
+        out.stderr
     }
 
     /// Every call the stand-in writer recorded, one per line.
