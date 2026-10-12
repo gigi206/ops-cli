@@ -520,7 +520,8 @@ pub(crate) struct ReapReport {
     /// hides the one tree that keeps failing, since it is named as reclaimed on every run. Always
     /// empty in a dry run, where nothing was attempted.
     pub(crate) failed: Vec<(PathBuf, io::Error)>,
-    /// Trees whose marker is there and cannot be read (the tree directory, and the reason). Which
+    /// Trees whose marker is there and cannot be read, or names no usable path (the tree directory,
+    /// and the reason). Which
     /// project such a tree belongs to is unknown, and so is whether it is gone: no sweep removes
     /// it, neither as dead nor under the `--markerless` opt-in, which covers trees that predate the
     /// marker rather than ones whose marker failed to read.
@@ -675,25 +676,50 @@ fn reap_dead_projects_with(
     })
 }
 
-/// The canonical project path recorded in `<dir>/project`, if the marker is present and holds an
-/// absolute path. An absent marker, and an empty or non-absolute one, yield `None`: the tree is
-/// then treated as unidentified, never reaped on a path that cannot be trusted.
+/// The canonical project path recorded in `<dir>/project`. `None` when there is no marker: the
+/// tree predates marker recording, and is treated as unidentified, never reaped on a path that
+/// cannot be trusted.
 ///
-/// A marker that is there and cannot be read is an error. Read as absent, it would make a tree
-/// whose project is known look like one that predates the marker, which `--markerless` removes
-/// without a deadness proof.
+/// A marker that is there and cannot be read, or that names no project a launch could have
+/// recorded, is an error: empty, relative, holding a NUL byte, or longer than any path. Read as
+/// absent, it would make a tree whose project is known look like one that predates the marker,
+/// which `--markerless` removes without a deadness proof; read as a path, a NUL byte names a file
+/// that cannot exist, so the tree would read as dead. A newline is a byte a directory name may
+/// hold, and [`write_marker`](super::projectstore::write_marker) stores the path's bytes as they
+/// are, so it is kept.
 pub(crate) fn read_marker(dir: &Path) -> io::Result<Option<PathBuf>> {
+    use std::io::Read as _;
     use std::os::unix::ffi::OsStrExt;
-    let bytes = match std::fs::read(dir.join(super::projectstore::PROJECT_MARKER)) {
-        Ok(bytes) => bytes,
+    let file = match std::fs::File::open(dir.join(super::projectstore::PROJECT_MARKER)) {
+        Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
+    // A canonical path is at most `PATH_MAX` bytes, so one byte more is enough to tell a marker
+    // longer than any path, and the read stays bounded whatever the file holds.
+    let max = libc::PATH_MAX as usize;
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1).read_to_end(&mut bytes)?;
+    let unusable = |why: &str| {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the marker {why}, so it names no project"),
+        ))
+    };
     if bytes.is_empty() {
-        return Ok(None);
+        return unusable("is empty");
+    }
+    if bytes.len() > max {
+        return unusable("is longer than any path");
+    }
+    if bytes.contains(&0) {
+        return unusable("holds a NUL byte");
     }
     let path = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
-    Ok(path.is_absolute().then_some(path))
+    if !path.is_absolute() {
+        return unusable("holds a relative path");
+    }
+    Ok(Some(path))
 }
 
 /// The outcome of [`reap_one`] — a targeted reap of a single named project tree. The caller names
@@ -1627,8 +1653,9 @@ pub(crate) enum TreeState {
     /// which is a *finding* — that no session holds this tree — and would be a claim nothing
     /// checked. A verb that deletes on this distinction refuses instead of acting on it.
     Unknown,
-    /// The tree's marker is there and cannot be read, so which project it belongs to is unknown.
-    /// Distinct from `Markerless`, a tree that predates the marker: no sweep removes this one.
+    /// The tree's marker is there and cannot be read, or names no usable path, so which project it
+    /// belongs to is unknown. Distinct from `Markerless`, a tree that predates the marker: no
+    /// sweep removes this one.
     Unreadable,
 }
 
@@ -3997,6 +4024,40 @@ mod tests {
                 path.as_os_str().as_bytes(),
             )
             .unwrap();
+        }
+    }
+
+    /// A marker names a project only when it holds a path a launch could have recorded. Each other
+    /// shape is an error rather than no marker, which `--markerless` would remove, or a path, which
+    /// a NUL byte makes absent and so dead. A newline is kept: a directory name may end in one.
+    #[test]
+    fn read_marker_accepts_only_a_path_a_launch_could_record() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = TmpDir::new();
+        let marker = tmp.path().join(super::super::projectstore::PROJECT_MARKER);
+        assert_eq!(read_marker(tmp.path()).unwrap(), None, "no marker");
+
+        let long = format!("/{}", "a".repeat(libc::PATH_MAX as usize));
+        for (bytes, shape) in [
+            (&b""[..], "is empty"),
+            (&b"work/proj"[..], "holds a relative path"),
+            (&b"/work/proj\0x"[..], "holds a NUL byte"),
+            (long.as_bytes(), "is longer than any path"),
+        ] {
+            std::fs::write(&marker, bytes).unwrap();
+            let read = read_marker(tmp.path());
+            assert!(
+                read.as_ref().is_err_and(|e| {
+                    e.kind() == io::ErrorKind::InvalidData && e.to_string().contains(shape)
+                }),
+                "{shape}: {read:?}"
+            );
+        }
+
+        for bytes in [&b"/work/proj"[..], &b"/work/proj\n"[..]] {
+            std::fs::write(&marker, bytes).unwrap();
+            let read = read_marker(tmp.path()).unwrap().expect("a recorded path");
+            assert_eq!(read.as_os_str().as_bytes(), bytes);
         }
     }
 
