@@ -99,7 +99,7 @@ What happens depends on what is already there:
 
 - **A fresh install (empty data directory)**: sbx creates and mounts a volume on the spot (there is
   nothing to copy) and uses it from that launch on. It says where the volume is mounted, that after
-  a reboot the first sbx command has to come from your desktop session (see
+  a reboot your desktop session should be open before the first sbx command (see
   [Mounting is automatic](#mounting-is-automatic)), and that `sbx storage unuse` goes back to a
   plain directory, whose store is then downloaded again. When the volume cannot be set up, sbx says
   why, removes the image it had just created, and carries on with the plain directory. The
@@ -274,10 +274,10 @@ return the way any freed space does: see [Releasing it](#releasing-it).
 ## Mounting is automatic
 
 `udisks` mounts under `/run`, which is cleared on reboot: so a volume is unmounted every time
-you log in. sbx mounts it on demand, so from your desktop session this is invisible. That is also
-where the first sbx command after a reboot has to come from: udisks mounts without a password only
-in a local active session, and from an SSH login, a cron job or a service unit its policy asks for
-administrator authentication instead.
+you log in. sbx mounts it on demand, so this is invisible while your desktop session is open:
+udisks then mounts without a password, whether the command runs in that session or in one of your
+services. After a reboot, open it before the first sbx command; where udisks would need
+administrator authentication instead, see [Where it works](#where-it-works-and-where-it-does-not).
 
 `sbx storage up` exists for the rare case where you want the mount without waiting for the
 next command; it is idempotent. `sbx storage down` unmounts, but while the volume is adopted
