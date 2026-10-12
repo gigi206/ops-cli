@@ -633,29 +633,6 @@ pub(crate) fn reap_dead_projects(
     prune_unidentified: bool,
     measure: &dyn Fn(&Path) -> u64,
 ) -> io::Result<ReapReport> {
-    reap_dead_projects_with(
-        projects_dir,
-        live_ids,
-        prune,
-        prune_unidentified,
-        measure,
-        &force_remove_dir_all,
-    )
-}
-
-/// [`reap_dead_projects`] with the removal injected, so the failure branch — a tree the recursive
-/// delete cannot get past — is testable on any host, the way [`sweep_runtime_dirs_with`] makes the
-/// sweep testable without spawning processes. A real removal fails only on conditions a unit test
-/// cannot create (a mount point inside the tree, a subdirectory owned by another uid), and that
-/// branch is the one that decides whether `sbx projects rm` tells the truth about what it freed.
-fn reap_dead_projects_with(
-    projects_dir: &Path,
-    live_ids: &BTreeSet<String>,
-    prune: bool,
-    prune_unidentified: bool,
-    measure: &dyn Fn(&Path) -> u64,
-    remove: &dyn Fn(&Path) -> io::Result<()>,
-) -> io::Result<ReapReport> {
     let mut dead = Vec::new();
     let mut unidentified = Vec::new();
     let mut reaped_unidentified = Vec::new();
@@ -701,7 +678,7 @@ fn reap_dead_projects_with(
                 let bytes = measure(&dir);
                 // Reclaimed is what the removal did, not what it was asked to do: the failure
                 // carries the tree and its reason into `failed`, for the reason that field gives.
-                if prune && let Err(e) = remove(&dir) {
+                if prune && let Err(e) = force_remove_dir_all(&dir) {
                     failed.push((dir, e));
                     continue;
                 }
@@ -715,7 +692,7 @@ fn reap_dead_projects_with(
             None => {
                 let bytes = measure(&dir);
                 if prune_unidentified {
-                    if let Err(e) = remove(&dir) {
+                    if let Err(e) = force_remove_dir_all(&dir) {
                         failed.push((dir, e));
                         continue;
                     }
@@ -834,25 +811,6 @@ pub(crate) fn reap_one(
     prune: bool,
     measure: &dyn Fn(&Path) -> u64,
 ) -> ReapOneOutcome {
-    reap_one_with(
-        projects_dir,
-        id,
-        live_ids,
-        prune,
-        measure,
-        &force_remove_dir_all,
-    )
-}
-
-/// [`reap_one`] with the removal injected, for the reason [`reap_dead_projects_with`] gives.
-fn reap_one_with(
-    projects_dir: &Path,
-    id: &str,
-    live_ids: &BTreeSet<String>,
-    prune: bool,
-    measure: &dyn Fn(&Path) -> u64,
-    remove: &dyn Fn(&Path) -> io::Result<()>,
-) -> ReapOneOutcome {
     // The id names a directory *under* `projects_dir` and reaches `force_remove_dir_all` — so it
     // must be a single, ordinary path component. Reject anything with a separator, a `..`, or an
     // absolute form before the `join`: `projects_dir.join("/etc")` would *replace* the base and
@@ -869,7 +827,7 @@ fn reap_one_with(
         return ReapOneOutcome::Live;
     }
     let bytes = measure(&dir);
-    if prune && let Err(error) = remove(&dir) {
+    if prune && let Err(error) = force_remove_dir_all(&dir) {
         return ReapOneOutcome::Failed { dir, error };
     }
     ReapOneOutcome::Tree { dir, bytes }
