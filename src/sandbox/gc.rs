@@ -248,16 +248,27 @@ pub(crate) fn prune_project_package_roots(
 /// per-app lock exists to make less frequent rather than to cause. [`crate::store::live_base_revisions`]
 /// reads the whole set, and the callers pass it because they hold the [`crate::store::Layout`] it
 /// derives from and this does not.
+///
+/// A family directory that does not exist roots nothing. One that cannot be read is an error, which
+/// names it: the set would lack the builds it roots, and [`prune_superseded_roots`] would drop
+/// their seed roots for the collection to take.
 pub(crate) fn project_keep_roots(
     data_gcroots: &Path,
     id: &str,
     base_revs: &BTreeSet<String>,
     mise_revs: &BTreeSet<String>,
-) -> BTreeSet<OsString> {
+) -> io::Result<BTreeSet<OsString>> {
     let mut keep = BTreeSet::new();
-    let mut add_targets = |dir: PathBuf| {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return;
+    let mut add_targets = |dir: PathBuf| -> io::Result<()> {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("cannot read {}: {e}", dir.display()),
+                ));
+            }
         };
         for entry in entries.flatten() {
             if let Ok(target) = std::fs::read_link(entry.path())
@@ -266,18 +277,19 @@ pub(crate) fn project_keep_roots(
                 keep.insert(base.to_os_string());
             }
         }
+        Ok(())
     };
-    add_targets(data_gcroots.join("projects").join(id));
-    add_targets(data_gcroots.join("projects").join(id).join("nix-tools"));
+    add_targets(data_gcroots.join("projects").join(id))?;
+    add_targets(data_gcroots.join("projects").join(id).join("nix-tools"))?;
     for family in ["base", "gui", "gpu", "audio"] {
         for rev in base_revs {
-            add_targets(data_gcroots.join(family).join(rev));
+            add_targets(data_gcroots.join(family).join(rev))?;
         }
     }
     for rev in mise_revs {
-        add_targets(data_gcroots.join("mise").join(rev));
+        add_targets(data_gcroots.join("mise").join(rev))?;
     }
-    keep
+    Ok(keep)
 }
 
 /// Prune — or, in a dry run, list — the per-project store's accumulated **seed** gc roots for
@@ -3994,6 +4006,55 @@ mod tests {
         }
     }
 
+    /// A family of roots that cannot be read leaves the keep-set unknown rather than smaller: a
+    /// smaller one has the sweep drop the seed roots of the builds that family holds. A family that
+    /// does not exist roots nothing.
+    #[test]
+    fn project_keep_roots_fails_on_a_family_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let data = TmpDir::new();
+        let gcroots = data.path().join("gcroots");
+        let (id, rev, mise_rev) = ("p", "rev1", "mrev1");
+        let base_revs = BTreeSet::from([rev.to_string()]);
+        let mise_revs = BTreeSet::from([mise_rev.to_string()]);
+        let base = gcroots.join("base").join(rev);
+        std::fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink("/nix/store/h2-glibc", base.join("glibc")).unwrap();
+        let keep = project_keep_roots(&gcroots, id, &base_revs, &mise_revs).unwrap();
+        assert_eq!(keep, BTreeSet::from([OsString::from("h2-glibc")]));
+
+        // The nested family first, while the project's own directory above it can still be read.
+        let families = [
+            gcroots.join("projects").join(id).join("nix-tools"),
+            gcroots.join("projects").join(id),
+            base.clone(),
+            gcroots.join("gui").join(rev),
+            gcroots.join("gpu").join(rev),
+            gcroots.join("audio").join(rev),
+            gcroots.join("mise").join(mise_rev),
+        ];
+        for dir in &families {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for dir in &families {
+            let mode = |m| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(m));
+            mode(0o000).unwrap();
+            if std::fs::read_dir(dir).is_ok() {
+                mode(0o700).unwrap();
+                skip_incapable!("running as root, which reads a directory its mode refuses");
+                return;
+            }
+            let keep = project_keep_roots(&gcroots, id, &base_revs, &mise_revs);
+            mode(0o700).unwrap();
+            let named = format!("cannot read {}: ", dir.display());
+            assert!(
+                keep.as_ref().is_err_and(|e| e.to_string().contains(&named)),
+                "{}: {keep:?}",
+                dir.display()
+            );
+        }
+    }
+
     #[test]
     fn project_keep_roots_unions_every_out_link_family_including_mise_on_its_own_rev() {
         let data = TmpDir::new();
@@ -4050,7 +4111,8 @@ mod tests {
 
         let mise_revs = BTreeSet::from([mise_rev.to_string()]);
         let base_revs = BTreeSet::from([base_rev.to_string()]);
-        let keep = project_keep_roots(&gcroots, id, &base_revs, &mise_revs);
+        let keep = project_keep_roots(&gcroots, id, &base_revs, &mise_revs)
+            .expect("read the fixture's roots");
 
         for base in [
             "h1-app-desktop",
@@ -4094,7 +4156,8 @@ mod tests {
             id,
             &BTreeSet::from([project_rev.to_string()]),
             &BTreeSet::new(),
-        );
+        )
+        .expect("read the fixture's roots");
         assert!(!only_project.contains(&OsString::from("b-glibc")));
 
         // The live set, which is what a caller holding a `Layout` now passes.
@@ -4103,7 +4166,8 @@ mod tests {
             id,
             &BTreeSet::from([project_rev.to_string(), app_rev.to_string()]),
             &BTreeSet::new(),
-        );
+        )
+        .expect("read the fixture's roots");
         assert!(
             live.contains(&OsString::from("a-glibc")) && live.contains(&OsString::from("b-glibc")),
             "both revisions' bases are live and must be kept: {live:?}"

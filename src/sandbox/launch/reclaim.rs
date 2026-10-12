@@ -546,9 +546,17 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
         // Every live base revision, not this project's alone: an app installed here may sit on a
         // revision of its own, and a keep-set built from one would let the sweep take that app's
         // base out from under it.
-        let keep =
-            crate::sandbox::gc::project_keep_roots(&data_gcroots, &id, &base_revs, &mise_revs);
-        crate::sandbox::gc::prune_superseded_roots(&store_dir, &keep, prune).len()
+        // A family of roots that cannot be read leaves the keep-set short of the builds it roots,
+        // and the sweep would take them: nothing is pruned then, as for an unreadable lock above.
+        match crate::sandbox::gc::project_keep_roots(&data_gcroots, &id, &base_revs, &mise_revs) {
+            Ok(keep) => crate::sandbox::gc::prune_superseded_roots(&store_dir, &keep, prune).len(),
+            Err(e) => {
+                crate::diag::warn(&format!(
+                    "sbx gc: {e}, so no superseded build is pruned from this project's store"
+                ));
+                0
+            }
+        }
     } else {
         0
     };
@@ -672,7 +680,11 @@ pub(crate) fn superseded_reclaimable_hint(
     let Ok(base_revs) = crate::store::live_base_revisions(layout) else {
         return;
     };
-    let keep = crate::sandbox::gc::project_keep_roots(&data_gcroots, &id, &base_revs, &mise_revs);
+    let Ok(keep) =
+        crate::sandbox::gc::project_keep_roots(&data_gcroots, &id, &base_revs, &mise_revs)
+    else {
+        return;
+    };
     let n = crate::sandbox::gc::prune_superseded_roots(&store_dir, &keep, false).len();
     if n > 0 {
         outln!(
