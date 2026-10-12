@@ -503,10 +503,12 @@ needs the answer the registry could not give. The preview never asks the registr
 keeps working.
 
 Which tools are undeclared is read from the configuration, so the sweep is **left alone
-while the configuration is one a launch refuses**: a config file that exists and cannot be
+while the configuration cannot be read whole**: a config file that exists and cannot be
 read declares no tool at all, a bundle the app uses and that cannot be found leaves out the
-tools it carries, and a project changed since it was approved waits for its re-approval.
-Every declared tool would otherwise read as undeclared. The preview and `--yes` both name the
+tools it carries, a project changed since it was approved waits for its re-approval, and an
+app whose profile is there but could not be loaded, or whose profiles directory cannot be
+read, is missing from the configuration altogether. Every declared tool would otherwise read
+as undeclared. The preview and `--yes` both name the
 reason and the apps left alone, and exit non-zero; under `--all` the apps whose own
 configuration reads whole are still swept. `--stale`, `--drop` and `--reset` read the home
 rather than the configuration, and go on.

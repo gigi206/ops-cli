@@ -58,7 +58,10 @@ names no revision, would leave its revision out of that set, so `sbx gc` fails c
 and names the file on stderr: `--all` skips the shared-store collection, and `--prune`
 removes no superseded build from this project's store. A directory of the out-links that say
 which builds are current, or an out-link in it, that cannot be read is met the same way:
-`--prune` removes no superseded build and names it. A distribution lock is read the same
+`--prune` removes no superseded build and names it. What each app declares is read the same
+way: while a profile is there and could not be loaded, the profiles directory cannot be read,
+or an app's bundle cannot be resolved, `--prune` drops the root of no package or inline
+flake that would read as removed. A distribution lock is read the same
 way: while one cannot be read, `--all` frees no unpacked distribution tree, and still sweeps
 the stagings an interrupted unpack left, which no lock names.
 
