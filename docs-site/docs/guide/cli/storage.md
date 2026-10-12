@@ -64,8 +64,15 @@ The one requirement is **`udisks2`**, and it is unavoidable: it is a system daem
 privilege lives with it rather than with any binary sbx could ship.
 
 `btrfs-progs` is **not** required. It is not installed on every distribution, so if the host
-has no `mkfs.btrfs`, sbx provisions `btrfs-progs` into its own store and runs it sandboxed, `init` says which it used. It is built from the channel the shared nixpkgs lock already records, so creating a volume never moves the global channel: only [`sbx upgrade nix`](upgrade) rolls that. Using a volume needs no `btrfs` binary at all: compression rides an
-extended attribute and space accounting an ioctl. Every file created on the volume inherits
+has no `mkfs.btrfs`, sbx provisions `btrfs-progs` and runs it sandboxed, `init` says which it used.
+The provisioned copy goes into a store set apart from sbx's own (`storage-tools` in the data
+directory), which is removed once the volume is formatted: the data directory's store is never
+touched, so the volume can be adopted straight after, and the nixpkgs source it is built from, a
+few hundred megabytes, does not stay behind. The price is a fresh download each time a volume is
+created. It is built from the channel the data directory's nixpkgs lock already records, which it
+reads and never writes, so creating a volume never moves that channel: only
+[`sbx upgrade nix`](upgrade) rolls it. Using a volume needs no `btrfs` binary at all: compression
+rides an extended attribute and space accounting an ioctl. Every file created on the volume inherits
 that attribute, and nix normally strips extended attributes when it finalizes a store path, which would abort a build whose files are already read-only: so on a btrfs-backed store sbx
 tells nix (host-side and in-cage alike) to leave `btrfs.compression` in place. The data was
 already written compressed, so nothing is lost.

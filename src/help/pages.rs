@@ -2164,9 +2164,10 @@ pub(super) const PAGES: &[Page] = &[
             \n\
             The one thing sbx cannot ship is `udisks`: it is a system daemon, and the privilege\n\
             lives with it rather than with any binary. Everything else it provides — if the host\n\
-            has no `mkfs.btrfs`, sbx provisions `btrfs-progs` into its own store and runs it in a\n\
-            sandbox, so creating a volume depends on no distribution package. Using one needs no\n\
-            `btrfs` binary at all.\n\
+            has no `mkfs.btrfs`, sbx provisions `btrfs-progs` into a store set apart from its\n\
+            own, runs it in a sandbox and removes that store once the volume is formatted, so\n\
+            creating a volume depends on no distribution package and the volume can still be\n\
+            adopted. Using one needs no `btrfs` binary at all.\n\
             \n\
             `init` writes the filesystem's metadata once (the `single` profile), where `mkfs.btrfs`\n\
             on its own writes it twice (`dup`). The second copy would sit in the same image file on\n\
