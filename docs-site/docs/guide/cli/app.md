@@ -393,8 +393,8 @@ home. Launching again recreates it; what is lost is the state the purge was aske
 The global home is under the data directory's `apps/`, the per-project ones under its
 `projects/`. When one of those places cannot be read, the purge still removes what it found
 elsewhere, names the place and fails: any home there, and the login state in it, is left.
-`sbx app list`, with or without `--shared`, and `sbx app prune --all` fail the same way,
-since the installed homes they read include those.
+`sbx app list`, with or without `--shared`, `sbx app prune` and `sbx app show` fail the same
+way, by name as with `--all`, since the installed homes they read include those.
 
 `--purge` on its own does **not** touch the shared per-project nix store, which backs
 every app in a project. Add **`--gc`** (which requires `--purge`) to sweep the **current
