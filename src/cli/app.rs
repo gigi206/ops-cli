@@ -1709,7 +1709,17 @@ fn open_app(verb: &str, name: &str) -> Result<AppTarget, ExitCode> {
     let cwd = config_cwd()?;
     let layout = layout_or_fail()?;
     let resolved = config::load(&cwd);
-    let homes = sandbox::inspect::app_home_dirs(layout.data_dir(), name);
+    // A place the app's homes are looked for that cannot be read is not a place that holds none:
+    // the verb stops, rather than show or sweep part of the app as all of it.
+    let homes = match sandbox::inspect::app_home_dirs(layout.data_dir(), name) {
+        Ok(homes) => homes,
+        Err(e) => {
+            diag::error(&format!(
+                "sbx: {verb}: {e}, so the homes of '{name}' there cannot be found"
+            ));
+            return Err(ExitCode::FAILURE);
+        }
+    };
     if !resolved.apps.contains_key(name) && homes.is_empty() {
         diag::error(&format!("sbx: {verb}: no app named {name:?}"));
         let declared: Vec<String> = resolved.apps.keys().cloned().collect();
@@ -1753,7 +1763,15 @@ fn app_show(args: &[OsString]) -> ExitCode {
     };
     let app = resolved.apps.get(name);
 
-    let view = build_app_show(name, app, &resolved.network, &homes, layout.data_dir());
+    let view = match build_app_show(name, app, &resolved.network, &homes, layout.data_dir()) {
+        Ok(view) => view,
+        Err(e) => {
+            diag::error(&format!(
+                "sbx: app show: {e}, so what '{name}' holds there cannot be shown"
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
     if json {
         if let Err(code) = print_json("app show", &view) {
             return code;
@@ -1858,7 +1876,7 @@ fn build_app_show(
     baseline_network: &config::NetworkPolicy,
     homes: &[sandbox::inspect::AppHome],
     data_dir: &Path,
-) -> AppShow {
+) -> std::io::Result<AppShow> {
     use crate::config::Backend;
 
     // The mise tools realized across every home of this app — the authoritative installed set for
@@ -1891,7 +1909,7 @@ fn build_app_show(
     // per project (aligned with each project's `/nix` store) rather than into the app-global home. A
     // per-project app has none (its mise data lives under its per-project home). Kept distinct from the
     // home's declared tools, and their bytes counted in the disk total.
-    let pools: Vec<AppMisePoolShow> = sandbox::inspect::app_per_project_mise_pools(data_dir, name)
+    let pools: Vec<AppMisePoolShow> = sandbox::inspect::app_per_project_mise_pools(data_dir, name)?
         .into_iter()
         .map(|pool| {
             let bytes = sandbox::tree_size(&pool.dir);
@@ -1913,23 +1931,20 @@ fn build_app_show(
     let total_bytes = home_views.iter().map(|h| h.bytes).sum::<u64>()
         + pools.iter().map(|p| p.bytes).sum::<u64>();
 
-    let packages = app
-        .map(|a| {
-            a.packages
-                .iter()
-                .map(|pkg| {
-                    let backend = pkg.backend.label();
-                    let locator = pkg.backend.locator().to_string();
-                    let installed = package_installed(pkg, &installed_tools, homes, data_dir);
-                    PackageShow {
-                        backend,
-                        locator,
-                        installed,
-                    }
+    let packages = match app {
+        Some(a) => a
+            .packages
+            .iter()
+            .map(|pkg| {
+                Ok(PackageShow {
+                    backend: pkg.backend.label(),
+                    locator: pkg.backend.locator().to_string(),
+                    installed: package_installed(pkg, &installed_tools, homes, data_dir)?,
                 })
-                .collect()
-        })
-        .unwrap_or_default();
+            })
+            .collect::<std::io::Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
 
     // Orphans: installed mise tools no declared `mise:` package accounts for. A home-only app
     // (nothing declared) surfaces its whole installed set here — the literal "everything actually
@@ -1974,7 +1989,7 @@ fn build_app_show(
         .filter(|p| p.is_file())
         .map(|p| p.display().to_string());
 
-    AppShow {
+    Ok(AppShow {
         name: name.to_string(),
         profile,
         home_scope: app.map(|a| match a.home_scope {
@@ -1995,7 +2010,7 @@ fn build_app_show(
         total_bytes,
         packages,
         orphans,
-    }
+    })
 }
 
 /// `1 tree` / `N trees` for the pinned-in count.
@@ -2017,9 +2032,9 @@ fn package_installed(
     installed_tools: &[sandbox::inspect::InstalledTool],
     homes: &[sandbox::inspect::AppHome],
     data_dir: &Path,
-) -> PackageInstalled {
+) -> std::io::Result<PackageInstalled> {
     use crate::config::Backend;
-    if pkg.state != trust::TrustState::Trusted {
+    Ok(if pkg.state != trust::TrustState::Trusted {
         PackageInstalled::Withheld
     } else if let Backend::Mise(token) = &pkg.backend {
         match installed_tools.iter().find(|t| t.is(token)) {
@@ -2053,7 +2068,7 @@ fn package_installed(
         // A `*:resolve` package's pin is keyed `resolve:<name>`, not by the `resolve`
         // sentinel `locator` carries — look it up by that key so a built one is found.
         let key = sandbox::inspect::prebuilt_pin_key(&pkg.backend, &pkg.name);
-        let hits = sandbox::inspect::prebuilt_pin_trees(data_dir, &lockfile, &key);
+        let hits = sandbox::inspect::prebuilt_pin_trees(data_dir, &lockfile, &key)?;
         match hits.first() {
             Some((_, short)) => PackageInstalled::Installed {
                 detail: format!("pinned in {} ({short})", plural_trees(hits.len())),
@@ -2076,7 +2091,7 @@ fn package_installed(
         // A backend with no specific realized-signal reader falls back here; its build
         // is in the per-project store, which `sbx projects show` details per tree.
         PackageInstalled::PerProject
-    }
+    })
 }
 
 /// Render the `sbx app show` model — a pure presenter (every color span is empty under a
@@ -2388,6 +2403,26 @@ struct PruneTotals {
     bytes: u64,
 }
 
+/// App `name`'s per-project mise pools for a prune to work through, or none when the projects
+/// directory cannot be read: that is said, and marks the run failed, since a pool there is one
+/// the prune did not reach.
+fn app_pools_or_say(
+    data_dir: &Path,
+    name: &str,
+    had_error: &mut bool,
+) -> Vec<sandbox::inspect::AppMisePool> {
+    match sandbox::inspect::app_per_project_mise_pools(data_dir, name) {
+        Ok(pools) => pools,
+        Err(e) => {
+            diag::error(&format!(
+                "sbx: app prune: {e}, so the per-project pools of '{name}' there are left alone"
+            ));
+            *had_error = true;
+            Vec::new()
+        }
+    }
+}
+
 /// `sbx app prune <name>|--all [--stale] [--drop <entry>]... [--reset] [--yes]`: remove the mise
 /// tools an app's home(s) carry that the app's config does **not** declare — the `installed
 /// (undeclared)` leftovers `sbx app show` surfaces (a former profile's tool, or one added by hand).
@@ -2492,7 +2527,16 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     };
 
     for app_name in &targets {
-        let homes = sandbox::inspect::app_home_dirs(layout.data_dir(), app_name);
+        let homes = match sandbox::inspect::app_home_dirs(layout.data_dir(), app_name) {
+            Ok(homes) => homes,
+            Err(e) => {
+                diag::error(&format!(
+                    "sbx: app prune: {e}, so the homes of '{app_name}' there cannot be found"
+                ));
+                had_error = true;
+                continue;
+            }
+        };
         // A prune deletes trees out of the home a running session of this app is using: its `PATH`
         // entries and interpreters are in `installs/`, and a cache is written to while the app runs,
         // so work in flight loses a tool or a cache mid-command and reports something that looks
@@ -2595,7 +2639,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         // self-equipped per project in a pool of its own, and a reset that left those standing
         // would leave the app equipped in some projects and bare in others.
         if reset {
-            for pool in sandbox::inspect::app_per_project_mise_pools(layout.data_dir(), app_name) {
+            for pool in app_pools_or_say(layout.data_dir(), app_name, &mut had_error) {
                 let taken = sandbox::reset_home(&pool.dir, apply);
                 if taken.is_empty() {
                     continue;
@@ -2649,7 +2693,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         // A per-project pool is governed by two files: the app's own activation record, which is
         // app-global and stays in its home, and the project's mise file, where a `mise use` without
         // `-g` writes. Reading only the first would call stale a version the project asks for.
-        for pool in sandbox::inspect::app_per_project_mise_pools(layout.data_dir(), app_name) {
+        for pool in app_pools_or_say(layout.data_dir(), app_name, &mut had_error) {
             let tree = layout.data_dir().join("projects").join(&pool.project_id);
             // A tree with no marker, or one that cannot be read, belongs to a project this cannot
             // name: its pool is left alone, the safe side for a sweep that deletes.
@@ -3469,8 +3513,9 @@ mod tests {
             std::fs::write(inst.join(".mise.backend.toml"), "short = \"nix:jq\"\n").unwrap();
         }
 
-        let homes = sandbox::inspect::app_home_dirs(d, "ag");
-        let view = build_app_show("ag", None, &config::NetworkPolicy::Shared, &homes, d);
+        let homes = sandbox::inspect::app_home_dirs(d, "ag").expect("read the fixture's homes");
+        let view = build_app_show("ag", None, &config::NetworkPolicy::Shared, &homes, d)
+            .expect("read the fixture's trees");
 
         // both pools captured, each holding exactly the self-equip; the pool tools are kept separate
         // from the app-global home's tools (the declared-package matching stays home-only).

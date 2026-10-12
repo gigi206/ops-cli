@@ -9,6 +9,7 @@
     reason = "both `expect`s stand inside a loop the depth counter guards: it is entered only while more than one level is held, so the pop and the peek below it both have one"
 )]
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// A mise tool present under a home's `installs/` dir, by its on-disk (munged) directory name and
@@ -253,36 +254,67 @@ pub(crate) struct AppHome {
 /// and each per-project home `<data>/projects/<id>/apps/<name>/home`. Only existing directories are
 /// returned, global first then per-project sorted by id. Read-only; a missing tree is simply no
 /// homes.
-pub(crate) fn app_home_dirs(data_dir: &Path, name: &str) -> Vec<AppHome> {
+///
+/// A global home, or a projects directory, that cannot be looked at is an error which names it:
+/// the homes there hold the app's tools and login state, and a list without them would say the app
+/// has none.
+pub(crate) fn app_home_dirs(data_dir: &Path, name: &str) -> io::Result<Vec<AppHome>> {
     let mut homes = Vec::new();
     let global = data_dir.join("apps").join(name).join("home");
-    if global.is_dir() {
-        homes.push(AppHome {
+    match std::fs::metadata(&global) {
+        Ok(meta) if meta.is_dir() => homes.push(AppHome {
             dir: global,
             global: true,
             project_id: None,
-        });
+        }),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot read {}: {e}", global.display()),
+            ));
+        }
     }
-    if let Ok(projects) = std::fs::read_dir(data_dir.join("projects")) {
-        let mut per_project: Vec<AppHome> = projects
-            .flatten()
-            .filter_map(|p| {
-                if !p.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    return None;
-                }
-                let id = p.file_name().to_string_lossy().into_owned();
-                let dir = p.path().join("apps").join(name).join("home");
-                dir.is_dir().then_some(AppHome {
-                    dir,
-                    global: false,
-                    project_id: Some(id),
-                })
+    let mut per_project: Vec<AppHome> = project_trees(data_dir)?
+        .into_iter()
+        .filter_map(|(id, tree)| {
+            let dir = tree.join("apps").join(name).join("home");
+            dir.is_dir().then_some(AppHome {
+                dir,
+                global: false,
+                project_id: Some(id),
             })
-            .collect();
-        per_project.sort_by(|a, b| a.project_id.cmp(&b.project_id));
-        homes.extend(per_project);
+        })
+        .collect();
+    per_project.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+    homes.extend(per_project);
+    Ok(homes)
+}
+
+/// The project trees under `<data>/projects/`, as `(id, path)`. None when the directory does not
+/// exist yet; an error naming it when it, or an entry of it, cannot be read, since every caller
+/// looks for an app's state in those trees and a short list would say the app has none there.
+fn project_trees(data_dir: &Path) -> io::Result<Vec<(String, PathBuf)>> {
+    let projects = data_dir.join("projects");
+    let unread =
+        |e: io::Error| io::Error::new(e.kind(), format!("cannot read {}: {e}", projects.display()));
+    let entries = match std::fs::read_dir(&projects) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(unread(e)),
+    };
+    let mut trees = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(unread)?;
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            trees.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path(),
+            ));
+        }
     }
-    homes
+    Ok(trees)
 }
 
 /// A global app's per-project mise pool on disk — `<data>/projects/<id>/apps/<name>/mise`, where a
@@ -300,26 +332,21 @@ pub(crate) struct AppMisePool {
 
 /// The per-project mise pools app `name` has on disk — one per project tree carrying a
 /// `projects/<id>/apps/<name>/mise` dir (a global app that self-equipped in that project). Sorted by
-/// project id. Read-only; a project without the dir contributes nothing.
-pub(crate) fn app_per_project_mise_pools(data_dir: &Path, name: &str) -> Vec<AppMisePool> {
+/// project id. Read-only; a project without the dir contributes nothing, and a projects directory
+/// that cannot be read is an error ([`project_trees`]).
+pub(crate) fn app_per_project_mise_pools(
+    data_dir: &Path,
+    name: &str,
+) -> io::Result<Vec<AppMisePool>> {
     let mut pools = Vec::new();
-    let Ok(projects) = std::fs::read_dir(data_dir.join("projects")) else {
-        return pools;
-    };
-    for p in projects.flatten() {
-        if !p.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let dir = p.path().join("apps").join(name).join("mise");
+    for (project_id, tree) in project_trees(data_dir)? {
+        let dir = tree.join("apps").join(name).join("mise");
         if dir.is_dir() {
-            pools.push(AppMisePool {
-                project_id: p.file_name().to_string_lossy().into_owned(),
-                dir,
-            });
+            pools.push(AppMisePool { project_id, dir });
         }
     }
     pools.sort_by(|a, b| a.project_id.cmp(&b.project_id));
-    pools
+    Ok(pools)
 }
 
 /// The other apps' per-project mise install pools in one project tree — the inverse of
@@ -397,27 +424,21 @@ pub(crate) fn project_mise_neighbours(
 /// `locator`, returning `(tree_id, short_pin)` per hit (the second column — a content hash or flake
 /// revision — shortened). `lockfile` is `deb-packages.lock` / `appimage-packages.lock` /
 /// `flake-packages.lock`, which share the `key\tpin[\t…]` line format keyed by the declared locator.
-/// Sorted by tree id. Read-only.
+/// Sorted by tree id. Read-only; a projects directory that cannot be read is an error
+/// ([`project_trees`]).
 pub(crate) fn prebuilt_pin_trees(
     data_dir: &Path,
     lockfile: &str,
     locator: &str,
-) -> Vec<(String, String)> {
+) -> io::Result<Vec<(String, String)>> {
     let mut hits = Vec::new();
-    let Ok(projects) = std::fs::read_dir(data_dir.join("projects")) else {
-        return hits;
-    };
-    for project in projects.flatten() {
-        if !project.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let id = project.file_name().to_string_lossy().into_owned();
-        if let Some(short) = prebuilt_pin_in(&project.path(), lockfile, locator) {
+    for (id, tree) in project_trees(data_dir)? {
+        if let Some(short) = prebuilt_pin_in(&tree, lockfile, locator) {
             hits.push((id, short));
         }
     }
     hits.sort();
-    hits
+    Ok(hits)
 }
 
 /// The pin `locator` has in one project tree's `lockfile`, or `None` if the tree does not pin it.
@@ -1157,7 +1178,7 @@ mod tests {
         // a project where this app has only a home (a per-project app, or no self-equip) — no pool
         std::fs::create_dir_all(data.join("projects/p3/apps/ag/home")).unwrap();
 
-        let pools = app_per_project_mise_pools(data, "ag");
+        let pools = app_per_project_mise_pools(data, "ag").expect("read the fixture's trees");
         assert_eq!(
             pools
                 .iter()
@@ -1196,7 +1217,8 @@ mod tests {
             "https://other.example/x.deb\tsha256-00\n",
         );
 
-        let hits = prebuilt_pin_trees(data, "deb-packages.lock", "https://example.com/app.deb");
+        let hits = prebuilt_pin_trees(data, "deb-packages.lock", "https://example.com/app.deb")
+            .expect("read the fixture's trees");
         assert_eq!(hits.len(), 2, "two trees pin it: {hits:?}");
         assert_eq!(hits[0], ("aaaaaaaaaaaaaaaa".into(), "DEADBEEF".into()));
         assert_eq!(hits[1].0, "bbbbbbbbbbbbbbbb");
