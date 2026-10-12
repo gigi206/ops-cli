@@ -102,15 +102,21 @@ fn kernel_has_dummy() -> bool {
 }
 
 /// `common::bwrap_on_path` and `common::nft_on_path` name the program a launch's search of `PATH`
-/// would take: the first file there this process may execute. One it may not execute is no program
-/// that search takes, and a test that runs it itself waits on a program that never started, as the
-/// stand-in below would, which `exec`s the bwrap it is given.
+/// would take: the first file this process may execute, in an absolute entry. One it may not
+/// execute is no program that search takes, and a test that runs it itself waits on a program that
+/// never started, as the stand-in below would, which `exec`s the bwrap it is given. An entry that
+/// is not absolute names a directory relative to wherever the test runs, and that search reads
+/// none.
 #[test]
 fn a_program_on_path_is_one_this_process_may_execute() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = TmpDir::new("onpath");
-    let (unrunnable, runnable) = (dir.join("unrunnable"), dir.join("runnable"));
-    for (entry, mode) in [(&unrunnable, 0o644), (&runnable, 0o755)] {
+    let (unrunnable, runnable, reached) = (
+        dir.join("unrunnable"),
+        dir.join("runnable"),
+        dir.join("reached"),
+    );
+    for (entry, mode) in [(&unrunnable, 0o644), (&runnable, 0o755), (&reached, 0o755)] {
         std::fs::create_dir(entry).unwrap();
         let program = entry.join("tool");
         std::fs::write(&program, "#!/bin/sh\n").unwrap();
@@ -121,6 +127,24 @@ fn a_program_on_path_is_one_this_process_may_execute() {
         common::program_in("tool", &path),
         Some(runnable.join("tool")),
         "a file this process may not execute is passed over"
+    );
+
+    // `reached` named from the working directory: one `..` per level climbs to `/`, and the path
+    // then descends from there. Its `tool` is executable, and the entry is still not read.
+    let cwd = std::env::current_dir().expect("the working directory");
+    let relative = std::iter::repeat_n(std::path::Path::new(".."), cwd.components().count())
+        .collect::<std::path::PathBuf>()
+        .join(
+            reached
+                .strip_prefix("/")
+                .expect("a fixture path is absolute"),
+        );
+    assert!(relative.join("tool").is_file(), "{}", relative.display());
+    let path = std::env::join_paths([&relative, &runnable]).unwrap();
+    assert_eq!(
+        common::program_in("tool", &path),
+        Some(runnable.join("tool")),
+        "an entry that is not absolute is not read"
     );
 }
 
