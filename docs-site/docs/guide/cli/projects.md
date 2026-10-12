@@ -118,8 +118,7 @@ launch is provisioning, and once it has the lock it sees that launch's session, 
 
 Which trees a session holds is read from the session registry. When it cannot be read, a removal
 and an applied sweep refuse, since a live session cannot be ruled out. A preview still names the
-trees, each one removable *unless a session holds it*, and the applied form refuses until the
-registry can be read.
+trees, each one removable *unless a session holds it*.
 
 ## Examples
 
