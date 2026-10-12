@@ -307,6 +307,16 @@ fn is_runtime_tree(dir: &std::path::Path) -> bool {
     std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
 }
 
+/// What stands in for a tree's project path when there is none to show. A marker that cannot be
+/// read is not an absent one: the project exists, and only its path is unknown.
+fn no_project_path(state: &str) -> &'static str {
+    if state == super::gc::TreeState::Unreadable.label() {
+        "marker unreadable"
+    } else {
+        "no marker"
+    }
+}
+
 /// The realized nix store roots of a project tree, grouped by backend, for `sbx projects show`.
 #[derive(serde::Serialize, Default)]
 struct StoreRootsView {
@@ -608,7 +618,11 @@ fn render_project_show(v: &ProjectShowView, pal: &crate::style::Palette) -> Stri
             let _ = writeln!(s, "  path:     {}", crate::diag::visible(p));
         }
         None => {
-            let _ = writeln!(s, "  path:     {dim}(no marker — project path unknown){r}");
+            let _ = writeln!(
+                s,
+                "  path:     {dim}({} — project path unknown){r}",
+                no_project_path(v.state)
+            );
         }
     }
     let _ = writeln!(s, "  last:     {dim}{}{r}", v.last_used);
@@ -682,10 +696,14 @@ fn render_project_show(v: &ProjectShowView, pal: &crate::style::Palette) -> Stri
     }
     // Declared-but-not-built (the useful direction of declared-vs-installed).
     if !v.config_available {
-        let _ = writeln!(
-            s,
-            "  {dim}(project directory is gone — showing realized state only){r}"
-        );
+        // A recorded path that names nothing is a project that is gone; no recorded path is a
+        // project that cannot be named, which says nothing about whether it still exists.
+        let why = if v.project.is_some() {
+            "project directory is gone"
+        } else {
+            "project path unknown"
+        };
+        let _ = writeln!(s, "  {dim}({why} — showing realized state only){r}");
     } else if v.unbuilt.is_empty() {
         let _ = writeln!(
             s,
@@ -764,10 +782,10 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
         };
         // Read from the tree's marker: a directory name is any bytes, so it is written escaped, as
         // `sbx config show` writes a value. `--json` keeps the bytes.
-        let path = row
-            .project
-            .as_deref()
-            .map_or_else(|| "(no marker)".to_string(), crate::diag::visible);
+        let path = row.project.as_deref().map_or_else(
+            || format!("({})", no_project_path(row.state)),
+            crate::diag::visible,
+        );
         outln!(
             "  {n}{id}{r}  {state}  {size}  {dim}{last}{r}  {path}{mark}",
             id = row.id,
@@ -1297,6 +1315,29 @@ mod projects_show_tests {
             text.contains("path:     /work/proj\\x1b[2J\\u{202e}x"),
             "{text:?}"
         );
+    }
+
+    /// A tree with no project path to show says why: no marker, or one that cannot be read. Neither
+    /// says the project is gone, which only a recorded path that names nothing shows.
+    #[test]
+    fn a_tree_without_a_project_path_says_why_and_not_that_it_is_gone() {
+        for (state, why) in [
+            ("markerless", "(no marker — project path unknown)"),
+            ("unreadable", "(marker unreadable — project path unknown)"),
+        ] {
+            let view = ProjectShowView {
+                state,
+                config_available: false,
+                ..a_view()
+            };
+            let text = render_project_show(&view, &crate::style::Palette::plain());
+            assert!(text.contains(why), "{state}: {text}");
+            assert!(
+                text.contains("(project path unknown — showing realized state only)")
+                    && !text.contains("project directory is gone"),
+                "{state}: {text}"
+            );
+        }
     }
 
     /// A link at a tree's name is not a runtime tree: `sbx projects list` does not list it, and
