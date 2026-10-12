@@ -130,7 +130,7 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
     let data = TmpDir::prefixed("a", "data");
     std::fs::write(
         project.path().join(".sbx.toml"),
-        "[app.probe]\ncmd = [\"sleep\", \"300\"]\n",
+        "[app.probe]\ncmd = [\"sleep\", \"300.381\"]\n",
     )
     .unwrap();
 
@@ -139,6 +139,11 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
         sandbox_probe(project.path(), data.path())
     );
 
+    // The agent's `sleep` carries a fingerprint unique across the suites ([`common::procs`]), so the
+    // sweep that backs the kill below, for a panic before it, signals nothing but this cage's. Five
+    // minutes outlast the registration and attach waits, and bound what a test binary killed
+    // outright, which runs no sweep, leaves behind.
+    let _sweep = common::procs::FingerprintCleanup(vec!["300.381"]);
     // Launch the app in the background: it registers a global-app session and `exec`s into the
     // cage running `sleep`, so the spawned pid is the session's pid throughout.
     let mut agent = sbx()
