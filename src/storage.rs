@@ -1825,8 +1825,8 @@ pub(crate) fn down(image: &Path) -> Result<(), String> {
                 .arg("unmount")
                 .arg("-b")
                 .arg(&loop_dev))?;
-            // udisks attaches with autoclear, so the kernel may release the device on its own as
-            // soon as the unmount completes: there is then nothing left to delete.
+            // The device may already be gone once the unmount completes, and there is then nothing
+            // left to delete.
             if matches!(state(image), Ok(State::Detached)) {
                 return Ok(());
             }
@@ -1840,10 +1840,10 @@ const RELEASE_CHECKS: u32 = 10;
 
 /// What a `loop-delete` amounts to, given how the image stands after it.
 ///
-/// udisks attaches the volume with autoclear, so the kernel releases the loop device by itself
-/// once nothing holds it, and a `loop-delete` that arrives after that fails with "No such device
-/// or address" over a device that is gone, which is what `down` was asked for. So a failure is
-/// weighed against the state rather than its message: the image no longer backing any loop device
+/// A `loop-delete` can fail with "No such device or address" over a device that is already gone,
+/// which is what `down` was asked for. Not through autoclear: the loop devices udisks attaches here
+/// carry none (measured: `loop/autoclear` reads 0 on a mounted volume). So a failure is weighed
+/// against the state rather than its message: the image no longer backing any loop device
 /// is success, read again up to `checks` times `pause` apart while a release may still be under
 /// way. Anything else, an unreadable state included, leaves the failure standing. That rests on
 /// [`state`] answering [`State::Detached`] only when no loop device backs the image, and an error
@@ -3026,12 +3026,12 @@ this line has no separator at all
         );
     }
 
-    /// A `loop-delete` that loses the race with udisks' autoclear fails over a device the kernel has
-    /// already released. That is what `down` was asked for, so it is a success once the image backs
-    /// no loop device, including when the release lands a moment later. A device still attached, or
+    /// A `loop-delete` that fails over a device already released did what `down` was asked for, so
+    /// it is a success once the image backs no loop device, including when the release lands a
+    /// moment later. A device still attached, or
     /// a state that cannot be read, leaves the failure as it was.
     #[test]
-    fn a_loop_delete_that_loses_the_race_with_autoclear_is_not_a_failure() {
+    fn a_loop_delete_over_a_device_already_released_is_not_a_failure() {
         let pause = std::time::Duration::ZERO;
         let attached = || State::Attached {
             loop_dev: "/dev/loop7".to_string(),
