@@ -199,21 +199,26 @@ fn no_shipped_profile_carries_a_key_sbx_does_not_know() {
 /// The command string the shell invocation `argv` runs, `argv[0]` being the shell: the first
 /// operand after its options, when one of them is `-c`, alone or in a cluster (`-lc`, `-ce`).
 ///
-/// Read as the shell reads it, so an option between the shell and `-c` does not hide the script:
-/// `-o`/`+o`, `--rcfile` and `--init-file` take the next word as their argument, any other word
-/// opening on `-` or `+` is an option, and `--` ends them.
+/// The options are read so that one between the shell and `-c` does not hide the script: a cluster
+/// holding `o` or `O` (`-o`, `+O`, `-euo`) takes the next word as its argument, as `--rcfile` and
+/// `--init-file` do, any other word opening on `-` or `+` is an option, and `--` ends them. Other
+/// long options that take an argument are not known here, and would read as the operand.
 fn shell_command_string(argv: &[String]) -> Option<&String> {
     let mut words = argv.iter().skip(1);
     let mut runs_a_string = false;
     while let Some(word) = words.next() {
         match word.as_str() {
             "--" => return words.next().filter(|_| runs_a_string),
-            "-o" | "+o" | "--rcfile" | "--init-file" => {
+            "--rcfile" | "--init-file" => {
                 words.next();
             }
             option if option.starts_with("--") => {}
             option if option.len() > 1 && (option.starts_with('-') || option.starts_with('+')) => {
-                runs_a_string |= option.starts_with('-') && option.contains('c');
+                let letters = &option[1..];
+                runs_a_string |= option.starts_with('-') && letters.contains('c');
+                if letters.contains(['o', 'O']) {
+                    words.next();
+                }
             }
             _ => return runs_a_string.then_some(word),
         }
@@ -2203,6 +2208,10 @@ fn a_shells_command_string_is_found_past_its_other_options() {
         &["bash", "-ce", "s"],
         &["bash", "--rcfile", "f", "-c", "s"],
         &["bash", "-c", "--", "s"],
+        &["bash", "-eo", "pipefail", "-c", "s"],
+        &["bash", "-euo", "pipefail", "-c", "s"],
+        &["bash", "-O", "extglob", "-c", "s"],
+        &["bash", "+O", "extglob", "-c", "s"],
     ] {
         assert_eq!(
             shell_command_string(&argv(runs)).map(String::as_str),
