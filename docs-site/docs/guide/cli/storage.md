@@ -186,6 +186,9 @@ leave its store, projects and app homes behind, not move them.
 The image is created **beside** the data directory (`<xdg-data>/sbx-storage.btrfs`), never
 inside it, the volume is what that directory becomes. `--image <path>` puts it elsewhere, on
 another disk for instance; it must be absolute, and is refused before anything mounts otherwise.
+The image is owner-only, as the directories `init` creates on the way to it are: it is the whole
+data directory, readable byte for byte by anyone who can read it. One that other accounts can
+read is narrowed to owner-only the next time sbx uses it, and sbx says so.
 `init` formats the volume from an empty directory it creates beside the image under the same
 name, `x.seed` for `x.btrfs`, and removes it afterwards. A directory already at that name is
 refused rather than emptied or reused, since it may be yours; one a format that did not finish
