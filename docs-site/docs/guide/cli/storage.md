@@ -195,7 +195,10 @@ Adopting a volume records its path as one quoted line in `storage.toml`, which i
 without unescaping. So the path may be anything absolute that carries no quote, no backslash and
 no control character; spaces and accents are fine. A path that carries one is refused the moment
 you pass it, with a message saying which character, rather than being written and read back later
-as a different path.
+as a different path, or not at all. Edited by hand, the line may end with a `#` comment; any other
+text after the closing quote, or a value that is not one double-quoted path, makes every launch
+refuse until the line is fixed. A line removed, commented out or emptied names no volume at all:
+sbx stops following it, as `sbx storage unuse` does, and moves nothing back.
 
 ## Choosing the size
 
