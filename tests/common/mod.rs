@@ -426,6 +426,28 @@ pub fn sbx(args: &[&str]) -> Output {
         .expect("spawn sbx")
 }
 
+/// The binary under test, its global config and its trust store read from fixed empty directories
+/// under the test tree, `<prefix>isolated-config` and `<prefix>isolated-state`, rather than from the
+/// developer's own. A launch in a project that carries a config otherwise looks its trust marker up
+/// in their `~/.local/state/sbx`, and a cage would answer in their locale, which is pinned for the
+/// reason [`project::Project::cmd_in`] gives.
+///
+/// A variable the caller sets again afterwards wins, since [`Command::env`] keeps the last value.
+pub fn isolated_sbx(prefix: &str) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
+    for (var, dir) in [
+        ("XDG_CONFIG_HOME", "isolated-config"),
+        ("XDG_STATE_HOME", "isolated-state"),
+    ] {
+        let path = fixture_root().join(format!("{prefix}{dir}"));
+        std::fs::create_dir_all(&path)
+            .unwrap_or_else(|e| panic!("`{}` cannot be created: {e}", path.display()));
+        cmd.env(var, path);
+    }
+    cmd.env("LC_ALL", "C.UTF-8").env_remove("LANG");
+    cmd
+}
+
 /// The first `nft` on `PATH`, where a launch looks for the one that installs its capture redirect,
 /// or `None` on a host without nftables. Without it a launch wires no capture tap, and says nothing.
 pub fn nft_on_path() -> Option<std::path::PathBuf> {
