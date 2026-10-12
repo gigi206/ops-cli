@@ -254,6 +254,13 @@ fn collect_project_trees(layout: &crate::store::Layout) -> std::io::Result<Vec<P
     Ok(rows)
 }
 
+/// Whether `dir` is a runtime tree: a directory in its own right. A link at a tree's name is not
+/// one, as `sbx projects list` does not list it: `show` does not read what it points at, and `rm`
+/// does not take a lock beside it.
+fn is_runtime_tree(dir: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+}
+
 /// The realized nix store roots of a project tree, grouped by backend, for `sbx projects show`.
 #[derive(serde::Serialize, Default)]
 struct StoreRootsView {
@@ -358,7 +365,7 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
     }
     let data = layout.data_dir();
     let dir = data.join("projects").join(id);
-    if !dir.is_dir() {
+    if !is_runtime_tree(&dir) {
         crate::diag::error(&format!(
             "sbx projects show: no runtime tree `{id}` — run `sbx projects list` to see them."
         ));
@@ -847,8 +854,7 @@ pub(crate) fn projects_rm(
         // launch that comes later waits for the removal. Taken only on a tree that is a directory
         // in its own right, since taking it creates the lock file and the directories above it.
         let mut held = None;
-        let is_tree = std::fs::symlink_metadata(projects_dir.join(id)).is_ok_and(|m| m.is_dir());
-        if apply && is_tree {
+        if apply && is_runtime_tree(&projects_dir.join(id)) {
             let locked = crate::sandbox::projectstore::lock_project_store(&layout, id, &|lock| {
                 crate::diag::note(&format!(
                     "waiting for the project's store lock `{}`, which a launch of the project \
@@ -1202,6 +1208,31 @@ mod projects_show_tests {
         assert!(
             line.contains("forged") && line.contains("= 1.0"),
             "the whole value stays on its own line: {text:?}"
+        );
+    }
+
+    /// A link at a tree's name is not a runtime tree: `sbx projects list` does not list it, and
+    /// `show` answers that no tree has that id rather than reading what the link points at.
+    #[test]
+    fn a_link_at_a_trees_name_is_not_shown_as_a_tree() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        let data = TmpDir::new();
+        let _lock = env_lock();
+        let _data = EnvVar::set("SBX_DATA_DIR", data.path());
+        let layout = crate::store::Layout::from_env().expect("a layout under the fixture root");
+        let target = data.path().join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            target.join(crate::sandbox::projectstore::PROJECT_MARKER),
+            "/a/project",
+        )
+        .unwrap();
+        let projects = layout.data_dir().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::os::unix::fs::symlink(&target, projects.join("0123456789abcdef")).unwrap();
+        assert_eq!(
+            projects_show("0123456789abcdef", true, &crate::style::Palette::plain()),
+            ExitCode::from(2)
         );
     }
 }
