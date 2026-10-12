@@ -642,7 +642,15 @@ pub fn walk() -> Vec<Vec<String>> {
     /// not contain: `sbx help` has no page of its own (`sbx help help` is refused), so probing the
     /// path verbatim would answer "not a page" for `help` and prune the mirrored half of the tree —
     /// the half this walk exists to cover.
+    ///
+    /// A flag is never a page, and is not asked about. A name is either a page, which `sbx help`
+    /// shows under its header, or a name `sbx help` refuses as having none: any other answer is a
+    /// fault, and fails the test. Read as "not a page", it would take the name's whole subtree out
+    /// of the sweeps without a word.
     fn is_page(path: &[String]) -> bool {
+        if path.last().is_some_and(|w| w.starts_with('-')) {
+            return false;
+        }
         let under_help = path.first().is_some_and(|w| w == "help");
         let probed: Vec<&str> = path
             .iter()
@@ -656,7 +664,18 @@ pub fn walk() -> Vec<Vec<String>> {
         let mut argv = vec!["help"];
         argv.extend(probed.iter().copied());
         let out = sbx(&argv);
-        out.status.success() && stdout_of(&out).contains(&format!("sbx {} —", probed.join(" ")))
+        let (stdout, stderr) = (stdout_of(&out), String::from_utf8_lossy(&out.stderr));
+        if out.status.success() && stdout.contains(&format!("sbx {} —", probed.join(" "))) {
+            return true;
+        }
+        if out.status.code() == Some(2) && stderr.starts_with("sbx: no help for ") {
+            return false;
+        }
+        panic!(
+            "`sbx {}` neither showed a page nor said there is none ({}):\n{stdout}{stderr}",
+            argv.join(" "),
+            out.status
+        );
     }
     let mut found: Vec<Vec<String>> = Vec::new();
     let mut queue: Vec<Vec<String>> = vec![Vec::new()];
