@@ -1712,6 +1712,61 @@ fn sbx_app_rm_purge_removes_the_installed_homes_and_lists_them() {
     );
 }
 
+/// Every per-project home of an app is under `projects/`: a purge that cannot read that directory
+/// has not removed them, and says so rather than announcing the app purged. With no home left
+/// where it can look, it does not say there is nothing to purge, which it could not have found out.
+#[test]
+fn sbx_app_rm_purge_over_an_unreadable_projects_directory_is_not_clean() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fx = Project::new("app");
+    let sbx_dir = fx.data_home.path().join("sbx");
+    touch_under(&sbx_dir.join("apps/claude/home/state"));
+    touch_under(&sbx_dir.join("projects/testproj/apps/claude/home/state"));
+    touch_under(&sbx_dir.join("apps/codex/home/state"));
+    let projects = sbx_dir.join("projects");
+    let mode = |m| std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(m));
+    mode(0o000).unwrap();
+    if std::fs::read_dir(&projects).is_ok() {
+        mode(0o700).unwrap();
+        skip_incapable!("running as root, which reads a directory its mode refuses");
+        return;
+    }
+    // What an app holds alone counts its per-project trees, which this listing cannot see.
+    let shared = fx.run(&["app", "list", "--shared"]);
+    let purged = fx.run(&["app", "rm", "claude", "--purge"]);
+    let again = fx.run(&["app", "rm", "claude", "--purge"]);
+    mode(0o700).unwrap();
+
+    assert!(
+        !shared.status.success() && String::from_utf8_lossy(&shared.stderr).contains("cannot read"),
+        "--shared measured the apps without their per-project trees: {}",
+        text(&shared)
+    );
+
+    assert_eq!(purged.status.code(), Some(1), "{}", text(&purged));
+    assert!(
+        String::from_utf8_lossy(&purged.stdout).contains("purged with errors")
+            && String::from_utf8_lossy(&purged.stderr).contains("could not be found"),
+        "the purge read as clean: {}",
+        text(&purged)
+    );
+    assert!(
+        !sbx_dir.join("apps/claude").exists(),
+        "the global home is the app's whatever projects/ holds, and is still purged"
+    );
+    assert!(
+        sbx_dir
+            .join("projects/testproj/apps/claude/home/state")
+            .exists()
+    );
+    assert!(!again.status.success(), "{}", text(&again));
+    assert!(
+        !String::from_utf8_lossy(&again.stderr).contains("nothing to purge"),
+        "a purge that could not look said there was nothing to purge: {}",
+        text(&again)
+    );
+}
+
 #[test]
 fn sbx_app_rm_purges_several_apps_in_one_call() {
     let fx = Project::new("app");
