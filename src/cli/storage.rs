@@ -1194,10 +1194,9 @@ fn render(v: &StatusView) {
 // adopts one without asking: the volume is the default, and the plain directory is what sbx keeps
 // when the volume cannot be set up. A data directory that already holds data gets one line pointing
 // at `sbx storage migrate` instead. Either way it happens once, recorded so it never repeats. It is
-// confined to a real terminal: an agent, a pipe or CI never has its storage decided for it, and
-// neither does a cron job or a service unit, which run outside the local active session udisks
-// mounts in without a password. `sbx doctor` stays the standing route to a volume for a data
-// directory that kept the plain layout.
+// confined to a real terminal, so an agent, a pipe, CI, a cron job or a service unit never has its
+// storage decided for it. `sbx doctor` stays the standing route to a volume for a data directory
+// that kept the plain layout.
 // ---------------------------------------------------------------------------------------------
 
 /// The full rule for whether the first-launch step runs, as a pure predicate over its six signals —
@@ -1309,8 +1308,8 @@ fn settle_first_launch(default_dir: &Path, pre: &storage::Preflight) {
                 &format!("sbx: now using the volume at {}", mount_point.display()),
             );
             diag::hint(
-                "     after a reboot, run the first sbx command from your desktop session: udisks \
-                 mounts the volume without a password only there.",
+                "     after a reboot, open your desktop session before the first sbx command: \
+                 udisks mounts the volume without a password while it is open.",
             );
             diag::hint(
                 "     `sbx storage unuse` goes back to a plain directory, whose store is then \
