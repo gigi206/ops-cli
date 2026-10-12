@@ -68,8 +68,12 @@ fn wait_for_session(data: &Path, pid: u32, deadline: Instant) -> Option<PathBuf>
     let dir = data.join("sbx").join("sessions");
     let prefix = format!("{pid}-");
     while Instant::now() < deadline {
+        // Absent until the first session registers; once there, an entry that cannot be read is an
+        // error to report rather than a reason to keep waiting.
         if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
+            for entry in entries {
+                let entry =
+                    entry.unwrap_or_else(|e| panic!("{} cannot be read: {e}", dir.display()));
                 if entry.file_name().to_string_lossy().starts_with(&prefix) {
                     return Some(entry.path());
                 }
@@ -150,14 +154,18 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
         .expect("spawn sbx app probe");
     let pid = agent.id();
 
-    let record = wait_for_session(data.path(), pid, Instant::now() + Duration::from_secs(60));
+    // The probe above has shown this host can build a cage, so a session that never registers is
+    // a failure of the launch, not a host that cannot sandbox. The wait is the one `drive_attach`
+    // allows a shell, so a slow runner is not mistaken for that failure.
+    let waited = Instant::now();
+    let record = wait_for_session(data.path(), pid, waited + Duration::from_secs(120));
     if record.is_none() {
         let _ = agent.kill();
         let _ = agent.wait();
-        skip_incapable!(
-            "skipping sbx attach app e2e: the app session never registered (cannot sandbox?)"
+        panic!(
+            "the app session {pid} never registered within {:?}, on a host the probe showed can sandbox",
+            waited.elapsed()
         );
-        return;
     }
 
     // Attach and have the shell drop a marker into its $HOME.
