@@ -112,6 +112,10 @@ Two trees are always protected:
   when the working directory cannot be resolved, since the current project cannot then be
   told apart from the others.
 
+A named removal first waits for any launch of that project still setting up. Such a launch holds
+the project's store lock until its session is recorded, so the removal never deletes a tree a
+launch is provisioning, and once it has the lock it sees that launch's session, if one started.
+
 ## Examples
 
 ```sh
