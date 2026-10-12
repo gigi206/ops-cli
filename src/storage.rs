@@ -314,10 +314,38 @@ pub(crate) fn ensure_mounted(image: &Path) -> Result<PathBuf, String> {
         ..
     }) = state(image)
     {
+        // Every launch that follows a volume comes through here, mounted or not.
+        narrow_image(image);
         // Checked on the way out, not only where the mount is made — see [`refuse_noexec`].
         return refuse_noexec(mount_point, &options);
     }
     up(image)
+}
+
+/// Narrow the image to owner-only when other accounts can reach it, and say whether it was.
+///
+/// The image is the whole data directory once adopted, and an account that can read it reads every
+/// byte of that by loop-mounting a copy. So it gets what `store::ensure` gives the data directory:
+/// one looser than owner-only is tightened where it is used, not only where `init` creates it.
+fn narrow_image_mode(image: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(image)?.permissions().mode();
+    if mode & 0o077 == 0 {
+        return Ok(false);
+    }
+    std::fs::set_permissions(image, std::fs::Permissions::from_mode(mode & 0o700))?;
+    Ok(true)
+}
+
+/// [`narrow_image_mode`], said when it narrowed something. A failure is left unsaid: a filesystem
+/// that cannot hold the mode would answer with one on every launch, and the volume works the same.
+fn narrow_image(image: &Path) {
+    if let Ok(true) = narrow_image_mode(image) {
+        crate::diag::note(&format!(
+            "{} could be read by other accounts; it is now owner-only",
+            image.display()
+        ));
+    }
 }
 
 /// Whether a label is safe to become both a filesystem label and a path component. Refuses
@@ -1707,6 +1735,8 @@ fn mounted_here(
 /// volume is reported, not mounted twice.
 pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
     let _lock = lock_image(image).map_err(|e| format!("cannot lock {}: {e}", image.display()))?;
+    // Before anything else, so a mount that goes on to fail leaves the image narrowed all the same.
+    narrow_image(image);
     let udisks = tool("udisksctl", "udisks2")?;
 
     // Whether this call attached the loop device, and so is the one to release it if the mount
@@ -3659,6 +3689,34 @@ this line has no separator at all
             lock_path(Path::new("/d/sbx/storage-tools")),
             Path::new("/d/sbx/storage-tools.lock")
         );
+    }
+
+    /// An image other accounts can read or write is narrowed to owner-only; one that already is, is
+    /// left as it is, and so is the owner's own access.
+    #[test]
+    fn an_image_others_can_reach_is_narrowed_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::testutil::TmpDir::new();
+        let image = base.path().join("vol.btrfs");
+        std::fs::write(&image, b"").unwrap();
+        let mode = || std::fs::metadata(&image).unwrap().permissions().mode() & 0o777;
+
+        let mut wrong = Vec::new();
+        for (before, after, narrowed) in [
+            (0o664, 0o600, true),
+            (0o640, 0o600, true),
+            (0o600, 0o600, false),
+        ] {
+            std::fs::set_permissions(&image, std::fs::Permissions::from_mode(before)).unwrap();
+            let said = narrow_image_mode(&image).expect("the image is there");
+            if (mode(), said) != (after, narrowed) {
+                wrong.push(format!(
+                    "{before:o}: became {:o}, narrowed {said}, where {after:o} and {narrowed} were wanted",
+                    mode()
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     #[test]
