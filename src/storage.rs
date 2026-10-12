@@ -1392,6 +1392,8 @@ pub(crate) fn mkfs_command(
         OsString::from(label),
         OsString::from("--rootdir"),
         seed.as_os_str().to_os_string(),
+        // Options end before the one positional, so an image path beginning with `-` is a path.
+        OsString::from("--"),
         image.as_os_str().to_os_string(),
     ];
     match mkfs {
@@ -3155,6 +3157,9 @@ this line has no separator at all
                 "l",
                 "--rootdir",
                 "/data/vol/sbx-storage.seed",
+                // The image is the one positional, and options end before it: a path beginning
+                // with `-` would otherwise be read as one.
+                "--",
                 "/data/vol/sbx-storage.btrfs"
             ]
         );
@@ -3237,7 +3242,7 @@ this line has no separator at all
         );
         // The command still ends with the real invocation, arguments intact.
         assert_eq!(
-            &a[a.len() - 8..],
+            &a[a.len() - 9..],
             &[
                 "-q",
                 "-m",
@@ -3246,6 +3251,7 @@ this line has no separator at all
                 "l",
                 "--rootdir",
                 "/data/vol/sbx-storage.seed",
+                "--",
                 "/data/vol/sbx-storage.btrfs"
             ]
         );
