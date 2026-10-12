@@ -257,6 +257,30 @@ fn proc_logs_reports_an_unobserved_session() {
     );
 }
 
+/// Whether `listing` shows the cage's `sleep <secs>` by the pid it runs as on the host. The
+/// launching `sbx run -- sleep <secs>` carries the same words, and is listed before the walk reaches
+/// the cage at all; a fingerprint names the process itself ([`common::procs`]).
+fn shows_the_cage_sleeping_for(listing: &str, secs: &str) -> bool {
+    common::procs::pids_sleeping_for(secs)
+        .into_iter()
+        .any(|pid| u32::try_from(pid).is_ok_and(|pid| common::procs::lists_pid(listing, pid)))
+}
+
+/// Whether the inline `--observe` feed in `stderr` records an exec of `program` itself: a
+/// `[sbx:exec]` line whose command starts with it, rather than any line that mentions the word.
+fn feed_records_exec_of(stderr: &str, program: &str) -> bool {
+    stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("[sbx:exec] "))
+        .any(|command| {
+            command
+                .split_whitespace()
+                .next()
+                .and_then(|first| first.rsplit('/').next())
+                == Some(program)
+        })
+}
+
 /// Extract the pid from the detached-launch line `sbx: started `run` as detached session <pid> …`.
 fn parse_detached_pid(msg: &str) -> Option<u32> {
     let after = msg.split("detached session ").nth(1)?;
@@ -321,7 +345,7 @@ fn detached_observe_records_exec_events_for_proc_logs() {
             .output()
             .expect("run sbx proc logs");
         last = String::from_utf8_lossy(&out.stdout).into_owned();
-        if out.status.code() == Some(0) && last.contains("sleep") {
+        if out.status.code() == Some(0) && shows_the_cage_sleeping_for(&last, "120.361") {
             ok = true;
             break;
         }
@@ -347,10 +371,11 @@ fn proc_ls_shows_a_real_cage_process_tree() {
     // the cage's processes ACROSS the pid namespace and the transient systemd scope. Launch a real
     // cage running `sleep` (the exec chain is sbx -> systemd-run --scope -> bwrap -> sleep, and
     // `sleep` is a descendant of the recorded pid in host pid-space), give it a fabricated session
-    // record, and assert `sbx proc ls` shows the cage's `sleep`. Teeth: a stunted walk — e.g. if the
-    // scope reparented the cage away from the recorded pid — would not contain `sleep`. Skipped, not
-    // failed, where the host cannot sandbox; but once the probe proves it can, a missing
-    // `sleep` is a real failure of the walk, not a skip.
+    // record, and assert `sbx proc ls` shows the cage's `sleep`. Teeth: a stunted walk — e.g. if
+    // the scope reparented the cage away from the recorded pid — would not list the cage's `sleep`
+    // by its host pid, whatever the launching command line says. Skipped, not failed, where the
+    // host cannot sandbox; but once the probe proves it can, a missing `sleep` is a real failure of
+    // the walk, not a skip.
     let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
     probe_or_skip!(
         "proc-ls cage e2e",
@@ -386,7 +411,7 @@ fn proc_ls_shows_a_real_cage_process_tree() {
             .output()
             .expect("run sbx proc ls");
         last = String::from_utf8_lossy(&out.stdout).into_owned();
-        if out.status.code() == Some(0) && last.contains("sleep") {
+        if out.status.code() == Some(0) && shows_the_cage_sleeping_for(&last, "120.362") {
             ok = true;
             break;
         }
@@ -429,7 +454,7 @@ fn run_observe_streams_exec_events() {
         "the observe feed is missing from stderr:\n{err}"
     );
     assert!(
-        err.contains("sleep"),
+        feed_records_exec_of(&err, "sleep"),
         "the spawned `sleep` should appear in the feed:\n{err}"
     );
 
@@ -750,7 +775,7 @@ fn app_run_observe_streams_exec_events() {
         .expect("app run --observe");
     let err = String::from_utf8_lossy(&observed.stderr);
     assert!(
-        err.contains("[sbx:exec]") && err.contains("sleep"),
+        feed_records_exec_of(&err, "sleep"),
         "the app's spawned `sleep` should appear in the feed:\n{err}"
     );
 
