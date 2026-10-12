@@ -304,6 +304,62 @@ fn report_optimise(
     }
 }
 
+/// Drop, or in a dry run list, the roots of the packages and inline flakes no runtime of the
+/// project declares any more, returning how many went.
+///
+/// The in-cage `sbx-flake-<name>` roots: only an inline `[flakes.<name>]` flake builds in-cage and
+/// registers this root (a remote `flake:` is provisioned host-side and carries a data-dir out-link,
+/// pruned with the packages'); the root is name-keyed and overwritten each launch, so an edit
+/// self-cleans, but a removal leaves it pointing at an unwanted build. The host-provisioned data-dir
+/// out-links: `<data>/gcroots/projects/<id>/<name>` (bare `<name>` for `nix:`,
+/// `deb-`/`appimage-`/`tarball-<name>` for a prebuilt) is add-only, so a package no longer declared
+/// keeps its out-link, which reads into the keep-set and holds its per-project store copy forever.
+/// Both declared sets span every runtime, the baseline and each app's merged packages, declared
+/// rather than trusted: a still-declared package whose trust has merely lapsed keeps its heavy
+/// build (see [`crate::sandbox::packages::project_gcroot_names`]).
+///
+/// When what an app declares cannot be told ([`crate::config::undeclarable_apps`]) nothing is
+/// dropped, and the reasons are returned: an app whose profile could not be loaded reads as
+/// declaring nothing, and every package it declares would read as removed.
+fn prune_undeclared_roots(
+    cfg: &crate::config::Resolved,
+    store_dir: &Path,
+    data_gcroots: &Path,
+    id: &str,
+    prune: bool,
+) -> Result<usize, Vec<String>> {
+    let why = crate::config::undeclarable_apps(cfg);
+    if !why.is_empty() {
+        return Err(why);
+    }
+    let mut flake_names: std::collections::BTreeSet<String> =
+        inline_flake_gcroot_names(&cfg.packages)
+            .into_iter()
+            .collect();
+    let mut package_names: std::collections::BTreeSet<String> =
+        crate::sandbox::packages::project_gcroot_names(&cfg.packages)
+            .into_iter()
+            .collect();
+    for app in cfg.apps.values() {
+        let mut merged = cfg.clone();
+        merged.merge_app(app.clone());
+        flake_names.extend(inline_flake_gcroot_names(&merged.packages));
+        package_names.extend(crate::sandbox::packages::project_gcroot_names(
+            &merged.packages,
+        ));
+    }
+    Ok(
+        crate::sandbox::gc::prune_flake_roots(store_dir, &flake_names, prune).len()
+            + crate::sandbox::gc::prune_project_package_roots(
+                data_gcroots,
+                id,
+                &package_names,
+                prune,
+            )
+            .len(),
+    )
+}
+
 /// The in-store `sbx-flake-<name>` gcroot names of every **declared** inline `[flakes.<name>]`,
 /// which is the keep-set `sbx gc` reconciles those roots against.
 ///
@@ -462,47 +518,23 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     let store = equip_for_gc(&prep)?;
     let store_dir = store.store_dir().to_path_buf();
 
-    // Drop the in-cage `sbx-flake-<name>` roots of removed inline `[flakes.<name>]` flakes. Only an
-    // inline flake builds in-cage and registers this root (a remote `flake:` is provisioned host-side
-    // and carries a data-dir out-link, pruned by `prune_project_package_roots` below); the root is
-    // name-keyed and overwritten each launch, so an edit self-cleans, but a removal leaves it pointing
-    // at an unwanted build — this prunes those so the sweep reclaims them. The current set spans every
-    // runtime — the baseline and each app's merged packages — so an inline flake declared only in an
-    // app keeps its root.
-    let mut flake_names: std::collections::BTreeSet<String> =
-        inline_flake_gcroot_names(&prep.cfg.packages)
-            .into_iter()
-            .collect();
-    // The host-provisioned data-dir out-links a removed package leaks: `<data>/gcroots/projects/<id>/
-    // <name>` (bare `<name>` for `nix:`, `deb-`/`appimage-`/`tarball-<name>` for a prebuilt) is
-    // add-only, so a package no longer declared keeps its out-link — which reads into the keep-set
-    // below and holds its per-project store copy forever. Collect the currently-declared set across
-    // the same runtimes as the flake names (declared, not trusted: a still-declared package whose
-    // trust has merely lapsed must keep its heavy build — see `packages::project_gcroot_names`).
-    let mut package_names: std::collections::BTreeSet<String> =
-        crate::sandbox::packages::project_gcroot_names(&prep.cfg.packages)
-            .into_iter()
-            .collect();
-    for app in prep.cfg.apps.values() {
-        let mut merged = prep.cfg.clone();
-        merged.merge_app(app.clone());
-        flake_names.extend(inline_flake_gcroot_names(&merged.packages));
-        package_names.extend(crate::sandbox::packages::project_gcroot_names(
-            &merged.packages,
-        ));
-    }
     let data_gcroots = prep.layout.data_dir().join("gcroots");
     // Drop the removed packages' roots — flake (inside the project store) and host-provisioned (in the
     // data dir) — *before* the keep-set is read below, so a dropped data-dir out-link no longer holds
     // its per-project seed copy and this same pass reclaims it.
-    let pruned = crate::sandbox::gc::prune_flake_roots(&store_dir, &flake_names, prune).len()
-        + crate::sandbox::gc::prune_project_package_roots(
-            &data_gcroots,
-            &id,
-            &package_names,
-            prune,
-        )
-        .len();
+    let pruned = match prune_undeclared_roots(&prep.cfg, &store_dir, &data_gcroots, &id, prune) {
+        Ok(pruned) => pruned,
+        Err(why) => {
+            for why in &why {
+                crate::diag::warn(&format!("sbx gc: {why}"));
+            }
+            crate::diag::warn(
+                "sbx gc: so no root of a package or flake that reads as removed is dropped from \
+                 this project's store",
+            );
+            0
+        }
+    };
 
     // Reconcile the seed roots too. `gcroot_roots` is add-only, so a superseded build — an old base
     // revision, a rebuilt tool, an app version rolled forward — keeps a permanent direct root and

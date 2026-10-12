@@ -946,6 +946,76 @@ pub(crate) fn profile_path(name: &str) -> Option<PathBuf> {
     profiles_dir().map(|d| d.join(format!("{name}.toml")))
 }
 
+/// Why app `name`'s declaration cannot be told from `cfg`, when it cannot: a launch of the app is
+/// refused (a bundle it uses could not be resolved), or `cfg` has no such app while its profile is
+/// there, or cannot be looked at. The load drops a profile it cannot read or parse with a warning,
+/// so such an app reads as declaring nothing. `None` when `cfg` says what the app declares, which
+/// includes an app no file declares any more.
+///
+/// For a verb that removes what an app does not declare: it acts on `cfg` only when this is `None`.
+pub(crate) fn undeclarable_app(cfg: &super::Resolved, name: &str) -> Option<String> {
+    if let Some(app) = cfg.apps.get(name) {
+        return (!app.refusals.is_empty())
+            .then(|| format!("app `{name}` {}", app.refusals.join("; ")));
+    }
+    let path = profile_path(name)?;
+    match std::fs::metadata(&path) {
+        Ok(_) => Some(format!(
+            "the profile of app `{name}`, {}, is there and could not be loaded",
+            path.display()
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => Some(format!("cannot read {}: {e}", path.display())),
+    }
+}
+
+/// Why the apps `cfg` resolved may not be every app the imported profiles declare, when they may
+/// not: the profiles directory cannot be read, or an app of a profile there cannot be told
+/// ([`undeclarable_app`]), or an app of `cfg` is refused. For a verb that removes what no app
+/// declares across every app, as `sbx gc --prune` does with the package roots of a project.
+pub(crate) fn undeclarable_apps(cfg: &super::Resolved) -> Vec<String> {
+    let mut why: Vec<String> = cfg
+        .apps
+        .keys()
+        .filter_map(|name| undeclarable_app(cfg, name))
+        .collect();
+    let Some(dir) = profiles_dir() else {
+        return why;
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return why,
+        Err(e) => {
+            why.push(format!("cannot read {}: {e}", dir.display()));
+            return why;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                why.push(format!("cannot read {}: {e}", dir.display()));
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        // A name the load would not key an app under never declared one.
+        let Some(name) = file_name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".toml"))
+            .filter(|n| super::is_valid_app_name(n))
+        else {
+            continue;
+        };
+        if !cfg.apps.contains_key(name)
+            && let Some(reason) = undeclarable_app(cfg, name)
+        {
+            why.push(reason);
+        }
+    }
+    why
+}
+
 /// The imported-bundles directory (`…/sbx/bundles/`), a sibling of the global config. `None` when
 /// no config base resolves, like [`profiles_dir`], whose role it plays for bundles: one file per
 /// bundle, read by [`read_global`] and written by `sbx bundle import`, so the location has a single

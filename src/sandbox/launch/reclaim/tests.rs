@@ -132,3 +132,97 @@ fn the_sweep_prepares_without_provisioning_a_distribution() {
         );
     }
 }
+
+/// What an app declares is read from its profile, and a profile the load could not read or parse
+/// is dropped: the app then reads as declaring nothing, and every package it declares as removed.
+/// The sweep of removed packages' roots drops nothing then, and says why; once the profile is gone
+/// for good, its packages are removed and their roots go.
+#[test]
+fn a_profile_that_cannot_be_loaded_drops_no_package_root() {
+    use crate::testutil::{EnvVar, TmpDir, env_lock};
+    use std::os::unix::fs::PermissionsExt as _;
+    let _lock = env_lock();
+    let (cfg_home, data, state, proj) =
+        (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let _cfg = EnvVar::set("XDG_CONFIG_HOME", cfg_home.path());
+    let _data = EnvVar::set("SBX_DATA_DIR", data.path());
+    let _state = EnvVar::set("XDG_STATE_HOME", state.path());
+    let apps = cfg_home.path().join("sbx/apps");
+    let bundles = cfg_home.path().join("sbx/bundles");
+    std::fs::create_dir_all(&apps).unwrap();
+    std::fs::create_dir_all(&bundles).unwrap();
+    std::fs::write(
+        bundles.join("b1.toml"),
+        "[packages]\nhello = \"nix:hello\"\n",
+    )
+    .unwrap();
+    let profile = apps.join("p1.toml");
+    std::fs::write(&profile, "cmd = [\"true\"]\nuse = [\"b1\"]\n").unwrap();
+    let gcroots = data.path().join("gcroots");
+    let out_link = gcroots.join("projects/p/hello");
+    std::fs::create_dir_all(out_link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/nix/store/h-hello", &out_link).unwrap();
+    let store = TmpDir::new();
+    let sweep = || {
+        let cfg = crate::config::load(proj.path());
+        prune_undeclared_roots(&cfg, store.path(), &gcroots, "p", true)
+    };
+
+    // Declared: the root stays.
+    assert_eq!(sweep(), Ok(0));
+    assert!(out_link.symlink_metadata().is_ok());
+
+    // A profile that does not parse, a directory of profiles that cannot be read, a bundle that
+    // does not parse: what the app declares cannot be told, and nothing goes.
+    // How each shape is made, and undone.
+    type Step<'a> = Box<dyn Fn() + 'a>;
+    let shapes: [(&str, Step, Step); 3] = [
+        (
+            "a profile that does not parse",
+            Box::new(|| std::fs::write(&profile, "cmd = [\"true\"\n").unwrap()),
+            Box::new(|| std::fs::write(&profile, "cmd = [\"true\"]\nuse = [\"b1\"]\n").unwrap()),
+        ),
+        (
+            "a directory of profiles that cannot be read",
+            Box::new(|| {
+                std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o000)).unwrap()
+            }),
+            Box::new(|| {
+                std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o700)).unwrap()
+            }),
+        ),
+        (
+            "a bundle that does not parse",
+            Box::new(|| std::fs::write(bundles.join("b1.toml"), "[packages\n").unwrap()),
+            Box::new(|| {
+                std::fs::write(
+                    bundles.join("b1.toml"),
+                    "[packages]\nhello = \"nix:hello\"\n",
+                )
+                .unwrap()
+            }),
+        ),
+    ];
+    for (shape, break_it, mend_it) in &shapes {
+        break_it();
+        if *shape == "a directory of profiles that cannot be read"
+            && std::fs::read_dir(&apps).is_ok()
+        {
+            mend_it();
+            skip_incapable!("running as root, which reads a directory its mode refuses");
+            return;
+        }
+        let swept = sweep();
+        mend_it();
+        assert!(swept.is_err(), "{shape}: {swept:?}");
+        assert!(
+            out_link.symlink_metadata().is_ok(),
+            "{shape}: the root was dropped"
+        );
+    }
+
+    // The profile removed: the app is gone, its packages are removed, and their roots go.
+    std::fs::remove_file(&profile).unwrap();
+    assert_eq!(sweep(), Ok(1));
+    assert!(out_link.symlink_metadata().is_err());
+}
