@@ -14394,3 +14394,26 @@ fn a_contract_the_launch_cannot_honour_is_refused_with_its_reason() {
         );
     }
 }
+
+/// The resolved-configuration dump [`resolve`] writes is created owner-only, whatever the umask: it
+/// reproduces the config files as written, `[env]` values and plugin keys included.
+#[cfg(debug_assertions)]
+#[test]
+fn the_resolved_dump_is_created_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TmpDir::new();
+    let dump = dir.join("resolved.dump");
+    let _lock = crate::testutil::env_lock();
+    let _dump = crate::testutil::EnvVar::set("SBX_DEBUG_RESOLVED_DUMP", &dump);
+    // A permissive umask, so a file created without a mode of its own is visibly wider than 0600
+    // rather than accidentally equal to it.
+    let previous = unsafe { libc::umask(0o022) };
+    let _ = resolve_no_plugins(RawConfig::default(), None);
+    unsafe { libc::umask(previous) };
+
+    let mode = std::fs::metadata(&dump)
+        .expect("the dump is written")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the resolved dump is owner-only");
+}
