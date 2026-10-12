@@ -10,6 +10,24 @@
 use super::schema;
 use crate::testutil::TmpDir;
 
+/// Every `*.toml` file directly under `dir`, in name order. `dir` is relative to the repository
+/// root; an absolute one is taken as it is, which is how its own test names a temporary directory.
+///
+/// Loud on a directory or an entry it cannot read: a guard whose population shrank in silence
+/// would pass over the files it lost. A link is listed like the file it names, which is how a
+/// shipped file is read.
+fn shipped_files(dir: &str) -> Vec<std::path::PathBuf> {
+    let unreadable = |e: std::io::Error| -> ! { panic!("`{dir}/` cannot be read: {e}") };
+    let mut out: Vec<std::path::PathBuf> =
+        std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir))
+            .unwrap_or_else(|e| unreadable(e))
+            .map(|entry| entry.unwrap_or_else(|e| unreadable(e)).path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("toml"))
+            .collect();
+    out.sort();
+    out
+}
+
 /// One shipped bundle, read the way `sbx bundle import` reads it: the file's fields at the top
 /// level, its name carried by the file name.
 ///
@@ -44,17 +62,9 @@ struct ShippedTables {
 /// Both halves: a bundle carries what rides with a tool, a profile what belongs to one app. The
 /// other `examples/` directories hold egress groups and secrets, whose schemas carry neither table.
 fn shipped_tables() -> Vec<ShippedTables> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut out = Vec::new();
     for dir in ["examples/bundle", "examples/app"] {
-        for entry in std::fs::read_dir(root.join(dir))
-            .unwrap_or_else(|e| panic!("{dir}/ dir exists: {e}"))
-            .flatten()
-        {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                continue;
-            }
+        for path in shipped_files(dir) {
             let source = format!("{dir}/{}", path.file_name().unwrap().to_string_lossy());
             out.push(if dir == "examples/bundle" {
                 let bundle = shipped_bundle(&path);
@@ -99,16 +109,8 @@ fn shipped_tables() -> Vec<ShippedTables> {
 /// Parsed with sbx's own reader, so a file this accepts is one the verb accepts: a key written where
 /// `entries` belongs names no hosts, and is refused here rather than shipped as an empty group.
 fn shipped_groups() -> std::collections::BTreeMap<String, Vec<String>> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/net-groups");
     let mut out = std::collections::BTreeMap::new();
-    for entry in std::fs::read_dir(&dir)
-        .expect("examples/net-groups/ dir exists")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/net-groups") {
         let entries =
             super::validate_group_file(&std::fs::read(&path).expect("read the group file"))
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -675,17 +677,9 @@ fn every_shipped_exemption_names_a_mise_package_its_own_layer_declares() {
     // So for what this repository ships, the stricter rule holds: a shipped layer names only its
     // own packages, and only `mise:` ones, since no freshness delay governs a `nix:` attribute or a
     // content-hashed prebuilt and exempting one would be a line that cannot do anything.
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut checked = 0;
     for dir in ["examples/bundle", "examples/app"] {
-        for entry in std::fs::read_dir(root.join(dir))
-            .expect("the examples directory is readable")
-            .flatten()
-        {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                continue;
-            }
+        for path in shipped_files(dir) {
             // Both kinds carry their declarations at the root of their own file, and each is read
             // by its own parser. Both are checked against the packages of the same layer.
             let layers: Vec<(Vec<String>, std::collections::BTreeMap<String, String>)> =
@@ -740,16 +734,8 @@ fn every_shipped_install_step_yields_to_the_upgrade_signal() {
     // trailing comment on a line of code is not stripped — it would take a shell parser to tell
     // one from a `#` inside a string, and a guard that reads the variable on the same line is not
     // the regression this is watching for.
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut checked = 0;
-    for entry in std::fs::read_dir(root.join("examples/bundle"))
-        .expect("examples/bundle/ dir exists")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/bundle") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let Some(provision) = shipped_bundle(&path).provision else {
             continue;
@@ -795,14 +781,7 @@ fn every_shipped_freshness_exemption_is_named_in_the_bundles_table() {
         .expect("the bundles page exists");
     let mut wrong = Vec::new();
     let mut carriers = 0;
-    for entry in std::fs::read_dir(root.join("examples/bundle"))
-        .expect("examples/bundle/ dir exists")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/bundle") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         // Read with sbx's own parser, like the step above: a name written under a sub-table folds
         // into it and never reaches the launch, and grepping the file would not tell.
@@ -856,14 +835,7 @@ fn every_shipped_install_step_is_named_in_the_bundles_table() {
         .expect("the bundles page exists");
     let mut wrong = Vec::new();
     let mut carriers = 0;
-    for entry in std::fs::read_dir(root.join("examples/bundle"))
-        .expect("examples/bundle/ dir exists")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/bundle") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let declared = shipped_bundle(&path).provision.is_some();
         if declared {
@@ -915,14 +887,7 @@ fn every_shipped_bundle_declares_the_packages_its_row_names() {
         .expect("the bundles page exists");
     let mut wrong = Vec::new();
     let mut checked = 0;
-    for entry in std::fs::read_dir(root.join("examples/bundle"))
-        .expect("examples/bundle/ dir exists")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/bundle") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let packages = shipped_bundle(&path).packages;
         let want = if packages.is_empty() {
@@ -985,14 +950,7 @@ fn every_shipped_resolver_table_is_named_in_the_bundles_table() {
         .expect("the bundles page exists");
     let mut wrong = Vec::new();
     let mut carriers = 0;
-    for entry in std::fs::read_dir(root.join("examples/bundle"))
-        .expect("examples/bundle/ dir exists")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/bundle") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let bundle = shipped_bundle(&path);
         // Read as tables rather than as `<name> = "<backend>:resolve"` package values: the sentinel
@@ -1067,14 +1025,7 @@ fn every_shipped_bundle_carries_the_counts_its_row_states() {
         .expect("the bundles page exists");
     let mut wrong = Vec::new();
     let mut checked = 0;
-    for entry in std::fs::read_dir(root.join("examples/bundle"))
-        .expect("examples/bundle/ dir exists")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/bundle") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let bundle = shipped_bundle(&path);
         let egress = bundle.allow.len() + bundle.mute.len() + bundle.deny.len();
@@ -1149,14 +1100,7 @@ fn every_shipped_bundle_row_names_the_groups_it_references() {
         .expect("the bundles page exists");
     let mut wrong = Vec::new();
     let mut checked = 0;
-    for entry in std::fs::read_dir(root.join("examples/bundle"))
-        .expect("examples/bundle/ dir exists")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/bundle") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let bundle = shipped_bundle(&path);
         let groups = super::group_refs(bundle.allow.iter().chain(&bundle.mute).chain(&bundle.deny));
@@ -1205,14 +1149,7 @@ fn every_shipped_service_is_named_in_the_bundles_table() {
         .expect("the bundles page exists");
     let mut wrong = Vec::new();
     let mut carriers = 0;
-    for entry in std::fs::read_dir(root.join("examples/bundle"))
-        .expect("examples/bundle/ dir exists")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/bundle") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let bundle = shipped_bundle(&path);
         let declared = !bundle.service.is_empty();
@@ -1637,18 +1574,10 @@ fn every_shipped_profile_resolves_the_egress_groups_it_references() {
     //
     // This walks `examples/app/` directly, so a profile is covered whether or not a bundle exists
     // for it.
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let shipped_groups = shipped_groups();
 
     let mut checked = 0;
-    for entry in std::fs::read_dir(root.join("examples/app"))
-        .expect("examples/app/ dir exists")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/app") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let profile = schema::parse_app(&std::fs::read(&path).expect("read the profile")).unwrap();
         if let Some(schema::NetworkField::Table(t)) = &profile.network {
@@ -1697,14 +1626,7 @@ fn every_shipped_profile_header_names_the_egress_groups_it_needs() {
     let mut needing = 0;
     let mut missing: Vec<String> = Vec::new();
 
-    for entry in std::fs::read_dir(root.join("examples/app"))
-        .expect("examples/app/ dir exists")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/app") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let text = std::fs::read_to_string(&path).expect("read the profile");
 
@@ -1765,17 +1687,9 @@ fn every_shipped_bundle_header_names_the_egress_groups_it_references() {
     // Unlike a profile, a bundle has no choice to make here. Every bundle that references a group
     // carries the block, so the obligation holds for each of them, not only for those that already
     // enumerate.
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut referencing = 0;
     let mut missing: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(root.join("examples/bundle"))
-        .expect("examples/bundle/ dir exists")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/bundle") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let bundle = shipped_bundle(&path);
         let required =
@@ -2089,17 +2003,9 @@ fn the_frozen_declaration_predicate_answers_on_shapes_this_catalogue_has_shipped
 /// served. This one asks whether it can be *left*, which a file can answer on its own.
 #[test]
 fn no_shipped_package_is_frozen_at_the_version_it_names() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut checked = 0;
     for dir in ["examples/bundle", "examples/app"] {
-        for entry in std::fs::read_dir(root.join(dir))
-            .unwrap_or_else(|e| panic!("{dir}/ dir exists: {e}"))
-            .flatten()
-        {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                continue;
-            }
+        for path in shipped_files(dir) {
             let bytes = std::fs::read(&path).expect("read the file");
             let packages = if dir == "examples/bundle" {
                 shipped_bundle(&path).packages
@@ -2134,20 +2040,14 @@ fn no_shipped_package_is_frozen_at_the_version_it_names() {
 /// Every shipped app's egress policy, by app name, as the loader resolves it with the shipped groups
 /// declared: what a launch of that app hands its proxy before the built-in rules are unioned in.
 pub(crate) fn shipped_egress_policies() -> Vec<(String, crate::allowlist::EgressPolicy)> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let toml_files = |dir: &str| -> Vec<(String, Vec<u8>)> {
-        let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(root.join(dir))
-            .unwrap_or_else(|e| panic!("{dir}/ exists: {e}"))
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+        shipped_files(dir)
+            .into_iter()
             .map(|p| {
                 let stem = p.file_stem().unwrap().to_string_lossy().into_owned();
                 (stem, std::fs::read(&p).unwrap())
             })
-            .collect();
-        out.sort();
-        out
+            .collect()
     };
 
     // The shipped groups, declared where the loader puts them: the global config's own table.
@@ -2242,4 +2142,18 @@ fn every_shipped_egress_policy_survives_the_transfer_to_the_proxy() {
         builtin > 0,
         "no checked rule was a built-in, so `builtin` went unwatched"
     );
+}
+
+/// The population every guard here reads: the `*.toml` files directly under a directory, a link
+/// among them included, in name order.
+#[test]
+fn the_shipped_files_are_every_toml_directly_under_the_directory_links_included() {
+    let dir = TmpDir::new();
+    std::fs::write(dir.join("b.toml"), "").unwrap();
+    std::fs::write(dir.join("notes.md"), "").unwrap();
+    std::fs::create_dir(dir.join("nested")).unwrap();
+    std::fs::write(dir.join("nested").join("c.toml"), "").unwrap();
+    std::os::unix::fs::symlink(dir.join("b.toml"), dir.join("a.toml")).unwrap();
+    let listed: Vec<std::path::PathBuf> = shipped_files(&dir.path().display().to_string());
+    assert_eq!(listed, vec![dir.join("a.toml"), dir.join("b.toml")]);
 }
