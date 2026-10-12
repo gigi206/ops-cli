@@ -415,15 +415,19 @@ pub fn sh_word(word: &str) -> String {
 /// `~/.config/sbx`, and the assertion then measures that machine. The locale is pinned for the
 /// reason [`project::Project::cmd_in`] gives.
 pub fn sbx(args: &[&str]) -> Output {
+    sbx_command(args).output().expect("spawn sbx")
+}
+
+/// The command [`sbx`] runs, for a caller that hands it to [`output_ok`].
+fn sbx_command(args: &[&str]) -> Command {
     let config = fixture_root().join("isolated-config");
     let _ = std::fs::create_dir_all(&config);
-    Command::new(env!("CARGO_BIN_EXE_sbx"))
-        .args(args)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
+    cmd.args(args)
         .env("XDG_CONFIG_HOME", config)
         .env("LC_ALL", "C.UTF-8")
-        .env_remove("LANG")
-        .output()
-        .expect("spawn sbx")
+        .env_remove("LANG");
+    cmd
 }
 
 /// The binary under test, its global config and its trust store read from fixed empty directories
@@ -575,12 +579,16 @@ pub fn start_ticks(pid: u32) -> u64 {
 }
 
 /// The candidate names the completion oracle offers after `path`, for the given cursor word.
+///
+/// The oracle exits 0 whatever it is asked, its one refusal being a missing `--`, which this always
+/// sends, so a run that failed is a fault, and fails the test. Read as an empty menu, it would end
+/// [`walk`] at `path`, and the sweeps over the tree would pass without reaching anything below it.
 pub fn oracle(path: &[String], cursor: &str) -> Vec<String> {
     let mut argv: Vec<String> = vec!["__complete".into(), "--".into()];
     argv.extend(path.iter().cloned());
     argv.push(cursor.to_string());
     let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
-    stdout_of(&sbx(&borrowed))
+    stdout_of(&output_ok(&mut sbx_command(&borrowed)))
         .lines()
         .filter_map(|l| l.split('\t').next().map(str::to_string))
         .collect()
