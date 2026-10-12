@@ -1710,7 +1710,7 @@ pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
     let udisks = tool("udisksctl", "udisks2")?;
 
     // Whether this call attached the loop device, and so is the one to release it if the mount
-    // it goes on to make has to be undone.
+    // it goes on to make fails or has to be undone.
     let (loop_dev, attached_here) = match state(image).map_err(|e| e.to_string())? {
         State::Absent => {
             return Err(format!(
@@ -1732,9 +1732,35 @@ pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
         }
     };
 
-    let out = run(Command::new(&udisks).arg("mount").arg("-b").arg(&loop_dev))?;
-    let reported = parse_mount(&out)
-        .ok_or_else(|| format!("cannot read the mount point from: {}", out.trim()))?;
+    // What this call did to the device is undone on the way out of a failure: udisks attaches a
+    // loop device without autoclear, so one nothing releases stays attached until `down`. Through
+    // udisks by device rather than through `down`, which goes by the state this process reads.
+    // Best-effort: the refusal stands either way.
+    let release = || {
+        if attached_here {
+            let _ = run(Command::new(&udisks)
+                .arg("loop-delete")
+                .arg("-b")
+                .arg(&loop_dev));
+        }
+    };
+    let unmount_and_release = || {
+        let _ = run(Command::new(&udisks)
+            .arg("unmount")
+            .arg("-b")
+            .arg(&loop_dev));
+        release();
+    };
+    // A mount that failed is no mount of this call's, and may be someone else's: only the loop
+    // device goes.
+    let out =
+        run(Command::new(&udisks).arg("mount").arg("-b").arg(&loop_dev)).inspect_err(|_| {
+            release();
+        })?;
+    let Some(reported) = parse_mount(&out) else {
+        unmount_and_release();
+        return Err(format!("cannot read the mount point from: {}", out.trim()));
+    };
 
     // A volume mounted `noexec` would host a store whose binaries cannot run — a failure that
     // surfaces far from its cause, so it is caught here rather than at the first launch.
@@ -1750,19 +1776,9 @@ pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
     let (mount_point, options) = match mounted_here(&loop_dev, &mountinfo, &reported) {
         Ok(found) => found,
         Err(e) => {
-            // Undone through udisks by device, not through `down`: `down` goes by the state this
-            // process reads, which shows the device attached but not mounted, so it would not
-            // unmount. Best-effort, as below: the refusal stands either way.
-            let _ = run(Command::new(&udisks)
-                .arg("unmount")
-                .arg("-b")
-                .arg(&loop_dev));
-            if attached_here {
-                let _ = run(Command::new(&udisks)
-                    .arg("loop-delete")
-                    .arg("-b")
-                    .arg(&loop_dev));
-            }
+            // `down` would not unmount here: the state this process reads shows the device
+            // attached but not mounted.
+            unmount_and_release();
             return Err(e);
         }
     };
