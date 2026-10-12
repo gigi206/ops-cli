@@ -434,11 +434,16 @@ fn cage_timezone(declared: Option<&str>, zoneinfo_src: &Path) -> String {
 /// reaches the file. The guard is summarised rather than printed — it owns live sockets and host
 /// threads and has no `Debug` — as one line naming which of its resources this launch stood up.
 ///
+/// The file is created owner-only (0600), whatever the umask: the rest of the spec still reads as
+/// the cage's environment, mounts and command, which a dump left in a shared directory would show
+/// to every local user. A file that already exists keeps the mode its owner gave it.
+///
 /// Best-effort and silent: a path that cannot be written is a developer's own diagnostic going
 /// missing, never a reason to fail a launch that is otherwise ready to run.
 #[cfg(debug_assertions)]
 fn debug_dump_spec(spec: &SandboxSpec, guard: Option<&LaunchGuard>) {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let Some(path) = std::env::var_os("SBX_DEBUG_SPEC_DUMP") else {
         return;
@@ -471,6 +476,7 @@ fn debug_dump_spec(spec: &SandboxSpec, guard: Option<&LaunchGuard>) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&path)
     {
         let _ = writeln!(file, "{redacted:#?}\n{summary}");
