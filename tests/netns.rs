@@ -101,6 +101,29 @@ fn kernel_has_dummy() -> bool {
         .is_ok_and(|list| list.lines().any(|l| l == "kernel/drivers/net/dummy.ko"))
 }
 
+/// `common::bwrap_on_path` and `common::nft_on_path` name a program a launch would run: the first
+/// file of `PATH` this process may execute. One it may not execute is no program a launch runs, and
+/// a test that runs it itself waits on a program that never started, as the stand-in below would,
+/// which `exec`s the bwrap it is given.
+#[test]
+fn a_program_on_path_is_one_this_process_may_execute() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TmpDir::new("onpath");
+    let (unrunnable, runnable) = (dir.join("unrunnable"), dir.join("runnable"));
+    for (entry, mode) in [(&unrunnable, 0o644), (&runnable, 0o755)] {
+        std::fs::create_dir(entry).unwrap();
+        let program = entry.join("tool");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let path = std::env::join_paths([&unrunnable, &runnable]).unwrap();
+    assert_eq!(
+        common::program_in("tool", &path),
+        Some(runnable.join("tool")),
+        "a file this process may not execute is passed over"
+    );
+}
+
 /// The holder reads bwrap's `--info-fd` report to its end before it closes the pipe.
 ///
 /// bwrap writes the report in several writes: the child's pid, each namespace id, the closing
