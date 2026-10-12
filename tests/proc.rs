@@ -177,25 +177,6 @@ fn sandbox_probe(project: &Path, data: &Path) -> Output {
         .expect("spawn sbx run")
 }
 
-/// Write the session record `proc ls` resolves, pointing at a live cage's `pid`. Using a fabricated
-/// record (the on-disk format is stable) isolates the property under test — the `/proc` descendant
-/// walk across the cage boundary — from the session-registration machinery, which is exercised
-/// elsewhere.
-fn write_session_record(data: &Path, pid: u32, project: &Path) {
-    use std::os::unix::ffi::OsStrExt;
-    let start = common::start_ticks(pid);
-    let dir = data.join("sbx").join("sessions");
-    std::fs::create_dir_all(&dir).unwrap();
-    let hex: String = project
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let rec = format!("kind=run\npid={pid}\nstart={start}\nruntime=project\nproject={hex}\n");
-    std::fs::write(dir.join(format!("{pid}-{start}")), rec).unwrap();
-}
-
 #[test]
 fn proc_logs_with_no_sessions_reports_none_and_exits_2() {
     let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
@@ -239,7 +220,7 @@ fn proc_logs_reports_an_unobserved_session() {
         .spawn()
         .expect("spawn sleep");
     let pid = child.id();
-    write_session_record(data.path(), pid, project.path());
+    common::write_session_record(data.path(), pid, "project", project.path());
 
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(["proc", "logs", &pid.to_string()])
@@ -396,7 +377,7 @@ fn proc_ls_shows_a_real_cage_process_tree() {
         .spawn()
         .expect("spawn sbx run -- sleep");
     let pid = cage.id();
-    write_session_record(data.path(), pid, project.path());
+    common::write_session_record(data.path(), pid, "project", project.path());
 
     // Poll `sbx proc ls` until the cage has exec-chained into `sleep` (host `/proc` reflects it once
     // bubblewrap starts it), then assert. `proc ls` re-reads `/proc` each call, so a broken walk
