@@ -110,9 +110,10 @@ pub(crate) fn parse_nix_tools(files: &[(String, Vec<u8>)]) -> DeclaredTools {
     for (name, bytes) in files {
         let entries = if name == TOOL_VERSIONS {
             parse_tool_versions(bytes)
-        } else if let Some(entries) = parse_toml_tools(bytes) {
-            entries
         } else {
+            parse_toml_tools(bytes)
+        };
+        let Some(entries) = entries else {
             out.unparsed.push(name.clone());
             continue;
         };
@@ -195,12 +196,11 @@ fn version_of(spec: &toml::Value) -> Option<String> {
 /// non-comment line, `<tool> <version> [more...]`, the first version taken. Blank lines
 /// and `#` comments are skipped, a comment trailing a line included, as mise reads them. A line
 /// naming only a tool yields an empty request rather than being dropped, for the reason given on
-/// [`parse_toml_tools`].
-fn parse_tool_versions(bytes: &[u8]) -> Vec<(String, String)> {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return Vec::new();
-    };
-    text.lines()
+/// [`parse_toml_tools`]. A file that is not UTF-8 yields `None`, for the reason given there too.
+fn parse_tool_versions(bytes: &[u8]) -> Option<Vec<(String, String)>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let entries = text
+        .lines()
         .map(|l| l.split('#').next().unwrap_or_default().trim())
         .filter(|l| !l.is_empty())
         .filter_map(|l| {
@@ -209,7 +209,8 @@ fn parse_tool_versions(bytes: &[u8]) -> Vec<(String, String)> {
             let version = parts.next().unwrap_or_default();
             Some((tool.to_string(), version.to_string()))
         })
-        .collect()
+        .collect();
+    Some(entries)
 }
 
 /// The nix system string for the current host (`x86_64-linux`, `aarch64-linux`), used
@@ -1167,8 +1168,8 @@ mod tests {
         );
     }
 
-    /// A mise file that is not TOML, or not UTF-8, declares what nobody can tell: read as declaring
-    /// nothing, it would unroot every tool it declares. A project can be approved with such a file,
+    /// A mise file that is not TOML, or not UTF-8 (a `.tool-versions` included), declares what
+    /// nobody can tell: read as declaring nothing, it would unroot every tool it declares. A project can be approved with such a file,
     /// so the trust gate does not stand in front of this. Nothing is unrooted, and the file is
     /// named.
     #[test]
@@ -1176,9 +1177,10 @@ mod tests {
         use crate::store::Layout;
         use crate::testutil::TmpDir;
 
-        for bytes in [
-            b"[tools\n\"nix:hello\" = \"2\"\n".to_vec(),
-            vec![0xff, 0xfe],
+        for (name, bytes) in [
+            ("mise.toml", b"[tools\n\"nix:hello\" = \"2\"\n".to_vec()),
+            ("mise.toml", vec![0xff, 0xfe]),
+            (TOOL_VERSIONS, vec![0xff, 0xfe]),
         ] {
             let data = TmpDir::new();
             let layout = Layout::under(data.path());
@@ -1194,7 +1196,7 @@ mod tests {
                 Path::new("/nonexistent/nix"),
                 &layout,
                 project.path(),
-                &[("mise.toml".to_string(), bytes.clone())],
+                &[(name.to_string(), bytes.clone())],
                 true,
                 &current_system(),
             )
@@ -1202,11 +1204,11 @@ mod tests {
 
             assert!(
                 roots.join("hello").symlink_metadata().is_ok(),
-                "{bytes:?}: the root of a tool the file may declare was dropped"
+                "{name} {bytes:?}: the root of a tool the file may declare was dropped"
             );
             assert!(
-                out.warnings.iter().any(|w| w.contains("mise.toml")),
-                "{bytes:?}: {:?}",
+                out.warnings.iter().any(|w| w.contains(name)),
+                "{name} {bytes:?}: {:?}",
                 out.warnings
             );
         }
@@ -1421,10 +1423,10 @@ mod tests {
         // mise cuts a `.tool-versions` line at `#`, with or without a space before it.
         assert_eq!(
             parse_tool_versions(b"nodejs # pinned for ci\nlua 5.4.6#x\n  # indented\n"),
-            vec![
+            Some(vec![
                 ("nodejs".to_string(), String::new()),
                 ("lua".to_string(), "5.4.6".to_string())
-            ]
+            ])
         );
     }
 
