@@ -12,9 +12,6 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
-
 /// Run `sbx <args>` with an isolated, empty data directory so the session registry is empty and
 /// the outcome is deterministic regardless of the host's real sessions.
 fn sbx(args: &[&str], data: &Path, cwd: &Path) -> Output {
@@ -158,14 +155,11 @@ fn proc_live_rejects_a_zero_interval() {
     assert!(err.contains("at least 1 second"), "got: {err}");
 }
 
-/// A `Command` for the built binary with an isolated global config dir, so the cage-launching e2e
-/// never depends on the developer's `~/.config/sbx`.
+/// A `Command` for the built binary with this suite's isolated global config and trust store
+/// ([`common::isolated_sbx`]), so the cage-launching e2e never depends on the developer's
+/// `~/.config/sbx` or `~/.local/state/sbx`.
 fn sbx_isolated() -> Command {
-    let cfg = fixture_root().join("proc-isolated-config");
-    let _ = std::fs::create_dir_all(&cfg);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
-    cmd.env("XDG_CONFIG_HOME", cfg);
-    cmd
+    common::isolated_sbx("proc-")
 }
 
 /// A launch that does nothing, run only to find out whether this host can build a cage at all. On
