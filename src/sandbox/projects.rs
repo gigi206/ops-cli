@@ -30,6 +30,9 @@ use std::process::ExitCode;
 /// `--markerless` was indistinguishable from a plain listing, so it pointed the reader at a manual
 /// removal instead of at the apply form, while the branch written for it could not be reached at
 /// all — with the flag set, the trees are reaped and the list it reads is empty.
+///
+/// Returns whether every tree the sweep set out to remove is gone. A removal that failed is named
+/// on stderr and makes the verb fail, as a named tree's does.
 fn reap_dead_trees(
     layout: &crate::store::Layout,
     live_ids: &std::collections::BTreeSet<String>,
@@ -37,7 +40,7 @@ fn reap_dead_trees(
     markerless: bool,
     apply: bool,
     pal: &crate::style::Palette,
-) {
+) -> bool {
     let (prune, prune_unidentified) = (apply && dead, apply && markerless);
     let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let projects_dir = layout.data_dir().join("projects");
@@ -52,7 +55,7 @@ fn reap_dead_trees(
         && report.failed.is_empty()
     {
         outln!("{h}sbx projects rm:{r} {dim}no dead project trees to reclaim.{r}");
-        return;
+        return true;
     }
 
     let mut freed = 0u64;
@@ -139,6 +142,7 @@ fn reap_dead_trees(
             dir.display()
         ));
     }
+    report.failed.is_empty()
 }
 
 /// One per-project runtime tree, classified and sized, for `sbx projects [list]`.
@@ -916,8 +920,8 @@ pub(crate) fn projects_rm(
         }
     }
 
-    if dead || markerless {
-        reap_dead_trees(&layout, &live_ids, dead, markerless, apply, pal);
+    if (dead || markerless) && !reap_dead_trees(&layout, &live_ids, dead, markerless, apply, pal) {
+        had_error = true;
     }
 
     if do_gc {
@@ -1019,6 +1023,49 @@ mod projects_rm_tests {
             !tree.exists(),
             "the removal went ahead once the launch let go"
         );
+    }
+
+    /// A tree the `--dead` sweep sets out to remove and cannot fails the verb, as a named tree
+    /// does: the sweep's report names it, and the exit status agrees with the report.
+    #[test]
+    fn a_dead_tree_the_sweep_cannot_remove_fails_the_verb() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let data = TmpDir::new();
+        let _lock = env_lock();
+        let _data = EnvVar::set("SBX_DATA_DIR", data.path());
+        let layout = crate::store::Layout::from_env().expect("a layout under the fixture root");
+        let projects = layout.data_dir().join("projects");
+        let tree = projects.join("0123456789abcdef");
+        std::fs::create_dir_all(&tree).unwrap();
+        // Dead: the recorded project directory is gone and the directory that held it is not.
+        let gone = data.path().join("gone");
+        std::fs::write(
+            tree.join(crate::sandbox::projectstore::PROJECT_MARKER),
+            gone.as_os_str().as_bytes(),
+        )
+        .unwrap();
+        // The tree's own entry cannot be unlinked from a directory its mode keeps read-only.
+        let mode = |m| std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(m));
+        mode(0o555).unwrap();
+        if std::fs::File::create(projects.join("probe")).is_ok() {
+            mode(0o700).unwrap();
+            skip_incapable!("running as root, which writes into a directory its mode refuses");
+            return;
+        }
+        let code = super::projects_rm(
+            &[],
+            true,
+            false,
+            true,
+            false,
+            false,
+            &crate::style::Palette::plain(),
+        );
+        mode(0o700).unwrap();
+        assert!(tree.is_dir(), "the fixture's removal was expected to fail");
+        assert_eq!(code, std::process::ExitCode::FAILURE);
     }
 }
 
