@@ -1268,15 +1268,26 @@ pub(super) fn remove_child(dir: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<
     use std::os::unix::ffi::OsStrExt;
 
     let c = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)?;
+    let is_dir = is_dir_at(dir, &c)?;
+    if is_dir {
+        // A link swapped in since the `fstatat` fails this open rather than being followed.
+        empty_dir(&open_dir_handle(Some(dir), &c)?)?;
+    }
+    unlink_at(dir, &c, is_dir)
+}
+
+/// Whether `name` in the directory `dir` refers to is itself a directory, read with `fstatat`
+/// without following it.
+fn is_dir_at(dir: &OwnedFd, name: &std::ffi::CStr) -> io::Result<bool> {
     // SAFETY: `stat` is a plain C struct of integer fields, for which all-zero is a valid value; the
     // call below overwrites it before any field is read.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `dir` is a live directory descriptor and `c` is a NUL-terminated name valid for the
+    // SAFETY: `dir` is a live directory descriptor and `name` is a NUL-terminated name valid for the
     // call, which writes `st` only when it reports success.
     if unsafe {
         libc::fstatat(
             dir.as_raw_fd(),
-            c.as_ptr(),
+            name.as_ptr(),
             &mut st,
             libc::AT_SYMLINK_NOFOLLOW,
         )
@@ -1284,14 +1295,16 @@ pub(super) fn remove_child(dir: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<
     {
         return Err(io::Error::last_os_error());
     }
-    let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
-    if is_dir {
-        // A link swapped in since the `fstatat` fails this open rather than being followed.
-        empty_dir(&open_dir_handle(Some(dir), &c)?)?;
-    }
+    Ok(st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+}
+
+/// Remove `name` from the directory `dir` refers to with `unlinkat`: a directory, which must be
+/// empty by now, with `AT_REMOVEDIR`.
+fn unlink_at(dir: &OwnedFd, name: &std::ffi::CStr, is_dir: bool) -> io::Result<()> {
     let flag = if is_dir { libc::AT_REMOVEDIR } else { 0 };
-    // SAFETY: same descriptor and name as above.
-    if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), flag) } < 0 {
+    // SAFETY: `dir` is a live directory descriptor and `name` is a NUL-terminated name valid for the
+    // call.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flag) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -1941,19 +1954,61 @@ pub(crate) fn force_remove_dir_all(path: &Path) -> io::Result<()> {
 /// minus its last step, which each caller takes its own way (`rmdir` on the root it opened, or
 /// `unlinkat` from the parent's descriptor in [`remove_child`]).
 ///
-/// The directory is made owner-writable and listed through `/proc/self/fd/<n>`, which names the
-/// inode `dir` holds rather than a path, and each entry is removed by [`remove_child`] from `dir`
-/// itself. Each level keeps two descriptors open while it is walked, its handle and its listing, so
-/// a tree deeper than half the process's descriptor limit stops with `EMFILE` and is left in place.
+/// Each directory is made owner-writable and listed through `/proc/self/fd/<n>`, which names the
+/// inode its handle holds rather than a path, and each entry is removed from that handle: a file
+/// by `unlinkat`, a directory opened from it with `O_NOFOLLOW`, emptied the same way, then
+/// unlinked. The walk is a loop over a stack of levels on the heap, not a recursion: a cage can
+/// make a tree as deep as it likes in a directory it writes, and one native stack frame per level
+/// aborts the process on a stack overflow, which nothing can report. Each level holds its handle
+/// open, and its entries are read before the walk goes down, so a tree deeper than the process's
+/// descriptor limit stops with `EMFILE` and is left in place.
 fn empty_dir(dir: &OwnedFd) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
-    let held = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
-    // `chmod` through the descriptor's own entry acts on the inode it holds, where `fchmod` refuses
-    // an `O_PATH` handle.
-    let _ = std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o700));
-    for entry in std::fs::read_dir(&held)? {
-        remove_child(dir, &entry?.file_name())?;
+    /// A directory being emptied: its handle, the entries still to remove from it, and the name it
+    /// has in the level above, which the root does not have (its caller removes it).
+    struct Level {
+        handle: OwnedFd,
+        pending: Vec<std::ffi::OsString>,
+        name: Option<std::ffi::CString>,
+    }
+    let read = |handle: OwnedFd, name: Option<std::ffi::CString>| -> io::Result<Level> {
+        let held = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
+        // `chmod` through the descriptor's own entry acts on the inode it holds, where `fchmod`
+        // refuses an `O_PATH` handle.
+        let _ = std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o700));
+        let pending = std::fs::read_dir(&held)?
+            .map(|entry| entry.map(|e| e.file_name()))
+            .collect::<io::Result<_>>()?;
+        Ok(Level {
+            handle,
+            pending,
+            name,
+        })
+    };
+
+    let mut stack = vec![read(dir.try_clone()?, None)?];
+    while let Some(mut level) = stack.pop() {
+        let Some(entry) = level.pending.pop() else {
+            // Emptied: unlinked from the level above, the root left to its caller.
+            if let (Some(name), Some(parent)) = (level.name, stack.last()) {
+                drop(level.handle);
+                unlink_at(&parent.handle, &name, true)?;
+            }
+            continue;
+        };
+        let name = std::ffi::CString::new(entry.as_bytes()).map_err(io::Error::other)?;
+        if is_dir_at(&level.handle, &name)? {
+            // A link swapped in since the `fstatat` fails this open rather than being followed.
+            let handle = open_dir_handle(Some(&level.handle), &name)?;
+            let below = read(handle, Some(name))?;
+            stack.push(level);
+            stack.push(below);
+        } else {
+            unlink_at(&level.handle, &name, false)?;
+            stack.push(level);
+        }
     }
     Ok(())
 }
@@ -3845,6 +3900,34 @@ mod tests {
 
         // Idempotent: a second sweep finds nothing left.
         assert!(sweep_runtime_dirs_with(root, true, &live).is_empty());
+    }
+
+    /// A cage can make a tree as deep as it likes in a directory it writes, and every removal of
+    /// such a directory goes through [`force_remove_dir_all`]: a walk taking one native stack frame
+    /// per level would abort the process on a stack overflow. The removal runs on a small stack,
+    /// which a few thousand levels overflow, so the tree stays shallow enough for every path in it
+    /// to resolve: nix's search for runtime roots reads every descriptor of this process, and one
+    /// on a path longer than `PATH_MAX` fails it for a test running nix at the same time.
+    #[test]
+    fn a_tree_deeper_than_its_stack_is_removed() {
+        let tmp = TmpDir::new();
+        let root = tmp.path().join("deep");
+        let mut dir = root.clone();
+        for _ in 0..1_800 {
+            dir.push("a");
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bottom"), b"x").unwrap();
+
+        let removing = root.clone();
+        let removed = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || force_remove_dir_all(&removing))
+            .unwrap()
+            .join()
+            .unwrap();
+        removed.expect("the deep tree is removed");
+        assert!(!root.exists());
     }
 
     /// An entry the sweep cannot remove stays, and is not counted among those removed: the count
