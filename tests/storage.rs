@@ -99,15 +99,19 @@ fn stand_in(dir: &Path, name: &str, log: &Path, status: i32, stderr: &str) {
         log = common::sh(log),
         stderr = common::sh_word(stderr),
     );
-    let path = dir.join(name);
+    install_script(&dir.join(name), &script);
+}
+
+/// Write `script` to `path` as an executable, from a child shell for the reason [`stand_in`] gives.
+fn install_script(path: &Path, script: &str) {
     let written = std::process::Command::new("/bin/sh")
         .args([
             "-c",
             "printf '%s' \"$1\" > \"$2\" && chmod 755 \"$2\"",
             "sh",
         ])
-        .arg(&script)
-        .arg(&path)
+        .arg(script)
+        .arg(path)
         .status()
         .expect("spawn /bin/sh");
     assert!(written.success(), "writing the stand-in {}", path.display());
@@ -322,4 +326,82 @@ fn a_volume_created_by_hand_waits_for_use_rather_than_the_first_launch() {
         image.is_file(),
         "the first launch removed the volume `sbx storage init` created: {said}"
     );
+}
+
+/// A `udisksctl` stand-in whose `loop-setup` attaches `/dev/loop99` and whose `mount` runs
+/// `mount`, every call recorded in `log`; any other subcommand succeeds.
+fn udisks_stand_in(dir: &Path, log: &Path, mount: &str) {
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\ncase \"$1\" in\n\
+         loop-setup) printf 'Mapped file %s as /dev/loop99.\\n' \"$3\" ;;\n\
+         mount) {mount} ;;\nesac\n",
+        log = common::sh(log),
+    );
+    install_script(&dir.join("udisksctl"), &script);
+}
+
+/// `sbx storage up` that attached a loop device and then could not mount it, or mounted it where
+/// this process cannot see it, leaves no loop device behind: udisks attaches without autoclear
+/// (measured: `/sys/block/loopN/loop/autoclear` reads 0, and the device stays attached), so a device
+/// nothing releases stays until `down`. A mount this call made is undone first; one it did not make,
+/// because `mount` failed, is not touched.
+#[test]
+fn an_up_that_cannot_mount_releases_the_loop_device_it_attached() {
+    let root = TmpDir::prefixed("st", "upfail");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let image = root.join("vol.btrfs");
+    std::fs::write(&image, b"").unwrap();
+
+    let mut wrong = Vec::new();
+    for (shape, mount, unmounts) in [
+        (
+            "a mount that fails",
+            "echo 'Error mounting /dev/loop99: wrong fs type' >&2; exit 1",
+            false,
+        ),
+        (
+            "a mount report that cannot be read",
+            "echo 'something else'",
+            true,
+        ),
+        (
+            "a mount this process cannot see",
+            "echo 'Mounted /dev/loop99 at /run/media/u/vol.'",
+            true,
+        ),
+    ] {
+        let calls = root.join(format!("calls-{}.log", shape.replace(' ', "-")));
+        udisks_stand_in(&bin, &calls, mount);
+        let out = common::isolated_sbx("st-")
+            .args(["storage", "up", "--image"])
+            .arg(&image)
+            .env("PATH", &bin)
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env_remove("SBX_DATA_DIR")
+            .output()
+            .expect("spawn sbx storage up");
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        if said.contains("this host cannot mount") {
+            skip_incapable!("skipping: this host cannot mount a volume ({said})");
+            return;
+        }
+        let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        if out.status.success() {
+            wrong.push(format!("{shape}: `up` succeeded: {said}"));
+        }
+        if !calls.lines().any(|c| c == "loop-delete -b /dev/loop99") {
+            wrong.push(format!(
+                "{shape}: the loop device was left attached: {calls:?}"
+            ));
+        }
+        if calls.lines().any(|c| c == "unmount -b /dev/loop99") != unmounts {
+            wrong.push(format!(
+                "{shape}: unmounted {}, as a mount this call {} made: {calls:?}",
+                if unmounts { "nothing" } else { "a device" },
+                if unmounts { "had" } else { "had not" }
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
