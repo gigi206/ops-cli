@@ -39,6 +39,14 @@ pub(super) fn launch_detached(
     label: &str,
     observe: bool,
 ) -> ExitCode {
+    // The daemon runs ordinary code before any `exec`, allocation included, which is sound only when
+    // no other thread could hold a lock at the fork: a daemon that inherited one held would wait on
+    // it for good, before it ever wrote the readiness byte or closed the pipe its parent reads.
+    // Nothing before [`build()`] starts a thread; this keeps that true rather than assumed.
+    if let Err(e) = crate::sandbox::netns::single_threaded() {
+        crate::diag::error(&format!("sbx: cannot start the detached session: {e}"));
+        return ExitCode::FAILURE;
+    }
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe2` fills the two-element array; `O_CLOEXEC` so neither end leaks into the
     // eventual `exec` of bwrap.
