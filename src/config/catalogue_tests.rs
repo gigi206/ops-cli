@@ -10,20 +10,23 @@
 use super::schema;
 use crate::testutil::TmpDir;
 
-/// Every `*.toml` file directly under `dir`, in name order. `dir` is relative to the repository
-/// root; an absolute one is taken as it is, which is how its own test names a temporary directory.
+/// Every `*.toml` file directly under `dir`, a directory of the repository, in name order.
+fn shipped_files(dir: &str) -> Vec<std::path::PathBuf> {
+    toml_files_in(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir))
+}
+
+/// Every `*.toml` file directly under `dir`, in name order.
 ///
 /// Loud on a directory or an entry it cannot read: a guard whose population shrank in silence
 /// would pass over the files it lost. A link is listed like the file it names, which is how a
 /// shipped file is read.
-fn shipped_files(dir: &str) -> Vec<std::path::PathBuf> {
-    let unreadable = |e: std::io::Error| -> ! { panic!("`{dir}/` cannot be read: {e}") };
-    let mut out: Vec<std::path::PathBuf> =
-        std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir))
-            .unwrap_or_else(|e| unreadable(e))
-            .map(|entry| entry.unwrap_or_else(|e| unreadable(e)).path())
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("toml"))
-            .collect();
+fn toml_files_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let unreadable = |e: std::io::Error| -> ! { panic!("`{}` cannot be read: {e}", dir.display()) };
+    let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| unreadable(e))
+        .map(|entry| entry.unwrap_or_else(|e| unreadable(e)).path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("toml"))
+        .collect();
     out.sort();
     out
 }
@@ -2154,6 +2157,6 @@ fn the_shipped_files_are_every_toml_directly_under_the_directory_links_included(
     std::fs::create_dir(dir.join("nested")).unwrap();
     std::fs::write(dir.join("nested").join("c.toml"), "").unwrap();
     std::os::unix::fs::symlink(dir.join("b.toml"), dir.join("a.toml")).unwrap();
-    let listed: Vec<std::path::PathBuf> = shipped_files(&dir.path().display().to_string());
+    let listed = toml_files_in(dir.path());
     assert_eq!(listed, vec![dir.join("a.toml"), dir.join("b.toml")]);
 }
