@@ -635,7 +635,16 @@ pub fn oracle(path: &[String], cursor: &str) -> Vec<String> {
 /// the same page table, so a walk cannot notice a verb the dispatcher accepts and the table never
 /// heard of. It answers "what does the binary declare?", and the sweeps assert that everything
 /// declared behaves; the other direction is a property of the dispatch, not of a list.
+///
+/// The tree is walked once per test binary, and each caller gets its own copy: it is the binary's
+/// own, which a run does not change, and the sweeps that ask for it run side by side.
 pub fn walk() -> Vec<Vec<String>> {
+    static WALKED: std::sync::OnceLock<Vec<Vec<String>>> = std::sync::OnceLock::new();
+    WALKED.get_or_init(walk_from_root).clone()
+}
+
+/// The walk [`walk`] runs once: from the root, into each path the oracle offers that names a page.
+fn walk_from_root() -> Vec<Vec<String>> {
     /// Whether a path names a page, and so is command tree rather than a value.
     ///
     /// A leading `help` is stripped before asking, because it is exactly what the page tree does
@@ -678,8 +687,8 @@ pub fn walk() -> Vec<Vec<String>> {
         );
     }
     let mut found: Vec<Vec<String>> = Vec::new();
-    let mut queue: Vec<Vec<String>> = vec![Vec::new()];
-    while let Some(path) = queue.pop() {
+    let mut pending: Vec<Vec<String>> = vec![Vec::new()];
+    while let Some(path) = pending.pop() {
         // A tree this deep would mean the walk is looping, not that the CLI grew: stop loudly
         // rather than spin (an earlier `help` that offered itself did exactly that).
         assert!(path.len() < 6, "the completion tree loops at {path:?}");
@@ -689,7 +698,7 @@ pub fn walk() -> Vec<Vec<String>> {
             if !is_page(&deeper) {
                 continue;
             }
-            queue.push(deeper.clone());
+            pending.push(deeper.clone());
             found.push(deeper);
         }
     }
