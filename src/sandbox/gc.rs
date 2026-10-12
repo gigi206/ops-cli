@@ -223,7 +223,9 @@ pub(crate) fn prune_project_package_roots(
 /// mise engine for each live engine revision (`mise/<mise_rev>/*` — mise is rooted on its *own*
 /// revision, not the base one, so omitting it would drop the current mise). Each out-link points
 /// at a `…/nix/store/<hash-name>` build; its basename is the key, matching a seed root's own file
-/// name. A broken or absent out-link simply contributes nothing.
+/// name. An absent out-link contributes nothing. One whose target is missing still contributes the
+/// name it records: the target is a store path of the store sbx built it in, which is not the host's
+/// `/nix/store`, and a build the shared store no longer holds may be the project's only copy.
 ///
 /// The `nix-tools` sub-directory is named rather than reached by descending:
 /// [`nixhub::provision`](crate::sandbox::nixhub::provision) roots a `nix:` mise tool under
