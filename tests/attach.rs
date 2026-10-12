@@ -222,14 +222,26 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
 
     // Teeth: the project's default home (created by the warm-up `sbx run -- true`) must NOT have
     // received the marker — proving attach reproduced the app's home, not the project's.
-    let project_homes: Vec<PathBuf> = std::fs::read_dir(data.path().join("sbx/projects"))
-        .map(|d| {
-            d.flatten()
-                .map(|e| e.path().join("home/ATTACH_OK"))
-                .collect()
+    // Read loudly, and required to name at least one home: a check over nothing would pass however
+    // attach behaved, and an unreadable or renamed directory reads as nothing.
+    let projects = data.path().join("sbx/projects");
+    let project_homes: Vec<PathBuf> = std::fs::read_dir(&projects)
+        .unwrap_or_else(|e| panic!("{} cannot be read: {e}", projects.display()))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|e| panic!("{} cannot be read: {e}", projects.display()))
+                .path()
+                .join("home")
         })
-        .unwrap_or_default();
-    for m in &project_homes {
+        .filter(|home| home.is_dir())
+        .collect();
+    assert!(
+        !project_homes.is_empty(),
+        "the warm-up launch left no project home under {}, so the check below would hold of nothing",
+        projects.display()
+    );
+    for home in &project_homes {
+        let m = home.join("ATTACH_OK");
         assert!(
             !m.exists(),
             "the marker landed in the project's shared home — attach used the wrong runtime: {m:?}\n{log}"
