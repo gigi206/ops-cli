@@ -294,7 +294,7 @@ out: [`sbx doctor`](doctor), or any launch, run from your desktop session mounts
 
 The mount point is read back rather than assumed: `udisks` decides it, and it varies by version
 (`/run/media` or `/media`) and gains a suffix if the label collides: so always take it from
-`use` or `status`. Once `udisks` has mounted the volume, sbx checks the mount table it reads: if
+`use` or `status`. sbx reads it from the mount table once `udisks` has mounted the volume. If
 that table does not show the mount, because sbx runs in a mount namespace `udisks`' mounts do not
 reach, the mount is undone and refused rather than written beside, on the tmpfs beneath it.
 
