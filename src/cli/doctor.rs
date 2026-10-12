@@ -568,7 +568,23 @@ fn report_storage_in(rep: &mut Report<'_>, default_dir: &Path) {
                     "compression {comp}; the data directory costs the host a single inode"
                 ));
             }
-            _ => rep.check(
+            Ok(storage::State::Absent) => rep.check(
+                "warn",
+                "storage",
+                &format!(
+                    "type: volume — set to use {} but it does not exist",
+                    image.display()
+                ),
+            ),
+            Err(e) => rep.check(
+                "warn",
+                "storage",
+                &format!(
+                    "type: volume — set to use {}, but its state cannot be read: {e}",
+                    image.display()
+                ),
+            ),
+            Ok(_) => rep.check(
                 "warn",
                 "storage",
                 &format!(
@@ -858,6 +874,32 @@ mod tests {
                 std::fs::remove_dir(&pointer).unwrap();
             } else {
                 std::fs::remove_file(&pointer).unwrap();
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// A volume sbx is set to use is reported as it stands: an image that is gone, or one whose
+    /// state cannot be read, is not "not mounted", which is what a mount would fix.
+    #[test]
+    fn an_adopted_image_that_is_gone_or_unusable_is_not_reported_as_unmounted() {
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("sbx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut wrong = Vec::new();
+        // Paths that are the same under any fixture root: one that cannot exist, and the root
+        // directory, which exists for every uid and is no image.
+        for (image, said) in [
+            ("/nonexistent-by-construction/vol.btrfs", "does not exist"),
+            ("/", "its state cannot be read"),
+        ] {
+            storage::write_pointer(&dir, Path::new(image)).unwrap();
+            let pal = style::Palette::plain();
+            let mut rep = Report::new(true, &pal);
+            report_storage_in(&mut rep, &dir);
+            let check = rep.checks.last().expect("the storage line");
+            if check.status != "warn" || !check.detail.contains(said) {
+                wrong.push(format!("{image}: [{}] {}", check.status, check.detail));
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
