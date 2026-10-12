@@ -162,13 +162,8 @@ fn no_shipped_profile_carries_a_key_sbx_does_not_know() {
     // profiles, each parsed on import, each warning surfacing at launch. A key that is real on the
     // baseline and inert here would have been invisible before; now it would be a line on every
     // launch of that app, so the catalogue has to be clean for the message to mean anything.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/app");
     let mut checked = 0;
-    for entry in std::fs::read_dir(&dir).expect("examples/app/ dir exists") {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/app") {
         let raw = schema::parse_app(&std::fs::read(&path).expect("read the profile")).unwrap();
         assert!(
             raw.rest.is_empty(),
@@ -181,13 +176,8 @@ fn no_shipped_profile_carries_a_key_sbx_does_not_know() {
     // The bundles beside them, on the same rule: a bundle carries no `cmd` and no posture, so one
     // written there would be dropped in silence, and the shipped set is where that would be
     // loudest.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/bundle");
     let mut bundles = 0;
-    for entry in std::fs::read_dir(&dir).expect("examples/bundle/ dir exists") {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/bundle") {
         // Parsed but NOT validated here: `validate_bundle` refuses an unknown key itself, so going
         // through it would make the assertion below unfailable and this guard decorative. The
         // stray key has to be the thing this test reports.
@@ -201,7 +191,7 @@ fn no_shipped_profile_carries_a_key_sbx_does_not_know() {
         );
         bundles += 1;
     }
-    // The guard asserts its own precondition: a `read_dir` that found nothing would pass in silence.
+    // The guard asserts its own precondition: a walk that found nothing would pass in silence.
     assert!(checked >= 60, "only {checked} profiles were read");
     assert!(bundles >= 60, "only {bundles} bundles were read");
 }
@@ -220,14 +210,8 @@ fn no_shipped_profile_carries_a_key_sbx_does_not_know() {
 #[test]
 fn every_shipped_shell_profile_forwards_its_trailing_arguments() {
     const SHELLS: [&str; 4] = ["bash", "sh", "zsh", "dash"];
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dir = root.join("examples/app");
     let (mut shell_profiles, mut plain) = (0, 0);
-    for entry in std::fs::read_dir(&dir).expect("examples/app/ dir exists") {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/app") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let raw = schema::parse_app(&std::fs::read(&path).expect("read the profile")).unwrap();
         let argv = match raw.cmd {
@@ -564,13 +548,8 @@ fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let shipped_groups = shipped_groups();
 
-    let dir = root.join("examples/bundle");
     let mut checked = 0;
-    for entry in std::fs::read_dir(&dir).expect("examples/bundle/ dir exists") {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
+    for path in shipped_files("examples/bundle") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
 
         // Parsed with sbx's own parser, so a fragment this test accepts is one `sbx bundle import`
