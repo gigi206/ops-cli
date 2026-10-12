@@ -26,7 +26,8 @@ location and channel revision, and the **storage posture**: whether the data dir
 (the filesystem it sits on, and whether btrfs, loop devices and udisks2 are present).
 That line is always informational, never a failure: a volume is never a prerequisite. It does flag one
 thing no volume would fix: a data directory on a **tmpfs**, where nothing survives a
-reboot.
+reboot. And it flags a volume pointer (`storage.toml`) that cannot be read, which every launch
+refuses on, rather than reporting the data directory as local.
 
 For the full explanation of each check, see
 [`sbx doctor` and prerequisites](../getting-started/doctor).
