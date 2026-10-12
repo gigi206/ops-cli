@@ -1,14 +1,23 @@
+//! `sbx storage` end to end.
+//!
 //! `sbx storage init` on a host without `btrfs-progs`, where sbx formats the volume with a copy it
 //! provisions for itself. Where that copy is built decides whether the data directory can still
 //! adopt the volume: a `store` left in it reads as data `sbx storage use` would strand, and `use`
 //! refuses. Skipped, not failed, where the host cannot run the provisioned copy or the binary cache
 //! is out of reach.
+//!
+//! The first interactive launch on a host a volume is worth it on, which adopts one without asking,
+//! and keeps the plain directory when the volume cannot be set up. `udisksctl` and `mkfs.btrfs` are
+//! stand-ins there, so no loop device is attached and nothing is mounted. Skipped where the host is
+//! not one a volume is adopted on.
 
 #[macro_use]
 mod common;
 use common::fixture::TmpDir;
+use common::pty::{Pty, Reaped};
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// A `PATH` of one directory under `root`, linking the programs a volume creation provisions with,
 /// as the inherited `PATH` finds them, and no `mkfs.btrfs`, so sbx has to build its own. Leaving out
@@ -75,5 +84,242 @@ fn a_volume_formatted_with_provisioned_btrfs_progs_leaves_the_data_directory_ado
         std::fs::read(theirs.join("file")).ok().as_deref(),
         Some(&b"theirs"[..]),
         "a directory beside the image that sbx did not create was removed"
+    );
+}
+
+/// Install a stand-in for the host program `name` in `dir`: a script that appends its arguments to
+/// `log`, one call per line, and exits `status` after printing `stderr` there.
+///
+/// Written by a child shell, so the descriptor that writes it is never open in this process: a test
+/// running beside this one that forked while it was would hold it across its own `exec`, and the
+/// stand-in would then fail to run as a busy text file.
+fn stand_in(dir: &Path, name: &str, log: &Path, status: i32, stderr: &str) {
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nprintf '%s\\n' {stderr} >&2\nexit {status}\n",
+        log = common::sh(log),
+        stderr = common::sh_word(stderr),
+    );
+    let path = dir.join(name);
+    let written = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "printf '%s' \"$1\" > \"$2\" && chmod 755 \"$2\"",
+            "sh",
+        ])
+        .arg(&script)
+        .arg(&path)
+        .status()
+        .expect("spawn /bin/sh");
+    assert!(written.success(), "writing the stand-in {}", path.display());
+}
+
+/// The host programs a first-launch adoption runs, as stand-ins in `root/bin`, every call recorded
+/// in `root/calls.log`: a format that succeeds without writing anything, and an attach udisks
+/// refuses, as it does outside a local active session, so the volume is created and never mounted.
+/// Returns the directory to put on `PATH` and the log.
+fn adoption_stand_ins(root: &Path) -> (PathBuf, PathBuf) {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let calls = root.join("calls.log");
+    stand_in(&bin, "mkfs.btrfs", &calls, 0, "");
+    stand_in(
+        &bin,
+        "udisksctl",
+        &calls,
+        1,
+        "Error setting up loop device: Not authorized to perform operation",
+    );
+    (bin, calls)
+}
+
+/// Launch `sbx run` on a terminal, with `bin` as the whole `PATH` and `data_home` as the data home,
+/// and read the terminal until it exits, never past a minute. The launch stops on its configuration
+/// before it builds anything, so all it does is the first-launch step.
+///
+/// A question on the terminal is a failure here: nothing answers it, so waiting would only wait out
+/// the minute. Returns whether it exited, and what it wrote.
+fn first_launch(project: &Path, bin: &Path, data_home: &Path) -> (bool, String) {
+    let mut pty = Pty::open(None);
+    let mut child = Reaped(
+        common::isolated_sbx("st-")
+            .args(["run", "--config", "x = = not toml", "--", "true"])
+            .current_dir(project)
+            .env("PATH", bin)
+            .env("XDG_DATA_HOME", data_home)
+            .env_remove("SBX_DATA_DIR")
+            .env_remove("SSH_CONNECTION")
+            .env_remove("SSH_TTY")
+            .stdin(pty.stdio())
+            .stdout(pty.stdio())
+            .stderr(pty.stdio())
+            .spawn()
+            .expect("spawn sbx run on a terminal"),
+    );
+    pty.release_slave();
+
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let exited = loop {
+        pty.read_into(&mut out, 300);
+        assert!(
+            !String::from_utf8_lossy(&out).contains("[y/N]"),
+            "the first launch asked instead of adopting: {}",
+            String::from_utf8_lossy(&out)
+        );
+        if child.0.try_wait().expect("poll sbx run").is_some() {
+            for _ in 0..10 {
+                if !pty.read_into(&mut out, 100) {
+                    break;
+                }
+            }
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+    };
+    (exited, String::from_utf8_lossy(&out).into_owned())
+}
+
+#[test]
+fn a_first_interactive_launch_adopts_a_volume_without_asking_and_keeps_the_plain_directory_when_it_cannot()
+ {
+    let root = TmpDir::prefixed("st", "first");
+    let data_home = root.join("data");
+    let project = root.join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let (bin, calls) = adoption_stand_ins(root.path());
+
+    let (exited, said) = first_launch(&project, &bin, &data_home);
+    assert!(exited, "the launch did not end within a minute: {said}");
+
+    let data = data_home.join("sbx");
+    if !data.join(".storage-offered").exists() {
+        skip_incapable!(
+            "skipping first-launch adoption: this host is not one a volume is adopted on ({said})"
+        );
+        return;
+    }
+    let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        calls.lines().any(|c| c.starts_with("loop-setup")),
+        "the volume was never attached; the stand-ins saw {calls:?}: {said}"
+    );
+    assert!(
+        !data.join("storage.toml").exists(),
+        "a volume that never mounted was adopted: {said}"
+    );
+    assert!(
+        said.contains("continuing on the plain data directory"),
+        "the launch did not say it kept the plain directory: {said}"
+    );
+    assert!(
+        data_home
+            .join("sbx-storage.btrfs")
+            .symlink_metadata()
+            .is_err(),
+        "the volume that could not be set up stayed behind, where `sbx storage init` meets it: \
+         {said}"
+    );
+}
+
+/// A storage verb run by hand settles where the data lives, so the first interactive launch after
+/// it adopts nothing: after `sbx storage unuse`, a volume adopted there would undo what was just
+/// asked for. Gated on a launch in a second, untouched data home adopting one, so a host where no
+/// launch would cannot pass this by doing nothing.
+#[test]
+fn a_storage_verb_run_by_hand_settles_the_first_launch() {
+    let root = TmpDir::prefixed("st", "byhand");
+    let project = root.join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let (bin, calls) = adoption_stand_ins(root.path());
+
+    let untouched = root.join("untouched");
+    let (exited, said) = first_launch(&project, &bin, &untouched);
+    assert!(exited, "the launch did not end within a minute: {said}");
+    if !untouched.join("sbx/.storage-offered").exists() {
+        skip_incapable!(
+            "skipping first-launch adoption: this host is not one a volume is adopted on ({said})"
+        );
+        return;
+    }
+
+    let data_home = root.join("data");
+    let unuse = common::isolated_sbx("st-")
+        .args(["storage", "unuse"])
+        .env("XDG_DATA_HOME", &data_home)
+        .env_remove("SBX_DATA_DIR")
+        .output()
+        .expect("spawn sbx storage unuse");
+    assert!(
+        unuse.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unuse.stderr)
+    );
+    std::fs::remove_file(&calls).unwrap();
+
+    let (exited, said) = first_launch(&project, &bin, &data_home);
+    assert!(exited, "the launch did not end within a minute: {said}");
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap_or_default(),
+        "",
+        "the first launch after `sbx storage unuse` set up a volume: {said}"
+    );
+    assert!(
+        data_home
+            .join("sbx-storage.btrfs")
+            .symlink_metadata()
+            .is_err(),
+        "the first launch after `sbx storage unuse` created a volume: {said}"
+    );
+}
+
+/// A volume created by hand with `sbx storage init` is not adopted by the next interactive launch:
+/// nothing changes until `sbx storage use`. Without the record `init` leaves, the launch would find
+/// the image and attach it. Gated on a launch in an untouched data home adopting one, as above.
+#[test]
+fn a_volume_created_by_hand_waits_for_use_rather_than_the_first_launch() {
+    let root = TmpDir::prefixed("st", "byinit");
+    let project = root.join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let (bin, calls) = adoption_stand_ins(root.path());
+
+    let untouched = root.join("untouched");
+    let (exited, said) = first_launch(&project, &bin, &untouched);
+    assert!(exited, "the launch did not end within a minute: {said}");
+    if !untouched.join("sbx/.storage-offered").exists() {
+        skip_incapable!(
+            "skipping first-launch adoption: this host is not one a volume is adopted on ({said})"
+        );
+        return;
+    }
+
+    let data_home = root.join("data");
+    let init = common::isolated_sbx("st-")
+        .args(["storage", "init", "--size", "2G"])
+        .env("PATH", &bin)
+        .env("XDG_DATA_HOME", &data_home)
+        .env_remove("SBX_DATA_DIR")
+        .output()
+        .expect("spawn sbx storage init");
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let image = data_home.join("sbx-storage.btrfs");
+    assert!(image.is_file(), "`sbx storage init` created no image");
+    std::fs::remove_file(&calls).unwrap();
+
+    let (exited, said) = first_launch(&project, &bin, &data_home);
+    assert!(exited, "the launch did not end within a minute: {said}");
+    let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|c| c.starts_with("loop-setup")),
+        "the first launch attached the volume `sbx storage init` created: {said}"
+    );
+    assert!(
+        image.is_file(),
+        "the first launch removed the volume `sbx storage init` created: {said}"
     );
 }
