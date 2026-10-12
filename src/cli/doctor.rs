@@ -525,14 +525,34 @@ fn report_storage(rep: &mut Report<'_>) {
     let Some(default_dir) = store::Layout::default_data_dir() else {
         return;
     };
+    report_storage_in(rep, &default_dir);
+}
 
+/// [`report_storage`] for the default data directory `default_dir`.
+fn report_storage_in(rep: &mut Report<'_>, default_dir: &Path) {
     // Set to follow a volume? Read the pointer directly, so the answer stands even when the
     // volume happens to be unmounted right now. The type leads — `volume (<fs>)` here, `local
     // (<fs>)` below — the one distinction that says whether sbx manages the backing or borrows
     // the host's.
-    // A report: an unreadable pointer is shown as no pointer rather than failing the check
-    // that exists to describe the machine.
-    if let Ok(Some(image)) = storage::read_pointer(&default_dir) {
+    //
+    // A pointer that cannot be read is reported as one, never as no pointer: every launch refuses
+    // on it, and that refusal sends its reader here, where a `local` line would contradict it.
+    let pointer = match storage::read_pointer(default_dir) {
+        Ok(pointer) => pointer,
+        Err(e) => {
+            rep.check(
+                "warn",
+                "storage",
+                &format!(
+                    "type: volume — the pointer `{}` cannot be read: {e}",
+                    storage::POINTER
+                ),
+            );
+            rep.note("every launch refuses until it can be read, rather than use an empty store");
+            return;
+        }
+    };
+    if let Some(image) = pointer {
         match storage::state(&image) {
             Ok(storage::State::Mounted { mount_point, .. }) => {
                 let fs = storage::fs_kind(&mount_point)
@@ -562,7 +582,7 @@ fn report_storage(rep: &mut Report<'_>) {
 
     // No volume: the data directory sits directly on a host filesystem — type `local (<fs>)` —
     // and the note says whether an encapsulated volume is worth adopting.
-    let pre = storage::Preflight::probe(&default_dir);
+    let pre = storage::Preflight::probe(default_dir);
     let fs = pre
         .host_fs
         .map(|k| k.name())
@@ -805,6 +825,43 @@ mod tests {
     }
 
     use super::*;
+
+    /// A volume pointer that cannot be read is reported as one. Shown as no pointer, the line would
+    /// read `local` while every launch refuses on that pointer, and the refusal names `sbx doctor`
+    /// as the place to look: an `image` line that is not one quoted path, and a pointer that cannot
+    /// be read at all.
+    #[test]
+    fn a_volume_pointer_that_cannot_be_read_is_reported_rather_than_shown_as_none() {
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("sbx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pointer = dir.join(storage::POINTER);
+        let mut wrong = Vec::new();
+        for shape in ["malformed", "unreadable"] {
+            match shape {
+                "malformed" => std::fs::write(&pointer, "image = \"/vol/a.btrfs\" junk\n"),
+                // A directory in the pointer's place reaches the read as an error for any uid,
+                // where a file stripped of its permissions is read anyway by root.
+                _ => std::fs::create_dir(&pointer),
+            }
+            .unwrap();
+            let pal = style::Palette::plain();
+            let mut rep = Report::new(true, &pal);
+            report_storage_in(&mut rep, &dir);
+            let check = rep.checks.last().expect("the storage line");
+            if (check.name.as_str(), check.status) != ("storage", "warn")
+                || !check.detail.contains("cannot be read")
+            {
+                wrong.push(format!("{shape}: [{}] {}", check.status, check.detail));
+            }
+            if pointer.is_dir() {
+                std::fs::remove_dir(&pointer).unwrap();
+            } else {
+                std::fs::remove_file(&pointer).unwrap();
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
 
     /// The profile names the binary's own path, and a path that would change what the profile
     /// says between its quotes gets none.
