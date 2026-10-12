@@ -1158,20 +1158,21 @@ fn set_mtime(path: &Path, times: Times) -> io::Result<()> {
     Ok(())
 }
 
-/// An advisory lock held through a `.lock` file beside what it guards: an image across the whole
-/// attach-and-mount sequence, so two concurrent `up` calls cannot each attach a loop device to the
-/// same bytes, or the [`ToolStore`] across a format.
+/// An advisory lock held through a `.lock` file beside what it guards: an image across its
+/// creation and across the whole attach-and-mount sequence, so two concurrent `init` calls cannot
+/// format it together and two concurrent `up` calls cannot each attach a loop device to the same
+/// bytes, or the [`ToolStore`] across a format.
 struct ImageLock(#[allow(dead_code)] std::fs::File);
 
 fn lock_image(image: &Path) -> io::Result<ImageLock> {
-    // The holder is another sbx in the middle of the same sequence, and that sequence calls
+    // The holder is another sbx formatting the image, or attaching and mounting it through
     // `udisksctl`, which goes through polkit: an authentication prompt takes as long as the person
     // in front of it.
     lock_beside(image, IMAGE_WAIT)
 }
 
-/// What another sbx holding an image's lock may be doing: answering polkit.
-const IMAGE_WAIT: &str = "it may be waiting for your authorisation";
+/// What another sbx holding an image's lock may be doing: formatting it, or answering polkit.
+const IMAGE_WAIT: &str = "it may be formatting it, or waiting for your authorisation";
 
 /// What another sbx holding the tool store's lock may be doing: provisioning before its format.
 const TOOL_STORE_WAIT: &str = "it may be downloading btrfs-progs";
@@ -1544,15 +1545,38 @@ pub(crate) fn init(
             "invalid label {label:?} — letters, digits, '-' and '_', at most 32"
         ));
     }
-    if image.exists() {
-        return Err(format!(
+    let taken = || {
+        Err(format!(
             "{} already exists — remove it first, or pass another path",
             image.display()
+        ))
+    };
+    // Under a provisioned mkfs this process already holds the tool store's lock, and an image at
+    // the tool store's own path locks through that same file: the lock below would wait on this
+    // process forever. Asked first, since that path then holds the tool store, which the existence
+    // check would otherwise report as an image to remove.
+    if let Mkfs::Owned { _tools: tools, .. } = mkfs
+        && lock_path(image) == lock_path(&tools.dir)
+    {
+        return Err(format!(
+            "{} is where sbx provisions the btrfs-progs that formats a volume — pass another path",
+            image.display()
         ));
+    }
+    if image.exists() {
+        return taken();
     }
     if let Some(parent) = image.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    // Held until the image is formatted or refused, so a second `init` of the same image waits for
+    // this one and then finds the image, rather than meeting the seed this one formats from. Asked
+    // again once held, for that second `init`'s sake. Dropped on return: a caller that goes on to
+    // mount the image takes the same lock in `up`.
+    let _lock = lock_image(image).map_err(|e| format!("cannot lock {}: {e}", image.display()))?;
+    if image.exists() {
+        return taken();
     }
 
     // The seed directory decides the filesystem root's ownership, so it must be ours and it
@@ -3011,14 +3035,15 @@ this line has no separator at all
         );
     }
 
-    /// A command waiting on another sbx's lock says what that one may be doing: answering polkit
-    /// over an image, provisioning over the tool store, where no authorisation is ever asked.
+    /// A command waiting on another sbx's lock says what that one may be doing: formatting or
+    /// answering polkit over an image, provisioning over the tool store, where no authorisation is
+    /// ever asked.
     #[test]
     fn a_wait_on_a_lock_names_what_its_holder_may_be_doing() {
         assert_eq!(
             wait_note(Path::new("/d/sbx-storage.btrfs"), IMAGE_WAIT),
             "another sbx is working on /d/sbx-storage.btrfs — waiting for it to finish (it may be \
-             waiting for your authorisation)"
+             formatting it, or waiting for your authorisation)"
         );
         let tools = wait_note(Path::new("/d/sbx/storage-tools"), TOOL_STORE_WAIT);
         assert!(!tools.contains("authorisation"), "{tools}");
@@ -3659,6 +3684,86 @@ this line has no separator at all
             image.symlink_metadata().is_err(),
             "a refused format left an image behind"
         );
+    }
+
+    /// Two `init`s of one image are serialized by its lock. The second waits while the first holds
+    /// it, creating nothing, not even the seed the first is formatting from, then finds the image
+    /// the first made and refuses it as it would have had it come later. Unlocked, the second would
+    /// meet the first's seed and be told to remove it if a format that did not finish had left it,
+    /// while that format is reading it.
+    #[test]
+    fn a_second_init_of_one_image_waits_for_the_first_then_refuses() {
+        if !Path::new("/bin/true").exists() {
+            skip_incapable!("skipping: no `/bin/true` to stand in for a mkfs that does nothing");
+            return;
+        }
+        let base = crate::testutil::TmpDir::new();
+        let image = base.path().join("a.btrfs");
+        let seed = image.with_extension("seed");
+        // This test stands in for the first `init`: it holds the image's lock.
+        let first = lock_image(&image).expect("locked");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second = image.clone();
+        std::thread::spawn(move || {
+            let made = init(
+                &second,
+                DEFAULT_SIZE_BYTES,
+                DEFAULT_LABEL,
+                MetadataProfile::default(),
+                &Mkfs::Host(PathBuf::from("/bin/true")),
+            );
+            let _ = tx.send(made);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut wrong = Vec::new();
+        if seed.symlink_metadata().is_ok() || image.symlink_metadata().is_ok() {
+            wrong.push("the second init went ahead while the first held the lock".to_string());
+        }
+        // The first makes its image, and lets go.
+        std::fs::write(&image, b"the first one's volume").unwrap();
+        drop(first);
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Err(e)) if e.contains("already exists") => {}
+            other => wrong.push(format!("the second init, once let through: {other:?}")),
+        }
+        assert_eq!(
+            std::fs::read(&image).unwrap(),
+            b"the first one's volume",
+            "the first one's image was touched"
+        );
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Under a provisioned mkfs this process already holds the tool store's lock, so an image at
+    /// the tool store's own path, whose lock file that is, would wait on itself forever. It is
+    /// refused instead, and the call returns.
+    #[test]
+    fn an_image_at_the_tool_store_path_is_refused_rather_than_waited_on() {
+        let base = crate::testutil::TmpDir::new();
+        let tools = ToolStore::claim(&base.path().join("sbx")).expect("claimed");
+        let image = tools.dir.clone();
+        let mkfs = Mkfs::Owned {
+            bwrap: PathBuf::from("/nonexistent-by-construction/bwrap"),
+            store_nix: PathBuf::from("/nonexistent-by-construction/nix"),
+            bin: PathBuf::from("/nonexistent-by-construction/mkfs.btrfs"),
+            _tools: tools,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let made = init(
+                &image,
+                DEFAULT_SIZE_BYTES,
+                DEFAULT_LABEL,
+                MetadataProfile::default(),
+                &mkfs,
+            );
+            let _ = tx.send(made);
+        });
+        let made = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("init returned rather than waiting on its own lock");
+        let err = made.expect_err("refused");
+        assert!(err.contains("btrfs-progs"), "{err}");
     }
 
     /// `init` promises it "can never destroy a store". The `exists()` check is a separate stat from
