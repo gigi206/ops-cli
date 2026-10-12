@@ -169,9 +169,9 @@ pub(crate) use flake::{
 };
 pub(crate) use gc::{
     InstalledApp, PrunedVersion, SIZE_CAVEAT, app_trees, classify_tree, drop_home_entries,
-    human_bytes, installed_app_homes, mise_tool_specs, project_mise_tool_specs, prune_app_tools,
-    prune_stale_versions, purge_app_homes, read_marker, reset_home, tree_size, tree_usage,
-    tree_usage_parts,
+    human_bytes, installed_app_homes, lock_app_projects, mise_tool_specs, project_mise_tool_specs,
+    prune_app_tools, prune_stale_versions, purge_app_homes, read_marker, reset_home, tree_size,
+    tree_usage, tree_usage_parts,
 };
 pub(crate) use launch::{
     Learned, RollMode, SessionHeader, app, attach, detach_log_path, distro_lock_path,
@@ -212,6 +212,8 @@ pub(crate) use projectstore::PROJECT_MARKER;
 /// waits for. Re-exported for the channel locks' writer guard
 /// ([`crate::store::hold_lock_for_write`]), so the two take their turns one way.
 pub(crate) use projectstore::flock_at;
+#[cfg(test)]
+pub(crate) use projectstore::hold_project_store;
 pub(crate) use projectstore::reflink_verdict;
 pub(crate) use proxy::child::main as run_proxy;
 pub(crate) use proxy::{

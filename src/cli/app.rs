@@ -1272,6 +1272,26 @@ fn nothing_purged_message(name: &str, profile_failed: bool) -> String {
     format!("sbx: nothing to purge for '{name}' (no profile and no home)")
 }
 
+/// Whether `sessions` holds a running session of app `name`, refused aloud with its pids when it
+/// does.
+fn refuse_live_app(name: &str, sessions: &[session::Session]) -> bool {
+    let pids: Vec<String> = sessions
+        .iter()
+        .filter(|s| s.app() == Some(name))
+        .map(|s| s.pid.to_string())
+        .collect();
+    if pids.is_empty() {
+        return false;
+    }
+    diag::error(&format!(
+        "sbx: app '{name}' has a running session (pid {}); stop it first \
+         (see `sbx session ls`; then `sbx session stop {}`).",
+        pids.join(", "),
+        pids.join(" ")
+    ));
+    true
+}
+
 /// Purge one app: its profile (if any) and its isolated home(s). `sessions` is the batch's single
 /// read of the registry, so the live-app guard costs one listing no matter how many names are given.
 ///
@@ -1287,23 +1307,42 @@ fn app_rm_purge_one(
 ) -> AppPurgeOutcome {
     let (ok, n, warn, dim, r) = (pal.ok, pal.name, pal.warn, pal.dim, pal.reset);
 
+    let refused = AppPurgeOutcome {
+        ok: false,
+        acted: false,
+    };
     // Live-session guard: a session running as this app holds its home open.
-    let pids: Vec<String> = sessions
-        .iter()
-        .filter(|s| s.app() == Some(name))
-        .map(|s| s.pid.to_string())
-        .collect();
-    if !pids.is_empty() {
-        diag::error(&format!(
-            "sbx: app '{name}' has a running session (pid {}); stop it first \
-             (see `sbx session ls`; then `sbx session stop {}`).",
-            pids.join(", "),
-            pids.join(" ")
-        ));
-        return AppPurgeOutcome {
-            ok: false,
-            acted: false,
-        };
+    if refuse_live_app(name, sessions) {
+        return refused;
+    }
+    // A launch of the app still setting up is in no record yet, and holds its project's store
+    // lock until it is: the purge holds those locks, and reads the registry again once it does.
+    // They are released when this returns, before the batch's `--gc` sweep takes the current
+    // project's again.
+    let _held = match sandbox::lock_app_projects(layout, name, &|lock| {
+        diag::note(&format!(
+            "waiting for the project's store lock `{}`, which a launch of '{name}' holds until its \
+             session is recorded",
+            lock.display()
+        ))
+    }) {
+        Ok(held) => held,
+        Err(e) => {
+            diag::error(&format!(
+                "sbx: cannot lock a project store '{name}' has a tree in ({e}); not purging it."
+            ));
+            return refused;
+        }
+    };
+    match session::Registry::at(layout.data_dir()).live() {
+        Ok(now) if refuse_live_app(name, &now) => return refused,
+        Ok(_) => {}
+        Err(e) => {
+            diag::error(&format!(
+                "sbx: cannot read the session registry ({e}); not purging '{name}'."
+            ));
+            return refused;
+        }
     }
 
     // 1. The profile (if any). Under --purge a missing profile is not fatal — the homes may still
@@ -2900,6 +2939,85 @@ mod tests {
             }
             _ => panic!("expected a successful parse"),
         }
+    }
+
+    /// A launch of the app still setting up holds its project's store lock and is in no session
+    /// record yet. The purge waits for it, so neither the app's tree in that project nor its
+    /// global home is removed under it, and goes ahead once the launch lets go.
+    #[test]
+    fn a_purge_waits_for_a_launch_of_the_app_still_setting_up() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        let data = TmpDir::new();
+        let cfg = TmpDir::new();
+        let _lock = env_lock();
+        let _data = EnvVar::set("SBX_DATA_DIR", data.path());
+        let _cfg = EnvVar::set("XDG_CONFIG_HOME", cfg.path());
+        let layout = store::Layout::from_env().expect("a layout under the fixture root");
+        let id = "0123456789abcdef";
+        let tree = layout
+            .data_dir()
+            .join("projects")
+            .join(id)
+            .join("apps/demo-app");
+        let global = layout.data_dir().join("apps/demo-app");
+        std::fs::create_dir_all(tree.join("mise")).unwrap();
+        std::fs::create_dir_all(global.join("home")).unwrap();
+        let launch = sandbox::hold_project_store(&layout, id, &|_| {}).unwrap();
+        let purge = std::thread::spawn(|| app_rm_purge(&["demo-app"], false));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            tree.is_dir() && global.join("home").is_dir(),
+            "the purge removed the app's trees under a launch still holding its project's lock"
+        );
+        drop(launch);
+        let _ = purge.join().unwrap();
+        assert!(
+            !tree.exists() && !global.exists(),
+            "the purge went ahead once the launch let go"
+        );
+    }
+
+    /// The registry is read again once the purge holds the locks: a launch that recorded its
+    /// session while the purge waited is a running session of the app, and the purge refuses.
+    #[test]
+    fn a_purge_refuses_a_session_recorded_while_it_waited() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        let data = TmpDir::new();
+        let cfg = TmpDir::new();
+        let _lock = env_lock();
+        let _data = EnvVar::set("SBX_DATA_DIR", data.path());
+        let _cfg = EnvVar::set("XDG_CONFIG_HOME", cfg.path());
+        let layout = store::Layout::from_env().expect("a layout under the fixture root");
+        let id = "0123456789abcdef";
+        let tree = layout
+            .data_dir()
+            .join("projects")
+            .join(id)
+            .join("apps/demo-app");
+        let global = layout.data_dir().join("apps/demo-app");
+        std::fs::create_dir_all(tree.join("mise")).unwrap();
+        std::fs::create_dir_all(global.join("home")).unwrap();
+        let launch = sandbox::hold_project_store(&layout, id, &|_| {}).unwrap();
+        let purge = std::thread::spawn(|| app_rm_purge(&["demo-app"], false));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // The launch records its session, then lets its lock go. This test process is the
+        // session's process, so the registry reads it live.
+        let session = session::Session::current(
+            data.path().to_path_buf(),
+            session::Kind::Run,
+            session::SessionRuntime::GlobalApp("demo-app".into()),
+        )
+        .expect("the test process itself is a live session");
+        session::Registry::at(layout.data_dir())
+            .register(&session)
+            .expect("a registered session");
+        drop(launch);
+        let code = purge.join().unwrap();
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(
+            tree.is_dir() && global.join("home").is_dir(),
+            "the purge removed the trees of an app whose session it found once it held the locks"
+        );
     }
 
     #[test]

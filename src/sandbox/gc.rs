@@ -903,6 +903,40 @@ fn app_trees_found(data_dir: &Path, name: &str) -> (Vec<PathBuf>, Vec<io::Error>
     (trees, unlisted)
 }
 
+/// The store locks of every project holding a tree of app `name`, taken exclusive in id order, for
+/// a purge of the app to hold while it reads the registry and removes the app's homes.
+///
+/// A launch of the app still setting up is in no session record yet: it holds its project's store
+/// lock shared from before it creates the app's directories until its session is recorded. Every
+/// launch creates the app's tree in the project it runs in, so these locks cover a relaunch in any
+/// project the app has run in, and the global home it writes as well. A first launch of the app in
+/// a project where it has no tree yet takes a lock this does not hold. Only a tree that is a
+/// directory in its own right is locked, since taking a lock creates its file and the directories
+/// above it; and in id order, so two purges cannot each hold a lock the other waits for.
+///
+/// A projects directory that cannot be read yields no lock: the purge reports it itself.
+pub(crate) fn lock_app_projects(
+    layout: &crate::store::Layout,
+    name: &str,
+    waiting: &dyn Fn(&Path),
+) -> io::Result<Vec<super::projectstore::ProjectStoreLock>> {
+    let mut ids: Vec<String> = match std::fs::read_dir(layout.data_dir().join("projects")) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| {
+                std::fs::symlink_metadata(e.path().join("apps").join(name))
+                    .is_ok_and(|m| m.is_dir())
+            })
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    ids.sort();
+    ids.iter()
+        .map(|id| super::projectstore::lock_project_store(layout, id, waiting))
+        .collect()
+}
+
 /// Remove app `name`'s isolated runtime directories — the global home `<data>/apps/<name>/` (shared
 /// across projects) and each per-project directory `<data>/projects/<id>/apps/<name>/`. The whole
 /// `apps/<name>/` subtree is removed at each site, so it reclaims everything an app keeps there: a
