@@ -209,7 +209,8 @@ struct ProjectTreeView {
     /// `live` (a running session holds it), `idle` (its project still exists), `dead` (the project
     /// directory is gone), `markerless` (a legacy tree pre-dating marker recording), `unknown`
     /// (the session registry could not be read, so no tree's liveness was established), or
-    /// `unreadable` (its marker is there and cannot be read, so its project is unknown).
+    /// `unreadable` (its marker is there and cannot be read, or names no usable path, so its
+    /// project is unknown).
     state: &'static str,
     /// On-disk size in bytes (an upper bound — reflinked content shared with another tree counts
     /// per file).
