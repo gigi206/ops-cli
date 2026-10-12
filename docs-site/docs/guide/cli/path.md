@@ -40,7 +40,10 @@ data:    ~/.local/share/sbx  (present)  $SBX_DATA_DIR, else $XDG_DATA_HOME/sbx (
 
 Each `projects/` row carries a liveness state and the last-used date. The `*` marks
 the tree for the current directory, `dead` means the project directory itself is
-gone (sweepable with [`sbx projects rm --dead`](projects)). An `(absent)` on an
+gone (sweepable with [`sbx projects rm --dead`](projects)). The project path on a row is the
+one the tree's marker records, written as [`sbx config show`](config) writes a value: a control
+character or a character that reorders a line is written out as an escape, and `--json` keeps
+the path as it is. An `(absent)` on an
 entry simply means nothing has needed it yet. Two more bases follow the `data` one:
 `config:` (the profiles directory and its siblings) and `state:` (the trust
 markers).
