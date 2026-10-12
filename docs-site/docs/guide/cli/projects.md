@@ -28,9 +28,9 @@ the size. The tree of the directory you are in is marked `*`. `sbx projects ls` 
 accepted alias.
 
 The project path is the one the tree's marker records, and a directory can be named anything.
-The listing, `show`, and the `rm --dead` sweep write it as [`sbx config show`](config) writes a
-value: a control character or a character that reorders a line is written out as an escape
-(`\x1b`, `\u{202e}`). `--json` keeps the path as it is.
+The listing, `show`, and the `rm --dead` and `--markerless` sweeps write it as
+[`sbx config show`](config) writes a value: a control character or a character that reorders a
+line is written out as an escape (`\x1b`, `\u{202e}`). `--json` keeps the path as it is.
 
 :::warning What the size column counts, and what it leaves out
 A tree's store is **seeded from the shared one**, path for path, and on a filesystem that
