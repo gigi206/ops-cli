@@ -31,8 +31,9 @@ use std::process::ExitCode;
 /// removal instead of at the apply form, while the branch written for it could not be reached at
 /// all — with the flag set, the trees are reaped and the list it reads is empty.
 ///
-/// Returns whether every tree the sweep set out to remove is gone. A removal that failed is named
-/// on stderr and makes the verb fail, as a named tree's does.
+/// Returns whether the sweep did what it set out to do: false when `<data>/projects/` cannot be
+/// read, or when a tree it was to remove is still there. Either is named on stderr and makes the
+/// verb fail, as a named tree's failure does.
 fn reap_dead_trees(
     layout: &crate::store::Layout,
     live_ids: &std::collections::BTreeSet<String>,
@@ -49,6 +50,16 @@ fn reap_dead_trees(
         super::gc::reap_dead_projects(&projects_dir, live_ids, prune, prune_unidentified, &|dir| {
             reclaim.bytes(dir)
         });
+    let report = match report {
+        Ok(report) => report,
+        Err(e) => {
+            crate::diag::error(&format!(
+                "sbx projects rm: cannot read {} ({e}), so the trees in it cannot be swept.",
+                projects_dir.display()
+            ));
+            return false;
+        }
+    };
     if report.dead.is_empty()
         && report.unidentified.is_empty()
         && report.reaped_unidentified.is_empty()
@@ -1066,6 +1077,45 @@ mod projects_rm_tests {
         mode(0o700).unwrap();
         assert!(tree.is_dir(), "the fixture's removal was expected to fail");
         assert_eq!(code, std::process::ExitCode::FAILURE);
+    }
+
+    /// A `projects/` directory the `--dead` sweep cannot read fails the verb, previewed or applied,
+    /// rather than reading as one with nothing to reclaim; one that does not exist yet still sweeps
+    /// nothing and succeeds.
+    #[test]
+    fn an_unreadable_projects_directory_fails_the_dead_sweep() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        use std::os::unix::fs::PermissionsExt as _;
+        let data = TmpDir::new();
+        let _lock = env_lock();
+        let _data = EnvVar::set("SBX_DATA_DIR", data.path());
+        let layout = crate::store::Layout::from_env().expect("a layout under the fixture root");
+        let pal = crate::style::Palette::plain();
+        let sweep = |apply| super::projects_rm(&[], true, false, apply, false, false, &pal);
+        let projects = layout.data_dir().join("projects");
+        assert!(!projects.exists(), "the fixture starts with no projects/");
+        assert_eq!(sweep(false), std::process::ExitCode::SUCCESS);
+        std::fs::create_dir_all(projects.join("0123456789abcdef")).unwrap();
+        let mode = |m| std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(m));
+        mode(0o000).unwrap();
+        if std::fs::read_dir(&projects).is_ok() {
+            mode(0o700).unwrap();
+            skip_incapable!("running as root, which reads a directory its mode refuses");
+            return;
+        }
+        let previewed = sweep(false);
+        let applied = sweep(true);
+        mode(0o700).unwrap();
+        assert_eq!(
+            previewed,
+            std::process::ExitCode::FAILURE,
+            "the preview read an unreadable projects/ as empty"
+        );
+        assert_eq!(
+            applied,
+            std::process::ExitCode::FAILURE,
+            "the applied sweep read an unreadable projects/ as empty"
+        );
     }
 }
 

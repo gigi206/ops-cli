@@ -558,13 +558,16 @@ pub(crate) struct UnidentifiedTree {
 ///
 /// Each tree is sized by `measure` before it is removed, so what is reported is the caller's figure
 /// for what a removal gives back ([`Reclaim::bytes`]).
+///
+/// A `projects_dir` that does not exist yet holds no tree, and the report is empty. One that cannot
+/// be read is an error: an empty report would say there is nothing to reclaim.
 pub(crate) fn reap_dead_projects(
     projects_dir: &Path,
     live_ids: &BTreeSet<String>,
     prune: bool,
     prune_unidentified: bool,
     measure: &dyn Fn(&Path) -> u64,
-) -> ReapReport {
+) -> io::Result<ReapReport> {
     reap_dead_projects_with(
         projects_dir,
         live_ids,
@@ -587,7 +590,7 @@ fn reap_dead_projects_with(
     prune_unidentified: bool,
     measure: &dyn Fn(&Path) -> u64,
     remove: &dyn Fn(&Path) -> io::Result<()>,
-) -> ReapReport {
+) -> io::Result<ReapReport> {
     let mut dead = Vec::new();
     let mut unidentified = Vec::new();
     let mut reaped_unidentified = Vec::new();
@@ -595,14 +598,15 @@ fn reap_dead_projects_with(
     let entries = match std::fs::read_dir(projects_dir) {
         Ok(e) => e,
         // No projects tree yet — nothing to reap.
-        Err(_) => {
-            return ReapReport {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(ReapReport {
                 dead,
                 unidentified,
                 reaped_unidentified,
                 failed,
-            };
+            });
         }
+        Err(e) => return Err(e),
     };
     for entry in entries.flatten() {
         let dir = entry.path();
@@ -649,12 +653,12 @@ fn reap_dead_projects_with(
             }
         }
     }
-    ReapReport {
+    Ok(ReapReport {
         dead,
         unidentified,
         reaped_unidentified,
         failed,
-    }
+    })
 }
 
 /// The canonical project path recorded in `<dir>/project`, if the marker is present and holds an
@@ -4000,7 +4004,8 @@ mod tests {
         let live = BTreeSet::from(["4444444444444444".to_string()]);
 
         // dry run: the one dead tree and the one unidentified tree are reported, nothing removed
-        let report = reap_dead_projects(&projects, &live, false, false, &tree_size);
+        let report = reap_dead_projects(&projects, &live, false, false, &tree_size)
+            .expect("read the fixture's projects directory");
         assert_eq!(report.dead.len(), 1, "exactly one tree is reclaimable");
         assert_eq!(report.dead[0].path, dead_path);
         assert_eq!(
@@ -4019,7 +4024,8 @@ mod tests {
         );
 
         // prune: only the dead, present-parent, not-busy, identified tree is removed
-        let report = reap_dead_projects(&projects, &live, true, false, &tree_size);
+        let report = reap_dead_projects(&projects, &live, true, false, &tree_size)
+            .expect("read the fixture's projects directory");
         assert_eq!(report.dead.len(), 1);
         assert!(
             !projects.join("2222222222222222").exists(),
@@ -4194,7 +4200,8 @@ mod tests {
         let live = BTreeSet::from(["bbbbbbbbbbbbbbbb".to_string()]);
 
         // dry run (neither switch): both reported as candidates, neither removed
-        let report = reap_dead_projects(&projects, &live, false, false, &tree_size);
+        let report = reap_dead_projects(&projects, &live, false, false, &tree_size)
+            .expect("read the fixture's projects directory");
         assert_eq!(
             report.unidentified.len(),
             1,
@@ -4215,7 +4222,8 @@ mod tests {
 
         // the markerless opt-in reaps the unheld markerless tree with the dead-prune OFF — the two
         // switches are independent — and the live one is still kept
-        let report = reap_dead_projects(&projects, &live, false, true, &tree_size);
+        let report = reap_dead_projects(&projects, &live, false, true, &tree_size)
+            .expect("read the fixture's projects directory");
         assert_eq!(
             report.reaped_unidentified.len(),
             1,
