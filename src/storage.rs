@@ -1564,13 +1564,39 @@ pub(crate) fn init(
     made
 }
 
+/// Where `loop_dev` is mounted, and with which options, once udisks has reported mounting it at
+/// `reported` — provided this process's mount table shows it.
+///
+/// The table is the proof that the mount reached this process at all: udisks mounts in the mount
+/// namespace its daemon runs in, and a process whose namespace that mount does not propagate into
+/// sees at most the directory beneath it, where whatever is written lands instead of in the volume,
+/// on the `/run` tmpfs. A device the table does not show is therefore an error rather than a mount
+/// point. The options are the table's, so they are those of the mount this process writes through.
+fn mounted_here(
+    loop_dev: &str,
+    mountinfo: &[u8],
+    reported: &Path,
+) -> Result<(PathBuf, String), String> {
+    let (_, options) = mount_of(loop_dev, mountinfo).ok_or_else(|| {
+        format!(
+            "udisks reports {loop_dev} mounted at {}, but this process's mount table does not \
+             show it, so sbx would write beside the volume rather than into it — run sbx in the \
+             mount namespace udisks mounts in",
+            reported.display()
+        )
+    })?;
+    Ok((reported.to_path_buf(), options))
+}
+
 /// Attach and mount the volume, and return where it landed. Idempotent: an already-mounted
 /// volume is reported, not mounted twice.
 pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
     let _lock = lock_image(image).map_err(|e| format!("cannot lock {}: {e}", image.display()))?;
     let udisks = tool("udisksctl", "udisks2")?;
 
-    let loop_dev = match state(image).map_err(|e| e.to_string())? {
+    // Whether this call attached the loop device, and so is the one to release it if the mount
+    // it goes on to make has to be undone.
+    let (loop_dev, attached_here) = match state(image).map_err(|e| e.to_string())? {
         State::Absent => {
             return Err(format!(
                 "{} does not exist — create it with `sbx storage init`",
@@ -1582,16 +1608,17 @@ pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
             options,
             ..
         } => return refuse_noexec(mount_point, &options),
-        State::Attached { loop_dev } => loop_dev,
+        State::Attached { loop_dev } => (loop_dev, false),
         State::Detached => {
             let out = run(Command::new(&udisks).arg("loop-setup").arg("-f").arg(image))?;
-            parse_loop_setup(&out)
-                .ok_or_else(|| format!("cannot read the loop device from: {}", out.trim()))?
+            let loop_dev = parse_loop_setup(&out)
+                .ok_or_else(|| format!("cannot read the loop device from: {}", out.trim()))?;
+            (loop_dev, true)
         }
     };
 
     let out = run(Command::new(&udisks).arg("mount").arg("-b").arg(&loop_dev))?;
-    let mount_point = parse_mount(&out)
+    let reported = parse_mount(&out)
         .ok_or_else(|| format!("cannot read the mount point from: {}", out.trim()))?;
 
     // A volume mounted `noexec` would host a store whose binaries cannot run — a failure that
@@ -1601,14 +1628,30 @@ pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
     // and the two `State::Mounted` arms then handed that same mount point back to every later
     // call — so the guard fired once and was never reachable again. `down` is best-effort: if it
     // cannot undo the mount the refusal still stands, and the arms above now refuse it too.
-    // Read errors are fatal here for the reason [`state`] states: an empty table answers `None`,
-    // which is indistinguishable from "this mount is not noexec" and would wave the volume through
-    // on the one call that performs the transition.
+    // Read errors are fatal here for the reason [`state`] states, and the options checked are the
+    // ones of the mount this process sees, which [`mounted_here`] requires to exist.
     let mountinfo = std::fs::read("/proc/self/mountinfo")
         .map_err(|e| format!("cannot read /proc/self/mountinfo: {e}"))?;
-    if let Some((_, options)) = mount_of(&loop_dev, &mountinfo)
-        && mount_is_noexec(&options)
-    {
+    let (mount_point, options) = match mounted_here(&loop_dev, &mountinfo, &reported) {
+        Ok(found) => found,
+        Err(e) => {
+            // Undone through udisks by device, not through `down`: `down` goes by the state this
+            // process reads, which shows the device attached but not mounted, so it would not
+            // unmount. Best-effort, as below: the refusal stands either way.
+            let _ = run(Command::new(&udisks)
+                .arg("unmount")
+                .arg("-b")
+                .arg(&loop_dev));
+            if attached_here {
+                let _ = run(Command::new(&udisks)
+                    .arg("loop-delete")
+                    .arg("-b")
+                    .arg(&loop_dev));
+            }
+            return Err(e);
+        }
+    };
+    if mount_is_noexec(&options) {
         // The lock goes first: `down` takes the same one, and `flock` on a second open of the
         // file would block against this call's own hold.
         drop(_lock);
@@ -2113,6 +2156,28 @@ this line has no separator at all
             Path::new(std::ffi::OsStr::from_bytes(b"/run/media/u/vol\xff"))
         );
         assert!(opts.contains("compress=zstd:3"), "{opts}");
+    }
+
+    /// Once udisks reports a mount, the mount table must show it: a device the table does not
+    /// show, mounted in a namespace this process does not see, is an error rather than the reported
+    /// path, which here is at most a directory on the `/run` tmpfs. The options checked are the
+    /// table's.
+    #[test]
+    fn a_mount_this_process_cannot_see_is_refused_rather_than_written_beside() {
+        let table = b"\
+50 30 0:61 / /media/usb rw - vfat /dev/sdb1 rw
+41 30 7:60 / /run/media/u/vol rw,nosuid,noexec - btrfs /dev/loop60 rw
+";
+        let (_, opts) = mounted_here("/dev/loop60", table, Path::new("/run/media/u/vol"))
+            .expect("the device is in the table");
+        assert!(mount_is_noexec(&opts), "the table's options: {opts}");
+
+        let err = mounted_here("/dev/loop61", table, Path::new("/run/media/u/other"))
+            .expect_err("a device the table does not show is not mounted here");
+        assert!(
+            err.contains("/dev/loop61") && err.contains("/run/media/u/other"),
+            "{err}"
+        );
     }
 
     /// A `loop/backing_file` as the kernel writes it: the path's bytes, then `tail`. Written from the
