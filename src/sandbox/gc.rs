@@ -403,12 +403,14 @@ fn print_dead(store: &StoreAt<'_>) -> io::Result<Vec<String>> {
 /// build lock, a `.chroot` build root) that `--gc --print-dead` reports yet which is not a
 /// registered store object, so it trips this. One such entry must not derail the whole collection:
 /// when nix names the path it stopped on, the sizes printed before it are summed, that path is
-/// skipped, and sizing resumes after it. The figure is only a report — `sweep` still deletes every
-/// dead entry regardless.
+/// skipped, and sizing resumes after it. A rejected path costs only its share of the figure, which
+/// is a report: `sweep` still deletes it with the rest.
 ///
 /// Any other failure is an error, with nix's own words: a store nix cannot open, or a database it
 /// cannot read, fails every batch alike, and skipping a path at a time would run one `nix-store`
-/// per remaining path to report a figure none of them measured.
+/// per remaining path to report a figure none of them measured. [`collect`] returns it before
+/// `sweep`, as it does a failed [`print_dead`]: a store nix cannot read is neither previewed nor
+/// collected.
 fn total_size(store: &StoreAt<'_>, paths: &[String]) -> io::Result<u64> {
     // Query in bounded windows: passing every dead path as one argv overflows the kernel's argv
     // limit (E2BIG) on a large store, which would abort the whole GC (including `--prune`). Store
