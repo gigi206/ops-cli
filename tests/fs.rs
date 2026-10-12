@@ -66,24 +66,6 @@ fn fs_unknown_subcommand_is_an_error() {
     assert!(err.contains("unknown subcommand"), "got: {err}");
 }
 
-/// Write the session record `sbx fs logs` resolves, pointing at a live `pid`. A fabricated record (the
-/// on-disk format is stable) isolates the property under test — the socket-missing path — from the
-/// session-registration machinery, which is exercised elsewhere.
-fn write_session_record(data: &Path, pid: u32, project: &Path) {
-    use std::os::unix::ffi::OsStrExt;
-    let start = common::start_ticks(pid);
-    let dir = data.join("sbx").join("sessions");
-    std::fs::create_dir_all(&dir).unwrap();
-    let hex: String = project
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let rec = format!("kind=run\npid={pid}\nstart={start}\nruntime=project\nproject={hex}\n");
-    std::fs::write(dir.join(format!("{pid}-{start}")), rec).unwrap();
-}
-
 #[test]
 fn fs_logs_reports_an_unobserved_session() {
     // A live session that was NOT launched with observation has no filesystem control socket, so
@@ -99,7 +81,7 @@ fn fs_logs_reports_an_unobserved_session() {
         .spawn()
         .expect("spawn sleep");
     let pid = child.id();
-    write_session_record(data.path(), pid, project.path());
+    common::write_session_record(data.path(), pid, "project", project.path());
 
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(["fs", "logs", &pid.to_string()])
