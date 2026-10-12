@@ -438,7 +438,9 @@ right before the switch, since one may have started during a long copy; if one h
 switched and the volume is cleared as after a failed copy. A volume whose free space cannot be
 read is refused before the copy starts, rather than risking a copy that fails half-way. The
 dated name is always a new directory: should it be taken, a `-1`, `-2`… suffix follows. Migrating into a volume that already holds a data
-directory (`store`, `projects`, `apps`) is refused, unless `--force` overrides it.
+directory (`store`, `projects`, `apps`) is refused, unless `--force` overrides it. Even then, the
+copy merges into what is there but never through a symbolic link: a sandbox writes its home, so
+the volume's old tree may hold links to anywhere, and one in the copy's way stops it.
 
 Living with it:
 
