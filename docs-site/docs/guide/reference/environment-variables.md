@@ -197,7 +197,7 @@ the supported surface, and no ordinary launch needs one.
 | `SBX_REQUIRE_CAPABLE` | set to a non-empty value other than `0`, a test that would skip for a missing host capability (user namespaces, bubblewrap, nix) fails instead |
 | `SBX_SKIP_LOG` | a **path**, not a boolean: every skipped test appends one line to that file, so a green run can be audited for what it did not do |
 | `SBX_TEST_TMPDIR` | moves the root under which the test suites build their temporary trees |
-| `SBX_DEBUG_RESOLVED_DUMP` | a path: appends the resolved configuration each call produced, so two runs can be compared byte for byte |
+| `SBX_DEBUG_RESOLVED_DUMP` | a path: appends the resolved configuration each call produced, so two runs can be compared byte for byte; a file it creates is owner-only (0600) |
 | `SBX_DEBUG_SPEC_DUMP` | a path: the same, for the sandbox spec a launch builds |
 | `SBX_CATALOGUE_CHECK` | set to any value (the idiom is `=1`), arms the app catalogue's freshness check; a scheduled run is what arms it, an ordinary launch never does |
 | `SBX_CATALOGUE_MISE` | the `mise` binary that check uses; without one, the specs it would test are reported **unchecked**, never as passing |
