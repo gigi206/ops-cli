@@ -463,11 +463,34 @@ pub fn bwrap_on_path() -> Option<std::path::PathBuf> {
     on_path("bwrap")
 }
 
-/// The first file called `name` in a directory of `PATH`.
+/// The first program called `name` in a directory of `PATH`, as [`program_in`] finds it.
 fn on_path(name: &str) -> Option<std::path::PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?)
+    program_in(name, &std::env::var_os("PATH")?)
+}
+
+/// The first program called `name` in a directory of the `PATH` value `path`: a regular file this
+/// process may execute, which a launch's own search also requires. A file it may not execute is
+/// passed over, as the launch passes over it: taken, it would name a program the launch never
+/// runs, and a test that runs it itself waits on a program that never started.
+///
+/// The launch also refuses a program owned by another user than this one or root, or writable by
+/// all, which this does not.
+pub fn program_in(name: &str, path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    std::env::split_paths(path)
         .map(|dir| dir.join(name))
-        .find(|p| p.is_file())
+        .find(|p| executable(p))
+}
+
+/// Whether `p` is a regular file this process may execute. `access(2)` answers, weighing this uid
+/// and its groups against the owner, group and other bits together, as a mode test does not.
+fn executable(p: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c` is a valid NUL-terminated path; `access` only reads and returns a status.
+    std::fs::metadata(p).is_ok_and(|m| m.is_file())
+        && unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
 }
 
 pub fn stdout_of(out: &Output) -> String {
