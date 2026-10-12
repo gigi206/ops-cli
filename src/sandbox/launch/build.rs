@@ -2431,7 +2431,8 @@ pub(super) fn build(
     let identity = binds::project_identity(&prep.cwd);
 
     // The project's store lock, shared, before anything is provisioned: an `sbx gc` of this
-    // project that has started finishes first, and one that starts later finds this launch's
+    // project, or a removal of its tree or of an app's trees in it, that has started finishes
+    // first, and one that starts later finds this launch's
     // session once the caller records it ([`super::cage::register`], which lets the lock go), or
     // waits for a cage no session records, which holds it until it ends. A project that cannot be
     // identified holds none, and its seed below fails on that.
@@ -2439,8 +2440,8 @@ pub(super) fn build(
         Ok((id, _)) => {
             match crate::sandbox::projectstore::hold_project_store(&prep.layout, id, &|lock| {
                 crate::diag::note(&format!(
-                    "waiting for the project's store lock `{}`, which `sbx gc` takes while it \
-                     works on the store",
+                    "waiting for the project's store lock `{}`, which `sbx gc`, `sbx projects rm` \
+                     and `sbx app rm --purge` take while they remove what a launch provisions",
                     lock.display()
                 ))
             }) {
