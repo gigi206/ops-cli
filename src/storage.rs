@@ -1566,8 +1566,14 @@ pub(crate) fn init(
     if image.exists() {
         return taken();
     }
+    // Owner-only, like every other directory this crate makes, rather than what the umask gives:
+    // they name the image, the whole data directory once adopted. One that exists is left as it is.
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     if let Some(parent) = image.parent() {
-        std::fs::create_dir_all(parent)
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
     // Held until the image is formatted or refused, so a second `init` of the same image waits for
@@ -1585,7 +1591,6 @@ pub(crate) fn init(
     // So it is created here or not used at all. A directory already at that name sits beside an
     // image path the user chose, so it may be theirs: it is neither emptied, which would destroy
     // what it holds, nor taken as it is, which would hand the volume's root its owner and mode.
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     let seed = image.with_extension("seed");
     // Owner-only, like every other directory this crate makes: the seed's mode is what the new
     // filesystem's root carries, and `store::ensure` tightens the *mounted* root to `0700` anyway —
@@ -3648,6 +3653,48 @@ this line has no separator at all
         assert!(
             !image.with_extension("seed").exists(),
             "the seed directory is cleaned up either way"
+        );
+    }
+
+    /// The directories `init` creates on the way to the image are owner-only, whatever the umask
+    /// says, like every other directory this crate makes: they name the image, which is the whole
+    /// data directory once adopted, to anyone who can list them. One that already existed is left as
+    /// it was.
+    #[test]
+    fn the_directories_init_creates_for_the_image_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::testutil::TmpDir::new();
+        let before = std::fs::metadata(base.path()).unwrap().permissions().mode() & 0o777;
+        let image = base.path().join("new/sub/x.btrfs");
+        // A mkfs that cannot run: `init` fails once the directories are made, which is all this
+        // looks at.
+        let nowhere = Mkfs::Host(PathBuf::from("/nonexistent-by-construction"));
+
+        // SAFETY: `umask` is a per-process scalar syscall; the previous value is restored below.
+        let previous = unsafe { libc::umask(0o022) };
+        let made = init(
+            &image,
+            DEFAULT_SIZE_BYTES,
+            DEFAULT_LABEL,
+            MetadataProfile::default(),
+            &nowhere,
+        );
+        // SAFETY: restoring the value the call above returned.
+        unsafe { libc::umask(previous) };
+        assert!(made.is_err(), "a mkfs that cannot run formatted nothing");
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let wrong: Vec<_> = ["new", "new/sub"]
+            .into_iter()
+            .map(|d| (d, mode(&base.path().join(d))))
+            .filter(|(_, m)| *m != 0o700)
+            .map(|(d, m)| format!("{d}: {m:o}"))
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        assert_eq!(
+            mode(base.path()),
+            before,
+            "a directory that existed was changed"
         );
     }
 
