@@ -388,7 +388,7 @@ A launch of the app still setting up has no session yet, and holds its project's
 until it has one. The purge waits for every project the app has run in, then refuses if a
 session started meanwhile. A first launch of the app in a project where it has never run is
 not covered: what it is creating can be removed under it, and it fails or runs on a removed
-home. Launching again recovers, from the state the purge was asked to erase.
+home. Launching again recreates it; what is lost is the state the purge was asked to remove.
 
 The global home is under the data directory's `apps/`, the per-project ones under its
 `projects/`. When one of those places cannot be read, the purge still removes what it found
