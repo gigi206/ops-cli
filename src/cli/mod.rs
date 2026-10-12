@@ -867,11 +867,12 @@ fn parse_run_launch(mut cmd: Vec<OsString>) -> Result<RunLaunch, ExitCode> {
 /// point. The shared leading-flag helpers (`flag_name`/`take_override_flag`/`build_override`) and
 /// the standalone `path` verb live at the crate root, reached via `crate::`.
 pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
-    // A one-time, terminal-only suggestion to adopt a storage volume, on the first interactive
-    // launch of an eligible host. Silent and immediate in every other case — a non-launch verb, a
-    // non-terminal (so an agent, a pipe or CI never meets it), an override already set, a host
-    // already using a volume, one already offered, or an ineligible host.
-    storage::maybe_propose_on_launch(name, &rest);
+    // On the first interactive launch of an eligible host, an empty data directory adopts a storage
+    // volume, once, and a full one is pointed at `sbx storage migrate`. Silent and immediate in
+    // every other case — a non-launch verb, a non-terminal (so an agent, a pipe or CI never meets
+    // it), an override already set, a host already using a volume, one already settled, or an
+    // ineligible host.
+    storage::maybe_settle_on_launch(name, &rest);
     match name {
         // Internal: the network-namespace holder. Runs host-side (never in the cage): forks a
         // configurer, then execs the real `bwrap …` command, which waits while the configurer

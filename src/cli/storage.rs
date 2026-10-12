@@ -25,6 +25,14 @@ fn default_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "cannot locate sbx's data directory".to_string())
 }
 
+/// Record that where the data lives was decided by hand, so the first interactive launch does not
+/// decide it again. A volume is adopted there without a question, and over a directory a user has
+/// just left with `unuse`, or beside an image `init` created before they chose to `use` it, that
+/// would undo their choice in silence.
+fn decided_by_hand(dir: &Path) {
+    storage::mark_offered(dir);
+}
+
 /// Resolve the image path: an explicit `--image`, else the default beside the data directory.
 fn image_path(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
     let image = match explicit {
@@ -246,6 +254,9 @@ fn init(args: Vec<OsString>) -> ExitCode {
     if let Err(e) = storage::init(&image, size, label, metadata, &mkfs) {
         return fail(e);
     }
+    if let Ok(dir) = default_dir() {
+        decided_by_hand(&dir);
+    }
     outln!(
         "  {}created{} — {}",
         pal.ok,
@@ -363,6 +374,7 @@ fn use_volume(args: Vec<OsString>) -> ExitCode {
     if let Err(e) = storage::write_pointer(&dir, &image) {
         return fail(format!("cannot record the volume: {e}"));
     }
+    decided_by_hand(&dir);
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     outln!(
         "{}sbx now uses{} {}",
@@ -634,6 +646,8 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
             diag::hint("       it is unused now; remove it by hand when you are satisfied.");
         }
     }
+    // After the set-aside, which takes everything but the pointer with it, the record included.
+    decided_by_hand(&dir);
     ExitCode::SUCCESS
 }
 
@@ -793,6 +807,8 @@ fn unuse_volume(args: Vec<OsString>) -> ExitCode {
         Ok(d) => d,
         Err(e) => return fail(e),
     };
+    // Whether or not a volume was followed, asking for none is a decision.
+    decided_by_hand(&dir);
     // Only a confirmed absence says "not using a volume": an unreadable pointer is precisely what
     // `unuse` should still be able to clear.
     if matches!(storage::read_pointer(&dir), Ok(None)) {
@@ -1172,36 +1188,39 @@ fn render(v: &StatusView) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The one-time first-launch proposal.
+// The first launch: where sbx keeps its data.
 //
-// On the first *interactive* launch of a host where a volume is worth it, sbx offers to adopt
-// one — exactly once, recorded so a decline never becomes a nag. It is confined to a real
-// terminal, so an agent, a pipe or CI never meets it: sbx has no other blocking prompt, and the
-// autonomous-agent path must keep none. The standing discoverability route is `sbx doctor`, so a
-// declined offer is never a dead end.
+// On the first *interactive* launch of a host where a volume is worth it, an empty data directory
+// adopts one without asking: the volume is the default, and the plain directory is what sbx keeps
+// when the volume cannot be set up. A data directory that already holds data gets one line pointing
+// at `sbx storage migrate` instead. Either way it happens once, recorded so it never repeats. It is
+// confined to a real terminal: an agent, a pipe or CI never has its storage decided for it, and
+// neither does a cron job or a service unit, which run outside the local active session udisks
+// mounts in without a password. `sbx doctor` stays the standing route to a volume for a data
+// directory that kept the plain layout.
 // ---------------------------------------------------------------------------------------------
 
-/// The full rule for whether to show the proposal, as a pure predicate over its six signals — so
-/// the decision is exercised in tests without a terminal, a data directory or a mount.
-fn should_propose(
+/// The full rule for whether the first-launch step runs, as a pure predicate over its six signals —
+/// so the decision is exercised in tests without a terminal, a data directory or a mount.
+fn first_launch_due(
     is_launch: bool,
     is_tty: bool,
     override_set: bool,
-    offered: bool,
+    settled: bool,
     already_using_a_volume: bool,
     recommended: bool,
 ) -> bool {
-    is_launch && is_tty && !override_set && !offered && !already_using_a_volume && recommended
+    is_launch && is_tty && !override_set && !settled && !already_using_a_volume && recommended
 }
 
 /// Whether this invocation is an actual sandbox launch — `sbx run`, or `sbx app run <name>` — as
 /// opposed to a management subcommand, an internal `__*` verb, or a help request. Only a launch
-/// is a moment where proposing a data-directory volume makes sense.
+/// is a moment where settling where the data lives makes sense.
 fn is_launch_invocation(name: &str, rest: &[OsString]) -> bool {
     // Only sbx's own `--help` counts, so the scan stops at the terminator: everything after `--` is
     // the payload's command line, where `--help` is an ordinary argument to an ordinary program.
     // Read over the whole slice, `sbx run -- mytool --help` was classified as a help request and
-    // the proposal this gates was skipped on a launch that is one. It is the same shape
+    // the first-launch step this gates was skipped on a launch that is one. It is the same shape
     // [`crate::split_session_flags`] documents having already met, on a different flag.
     let upto = rest
         .iter()
@@ -1220,10 +1239,10 @@ fn is_launch_invocation(name: &str, rest: &[OsString]) -> bool {
     }
 }
 
-/// Offer to adopt a volume, once, when a launch on an eligible host meets a terminal. Called for
-/// every command and cheap in the common case: three predicate checks reject an ordinary launch
+/// Settle where sbx keeps its data, once, when a launch on an eligible host meets a terminal. Called
+/// for every command and cheap in the common case: three predicate checks reject an ordinary launch
 /// before the data directory is even resolved.
-pub(crate) fn maybe_propose_on_launch(name: &str, rest: &[OsString]) {
+pub(crate) fn maybe_settle_on_launch(name: &str, rest: &[OsString]) {
     let is_launch = is_launch_invocation(name, rest);
     let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let override_set = std::env::var_os("SBX_DATA_DIR").is_some_and(|v| !v.is_empty());
@@ -1234,30 +1253,29 @@ pub(crate) fn maybe_propose_on_launch(name: &str, rest: &[OsString]) {
     let Ok(default_dir) = default_dir() else {
         return;
     };
-    let offered = storage::has_been_offered(&default_dir);
-    // An unreadable pointer counts as one: this decides whether to offer adoption, and
-    // offering it over a pointer that is merely unreadable is how one gets overwritten.
+    let settled = storage::has_been_offered(&default_dir);
+    // An unreadable pointer counts as one: this decides whether to adopt a volume, and adopting
+    // one over a pointer that is merely unreadable is how one gets overwritten.
     let has_pointer = !matches!(storage::read_pointer(&default_dir), Ok(None));
     let pre = storage::Preflight::probe(&default_dir);
-    if !should_propose(
+    if !first_launch_due(
         is_launch,
         is_tty,
         override_set,
-        offered,
+        settled,
         has_pointer,
         pre.recommends_volume(),
     ) {
         return;
     }
-    propose(&default_dir, &pre);
+    settle_first_launch(&default_dir, &pre);
 }
 
-/// Show the offer. Empty data directory → a blocking yes/no whose "yes" adopts inline (instant,
-/// and it cannot fail on a copy). A data directory that already holds a store → a single
-/// non-blocking line pointing at `sbx storage migrate`, since copying it is slow and can fail on
-/// its own checks, and hijacking the launch the user typed with that is the wrong trade.
-fn propose(default_dir: &Path, pre: &storage::Preflight) {
-    let pal = style::Palette::for_stream(std::io::stderr().is_terminal());
+/// Empty data directory → adopt a volume, without a question, and keep the plain directory when it
+/// cannot be set up. A data directory that already holds data → a single line pointing at
+/// `sbx storage migrate`, since copying it is slow and can fail on its own checks, and hijacking
+/// the launch the user typed with that is the wrong trade.
+fn settle_first_launch(default_dir: &Path, pre: &storage::Preflight) {
     let fs = pre
         .host_fs
         .map(|k| k.name())
@@ -1276,45 +1294,37 @@ fn propose(default_dir: &Path, pre: &storage::Preflight) {
         return;
     }
 
-    // An empty data directory is the true first launch: adopting is instant and cannot fail on a
-    // copy, so this is the one place the blocking question is cheap and safe. The default stays
-    // *no* — the safe answer for an unattended Enter — but the proposal only fires on a host where
-    // a volume is genuinely worth it, so `y` is the recommended answer and the prompt says so.
-    // A question that could not be shown was not asked: no answer is read, and nothing is recorded,
-    // so the next launch asks again.
-    if !diag::prompt(&format!(
-        "{}sbx:{} first launch on {fs}. sbx can keep its data in a compressed btrfs volume it \
-         mounts itself — one host inode instead of thousands, about half the disk.\n     \
-         Adopt one now? [y/N]  (recommended: y — N changes nothing) ",
-        pal.head, pal.reset
-    )) {
-        return;
-    }
-    let yes = read_yes();
-    // Recorded whatever the answer, so the question is asked exactly once.
+    // An empty data directory is the true first launch: adopting copies nothing, so the volume is
+    // taken without a question, and the plain directory is what remains when it cannot be set up.
+    // Recorded before the attempt, so one that fails is not made again on every launch after it.
     storage::mark_offered(default_dir);
-    if !yes {
-        diag::error(
-            "sbx: keeping the plain data directory — adopt one later with `sbx storage init` \
-             then `sbx storage use`.",
-        );
-        return;
-    }
+    diag::error(&format!(
+        "sbx: first launch on {fs}: setting up a compressed btrfs volume for sbx's data, which \
+         sbx mounts itself — one host inode instead of thousands, about half the disk."
+    ));
     match adopt_empty(default_dir) {
         Ok(mount_point) => {
             diag::error_in(
                 diag::Hue::Ok,
                 &format!("sbx: now using the volume at {}", mount_point.display()),
             );
+            diag::hint(
+                "     after a reboot, run the first sbx command from your desktop session: udisks \
+                 mounts the volume without a password only there.",
+            );
+            diag::hint(
+                "     `sbx storage unuse` goes back to a plain directory, whose store is then \
+                 downloaded again.",
+            );
             // The pointer-following path is memoised once per process and may already have been
             // consulted — and cached as "no volume" — while reading the data directory's channel
             // lock to provision btrfs-progs just above. So this process is steered onto the volume
             // by the override, which `from_env` honours *before* the pointer; later processes
             // follow the pointer normally.
-            // SAFETY: this runs on the first line of `cli::dispatch`, before any command
-            // handler has started a thread, and behind a blocking prompt on a terminal —
-            // so sbx is single-threaded here and nothing else can be reading the
-            // environment while it is rewritten.
+            // SAFETY: this runs on the first line of `cli::dispatch`, before any command handler
+            // has started a thread, and the adoption above starts none that outlives it — so sbx
+            // is single-threaded here and nothing else can be reading the environment while it is
+            // rewritten.
             unsafe { std::env::set_var("SBX_DATA_DIR", &mount_point) };
         }
         Err(e) => {
@@ -1327,29 +1337,20 @@ fn propose(default_dir: &Path, pre: &storage::Preflight) {
     }
 }
 
-/// Read a single yes/no answer, defaulting to no — an empty line, EOF or an unreadable stdin are
-/// all "no", the safe default for a suggestion.
-fn read_yes() -> bool {
-    use std::io::BufRead;
-    let mut line = String::new();
-    if std::io::stdin().lock().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-}
-
 /// Adopt a fresh volume for an empty data directory: create the image if it is not there, mount
-/// it, and record the pointer.
+/// it, and record the pointer. An image this call created goes again when the adoption fails.
 ///
-/// The caller found the directory empty, but before a question that waits on the user for as long
-/// as they take; a launch in another terminal may have filled it since. So the emptiness and the
-/// absence of a running sandbox are asked again before anything is created, and once more right
-/// before the pointer is written, which is the step that would strand what is there.
+/// The caller found the directory empty, but a format can take a while, provisioning
+/// `btrfs-progs` included, and a launch in another terminal may fill the directory meanwhile. So
+/// the emptiness and the absence of a running sandbox are asked again before anything is created,
+/// and once more right before the pointer is written, which is the step that would strand what is
+/// there.
 fn adopt_empty(default_dir: &Path) -> Result<PathBuf, String> {
     if let Some(refusal) = adopt_refusal(default_dir) {
         return Err(refusal);
     }
     let image = image_path(None)?;
+    let mut created = false;
     if matches!(
         storage::state(&image).map_err(|e| e.to_string())?,
         storage::State::Absent
@@ -1366,19 +1367,36 @@ fn adopt_empty(default_dir: &Path) -> Result<PathBuf, String> {
             storage::MetadataProfile::default(),
             &mkfs,
         )?;
+        // Only once `init` has succeeded: it refuses an image that appeared since the check above,
+        // and that one is another launch's.
+        created = true;
     }
-    let was_mounted = matches!(storage::state(&image), Ok(storage::State::Mounted { .. }));
-    let mount_point = storage::ensure_mounted(&image)?;
+    let adopted = mount_and_point(default_dir, &image);
+    if adopted.is_err() && created {
+        // The image this call formatted holds nothing, so an adoption that did not happen takes it
+        // with it: the plain directory is all that remains, and `sbx storage init` can create a
+        // volume later without meeting this one.
+        let _ = storage::down(&image);
+        let _ = std::fs::remove_file(&image);
+    }
+    adopted
+}
+
+/// Mount `image` and record it as the volume `default_dir` follows, unless the directory has
+/// filled up meanwhile.
+fn mount_and_point(default_dir: &Path, image: &Path) -> Result<PathBuf, String> {
+    let was_mounted = matches!(storage::state(image), Ok(storage::State::Mounted { .. }));
+    let mount_point = storage::ensure_mounted(image)?;
     if let Some(refusal) = adopt_refusal(default_dir) {
         // A volume this call mounted is not left up behind an adoption that did not happen: no
         // pointer names it, so nothing would ever unmount it. One that was already mounted stays,
         // since whoever mounted it may be using it.
         if !was_mounted {
-            let _ = storage::down(&image);
+            let _ = storage::down(image);
         }
         return Err(refusal);
     }
-    storage::write_pointer(default_dir, &image).map_err(|e| e.to_string())?;
+    storage::write_pointer(default_dir, image).map_err(|e| e.to_string())?;
     Ok(mount_point)
 }
 
@@ -1508,8 +1526,8 @@ mod tests {
         assert!(refusal.contains("already uses"), "{refusal}");
     }
 
-    /// The first-launch adoption asks again after its question, which waited on the user while
-    /// another launch could fill the directory.
+    /// The first-launch adoption asks again before the pointer, after a format and a mount during
+    /// which another launch could fill the directory.
     #[test]
     fn the_first_launch_adoption_asks_again_before_the_pointer() {
         let tmp = crate::testutil::TmpDir::new();
@@ -1698,33 +1716,33 @@ mod tests {
     }
 
     #[test]
-    fn the_proposal_needs_every_gate_open() {
-        // Every gate open is the one combination that proposes.
-        assert!(should_propose(true, true, false, false, false, true));
-        // Each gate, closed on its own, suppresses the proposal — the properties that keep it
-        // off the agent path and out of an unwanted spot.
+    fn the_first_launch_step_needs_every_gate_open() {
+        // Every gate open is the one combination that runs it.
+        assert!(first_launch_due(true, true, false, false, false, true));
+        // Each gate, closed on its own, keeps it from running — the properties that keep it off
+        // the agent path and out of an unwanted spot.
         assert!(
-            !should_propose(false, true, false, false, false, true),
+            !first_launch_due(false, true, false, false, false, true),
             "not a launch"
         );
         assert!(
-            !should_propose(true, false, false, false, false, true),
+            !first_launch_due(true, false, false, false, false, true),
             "not a terminal — the agent/pipe/CI guarantee"
         );
         assert!(
-            !should_propose(true, true, true, false, false, true),
+            !first_launch_due(true, true, true, false, false, true),
             "the invoker set SBX_DATA_DIR, which settles it"
         );
         assert!(
-            !should_propose(true, true, false, true, false, true),
-            "already offered once — never a nag"
+            !first_launch_due(true, true, false, true, false, true),
+            "already settled once — never a nag"
         );
         assert!(
-            !should_propose(true, true, false, false, true, true),
+            !first_launch_due(true, true, false, false, true, true),
             "already using a volume"
         );
         assert!(
-            !should_propose(true, true, false, false, false, false),
+            !first_launch_due(true, true, false, false, false, false),
             "the host is not eligible"
         );
     }
@@ -1745,7 +1763,7 @@ mod tests {
         // A help request is never a launch, even on a launch verb.
         assert!(!is_launch_invocation("run", &[os("--help")]));
         // The payload's own `--help` is not sbx's: `sbx run -- mytool --help` IS a launch, and the
-        // proposal it gates belongs there. Read over the whole argv, the flag was taken from after
+        // first-launch step it gates belongs there. Read over the whole argv, the flag was taken from after
         // the terminator too -- the shape `split_session_flags` documents having already met once.
         assert!(is_launch_invocation(
             "run",

@@ -23,9 +23,9 @@
 //!   granting both to a **locally active** session without authentication.
 //!
 //! That last point bounds where this works: a remote, headless or inactive session falls
-//! under a rule requiring administrator authentication, so it cannot mount unattended. The
-//! feature is therefore opt-in and never a prerequisite — sbx without a volume behaves
-//! exactly as before.
+//! under a rule requiring administrator authentication, so it cannot mount unattended. A volume
+//! is therefore never a prerequisite: the first interactive launch of a host that can mount one
+//! adopts it, and everywhere else sbx keeps its data in a plain directory.
 //!
 //! # What is deliberately not shelled out
 //!
@@ -220,19 +220,20 @@ pub(crate) fn clear_pointer(default_data_dir: &Path) -> io::Result<()> {
     }
 }
 
-/// The file recording that the one-time offer to adopt a volume has been shown. Its presence is
-/// what makes the offer happen exactly once — whatever the answer was — so a declined suggestion
-/// never becomes a nag. Kept beside the pointer in the *default* data directory, so it survives
-/// whether or not a volume is adopted.
+/// The file recording that the first launch has settled where the data lives: a volume adopted,
+/// one that could not be set up, or a migration suggested. Its presence is what makes that happen
+/// exactly once, so a suggestion never becomes a nag and a failed adoption is not retried on every
+/// launch. Kept beside the pointer in the *default* data directory, so it survives whether or not
+/// a volume is adopted.
 pub(crate) const OFFERED_MARKER: &str = ".storage-offered";
 
-/// Whether the one-time volume offer has already been shown.
+/// Whether the first launch has already settled where the data lives.
 pub(crate) fn has_been_offered(default_data_dir: &Path) -> bool {
     default_data_dir.join(OFFERED_MARKER).exists()
 }
 
-/// Record that the one-time volume offer has been shown. Best-effort: the worst a failed write
-/// costs is the offer appearing once more, never a broken launch, so it is never fatal.
+/// Record that the first launch has settled where the data lives. Best-effort: the worst a failed
+/// write costs is that step running once more, never a broken launch, so it is never fatal.
 pub(crate) fn mark_offered(default_data_dir: &Path) {
     use std::os::unix::fs::DirBuilderExt;
     let _ = std::fs::DirBuilder::new()
@@ -2569,15 +2570,15 @@ this line has no separator at all
     }
 
     #[test]
-    fn the_offer_marker_makes_the_proposal_a_one_time_event() {
+    fn the_marker_makes_the_first_launch_step_a_one_time_event() {
         let base = crate::testutil::TmpDir::new();
         let dir = base.path().join("sbx");
-        // Never offered on a fresh installation — the offer must be able to happen.
+        // Never settled on a fresh installation — the first launch must be able to settle it.
         assert!(!has_been_offered(&dir));
-        // Marking it creates the directory if need be and records the offer...
+        // Marking it creates the directory if need be and records that it ran...
         mark_offered(&dir);
         assert!(has_been_offered(&dir));
-        // ...and it stays recorded, so a declined suggestion never becomes a nag.
+        // ...and it stays recorded, so a suggestion never becomes a nag.
         mark_offered(&dir);
         assert!(has_been_offered(&dir));
     }

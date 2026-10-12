@@ -332,10 +332,10 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
         }
     }
 
-    // Storage is opt-in and never a prerequisite, so this line is always [ ok ]/[warn], never a
-    // failure: it reports whether the data directory lives in a volume, and — when it does not —
-    // whether one is worth adopting on this host. It is the standing discoverability anchor, so a
-    // one-time proposal declined elsewhere still leaves the path visible here.
+    // A volume is never a prerequisite, so this line is always [ ok ]/[warn], never a failure: it
+    // reports whether the data directory lives in a volume, and — when it does not — whether one
+    // is worth adopting on this host. It is the standing discoverability anchor, so a data
+    // directory the first launch left plain, or one that predates it, still sees the path here.
     report_storage(&mut rep);
 
     // The document is printed instead of the summary, not beside it: a caller asked for one

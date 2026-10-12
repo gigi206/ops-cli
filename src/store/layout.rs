@@ -75,14 +75,21 @@ impl Layout {
                     // Fail closed. The mount point exists only while mounted, and it lives
                     // under `/run` — a tmpfs. Carrying on with the unmounted path would
                     // provision gigabytes into RAM and present an empty store as the truth.
-                    // Both lines are inside the gate: they are one diagnostic, and speaking
-                    // the refusal without the consequence would stop mid-sentence.
+                    // All three lines are inside the gate: they are one diagnostic, and speaking
+                    // the refusal without the consequence or the way out would stop mid-sentence.
+                    // The way out holds wherever the refusal is met: udisks mounts without a
+                    // password in a local active session, which is not always this one.
                     if refusal_unspoken() {
                         crate::diag::error(&format!(
                             "sbx: sbx's data is in a volume that could not be mounted: {why}"
                         ));
                         crate::diag::error(
                             "sbx: refusing to continue rather than use an empty data directory",
+                        );
+                        crate::diag::hint(
+                            "     run `sbx doctor` from your desktop session to mount it, or \
+                             `sbx storage unuse` to go back to the plain directory, leaving the \
+                             volume's data in it.",
                         );
                     }
                     return None;
