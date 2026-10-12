@@ -549,6 +549,43 @@ fn a_preview_without_the_registry_does_not_present_a_tree_as_free() {
     assert!(dir.exists() && markerless.exists());
 }
 
+/// A marker that is there and cannot be read names a project nothing can read back: the tree is
+/// `unreadable`, and no sweep removes it, not even `--markerless`, which is for trees that predate
+/// the marker. Each sweep names it and fails.
+#[test]
+fn a_tree_whose_marker_cannot_be_read_is_never_swept() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fx = Project::new("projects");
+    let dir = fx.make_tree("1234567890abcdef", Some(fx.proj.path()));
+    let marker = dir.join("project");
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&marker).is_ok() {
+        skip_incapable!("running as root, which reads a file its mode refuses");
+        return;
+    }
+
+    let list = fx.run(&["projects", "list", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&list.stdout).expect("valid JSON");
+    assert_eq!(v[0]["state"], "unreadable", "{}", text(&list));
+    for args in [
+        &["projects", "rm", "--markerless", "--yes"][..],
+        &["projects", "rm", "--dead", "--yes"][..],
+        &["projects", "rm", "--markerless"][..],
+    ] {
+        let out = fx.run(args);
+        assert!(
+            dir.exists(),
+            "{args:?} removed a tree whose project it could not read"
+        );
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", text(&out));
+        assert!(
+            text(&out).contains("cannot read the marker"),
+            "{args:?}: {}",
+            text(&out)
+        );
+    }
+}
+
 /// The project path a tree's marker records names a directory whatever its creator called it: the
 /// listing and the dead-tree sweep write it as text that drives nothing, and `--json` keeps it.
 #[test]
