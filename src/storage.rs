@@ -1414,16 +1414,27 @@ pub(crate) fn init(
 
     // The seed directory decides the filesystem root's ownership, so it must be ours and it
     // must be empty — every byte it held would be copied into the new volume.
+    //
+    // So it is created here or not used at all. A directory already at that name sits beside an
+    // image path the user chose, so it may be theirs: it is neither emptied, which would destroy
+    // what it holds, nor taken as it is, which would hand the volume's root its owner and mode.
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     let seed = image.with_extension("seed");
-    let _ = std::fs::remove_dir_all(&seed);
     // Owner-only, like every other directory this crate makes: the seed's mode is what the new
     // filesystem's root carries, and `store::ensure` tightens the *mounted* root to `0700` anyway —
     // so taking the umask's answer here only opened a window, it never decided anything.
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&seed)
-        .map_err(|e| format!("cannot create {}: {e}", seed.display()))?;
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::AlreadyExists => format!(
+                "{} already exists — a volume is formatted from an empty directory of that name \
+                 that sbx creates itself; move it aside, or remove it if a format that did not \
+                 finish left it",
+                seed.display()
+            ),
+            _ => format!("cannot create {}: {e}", seed.display()),
+        })?;
 
     // Sparse: the file declares its size but occupies only what gets written.
     //
@@ -1459,7 +1470,9 @@ pub(crate) fn init(
         let mut cmd = mkfs_command(mkfs, image, &seed, label, metadata)?;
         run(&mut cmd).map(|_| ())
     });
-    let _ = std::fs::remove_dir_all(&seed);
+    // Not recursive: the seed was created empty here and mkfs only reads it, so removing anything
+    // more than an empty directory is never this call's to do.
+    let _ = std::fs::remove_dir(&seed);
     if ours && made.is_err() {
         // Never leave a half-formatted image: it would look like a volume to `state`.
         let _ = std::fs::remove_file(image);
@@ -3078,6 +3091,41 @@ this line has no separator at all
         assert!(
             !image.with_extension("seed").exists(),
             "the seed directory is cleaned up either way"
+        );
+    }
+
+    /// A directory already named like the seed sits beside an image path the user chose, so it may
+    /// be theirs. `init` refuses over it, naming it, before anything is created: emptying it would
+    /// destroy what it holds, and taking it as it is would hand the volume's root its owner and mode.
+    #[test]
+    fn init_leaves_a_directory_named_like_the_seed_untouched() {
+        let base = crate::testutil::TmpDir::new();
+        let image = base.path().join("x.btrfs");
+        let theirs = base.path().join("x.seed/keep");
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::write(theirs.join("file"), b"theirs").unwrap();
+        let nowhere = Mkfs::Host(PathBuf::from("/nonexistent-by-construction"));
+
+        let err = init(
+            &image,
+            DEFAULT_SIZE_BYTES,
+            DEFAULT_LABEL,
+            MetadataProfile::default(),
+            &nowhere,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(&base.path().join("x.seed").display().to_string()),
+            "the refusal names the directory: {err}"
+        );
+        assert_eq!(
+            std::fs::read(theirs.join("file")).ok().as_deref(),
+            Some(&b"theirs"[..]),
+            "a directory init did not create was emptied"
+        );
+        assert!(
+            image.symlink_metadata().is_err(),
+            "a refused format left an image behind"
         );
     }
 
