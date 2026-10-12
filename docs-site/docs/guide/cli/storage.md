@@ -186,6 +186,10 @@ leave its store, projects and app homes behind, not move them.
 The image is created **beside** the data directory (`<xdg-data>/sbx-storage.btrfs`), never
 inside it, the volume is what that directory becomes. `--image <path>` puts it elsewhere, on
 another disk for instance; it must be absolute, and is refused before anything mounts otherwise.
+`init` formats the volume from an empty directory it creates beside the image under the same
+name, `x.seed` for `x.btrfs`, and removes it afterwards. A directory already at that name is
+refused rather than emptied or reused, since it may be yours; one a format that did not finish
+left behind is yours to remove.
 
 Adopting a volume records its path as one quoted line in `storage.toml`, which is read back
 without unescaping. So the path may be anything absolute that carries no quote, no backslash and
