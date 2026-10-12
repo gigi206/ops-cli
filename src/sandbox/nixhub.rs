@@ -94,6 +94,10 @@ pub(crate) struct DeclaredTools {
     /// `nix:` tokens sbx cannot resolve (a malformed package name or version), reported so
     /// the declaration can be fixed.
     pub(crate) malformed: Vec<String>,
+    /// The mise files that are not UTF-8 or not TOML. What they declare is unknown, which is not
+    /// the same as nothing: no root or pin of a tool such a file may declare is dropped on this
+    /// reading.
+    pub(crate) unparsed: Vec<String>,
 }
 
 /// Parse the `nix:` tools out of a project's mise files. `files` are the authorized
@@ -106,8 +110,11 @@ pub(crate) fn parse_nix_tools(files: &[(String, Vec<u8>)]) -> DeclaredTools {
     for (name, bytes) in files {
         let entries = if name == TOOL_VERSIONS {
             parse_tool_versions(bytes)
+        } else if let Some(entries) = parse_toml_tools(bytes) {
+            entries
         } else {
-            parse_toml_tools(bytes)
+            out.unparsed.push(name.clone());
+            continue;
         };
         for (token, version) in entries {
             // The merge key is the tool token exactly as written: `nix:nodejs` and a
@@ -149,26 +156,25 @@ pub(crate) fn parse_nix_tools(files: &[(String, Vec<u8>)]) -> DeclaredTools {
 /// may be a bare version string, a table carrying a `version` key, or an array of
 /// versions (the first is taken). Entries come in sorted key order (a TOML table is not
 /// insertion-ordered) — deterministic, and ordering among one file's own tools is not
-/// load-bearing. An unreadable or non-TOML file yields nothing — the bytes were already
-/// safety-gated and trust-hashed, so a parse failure degrades to "no tools" here.
+/// load-bearing. A file that is not UTF-8 or not TOML yields `None`: what it declares is
+/// unknown, and [`parse_nix_tools`] records it in [`DeclaredTools::unparsed`] rather than read it
+/// as declaring nothing. A file with no `[tools]` table declares none.
 ///
 /// A value carrying no version string (a table without `version`, a number) yields an empty
 /// request rather than being dropped: [`DeclaredTools`] promises every declared token lands in a
 /// bucket, and [`parse_nix_tools`] is where the empty request decides which one.
-fn parse_toml_tools(bytes: &[u8]) -> Vec<(String, String)> {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return Vec::new();
-    };
-    let Ok(value) = toml::from_str::<toml::Value>(text) else {
-        return Vec::new();
-    };
+fn parse_toml_tools(bytes: &[u8]) -> Option<Vec<(String, String)>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let value = toml::from_str::<toml::Value>(text).ok()?;
     let Some(tools) = value.get("tools").and_then(toml::Value::as_table) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
-    tools
-        .iter()
-        .map(|(name, spec)| (name.clone(), version_of(spec).unwrap_or_default()))
-        .collect()
+    Some(
+        tools
+            .iter()
+            .map(|(name, spec)| (name.clone(), version_of(spec).unwrap_or_default()))
+            .collect(),
+    )
 }
 
 /// The requested version a `[tools]` value carries: a bare string, a table's `version`
@@ -267,8 +273,19 @@ pub(crate) fn provision(
     // and failing a launch over housekeeping would trade a bounded cost for a total one. The
     // provisioning path below reads it again, where a failure *is* fatal because a declared tool
     // could not otherwise be placed.
+    //
+    // A mise file that cannot be read declares what nobody can tell: reconciling against the rest
+    // would drop the roots of every tool it declares, so nothing is dropped and the file is named.
     if let Ok(id) = super::binds::project_runtime_id(project) {
-        prune_tool_roots(&tool_roots_dir(layout, &id), &declared.nix);
+        if declared.unparsed.is_empty() {
+            prune_tool_roots(&tool_roots_dir(layout, &id), &declared.nix);
+        } else {
+            warnings.push(format!(
+                "{} cannot be read as a mise file, so no `nix:` tool root is dropped: what it \
+                 declares is unknown",
+                declared.unparsed.join(", ")
+            ));
+        }
     }
 
     if declared.nix.is_empty() {
@@ -379,6 +396,9 @@ pub(crate) enum ToolUpgrade {
         error: String,
         kept: Option<String>,
     },
+    /// A mise file that cannot be read as one: what it declares is unknown, so the roll prunes no
+    /// pin and reports a non-zero exit.
+    Unread { file: String },
     /// A lock entry for a tool no longer declared on this system, dropped from the lock.
     Pruned { pkg: String, request: String },
     /// A declared token `sbx upgrade` does not roll, reported so it is never a silent
@@ -507,14 +527,22 @@ pub(crate) fn upgrade_tools(
         .iter()
         .map(|t| (t.pkg.as_str(), t.version.as_str()))
         .collect();
-    let stale: Vec<(String, String, String)> = lock
-        .entries
-        .keys()
-        .filter(|(pkg, req, sys)| {
-            sys == system && !declared_keys.contains(&(pkg.as_str(), req.as_str()))
-        })
-        .cloned()
-        .collect();
+    // Not when a mise file cannot be read: every pin of a tool it declares would read as stale.
+    // The file is reported, and the roll exits non-zero on it.
+    let stale: Vec<(String, String, String)> = if declared.unparsed.is_empty() {
+        lock.entries
+            .keys()
+            .filter(|(pkg, req, sys)| {
+                sys == system && !declared_keys.contains(&(pkg.as_str(), req.as_str()))
+            })
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for file in &declared.unparsed {
+        outcomes.push(ToolUpgrade::Unread { file: file.clone() });
+    }
     for (pkg, request, sys) in &stale {
         lock.entries
             .remove(&(pkg.clone(), request.clone(), sys.clone()));
@@ -1136,6 +1164,100 @@ mod tests {
             !roots.join("dropped").exists(),
             "the root of the last dropped tool must be unpinned, not left to pin its closure \
              against every `sbx gc`"
+        );
+    }
+
+    /// A mise file that is not TOML, or not UTF-8, declares what nobody can tell: read as declaring
+    /// nothing, it would unroot every tool it declares. A project can be approved with such a file,
+    /// so the trust gate does not stand in front of this. Nothing is unrooted, and the file is
+    /// named.
+    #[test]
+    fn a_mise_file_that_cannot_be_read_unpins_nothing() {
+        use crate::store::Layout;
+        use crate::testutil::TmpDir;
+
+        for bytes in [
+            b"[tools\n\"nix:hello\" = \"2\"\n".to_vec(),
+            vec![0xff, 0xfe],
+        ] {
+            let data = TmpDir::new();
+            let layout = Layout::under(data.path());
+            let project = TmpDir::new();
+            let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+            let roots = tool_roots_dir(&layout, &id);
+            let target = data.join("store-path");
+            std::fs::create_dir_all(&roots).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            std::os::unix::fs::symlink(&target, roots.join("hello")).unwrap();
+
+            let out = provision(
+                Path::new("/nonexistent/nix"),
+                &layout,
+                project.path(),
+                &[("mise.toml".to_string(), bytes.clone())],
+                true,
+                &current_system(),
+            )
+            .expect("a declaration that cannot be read provisions nothing and fails nothing");
+
+            assert!(
+                roots.join("hello").symlink_metadata().is_ok(),
+                "{bytes:?}: the root of a tool the file may declare was dropped"
+            );
+            assert!(
+                out.warnings.iter().any(|w| w.contains("mise.toml")),
+                "{bytes:?}: {:?}",
+                out.warnings
+            );
+        }
+    }
+
+    /// The roll of the tools lock reads the same declaration: a mise file that cannot be read
+    /// prunes no pin, and is reported as a failure.
+    #[test]
+    fn a_mise_file_that_cannot_be_read_prunes_no_pin() {
+        use crate::store::Layout;
+        use crate::testutil::TmpDir;
+
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let project = TmpDir::new();
+        let system = current_system();
+        let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+        let lock_path = layout
+            .data_dir()
+            .join("projects")
+            .join(&id)
+            .join(TOOLS_LOCK);
+        let mut seed = ResolutionLock::read(Path::new("/nonexistent-seed"));
+        let pin = Pin {
+            commit: "a".repeat(40),
+            attr: "x".to_string(),
+            version: "2.12".to_string(),
+        };
+        seed.insert("hello", "2.12", &system, &pin);
+        seed.write(&lock_path).expect("seed the lock");
+
+        let outcomes = upgrade_tools(
+            Path::new("/nonexistent/sbx-test-nix"),
+            &layout,
+            project.path(),
+            &[("mise.toml".to_string(), b"[tools\n".to_vec())],
+            &system,
+            super::super::RollMode::Apply,
+        )
+        .expect("the roll runs");
+        assert!(
+            ResolutionLock::read(&lock_path)
+                .get("hello", "2.12", &system)
+                .is_some(),
+            "a pin of a tool the file may declare was pruned"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, ToolUpgrade::Unread { file } if file == "mise.toml")),
+            "{outcomes:?}"
         );
     }
 

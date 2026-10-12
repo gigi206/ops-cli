@@ -1191,9 +1191,12 @@ fn upgrade_mise_tools(
         outln!("{line}");
     }
     Roll {
-        ok: !outcomes
-            .iter()
-            .any(|o| matches!(o, sandbox::ToolUpgrade::Failed { .. })),
+        ok: !outcomes.iter().any(|o| {
+            matches!(
+                o,
+                sandbox::ToolUpgrade::Failed { .. } | sandbox::ToolUpgrade::Unread { .. }
+            )
+        }),
         // Same rule as the other two: only a version that *replaced* a locked one repoints a
         // path. A first pin creates one, and an unchanged request keeps the one already there.
         moved: outcomes
@@ -1248,6 +1251,14 @@ fn upgrade_tools_summary(
             Pruned { pkg, request } => format!(
                 "  {n}nix:{pkg}{r} ({request}): {dim}{} (no longer declared).{r}",
                 mode.says("removed from the lock", "would be removed from the lock")
+            ),
+            // One of the fixed names sbx reads mise files under (`trust::MISE_CONFIG_NAMES`).
+            Unread { file } => format!(
+                "  {n}{file}{r}: {err}cannot be read as a mise file{r} — {}",
+                mode.says(
+                    "no pin was pruned, since what it declares is unknown.",
+                    "no pin would be pruned, since what it declares is unknown."
+                )
             ),
             Ignored {
                 token,
@@ -3305,6 +3316,25 @@ mod tests {
         .join("\n");
         assert!(trailing.contains("tarball:https://e/c.tar.gz: XH0ykkcZ — newly pinned"));
         assert!(trailing.contains("2 tarball: package(s) withheld (untrusted)"));
+    }
+
+    /// A mise file that cannot be read is named as such, not as a tool whose resolution failed,
+    /// and says that no pin was pruned on its account.
+    #[test]
+    fn an_unread_mise_file_is_named_in_the_tools_summary() {
+        let lines = upgrade_tools_summary(
+            sandbox::RollMode::Apply,
+            &[sandbox::ToolUpgrade::Unread {
+                file: ".mise.toml".into(),
+            }],
+            &style::Palette::plain(),
+        )
+        .join("\n");
+        assert!(
+            lines.contains(".mise.toml: cannot be read as a mise file — no pin was pruned"),
+            "{lines}"
+        );
+        assert!(!lines.contains("nix:.mise.toml"), "{lines}");
     }
 
     #[test]
