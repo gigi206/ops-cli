@@ -621,11 +621,14 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
                             };
                             // The project tree line: id, tree path, (state), date, recorded
                             // project path (or "(unknown)" for markerless), and a `*` when it is
-                            // the tree of the cwd sbx path was launched from.
+                            // the tree of the cwd sbx path was launched from. The project path is
+                            // read from the tree's marker and a directory name is any bytes, so it
+                            // is written escaped, as `sbx config show` writes a value; `--json`
+                            // keeps the bytes.
                             let proj = c
                                 .project_path
                                 .as_deref()
-                                .map(|p| p.display().to_string())
+                                .map(|p| crate::diag::visible(&p.to_string_lossy()))
                                 .unwrap_or_else(|| "(unknown)".to_string());
                             let cur = if c.current { "  *" } else { "" };
                             let _ = writeln!(
@@ -1001,6 +1004,37 @@ mod tests {
                 "date shape YYYY-MM-DD: {d}"
             );
         }
+    }
+
+    /// The project path a tree's marker records names a directory whatever its creator called it:
+    /// the text render writes it as text that drives nothing, and the view keeps its bytes for
+    /// `--json`.
+    #[test]
+    fn a_marker_path_is_rendered_as_text_that_drives_nothing() {
+        let data = TmpDir::new();
+        let tree = data.path().join("projects").join("deadid");
+        let gone = data.path().join("gone\u{1b}[2J");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(
+            tree.join(crate::sandbox::PROJECT_MARKER),
+            std::os::unix::ffi::OsStrExt::as_bytes(gone.as_os_str()),
+        )
+        .unwrap();
+        let v = view_with_roots(Some(data.path().to_path_buf()), None, None);
+        let text = render(&v, &crate::style::Palette::plain());
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        assert!(text.contains("gone\\x1b[2J"), "{text:?}");
+        let child = v
+            .bases
+            .iter()
+            .flat_map(|b| &b.entries)
+            .flat_map(|e| &e.children)
+            .find(|c| c.name == "deadid")
+            .expect("the tree is listed");
+        assert_eq!(child.project_path.as_deref(), Some(gone.as_path()));
     }
 
     /// The project tree matching the current working directory is marked `current` — so `sbx path`
