@@ -813,9 +813,40 @@ pub(crate) fn projects_rm(
             had_error = true;
             continue;
         }
-        match super::gc::reap_one(&projects_dir, id, &live_ids, apply, &|dir| {
-            reclaim.bytes(dir)
-        }) {
+        // Applied, the removal holds the project's store lock exclusive, as `sbx gc` does, and reads
+        // the registry only once it holds it: a launch still provisioning holds that lock shared
+        // until its session is recorded, so a registry read before it cannot see that launch, and a
+        // launch that comes later waits for the removal. Taken only on a tree that is a directory
+        // in its own right, since taking it creates the lock file and the directories above it.
+        let mut held = None;
+        let is_tree = std::fs::symlink_metadata(projects_dir.join(id)).is_ok_and(|m| m.is_dir());
+        if apply && is_tree {
+            let locked = crate::sandbox::projectstore::lock_project_store(&layout, id, &|lock| {
+                crate::diag::note(&format!(
+                    "waiting for the project's store lock `{}`, which a launch of the project \
+                     holds until its session is recorded",
+                    lock.display()
+                ))
+            });
+            match locked
+                .map_err(|e| format!("cannot lock its store: {e}"))
+                .and_then(|lock| {
+                    super::launch::session_housekeeping(&layout)
+                        .map(|ids| (lock, ids))
+                        .map_err(|e| format!("cannot read the session registry: {e}"))
+                }) {
+                Ok(both) => held = Some(both),
+                Err(e) => {
+                    crate::diag::error(&format!(
+                        "sbx projects rm: project tree `{id}`: {e} — refusing to remove it."
+                    ));
+                    had_error = true;
+                    continue;
+                }
+            }
+        }
+        let live = held.as_ref().map_or(&live_ids, |(_, ids)| ids);
+        match super::gc::reap_one(&projects_dir, id, live, apply, &|dir| reclaim.bytes(dir)) {
             super::gc::ReapOneOutcome::NotFound => {
                 crate::diag::error(&format!(
                     "sbx projects rm: no project tree for id `{id}` under {}.",
@@ -936,6 +967,45 @@ mod projects_rm_tests {
             "{refusal}"
         );
         assert!(rm_refuses_current("abc", &unknown, true).is_none());
+    }
+
+    /// A removal waits for a launch of the project that still holds its store lock shared — one
+    /// still provisioning, whose session the registry does not name yet — rather than deleting the
+    /// tree under it, and goes ahead once that launch lets go.
+    #[test]
+    fn a_removal_waits_for_a_launch_still_provisioning_the_tree() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        let data = TmpDir::new();
+        let _lock = env_lock();
+        let _data = EnvVar::set("SBX_DATA_DIR", data.path());
+        let layout = crate::store::Layout::from_env().expect("a layout under the fixture root");
+        let id = "0123456789abcdef";
+        let tree = layout.data_dir().join("projects").join(id);
+        std::fs::create_dir_all(tree.join("home")).unwrap();
+        let launch =
+            crate::sandbox::projectstore::hold_project_store(&layout, id, &|_| {}).unwrap();
+        let removal = std::thread::spawn(move || {
+            super::projects_rm(
+                &[id.to_string()],
+                false,
+                false,
+                true,
+                false,
+                true,
+                &crate::style::Palette::plain(),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            tree.join("home").is_dir(),
+            "the tree was removed under a launch still holding its store lock"
+        );
+        drop(launch);
+        let _ = removal.join().unwrap();
+        assert!(
+            !tree.exists(),
+            "the removal went ahead once the launch let go"
+        );
     }
 }
 
