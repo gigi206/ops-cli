@@ -616,7 +616,7 @@ pub fn oracle(path: &[String], cursor: &str) -> Vec<String> {
     let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
     stdout_of(&output_ok(&mut sbx_command(&borrowed)))
         .lines()
-        .filter_map(|l| l.split('\t').next().map(str::to_string))
+        .map(|l| l.split_once('\t').map_or(l, |(name, _)| name).to_owned())
         .collect()
 }
 
