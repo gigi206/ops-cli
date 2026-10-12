@@ -549,6 +549,33 @@ fn a_preview_without_the_registry_does_not_present_a_tree_as_free() {
     assert!(dir.exists() && markerless.exists());
 }
 
+/// The project path a tree's marker records names a directory whatever its creator called it: the
+/// listing and the dead-tree sweep write it as text that drives nothing, and `--json` keeps it.
+#[test]
+fn a_marker_path_is_written_as_text_that_drives_nothing() {
+    let fx = Project::new("projects");
+    let gone = fx.proj.path().join("gone\x1b[2J");
+    fx.make_tree("1234567890abcdef", Some(&gone));
+
+    for args in [&["projects", "list"][..], &["projects", "rm", "--dead"][..]] {
+        let out = fx.run(args);
+        assert!(out.status.success(), "{args:?}: {}", text(&out));
+        assert!(
+            !out.stdout.contains(&0x1b),
+            "{args:?} wrote the escape raw: {}",
+            text(&out)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("gone\\x1b[2J"),
+            "{args:?} did not name the path: {}",
+            text(&out)
+        );
+    }
+    let json = fx.run(&["projects", "list", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).expect("valid JSON");
+    assert_eq!(v[0]["project"], gone.to_str().unwrap(), "{}", text(&json));
+}
+
 /// A listing answers rather than deletes, so it keeps answering — but `idle` is a finding, and one
 /// stated off a registry nothing could read would be a claim nothing checked.
 #[test]
