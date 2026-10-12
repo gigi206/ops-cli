@@ -226,6 +226,16 @@ fn shell_command_string(argv: &[String]) -> Option<&String> {
     None
 }
 
+/// Whether `script` expands `"$@"` on a line of code: a line whose first non-blank character is
+/// `#` is a comment, and an expansion there forwards nothing. A comment that follows code on the
+/// same line is not told apart.
+fn expands_its_arguments(script: &str) -> bool {
+    script
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .any(|line| line.contains("\"$@\""))
+}
+
 /// Every shipped profile whose `cmd` is a shell script forwards `"$@"`.
 ///
 /// `sbx app run <name> -- <args>` is in the verb's own synopsis, and sbx honours it by appending
@@ -263,7 +273,7 @@ fn every_shipped_shell_profile_forwards_its_trailing_arguments() {
         };
         shell_profiles += 1;
         assert!(
-            i.contains("\"$@\""),
+            expands_its_arguments(i),
             "`examples/app/{name}.toml` wraps its command in a shell but never expands `\"$@\"`, so \
              `sbx app run {name} -- <args>` accepts arguments and silently drops them. Add `\"$@\"` \
              to the final `exec`, or drop the shell if the command is a plain argv."
@@ -2229,5 +2239,22 @@ fn a_shells_command_string_is_found_past_its_other_options() {
             None,
             "{runs_a_file:?}"
         );
+    }
+}
+
+/// A script forwards its arguments only where `"$@"` is code: on a comment line it expands nothing,
+/// and an unquoted `$@` splits them, so neither counts.
+#[test]
+fn only_a_quoted_expansion_on_a_line_of_code_forwards_the_arguments() {
+    assert!(expands_its_arguments("set -e\nexec app \"$@\"\n"));
+    assert!(expands_its_arguments(
+        "# launch it\n  exec app --flag \"$@\""
+    ));
+    for drops in [
+        "exec app\n# exec app \"$@\"\n",
+        "  # exec app \"$@\"\nexec app\n",
+        "exec app $@\n",
+    ] {
+        assert!(!expands_its_arguments(drops), "{drops:?}");
     }
 }
