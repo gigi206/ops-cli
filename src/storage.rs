@@ -1546,28 +1546,68 @@ pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
 pub(crate) fn down(image: &Path) -> Result<(), String> {
     let _lock = lock_image(image).map_err(|e| format!("cannot lock {}: {e}", image.display()))?;
     let udisks = tool("udisksctl", "udisks2")?;
+    let delete = |loop_dev: &str| {
+        let deleted = run(Command::new(&udisks)
+            .arg("loop-delete")
+            .arg("-b")
+            .arg(loop_dev));
+        loop_released(
+            deleted,
+            || state(image),
+            RELEASE_CHECKS,
+            std::time::Duration::from_millis(100),
+        )
+    };
     match state(image).map_err(|e| e.to_string())? {
         State::Absent => Err(format!("{} does not exist", image.display())),
         State::Detached => Ok(()),
-        State::Attached { loop_dev } => {
-            run(Command::new(&udisks)
-                .arg("loop-delete")
-                .arg("-b")
-                .arg(&loop_dev))?;
-            Ok(())
-        }
+        State::Attached { loop_dev } => delete(&loop_dev),
         State::Mounted { loop_dev, .. } => {
             run(Command::new(&udisks)
                 .arg("unmount")
                 .arg("-b")
                 .arg(&loop_dev))?;
-            run(Command::new(&udisks)
-                .arg("loop-delete")
-                .arg("-b")
-                .arg(&loop_dev))?;
-            Ok(())
+            // udisks attaches with autoclear, so the kernel may release the device on its own as
+            // soon as the unmount completes: there is then nothing left to delete.
+            if matches!(state(image), Ok(State::Detached)) {
+                return Ok(());
+            }
+            delete(&loop_dev)
         }
     }
+}
+
+/// How many times [`loop_released`] reads the state again before a failed `loop-delete` stands.
+const RELEASE_CHECKS: u32 = 10;
+
+/// What a `loop-delete` amounts to, given how the image stands after it.
+///
+/// udisks attaches the volume with autoclear, so the kernel releases the loop device by itself
+/// once nothing holds it, and a `loop-delete` that arrives after that fails with "No such device
+/// or address" over a device that is gone, which is what `down` was asked for. So a failure is
+/// weighed against the state rather than its message: the image no longer backing any loop device
+/// is success, read again up to `checks` times `pause` apart while a release may still be under
+/// way. Anything else, an unreadable state included, leaves the failure standing. That rests on
+/// [`state`] answering [`State::Detached`] only when no loop device backs the image, and an error
+/// when it cannot tell.
+fn loop_released(
+    deleted: Result<String, String>,
+    mut now: impl FnMut() -> io::Result<State>,
+    checks: u32,
+    pause: std::time::Duration,
+) -> Result<(), String> {
+    let Err(failure) = deleted else {
+        return Ok(());
+    };
+    for check in 0..checks {
+        if check > 0 {
+            std::thread::sleep(pause);
+        }
+        if matches!(now(), Ok(State::Detached)) {
+            return Ok(());
+        }
+    }
+    Err(failure)
 }
 
 /// The host bytes the image actually occupies, as opposed to the size it declares.
@@ -2640,6 +2680,62 @@ this line has no separator at all
         assert!(
             tools_dir.join("nixpkgs.lock").is_file(),
             "the revision is pinned in the tool store's own lock"
+        );
+    }
+
+    /// A `loop-delete` that loses the race with udisks' autoclear fails over a device the kernel has
+    /// already released. That is what `down` was asked for, so it is a success once the image backs
+    /// no loop device, including when the release lands a moment later. A device still attached, or
+    /// a state that cannot be read, leaves the failure as it was.
+    #[test]
+    fn a_loop_delete_that_loses_the_race_with_autoclear_is_not_a_failure() {
+        let pause = std::time::Duration::ZERO;
+        let attached = || State::Attached {
+            loop_dev: "/dev/loop7".to_string(),
+        };
+        let enxio = || Err("No such device or address".to_string());
+
+        let mut reads = 0;
+        let ok = loop_released(
+            Ok(String::new()),
+            || {
+                reads += 1;
+                Ok(attached())
+            },
+            3,
+            pause,
+        );
+        assert_eq!(
+            (ok, reads),
+            (Ok(()), 0),
+            "a delete that succeeded reads nothing"
+        );
+
+        assert_eq!(
+            loop_released(enxio(), || Ok(State::Detached), 3, pause),
+            Ok(()),
+            "the device was already gone"
+        );
+        let mut later = [Ok(attached()), Ok(attached()), Ok(State::Detached)].into_iter();
+        assert_eq!(
+            loop_released(enxio(), || later.next().unwrap(), 3, pause),
+            Ok(()),
+            "the release landed while it was being read"
+        );
+        assert_eq!(
+            loop_released(enxio(), || Ok(attached()), 3, pause),
+            enxio().map(|_: String| ()),
+            "the device is still attached"
+        );
+        assert_eq!(
+            loop_released(
+                enxio(),
+                || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                3,
+                pause
+            ),
+            enxio().map(|_: String| ()),
+            "a state that cannot be read is not a released device"
         );
     }
 
