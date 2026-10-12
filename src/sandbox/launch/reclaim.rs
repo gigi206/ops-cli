@@ -531,10 +531,10 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     // families root the irreducible userland (mise on its own revision, not the base one), so without
     // them the keep-set could omit a current core build and the sweep would delete it. A missing
     // family means we cannot safely tell superseded from sole-current, so skip — a re-provision on
-    // the next launch is cheap, a wrongful wipe is not. This out-link check is the whole guard: the
-    // revision itself is always known here (the launch resolved it above), so there is no
-    // "unknown revision" case to fall through, and pretending there is would hide which condition
-    // actually protects the sweep.
+    // the next launch is cheap, a wrongful wipe is not. The revision itself is always known here
+    // (the launch resolved it above), so there is no "unknown revision" case to fall through, and
+    // pretending there is would hide which conditions protect the sweep: this out-link check, and
+    // the keep-set read below, which prunes nothing when a family of roots cannot be read.
     let superseded = if data_gcroots.join("base").join(base_rev).is_dir()
         && mise_revs
             .iter()
@@ -548,8 +548,15 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
         // base out from under it.
         // A family of roots that cannot be read leaves the keep-set short of the builds it roots,
         // and the sweep would take them: nothing is pruned then, as for an unreadable lock above.
-        match crate::sandbox::gc::project_keep_roots(&data_gcroots, &id, &base_revs, &mise_revs) {
-            Ok(keep) => crate::sandbox::gc::prune_superseded_roots(&store_dir, &keep, prune).len(),
+        match crate::sandbox::gc::prune_superseded_project_roots(
+            &data_gcroots,
+            &id,
+            &base_revs,
+            &mise_revs,
+            &store_dir,
+            prune,
+        ) {
+            Ok(pruned) => pruned.len(),
             Err(e) => {
                 crate::diag::warn(&format!(
                     "sbx gc: {e}, so no superseded build is pruned from this project's store"
@@ -680,12 +687,17 @@ pub(crate) fn superseded_reclaimable_hint(
     let Ok(base_revs) = crate::store::live_base_revisions(layout) else {
         return;
     };
-    let Ok(keep) =
-        crate::sandbox::gc::project_keep_roots(&data_gcroots, &id, &base_revs, &mise_revs)
-    else {
+    let Ok(listed) = crate::sandbox::gc::prune_superseded_project_roots(
+        &data_gcroots,
+        &id,
+        &base_revs,
+        &mise_revs,
+        &store_dir,
+        false,
+    ) else {
         return;
     };
-    let n = crate::sandbox::gc::prune_superseded_roots(&store_dir, &keep, false).len();
+    let n = listed.len();
     if n > 0 {
         outln!(
             "  {}",

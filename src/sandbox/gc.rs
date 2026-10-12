@@ -270,11 +270,26 @@ pub(crate) fn project_keep_roots(
                 ));
             }
         };
-        for entry in entries.flatten() {
-            if let Ok(target) = std::fs::read_link(entry.path())
-                && let Some(base) = target.file_name()
-            {
-                keep.insert(base.to_os_string());
+        // Every entry is read too: a directory that lists and does not let its entries be read
+        // gives the same short set as one that does not list.
+        let named = |path: &Path, e: io::Error| {
+            io::Error::new(e.kind(), format!("cannot read {}: {e}", path.display()))
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| named(&dir, e))?;
+            match std::fs::read_link(entry.path()) {
+                Ok(target) => {
+                    if let Some(base) = target.file_name() {
+                        keep.insert(base.to_os_string());
+                    }
+                }
+                // Not a link (a prebuilt root's `.expr` stamp), or gone since the listing.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
+                    ) => {}
+                Err(e) => return Err(named(&entry.path(), e)),
             }
         }
         Ok(())
@@ -325,6 +340,21 @@ pub(crate) fn prune_superseded_roots(
         // directory or regular file that landed here.
         !keep.contains(&name) && entry.file_type().is_ok_and(|t| t.is_symlink())
     })
+}
+
+/// Drop, or in a dry run list, the project's seed roots no current out-link references: the
+/// keep-set [`project_keep_roots`] reads, reconciled by [`prune_superseded_roots`]. A keep-set that
+/// cannot be read is an error and prunes nothing, since every root it would lack would be dropped.
+pub(crate) fn prune_superseded_project_roots(
+    data_gcroots: &Path,
+    id: &str,
+    base_revs: &BTreeSet<String>,
+    mise_revs: &BTreeSet<String>,
+    store_dir: &Path,
+    prune: bool,
+) -> io::Result<Vec<PathBuf>> {
+    let keep = project_keep_roots(data_gcroots, id, base_revs, mise_revs)?;
+    Ok(prune_superseded_roots(store_dir, &keep, prune))
 }
 
 /// What deduplicating a store reclaimed.
@@ -4006,51 +4036,102 @@ mod tests {
         }
     }
 
+    /// A fixture with one out-link in every family [`project_keep_roots`] reads, the families
+    /// listed nested-first, and the seed root of the base build in a project store.
+    fn keep_roots_fixture(data: &Path) -> (PathBuf, Vec<PathBuf>, PathBuf) {
+        let gcroots = data.join("gcroots");
+        let families = vec![
+            gcroots.join("projects/p/nix-tools"),
+            gcroots.join("projects/p"),
+            gcroots.join("base/rev1"),
+            gcroots.join("gui/rev1"),
+            gcroots.join("gpu/rev1"),
+            gcroots.join("audio/rev1"),
+            gcroots.join("mise/mrev1"),
+        ];
+        for (n, dir) in families.iter().enumerate() {
+            std::fs::create_dir_all(dir).unwrap();
+            std::os::unix::fs::symlink(format!("/nix/store/h{n}-build"), dir.join("link")).unwrap();
+        }
+        let roots = data.join("store/nix/var/nix/gcroots");
+        std::fs::create_dir_all(&roots).unwrap();
+        std::os::unix::fs::symlink("/nix/store/h2-build", roots.join("h2-build")).unwrap();
+        (gcroots, families, roots.join("h2-build"))
+    }
+
     /// A family of roots that cannot be read leaves the keep-set unknown rather than smaller: a
-    /// smaller one has the sweep drop the seed roots of the builds that family holds. A family that
-    /// does not exist roots nothing.
+    /// smaller one has the sweep drop the seed roots of the builds that family holds. That is so
+    /// of a directory that does not list, and of one that lists and does not let its entries be
+    /// read. A family that does not exist roots nothing.
     #[test]
     fn project_keep_roots_fails_on_a_family_it_cannot_read() {
         use std::os::unix::fs::PermissionsExt as _;
         let data = TmpDir::new();
-        let gcroots = data.path().join("gcroots");
-        let (id, rev, mise_rev) = ("p", "rev1", "mrev1");
-        let base_revs = BTreeSet::from([rev.to_string()]);
-        let mise_revs = BTreeSet::from([mise_rev.to_string()]);
-        let base = gcroots.join("base").join(rev);
-        std::fs::create_dir_all(&base).unwrap();
-        std::os::unix::fs::symlink("/nix/store/h2-glibc", base.join("glibc")).unwrap();
-        let keep = project_keep_roots(&gcroots, id, &base_revs, &mise_revs).unwrap();
-        assert_eq!(keep, BTreeSet::from([OsString::from("h2-glibc")]));
+        let (gcroots, families, _) = keep_roots_fixture(data.path());
+        let base_revs = BTreeSet::from(["rev1".to_string()]);
+        let mise_revs = BTreeSet::from(["mrev1".to_string()]);
+        let keep = project_keep_roots(&gcroots, "p", &base_revs, &mise_revs).unwrap();
+        assert_eq!(keep.len(), families.len());
+        let absent =
+            project_keep_roots(&gcroots, "p", &BTreeSet::from(["none".into()]), &mise_revs);
+        assert!(absent.is_ok_and(|k| !k.contains(&OsString::from("h2-build"))));
 
-        // The nested family first, while the project's own directory above it can still be read.
-        let families = [
-            gcroots.join("projects").join(id).join("nix-tools"),
-            gcroots.join("projects").join(id),
-            base.clone(),
-            gcroots.join("gui").join(rev),
-            gcroots.join("gpu").join(rev),
-            gcroots.join("audio").join(rev),
-            gcroots.join("mise").join(mise_rev),
-        ];
         for dir in &families {
-            std::fs::create_dir_all(dir).unwrap();
+            for mode in [0o000, 0o444] {
+                let set = |m| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(m));
+                set(mode).unwrap();
+                if std::fs::read_link(dir.join("link")).is_ok() {
+                    set(0o700).unwrap();
+                    skip_incapable!("running as root, which reads a directory its mode refuses");
+                    return;
+                }
+                let keep = project_keep_roots(&gcroots, "p", &base_revs, &mise_revs);
+                set(0o700).unwrap();
+                // A directory that does not list is named itself; one that lists names the entry
+                // it could not read, whichever the listing gave first.
+                let named = match mode {
+                    0o000 => format!("cannot read {}: ", dir.display()),
+                    _ => format!("cannot read {}/", dir.display()),
+                };
+                assert!(
+                    keep.as_ref().is_err_and(|e| e.to_string().contains(&named)),
+                    "{} at {mode:o}: {keep:?}",
+                    dir.display()
+                );
+            }
         }
-        for dir in &families {
-            let mode = |m| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(m));
-            mode(0o000).unwrap();
-            if std::fs::read_dir(dir).is_ok() {
-                mode(0o700).unwrap();
+    }
+
+    /// The sweep a keep-set it cannot read would short prunes nothing: the seed root of the build
+    /// an unreadable family holds stays.
+    #[test]
+    fn a_superseded_sweep_over_an_unreadable_family_prunes_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let data = TmpDir::new();
+        let (gcroots, _, seed_root) = keep_roots_fixture(data.path());
+        let base = gcroots.join("base/rev1");
+        let store = data.path().join("store");
+        for mode in [0o000, 0o444] {
+            let set = |m| std::fs::set_permissions(&base, std::fs::Permissions::from_mode(m));
+            set(mode).unwrap();
+            if std::fs::read_link(base.join("link")).is_ok() {
+                set(0o700).unwrap();
                 skip_incapable!("running as root, which reads a directory its mode refuses");
                 return;
             }
-            let keep = project_keep_roots(&gcroots, id, &base_revs, &mise_revs);
-            mode(0o700).unwrap();
-            let named = format!("cannot read {}: ", dir.display());
+            let pruned = prune_superseded_project_roots(
+                &gcroots,
+                "p",
+                &BTreeSet::from(["rev1".to_string()]),
+                &BTreeSet::from(["mrev1".to_string()]),
+                &store,
+                true,
+            );
+            set(0o700).unwrap();
+            assert!(pruned.is_err(), "{mode:o}: {pruned:?}");
             assert!(
-                keep.as_ref().is_err_and(|e| e.to_string().contains(&named)),
-                "{}: {keep:?}",
-                dir.display()
+                seed_root.symlink_metadata().is_ok(),
+                "{mode:o}: the seed root was dropped"
             );
         }
     }
