@@ -12520,9 +12520,15 @@ fn ws_send_from_cage(
 /// Encode one WebSocket frame the way a peer would. A client must mask; a server must not.
 #[cfg(test)]
 fn ws_frame(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
+    // The seven-bit length is the only one written here: 126 and 127 announce an extended length
+    // that is not, so a longer payload would make a frame no reader frames as intended.
+    let len = u8::try_from(payload.len())
+        .ok()
+        .filter(|len| *len <= 125)
+        .unwrap_or_else(|| panic!("a {}-byte payload needs an extended length", payload.len()));
     let mut out = vec![0x80 | opcode];
     let flag = if mask.is_some() { 0x80u8 } else { 0 };
-    out.push(flag | payload.len() as u8);
+    out.push(flag | len);
     match mask {
         Some(key) => {
             out.extend_from_slice(&key);
@@ -12531,6 +12537,14 @@ fn ws_frame(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
         None => out.extend_from_slice(payload),
     }
     out
+}
+
+/// A payload too long for the seven-bit length fails the test that builds it, rather than becoming
+/// a frame whose length byte announces something else.
+#[test]
+#[should_panic(expected = "needs an extended length")]
+fn a_frame_too_long_for_the_short_length_is_refused_by_the_builder() {
+    let _ = ws_frame(0x1, &[b'x'; 126], None);
 }
 
 /// A WebSocket upstream that speaks real framing: it pushes a text frame **in the same write as
