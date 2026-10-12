@@ -2309,7 +2309,7 @@ pub(super) const PAGES: &[Page] = &[
             by `sbx projects rm --dead`), `markerless` (a legacy tree pre-dating marker\n\
             recording), `unknown` (the session registry could not be read, so no tree's\n\
             liveness was established), or `unreadable` (its marker is there and cannot be read,\n\
-            so its project is unknown) — plus the last-used date, and (via `sbx projects list`) its size. Under `apps/`\n\
+            or names no usable path, so its project is unknown) — plus the last-used date, and (via `sbx projects list`) its size. Under `apps/`\n\
             it lists each global app home, and under the config\n\
             `apps/` each imported profile. Read-only: no trust gate, no network. For the config\n\
             files in resolution order, see `sbx config path`.",
