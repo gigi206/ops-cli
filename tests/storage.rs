@@ -405,3 +405,39 @@ fn an_up_that_cannot_mount_releases_the_loop_device_it_attached() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// `sbx storage up` narrows an image other accounts can read to owner-only, before anything else,
+/// so even an `up` whose mount then fails leaves it narrowed: the image is the whole data directory
+/// once adopted.
+#[test]
+fn up_narrows_an_image_other_accounts_can_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = TmpDir::prefixed("st", "upmode");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let image = root.join("vol.btrfs");
+    std::fs::write(&image, b"").unwrap();
+    std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o664)).unwrap();
+    let calls = root.join("calls.log");
+    udisks_stand_in(&bin, &calls, "exit 1");
+
+    let out = common::isolated_sbx("st-")
+        .args(["storage", "up", "--image"])
+        .arg(&image)
+        .env("PATH", &bin)
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env_remove("SBX_DATA_DIR")
+        .output()
+        .expect("spawn sbx storage up");
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    if said.contains("this host cannot mount") {
+        skip_incapable!("skipping: this host cannot mount a volume ({said})");
+        return;
+    }
+    let mode = std::fs::metadata(&image).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the image was left {mode:o}: {said}");
+    assert!(
+        said.contains("owner-only"),
+        "the narrowing went unsaid: {said}"
+    );
+}
