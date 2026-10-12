@@ -3185,13 +3185,16 @@ fn resolve(
 /// `SecretSource::describe` can print one whole. What the dump does carry is whatever the config
 /// files themselves hold: an `[env]` value or a `[plugin.<name>]` key is reproduced as written. A
 /// developer pointing this at a path is dumping their own config, and the `debug_assertions` gate
-/// is what keeps that from being possible anywhere else.
+/// is what keeps that from being possible anywhere else. For the same reason the file is created
+/// owner-only (0600), whatever the umask, so a dump left in a shared directory shows that config to
+/// no other local user. A file that already exists keeps the mode its owner gave it.
 ///
 /// Best-effort and silent: a path that cannot be written is a developer's own diagnostic going
 /// missing, never a reason to fail a launch that is otherwise ready to run.
 #[cfg(debug_assertions)]
 fn debug_dump_resolved(resolved: &Resolved) {
     use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let Some(path) = std::env::var_os("SBX_DEBUG_RESOLVED_DUMP") else {
         return;
@@ -3199,6 +3202,7 @@ fn debug_dump_resolved(resolved: &Resolved) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&path)
     {
         let _ = writeln!(file, "{resolved:#?}");
