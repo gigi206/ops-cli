@@ -401,10 +401,14 @@ fn print_dead(store: &StoreAt<'_>) -> io::Result<Vec<String>> {
 /// `--query --size` prints one size per path in argv order and aborts at the *first* path it
 /// rejects as invalid — an interrupted build leaves residue in the store dir (a `<store-path>.lock`
 /// build lock, a `.chroot` build root) that `--gc --print-dead` reports yet which is not a
-/// registered store object, so it trips this. One such entry must not derail the whole collection,
-/// so a failing batch is not fatal: the sizes printed before the abort are summed, the single
-/// rejected path is skipped, and sizing resumes after it. The figure is only a report — `sweep`
-/// still deletes every dead entry regardless.
+/// registered store object, so it trips this. One such entry must not derail the whole collection:
+/// when nix names the path it stopped on, the sizes printed before it are summed, that path is
+/// skipped, and sizing resumes after it. The figure is only a report — `sweep` still deletes every
+/// dead entry regardless.
+///
+/// Any other failure is an error, with nix's own words: a store nix cannot open, or a database it
+/// cannot read, fails every batch alike, and skipping a path at a time would run one `nix-store`
+/// per remaining path to report a figure none of them measured.
 fn total_size(store: &StoreAt<'_>, paths: &[String]) -> io::Result<u64> {
     // Query in bounded windows: passing every dead path as one argv overflows the kernel's argv
     // limit (E2BIG) on a large store, which would abort the whole GC (including `--prune`). Store
@@ -421,11 +425,20 @@ fn total_size(store: &StoreAt<'_>, paths: &[String]) -> io::Result<u64> {
         total = total.saturating_add(bytes);
         if out.status.success() {
             i = end;
+            continue;
+        }
+        // nix sized the `consumed` leading paths, then stopped. When it names the next one, that
+        // path is not a store object: skip it (its size is unknowable and it is residue) and
+        // resume; the step is always at least one, so the loop terminates.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let next = i + consumed;
+        if next < end && stderr.contains(paths[next].as_str()) {
+            i = next + 1;
         } else {
-            // nix sized the `consumed` leading paths, then rejected the next one. Skip that path
-            // (its size is unknowable and it is residue, not a real store object) and resume; the
-            // step is always at least one, so the loop terminates.
-            i += consumed + 1;
+            return Err(io::Error::other(format!(
+                "nix-store --query --size failed: {}",
+                stderr.trim()
+            )));
         }
     }
     Ok(total)
@@ -4063,6 +4076,57 @@ mod tests {
             live.contains(&OsString::from("a-glibc")) && live.contains(&OsString::from("b-glibc")),
             "both revisions' bases are live and must be kept: {live:?}"
         );
+    }
+
+    /// A path nix names as not valid is skipped and the others are sized. A failure that names no
+    /// path ends the sizing with nix's own words after one call, rather than one call per path.
+    #[test]
+    fn total_size_skips_a_rejected_path_and_stops_on_any_other_failure() {
+        use crate::testutil::{result_past_etxtbsy, sh_word, write_script};
+        let tmp = TmpDir::new();
+        let calls = tmp.path().join("calls");
+        let fake = tmp.path().join("nix-store");
+        // Called as `--store <dir> --query --size <paths>`. A path ending in `.lock` is not a store
+        // object; one holding `broken` stands for a store nix cannot read.
+        write_script(
+            &fake,
+            &format!(
+                r#"echo call >> {calls}
+shift 4
+for p in "$@"; do
+  case "$p" in
+    *.lock) echo "error: path '$p' is not valid" >&2; exit 1 ;;
+    *broken*) echo "error: database disk image is malformed" >&2; exit 1 ;;
+    *) echo 10 ;;
+  esac
+done"#,
+                calls = sh_word(&calls)
+            ),
+        );
+        let store_dir = tmp.path().join("store");
+        let store = StoreAt::Host {
+            nix_store: &fake,
+            store_dir: &store_dir,
+        };
+        let paths = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|n| format!("/nix/store/{n}")).collect()
+        };
+        let calls_made = || std::fs::read_to_string(&calls).map_or(0, |s| s.lines().count());
+
+        let residue = paths(&["a", "b.lock", "c"]);
+        let sized = result_past_etxtbsy("the stand-in nix-store", || total_size(&store, &residue));
+        assert_eq!(sized.unwrap(), 20);
+
+        let before = calls_made();
+        let broken = paths(&["broken-1", "broken-2", "broken-3"]);
+        let failed = result_past_etxtbsy("the stand-in nix-store", || total_size(&store, &broken));
+        assert!(
+            failed
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("database disk image is malformed")),
+            "{failed:?}"
+        );
+        assert_eq!(calls_made() - before, 1, "one call, not one per path");
     }
 
     #[test]
