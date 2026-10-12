@@ -430,7 +430,10 @@ sbx storage migrate               # copy, verify, then switch over
 
 `migrate` keeps the original authoritative for the whole copy and sets it aside under a
 dated name rather than deleting it, so an interruption before the switch leaves the
-installation exactly as it was. It asks again for running sandboxes once the copy is verified,
+installation exactly as it was. A sandbox running from the volume counts as much as one running
+from the data directory: one can still run there after `sbx storage unuse`, and it would write
+into the copy. `sbx session` does not see it then, so the refusal names the command that does.
+It asks again for running sandboxes once the copy is verified,
 right before the switch, since one may have started during a long copy; if one has, nothing is
 switched and the volume is cleared as after a failed copy. A volume whose free space cannot be
 read is refused before the copy starts, rather than risking a copy that fails half-way. The
