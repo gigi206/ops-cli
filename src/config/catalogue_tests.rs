@@ -226,14 +226,30 @@ fn shell_command_string(argv: &[String]) -> Option<&String> {
     None
 }
 
-/// Whether `script` expands `"$@"` on a line of code: a line whose first non-blank character is
-/// `#` is a comment, and an expansion there forwards nothing. A comment that follows code on the
-/// same line is not told apart.
-fn expands_its_arguments(script: &str) -> bool {
+/// The lines of `script` that are code: a line whose first non-blank character is `#` is a
+/// comment. A comment that follows code on the same line is not told apart, nor is a word inside a
+/// string; that would take a shell parser.
+fn code_lines(script: &str) -> impl Iterator<Item = &str> {
     script
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
-        .any(|line| line.contains("\"$@\""))
+}
+
+/// Whether `script` expands `"$@"` on a line of code ([`code_lines`]): an expansion on a comment
+/// line forwards nothing.
+fn expands_its_arguments(script: &str) -> bool {
+    code_lines(script).any(|line| line.contains("\"$@\""))
+}
+
+/// Whether the install step `argv` reads `SBX_UPGRADE` on a line of code ([`code_lines`]).
+///
+/// The script is taken as its shell runs it ([`shell_command_string`]), so its first line is read
+/// like every other one; a step that is no shell script is searched as its argv.
+fn reads_the_upgrade_signal(argv: &[String]) -> bool {
+    let script = shell_command_string(argv)
+        .cloned()
+        .unwrap_or_else(|| argv.join(" "));
+    code_lines(&script).any(|line| line.contains("SBX_UPGRADE"))
 }
 
 /// Every shipped profile whose `cmd` is a shell script forwards `"$@"`.
@@ -756,29 +772,21 @@ fn every_shipped_install_step_yields_to_the_upgrade_signal() {
     // `re-installed`. The channel would be inert for that app and say the opposite, which is
     // exactly what this guard exists to prevent for the steps this repository ships.
     //
-    // The variable is looked for in the step's own argv rather than in the file text, and the
-    // script's whole-line shell comments are dropped before the search. Both filters are load
-    // bearing and were each proven by mutation: every bundle carrying a step explains the channel
-    // in a TOML comment above it *and* in a shell comment inside it, so a search over either the
-    // file or the raw script passes on a script whose guard no longer reads the variable. A
-    // trailing comment on a line of code is not stripped — it would take a shell parser to tell
-    // one from a `#` inside a string, and a guard that reads the variable on the same line is not
-    // the regression this is watching for.
+    // The variable is looked for in the step's own script rather than in the file text, and only on
+    // its lines of code ([`reads_the_upgrade_signal`]). Both filters are load bearing: every bundle
+    // carrying a step explains the channel in a TOML comment above it *and* in a shell comment
+    // inside it, so a search over either the file or the raw script would pass on a script whose
+    // guard no longer reads the variable. A trailing comment on a line of code is not stripped — it
+    // would take a shell parser to tell one from a `#` inside a string, and a guard that reads the
+    // variable on the same line is not the regression this is watching for.
     let mut checked = 0;
     for path in shipped_files("examples/bundle") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let Some(provision) = shipped_bundle(&path).provision else {
             continue;
         };
-        let script: String = provision
-            .into_argv()
-            .join(" ")
-            .lines()
-            .filter(|line| !line.trim_start().starts_with('#'))
-            .collect::<Vec<_>>()
-            .join("\n");
         assert!(
-            script.contains("SBX_UPGRADE"),
+            reads_the_upgrade_signal(&provision.into_argv()),
             "`examples/bundle/{name}.toml` carries a `provision` whose script never reads \
              SBX_UPGRADE — a run that forces (`sbx upgrade provision`, or one app named with \
              `-a`) would run it, its own guard would skip the install, and the roll would still \
@@ -2256,5 +2264,24 @@ fn only_a_quoted_expansion_on_a_line_of_code_forwards_the_arguments() {
         "exec app $@\n",
     ] {
         assert!(!expands_its_arguments(drops), "{drops:?}");
+    }
+}
+
+/// An install step reads the upgrade signal only where `SBX_UPGRADE` is code, its first line
+/// included: a mention on a comment line reads nothing.
+#[test]
+fn only_a_line_of_code_reads_the_upgrade_signal() {
+    let step = |script: &str| vec!["bash".to_string(), "-c".to_string(), script.to_string()];
+    assert!(reads_the_upgrade_signal(&step(
+        "set -e\n[ -n \"${SBX_UPGRADE:-}\" ] || [ ! -e marker ] || exit 0\ninstall\n"
+    )));
+    for reads_nothing in [
+        "# SBX_UPGRADE forces a re-install\nset -e\n[ -e marker ] && exit 0\ninstall\n",
+        "set -e\n  # SBX_UPGRADE forces a re-install\n[ -e marker ] && exit 0\ninstall\n",
+    ] {
+        assert!(
+            !reads_the_upgrade_signal(&step(reads_nothing)),
+            "{reads_nothing:?}"
+        );
     }
 }
