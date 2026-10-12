@@ -38,10 +38,13 @@
 # The command hands opencode the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
 # which files it protects, which operations it offers) as its global instructions file,
 # `~/.config/opencode/AGENTS.md`, which v2 loads beside the `AGENTS.md` files from the project root
-# down to the working directory. That file is yours to keep, so the command writes it only while
-# you have none: a copy marked as sbx's, rewritten at every launch and removed by a launch without
-# a summary. Once you write your own there, it is left untouched and the summary is no longer
-# added. The file lives in the app's isolated home, which only this app's cages read.
+# down to the working directory. That file is a symbolic link to the summary, not a copy of it: the
+# app's home is shared by every cage of this app, whatever its project, while each cage mounts its
+# own project's summary at the link's target, so every cage reads its own project's summary through
+# the same link, and v2, which watches the file, never picks up another project's. The command
+# creates the link only while that path is free, and removes it in a launch without a summary; a
+# file of yours there, or a link of yours to anything else, is left untouched and the summary is no
+# longer added. The file lives in the app's isolated home, which only this app's cages read.
 # `XDG_CONFIG_HOME` moves it and `OPENCODE_CONFIG_DIR` replaces its directory; the command follows
 # both, but only while the path they give stays under that home: a variable pointed at a host
 # path (such as a bind below) leaves the file there alone, and the summary is not added, rather
@@ -55,14 +58,13 @@ cmd = [
     '''
 s=/opt/sbx/contract-summary.md
 f="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}/AGENTS.md"
-m='<!-- sbx: the cage summary, rewritten at every launch -->'
 case "$f" in
   "$HOME"/*)
     if [ -r "$s" ]; then
-      if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
-        mkdir -p "${f%/*}" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+      if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+        mkdir -p "${f%/*}" && ln -s "$s" "$f"
       fi
-    elif grep -qsF "$m" "$f"; then
+    elif [ -L "$f" ] && [ "$(readlink -- "$f")" = "$s" ]; then
       rm -f "$f"
     fi
     ;;
@@ -142,7 +144,7 @@ allow = [
 # header, and env var instead.)
 [env]
 # No `OPENCODE_CONFIG_CONTENT` here: v2 loads no file named by an `instructions` list, so the
-# cage's summary reaches opencode through the global `AGENTS.md` that `cmd` writes (see above).
+# cage's summary reaches opencode through the global `AGENTS.md` link that `cmd` places (see above).
 #OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]
