@@ -1048,28 +1048,43 @@ fn set_mtime(path: &Path, times: Times) -> io::Result<()> {
     Ok(())
 }
 
-/// An advisory lock over the image, held across the whole attach-and-mount sequence so two
-/// concurrent `up` calls cannot each attach a loop device to the same bytes.
+/// An advisory lock held through a `.lock` file beside what it guards: an image across the whole
+/// attach-and-mount sequence, so two concurrent `up` calls cannot each attach a loop device to the
+/// same bytes, or the [`ToolStore`] across a format.
 struct ImageLock(#[allow(dead_code)] std::fs::File);
 
 fn lock_image(image: &Path) -> io::Result<ImageLock> {
+    // The holder is another sbx in the middle of the same sequence, and that sequence calls
+    // `udisksctl`, which goes through polkit: an authentication prompt takes as long as the person
+    // in front of it.
+    lock_beside(image, IMAGE_WAIT)
+}
+
+/// What another sbx holding an image's lock may be doing: answering polkit.
+const IMAGE_WAIT: &str = "it may be waiting for your authorisation";
+
+/// What another sbx holding the tool store's lock may be doing: provisioning before its format.
+const TOOL_STORE_WAIT: &str = "it may be downloading btrfs-progs";
+
+/// Lock `path` through a `.lock` file beside it, saying why the wait may be long when another
+/// sbx holds it: `why` is what that holder may be doing.
+fn lock_beside(path: &Path, why: &str) -> io::Result<ImageLock> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
-    let path = image.with_extension("lock");
+    let lock = path.with_extension("lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .mode(0o600)
-        .open(&path)?;
+        .open(&lock)?;
     // Asked without blocking first, so a lock somebody else holds can be *named* before it is
-    // waited on. The holder is another sbx in the middle of the same sequence, and that sequence
-    // calls `udisksctl`, which goes through polkit: an authentication prompt takes as long as the
-    // person in front of it, and a second `up` that simply stopped printing reads as a hang.
+    // waited on: a second command that simply stopped printing reads as a hang.
     //
-    // The wait itself stays unbounded, and giving up would be the wrong trade: this lock is what
-    // keeps two loop devices off one image, and a bounded wait that expired would hand the caller
-    // the very race the lock exists to prevent. What changes is that the wait is announced.
+    // The wait itself stays unbounded, and giving up would be the wrong trade: the lock is what
+    // keeps two loop devices off one image, or two formats out of one tool store, and a bounded
+    // wait that expired would hand the caller the very race the lock exists to prevent. What
+    // changes is that the wait is announced.
     //
     // SAFETY: `flock` on a valid owned fd. `LOCK_NB` returns `EWOULDBLOCK` instead of blocking when
     // another open file description holds the lock. The fd lives in the guard, so the lock is held
@@ -1079,17 +1094,22 @@ fn lock_image(image: &Path) -> io::Result<ImageLock> {
         if err.kind() != io::ErrorKind::WouldBlock {
             return Err(err);
         }
-        crate::diag::note(&format!(
-            "another sbx is working on {} — waiting for it to finish (it may be waiting for your \
-             authorisation)",
-            image.display()
-        ));
+        crate::diag::note(&wait_note(path, why));
         // SAFETY: as above, blocking this time now that the wait has been announced.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(io::Error::last_os_error());
         }
     }
     Ok(ImageLock(file))
+}
+
+/// What a command waiting on another sbx's lock over `path` says, `why` naming what that one may
+/// be doing.
+fn wait_note(path: &Path, why: &str) -> String {
+    format!(
+        "another sbx is working on {} — waiting for it to finish ({why})",
+        path.display()
+    )
 }
 
 /// Locate a required host program, with an error naming what it belongs to.
@@ -1164,7 +1184,7 @@ impl ToolStore {
             .mode(0o700)
             .create(data)?;
         let dir = data.join(TOOL_STORE);
-        let lock = lock_image(&dir)?;
+        let lock = lock_beside(&dir, TOOL_STORE_WAIT)?;
         match crate::sandbox::gc::force_remove_dir_all(&dir) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             _ => {}
@@ -2737,6 +2757,20 @@ this line has no separator at all
             enxio().map(|_: String| ()),
             "a state that cannot be read is not a released device"
         );
+    }
+
+    /// A command waiting on another sbx's lock says what that one may be doing: answering polkit
+    /// over an image, provisioning over the tool store, where no authorisation is ever asked.
+    #[test]
+    fn a_wait_on_a_lock_names_what_its_holder_may_be_doing() {
+        assert_eq!(
+            wait_note(Path::new("/d/sbx-storage.btrfs"), IMAGE_WAIT),
+            "another sbx is working on /d/sbx-storage.btrfs — waiting for it to finish (it may be \
+             waiting for your authorisation)"
+        );
+        let tools = wait_note(Path::new("/d/sbx/storage-tools"), TOOL_STORE_WAIT);
+        assert!(!tools.contains("authorisation"), "{tools}");
+        assert!(tools.contains("btrfs-progs"), "{tools}");
     }
 
     /// The tool store lives under a name of sbx's own in the data directory, and is gone once the
