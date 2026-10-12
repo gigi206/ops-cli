@@ -321,8 +321,8 @@ fn project_store_lock_path(layout: &Layout, project_id: &str) -> PathBuf {
 
 /// Take `project_id`'s store lock **shared**, for a launch: from before it provisions until its
 /// session is recorded, or for the whole run of a cage no session records. Launches of one project
-/// hold it together; a running `sbx gc` on it makes this wait, after `waiting` is given the lock
-/// file.
+/// hold it together; a verb holding it exclusive ([`lock_project_store`]) makes this wait, after
+/// `waiting` is given the lock file.
 pub(crate) fn hold_project_store(
     layout: &Layout,
     project_id: &str,
@@ -336,10 +336,11 @@ pub(crate) fn hold_project_store(
     .map(ProjectStoreLock)
 }
 
-/// Take `project_id`'s store lock **exclusive**, for `sbx gc`: from before it looks for a live
-/// session of the project until its work on the store is done. It waits, after `waiting` is given
-/// the lock file, for every launch still holding the lock shared, and every launch that comes
-/// after waits for it.
+/// Take `project_id`'s store lock **exclusive**, for a verb that removes what a launch of the
+/// project provisions (`sbx gc` on its store, `sbx projects rm` on its tree, `sbx app rm --purge`
+/// on an app's trees in it): from before it looks for a live session until its removal is done.
+/// It waits, after `waiting` is given the lock file, for every launch still holding the lock
+/// shared, and every launch that comes after waits for it.
 pub(crate) fn lock_project_store(
     layout: &Layout,
     project_id: &str,
