@@ -259,8 +259,12 @@ fn split_clearsigned(text: &str) -> Result<Clearsigned, String> {
         .find("\n\n")
         .ok_or("clearsigned document has no armor header block")?
         + 2;
+    // The signature's armor opens at the start of a line. A message line carrying the same words is
+    // dash-escaped by the signer (`- -----BEGIN …`), so a search not anchored to a line start would
+    // end the message there.
     let signature_at = text
-        .find(SIGNATURE_HEADER)
+        .find(&format!("\n{SIGNATURE_HEADER}"))
+        .map(|at| at + 1)
         .ok_or("clearsigned document carries no signature")?;
     let body = text
         .get(after_headers..signature_at)
