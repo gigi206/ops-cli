@@ -331,3 +331,18 @@ fn a_key_packet_with_bytes_past_its_exponent_is_refused() {
     assert!(err.contains("past its RSA exponent"), "{err}");
     assert!(parse_public_key(&armored_key(&bare)).is_ok());
 }
+
+/// The issuer is read from the hashed area only: a subpacket that starts inside it and runs past its
+/// end is refused, not read on into the bytes that follow.
+#[test]
+fn an_issuer_subpacket_running_past_the_hashed_area_is_refused() {
+    let doc = split_clearsigned(CLEARSIGNED).unwrap();
+    let packets = packets(&doc.signature).unwrap();
+    let body = packets[0].1;
+    assert_eq!(issuer_of(body), Ok(pinned()));
+    // The fixture's first hashed subpacket is the issuer fingerprint, 23 bytes from offset 6. A
+    // hashed area declared ten bytes long ends inside it.
+    let mut short = body.to_vec();
+    short[4..6].copy_from_slice(&10u16.to_be_bytes());
+    assert!(issuer_of(&short).is_err(), "{:?}", issuer_of(&short));
+}
