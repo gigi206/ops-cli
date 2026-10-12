@@ -42,7 +42,7 @@ pub(super) fn launch_detached(
     // The daemon runs ordinary code before any `exec`, allocation included, which is sound only when
     // no other thread could hold a lock at the fork: a daemon that inherited one held would wait on
     // it for good, before it ever wrote the readiness byte or closed the pipe its parent reads.
-    // Nothing before [`build()`] starts a thread; this keeps that true rather than assumed.
+    // Nothing before [`build()`] starts a thread; this checks it rather than assuming it.
     if let Err(e) = crate::sandbox::netns::single_threaded() {
         crate::diag::error(&format!("sbx: cannot start the detached session: {e}"));
         return ExitCode::FAILURE;
@@ -59,8 +59,8 @@ pub(super) fn launch_detached(
     }
     let (read_fd, write_fd) = (fds[0], fds[1]);
 
-    // SAFETY: the process is single-threaded here, so the child may safely run code (allocate,
-    // build the cage, spawn the proxy thread) before any `exec`.
+    // SAFETY: the process is single-threaded here (checked above), so the child may safely run code
+    // (allocate, build the cage, spawn the proxy thread) before any `exec`.
     match unsafe { libc::fork() } {
         -1 => {
             // SAFETY: `fork` failed, so no second process shares them: both ends are the ones
