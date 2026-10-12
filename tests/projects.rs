@@ -510,6 +510,45 @@ fn rm_refuses_when_the_session_registry_cannot_be_read() {
     assert!(dir.exists());
 }
 
+/// A preview that could not read the registry still names what would go, but not as free: no
+/// session was ruled out, and the applied form it would otherwise point at refuses until the
+/// registry reads. `sbx projects list` reports the same trees' liveness as `unknown`.
+#[test]
+fn a_preview_without_the_registry_does_not_present_a_tree_as_free() {
+    let fx = Project::new("projects");
+    let dir = fx.make_tree("1234567890abcdef", Some(&fx.proj.path().join("gone")));
+    let markerless = fx.make_tree("fedcba0987654321", None);
+    let sessions = fx.data_home.path().join("sbx/sessions");
+    std::fs::create_dir_all(sessions.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_dir_all(&sessions);
+    std::fs::write(&sessions, b"not a directory").unwrap();
+
+    for args in [
+        &["projects", "rm", "1234567890abcdef", "--dry-run"][..],
+        &["projects", "rm", "--dead"][..],
+        &["projects", "rm", "--markerless"][..],
+    ] {
+        let out = fx.run(args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{args:?}: {}", text(&out));
+        // Each tree's own line carries the qualifier: a bare `removable:` or `reclaimable:` is
+        // the label of a tree a session was ruled out of holding.
+        assert!(
+            stdout.contains("unless a session holds it")
+                && !stdout.contains("removable: ")
+                && !stdout.contains("reclaimable: "),
+            "{args:?} presented a tree as free: {}",
+            text(&out)
+        );
+        assert!(
+            !stdout.contains(" to remove") && !stdout.contains(" to reclaim"),
+            "{args:?} pointed at an applied form that refuses: {}",
+            text(&out)
+        );
+    }
+    assert!(dir.exists() && markerless.exists());
+}
+
 /// A listing answers rather than deletes, so it keeps answering — but `idle` is a finding, and one
 /// stated off a registry nothing could read would be a claim nothing checked.
 #[test]
