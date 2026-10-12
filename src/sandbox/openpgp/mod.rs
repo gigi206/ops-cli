@@ -5,9 +5,11 @@
 //! accepts exactly the shape the chain it serves actually uses and refuses everything else, so the
 //! surface a reviewer has to audit is the list below rather than the standard:
 //!
-//! * a clearsigned document carrying **exactly one** signature packet — a second one is refused
-//!   rather than searched, because "accept if any signature verifies" is the bypass this whole
-//!   module exists to prevent (an attacker appends a packet of their own beside the real one);
+//! * a clearsigned document carrying **exactly one** signature packet that names the pinned issuer,
+//!   which is the one verified. Packets naming another issuer are passed over, since a repository
+//!   rotating its key signs with the old one and the new; a second packet naming the pinned issuer
+//!   is refused rather than searched, because "accept if any signature verifies" is the bypass this
+//!   whole module exists to prevent (an attacker appends a packet of their own beside the real one);
 //! * a **version 4** signature over a **canonical text document** (type `0x01`);
 //! * **RSA** (public-key algorithm 1) with **SHA-512** or **SHA-256** — the two an apt vendor
 //!   signs with. MD5 and SHA-1 are refused, not merely deprecated;
