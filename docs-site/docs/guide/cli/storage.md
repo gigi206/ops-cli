@@ -292,9 +292,11 @@ would provision gigabytes into RAM and report an empty store as the truth. The r
 out: [`sbx doctor`](doctor), or any launch, run from your desktop session mounts the volume, and
 `sbx storage unuse` goes back to the plain directory, leaving the volume's data in it.
 
-The mount point is read back from `udisks` rather than assumed: it varies by version
+The mount point is read back rather than assumed: `udisks` decides it, and it varies by version
 (`/run/media` or `/media`) and gains a suffix if the label collides: so always take it from
-`use` or `status`.
+`use` or `status`. Once `udisks` has mounted the volume, sbx checks the mount table it reads: if
+that table does not show the mount, because sbx runs in a mount namespace `udisks`' mounts do not
+reach, the mount is undone and refused rather than written beside, on the tmpfs beneath it.
 
 ## `status`
 
