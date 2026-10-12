@@ -280,7 +280,7 @@ struct ChildView {
     /// (the `.toml` suffix stripped).
     name: String,
     path: PathBuf,
-    /// Only set for per-project trees: `live`/`idle`/`dead`/`markerless`/`unknown`. `None` for app homes and
+    /// Only set for per-project trees: `live`/`idle`/`dead`/`markerless`/`unknown`/`unreadable`. `None` for app homes and
     /// profiles, which have no liveness state.
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<&'static str>,
@@ -616,7 +616,7 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
                         (Some(st), Some(date)) => {
                             let hue = match st {
                                 "live" | "idle" => ok,
-                                "unknown" => warn,
+                                "unknown" | "unreadable" => warn,
                                 _ => dim,
                             };
                             // The project tree line: id, tree path, (state), date, recorded
