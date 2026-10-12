@@ -680,9 +680,12 @@ fn through_proxy_websocket(
         let _ = tls.write_all(b"client-frame");
         let _ = tls.flush();
     }
-    let mut rest = String::new();
-    let _ = tls.read_to_string(&mut rest);
-    Ok(format!("{heads}{rest}"))
+    // Read as bytes and rendered lossily: `read_to_string` keeps nothing of a read that is not
+    // UTF-8, and what follows a `101` is frames, so a transcript would lose exactly the bytes an
+    // assertion of absence is about. The bytes read before an error are kept either way.
+    let mut rest = Vec::new();
+    let _ = tls.read_to_end(&mut rest);
+    Ok(format!("{heads}{}", String::from_utf8_lossy(&rest)))
 }
 
 /// Read bytes until the `\r\n\r\n` blank-line terminator (cleartext CONNECT reply).
@@ -1223,6 +1226,40 @@ fn a_websocket_upgrade_is_relayed_bidirectionally() {
     assert!(
         transcript.contains("ECHO:client-frame"),
         "the client frame did not round-trip (client→upstream→client): {transcript:?}"
+    );
+}
+
+/// The transcript of an upgraded tunnel keeps every byte the upstream sent past the `101`, a byte
+/// that is not UTF-8 included: a frame is binary, and a transcript that dropped it would make an
+/// assertion that something was not relayed pass for want of reading it.
+#[test]
+fn a_websocket_transcript_keeps_bytes_that_are_not_text() {
+    let (addr, upstream_ca, up) = spawn_ws_upstream_answering(
+        b"",
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+          Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\nS-FIRST;\xff",
+    );
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+    let ctx = Arc::new(
+        ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    let transcript =
+        through_proxy_websocket(ctx, proxy_ca_der, "upstream.test", addr.port()).unwrap();
+    up.join().unwrap();
+    assert!(
+        transcript.contains("S-FIRST;\u{fffd}") && transcript.contains("ECHO:client-frame"),
+        "{transcript:?}"
     );
 }
 
