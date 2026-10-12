@@ -1176,12 +1176,23 @@ const IMAGE_WAIT: &str = "it may be waiting for your authorisation";
 /// What another sbx holding the tool store's lock may be doing: provisioning before its format.
 const TOOL_STORE_WAIT: &str = "it may be downloading btrfs-progs";
 
-/// Lock `path` through a `.lock` file beside it, saying why the wait may be long when another
-/// sbx holds it: `why` is what that holder may be doing.
+/// The lock file guarding `path`: its name with `.lock` appended.
+///
+/// Appended rather than put in place of the extension, which would give `a.btrfs` and `a.img` side
+/// by side one lock, so that either image waited on the other's `up`, and make an image named
+/// `x.lock` its own lock file. The tool store, which has no extension, keeps `storage-tools.lock`.
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Lock `path` through a `.lock` file beside it ([`lock_path`]), saying why the wait may be long
+/// when another sbx holds it: `why` is what that holder may be doing.
 fn lock_beside(path: &Path, why: &str) -> io::Result<ImageLock> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
-    let lock = path.with_extension("lock");
+    let lock = lock_path(path);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -3483,6 +3494,29 @@ this line has no separator at all
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Each path locks through a file of its own, whatever extensions sit beside it, and never
+    /// through itself; the tool store's lock keeps its name.
+    #[test]
+    fn each_path_locks_through_a_file_of_its_own() {
+        let mut wrong = Vec::new();
+        let (btrfs, img) = (
+            lock_path(Path::new("/d/a.btrfs")),
+            lock_path(Path::new("/d/a.img")),
+        );
+        if btrfs == img {
+            wrong.push(format!("a.btrfs and a.img share {}", btrfs.display()));
+        }
+        let named_lock = lock_path(Path::new("/d/x.lock"));
+        if named_lock == Path::new("/d/x.lock") {
+            wrong.push("an image named x.lock is its own lock".to_string());
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        assert_eq!(
+            lock_path(Path::new("/d/sbx/storage-tools")),
+            Path::new("/d/sbx/storage-tools.lock")
+        );
     }
 
     #[test]
