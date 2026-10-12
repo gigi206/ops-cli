@@ -368,6 +368,8 @@ pub(crate) fn parse_loop_setup(out: &str) -> Option<String> {
 ///
 /// The path is read back rather than constructed: `udisks` decides it, and it varies with the
 /// version (`/run/media` or `/media`) and disambiguates a label collision by appending a digit.
+/// What [`up`] returns comes from the mount table instead ([`mounted_here`]); this report names the
+/// mount when the table does not show it.
 pub(crate) fn parse_mount(out: &str) -> Option<PathBuf> {
     let (_, tail) = out.rsplit_once(" at ")?;
     let p = tail.trim().trim_end_matches('.');
@@ -1564,28 +1566,29 @@ pub(crate) fn init(
     made
 }
 
-/// Where `loop_dev` is mounted, and with which options, once udisks has reported mounting it at
-/// `reported` — provided this process's mount table shows it.
+/// Where `loop_dev` is mounted, and with which options, as this process's mount table shows it
+/// once udisks has reported mounting it at `reported`.
 ///
-/// The table is the proof that the mount reached this process at all: udisks mounts in the mount
-/// namespace its daemon runs in, and a process whose namespace that mount does not propagate into
-/// sees at most the directory beneath it, where whatever is written lands instead of in the volume,
-/// on the `/run` tmpfs. A device the table does not show is therefore an error rather than a mount
-/// point. The options are the table's, so they are those of the mount this process writes through.
+/// The table, not udisks' report, answers. It is what [`state`] reads on every later call, so the
+/// path handed back now is the one every later command gets, byte for byte, where the report comes
+/// through `udisksctl`'s text output and loses a path that is not UTF-8. And it is the proof that
+/// the mount reached this process at all: udisks mounts in the mount namespace its daemon runs in,
+/// and a process whose namespace that mount does not propagate into sees at most the directory
+/// beneath it, where whatever is written lands instead of in the volume, on the `/run` tmpfs. A
+/// device the table does not show is therefore an error rather than a mount point.
 fn mounted_here(
     loop_dev: &str,
     mountinfo: &[u8],
     reported: &Path,
 ) -> Result<(PathBuf, String), String> {
-    let (_, options) = mount_of(loop_dev, mountinfo).ok_or_else(|| {
+    mount_of(loop_dev, mountinfo).ok_or_else(|| {
         format!(
             "udisks reports {loop_dev} mounted at {}, but this process's mount table does not \
              show it, so sbx would write beside the volume rather than into it — run sbx in the \
              mount namespace udisks mounts in",
             reported.display()
         )
-    })?;
-    Ok((reported.to_path_buf(), options))
+    })
 }
 
 /// Attach and mount the volume, and return where it landed. Idempotent: an already-mounted
@@ -2177,6 +2180,23 @@ this line has no separator at all
         assert!(
             err.contains("/dev/loop61") && err.contains("/run/media/u/other"),
             "{err}"
+        );
+    }
+
+    /// The mount table, not udisks' report, says where the volume landed: the path every later
+    /// [`state`] reads, byte for byte, which the report cannot carry when it is not UTF-8 — `run`
+    /// decodes `udisksctl`'s output as text.
+    #[test]
+    fn the_mount_table_rather_than_udisks_says_where_the_volume_landed() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let table = b"41 30 7:60 / /run/media/u/vol\xff rw,nosuid - btrfs /dev/loop60 rw\n";
+        // udisks' report as `run` decodes it: the byte that is not UTF-8 is lost.
+        let reported = Path::new("/run/media/u/vol\u{fffd}");
+        let (mp, _) =
+            mounted_here("/dev/loop60", table, reported).expect("the device is in the table");
+        assert_eq!(
+            mp,
+            Path::new(std::ffi::OsStr::from_bytes(b"/run/media/u/vol\xff"))
         );
     }
 
