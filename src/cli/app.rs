@@ -1352,15 +1352,12 @@ fn app_rm_purge_one(
             &format!("sbx: could not remove {}: {e}", path.display()),
         );
     }
-    // Every per-project home of the app is under the projects directory: one that cannot be read
-    // hides them, so none was found or removed, and the purge cannot say the app's state is gone.
-    if let Some(e) = &report.unlisted {
+    // A place a home of the app could be that cannot be read hides it, so it was neither found
+    // nor removed, and the purge cannot say the app's state is gone.
+    for e in &report.unlisted {
         diag::error_in(
             diag::Hue::Warn,
-            &format!(
-                "sbx: {e}, so the per-project homes of '{name}' there could not be found, and \
-                 any it has are left"
-            ),
+            &format!("sbx: {e}, so any home of '{name}' there could not be found and is left"),
         );
     }
 
@@ -1372,7 +1369,7 @@ fn app_rm_purge_one(
     if !profile_removed && report.found_nothing() {
         // With the projects directory unread, nothing was found where the homes would be, which
         // is not finding that there are none: the line above is the answer.
-        if report.unlisted.is_none() {
+        if report.unlisted.is_empty() {
             diag::error(&nothing_purged_message(name, profile_failed));
         }
         return AppPurgeOutcome {
@@ -1393,7 +1390,7 @@ fn app_rm_purge_one(
     };
     // A partial failure (a home that would not delete) is not a clean purge — say so, so the green
     // summary never contradicts the non-zero exit the batch will carry.
-    let clean = report.failed.is_empty() && report.unlisted.is_none() && !profile_failed;
+    let clean = report.failed.is_empty() && report.unlisted.is_empty() && !profile_failed;
     let verb = if clean {
         format!("{ok}purged{r}")
     } else {

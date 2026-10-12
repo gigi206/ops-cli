@@ -834,9 +834,10 @@ pub(crate) struct AppPurgeReport {
     pub(crate) removed: Vec<PurgedHome>,
     /// Homes that existed but could not be removed (path and the reason), reported not swallowed.
     pub(crate) failed: Vec<(PathBuf, io::Error)>,
-    /// Why `<data>/projects/` could not be read, when it could not: every per-project home of the
-    /// app is in there, so none of them was found or removed, and the purge is not complete.
-    pub(crate) unlisted: Option<io::Error>,
+    /// The places a home of the app could be and that could not be read, each named in its error:
+    /// the global home, or `<data>/projects/`, which holds every per-project one. What is there
+    /// was neither found nor removed, so the purge is not complete.
+    pub(crate) unlisted: Vec<io::Error>,
 }
 
 impl AppPurgeReport {
@@ -858,35 +859,48 @@ impl AppPurgeReport {
 ///
 /// `name` must already have passed [`is_safe_tree_id`]: it is joined as given.
 ///
-/// A data directory with no `projects/` yet holds no per-project tree. One that cannot be read is
-/// an error, which names it: the trees in it are the app's too, and a list without them would
-/// measure, or purge, part of the app as if it were all of it.
+/// A global home that does not exist, and a data directory with no `projects/` yet, hold nothing.
+/// One that cannot be read is an error, which names it: what is there is the app's too, and a list
+/// without it would measure, or purge, part of the app as if it were all of it.
 pub(crate) fn app_trees(data_dir: &Path, name: &str) -> io::Result<Vec<PathBuf>> {
-    let mut candidates = vec![global_app_tree(data_dir, name)];
+    let (trees, mut unlisted) = app_trees_found(data_dir, name);
+    match unlisted.pop() {
+        Some(e) => Err(e),
+        None => Ok(trees),
+    }
+}
+
+/// [`app_trees`], with the trees that were found kept beside the places that could not be read,
+/// for a caller that acts on what it found and reports the rest.
+fn app_trees_found(data_dir: &Path, name: &str) -> (Vec<PathBuf>, Vec<io::Error>) {
+    let named = |path: &Path, e: io::Error| {
+        io::Error::new(e.kind(), format!("cannot read {}: {e}", path.display()))
+    };
+    let mut trees = Vec::new();
+    let mut unlisted = Vec::new();
+    let global = data_dir.join("apps").join(name);
+    match std::fs::metadata(&global) {
+        Ok(meta) if meta.is_dir() => trees.push(global),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => unlisted.push(named(&global, e)),
+    }
     let projects = data_dir.join("projects");
     match std::fs::read_dir(&projects) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    candidates.push(entry.path().join("apps").join(name));
+                    let tree = entry.path().join("apps").join(name);
+                    if tree.is_dir() {
+                        trees.push(tree);
+                    }
                 }
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(io::Error::new(
-                e.kind(),
-                format!("cannot read {}: {e}", projects.display()),
-            ));
-        }
+        Err(e) => unlisted.push(named(&projects, e)),
     }
-    candidates.retain(|dir| dir.is_dir());
-    Ok(candidates)
-}
-
-/// App `name`'s global home directory, `<data>/apps/<name>/`, whether or not it exists.
-fn global_app_tree(data_dir: &Path, name: &str) -> PathBuf {
-    data_dir.join("apps").join(name)
+    (trees, unlisted)
 }
 
 /// Remove app `name`'s isolated runtime directories — the global home `<data>/apps/<name>/` (shared
@@ -913,22 +927,13 @@ pub(crate) fn purge_app_homes(data_dir: &Path, name: &str) -> AppPurgeReport {
         return AppPurgeReport {
             removed,
             failed,
-            unlisted: None,
+            unlisted: Vec::new(),
         };
     }
     // The global home, then each per-project home under an existing project tree. Best-effort, as
-    // every other failure here: a projects directory that cannot be read still leaves the global
-    // home the app's to purge, and the report says the rest could not be found.
-    let (trees, unlisted) = match app_trees(data_dir, name) {
-        Ok(trees) => (trees, None),
-        Err(e) => {
-            let global = global_app_tree(data_dir, name);
-            (
-                global.is_dir().then_some(global).into_iter().collect(),
-                Some(e),
-            )
-        }
-    };
+    // every other failure here: a place that cannot be read leaves what was found elsewhere the
+    // app's to purge, and the report says what could not be found.
+    let (trees, unlisted) = app_trees_found(data_dir, name);
     for dir in trees {
         let bytes = tree_size(&dir);
         let carried_home = dir.join("home").is_dir();
@@ -4787,38 +4792,54 @@ mod tests {
         assert!(data.path().join("apps/demo-app").is_dir()); // the real app is untouched
     }
 
-    /// A projects directory that cannot be read hides the app's per-project homes: the purge still
-    /// removes the global home, and reports the directory rather than reading as complete. One
-    /// that does not exist yet hides nothing.
+    /// A place a home of the app could be that cannot be read hides it: the purge still removes
+    /// what it found elsewhere, and reports the place rather than reading as complete. A
+    /// projects directory that does not exist yet hides nothing.
     #[test]
-    fn purge_app_homes_reports_a_projects_directory_it_cannot_read() {
+    fn purge_app_homes_reports_a_place_it_cannot_read() {
         use std::os::unix::fs::PermissionsExt as _;
         let data = TmpDir::new();
         mk_home(&data.path().join("apps/demo-app/home"));
-        assert!(purge_app_homes(data.path(), "demo-app").unlisted.is_none());
+        assert!(purge_app_homes(data.path(), "demo-app").unlisted.is_empty());
 
-        mk_home(&data.path().join("apps/demo-app/home"));
-        mk_home(&data.path().join("projects/p1/apps/demo-app/home"));
-        let projects = data.path().join("projects");
-        let mode = |m| std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(m));
-        mode(0o000).unwrap();
-        if std::fs::read_dir(&projects).is_ok() {
+        for (hidden, found) in [
+            ("projects", "apps/demo-app"),
+            ("apps", "projects/p1/apps/demo-app"),
+        ] {
+            mk_home(&data.path().join("apps/demo-app/home"));
+            mk_home(&data.path().join("projects/p1/apps/demo-app/home"));
+            let dir = data.path().join(hidden);
+            let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m));
+            mode(0o000).unwrap();
+            if std::fs::read_dir(&dir).is_ok() {
+                mode(0o700).unwrap();
+                skip_incapable!("running as root, which reads a directory its mode refuses");
+                return;
+            }
+            let report = purge_app_homes(data.path(), "demo-app");
             mode(0o700).unwrap();
-            skip_incapable!("running as root, which reads a directory its mode refuses");
-            return;
+            assert!(
+                report
+                    .unlisted
+                    .iter()
+                    .any(|e| e.to_string().contains(&dir.display().to_string())),
+                "{hidden}: {:?}",
+                report.unlisted
+            );
+            assert_eq!(
+                report.removed.len(),
+                1,
+                "{hidden}: what was found is purged"
+            );
+            assert!(!data.path().join(found).exists(), "{hidden}");
+            let left = data.path().join(hidden);
+            assert!(
+                std::fs::read_dir(&left).unwrap().next().is_some(),
+                "{hidden}"
+            );
+            let _ = force_remove_dir_all(&data.path().join("apps/demo-app"));
+            let _ = force_remove_dir_all(&data.path().join("projects/p1/apps/demo-app"));
         }
-        let report = purge_app_homes(data.path(), "demo-app");
-        mode(0o700).unwrap();
-        assert!(
-            report
-                .unlisted
-                .as_ref()
-                .is_some_and(|e| e.to_string().contains(&projects.display().to_string())),
-            "{:?}",
-            report.unlisted
-        );
-        assert_eq!(report.removed.len(), 1, "the global home is still purged");
-        assert!(projects.join("p1/apps/demo-app/home").is_dir());
     }
 
     #[test]
