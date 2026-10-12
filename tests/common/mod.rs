@@ -468,15 +468,18 @@ fn on_path(name: &str) -> Option<std::path::PathBuf> {
     program_in(name, &std::env::var_os("PATH")?)
 }
 
-/// The first program called `name` in a directory of the `PATH` value `path`: a regular file this
-/// process may execute, which a launch's own search also requires. A file it may not execute is
-/// passed over, as the launch passes over it: taken, it would name a program the launch never
-/// runs, and a test that runs it itself waits on a program that never started.
+/// The first program called `name` in a directory of the `PATH` value `path`, as a launch's own
+/// search finds it: in an absolute entry, a regular file this process may execute. An entry that
+/// is not absolute, the empty one included, names a directory relative to wherever the test runs,
+/// and the launch reads none. A file this process may not execute is passed over, as the launch
+/// passes over it: taken, it would name a program the launch never runs, and a test that runs it
+/// itself waits on a program that never started.
 ///
 /// The launch also refuses a program owned by another user than this one or root, or writable by
-/// all, which this does not.
+/// all, and an entry under the project it runs in, which this does not.
 pub fn program_in(name: &str, path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
     std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|p| executable(p))
 }
