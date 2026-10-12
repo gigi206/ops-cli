@@ -58,7 +58,11 @@ The sweep therefore reconciles those seed roots against what the project's **cur
 out-links reference: it keeps the current version of each and collects the superseded ones.
 A live package's `<name>-man` / `<name>-dev` sibling outputs are kept with it, and a pruned
 prebuilt root takes its `.expr` stamp with it. The keep-set also covers
-`projects/<id>/nix-tools/*` (the `nix:`-via-mise tools).
+`projects/<id>/nix-tools/*` (the `nix:`-via-mise tools). A launch drops the out-link of a
+`nix:` tool the project's mise files no longer declare, and [`sbx upgrade`](upgrade) its pin;
+while one of those files cannot be read as a mise file (not TOML, or not UTF-8), neither drops
+anything, since what it declares is unknown: the launch warns, and the upgrade names the file
+and exits non-zero.
 It is conservative: if the base or mise out-links for the current revision are missing it
 skips rather than risk dropping a live build, so an over-eager prune only ever costs a
 re-provision on the next launch.
