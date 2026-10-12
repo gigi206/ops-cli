@@ -242,3 +242,18 @@ fn trailing_whitespace_is_stripped_before_hashing_so_a_padded_line_still_verifie
     assert!(doc.plain.contains("Suite: stable \t "));
     assert!(!doc.signed.windows(4).any(|w| w == b"le \t"));
 }
+
+/// The signature's armor is found at the start of a line, so a message line that reads like it —
+/// dash-escaped by the signer — stays in the message instead of ending it there.
+#[test]
+fn an_escaped_armor_line_in_the_message_does_not_end_it() {
+    let original = split_clearsigned(CLEARSIGNED).unwrap();
+    let escaped = CLEARSIGNED.replacen("Origin: demo-repo", "- -----BEGIN PGP SIGNATURE-----", 1);
+    let doc = split_clearsigned(&escaped).expect("the escaped line stays in the message");
+    assert!(
+        doc.plain.starts_with("-----BEGIN PGP SIGNATURE-----\n"),
+        "{}",
+        doc.plain
+    );
+    assert_eq!(doc.signature, original.signature);
+}
