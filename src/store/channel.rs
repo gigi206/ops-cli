@@ -106,7 +106,8 @@ pub(crate) struct LockTarget {
     /// need a network the base does not.
     ///
     /// So the seed is not a cache: it is what makes the carve-out invisible until something is
-    /// rolled on purpose. `None` for the two targets that were always their own source of truth.
+    /// rolled on purpose. `None` for the two targets that were always their own source of truth,
+    /// unless [`LockTarget::seeded_from_global`] points one at a data directory it must follow.
     seed_from: Option<PathBuf>,
     /// Which lock `lock_path` is, named rather than inferred from the path, so a caller asking
     /// whose revision a roll replaced reads the answer off the target it rolled.
@@ -191,6 +192,14 @@ impl LockTarget {
             seed_from: Some(global_lock_path(layout)),
             scope: Scope::App,
         })
+    }
+
+    /// This target, taking its first revision from the global lock of `layout` when that lock
+    /// records the same source. For a lock kept outside the data directory whose channel it has to
+    /// follow: resolving it reads that directory's lock and never writes it.
+    pub(crate) fn seeded_from_global(mut self, layout: &Layout) -> Self {
+        self.seed_from = Some(global_lock_path(layout));
+        self
     }
 
     /// The configured source (a branch/channel or a 40-hex revision).

@@ -1307,11 +1307,10 @@ fn propose(default_dir: &Path, pre: &storage::Preflight) {
                 &format!("sbx: now using the volume at {}", mount_point.display()),
             );
             // The pointer-following path is memoised once per process and may already have been
-            // consulted — and cached as "no volume" — while provisioning btrfs-progs into the
-            // host store just above. So this process is steered onto the volume by the override,
-            // which `from_env` honours *before* the pointer; later processes follow the pointer
-            // normally. (btrfs-progs is provisioned into the host store, not the volume — it is
-            // only needed to create the filesystem, so that is harmless.)
+            // consulted — and cached as "no volume" — while reading the data directory's channel
+            // lock to provision btrfs-progs just above. So this process is steered onto the volume
+            // by the override, which `from_env` honours *before* the pointer; later processes
+            // follow the pointer normally.
             // SAFETY: this runs on the first line of `cli::dispatch`, before any command
             // handler has started a thread, and behind a blocking prompt on a terminal —
             // so sbx is single-threaded here and nothing else can be reading the
@@ -1368,8 +1367,15 @@ fn adopt_empty(default_dir: &Path) -> Result<PathBuf, String> {
             &mkfs,
         )?;
     }
+    let was_mounted = matches!(storage::state(&image), Ok(storage::State::Mounted { .. }));
     let mount_point = storage::ensure_mounted(&image)?;
     if let Some(refusal) = adopt_refusal(default_dir) {
+        // A volume this call mounted is not left up behind an adoption that did not happen: no
+        // pointer names it, so nothing would ever unmount it. One that was already mounted stays,
+        // since whoever mounted it may be using it.
+        if !was_mounted {
+            let _ = storage::down(&image);
+        }
         return Err(refusal);
     }
     storage::write_pointer(default_dir, &image).map_err(|e| e.to_string())?;

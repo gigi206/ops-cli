@@ -153,6 +153,16 @@ impl Layout {
         }
     }
 
+    /// The layout of a store kept apart from the data directory's own, rooted at `dir`: the
+    /// [`crate::storage::ToolStore`] a volume is formatted from, which sits inside a data directory
+    /// [`Layout::from_env`] already resolved. Nothing launches from it and no socket is bound under
+    /// it, so it takes none of the checks that function applies.
+    pub(crate) fn tool_store(dir: &Path) -> Self {
+        Self {
+            data_dir: dir.to_path_buf(),
+        }
+    }
+
     /// The argument passed to `nix --store`: the directory that *contains* the
     /// `nix/` tree. A daemonless build into it yields `<store_dir>/nix/store`,
     /// owned by the invoking user.

@@ -1120,12 +1120,72 @@ pub(crate) enum Mkfs {
     Host(PathBuf),
     /// Provisioned by sbx. A binary in a relocated store hard-codes its interpreter under
     /// `/nix/store/…`, a path the host does not have, so it runs inside a minimal bubblewrap
-    /// with sbx's store bound there — the same way sbx already drives its own mise engine.
+    /// with that store bound there — the same way sbx already drives its own mise engine.
     Owned {
         bwrap: PathBuf,
         store_nix: PathBuf,
         bin: PathBuf,
+        /// The store `store_nix` lives in, removed with this value.
+        _tools: ToolStore,
     },
+}
+
+/// The directory, inside the data directory, a provisioned `btrfs-progs` is built into.
+const TOOL_STORE: &str = "storage-tools";
+
+/// Where a provisioned `btrfs-progs` lives for the one format that needs it: a store of its own in
+/// the data directory, held under a lock and removed when this is dropped.
+///
+/// Never the data directory's `store`. A `store` there reads as data that adopting a volume would
+/// leave behind, so `sbx storage use` would refuse a volume over a directory holding nothing but
+/// this tool; and once a volume is adopted, nothing reads or collects the directory it sits in.
+/// The closure is mostly the nixpkgs source it is evaluated from, a few hundred MiB in well over a
+/// hundred thousand files, which a format needs once and nothing needs after it.
+///
+/// Inside the data directory rather than beside the image: the binary runs from it, and the data
+/// directory is the one place sbx already requires to allow that, where an `--image` may name a
+/// filesystem mounted `noexec`. And the name is sbx's own there, so what a run that did not finish
+/// left under it can be removed, where a directory beside an image the user named may be theirs.
+pub(crate) struct ToolStore {
+    dir: PathBuf,
+    /// Held until the store is removed, so a second volume creation neither builds into this one
+    /// nor removes it from under the format it serves.
+    _lock: ImageLock,
+}
+
+impl ToolStore {
+    /// Claim the tool store of the data directory `data`: wait for any other volume creation to
+    /// finish with it, then clear what a run that did not finish left in it.
+    fn claim(data: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(data)?;
+        let dir = data.join(TOOL_STORE);
+        let lock = lock_image(&dir)?;
+        match crate::sandbox::gc::force_remove_dir_all(&dir) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        Ok(ToolStore { dir, _lock: lock })
+    }
+}
+
+impl Drop for ToolStore {
+    fn drop(&mut self) {
+        // Best-effort: the volume is formatted whatever happens here, so a store left behind is
+        // named for whoever wants the space back rather than failing what already succeeded. The
+        // next volume creation clears it in any case.
+        match crate::sandbox::gc::force_remove_dir_all(&self.dir) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => crate::diag::error(&format!(
+                "sbx: cannot remove {}: {e} — it holds only the btrfs-progs that formatted the \
+                 volume",
+                self.dir.display()
+            )),
+            _ => {}
+        }
+    }
 }
 
 impl Mkfs {
@@ -1138,28 +1198,34 @@ impl Mkfs {
     }
 }
 
-/// The channel the provisioned `btrfs-progs` is built from: whatever the shared lock already
-/// records, and only failing that the default.
+/// The channel the provisioned `btrfs-progs` is built from: whatever the data directory's lock
+/// already records, and only failing that the default — pinned in the tool store's own lock.
 ///
-/// The lock this targets is `<data>/nixpkgs.lock`: what a launch naming no app resolves the base
-/// userland from, and the seed an app's own lock takes its first revision from — so the source
-/// handed to [`crate::store::LockTarget::global`] decides whether creating a volume *reads* that
-/// lock or *rewrites* it. Passing `None` names the default rolling channel, and
-/// a lock recording a global `nixpkgs` override then matches no longer: resolution falls through to
-/// the network and writes the default back over the user's pin, rolling the whole installation's
-/// channel for the sake of one helper binary. Reusing the recorded source keeps the resolution a
-/// lock hit — no network, no write — and builds the helper against the channel everything else on
-/// the host already uses. A fresh installation has no lock and is unchanged: it resolves the
-/// default, exactly as a first launch would.
-fn mkfs_lock_target(layout: &crate::store::Layout) -> crate::store::LockTarget {
-    let locked = crate::store::read_global_lock(layout).map(|(source, _)| source);
-    crate::store::LockTarget::global(layout, locked.as_deref())
+/// `<data>/nixpkgs.lock` is what a launch naming no app resolves the base userland from, and the
+/// seed an app's own lock takes its first revision from. The helper follows it without ever
+/// writing it: the target lives in `tools`, takes the source `data` records, and is seeded from
+/// `data`'s revision, so a lock that exists resolves without the network and builds the helper
+/// against the channel everything else on the host already uses. Passing `None` as the source
+/// would name the default rolling channel, which a lock recording a global `nixpkgs` override does
+/// not match: the seed would not apply, and the helper would come from another channel than the
+/// installation's. A fresh installation has no lock: the default is resolved into the tool store's
+/// lock alone, so creating a volume pins no channel for the data directory.
+fn mkfs_lock_target(
+    tools: &crate::store::Layout,
+    data: &crate::store::Layout,
+) -> crate::store::LockTarget {
+    let locked = crate::store::read_global_lock(data).map(|(source, _)| source);
+    crate::store::LockTarget::global(tools, locked.as_deref()).seeded_from_global(data)
 }
 
 /// Find `mkfs.btrfs`, provisioning it if the host has none.
 ///
 /// Only ever needed to *create* a volume. Using one needs no `btrfs` binary at all —
 /// compression rides an extended attribute and space accounting an ioctl.
+///
+/// A provisioned one is built into the [`ToolStore`], engines included, and goes with it. The
+/// data directory keeps only that store's lock file: its `store` is never touched, and its channel
+/// lock is read, never written.
 pub(crate) fn resolve_mkfs() -> Result<Mkfs, String> {
     // The host copy is a shortcut, so a match that fails the owner/mode check is not an error
     // here: it is skipped like any other, and nothing usable falls through to provisioning sbx's
@@ -1167,20 +1233,21 @@ pub(crate) fn resolve_mkfs() -> Result<Mkfs, String> {
     if let Some(host) = crate::store::find_trusted_on_path("mkfs.btrfs") {
         return Ok(Mkfs::Host(host));
     }
-    let layout = crate::store::Layout::from_env()
+    let data = crate::store::Layout::from_env()
         .ok_or_else(|| "cannot locate sbx's data directory".to_string())?;
+    // Owned from here, so every way out below removes what was provisioned so far.
+    let tools = ToolStore::claim(data.data_dir())
+        .map_err(|e| format!("cannot prepare a store for btrfs-progs: {e}"))?;
+    let layout = crate::store::Layout::tool_store(&tools.dir);
     let nix = crate::store::resolve_nix(Some(&layout))
         .ok_or_else(|| "no mkfs.btrfs on PATH, and no nix to provision one with".to_string())?;
     let bwrap = crate::store::resolve_bwrap(Some(&layout))
         .map(|c| c.path)
         .ok_or("no mkfs.btrfs on PATH, and no bubblewrap to run a provisioned one")?;
-    let nixpkgs = mkfs_lock_target(&layout)
+    let nixpkgs = mkfs_lock_target(&layout, &data)
         .resolve(&nix, &layout)
         .map_err(|e| format!("cannot resolve the nixpkgs channel: {e}"))?;
-    let gcroot = layout
-        .data_dir()
-        .join("gcroots/storage")
-        .join(crate::store::revision_of(&nixpkgs));
+    let gcroot = layout.data_dir().join("btrfs-progs");
     let logical = crate::store::provision(
         &nix,
         &layout,
@@ -1194,6 +1261,7 @@ pub(crate) fn resolve_mkfs() -> Result<Mkfs, String> {
         bwrap,
         store_nix: layout.store_dir().join("nix"),
         bin: logical.join("bin/mkfs.btrfs"),
+        _tools: tools,
     })
 }
 
@@ -1254,9 +1322,10 @@ pub(crate) fn mkfs_command(
             bwrap,
             store_nix,
             bin,
+            ..
         } => {
             use crate::sandbox::{Mount, NetPolicy, SandboxSpec};
-            // sbx's store at `/nix`, which backs the binary's interpreter, and a minimal root.
+            // The tool store at `/nix`, which backs the binary's interpreter, and a minimal root.
             let mut mounts = crate::sandbox::store_tool_mounts(store_nix);
             // The seed is read; the image's directory is written. Each is bound at its own
             // path so the arguments below stay valid inside.
@@ -2513,30 +2582,85 @@ this line has no separator at all
         assert!(has_been_offered(&dir));
     }
 
-    /// The `btrfs-progs` sbx provisions is built from the **shared** global lock, the one every
-    /// launch resolves the base userland from. Naming the default channel there when the lock
-    /// records an override makes resolution miss it and rewrite both its lines, rolling the
-    /// installation's channel off its pinned revision to create a volume. So the target adopts the
-    /// recorded source, which resolves straight out of the lock — no network, no write.
+    /// The `btrfs-progs` sbx provisions follows the data directory's channel without writing to it.
+    /// The tool store's own lock takes the source the data directory's lock records, which the
+    /// default rolling channel would not match on a lock recording an override, and takes its
+    /// revision too, so an existing lock resolves with no network. The data directory's lock is
+    /// read and never written: creating a volume moves no channel and leaves no trace there.
     #[test]
-    fn provisioning_mkfs_tracks_the_locked_channel_rather_than_the_default() {
+    fn provisioning_mkfs_follows_the_data_directory_channel_without_writing_to_it() {
         let base = crate::testutil::TmpDir::new();
-        let data = base.path().join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        let layout = crate::store::Layout::under(&data);
+        let data_dir = base.path().join("data");
+        let tools_dir = base.path().join("tools");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let data = crate::store::Layout::under(&data_dir);
+        let tools = crate::store::Layout::tool_store(&tools_dir);
         // A fresh installation has no lock and resolves the default, exactly as a first launch does.
-        assert_eq!(mkfs_lock_target(&layout).source(), "nixos-unstable");
+        assert_eq!(mkfs_lock_target(&tools, &data).source(), "nixos-unstable");
 
         let rev = "a".repeat(40);
-        let lock = data.join("nixpkgs.lock");
-        std::fs::write(&lock, format!("nixos-24.11\n{rev}\n")).unwrap();
-        let target = mkfs_lock_target(&layout);
+        let lock = data_dir.join("nixpkgs.lock");
+        let recorded = format!("nixos-24.11\n{rev}\n");
+        std::fs::write(&lock, &recorded).unwrap();
+        let target = mkfs_lock_target(&tools, &data);
         assert_eq!(target.source(), "nixos-24.11");
+        // A resolution that needed nix would fail on a path to nothing: this one reads the lock.
+        let resolved = target
+            .resolve(Path::new("/nonexistent-by-construction"), &tools)
+            .expect("resolved out of the data directory's lock, with no nix run");
+        assert_eq!(crate::store::revision_of(&resolved), rev);
         assert_eq!(
-            target.locked_revision().as_deref(),
-            Some(rev.as_str()),
-            "a target whose source matches the lock resolves out of it instead of rewriting it"
+            std::fs::read_to_string(&lock).unwrap(),
+            recorded,
+            "the data directory's lock was rewritten"
         );
+        let left: Vec<_> = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["nixpkgs.lock"],
+            "resolving wrote into the data directory"
+        );
+        assert!(
+            tools_dir.join("nixpkgs.lock").is_file(),
+            "the revision is pinned in the tool store's own lock"
+        );
+    }
+
+    /// The tool store lives under a name of sbx's own in the data directory, and is gone once the
+    /// format is done, read-only directories included, as a nix store leaves them. A claim also
+    /// clears what a run that did not finish left there, so nothing accumulates under the name.
+    #[test]
+    fn a_tool_store_is_cleared_when_claimed_and_removed_with_the_value_that_owns_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::testutil::TmpDir::new();
+        let data = base.path().join("sbx");
+        let store_shaped = |root: &Path| {
+            let pkg = root.join("store/nix/store/x-btrfs-progs/bin");
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(pkg.join("mkfs.btrfs"), b"payload").unwrap();
+            for dir in [pkg.as_path(), pkg.parent().unwrap()] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            }
+        };
+        let stale = data.join("storage-tools");
+        store_shaped(&stale);
+
+        let tools = ToolStore::claim(&data).expect("claimed");
+        assert_eq!(tools.dir, stale);
+        assert!(
+            stale.symlink_metadata().is_err(),
+            "a claim kept what an unfinished run left"
+        );
+        store_shaped(&tools.dir);
+        drop(tools);
+        assert!(
+            stale.symlink_metadata().is_err(),
+            "the tool store outlived the format it served"
+        );
+        drop(ToolStore::claim(&data).expect("claimed again"));
     }
 
     #[test]
@@ -2718,6 +2842,8 @@ this line has no separator at all
         };
         let image = Path::new("/data/vol/sbx-storage.btrfs");
         let seed = Path::new("/data/vol/sbx-storage.seed");
+        // Only what the caged command is built from is read; the tool store itself is never entered.
+        let base = crate::testutil::TmpDir::new();
 
         // The host's own tool runs uncaged: its whole argument list names no descriptor.
         let host = mkfs_command(
@@ -2750,6 +2876,7 @@ this line has no separator at all
                 bwrap: PathBuf::from("/e/bwrap"),
                 store_nix: PathBuf::from("/d/store/nix"),
                 bin: PathBuf::from("/nix/store/x-btrfs-progs/bin/mkfs.btrfs"),
+                _tools: ToolStore::claim(&base.path().join("sbx")).expect("claimed"),
             },
             image,
             seed,
