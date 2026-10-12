@@ -257,3 +257,21 @@ fn an_escaped_armor_line_in_the_message_does_not_end_it() {
     );
     assert_eq!(doc.signature, original.signature);
 }
+
+/// A signature packet ends with its signature: a byte after it, inside the packet, is refused.
+#[test]
+fn a_signature_packet_with_bytes_past_its_signature_is_refused() {
+    let doc = split_clearsigned(CLEARSIGNED).unwrap();
+    // The fixture's one packet, in the old framing with a two-byte length: grow the body by one byte
+    // and the length with it, so the packet still parses and only its tail differs.
+    let mut grown = doc.signature.clone();
+    assert_eq!(grown[0], 0x89, "the fixture's framing changed");
+    let len = u16::from_be_bytes([grown[1], grown[2]]) + 1;
+    grown[1..3].copy_from_slice(&len.to_be_bytes());
+    grown.push(0);
+    let err = parse_signature(&grown, &pinned())
+        .err()
+        .expect("a byte past the signature must be refused");
+    assert!(err.contains("past its signature"), "{err}");
+    assert!(parse_signature(&doc.signature, &pinned()).is_ok());
+}
