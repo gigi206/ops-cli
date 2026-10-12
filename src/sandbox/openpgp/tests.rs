@@ -275,3 +275,35 @@ fn a_signature_packet_with_bytes_past_its_signature_is_refused() {
     assert!(err.contains("past its signature"), "{err}");
     assert!(parse_signature(&doc.signature, &pinned()).is_ok());
 }
+
+/// A public-key packet ends with its exponent: a byte after it, inside the packet, is refused. The
+/// packets that follow it in a certificate (its user IDs) are other packets, and still read — the
+/// test above reads `KEY`, which carries them.
+#[test]
+fn a_key_packet_with_bytes_past_its_exponent_is_refused() {
+    let armored = |bytes: &[u8]| {
+        format!(
+            "{}\n\n{}\n-----END PGP PUBLIC KEY BLOCK-----\n",
+            KEY_ARMOR.0,
+            crate::config::base64_encode(bytes)
+        )
+    };
+    let bare = dearmor(KEY_BARE, KEY_ARMOR.0).unwrap();
+    // The bare key is one packet in the old framing with a two-byte length: grow the body by one
+    // byte and the length with it.
+    assert_eq!(bare[0], 0x99, "the fixture's framing changed");
+    let len = u16::from_be_bytes([bare[1], bare[2]]);
+    assert_eq!(
+        bare.len(),
+        3 + usize::from(len),
+        "the fixture holds one packet"
+    );
+    let mut grown = bare.clone();
+    grown[1..3].copy_from_slice(&(len + 1).to_be_bytes());
+    grown.push(0);
+    let err = parse_public_key(&armored(&grown))
+        .err()
+        .expect("a byte past the exponent must be refused");
+    assert!(err.contains("past its RSA exponent"), "{err}");
+    assert!(parse_public_key(&armored(&bare)).is_ok());
+}
