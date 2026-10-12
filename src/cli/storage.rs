@@ -501,6 +501,9 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
         Ok(p) => p,
         Err(e) => return fail(e),
     };
+    if let Some(refusal) = migrate_refusal(&dir, &mount_point) {
+        return fail(refusal);
+    }
     // Migrating into a volume that already holds a data directory would interleave two of
     // them. The pointer file is not data, so a previously-adopted volume can be re-migrated.
     let occupied = occupied_subtrees(&mount_point);
@@ -592,7 +595,7 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
     // directory while it ran keeps its records and writes there. Switched over, it would be out
     // of `sbx session ls`'s sight, writing into a tree about to be set aside. Nothing has changed
     // yet, so the volume is swept exactly as after a failed copy.
-    if let Some(refusal) = refuse_live(&dir) {
+    if let Some(refusal) = migrate_refusal(&dir, &mount_point) {
         let swept = volume_was_empty && clear_tree(&mount_point).is_ok();
         return fail(format!(
             "{refusal}\n       nothing was switched over; {} is untouched and still in use{}",
@@ -866,6 +869,30 @@ fn refuse_live(data_dir: &Path) -> Option<String> {
         )),
         Err(e) => Some(e),
     }
+}
+
+/// Why `migrate` must not copy the data directory `dir` into the volume mounted at `mount_point`
+/// now, or `None` when it may: a sandbox running from either side, or a registry that cannot say.
+///
+/// One running from `dir` writes into the source while it is copied. One running from the volume
+/// writes into the destination: it is still running after `sbx storage unuse`, which leaves
+/// sessions alone, or was started with `SBX_DATA_DIR` at the mount point. Its home is in the volume,
+/// so it could put a symbolic link where the copy is about to write, between the check that refuses
+/// one and the write ([`storage::copy_tree`]).
+///
+/// The volume's sandboxes get their own way out: `sbx session` reads the registry of the data
+/// directory sbx uses, which `migrate` requires to be the plain one, so it does not see them.
+fn migrate_refusal(dir: &Path, mount_point: &Path) -> Option<String> {
+    refuse_live(dir).or_else(|| match live_sessions_under(mount_point) {
+        Ok(0) => None,
+        Ok(live) => Some(format!(
+            "{live} session(s) are still running from the volume at {mp} — stop them first; \
+             `sbx session` reads {}, so name the volume: `SBX_DATA_DIR={mp} sbx session stop --all`",
+            dir.display(),
+            mp = mount_point.display()
+        )),
+        Err(e) => Some(e),
+    })
 }
 
 /// The image the volume pointer names, for a command that only reports. An unreadable pointer is
@@ -1417,6 +1444,47 @@ fn adopt_refusal(default_dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `migrate` refuses while a sandbox may run from the volume it copies into, not only from the
+    /// data directory it copies: one there writes into the destination during the copy. A registry
+    /// that cannot be read refuses, as it does for the data directory.
+    #[test]
+    fn migrate_refuses_while_a_sandbox_may_run_from_the_volume() {
+        let base = crate::testutil::TmpDir::new();
+        let (dir, volume) = (base.path().join("sbx"), base.path().join("volume"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&volume).unwrap();
+        assert_eq!(
+            migrate_refusal(&dir, &volume),
+            None,
+            "nothing runs from either"
+        );
+
+        // A sandbox running from the volume, this process standing in for it: the refusal names the
+        // way to reach it, which `sbx session` alone, reading the data directory, would not.
+        {
+            use crate::session::{Kind, Registry, Session, SessionRuntime};
+            let me = Session::current(PathBuf::from("/test"), Kind::Run, SessionRuntime::Project)
+                .expect("read this process's session identity");
+            let record = Registry::at(&volume)
+                .register(&me)
+                .expect("register the session");
+            let refusal = migrate_refusal(&dir, &volume).expect("a sandbox runs from the volume");
+            assert!(
+                refusal.contains(&format!("SBX_DATA_DIR={}", volume.display())),
+                "{refusal}"
+            );
+            std::fs::remove_file(record).unwrap();
+            std::fs::remove_dir_all(volume.join("sessions")).unwrap();
+        }
+
+        std::fs::write(volume.join("sessions"), b"").unwrap();
+        let refusal = migrate_refusal(&dir, &volume).expect("the volume's registry cannot be read");
+        assert!(
+            refusal.contains("session registry") && refusal.contains(&volume.display().to_string()),
+            "{refusal}"
+        );
+    }
 
     /// Every subcommand resolves its image through one function, so the check that the pointer file
     /// can name the path belongs there: `use` mounts the volume before it records it, and a refusal
