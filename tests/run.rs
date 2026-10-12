@@ -12,34 +12,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn sbx() -> Command {
-    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/sbx`: these e2es must not read the
-    // developer's global sbx config (imported app profiles, a global `[network]` posture), or a
-    // test's outcome would depend on the host. Default it to a fixed empty dir under the test
-    // tree — no run.rs test writes a global config there (the profile-import test sets its own
-    // XDG_CONFIG_HOME, which overrides this default), so a shared empty dir is race-free.
-    //
-    // The trust store is isolated the same way, for the same reason: a launch reads its verdict on
-    // the project's config from `$XDG_STATE_HOME/sbx/trusted`, so without this default every launch
-    // that names no state dir of its own would answer out of the developer's trust store. Nothing
-    // reaches this one to write it: a trust marker is written by `sbx trust`, by a rule-writing verb,
-    // by `sbx config set|edit --trust` and by a learning run, and every test that runs one passes its
-    // own `XDG_STATE_HOME` ([`sbx_session_in`]), which overrides this default.
-    let cfg = fixture_root().join("isolated-config");
-    let _ = std::fs::create_dir_all(&cfg);
-    let state = fixture_root().join("isolated-state");
-    let _ = std::fs::create_dir_all(&state);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
-    cmd.env("XDG_CONFIG_HOME", cfg).env("XDG_STATE_HOME", state);
-    // Pin a deterministic UTF-8 locale: the cage now honors the host locale, so a provisioned
-    // tool's output (e.g. GNU `hello`) would otherwise be translated on a non-English developer
-    // machine and break an assertion on its English text. `C.UTF-8` keeps messages English while
-    // staying UTF-8-clean, independent of the runner's own `LANG`.
-    cmd.env("LC_ALL", "C.UTF-8").env_remove("LANG");
-    cmd
+    // The global config and the trust store come from fixed empty directories under the test tree
+    // ([`common::isolated_sbx`]), shared by every test here. No run.rs test writes either of them:
+    // the profile-import test sets its own `XDG_CONFIG_HOME`, and a trust marker is written only by
+    // `sbx trust`, a rule-writing verb, `sbx config set|edit --trust` or a learning run, each of
+    // which passes its own `XDG_STATE_HOME` ([`sbx_session_in`]). Either overrides the default.
+    common::isolated_sbx("")
 }
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
 
 /// Kills and reaps a backgrounded child on drop, so a panicking assertion never leaks the running
 /// cage — a `TmpDir` cleans directories, not processes.
