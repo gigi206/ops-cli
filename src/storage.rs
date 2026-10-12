@@ -360,7 +360,8 @@ pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
 /// `Mapped file <path> as /dev/loop3.`
 pub(crate) fn parse_loop_setup(out: &str) -> Option<String> {
     let (_, tail) = out.rsplit_once(" as ")?;
-    Some(tail.trim().trim_end_matches('.').to_string())
+    let dev = tail.trim().trim_end_matches('.');
+    (!dev.is_empty()).then(|| dev.to_string())
 }
 
 /// Extract the mount point from `udisksctl mount` output, which reads
@@ -2072,6 +2073,14 @@ mod tests {
         );
         assert_eq!(parse_loop_setup("unexpected"), None);
         assert_eq!(parse_mount("unexpected"), None);
+        // A report that names nothing after its marker is no device: an empty name would reach
+        // `udisksctl mount -b` as one, and fail there with a message about a device lookup instead
+        // of the output that could not be read.
+        let named: Vec<_> = ["Mapped file /x as .\n", "Mapped file /x as \n"]
+            .into_iter()
+            .filter_map(|out| parse_loop_setup(out).map(|dev| format!("{out:?} → {dev:?}")))
+            .collect();
+        assert!(named.is_empty(), "{}", named.join("\n"));
     }
 
     #[test]
