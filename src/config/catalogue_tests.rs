@@ -196,6 +196,31 @@ fn no_shipped_profile_carries_a_key_sbx_does_not_know() {
     assert!(bundles >= 60, "only {bundles} bundles were read");
 }
 
+/// The command string the shell invocation `argv` runs, `argv[0]` being the shell: the first
+/// operand after its options, when one of them is `-c`, alone or in a cluster (`-lc`, `-ce`).
+///
+/// Read as the shell reads it, so an option between the shell and `-c` does not hide the script:
+/// `-o`/`+o`, `--rcfile` and `--init-file` take the next word as their argument, any other word
+/// opening on `-` or `+` is an option, and `--` ends them.
+fn shell_command_string(argv: &[String]) -> Option<&String> {
+    let mut words = argv.iter().skip(1);
+    let mut runs_a_string = false;
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--" => return words.next().filter(|_| runs_a_string),
+            "-o" | "+o" | "--rcfile" | "--init-file" => {
+                words.next();
+            }
+            option if option.starts_with("--") => {}
+            option if option.len() > 1 && (option.starts_with('-') || option.starts_with('+')) => {
+                runs_a_string |= option.starts_with('-') && option.contains('c');
+            }
+            _ => return runs_a_string.then_some(word),
+        }
+    }
+    None
+}
+
 /// Every shipped profile whose `cmd` is a shell script forwards `"$@"`.
 ///
 /// `sbx app run <name> -- <args>` is in the verb's own synopsis, and sbx honours it by appending
@@ -218,18 +243,16 @@ fn every_shipped_shell_profile_forwards_its_trailing_arguments() {
             Some(cmd) => cmd.into_argv(),
             None => continue,
         };
-        // The script is whatever follows a `-…c` flag that follows a shell. Anything else is a
-        // program, and its arguments are its own.
-        let script = argv.windows(2).position(|w| {
-            let is_shell = std::path::Path::new(&w[0])
-                .file_name()
-                .is_some_and(|s| SHELLS.iter().any(|k| s == *k));
-            let is_c_flag = w[1].strip_prefix('-').is_some_and(|rest| {
-                rest.ends_with('c') && rest.bytes().all(|b| b.is_ascii_lowercase())
-            });
-            is_shell && is_c_flag
-        });
-        let Some(i) = script.and_then(|i| argv.get(i + 2)) else {
+        // The script is the command string a shell in the argv runs. Anything else is a program,
+        // and its arguments are its own.
+        let script = (0..argv.len())
+            .filter(|&at| {
+                std::path::Path::new(&argv[at])
+                    .file_name()
+                    .is_some_and(|s| SHELLS.iter().any(|k| s == *k))
+            })
+            .find_map(|at| shell_command_string(&argv[at..]));
+        let Some(i) = script else {
             plain += 1;
             continue;
         };
@@ -2164,4 +2187,38 @@ fn the_shipped_files_are_every_toml_directly_under_the_directory_links_included(
     std::os::unix::fs::symlink(dir.join("b.toml"), dir.join("a.toml")).unwrap();
     let listed = toml_files_in(dir.path());
     assert_eq!(listed, vec![dir.join("a.toml"), dir.join("b.toml")]);
+}
+
+/// The script a shell runs is found past any option between the shell and `-c`, and a shell that
+/// runs a file, or is given no `-c`, runs no string.
+#[test]
+fn a_shells_command_string_is_found_past_its_other_options() {
+    let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+    for runs in [
+        &["bash", "-c", "s"][..],
+        &["bash", "-lc", "s"],
+        &["bash", "--login", "-c", "s"],
+        &["bash", "-l", "-c", "s"],
+        &["bash", "-o", "pipefail", "-c", "s"],
+        &["bash", "-ce", "s"],
+        &["bash", "--rcfile", "f", "-c", "s"],
+        &["bash", "-c", "--", "s"],
+    ] {
+        assert_eq!(
+            shell_command_string(&argv(runs)).map(String::as_str),
+            Some("s"),
+            "{runs:?}"
+        );
+    }
+    for runs_a_file in [
+        &["bash", "--", "s"][..],
+        &["bash", "script.sh"],
+        &["bash", "-l", "script.sh"],
+    ] {
+        assert_eq!(
+            shell_command_string(&argv(runs_a_file)),
+            None,
+            "{runs_a_file:?}"
+        );
+    }
 }
