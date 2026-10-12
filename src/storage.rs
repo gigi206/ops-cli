@@ -1056,6 +1056,7 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> io::Result<Cen
                 c.symlinks += 1;
             } else if meta.is_dir() {
                 // Writable for now: its contents still have to be written into it.
+                refuse_link_at(&d)?;
                 std::fs::create_dir_all(&d)?;
                 std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))?;
                 dir_modes.push((d.clone(), meta.mode() & 0o7777, Times::of(&meta)));
@@ -1075,6 +1076,7 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> io::Result<Cen
                     }
                     linked.insert(key, d.clone());
                 }
+                refuse_link_at(&d)?;
                 std::fs::copy(&s, &d)?;
                 set_mtime(&d, Times::of(&meta))?;
                 c.files += 1;
@@ -1094,6 +1096,30 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> io::Result<Cen
         set_mtime(&path, times)?;
     }
     Ok(c)
+}
+
+/// Refuse to write through `path` when a symbolic link stands there.
+///
+/// [`copy_tree`] may copy into a tree that is already there, which `sbx storage migrate --force`
+/// over an occupied volume does, and a directory created or a file written through a link lands
+/// wherever it points, the source's mode with it. A cage writes its project's home, which lives in
+/// the data directory, so a volume that once held one can carry such a link to anywhere the user
+/// can write. A directory already there is merged into and a file already there is overwritten, as
+/// that `--force` asks; only a link is refused. Checked just before the write rather than held
+/// across it: `sbx storage migrate` refuses to start the copy while a sandbox runs from the volume
+/// or from the data directory, and asks again before it switches over, so only a sandbox launched
+/// against the mount point while the copy runs could swap a link in between the two.
+fn refuse_link_at(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} is a symbolic link in the destination — refusing to copy through it",
+                path.display()
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// The two timestamps [`set_mtime`] carries across, held for an entry whose own date can only be
@@ -3293,6 +3319,76 @@ this line has no separator at all
                 .unwrap()
                 .is_symlink()
         );
+    }
+
+    /// Copying into a destination that already holds a tree, as `sbx storage migrate --force` does,
+    /// never follows a symbolic link standing where the copy writes. A cage writes its project's
+    /// home, which lives in the data directory, so a volume that once held one can carry a link
+    /// there to anywhere the user can write; followed, the copy would create directories and write
+    /// files there, and set the source's modes on them. A directory to be made in a link's place and
+    /// a file to be written through one are both refused.
+    #[test]
+    fn a_copy_never_writes_through_a_link_already_in_the_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::testutil::TmpDir::new();
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let victim = outside.join("victim");
+        std::fs::write(&victim, b"the host's").unwrap();
+
+        let mut wrong = Vec::new();
+        for (shape, entry, target) in [
+            ("a directory", "home/d", outside.clone()),
+            ("a file", "home/g", victim.clone()),
+        ] {
+            let src = base.path().join(format!("src-{}", entry.replace('/', "-")));
+            let dst = base.path().join(format!("dst-{}", entry.replace('/', "-")));
+            if shape == "a directory" {
+                std::fs::create_dir_all(src.join(entry)).unwrap();
+                std::fs::write(src.join(entry).join("f"), b"the cage's").unwrap();
+            } else {
+                std::fs::create_dir_all(src.join("home")).unwrap();
+                std::fs::write(src.join(entry), b"the cage's").unwrap();
+            }
+            std::fs::create_dir_all(dst.join("home")).unwrap();
+            std::os::unix::fs::symlink(&target, dst.join(entry)).unwrap();
+
+            let copied = copy_tree(&src, &dst, &[]);
+            if copied.is_ok() {
+                wrong.push(format!("{shape}: copied through the link"));
+            }
+        }
+        let mode = std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        if mode != 0o750 {
+            wrong.push(format!("the directory outside was set to {mode:o}"));
+        }
+        if outside.join("f").exists() {
+            wrong.push("a file was written outside".to_string());
+        }
+        if std::fs::read(&victim).unwrap() != b"the host's" {
+            wrong.push("the file outside was overwritten".to_string());
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// What `--force` over an occupied volume is for still holds: the copy merges into a directory
+    /// already there and overwrites a file already there.
+    #[test]
+    fn a_copy_merges_into_a_directory_and_over_a_file_already_in_the_destination() {
+        let base = crate::testutil::TmpDir::new();
+        let (src, dst) = (base.path().join("src"), base.path().join("dst"));
+        std::fs::create_dir_all(src.join("x")).unwrap();
+        std::fs::write(src.join("x/new"), b"new").unwrap();
+        std::fs::write(src.join("y"), b"new").unwrap();
+        std::fs::create_dir_all(dst.join("x")).unwrap();
+        std::fs::write(dst.join("x/old"), b"old").unwrap();
+        std::fs::write(dst.join("y"), b"old").unwrap();
+
+        copy_tree(&src, &dst, &[]).expect("merged");
+        assert_eq!(std::fs::read(dst.join("x/new")).unwrap(), b"new");
+        assert_eq!(std::fs::read(dst.join("x/old")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dst.join("y")).unwrap(), b"new");
     }
 
     #[test]
