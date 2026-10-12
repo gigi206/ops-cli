@@ -34,9 +34,12 @@ use std::process::ExitCode;
 /// Returns whether the sweep did what it set out to do: false when `<data>/projects/` cannot be
 /// read, or when a tree it was to remove is still there. Either is named on stderr and makes the
 /// verb fail, as a named tree's failure does.
+///
+/// `live_ids` is `None` when a preview could not read the session registry: the trees are still
+/// named, and none of them as free.
 fn reap_dead_trees(
     layout: &crate::store::Layout,
-    live_ids: &std::collections::BTreeSet<String>,
+    live_ids: Option<&std::collections::BTreeSet<String>>,
     dead: bool,
     markerless: bool,
     apply: bool,
@@ -46,10 +49,14 @@ fn reap_dead_trees(
     let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let projects_dir = layout.data_dir().join("projects");
     let reclaim = super::gc::Reclaim::for_layout(layout);
-    let report =
-        super::gc::reap_dead_projects(&projects_dir, live_ids, prune, prune_unidentified, &|dir| {
-            reclaim.bytes(dir)
-        });
+    let unread = std::collections::BTreeSet::new();
+    let report = super::gc::reap_dead_projects(
+        &projects_dir,
+        live_ids.unwrap_or(&unread),
+        prune,
+        prune_unidentified,
+        &|dir| reclaim.bytes(dir),
+    );
     let report = match report {
         Ok(report) => report,
         Err(e) => {
@@ -75,8 +82,10 @@ fn reap_dead_trees(
         // Done (green) when actually reclaimed; a dry-run "reclaimable" is dim (nothing changed).
         let verb = if prune {
             format!("{ok}reclaimed{r}")
-        } else {
+        } else if live_ids.is_some() {
             format!("{dim}reclaimable{r}")
+        } else {
+            format!("{warn}reclaimable unless a session holds it{r}")
         };
         outln!(
             "  {verb}: {n}{}{r} ({})",
@@ -91,13 +100,27 @@ fn reap_dead_trees(
                 report.dead.len(),
                 super::gc::human_bytes(freed)
             );
-        } else {
+        } else if live_ids.is_some() {
             outln!(
                 "{}",
                 crate::style::prose(
                     &format!(
                         "{h}sbx projects rm:{r} {} dead project tree(s) reclaimable (up to {}) — \
                          run `sbx projects rm --dead --yes` to reclaim.",
+                        report.dead.len(),
+                        super::gc::human_bytes(freed)
+                    ),
+                    pal
+                )
+            );
+        } else {
+            outln!(
+                "{}",
+                crate::style::prose(
+                    &format!(
+                        "{h}sbx projects rm:{r} {} dead project tree(s) reclaimable (up to {}), \
+                         less any a session holds — `sbx projects rm --dead --yes` refuses until \
+                         the session registry can be read.",
                         report.dead.len(),
                         super::gc::human_bytes(freed)
                     ),
@@ -131,7 +154,9 @@ fn reap_dead_trees(
     // hint adapts to whether the user is using the `--markerless` hatch — a dry run of it points
     // at the apply form, the default still points at a by-hand removal (the fail-closed stance).
     for tree in &report.unidentified {
-        let hint = if markerless {
+        let hint = if live_ids.is_none() {
+            "no session was ruled out: the session registry could not be read"
+        } else if markerless {
             "run `sbx projects rm --markerless --yes` to reclaim (no deadness proof)"
         } else {
             "remove by hand if unwanted"
@@ -790,7 +815,7 @@ pub(crate) fn projects_rm(
     force: bool,
     pal: &crate::style::Palette,
 ) -> ExitCode {
-    let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
+    let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let layout = match crate::layout_or_fail() {
         Ok(l) => l,
         Err(code) => return code,
@@ -803,9 +828,10 @@ pub(crate) fn projects_rm(
     //
     // Read for the applying form only. A preview deletes nothing, so it stays available on a host
     // whose registry cannot be read — which is where a user goes looking for what happened — and it
-    // says outright that it could not tell a held tree from a free one.
+    // says outright that it could not tell a held tree from a free one: `None`, and no tree it
+    // names is presented as free.
     let live_ids = match super::launch::session_housekeeping(&layout) {
-        Ok(ids) => ids,
+        Ok(ids) => Some(ids),
         Err(e) if apply => {
             crate::diag::error(&format!(
                 "sbx projects rm: cannot read the session registry ({e}) — refusing to remove, \
@@ -822,9 +848,10 @@ pub(crate) fn projects_rm(
                 "sbx projects rm: cannot read the session registry ({e}) — this preview cannot tell \
                  a tree a session holds from a free one."
             ));
-            std::collections::BTreeSet::new()
+            None
         }
     };
+    let unread = std::collections::BTreeSet::new();
     let current = crate::current_project_identity();
     let projects_dir = layout.data_dir().join("projects");
     // Probed once for every id named, before any removal: what each gives back is sized first.
@@ -879,7 +906,9 @@ pub(crate) fn projects_rm(
                 }
             }
         }
-        let live = held.as_ref().map_or(&live_ids, |(_, ids)| ids);
+        let live = held
+            .as_ref()
+            .map_or(live_ids.as_ref().unwrap_or(&unread), |(_, ids)| ids);
         match super::gc::reap_one(&projects_dir, id, live, apply, &|dir| reclaim.bytes(dir)) {
             super::gc::ReapOneOutcome::NotFound => {
                 crate::diag::error(&format!(
@@ -899,8 +928,10 @@ pub(crate) fn projects_rm(
             super::gc::ReapOneOutcome::Tree { dir, bytes } => {
                 let verb = if apply {
                     format!("{ok}removed{r}")
-                } else {
+                } else if live_ids.is_some() {
                     format!("{dim}removable{r}")
+                } else {
+                    format!("{warn}removable unless a session holds it{r}")
                 };
                 outln!(
                     "  {verb}: {n}{}{r} ({})",
@@ -908,17 +939,21 @@ pub(crate) fn projects_rm(
                     super::gc::human_bytes(bytes)
                 );
                 if !apply {
-                    outln!(
-                        "{}",
-                        crate::style::prose(
-                            &format!(
-                                "{h}sbx projects rm:{r} {n}{id}{r} removable ({}) — \
-                                 run `sbx projects rm {id}` (without `--dry-run`) to remove.",
-                                super::gc::human_bytes(bytes)
-                            ),
-                            pal
+                    let next = if live_ids.is_some() {
+                        format!(
+                            "{h}sbx projects rm:{r} {n}{id}{r} removable ({}) — \
+                             run `sbx projects rm {id}` (without `--dry-run`) to remove.",
+                            super::gc::human_bytes(bytes)
                         )
-                    );
+                    } else {
+                        format!(
+                            "{h}sbx projects rm:{r} {n}{id}{r} removable ({}) unless a session \
+                             holds it — `sbx projects rm {id}` refuses until the session registry \
+                             can be read.",
+                            super::gc::human_bytes(bytes)
+                        )
+                    };
+                    outln!("{}", crate::style::prose(&next, pal));
                 }
             }
             // A recursive delete fails on a tree holding a mount point or a subdirectory another
@@ -937,7 +972,9 @@ pub(crate) fn projects_rm(
         }
     }
 
-    if (dead || markerless) && !reap_dead_trees(&layout, &live_ids, dead, markerless, apply, pal) {
+    if (dead || markerless)
+        && !reap_dead_trees(&layout, live_ids.as_ref(), dead, markerless, apply, pal)
+    {
         had_error = true;
     }
 
