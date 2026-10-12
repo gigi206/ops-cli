@@ -702,11 +702,25 @@ fn device_factor(flags: u64) -> u64 {
 /// `entries` is the ioctl's payload with its header already stripped. A trailing partial entry
 /// cannot occur — the buffer is sized from the kernel's own count — and is dropped rather than
 /// read out of a half-written slot.
-fn tally(entries: &[u8]) -> Space {
+///
+/// Figures whose device-side sum does not fit a `u64` are refused rather than summed. They cannot
+/// describe a filesystem over one loop image, and plain arithmetic panics on them in every build,
+/// the shipped one keeping overflow checks on, so `sbx storage status` and `sbx store` would end
+/// mid-report. Saturating instead would report `u64::MAX` bytes in use, a figure that means
+/// nothing; an error is what both callers of [`space`] already show as a figure they could not
+/// read.
+fn tally(entries: &[u8]) -> io::Result<Space> {
     // A reservation btrfs holds back *within* the metadata it has already claimed, reported
     // alongside the block groups rather than as one. Adding it would count those bytes twice.
     const GLOBAL_RSV: u64 = 1 << 49;
     const DATA: u64 = 1 << 0;
+    let overflow = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the btrfs space ioctl reported block groups whose device-side sizes do not fit a 64-bit \
+             count",
+        )
+    };
 
     let mut space = Space::default();
     #[expect(
@@ -720,14 +734,20 @@ fn tally(entries: &[u8]) -> Space {
             continue;
         }
         let factor = device_factor(flags);
-        space.allocated += u64::from_ne_bytes(e[8..16].try_into().unwrap()) * factor;
-        let used = u64::from_ne_bytes(e[16..24].try_into().unwrap()) * factor;
-        space.used += used;
+        let total = u64::from_ne_bytes(e[8..16].try_into().unwrap())
+            .checked_mul(factor)
+            .ok_or_else(overflow)?;
+        space.allocated = space.allocated.checked_add(total).ok_or_else(overflow)?;
+        let used = u64::from_ne_bytes(e[16..24].try_into().unwrap())
+            .checked_mul(factor)
+            .ok_or_else(overflow)?;
+        space.used = space.used.checked_add(used).ok_or_else(overflow)?;
         if flags & DATA != 0 {
+            // Within `used`, whose sum was just checked: a part of it cannot overflow.
             space.data_used += used;
         }
     }
-    space
+    Ok(space)
 }
 
 /// Bytes the image carries on the host beyond the data alive inside it.
@@ -835,7 +855,7 @@ pub(crate) fn space(mount_point: &Path) -> io::Result<Space> {
     )]
     let got = u64::from_ne_bytes(buf[8..16].try_into().unwrap()) as usize;
 
-    Ok(tally(&buf[HEADER..HEADER + got.min(count) * ENTRY]))
+    tally(&buf[HEADER..HEADER + got.min(count) * ENTRY])
 }
 
 /// Whether the kernel has discard work queued for the volume, and how much it has listed.
@@ -2460,7 +2480,7 @@ this line has no separator at all
         // Reported beside the block groups, but held back inside metadata already claimed above.
         entries.extend(block_group(GLOBAL_RSV, 51_953_664, 0));
 
-        let space = tally(&entries);
+        let space = tally(&entries).expect("figures that fit");
         assert_eq!(space.used, 12_645_679_104 + 1_944_616_960 + 32_768);
         assert_eq!(space.allocated, 17_179_869_184 + 4_294_967_296 + 16_777_216);
         assert_eq!(
@@ -2477,11 +2497,46 @@ this line has no separator at all
         let mut ragged = block_group(DATA, 4096, 4096);
         ragged.extend_from_slice(&[0u8; ENTRY - 1]);
         assert_eq!(
-            tally(&ragged).allocated,
+            tally(&ragged).expect("figures that fit").allocated,
             4096,
             "the partial entry is dropped"
         );
-        assert_eq!(tally(&[]).allocated, 0);
+        assert_eq!(tally(&[]).expect("nothing to sum").allocated, 0);
+    }
+
+    /// The block groups' figures are the kernel's, and their device-side sum must fit a `u64`: one
+    /// that does not is refused rather than summed into a panic or a figure that means nothing, a
+    /// mirrored group's doubled total or used bytes and two groups' sums alike.
+    #[test]
+    fn block_groups_that_sum_past_a_u64_are_refused() {
+        const DATA: u64 = 1 << 0;
+        const METADATA: u64 = 1 << 2;
+        const DUP: u64 = 1 << 5;
+        let half = u64::MAX / 2 + 1;
+        let mut wrong = Vec::new();
+        for (shape, entries) in [
+            ("a mirrored total", block_group(DUP, half, 0)),
+            ("a mirrored used", block_group(DUP, 0, half)),
+            (
+                "two totals",
+                [block_group(DATA, half, 0), block_group(DATA, half, 0)].concat(),
+            ),
+            (
+                // Metadata, so the sum checked is `used` itself and not the data part within it.
+                "two used",
+                [
+                    block_group(METADATA, 0, half),
+                    block_group(METADATA, 0, half),
+                ]
+                .concat(),
+            ),
+        ] {
+            match tally(&entries) {
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => {}
+                other => wrong.push(format!("{shape}: {other:?}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// The number of block groups is the kernel's, and the buffer the second ioctl writes into is
