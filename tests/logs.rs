@@ -26,23 +26,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-/// Write the session record the `logs` views resolve, pointing at a live `pid`. The on-disk format
-/// is stable, and fabricating it isolates the view under test from the registration machinery.
-fn write_session_record(data: &Path, pid: u32, project: &Path) {
-    use std::os::unix::ffi::OsStrExt;
-    let start = common::start_ticks(pid);
-    let dir = data.join("sbx").join("sessions");
-    std::fs::create_dir_all(&dir).unwrap();
-    let hex: String = project
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let rec = format!("kind=run\npid={pid}\nstart={start}\nruntime=project\nproject={hex}\n");
-    std::fs::write(dir.join(format!("{pid}-{start}")), rec).unwrap();
-}
-
 /// The commands a stand-in socket was asked, in order — how a test sees the cursor the view walked.
 type Asked = Arc<Mutex<Vec<String>>>;
 
@@ -224,7 +207,7 @@ fn read_feed(data: &Path, args: &[&str]) -> String {
 fn the_filesystem_lens_reads_its_own_socket_and_renders_its_own_rows() {
     let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
     let child = Standin::new();
-    write_session_record(data.path(), child.pid(), project.path());
+    common::write_session_record(data.path(), child.pid(), "project", project.path());
     serve_lens(
         data.path(),
         "fs",
@@ -267,7 +250,7 @@ fn the_filesystem_lens_reads_its_own_socket_and_renders_its_own_rows() {
 fn the_process_lens_reads_its_own_socket_and_renders_its_own_rows() {
     let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
     let child = Standin::new();
-    write_session_record(data.path(), child.pid(), project.path());
+    common::write_session_record(data.path(), child.pid(), "project", project.path());
     serve_lens(
         data.path(),
         "proc",
@@ -298,7 +281,7 @@ fn the_process_lens_reads_its_own_socket_and_renders_its_own_rows() {
 fn the_ssh_agent_lens_reads_its_own_socket_and_renders_its_own_rows() {
     let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
     let child = Standin::new();
-    write_session_record(data.path(), child.pid(), project.path());
+    common::write_session_record(data.path(), child.pid(), "project", project.path());
     serve_lens(
         data.path(),
         "ssh-agent",
@@ -337,7 +320,7 @@ fn the_ssh_agent_lens_reads_its_own_socket_and_renders_its_own_rows() {
 fn a_follow_walks_its_cursor_reports_the_gap_and_stops_when_the_session_ends() {
     let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
     let child = Standin::new();
-    write_session_record(data.path(), child.pid(), project.path());
+    common::write_session_record(data.path(), child.pid(), "project", project.path());
     let asked = serve_script(
         data.path(),
         "fs",
@@ -385,7 +368,7 @@ fn a_follow_names_a_session_each_time_it_stops_answering() {
     ] {
         let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
         let child = Standin::new();
-        write_session_record(data.path(), child.pid(), project.path());
+        common::write_session_record(data.path(), child.pid(), "project", project.path());
         let asked = serve_turns(
             data.path(),
             "fs",
@@ -445,7 +428,7 @@ fn a_merged_follow_asks_again_a_feed_that_did_not_answer_at_first() {
         let data = dir.path();
         let standin = Standin::new();
         let pid = standin.pid();
-        write_session_record(data, pid, Path::new("/tmp/demo-app"));
+        common::write_session_record(data, pid, "project", Path::new("/tmp/demo-app"));
         serve_script(
             data,
             "fs",
@@ -609,7 +592,7 @@ fn a_feed_that_answers_without_a_cursor_is_still_a_recording_session() {
     let data = dir.path();
     let standin = Standin::new();
     let pid = standin.pid();
-    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    common::write_session_record(data, pid, "project", Path::new("/tmp/demo-app"));
     // Nothing else bound: every other feed fails its connect, exactly as on a session that
     // recorded only its declared operations.
     serve_task_without_a_cursor(
@@ -646,7 +629,7 @@ fn a_feed_whose_answer_is_cut_short_is_named_and_shows_nothing() {
     let data = dir.path();
     let standin = Standin::new();
     let pid = standin.pid();
-    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    common::write_session_record(data, pid, "project", Path::new("/tmp/demo-app"));
     serve_lens(
         data,
         "fs",
@@ -706,7 +689,7 @@ fn a_feed_whose_session_refuses_the_reader_is_named_as_unanswered() {
     let data = dir.path();
     let standin = Standin::new();
     let pid = standin.pid();
-    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    common::write_session_record(data, pid, "project", Path::new("/tmp/demo-app"));
     serve_lens(
         data,
         "fs",
@@ -754,7 +737,7 @@ fn a_listing_across_sessions_names_a_session_that_did_not_answer() {
     let standin = Standin::new();
     let pid = standin.pid();
     let project = std::fs::canonicalize(project.path()).expect("canonical project");
-    write_session_record(data.path(), pid, &project);
+    common::write_session_record(data.path(), pid, "project", &project);
     // The exec supervisor refuses the reader; the egress plane cuts its answer after one line.
     serve_refusal(data.path(), "proc", pid);
     serve_reply(data.path(), "egress", pid, "head=1\n".into());
@@ -818,7 +801,7 @@ fn a_live_snapshot_names_a_session_that_did_not_answer() {
     let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
     let standin = Standin::new();
     let pid = standin.pid();
-    write_session_record(data.path(), pid, project.path());
+    common::write_session_record(data.path(), pid, "project", project.path());
     serve_refusal(data.path(), "egress", pid);
 
     let first_snapshot = |args: &[&str]| {
@@ -866,7 +849,7 @@ fn an_egress_follow_names_a_session_each_time_it_stops_answering() {
     let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
     let standin = Standin::new();
     let pid = standin.pid();
-    write_session_record(data.path(), pid, project.path());
+    common::write_session_record(data.path(), pid, "project", project.path());
     let asked = serve_turns(
         data.path(),
         "egress",
@@ -962,7 +945,7 @@ fn the_merged_view_orders_every_feed_by_when_it_happened() {
     let data = dir.path();
     let standin = Standin::new();
     let pid = standin.pid();
-    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    common::write_session_record(data, pid, "project", Path::new("/tmp/demo-app"));
 
     serve_lens(
         data,
@@ -1055,7 +1038,7 @@ fn the_unified_feed_drops_a_reason_that_only_repeats_its_verdict() {
     let data = dir.path();
     let standin = Standin::new();
     let pid = standin.pid();
-    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    common::write_session_record(data, pid, "project", Path::new("/tmp/demo-app"));
     serve_lens(
         data,
         "egress",
@@ -1094,7 +1077,7 @@ fn the_broker_feed_shows_every_broker_of_one_session() {
     let data = dir.path();
     let standin = Standin::new();
     let pid = standin.pid();
-    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    common::write_session_record(data, pid, "project", Path::new("/tmp/demo-app"));
     serve_lens(
         data,
         "broker",
@@ -1124,7 +1107,7 @@ fn the_merged_view_narrows_by_feed_and_refuses_a_name_no_feed_answers_to() {
     let data = dir.path();
     let standin = Standin::new();
     let pid = standin.pid();
-    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    common::write_session_record(data, pid, "project", Path::new("/tmp/demo-app"));
     serve_lens(
         data,
         "fs",
@@ -1167,7 +1150,7 @@ fn the_merged_view_refuses_a_session_that_records_nothing() {
     let data = dir.path();
     let standin = Standin::new();
     let pid = standin.pid();
-    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    common::write_session_record(data, pid, "project", Path::new("/tmp/demo-app"));
 
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(["logs", &pid.to_string()])
@@ -1264,7 +1247,7 @@ fn with_no_id_a_neighbouring_projects_live_session_does_not_hide_this_projects_r
 
     // A live session, belonging to another project entirely.
     let standin = Standin::new();
-    write_session_record(data, standin.pid(), Path::new("/tmp/demo-app"));
+    common::write_session_record(data, standin.pid(), "project", Path::new("/tmp/demo-app"));
 
     // A finished session of the project the reader is standing in.
     let lens_dir = data.join("sbx").join("broker");
