@@ -45,6 +45,12 @@ fn reap_dead_trees(
     apply: bool,
     pal: &crate::style::Palette,
 ) -> bool {
+    // The empty set passed below in place of an unread registry is safe only because nothing is
+    // removed: `projects_rm` refuses an applied sweep without the registry before it gets here.
+    debug_assert!(
+        live_ids.is_some() || !apply,
+        "an applied sweep reached the reap without the session registry"
+    );
     let (prune, prune_unidentified) = (apply && dead, apply && markerless);
     let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let projects_dir = layout.data_dir().join("projects");
