@@ -517,8 +517,8 @@ fn the_cage_runs_from_a_writable_per_project_store_seeded_with_the_base_closure(
 /// asserted **absent before** and **present after**, so a successful build can only
 /// be a real local build from the seeded bash+coreutils. nix needs *no* sbx-supplied
 /// configuration: its compiled defaults resolve the store to the local `/nix` and
-/// build there. The teeth: a sibling derivation whose only input is a package realised
-/// into the shared store but **left out of the seed** must *fail* offline — proving
+/// build there. The teeth: a sibling derivation that differs only by naming a package
+/// realised into the shared store but **left out of the seed** must *fail* offline — proving
 /// "present" means "seeded", and the shared store is genuinely absent from the cage.
 #[test]
 fn the_cage_builds_a_fresh_derivation_offline_from_the_seeded_base() {
@@ -577,30 +577,30 @@ fn the_cage_builds_a_fresh_derivation_offline_from_the_seeded_base() {
     )
     .expect("seed the per-project store");
 
-    // the reuse derivation: build closure is bash + coreutils only, both seeded.
-    // `builtins.storePath` validates them against the per-project store's own DB, so
-    // a successful build proves the seeded store (paths AND database) is sufficient.
+    // Both derivations are one text and differ only in the input it names. The builder is the
+    // seeded bash and coreutils, which produce the output whatever that input is, so the reuse
+    // build succeeding is what shows the discriminant would succeed too, were its input present.
+    // `builtins.storePath` validates every path against the per-project store's own DB, so a
+    // successful build proves the seeded store (paths AND database) is sufficient.
     let bash_store = userland.shell_bin.parent().unwrap().parent().unwrap();
     let cu_store = userland.bin_paths[1].parent().unwrap();
-    let reuse = proj.join("reuse.nix");
-    std::fs::write(
-        &reuse,
-        r#"let b = builtins.storePath "@BASH@"; c = builtins.storePath "@CU@"; in derivation { name = "sbx-reuse-proof"; system = builtins.currentSystem; builder = "${b}/bin/bash"; args = ["-c" "${c}/bin/mkdir -p $out; ${c}/bin/echo ok > $out/result"]; }"#
+    let derivation = |name: &str, input: &Path| {
+        r#"let b = builtins.storePath "@BASH@"; c = builtins.storePath "@CU@"; x = builtins.storePath "@INPUT@"; in derivation { name = "@NAME@"; system = builtins.currentSystem; builder = "${b}/bin/bash"; args = ["-c" ": ${x}; ${c}/bin/mkdir -p $out; ${c}/bin/echo ok > $out/result"]; }"#
             .replace("@BASH@", &bash_store.to_string_lossy())
-            .replace("@CU@", &cu_store.to_string_lossy()),
-    )
-    .unwrap();
-    // the discriminant: its only input is hello, which is in the shared store but not
-    // in the seed — `builtins.storePath` against the per-project store rejects it, so
-    // the build fails offline. That a *seeded* path succeeds while this one fails
-    // proves the cage runs from the seed, not from the shared store at large.
+            .replace("@CU@", &cu_store.to_string_lossy())
+            .replace("@INPUT@", &input.to_string_lossy())
+            .replace("@NAME@", name)
+    };
+    // the reuse derivation names coreutils, so its build closure is bash + coreutils only,
+    // both seeded.
+    let reuse = proj.join("reuse.nix");
+    std::fs::write(&reuse, derivation("sbx-reuse-proof", cu_store)).unwrap();
+    // the discriminant names hello, which is in the shared store but not in the seed —
+    // `builtins.storePath` against the per-project store rejects it, so the build fails
+    // offline. That a *seeded* input succeeds while this one fails proves the cage runs
+    // from the seed, not from the shared store at large.
     let discriminant = proj.join("discriminant.nix");
-    std::fs::write(
-        &discriminant,
-        r#"let j = builtins.storePath "@HELLO@"; in derivation { name = "sbx-discriminant"; system = builtins.currentSystem; builder = "${j}/bin/hello"; args = []; }"#
-            .replace("@HELLO@", &hello.to_string_lossy()),
-    )
-    .unwrap();
+    std::fs::write(&discriminant, derivation("sbx-discriminant", &hello)).unwrap();
 
     // The agent's commands. nix is invoked by name (cage PATH), with substituters
     // emptied so nothing can be fetched. Pre/post existence of the reuse output is
@@ -711,7 +711,7 @@ fn the_cage_builds_a_fresh_derivation_offline_from_the_seeded_base() {
     assert_ne!(
         marker("DISC_EXIT"),
         "0",
-        "a build whose only input is unseeded succeeded offline — the cage is not running from the seed alone"
+        "a build naming an input left out of the seed succeeded offline — the cage is not running from the seed alone"
     );
 
     // the shared store is byte-identical: the in-cage build could not reach it
