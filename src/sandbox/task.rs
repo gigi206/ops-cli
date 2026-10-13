@@ -94,8 +94,8 @@ const TASK_OUT_LOCKS: &str = "task-out.locks";
 /// unsweepable is how a data directory grows without bound.
 static TASK_INVOCATION: AtomicU64 = AtomicU64::new(1);
 
-/// Draw the next invocation id. Taken by the caller that admits the invocation, not by [`TaskEngine::run`]
-/// itself, so that a request refused *after* admission still carries the id its refusal is recorded
+/// Draw the next invocation id. Taken by the caller that admits the invocation rather than by the
+/// engine, so that a request refused *after* admission still carries the id its refusal is recorded
 /// under — there is one number per admitted invocation whether or not a command ever ran.
 pub(crate) fn next_invocation() -> u64 {
     TASK_INVOCATION.fetch_add(1, Ordering::Relaxed)
@@ -653,6 +653,10 @@ impl TaskEngine {
     /// `invocation` is drawn by the caller that admitted this run ([`next_invocation`]), not here:
     /// it is the id the refusal would be recorded under too, and a number the engine drew privately
     /// could not be one.
+    ///
+    /// Only tests call it whole. The plane calls [`Self::admit`] and [`Self::run_admitted`] itself,
+    /// so that it records the run in its log while the invocation's registration is still held.
+    #[cfg(test)]
     pub(crate) fn run(
         &self,
         name: &str,

@@ -1145,14 +1145,29 @@ fn serve_run(
         return Ok(());
     };
 
-    match engine.run(name, &params, &env, id) {
+    // The registry entry is held here until the log records the run, for the reason
+    // [`serve_detach`] holds it until the result is stored: released when the run returns, the
+    // invocation reads as neither running nor recorded until its line lands, and `RESULT`, `INFO`
+    // and `STOP` — which read the registry first and the log second — each answer that there is
+    // no such invocation. It goes before the answer is written, so a caller slow to read it does
+    // not keep the invocation listed as running.
+    let (ran, live) = match engine.admit(name, &params, &env, id, false) {
+        Ok(mut admitted) => {
+            let live = admitted.hold_registration();
+            (engine.run_admitted(name, admitted), live)
+        }
+        Err(e) => (Err(e), None),
+    };
+    match ran {
         Ok(outcome) => {
             log.push(finished(id, name, &outcome, false));
+            drop(live);
             write_outcome(writer, id, &outcome)
         }
         Err(e) => {
             let reason = e.to_string();
             log.push(refusal(id, name, &reason));
+            drop(live);
             // The id first, then the refusal: this request was admitted, so it *has* an invocation,
             // and the log records the refusal under that number. Without it a caller could not find
             // its own refusal in `sbx task logs`. It precedes `err` because that line ends the
