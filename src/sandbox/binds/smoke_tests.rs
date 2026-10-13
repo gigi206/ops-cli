@@ -604,7 +604,8 @@ fn the_cage_builds_a_fresh_derivation_offline_from_the_seeded_base() {
 
     // The agent's commands. nix is invoked by name (cage PATH), with substituters
     // emptied so nothing can be fetched. Pre/post existence of the reuse output is
-    // probed against the cage's own store (`/nix` = the per-project store).
+    // probed against the cage's own store (`/nix` = the per-project store). The builds'
+    // diagnostics go to the test's stderr, which the assertions on their exits carry.
     let script = format!(
         "set +e\n\
          command -v nix-build > /dev/null && echo 'NIX_ON_PATH=yes' || echo 'NIX_ON_PATH=no'\n\
@@ -612,11 +613,11 @@ fn the_cage_builds_a_fresh_derivation_offline_from_the_seeded_base() {
          outp=$(nix-store -q --outputs \"$drv\" 2>/dev/null)\n\
          echo \"OUTPATH=$outp\"\n\
          if [ -e \"$outp\" ]; then echo PRE=present; else echo PRE=absent; fi\n\
-         nix-build --no-out-link --option substituters '' --option builders '' {reuse} > /dev/null 2>&1\n\
+         nix-build --no-out-link --option substituters '' --option builders '' {reuse} 1>&2\n\
          echo \"REUSE_EXIT=$?\"\n\
          if [ -e \"$outp\" ]; then echo POST=present; else echo POST=absent; fi\n\
          echo \"RESULT=$(cat \"$outp/result\" 2>/dev/null)\"\n\
-         nix-build --no-out-link --option substituters '' --option builders '' {disc} > /dev/null 2>&1\n\
+         nix-build --no-out-link --option substituters '' --option builders '' {disc} 1>&2\n\
          echo \"DISC_EXIT=$?\"\n",
         reuse = reuse.display(),
         disc = discriminant.display(),
@@ -687,7 +688,12 @@ fn the_cage_builds_a_fresh_derivation_offline_from_the_seeded_base() {
     );
     // the reuse output was absent before and present after — a genuine fresh build
     assert_eq!(marker("PRE"), "absent", "the reuse output pre-existed");
-    assert_eq!(marker("REUSE_EXIT"), "0", "the offline reuse build failed");
+    assert_eq!(
+        marker("REUSE_EXIT"),
+        "0",
+        "the offline reuse build failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(
         marker("POST"),
         "present",
@@ -711,7 +717,8 @@ fn the_cage_builds_a_fresh_derivation_offline_from_the_seeded_base() {
     assert_ne!(
         marker("DISC_EXIT"),
         "0",
-        "a build naming an input left out of the seed succeeded offline — the cage is not running from the seed alone"
+        "a build naming an input left out of the seed succeeded offline — the cage is not running from the seed alone:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 
     // the shared store is byte-identical: the in-cage build could not reach it
