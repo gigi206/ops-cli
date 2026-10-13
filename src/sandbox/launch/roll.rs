@@ -263,25 +263,16 @@ pub(crate) fn upgrade_mise_packages(
     // The declared operations' own tool pool rolls here too: it is filled by `mise use -g`, which
     // records a spec the launch then short-circuits on, so without this pass a pool tool would be
     // frozen at whatever the first fill resolved.
-    let pool_tokens: Vec<String> = cfg
-        .tasks
-        .iter()
-        .flat_map(|t| t.packages.iter().cloned())
-        .fold(Vec::new(), |mut acc, t| {
-            if !acc.contains(&t) {
-                acc.push(t);
-            }
-            acc
-        });
+    let pool = rolls_task_pool(cfg, only);
 
-    if groups.is_empty() && pool_tokens.is_empty() {
+    if groups.is_empty() && !pool {
         if withheld == 0 {
             outln!("  {dim}no mise: packages to roll.{r}");
         }
         return true;
     }
     if !mode.applies() {
-        return check_mise_packages(cwd, groups, !pool_tokens.is_empty(), pal);
+        return check_mise_packages(cwd, groups, pool, pal);
     }
 
     // Only now, with something to roll, take on the sandbox prerequisites — against `cwd`, the
@@ -484,7 +475,7 @@ pub(crate) fn upgrade_mise_packages(
 
     // The task tool pool, rolled host-side rather than in a cage (that is where it is filled). Its
     // own line, because it belongs to the declared operations, not to any app.
-    if !pool_tokens.is_empty() {
+    if pool {
         // Counted into the same tallies the apps use, so the closing recap can never read
         // "nothing to roll" one line under a pool that rolled.
         match roll_task_pool(cwd, &mut prep, cfg) {
@@ -1117,6 +1108,17 @@ fn provision_roll_recap(ran: &[String], skipped: usize, failed: usize, force: bo
         parts.push(format!("{failed} failed"));
     }
     parts.join(" · ")
+}
+
+/// Whether a roll covers the declared operations' tool pool: only one that is project-wide, and
+/// only when a task declares a tool. The pool belongs to the project's declared operations rather
+/// than to any app, so a roll narrowed to one app leaves it alone, as it leaves the project
+/// baseline ([`mise_package_groups`]) and, upstream, the engine and the project's `nix:` tools.
+///
+/// Which tools the pool holds is not decided here: the roll asks the task engine, which lists them
+/// the way the launch that filled the pool did.
+fn rolls_task_pool(cfg: &crate::config::Resolved, only: Option<&str>) -> bool {
+    only.is_none() && cfg.tasks.iter().any(|task| !task.packages.is_empty())
 }
 
 /// Roll the declared operations' tool pool forward. Returns whether anything was rolled, or the

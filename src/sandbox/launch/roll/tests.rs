@@ -428,6 +428,27 @@ fn mise_package_groups_covers_the_baseline_and_each_app_generically() {
     );
 }
 
+/// The declared operations' tool pool is the project's: a roll narrowed to one app leaves it alone,
+/// as it leaves the project baseline, and a project whose tasks declare no tool has none to roll.
+#[test]
+fn the_task_pool_rolls_only_project_wide_and_only_when_a_task_declares_a_tool() {
+    let mut cfg = crate::testutil::resolved_channels(None, None);
+    let mut task = crate::testutil::task_spec();
+    cfg.tasks = vec![task.clone()];
+    assert!(!rolls_task_pool(&cfg, None), "no task declares a tool");
+
+    task.packages = vec!["jq".to_string()];
+    cfg.tasks = vec![task];
+    assert!(
+        rolls_task_pool(&cfg, None),
+        "a project-wide roll covers the pool"
+    );
+    assert!(
+        !rolls_task_pool(&cfg, Some("demo-app")),
+        "a roll narrowed to one app must not roll the project's task pool"
+    );
+}
+
 /// The roll report's pool line must quote whichever stream carried the diagnostic.
 ///
 /// mise wraps backends (`npm`, `pipx`) that report a resolution failure on stdout while mise's own
