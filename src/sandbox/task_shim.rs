@@ -361,12 +361,15 @@ run_task() {{
         fi
     fi
 
-    # The plane writes an integer here; anything else means a response this client cannot trust, so
-    # it reports success rather than passing a word to `exit`. The clamp matches the host's: a
-    # process returns one byte.
-    [ "$code" -eq "$code" ] 2>/dev/null || code=0
-    [ "$code" -lt 0 ] && code=0
-    [ "$code" -gt 255 ] && code=255
+    # The plane writes the command's code here, which a process returns as one byte. A code no
+    # process returns (not a run of digits, or one past 255) is a failure, never success: the rule
+    # of the host's `exit_byte`, so a response this client cannot trust does not read as a command
+    # that worked. The range is tested only once the value is digits, and a test the shell cannot
+    # make on a number too long for it fails the same way.
+    case $code in
+        '' | *[!0-9]*) code=1 ;;
+    esac
+    [ "$code" -le 255 ] 2>/dev/null || code=1
     exit "$code"
 }}
 
@@ -738,6 +741,26 @@ mod tests {
             let (code, _, err) = run_client(&client, &["task", "run", "build"]);
             if code != 1 || !err.contains(says) {
                 wrong.push(format!("{shape}: exit {code}, {err}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The code a run exits with follows the host's rule ([`crate::cli::task::exit_byte`]) for any
+    /// value the plane's `exit` line could carry: the expected code is the host's own answer for the
+    /// same line, so the two ends cannot drift apart unseen. A value no process returns is a
+    /// failure, never success. Every value is asked before anything is asserted.
+    #[test]
+    fn a_runs_exit_code_follows_the_hosts_rule() {
+        let mut wrong = Vec::new();
+        for written in ["7", "abc", "-3", "300", "99999999999999999999"] {
+            let (_dir, client) = client_answering(&format!("exit {written}\nok\n"));
+            let (code, _, err) = run_client(&client, &["task", "run", "build"]);
+            let host = i32::from(crate::cli::task::exit_byte(written.parse().unwrap_or(-1)));
+            if code != host {
+                wrong.push(format!(
+                    "`exit {written}`: the client exits {code}, the host {host}: {err}"
+                ));
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");

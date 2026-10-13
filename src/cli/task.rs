@@ -1008,7 +1008,7 @@ fn render_result(
 /// The byte `sbx task run` returns for the command's exit code `exit`. A code no process returns —
 /// a negative one, which is what the client reads for an `exit` field it could not parse, or one
 /// past 255 — is a failure, never clamped into the success `0` is.
-fn exit_byte(exit: i32) -> u8 {
+pub(crate) fn exit_byte(exit: i32) -> u8 {
     u8::try_from(exit).unwrap_or(1)
 }
 
