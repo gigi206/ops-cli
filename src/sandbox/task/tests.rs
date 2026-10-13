@@ -1,5 +1,6 @@
 use super::*;
-use crate::config::{Encoding, ParamBound, TaskParam, TaskSecret};
+use crate::config::{Encoding, TaskSecret};
+use crate::testutil::task_spec as task;
 
 // --- what a launcher leaves open ---
 
@@ -277,37 +278,6 @@ fn a_poisoned_registry_still_reports_the_invocation_it_holds() {
         !engine.running().iter().any(|row| row.id == 7),
         "a poisoned registry must still let go of what has ended"
     );
-}
-
-fn task() -> TaskSpec {
-    TaskSpec {
-        unmask: Vec::new(),
-        name: "db-query".into(),
-        description: None,
-        cmd: vec!["psql".into(), "-c".into(), "{sql}".into()],
-        params: vec![TaskParam {
-            name: "sql".into(),
-            bound: ParamBound::Pattern("^SELECT [a-z]+$".into()),
-            default: None,
-        }],
-        secrets: vec![],
-        injections: vec![],
-        env: BTreeMap::new(),
-        env_allow: vec!["PGCONNECT_TIMEOUT".into()],
-        stdout: OutputDisposition::Show,
-        stderr: OutputDisposition::Show,
-        timeout: Duration::from_secs(5),
-        max_output: 1024,
-        network: vec![],
-        nonce: false,
-        packages: vec![],
-        spawn: None,
-        exec: Default::default(),
-        output: false,
-        origin: crate::config::TaskOrigin::Project,
-        timeout_from: crate::config::Ceiling::Declared,
-        max_output_from: crate::config::Ceiling::Declared,
-    }
 }
 
 fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

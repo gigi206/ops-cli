@@ -893,6 +893,42 @@ pub(crate) fn fingerprint(root: &Path) -> Vec<(PathBuf, u64)> {
     out
 }
 
+/// A declared operation: `psql -c {sql}`, its `sql` held to a single-word `SELECT`, and
+/// `PGCONNECT_TIMEOUT` the one variable a caller may set. The fixture a test starts from, changing
+/// only the field it is about, since a task spelled out whole says nothing about which of its
+/// fields a test reads.
+pub(crate) fn task_spec() -> crate::config::TaskSpec {
+    use crate::config::{OutputDisposition, ParamBound, TaskParam, TaskSpec};
+    TaskSpec {
+        unmask: Vec::new(),
+        name: "db-query".into(),
+        description: None,
+        cmd: vec!["psql".into(), "-c".into(), "{sql}".into()],
+        params: vec![TaskParam {
+            name: "sql".into(),
+            bound: ParamBound::Pattern("^SELECT [a-z]+$".into()),
+            default: None,
+        }],
+        secrets: vec![],
+        injections: vec![],
+        env: std::collections::BTreeMap::new(),
+        env_allow: vec!["PGCONNECT_TIMEOUT".into()],
+        stdout: OutputDisposition::Show,
+        stderr: OutputDisposition::Show,
+        timeout: std::time::Duration::from_secs(5),
+        max_output: 1024,
+        network: vec![],
+        nonce: false,
+        packages: vec![],
+        spawn: None,
+        exec: Default::default(),
+        output: false,
+        origin: crate::config::TaskOrigin::Project,
+        timeout_from: crate::config::Ceiling::Declared,
+        max_output_from: crate::config::Ceiling::Declared,
+    }
+}
+
 /// A baseline [`crate::config::Resolved`] carrying nothing but the packages and apps a test cares
 /// about, every other field at its quietest value. Config resolution has a wide struct and a test
 /// that spells all of it out says nothing about what it is testing; this keeps each test's fixture
