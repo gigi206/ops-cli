@@ -296,11 +296,16 @@ fn a_layer_is_verified_against_its_digest_as_it_lands() {
         err.to_string().contains("came back as") || err.to_string().contains("answered"),
         "{err}"
     );
-    assert!(
-        !dir.path()
-            .join(format!("{}.partial", wrong.digest.replace(':', "-")))
-            .exists(),
-        "a refused blob leaves no partial file"
+    // Nothing is left of the refused blob: not its partial download, and not a file under its
+    // digest, which a later `fetch_layer` would hand back as the layer without fetching it.
+    let left: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("the layer directory")
+        .map(|entry| entry.expect("a directory entry").file_name())
+        .collect();
+    assert_eq!(
+        left,
+        [std::ffi::OsString::from(layer.digest.replace(':', "-"))],
+        "the directory holds the layer that was fetched, and nothing of the one refused"
     );
 }
 
