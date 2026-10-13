@@ -1528,6 +1528,7 @@ fn the_client_lists_what_the_plane_serves() {
 #[test]
 fn the_client_names_an_empty_inventory() {
     let Some((_data, _plane, script)) = plane_and_client(vec![]) else {
+        skip_incapable!("skipping: bash, socat or head is not on PATH");
         return;
     };
     let out = run_client(&script, &["task", "secrets"]);
@@ -1550,6 +1551,7 @@ fn an_awkward_parameter_crosses_the_wire_byte_identical() {
     let Some((_data, _plane, script)) =
         plane_and_client_with_launcher(vec![probe_task()], "echo '<<STDERR-MARKER>>' >&2; exit 7")
     else {
+        skip_incapable!("skipping: bash, socat or head is not on PATH");
         return;
     };
     let out = run_client(
@@ -1591,6 +1593,7 @@ fn an_awkward_parameter_crosses_the_wire_byte_identical() {
 #[test]
 fn a_value_outside_its_bound_is_refused_by_the_plane() {
     let Some((_data, _plane, script)) = plane_and_client(vec![probe_task()]) else {
+        skip_incapable!("skipping: bash, socat or head is not on PATH");
         return;
     };
     let out = run_client(&script, &["task", "run", "probe", "-p", "sql=DROP TABLE t"]);
@@ -1667,13 +1670,12 @@ fn the_inventory_writes_what_a_declaration_chose_as_text_that_drives_nothing() {
 // payload containing the protocol's own keywords is copied rather than re-read as headers.
 #[test]
 fn the_client_parses_what_write_outcome_produces() {
-    let Some(bash) = crate::pathfind::find_on_path("bash") else {
-        return;
-    };
-    let (Some(socat), Some(head)) = (
+    let (Some(bash), Some(socat), Some(head)) = (
+        crate::pathfind::find_on_path("bash"),
         crate::pathfind::find_on_path("socat"),
         crate::pathfind::find_on_path("head"),
     ) else {
+        skip_incapable!("skipping: bash, socat or head is not on PATH");
         return;
     };
     let dir = TmpDir::new();
@@ -1743,13 +1745,12 @@ fn the_client_parses_what_write_outcome_produces() {
 // declaring `spawn` turns a missing entry into an unexplainable command.
 #[test]
 fn a_refused_exec_is_reported_to_the_caller_by_name() {
-    let Some(bash) = crate::pathfind::find_on_path("bash") else {
-        return;
-    };
-    let (Some(socat), Some(head)) = (
+    let (Some(bash), Some(socat), Some(head)) = (
+        crate::pathfind::find_on_path("bash"),
         crate::pathfind::find_on_path("socat"),
         crate::pathfind::find_on_path("head"),
     ) else {
+        skip_incapable!("skipping: bash, socat or head is not on PATH");
         return;
     };
     let dir = TmpDir::new();
@@ -1831,13 +1832,12 @@ fn a_refused_exec_is_reported_to_the_caller_by_name() {
 // next header as payload.
 #[test]
 fn a_hidden_stream_and_an_empty_one_stay_distinguishable() {
-    let Some(bash) = crate::pathfind::find_on_path("bash") else {
-        return;
-    };
-    let (Some(socat), Some(head)) = (
+    let (Some(bash), Some(socat), Some(head)) = (
+        crate::pathfind::find_on_path("bash"),
         crate::pathfind::find_on_path("socat"),
         crate::pathfind::find_on_path("head"),
     ) else {
+        skip_incapable!("skipping: bash, socat or head is not on PATH");
         return;
     };
     let dir = TmpDir::new();
@@ -1896,6 +1896,7 @@ fn a_hidden_stream_and_an_empty_one_stay_distinguishable() {
 #[test]
 fn the_client_refuses_every_word_but_task() {
     let Some((_data, _plane, script)) = plane_and_client(vec![probe_task()]) else {
+        skip_incapable!("skipping: bash, socat or head is not on PATH");
         return;
     };
     for verb in ["config", "app", "secret", "run", "gc", "trust", "doctor"] {
@@ -1926,6 +1927,7 @@ fn the_client_refuses_every_word_but_task() {
 #[test]
 fn the_plane_writes_a_client_aimed_at_the_cage_socket() {
     let Some(bash) = crate::pathfind::find_on_path("bash") else {
+        skip_incapable!("skipping: bash is not on PATH");
         return;
     };
     let data = TmpDir::new();
