@@ -215,6 +215,19 @@ fn prepare_roll_cage(cwd: &Path, app: Option<&str>) -> Result<Prepared, ExitCode
     Ok(prep)
 }
 
+/// The roll cage preparation `slot` holds for `app`, made the first time it is asked for and kept,
+/// failure included, so a second unit of the same identity neither prepares nor reports twice;
+/// `None` when it could not be made, which the preparation has already said.
+fn prepared<'a>(
+    slot: &'a mut Option<Result<Prepared, ExitCode>>,
+    cwd: &Path,
+    app: Option<&str>,
+) -> Option<&'a mut Prepared> {
+    slot.get_or_insert_with(|| prepare_roll_cage(cwd, app))
+        .as_mut()
+        .ok()
+}
+
 /// Roll the project's and its apps' `mise:` `[packages]` forward, in-cage. A `mise:` package is
 /// equipped by `mise use -g --pin <token>` at launch and is frozen there at the installed version —
 /// frozen *because* of the pin, which writes the resolved version into the cage's config so a later
@@ -232,7 +245,9 @@ fn prepare_roll_cage(cwd: &Path, app: Option<&str>) -> Result<Prepared, ExitCode
 /// already-resolved `cfg` first, so a project with no `mise:` package costs nothing here and
 /// `sbx upgrade nix`/`all` keeps its cheap, sandbox-free common path. With work to do, a host
 /// that cannot sandbox warns and rolls nothing rather than failing (best-effort, like the
-/// cgroup limits).
+/// cgroup limits). A preparation that fails on a host that can (a configuration refused, a lock
+/// that cannot be read, a channel that does not resolve) is no such host: it fails the group it
+/// was made for.
 ///
 /// Under [`RollMode::DryRun`] nothing is rolled: [`check_mise_packages`] asks each group's home what
 /// it holds and what a roll would move it to.
@@ -275,19 +290,18 @@ pub(crate) fn upgrade_mise_packages(
         return check_mise_packages(cwd, groups, pool, pal);
     }
 
-    // Only now, with something to roll, take on the sandbox prerequisites — against `cwd`, the
-    // project being upgraded, so `--project` builds the roll cage in that project's store and home
-    // rather
-    // than wherever the command was invoked. This one carries the baseline identity (`only`, which
-    // is `None` for a project-wide roll); each app group prepares its own below.
-    let mut prep = match prepare_roll_cage(cwd, only) {
-        Ok(p) => p,
-        Err(_) => {
-            // prepare_in already printed the pointed reason (missing bwrap/userns/nix).
-            crate::diag::warn("mise packages: skipped — no usable sandbox; see `sbx doctor`");
-            return true;
-        }
-    };
+    // Only now, with something to roll, take on the sandbox prerequisites. A host that cannot run a
+    // cage at all rolls nothing and says so once, under the reason it printed; past that, each
+    // preparation belongs to the group it is made for, and one that fails fails that group alone.
+    if !super::host_can_sandbox() {
+        crate::diag::warn("mise packages: skipped — no usable sandbox; see `sbx doctor`");
+        return true;
+    }
+    // The preparation for the identity `only` names (`None`, the project baseline, in a
+    // project-wide roll), made against `cwd` the first time a group or the pool needs it, so
+    // `--project` builds the roll cages in that project's store and home rather than wherever the
+    // command was invoked.
+    let mut shared = None;
 
     // Every group name is known up front, so the result lines are dot-leader aligned to one column
     // even though each prints live (as its cage finishes) to keep progress visible over a long
@@ -325,25 +339,23 @@ pub(crate) fn upgrade_mise_packages(
             continue;
         }
 
-        // A group whose identity is not the one the preparation above carries resolves against
-        // another lock, so it gets its own cage preparation rather than that one.
-        let mut group_prep = if home.app() == only {
-            None
+        // A group whose identity is not the shared one resolves against another lock, so it gets
+        // its own cage preparation rather than that one.
+        let mut own = None;
+        let slot = if home.app() == only {
+            &mut shared
         } else {
-            match prepare_roll_cage(cwd, home.app()) {
-                Ok(p) => Some(p),
-                Err(_) => {
-                    outln!(
-                        "{}",
-                        roll_line(&name, width, &format!("{warn}failed to prepare{r}"), pal)
-                    );
-                    failed += 1;
-                    ok = false;
-                    continue;
-                }
-            }
+            &mut own
         };
-        let prep = group_prep.as_mut().unwrap_or(&mut prep);
+        let Some(prep) = prepared(slot, cwd, home.app()) else {
+            outln!(
+                "{}",
+                roll_line(&name, width, &format!("{warn}failed to prepare{r}"), pal)
+            );
+            failed += 1;
+            ok = false;
+            continue;
+        };
 
         // Launch a cage in this group's home with its merged config so `build` sees the right
         // network/packages/home. The baseline warnings were already surfaced by `upgrade_cmd`,
@@ -478,7 +490,11 @@ pub(crate) fn upgrade_mise_packages(
     if pool {
         // Counted into the same tallies the apps use, so the closing recap can never read
         // "nothing to roll" one line under a pool that rolled.
-        match roll_task_pool(cwd, &mut prep, cfg) {
+        let outcome = match prepared(&mut shared, cwd, only) {
+            Some(prep) => roll_task_pool(cwd, prep, cfg),
+            None => Err("failed to prepare".to_string()),
+        };
+        match outcome {
             Ok(true) => {
                 outln!(
                     "{}",
@@ -919,17 +935,15 @@ pub(crate) fn upgrade_provision_steps(
         return true;
     }
 
-    // Only now, with work to do, take on the sandbox prerequisites — against `cwd`, so `--project`
-    // retargets these cages the way it retargets every other roll. Every group here is an app, so
-    // this preparation serves the roll only when one app was named; the others prepare their own.
-    let mut prep = match prepare_roll_cage(cwd, only) {
-        Ok(p) => p,
-        Err(_) => {
-            // prepare_in already printed the pointed reason (missing bwrap/userns/nix).
-            crate::diag::warn("install steps: skipped — no usable sandbox; see `sbx doctor`");
-            return true;
-        }
-    };
+    // Only now, with work to do, take on the sandbox prerequisites, as the `mise:` roll does: a
+    // host that cannot run a cage at all is told once, and every other preparation is its group's.
+    // Every group here is an app, so the shared preparation serves the roll only when one app was
+    // named; in a roll of every app, each prepares its own and the baseline is never prepared.
+    if !super::host_can_sandbox() {
+        crate::diag::warn("install steps: skipped — no usable sandbox; see `sbx doctor`");
+        return true;
+    }
+    let mut shared = None;
 
     let width = groups
         .iter()
@@ -958,25 +972,23 @@ pub(crate) fn upgrade_provision_steps(
             continue;
         }
 
-        // A group whose identity is not the one the preparation above carries resolves against
-        // another lock, so it gets its own cage preparation rather than that one.
-        let mut group_prep = if home.app() == only {
-            None
+        // A group whose identity is not the shared one resolves against another lock, so it gets
+        // its own cage preparation rather than that one.
+        let mut own = None;
+        let slot = if home.app() == only {
+            &mut shared
         } else {
-            match prepare_roll_cage(cwd, home.app()) {
-                Ok(p) => Some(p),
-                Err(_) => {
-                    outln!(
-                        "{}",
-                        roll_line(&name, width, &format!("{warn}failed to prepare{r}"), pal)
-                    );
-                    failed += 1;
-                    ok = false;
-                    continue;
-                }
-            }
+            &mut own
         };
-        let prep = group_prep.as_mut().unwrap_or(&mut prep);
+        let Some(prep) = prepared(slot, cwd, home.app()) else {
+            outln!(
+                "{}",
+                roll_line(&name, width, &format!("{warn}failed to prepare{r}"), pal)
+            );
+            failed += 1;
+            ok = false;
+            continue;
+        };
 
         let runtime = home.runtime();
         let mut cfg = cfg;

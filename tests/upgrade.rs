@@ -442,3 +442,109 @@ fn a_name_is_refused_without_a_store_and_the_roll_needs_one() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `sbx upgrade <target> --app <name>` against the fixture's homes, with its output as one log.
+fn narrowed_roll(
+    config: &Path,
+    data: &Path,
+    proj: &Path,
+    target: &str,
+    name: &str,
+) -> (std::process::Output, String) {
+    let out = sbx()
+        .args(["upgrade", target, "--app", name])
+        .current_dir(proj)
+        .env("XDG_CONFIG_HOME", config)
+        .env("XDG_DATA_HOME", data)
+        .env("LC_ALL", "C.UTF-8")
+        .output()
+        .expect("spawn sbx upgrade");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    (out, log)
+}
+
+/// Make the channel lock of the app `name` unreadable: a directory where the file goes. A roll
+/// cage's preparation reads that lock before it resolves any channel, so it fails there, on a host
+/// that can sandbox, without fetching anything.
+fn break_app_lock(data: &Path, name: &str) {
+    std::fs::create_dir_all(data.join(format!("sbx/apps/{name}/nixpkgs.lock"))).unwrap();
+}
+
+/// A `mise:` roll whose preparation fails on a host that can sandbox has failed: it names the
+/// group, and the upgrade exits non-zero. Reporting "no usable sandbox" and exiting 0 would send the
+/// user to `sbx doctor` for a lock `sbx doctor` says nothing about, and tell a script the roll had
+/// succeeded.
+#[test]
+fn a_mise_roll_whose_preparation_fails_is_a_failure_not_a_missing_sandbox() {
+    let (config, data, proj) = (TmpDir::new("upg"), TmpDir::new("upg"), TmpDir::new("upg"));
+    write_profile(
+        config.path(),
+        "reader",
+        "cmd = [\"reader\"]\n[packages]\ntool = \"mise:aqua:demo/tool\"\n",
+    );
+    break_app_lock(data.path(), "reader");
+
+    let (out, log) = narrowed_roll(config.path(), data.path(), proj.path(), "mise", "reader");
+    // A host with no nix stops before any roll ("cannot upgrade"), one with no sandbox before any
+    // preparation ("the sandbox cannot run"): neither is the case under test.
+    if log.contains("cannot upgrade") || log.contains("the sandbox cannot run") {
+        skip_incapable!("skipping the failed-preparation roll: {log}");
+        return;
+    }
+    assert!(
+        log.contains("nixpkgs.lock") && log.contains("failed to prepare"),
+        "the group must fail on the lock it could not read:\n{log}"
+    );
+    assert!(
+        !log.contains("no usable sandbox"),
+        "a host that can sandbox must not be reported as one that cannot:\n{log}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{log}");
+}
+
+/// The install-step roll, the same way: a preparation that fails on a host that can sandbox fails
+/// the app it was made for.
+#[test]
+fn an_install_roll_whose_preparation_fails_is_a_failure_not_a_missing_sandbox() {
+    let (config, data, proj) = (TmpDir::new("upg"), TmpDir::new("upg"), TmpDir::new("upg"));
+    let bundles = config.path().join("sbx/bundles");
+    std::fs::create_dir_all(&bundles).unwrap();
+    std::fs::write(
+        bundles.join("finish.toml"),
+        "provision = [\"bash\", \"-c\", \"true\"]\n",
+    )
+    .unwrap();
+    write_profile(
+        config.path(),
+        "installer",
+        "cmd = [\"installer\"]\nuse = [\"finish\"]\n",
+    );
+    break_app_lock(data.path(), "installer");
+
+    let (out, log) = narrowed_roll(
+        config.path(),
+        data.path(),
+        proj.path(),
+        "provision",
+        "installer",
+    );
+    // A host with no nix stops before any roll ("cannot upgrade"), one with no sandbox before any
+    // preparation ("the sandbox cannot run"): neither is the case under test.
+    if log.contains("cannot upgrade") || log.contains("the sandbox cannot run") {
+        skip_incapable!("skipping the failed-preparation install roll: {log}");
+        return;
+    }
+    assert!(
+        log.contains("nixpkgs.lock") && log.contains("failed to prepare"),
+        "the app must fail on the lock it could not read:\n{log}"
+    );
+    assert!(
+        !log.contains("no usable sandbox"),
+        "a host that can sandbox must not be reported as one that cannot:\n{log}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{log}");
+}

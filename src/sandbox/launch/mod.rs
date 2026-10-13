@@ -1146,20 +1146,19 @@ fn sandbox_available(userns: crate::Userns, smoke: impl FnOnce() -> bool) -> boo
     matches!(userns, crate::Userns::Ok) || smoke()
 }
 
-/// The half that needs the host to be able to sandbox: the engines, the user namespace, and the
-/// channel/userland resolution they drive.
-///
-/// `app` is the launch's identity only — it selects which lock the resolution runs against
-/// ([`effective_lock_target`]), and nothing of the app's configuration is read here. A caller that
-/// has already taken the app out of the configuration (as [`app`] does, to refuse an undeclared one
-/// before reaching this point) therefore loses nothing by doing so.
-fn prepare_engines(
-    pc: PreparedConfig,
-    app: Option<&str>,
-    purpose: Purpose,
-) -> Result<Prepared, ExitCode> {
-    let PreparedConfig { layout, cwd, cfg } = pc;
-    let bwrap = match crate::store::try_resolve_bwrap(Some(&layout)) {
+/// The engines a cage runs on: the sandbox engine, and the nix and nix-store commands that drive the
+/// store it binds.
+struct Engines {
+    bwrap: PathBuf,
+    nix: PathBuf,
+    nix_store: PathBuf,
+}
+
+/// Resolve the engines and prove the user namespace a cage needs, saying why when this host cannot
+/// sandbox. The opening of [`prepare_engines`], and the whole of what [`host_can_sandbox`] asks: one
+/// definition, so a roll that decides it cannot sandbox decides it the way a launch would.
+fn resolve_engines(layout: &Layout) -> Result<Engines, ExitCode> {
+    let bwrap = match crate::store::try_resolve_bwrap(Some(layout)) {
         Ok(choice) => choice.path,
         Err(miss) => return Err(unresolved_engine("bubblewrap (the sandbox engine)", &miss)),
     };
@@ -1183,11 +1182,11 @@ fn prepare_engines(
     // The runtime-directory sweep is the one that must stay out of `prepare` for that reason, and
     // does: it would delete what gc reports as merely reclaimable. This one reports nothing.
     super::cgroup::sweep_stale_scopes();
-    let nix = match crate::store::try_resolve_nix(Some(&layout)) {
+    let nix = match crate::store::try_resolve_nix(Some(layout)) {
         Ok(nix) => nix,
         Err(miss) => return Err(unresolved_engine("nix (the store engine)", &miss)),
     };
-    let nix_store = match crate::store::try_resolve_nix_store(Some(&layout)) {
+    let nix_store = match crate::store::try_resolve_nix_store(Some(layout)) {
         Ok(bin) => bin,
         Err(miss) => {
             return Err(unresolved_engine(
@@ -1196,6 +1195,41 @@ fn prepare_engines(
             ));
         }
     };
+    Ok(Engines {
+        bwrap,
+        nix,
+        nix_store,
+    })
+}
+
+/// Whether this host can run a cage at all: the data directory resolves, and so do the engines and
+/// the user namespace ([`resolve_engines`]). Prints the reason when it cannot, as a launch would.
+///
+/// Asked by a roll before it prepares anything, so that a host without a sandbox is told once and
+/// rolls nothing, while a preparation that fails for any other reason (a configuration refused, a
+/// lock that cannot be read, a channel that does not resolve) fails the one group it was made for.
+pub(super) fn host_can_sandbox() -> bool {
+    crate::layout_or_fail().is_ok_and(|layout| resolve_engines(&layout).is_ok())
+}
+
+/// The half that needs the host to be able to sandbox: the engines, the user namespace, and the
+/// channel/userland resolution they drive.
+///
+/// `app` is the launch's identity only — it selects which lock the resolution runs against
+/// ([`effective_lock_target`]), and nothing of the app's configuration is read here. A caller that
+/// has already taken the app out of the configuration (as [`app`] does, to refuse an undeclared one
+/// before reaching this point) therefore loses nothing by doing so.
+fn prepare_engines(
+    pc: PreparedConfig,
+    app: Option<&str>,
+    purpose: Purpose,
+) -> Result<Prepared, ExitCode> {
+    let PreparedConfig { layout, cwd, cfg } = pc;
+    let Engines {
+        bwrap,
+        nix,
+        nix_store,
+    } = resolve_engines(&layout)?;
 
     let nixpkgs = match effective_lock_target(&cwd, &layout, &cfg, app)
         .and_then(|t| t.resolve(&nix, &layout))
