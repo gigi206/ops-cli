@@ -1246,9 +1246,12 @@ fn token_names_app(token: &str, name: &str) -> bool {
 }
 
 /// Whether mise reported nothing to do. mise prints `All tools are up to date` (to stderr) when a
-/// roll finds every tool already current. Pure — unit-tested against real mise output.
+/// roll finds every tool already current, and that line is matched whole: the captured output
+/// carries other tools' words too, npm's `up to date, audited <n> packages` for a reinstall that
+/// changed nothing among them, and mise has other uses of the phrase. Pure — unit-tested against
+/// real output.
 fn mise_up_to_date(captured: &str) -> bool {
-    captured.contains("up to date")
+    captured.contains("All tools are up to date")
 }
 
 /// The name the declared operations' tool pool goes by in the `mise:` roll report.

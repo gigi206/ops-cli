@@ -38,6 +38,11 @@ fn mise_up_to_date_detects_the_no_op_roll() {
     assert!(!mise_up_to_date(
         "Upgraded 1 tool:\n  shfmt 3.7.0 → 3.13.1\n"
     ));
+    // npm's own verdict on an install that changed nothing, which an npm-backed equip can print
+    // into the same captured output, is not mise's.
+    assert!(!mise_up_to_date(
+        "up to date, audited 1394 packages in 2s\n"
+    ));
 }
 
 #[test]
