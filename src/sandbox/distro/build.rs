@@ -107,8 +107,11 @@ pub(crate) fn run(rootfs: &Path, ctx: &Context<'_>) -> io::Result<()> {
     // A shell is what every command is handed to, so its absence is the failure to report — before
     // standing up a proxy and a cage for a command that cannot start. Looked up as the cage will
     // see it ([`super::store::carries`]): a link in the image names the image's own path.
-    let root = crate::sandbox::attach::open_dir_path(rootfs)?;
-    if !super::store::carries(&root, "/bin/sh", "the image")? {
+    let has_shell = {
+        let root = crate::sandbox::attach::open_dir_path(rootfs)?;
+        super::store::carries(&root, "/bin/sh", "the image")?
+    };
+    if !has_shell {
         return Err(io::Error::other(
             "the image carries no `/bin/sh`, so there is nothing to run `[distro] run` with",
         ));
@@ -254,15 +257,16 @@ fn one(
     // environment travels on.
     let mut cage =
         crate::sandbox::launch::cage_command(ctx.bwrap, &spec, ctx.limits)?.into_command();
-    let mut child = cage
-        .stdin(std::process::Stdio::null())
-        .spawn()
+    cage.stdin(std::process::Stdio::null());
+    // Through [`crate::sandbox::task::spawn_launcher`], which closes this process's copies of those
+    // descriptors once bwrap holds its own: a command runs for minutes, and nothing here needs them
+    // past the spawn.
+    let mut child = crate::sandbox::task::spawn_launcher(cage)
         .map_err(|e| io::Error::other(format!("running `{command}`: {e}")))?;
 
     let deadline = Instant::now() + BUILD_TIMEOUT;
     let (status, timed_out) =
         crate::sandbox::cagewait::wait_capped(&mut child, deadline, POLL_INTERVAL)?;
-    drop(cage);
     if timed_out {
         return Err(io::Error::other(format!(
             "`{command}` passed its {}s ceiling and was killed",

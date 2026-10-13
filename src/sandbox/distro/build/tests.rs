@@ -356,3 +356,55 @@ fn a_build_cage_runs_inside_the_resource_limit_scope() {
         "a build cage runs outside sbx's own resource scope: {cgroup}"
     );
 }
+
+/// A build lets go of what its cage is handed — the seccomp filters, the environment, each an
+/// anonymous file — as soon as the spawn has handed them over. A command runs for minutes, and
+/// nothing in this process reads them again.
+///
+/// Asked from inside the stand-in, while it runs: it names the anonymous files it was handed by
+/// identity, then waits a bounded while for this process to hold none of them. The wait is the
+/// spawn returning before the drop, and through `systemd-run` before the stand-in even starts.
+#[test]
+fn a_build_lets_go_of_its_cages_descriptors_once_it_has_spawned() {
+    let tmp = crate::testutil::TmpDir::new();
+    let rootfs = tmp.join("rootfs");
+    std::fs::create_dir_all(rootfs.join("bin")).unwrap();
+    std::fs::write(rootfs.join("bin/sh"), b"").unwrap();
+    let seen = tmp.join("seen");
+    let probe = format!(
+        "mine=$(for f in /proc/$$/fd/*; do case $(readlink \"$f\") in /memfd:*) stat -L -c %d:%i \"$f\";; esac; done)\n\
+         [ -n \"$mine\" ] || {{ echo none > {seen}; exit 0; }}\n\
+         i=0\n\
+         while [ $i -lt 100 ]; do\n\
+         if ! for f in /proc/{pid}/fd/*; do stat -L -c %d:%i \"$f\" 2>/dev/null; done | grep -Fxq \"$mine\"; then echo released > {seen}; exit 0; fi\n\
+         i=$((i + 1)); sleep 0.05\n\
+         done\n\
+         echo held > {seen}",
+        seen = crate::testutil::sh_word(&seen),
+        pid = std::process::id(),
+    );
+    let fake = stand_in(tmp.path(), &probe);
+
+    let ca = tmp.join("ca.crt");
+    std::fs::write(&ca, b"").unwrap();
+    let layout = crate::store::Layout::under(tmp.path());
+    let network = crate::config::NetworkPolicy::Isolated;
+    let commands = vec!["true".to_string()];
+    run(
+        &rootfs,
+        &inert(&commands, &fake, &ca, &layout, tmp.path(), &network),
+    )
+    .expect("the probe cage runs");
+
+    let answer = std::fs::read_to_string(&seen).unwrap();
+    assert_ne!(
+        answer.trim(),
+        "none",
+        "the stand-in was handed no anonymous file, so there is nothing to ask about"
+    );
+    assert_eq!(
+        answer.trim(),
+        "released",
+        "this process still holds the cage's descriptors while the command runs"
+    );
+}
