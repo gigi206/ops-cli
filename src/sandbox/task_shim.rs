@@ -165,14 +165,18 @@ inventory() {{
                 # The operation this row is about, for the filter and for the "what IS here" list.
                 # The two answers name it in different places, as the host's own two filters do: a
                 # `LIST` row leads with the name, a `SECRETS` row carries a `task=<name>` field
-                # among the rest.
+                # among the rest. That field is looked for between the variable's name and the
+                # trailing description, split on the tabs that delimit them, as the host reads it:
+                # the description is free text, which may say `task=<name>` in a sentence or hold a
+                # word the shell would expand into file names.
                 if [ "$command" = LIST ]; then
                     name=${{line%%$'\t'*}}
                 else
                     name=
-                    local field
-                    for field in $line; do
-                        case $field in task=*) name=${{field#task=}} ;; esac
+                    local fields i
+                    IFS=$'\t' read -r -a fields <<< "$line"
+                    for (( i = 1; i < ${{#fields[@]}} - 1; i++ )); do
+                        case ${{fields[i]}} in task=*) name=${{fields[i]#task=}} ;; esac
                     done
                 fi
                 case " $known " in
@@ -645,6 +649,30 @@ mod tests {
         let (code, _, err) = run_client(&client, &["task", "secrets", "nope"]);
         assert_eq!(code, 2);
         assert!(err.contains("build") && err.contains("deploy"), "{err}");
+    }
+
+    /// A credential belongs to the operation its `task=` field names, read among the fields between
+    /// the variable's name and the trailing description, as the host reads it. The description is
+    /// free text the operator wrote: it can say `task=<another>` in a sentence, and a `*` in it is a
+    /// word the shell would expand into the names of the files beside the client. Both shapes are
+    /// asked before anything is asserted, so a run names each one that is misread.
+    #[test]
+    fn a_credential_belongs_to_its_task_field_whatever_its_description_says() {
+        let shapes = [
+            ("said in the description", "read task=intruder first"),
+            ("a pattern in the description", "*"),
+        ];
+        let mut misread = Vec::new();
+        for (shape, description) in shapes {
+            let reply = format!("secret TOKEN\ttask=build\tencode=raw\t{description}\nok\n");
+            let (dir, client) = client_answering(&reply);
+            std::fs::write(dir.path().join("task=intruder"), "").expect("a file the pattern finds");
+            let (code, out, err) = run_client(&client, &["task", "secrets", "build"]);
+            if code != 0 || !out.contains("TOKEN") {
+                misread.push(format!("{shape}: exit {code}, {out}{err}"));
+            }
+        }
+        assert!(misread.is_empty(), "{misread:#?}");
     }
 
     /// An empty inventory and a filter that matched nothing are different answers, and only the
