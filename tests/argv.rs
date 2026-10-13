@@ -3,7 +3,8 @@
 //! An unknown flag that is *rejected* costs one retry; one that is silently *dropped* answers a
 //! different question than the one asked, with a zero exit and output that looks right —
 //! `sbx plugins store ls --installed` printing the whole listing reads as a filtered result. This
-//! suite sweeps every read-only verb with a token it cannot mean, and requires a non-zero exit.
+//! suite sweeps every read-only verb with a token it cannot mean, and requires it refused (see
+//! [`refused`]): the usage exit, in the words a parser refuses an argument with.
 //!
 //! Only side-effect-free verbs are swept: nothing here launches a cage, fetches, installs, or
 //! writes outside its throwaway data directory. Verbs that legitimately take a positional (say
@@ -30,6 +31,33 @@ fn run(args: &[&str], home: &Path) -> (i32, String) {
     let mut streams = String::from_utf8_lossy(&out.stdout).into_owned();
     streams.push_str(&String::from_utf8_lossy(&out.stderr));
     (out.status.code().unwrap_or(-1), streams)
+}
+
+/// The words sbx's argument parsers refuse a token with, across the verbs swept here, the usage
+/// line included.
+const REFUSALS: &[&str] = &[
+    "takes no option",
+    "takes no argument",
+    "takes a single",
+    "at most one",
+    "unknown argument",
+    "unexpected argument",
+    "unknown flag",
+    "unknown option",
+    "is an option",
+    "usage",
+];
+
+/// Whether a run refused its arguments: the usage exit, 2, saying so in one of [`REFUSALS`].
+///
+/// Neither half is the answer alone. Any non-zero exit is not a refusal: a crash, a run killed by
+/// a signal, a verb that found no session to ask and one that refused its data directory before
+/// reading its arguments all exit non-zero without having read the token. Nor is the usage exit
+/// with the token in the message: a name the verb looked up and did not find exits 2 naming it. A
+/// parser that words a refusal another way fails the sweep, and its wording is then added here
+/// rather than the sweep loosened.
+fn refused(code: i32, out: &str) -> bool {
+    code == 2 && REFUSALS.iter().any(|said| out.contains(said))
 }
 
 /// Every read-only verb, with the arguments it legitimately takes (so the probe appends a token
@@ -72,8 +100,11 @@ fn no_read_only_verb_accepts_a_surplus_flag() {
         let mut args = verb.to_vec();
         args.push("--zzz-not-a-flag");
         let (code, out) = run(&args, home.path());
-        if code == 0 {
-            accepted.push(format!("sbx {} --zzz-not-a-flag\n{out}", verb.join(" ")));
+        if !refused(code, &out) {
+            accepted.push(format!(
+                "sbx {} --zzz-not-a-flag (exit {code})\n{out}",
+                verb.join(" ")
+            ));
         }
     }
     assert!(
@@ -97,10 +128,9 @@ fn a_verb_taking_a_path_still_refuses_an_unknown_flag() {
         let (code, out) = run(&args, home.path());
         // Read as a path, an unknown flag would report "nothing to revoke" and exit 0 — a success
         // for something that never happened.
-        assert_ne!(
-            code,
-            0,
-            "`sbx {} --zzz-not-a-flag` treated a flag as a path:\n{out}",
+        assert!(
+            refused(code, &out),
+            "`sbx {} --zzz-not-a-flag` treated a flag as a path (exit {code}):\n{out}",
             verb.join(" ")
         );
     }
@@ -114,8 +144,11 @@ fn no_read_only_verb_accepts_a_surplus_argument() {
         let mut args = verb.to_vec();
         args.push("zzz-not-an-argument");
         let (code, out) = run(&args, home.path());
-        if code == 0 {
-            accepted.push(format!("sbx {} zzz-not-an-argument\n{out}", verb.join(" ")));
+        if !refused(code, &out) {
+            accepted.push(format!(
+                "sbx {} zzz-not-an-argument (exit {code})\n{out}",
+                verb.join(" ")
+            ));
         }
     }
     assert!(
@@ -140,10 +173,9 @@ fn a_verb_that_takes_a_positional_still_refuses_a_second_one() {
     std::fs::write(home.path().join(".sbx.toml"), "env = { A = \"1\" }\n").unwrap();
     for args in cases {
         let (code, out) = run(args, home.path());
-        assert_ne!(
-            code,
-            0,
-            "`sbx {}` accepted a surplus argument:\n{out}",
+        assert!(
+            refused(code, &out),
+            "`sbx {}` accepted a surplus argument (exit {code}):\n{out}",
             args.join(" ")
         );
     }
