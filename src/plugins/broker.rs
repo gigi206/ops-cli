@@ -308,6 +308,16 @@ pub(super) struct RawBroker {
     at_host_path: bool,
 }
 
+/// Whether `value` is one file name and never a path: not empty, no separator, not `.` or `..`,
+/// and no control character.
+fn is_plain_file_name(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('/')
+        && value != "."
+        && value != ".."
+        && !value.chars().any(char::is_control)
+}
+
 /// Validate a manifest's `[broker]` table. `is_reserved` is the cage's reserved-environment-key
 /// predicate, injected so this stays testable without the config layer and so there is exactly
 /// one list of reserved keys in the tree.
@@ -330,17 +340,21 @@ pub(super) fn validate(
                 .to_string(),
         );
     }
+    // The plugin's name names its sockets (`<name>.sock` in the launch's host-side directory,
+    // `/tmp/sbx-broker-<name>` in the cage), so it is held to the rule `socket_name` is, whatever
+    // that field says. An install holds the name to a stricter one, but a manifest edited since, or
+    // placed by hand, may declare any name the loader admits, and it admits any printable one.
+    if !is_plain_file_name(name) {
+        return Err(format!(
+            "`name` is `{}`, which is not a plain file name — a broker's name names its sockets",
+            name.escape_debug()
+        ));
+    }
     // A name, never a path: a separator or a `.`/`..` component would let a manifest place its
     // socket somewhere sbx did not choose. Held to the default too, which is built from the
-    // plugin's name: that name was checked when the plugin was installed, and this does not rest on
-    // the installed manifest never having been edited since.
+    // plugin's name and so is left to fail on its length alone.
     let socket_name = raw.socket_name.unwrap_or_else(|| format!("{name}.sock"));
-    if socket_name.is_empty()
-        || socket_name.contains('/')
-        || socket_name == "."
-        || socket_name == ".."
-        || socket_name.chars().any(char::is_control)
-    {
+    if !is_plain_file_name(&socket_name) {
         return Err(format!(
             "`socket_name` is `{}`, which is not a plain file name — the directory is sbx's to \
              choose",
@@ -576,10 +590,13 @@ mod tests {
     }
 
     /// The socket's name is held to the same rule whether the manifest wrote it or sbx built it from
-    /// the plugin's name, and it must leave room for a directory in a socket path.
+    /// the plugin's name, and it must leave room for a directory in a socket path. A built one can
+    /// only fail on its length, since the name it is built from has passed the same rule first.
     #[test]
     fn a_socket_name_that_is_not_a_short_plain_file_name_is_refused() {
-        assert!(validate(raw(), "../escape", valid_key, reserved).is_err());
+        let built = validate(raw(), &"n".repeat(MAX_SOCKET_NAME), valid_key, reserved)
+            .expect_err("a name whose socket would not fit");
+        assert!(built.starts_with("`socket_name`"), "{built}");
         for named in ["a\nb", "x/y", "..", &"s".repeat(MAX_SOCKET_NAME + 1)] {
             let err = validate(
                 RawBroker {
@@ -607,6 +624,30 @@ mod tests {
         )
         .expect("a plain name");
         assert_eq!(spec.socket_name, "S.gpg-agent");
+    }
+
+    /// A broker's name names its sockets, so it is held to the plain-file-name rule whatever
+    /// `socket_name` says. With one written out, a name that is a path would place the host socket
+    /// outside the launch's own directory (`../x`), or anywhere at all (`/abs`, which `Path::join`
+    /// takes in place of the directory). Without one, the refusal names the field the author wrote.
+    /// Every shape is asked before anything is asserted, so a run names each one that passes.
+    #[test]
+    fn a_brokers_name_is_a_plain_file_name_whatever_its_socket_name() {
+        let explicit = || RawBroker {
+            socket_name: Some("s.sock".to_string()),
+            ..raw()
+        };
+        let wrong: Vec<String> = [("../x", explicit()), ("/abs", explicit()), ("x/y", raw())]
+            .into_iter()
+            .filter_map(
+                |(name, raw)| match validate(raw, name, valid_key, reserved) {
+                    Ok(_) => Some(format!("`{name}` was taken as a broker's name")),
+                    Err(e) if !e.starts_with("`name`") => Some(format!("`{name}`: {e}")),
+                    Err(_) => None,
+                },
+            )
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// Every variable sbx sets to point the cage at a channel of its own is one a broker cannot

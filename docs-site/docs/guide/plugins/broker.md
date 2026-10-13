@@ -64,7 +64,8 @@ launch:
   once across `cage_env` and `cage_env_dir`.
   `socket_name` defaults to `<plugin>.sock`: a file name only, never a path (empty,
   `/`, `.`, `..` and control characters refused, the default included), and at most
-  100 bytes, so a socket path can still hold a directory.
+  100 bytes, so a socket path can still hold a directory. The plugin's own `name` is held
+  to the same rule whatever `socket_name` says, since it names the broker's sockets too.
 - **`framing` is a closed set** implemented in `sbx`: `length-u32-be` (a four-byte
   big-endian length, then the body, which carries the protocol's own type byte),
 - **`framing` is a closed set** implemented in `sbx`: `length-u32-be` (a four-byte
