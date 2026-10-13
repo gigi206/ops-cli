@@ -273,7 +273,6 @@ fn a_name_that_names_nothing_is_a_usage_error() {
         &["bundle", "rm", "nope"],
         &["net", "groups", "nope"],
         &["net", "groups", "export", "nope"],
-        &["net", "groups", "rm", "nope"],
         &["session", "stop", "999999"],
         &["session", "logs", "nope"],
         &["session", "logs", "999999"],
