@@ -425,34 +425,37 @@ mod tests {
         use std::os::unix::io::AsRawFd;
 
         use std::os::unix::process::CommandExt as _;
-        const HELD: libc::c_int = 50;
 
         let stray = super::write(c"sbx-stray", b"stray").expect("memfd");
         let raw = stray.as_raw_fd();
         // Held for another exec, the way a holder keeps the cage's descriptors: a copy without the
-        // flag, made in the child alone so no other test's spawn inherits it, and made first.
-        let hold = |command: &mut Command| {
+        // flag, made in the child alone so no other test's spawn inherits it, and made first. Its
+        // number is one past both files', so the copy never lands on the handed file, which a
+        // fixed number does whenever this process, its other tests included, holds enough
+        // descriptors for the handed one to be given that number.
+        let hold_and_read = |command: &mut Command, handed: &std::fs::File| {
+            let held = raw.max(handed.as_raw_fd()) + 1;
+            command.arg("-c").arg(format!(
+                "cat /proc/self/fd/{}; cat /proc/self/fd/{held}",
+                handed.as_raw_fd()
+            ));
             // SAFETY: `dup2` is async-signal-safe, and `raw` is open for the whole spawn.
             unsafe {
-                command.pre_exec(move || match libc::dup2(raw, HELD) {
-                    HELD => Ok(()),
-                    _ => Err(std::io::Error::last_os_error()),
+                command.pre_exec(move || {
+                    if libc::dup2(raw, held) == held {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
                 });
             }
         };
         // One handed file per command, since each command takes the one it hands on.
         let handed = || super::write(c"sbx-handed", b"handed").expect("memfd");
-        let read_both = |handed: &std::fs::File| {
-            format!(
-                "cat /proc/self/fd/{}; cat /proc/self/fd/{HELD}",
-                handed.as_raw_fd()
-            )
-        };
 
         let handed_across = handed();
         let mut across = Command::new("/bin/sh");
-        across.arg("-c").arg(read_both(&handed_across));
-        hold(&mut across);
+        hold_and_read(&mut across, &handed_across);
         super::inherit_across_exec(&mut across, vec![handed_across]);
         let out = across.output().expect("the child runs");
         assert_eq!(
@@ -462,8 +465,7 @@ mod tests {
 
         let handed_only = handed();
         let mut only = Command::new("/bin/sh");
-        only.arg("-c").arg(read_both(&handed_only));
-        hold(&mut only);
+        hold_and_read(&mut only, &handed_only);
         super::inherit_only(&mut only, vec![handed_only]);
         let out = only.output().expect("the child runs");
         assert_eq!(out.stdout, b"handed");
