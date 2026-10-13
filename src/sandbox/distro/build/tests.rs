@@ -408,3 +408,32 @@ fn a_build_lets_go_of_its_cages_descriptors_once_it_has_spawned() {
         "this process still holds the cage's descriptors while the command runs"
     );
 }
+
+/// A cage ended by a signal says which. A signal inside the cage reaches bwrap's exit as `128 + N`,
+/// which the exit code already reports; a status with no code is bwrap itself killed — from
+/// outside, by the scope, by the kernel — and the number is what tells those apart. `SIGTERM`
+/// rather than `SIGKILL`, which is also how the ceiling ends a command.
+#[test]
+fn a_cage_killed_by_a_signal_names_the_signal() {
+    let tmp = crate::testutil::TmpDir::new();
+    let rootfs = tmp.join("rootfs");
+    std::fs::create_dir_all(rootfs.join("bin")).unwrap();
+    std::fs::write(rootfs.join("bin/sh"), b"").unwrap();
+    let fake = stand_in(tmp.path(), "kill -TERM $$");
+
+    let ca = tmp.join("ca.crt");
+    std::fs::write(&ca, b"").unwrap();
+    let layout = crate::store::Layout::under(tmp.path());
+    let network = crate::config::NetworkPolicy::Isolated;
+    let commands = vec!["true".to_string()];
+    let err = run(
+        &rootfs,
+        &inert(&commands, &fake, &ca, &layout, tmp.path(), &network),
+    )
+    .expect_err("a cage killed by a signal fails the build");
+    let message = err.to_string();
+    assert!(
+        message.contains("`true`") && message.contains("signal 15"),
+        "{message}"
+    );
+}

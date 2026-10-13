@@ -274,12 +274,16 @@ fn one(
         )));
     }
     if !status.success() {
-        return Err(io::Error::other(format!(
-            "`{command}` exited {}",
-            status
-                .code()
-                .map_or_else(|| "on a signal".to_string(), |c| c.to_string())
-        )));
+        use std::os::unix::process::ExitStatusExt as _;
+        return Err(io::Error::other(match status.code() {
+            Some(code) => format!("`{command}` exited {code}"),
+            // A signal inside the cage reaches bwrap's exit as `128 + N`, so a status with no code
+            // is bwrap itself killed: the cage ended, not the command, and the signal says by what.
+            None => format!(
+                "the cage running `{command}` was killed by signal {}",
+                status.signal().unwrap_or_default()
+            ),
+        }));
     }
     Ok(())
 }
