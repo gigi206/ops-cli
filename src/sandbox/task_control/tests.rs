@@ -797,7 +797,11 @@ fn a_second_detached_writer_is_refused_before_it_is_given_an_id() {
         third.error, None,
         "the directory must be free once the invocation holding it has ended"
     );
-    let _ = stop_invocation(&host, third.id);
+    assert_eq!(
+        stop_invocation(&host, third.id).expect("stop"),
+        StopReply::Stopped,
+        "a stop that did not land would leave this writer running past the test"
+    );
 }
 
 /// An operation that takes longer than an instant still answers the in-cage caller.
@@ -1176,7 +1180,11 @@ fn detached_invocations_are_capped_while_they_are_live() {
     );
 
     for id in ids {
-        let _ = stop_invocation(&host, id);
+        assert_eq!(
+            stop_invocation(&host, id).expect("stop"),
+            StopReply::Stopped,
+            "a stop that did not land would leave this sleep running past the test"
+        );
     }
 }
 
@@ -1211,7 +1219,11 @@ fn a_result_tells_running_from_foreground_from_unknown() {
         Some(&*format!("invocation {} is still running", running.id)),
         "a result that has not happened yet is not a missing one"
     );
-    let _ = stop_invocation(&host, running.id);
+    assert_eq!(
+        stop_invocation(&host, running.id).expect("stop"),
+        StopReply::Stopped,
+        "a stop that did not land would leave this sleep running past the test"
+    );
 
     // A foreground invocation's result went to the caller that waited for it, and was never kept
     // here — which is a different thing to be told than "there is no such invocation".
@@ -1231,7 +1243,11 @@ fn a_result_tells_running_from_foreground_from_unknown() {
             .map(|row| row.id)
     })
     .expect("the foreground invocation must be visible while it runs");
-    let _ = stop_invocation(&host, id);
+    assert_eq!(
+        stop_invocation(&host, id).expect("stop"),
+        StopReply::Stopped,
+        "a stop that did not land would have the caller below wait out the whole command"
+    );
     let _ = attached.join().expect("the caller thread");
 
     let answer = client::result(&host, id).expect("an answer");
