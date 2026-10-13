@@ -7,7 +7,7 @@
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 /// The pids of this user's processes whose argv is exactly `sleep <secs>`.
@@ -173,6 +173,53 @@ pub fn finish_within(cmd: &mut Command, limit: Duration) -> Option<ExitStatus> {
             }
         }
     }
+}
+
+/// Run `cmd` to its end with both streams captured, killing it once `limit` passes: `Some` with
+/// what it printed when it ended in time, `None` when it had to be killed.
+///
+/// For a command that ends on its own and could, through a regression, wait for good — a verb
+/// that misreads its arguments as a request to watch — so that the caller fails naming it rather
+/// than holding the suite until its job times out. Each stream is read on a thread of its own and
+/// handed over by channel, and waited for only briefly once the command has ended: something it
+/// started can hold a pipe open after it, and a join would wait on that instead.
+pub fn output_within(cmd: &mut Command, limit: Duration) -> Option<Output> {
+    use std::io::Read as _;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawning {cmd:?}: {e}"));
+    let drain = |mut pipe: Box<dyn std::io::Read + Send>| {
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = sent.send(bytes);
+        });
+        received
+    };
+    let stdout = drain(Box::new(child.stdout.take().expect("stdout is piped")));
+    let stderr = drain(Box::new(child.stderr.take().expect("stderr is piped")));
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let grace = Duration::from_secs(5);
+    Some(Output {
+        status,
+        stdout: stdout.recv_timeout(grace).unwrap_or_default(),
+        stderr: stderr.recv_timeout(grace).unwrap_or_default(),
+    })
 }
 
 /// The detached session's id, out of the line `sbx` prints as it detaches

@@ -16,18 +16,31 @@ use common::fixture::TmpDir;
 
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
+
+/// The longest one probe may take. Every verb swept here answers at once, so one still running
+/// past this has taken its arguments as a request to wait or to watch, and is named rather than
+/// left to hold the suite until its job times out.
+const PROBE_LIMIT: Duration = Duration::from_secs(60);
 
 /// Run `sbx <args>` against a throwaway home and return its exit code with both streams.
 fn run(args: &[&str], home: &Path) -> (i32, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
-        .args(args)
-        .current_dir(home)
-        .env("HOME", home)
-        .env("XDG_DATA_HOME", home)
-        .env("XDG_STATE_HOME", home)
-        .env("XDG_CONFIG_HOME", home)
-        .output()
-        .expect("spawn sbx");
+    let out = common::procs::output_within(
+        Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(args)
+            .current_dir(home)
+            .env("HOME", home)
+            .env("XDG_DATA_HOME", home)
+            .env("XDG_STATE_HOME", home)
+            .env("XDG_CONFIG_HOME", home),
+        PROBE_LIMIT,
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "`sbx {}` was still running after {PROBE_LIMIT:?}",
+            args.join(" ")
+        )
+    });
     let mut streams = String::from_utf8_lossy(&out.stdout).into_owned();
     streams.push_str(&String::from_utf8_lossy(&out.stderr));
     (out.status.code().unwrap_or(-1), streams)
