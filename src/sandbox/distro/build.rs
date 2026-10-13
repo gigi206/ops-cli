@@ -105,8 +105,10 @@ pub(crate) fn run(rootfs: &Path, ctx: &Context<'_>) -> io::Result<()> {
         return Ok(());
     }
     // A shell is what every command is handed to, so its absence is the failure to report — before
-    // standing up a proxy and a cage for a command that cannot start.
-    if !rootfs.join("bin/sh").symlink_metadata().is_ok() {
+    // standing up a proxy and a cage for a command that cannot start. Looked up as the cage will
+    // see it ([`super::store::carries`]): a link in the image names the image's own path.
+    let root = crate::sandbox::attach::open_dir_path(rootfs)?;
+    if !super::store::carries(&root, "/bin/sh", "the image")? {
         return Err(io::Error::other(
             "the image carries no `/bin/sh`, so there is nothing to run `[distro] run` with",
         ));

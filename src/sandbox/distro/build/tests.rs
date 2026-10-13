@@ -80,6 +80,45 @@ fn an_image_with_no_shell_is_refused_before_a_cage_is_stood_up() {
     assert!(err.to_string().contains("`/bin/sh`"), "{err}");
 }
 
+/// The shell is looked up as the cage will see it: a link in the image names the image's own path,
+/// never the host's. Looked up on the host, an image whose `bin` names a directory only the host
+/// carries passes with no shell of its own, and one whose `bin` names a directory only the image
+/// carries is refused on every host without it. Both shapes, because each is the other's mistake.
+#[test]
+fn the_shell_is_looked_up_inside_the_image_not_on_the_host() {
+    let tmp = crate::testutil::TmpDir::new();
+    let fake = stand_in(tmp.path(), "exit 0");
+    let ca = tmp.join("ca.crt");
+    std::fs::write(&ca, b"").unwrap();
+    let layout = crate::store::Layout::under(tmp.path());
+    let network = crate::config::NetworkPolicy::Isolated;
+    let commands = vec!["true".to_string()];
+    let context = || inert(&commands, &fake, &ca, &layout, tmp.path(), &network);
+
+    // A shell the host has at the link's target, and the image does not.
+    let on_the_host = tmp.join("on-the-host");
+    std::fs::create_dir_all(&on_the_host).unwrap();
+    std::fs::write(on_the_host.join("sh"), b"").unwrap();
+    let borrowed = tmp.join("borrowed");
+    std::fs::create_dir_all(&borrowed).unwrap();
+    std::os::unix::fs::symlink(&on_the_host, borrowed.join("bin")).unwrap();
+    let err = run(&borrowed, &context()).expect_err("the host's shell is not the image's");
+    assert!(err.to_string().contains("carries no `/bin/sh`"), "{err}");
+
+    // A shell the image has at the link's target, and the host does not.
+    let in_the_image = tmp.join("in-the-image");
+    let own = tmp.join("own");
+    let target = own.join(in_the_image.strip_prefix("/").unwrap());
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("sh"), b"").unwrap();
+    std::os::unix::fs::symlink(&in_the_image, own.join("bin")).unwrap();
+    assert!(
+        !in_the_image.exists(),
+        "the fixture must name a path the host does not carry"
+    );
+    run(&own, &context()).expect("the shell the image's own link names");
+}
+
 #[test]
 fn an_empty_command_list_stands_nothing_up() {
     // The consuming path passes no context at all, but a table that declared `run = []` must not
