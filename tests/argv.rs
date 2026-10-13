@@ -46,17 +46,22 @@ const READ_ONLY_VERBS: &[&[&str]] = &[
     &["net", "rules"],
     &["net", "pending"],
     &["net", "stats"],
-    &["proc", "ls"],
+    // A session id is the one positional of `proc ls`, `fs logs` and `ssh-agent logs`, and a store's
+    // name that of `plugins store list`: each is probed after one, since a bare token after the
+    // verb names a session or a store, and one that names nothing is a failure of its own.
+    &["proc", "ls", "999999"],
     &["proc", "pending"],
     &["proc", "rules"],
-    &["fs", "logs"],
-    &["ssh-agent", "logs"],
+    &["fs", "logs", "999999"],
+    &["ssh-agent", "logs", "999999"],
     &["secret", "list"],
-    &["task", "list"],
-    &["task", "status"],
+    // The operation is their one positional, so the probe follows one: a bare token after the verb
+    // is an operation to narrow to, which no session declaring it answers with a failure of its own.
+    &["task", "list", "build"],
+    &["task", "status", "build"],
     &["storage", "status"],
     &["plugins", "list"],
-    &["plugins", "store", "list"],
+    &["plugins", "store", "list", "nope"],
 ];
 
 #[test]
