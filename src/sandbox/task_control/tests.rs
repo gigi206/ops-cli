@@ -916,8 +916,18 @@ fn a_detached_invocation_is_answered_at_once_and_collected_afterwards() {
 /// prove it exists and rarely enough to be no guard at all; the repetition is what turns that
 /// into a test. It cannot fail the other way: while the registration is held, "still running"
 /// is a true answer, so a correct tree has nothing here to trip on.
+///
+/// The busy poll is bounded, though, and then gives the CPU back between polls. On a host with
+/// one CPU free, a poll that never yields takes the time the launcher needs to finish, so the
+/// invocation never produces a result and a correct tree fails on the deadline. Pausing from the
+/// start would cure that and blind the test instead: the window is narrower than any pause, so
+/// polls that sleep step over it. Spinning first keeps the window in view wherever another CPU
+/// runs the command; pausing afterwards lets the command finish where none does.
 #[test]
 fn a_finishing_invocation_is_never_reported_as_one_that_never_ran() {
+    // How long each attempt polls without pausing, and the pause between polls after that.
+    const SPIN_FOR: Duration = Duration::from_millis(100);
+    const PAUSE: Duration = Duration::from_micros(100);
     let Some((_data, plane, _script)) = plane_with_launcher("printf 'done\n'\n") else {
         skip_incapable!("skipping: bash, socat or head is not on PATH");
         return;
@@ -936,7 +946,8 @@ fn a_finishing_invocation_is_never_reported_as_one_that_never_ran() {
             "the invocation must have been admitted"
         );
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let polling_since = std::time::Instant::now();
+        let deadline = polling_since + Duration::from_secs(30);
         loop {
             let answer = client::result(&host, started.id).expect("an answer");
             let Some(why) = answer.error.as_deref() else {
@@ -951,6 +962,9 @@ fn a_finishing_invocation_is_never_reported_as_one_that_never_ran() {
                 std::time::Instant::now() < deadline,
                 "the invocation never produced a result"
             );
+            if polling_since.elapsed() >= SPIN_FOR {
+                std::thread::sleep(PAUSE);
+            }
         }
     }
 }
