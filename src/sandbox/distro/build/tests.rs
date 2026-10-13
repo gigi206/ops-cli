@@ -33,6 +33,20 @@ fn inert<'a>(
     }
 }
 
+/// A stand-in for `bwrap` in `dir` that runs `body`, run once already so the cage it stands in for
+/// is never the first exec of a file just written.
+///
+/// A launch reaches the stand-in through the resource scope's `systemd-run` where this host has
+/// one, so the `ETXTBSY` of an executable written this instant ([`crate::testutil::write_script`])
+/// would surface as the wrapper's exit rather than as a spawn failure that can be waited out. An
+/// exec that succeeds says no descriptor open for writing is left, and none can appear after it.
+fn stand_in(dir: &Path, body: &str) -> PathBuf {
+    let fake = dir.join("fake-bwrap");
+    crate::testutil::write_script(&fake, &format!("[ \"$1\" = --primed ] && exit 0\n{body}"));
+    crate::testutil::output_past_etxtbsy(std::process::Command::new(&fake).arg("--primed"));
+    fake
+}
+
 /// The default ceilings, which is what a launch that declares no `[limits]` runs under.
 static INERT_LIMITS: crate::sandbox::cgroup::Limits = crate::sandbox::cgroup::Limits {
     memory_high: None,
@@ -220,22 +234,18 @@ fn a_build_cage_carries_the_mandatory_seccomp_filters() {
     // package scripts. What decides it is the argument list bubblewrap is handed, so the list is
     // read back from a stand-in that records it. Two commands, because the cages of one list are
     // stood up in sequence and each must be admissible on its own.
-    use std::os::unix::fs::PermissionsExt;
     let tmp = crate::testutil::TmpDir::new();
     let rootfs = tmp.join("rootfs");
     std::fs::create_dir_all(rootfs.join("bin")).unwrap();
     std::fs::write(rootfs.join("bin/sh"), b"").unwrap();
     let dump = tmp.join("argv.txt");
-    let fake = tmp.join("fake-bwrap");
-    std::fs::write(
-        &fake,
-        format!(
-            "#!/bin/sh\nprintf 'CAGE\\n' >> {0}\nprintf '%s\\n' \"$@\" >> {0}\n",
+    let fake = stand_in(
+        tmp.path(),
+        &format!(
+            "printf 'CAGE\\n' >> {0}\nprintf '%s\\n' \"$@\" >> {0}",
             crate::testutil::sh_word(&dump)
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let ca = tmp.join("ca.crt");
     std::fs::write(&ca, b"").unwrap();
@@ -266,22 +276,18 @@ fn a_build_cage_carries_the_mandatory_seccomp_filters() {
 fn a_build_cage_runs_inside_the_resource_limit_scope() {
     // A build is bounded like every other cage. Read from inside the cage rather than off the
     // command line, so what is asserted is the control group the process actually landed in.
-    use std::os::unix::fs::PermissionsExt;
     let tmp = crate::testutil::TmpDir::new();
     let rootfs = tmp.join("rootfs");
     std::fs::create_dir_all(rootfs.join("bin")).unwrap();
     std::fs::write(rootfs.join("bin/sh"), b"").unwrap();
     let seen = tmp.join("cgroup.txt");
-    let fake = tmp.join("fake-bwrap");
-    std::fs::write(
-        &fake,
-        format!(
-            "#!/bin/sh\ncat /proc/self/cgroup > {}\n",
+    let fake = stand_in(
+        tmp.path(),
+        &format!(
+            "cat /proc/self/cgroup > {}",
             crate::testutil::sh_word(&seen)
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let ca = tmp.join("ca.crt");
     std::fs::write(&ca, b"").unwrap();
