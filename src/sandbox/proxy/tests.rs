@@ -103,9 +103,36 @@ fn policy(entries: &[&str]) -> EgressPolicy {
     )
 }
 
+/// How long an upstream stand-in waits for the body a request head declares.
+const DECLARED_BODY_WAIT: Duration = Duration::from_secs(5);
+
+/// The body a request `head` declares by `Content-Length`, read off `reader` — empty when the head
+/// declares none or the body does not arrive whole.
+///
+/// An upstream stand-in reads it before replying even when the test has no use for it. A socket
+/// closed while it still holds received bytes makes Linux send an RST rather than a FIN, and an
+/// RST discards whatever this end had queued to send. When the response just written has not yet
+/// left the socket, it goes with it: the proxy then answers its client that the upstream closed
+/// without a response, and logs that as a second event. It takes a body that reaches the socket
+/// after the read that took the head, and a response still queued at the close, so it depends on
+/// timing. The caller bounds the socket's reads by [`DECLARED_BODY_WAIT`] first, so a body that
+/// never comes fails the test that waits for it rather than hanging it.
+fn read_declared_body(reader: &mut impl Read, head: &str) -> Vec<u8> {
+    let declared = head.lines().find_map(|l| {
+        let (name, value) = l.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())?
+    });
+    let mut body = vec![0; declared.unwrap_or(0)];
+    if reader.read_exact(&mut body).is_err() {
+        body.clear();
+    }
+    body
+}
+
 /// A one-shot loopback TLS "upstream": its own ephemeral CA mints a leaf for `host`; it accepts
-/// one connection, reads the request head, and replies with `response`. Returns its address,
-/// the CA the proxy must trust to validate it, and the join handle.
+/// one connection, reads the request head and the body it declares, and replies with `response`.
+/// Returns its address, the CA the proxy must trust to validate it, and the join handle.
 fn spawn_upstream(
     host: &'static str,
     response: &'static [u8],
@@ -130,15 +157,18 @@ fn spawn_upstream(
         };
         let mut tls = StreamOwned::new(conn, sock);
         let mut br = BufReader::new(&mut tls);
+        let mut head = String::new();
         let mut line = String::new();
         loop {
             line.clear();
             match br.read_line(&mut line) {
                 Ok(0) | Err(_) => return,
                 Ok(_) if line == "\r\n" || line == "\n" => break,
-                Ok(_) => {}
+                Ok(_) => head.push_str(&line),
             }
         }
+        let _ = br.get_ref().sock.set_read_timeout(Some(DECLARED_BODY_WAIT));
+        let _ = read_declared_body(&mut br, &head);
         let _ = tls.write_all(response);
         let _ = tls.flush();
     });
@@ -235,10 +265,9 @@ fn spawn_upstream_capturing_request(
             return;
         };
         let mut tls = StreamOwned::new(conn, sock);
-        let mut head = String::new();
-        let mut body = Vec::new();
-        {
+        let (head, body) = {
             let mut br = BufReader::new(&mut tls);
+            let mut head = String::new();
             let mut line = String::new();
             loop {
                 line.clear();
@@ -248,24 +277,10 @@ fn spawn_upstream_capturing_request(
                     Ok(_) => head.push_str(&line),
                 }
             }
-            let declared = head.lines().find_map(|l| {
-                let (name, value) = l.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())?
-            });
-            if let Some(len) = declared {
-                // Bounded, so a body that never comes fails the test that waits for it rather than
-                // hanging it.
-                let _ = br
-                    .get_ref()
-                    .sock
-                    .set_read_timeout(Some(Duration::from_secs(5)));
-                body.resize(len, 0);
-                if br.read_exact(&mut body).is_err() {
-                    body.clear();
-                }
-            }
-        }
+            let _ = br.get_ref().sock.set_read_timeout(Some(DECLARED_BODY_WAIT));
+            let body = read_declared_body(&mut br, &head);
+            (head, body)
+        };
         let _ = tx.send(head);
         let _ = body_tx.send(body);
         let _ = tls.write_all(response);
@@ -706,7 +721,8 @@ fn read_until_blank(sock: &mut UnixStream) -> io::Result<String> {
 
 /// A one-shot **plaintext** (no TLS) loopback upstream for the `http://` cleartext path: it
 /// accepts one connection, reports the request head it received over a channel (so a test can
-/// assert the proxy forwarded origin-form with `Connection: close`), and replies with `response`.
+/// assert the proxy forwarded origin-form with `Connection: close`), reads the body that head
+/// declares, and replies with `response`.
 fn spawn_plain_upstream(
     response: &'static [u8],
 ) -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
@@ -729,6 +745,8 @@ fn spawn_plain_upstream(
                     Ok(_) => head.push_str(&line),
                 }
             }
+            let _ = br.get_ref().set_read_timeout(Some(DECLARED_BODY_WAIT));
+            let _ = read_declared_body(&mut br, &head);
         }
         let _ = tx.send(head);
         let _ = sock.write_all(response);
@@ -12033,7 +12051,8 @@ fn a_non_capturing_launch_files_nothing() {
         "nothing is captured"
     );
     // The event is still logged — only the traffic is absent.
-    assert_eq!(log.snapshot(None, None, false).events.len(), 1);
+    let events = log.snapshot(None, None, false).events;
+    assert_eq!(events.len(), 1, "{events:?}");
 }
 
 /// A capturing ctx allowing a WebSocket upgrade to `upstream.test`, with the store it files its
