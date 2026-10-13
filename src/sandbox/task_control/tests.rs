@@ -902,6 +902,43 @@ fn a_detached_invocation_is_answered_at_once_and_collected_afterwards() {
     assert_eq!(result.id, started.id, "one id, whichever verb reports it");
 }
 
+/// Ask `RESULT <id>` until `over` accepts the answer, failing on any answer before it that does
+/// not say the invocation is still running.
+///
+/// The window these polls look for is a few statements wide, so they start without pausing. The
+/// busy poll is bounded, though, and then gives the CPU back between polls. On a host with one CPU
+/// free, a poll that never yields takes the time the launcher needs to finish, so the invocation
+/// never ends and a correct tree fails on the deadline. Pausing from the start would cure that and
+/// blind the test instead: the window is narrower than any pause, so polls that sleep step over
+/// it. Spinning first keeps the window in view wherever another CPU runs the command; pausing
+/// afterwards lets the command finish where none does.
+fn poll_result_through_its_end(host: &Path, id: u64, over: impl Fn(&client::RunResult) -> bool) {
+    // How long the poll runs without pausing, and the pause between polls after that.
+    const SPIN_FOR: Duration = Duration::from_millis(100);
+    const PAUSE: Duration = Duration::from_micros(100);
+    let polling_since = std::time::Instant::now();
+    let deadline = polling_since + Duration::from_secs(30);
+    loop {
+        let answer = client::result(host, id).expect("an answer");
+        if over(&answer) {
+            return;
+        }
+        let why = answer.error.as_deref().unwrap_or_default();
+        assert!(
+            why.contains("is still running"),
+            "an invocation that is finishing is still running until what it leaves behind is in \
+             place, and nothing else is true of it — answered instead: {why:?}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the invocation never finished"
+        );
+        if polling_since.elapsed() >= SPIN_FOR {
+            std::thread::sleep(PAUSE);
+        }
+    }
+}
+
 /// An invocation that is finishing is never reported as one that never existed.
 ///
 /// The run releases its registry entry and stores its result at two different moments, and the
@@ -910,24 +947,15 @@ fn a_detached_invocation_is_answered_at_once_and_collected_afterwards() {
 /// So the only answer this loop tolerates before the result is that the invocation is still
 /// running, which is the answer a caller retries on.
 ///
-/// It polls without sleeping and runs the shortest command there is, because the window it is
-/// looking for is two statements wide, and it repeats the whole invocation because landing in
-/// those two statements is a matter of chance. One attempt catches the defect often enough to
-/// prove it exists and rarely enough to be no guard at all; the repetition is what turns that
-/// into a test. It cannot fail the other way: while the registration is held, "still running"
-/// is a true answer, so a correct tree has nothing here to trip on.
-///
-/// The busy poll is bounded, though, and then gives the CPU back between polls. On a host with
-/// one CPU free, a poll that never yields takes the time the launcher needs to finish, so the
-/// invocation never produces a result and a correct tree fails on the deadline. Pausing from the
-/// start would cure that and blind the test instead: the window is narrower than any pause, so
-/// polls that sleep step over it. Spinning first keeps the window in view wherever another CPU
-/// runs the command; pausing afterwards lets the command finish where none does.
+/// It polls through [`poll_result_through_its_end`] and runs the shortest command there is,
+/// because the window it is looking for is two statements wide, and it repeats the whole
+/// invocation because landing in those two statements is a matter of chance. One attempt catches
+/// the defect often enough to prove it exists and rarely enough to be no guard at all; the
+/// repetition is what turns that into a test. It cannot fail the other way: while the
+/// registration is held, "still running" is a true answer, so a correct tree has nothing here to
+/// trip on.
 #[test]
 fn a_finishing_invocation_is_never_reported_as_one_that_never_ran() {
-    // How long each attempt polls without pausing, and the pause between polls after that.
-    const SPIN_FOR: Duration = Duration::from_millis(100);
-    const PAUSE: Duration = Duration::from_micros(100);
     let Some((_data, plane, _script)) = plane_with_launcher("printf 'done\n'\n") else {
         skip_incapable!("skipping: bash, socat or head is not on PATH");
         return;
@@ -945,27 +973,60 @@ fn a_finishing_invocation_is_never_reported_as_one_that_never_ran() {
             started.error, None,
             "the invocation must have been admitted"
         );
+        poll_result_through_its_end(&host, started.id, |answer| answer.error.is_none());
+    }
+}
 
-        let polling_since = std::time::Instant::now();
-        let deadline = polling_since + Duration::from_secs(30);
-        loop {
-            let answer = client::result(&host, started.id).expect("an answer");
-            let Some(why) = answer.error.as_deref() else {
-                break;
-            };
-            assert!(
-                why.contains("is still running"),
-                "an invocation between its last statement and its stored result is still \
-                 running, and nothing else is true of it — answered instead: {why:?}"
-            );
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the invocation never produced a result"
-            );
-            if polling_since.elapsed() >= SPIN_FOR {
-                std::thread::sleep(PAUSE);
-            }
-        }
+/// A foreground invocation that is finishing is never reported as one that never existed.
+///
+/// The same window through the other door: a foreground run releases its registry entry and
+/// records its log line at two different moments, and `RESULT`, `INFO` and `STOP` all read the
+/// registry first and the log second. Caught in between, the invocation is neither running nor
+/// recorded, and each of them says there is no such invocation — to a person who read its id off
+/// `sbx task status` a moment earlier. So the only answer tolerated before the one a finished
+/// foreground invocation gets is that it is still running.
+///
+/// A foreground caller learns its id only with the answer, so the test reads it from `STATUS`
+/// while the launcher waits on a file, and creates the file once it has.
+#[test]
+fn a_finishing_foreground_invocation_is_never_reported_as_one_that_never_ran() {
+    let Some((data, plane, _script)) = plane_with_launcher(
+        "gate=\"${0%/*}/gate\"\nwhile [ ! -e \"$gate\" ]; do sleep 0.01; done\nprintf 'done\\n'\n",
+    ) else {
+        skip_incapable!("skipping: bash, socat or head is not on PATH");
+        return;
+    };
+    let host = plane.log_socket.clone();
+    let gate = data.path().join("gate");
+    for _ in 0..10 {
+        let cage = plane.cage_socket.clone();
+        let caller = std::thread::spawn(move || {
+            client::run(
+                &cage,
+                "probe",
+                &BTreeMap::from([("sql".to_string(), AWKWARD.to_string())]),
+                &BTreeMap::new(),
+            )
+        });
+        let id = eventually(|| {
+            read_status(&host)
+                .expect("status")
+                .first()
+                .map(|row| row.id)
+        })
+        .expect("the foreground invocation must be visible while it runs");
+        std::fs::write(&gate, "").expect("open the gate");
+        poll_result_through_its_end(&host, id, |answer| {
+            answer
+                .error
+                .as_deref()
+                .is_some_and(|why| why.contains("did not run detached"))
+        });
+        caller
+            .join()
+            .expect("the caller thread")
+            .expect("the caller's answer");
+        std::fs::remove_file(&gate).expect("close the gate");
     }
 }
 
