@@ -449,6 +449,31 @@ fn the_task_pool_rolls_only_project_wide_and_only_when_a_task_declares_a_tool() 
     );
 }
 
+/// The task pool's line lands on the groups' column even when every group is named shorter than
+/// it: the column is the widest name's, the pool's counted among them whenever it has a line.
+#[test]
+fn the_task_pool_line_aligns_with_groups_named_shorter_than_it() {
+    let group = |name: &str| MiseGroup {
+        home: GroupHome::ProjectApp(name.to_string()),
+        cfg: crate::testutil::resolved_channels(None, None),
+        tokens: vec![],
+    };
+    let groups = [group("kilo"), group("ab")];
+    let pal = crate::style::Palette::plain();
+    let width = report_width(&groups, true);
+    let column = |name: &str| roll_line(name, width, "STATUS", &pal).find("STATUS");
+    assert_eq!(
+        column("kilo"),
+        column(TASK_POOL),
+        "the pool's status must land on the groups' column"
+    );
+    assert_eq!(
+        report_width(&groups, false),
+        "kilo".len(),
+        "without a pool line, the widest group sets the column"
+    );
+}
+
 /// The roll report's pool line must quote whichever stream carried the diagnostic.
 ///
 /// mise wraps backends (`npm`, `pipx`) that report a resolution failure on stdout while mise's own

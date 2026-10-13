@@ -306,11 +306,7 @@ pub(crate) fn upgrade_mise_packages(
     // Every group name is known up front, so the result lines are dot-leader aligned to one column
     // even though each prints live (as its cage finishes) to keep progress visible over a long
     // multi-app roll. A closing recap then names exactly which apps advanced.
-    let width = groups
-        .iter()
-        .map(|g| g.home.name().chars().count())
-        .max()
-        .unwrap_or(0);
+    let width = report_width(&groups, pool);
 
     let mut ok = true;
     let mut rolled: Vec<String> = Vec::new();
@@ -498,26 +494,21 @@ pub(crate) fn upgrade_mise_packages(
             Ok(true) => {
                 outln!(
                     "{}",
-                    roll_line("task pool", width.max(9), &format!("{ok_c}rolled{r}"), pal)
+                    roll_line(TASK_POOL, width, &format!("{ok_c}rolled{r}"), pal)
                 );
-                rolled.push("task pool".to_string());
+                rolled.push(TASK_POOL.to_string());
             }
             Ok(false) => {
                 outln!(
                     "{}",
-                    roll_line(
-                        "task pool",
-                        width.max(9),
-                        &format!("{dim}nothing to roll{r}"),
-                        pal
-                    )
+                    roll_line(TASK_POOL, width, &format!("{dim}nothing to roll{r}"), pal)
                 );
                 up_to_date += 1;
             }
             Err(e) => {
                 outln!(
                     "{}",
-                    roll_line("task pool", width.max(9), &format!("{warn}{e}{r}"), pal)
+                    roll_line(TASK_POOL, width, &format!("{warn}{e}{r}"), pal)
                 );
                 failed += 1;
                 ok = false;
@@ -561,12 +552,7 @@ fn check_mise_packages(
     pal: &crate::style::Palette,
 ) -> bool {
     let (warn, dim, r, ok_c) = (pal.warn, pal.dim, pal.reset, pal.ok);
-    let width = groups
-        .iter()
-        .map(|g| g.home.name().chars().count())
-        .chain(has_pool.then_some("task pool".len()))
-        .max()
-        .unwrap_or(0);
+    let width = report_width(&groups, has_pool);
     let mut ok = true;
     let mut behind: Vec<String> = Vec::new();
     let layout = crate::store::Layout::from_env();
@@ -669,7 +655,7 @@ fn check_mise_packages(
         outln!(
             "{}",
             roll_line(
-                "task pool",
+                TASK_POOL,
                 width,
                 &format!("{dim}not checked by a dry run — `sbx upgrade mise` rolls it{r}"),
                 pal
@@ -1263,6 +1249,21 @@ fn token_names_app(token: &str, name: &str) -> bool {
 /// roll finds every tool already current. Pure — unit-tested against real mise output.
 fn mise_up_to_date(captured: &str) -> bool {
     captured.contains("up to date")
+}
+
+/// The name the declared operations' tool pool goes by in the `mise:` roll report.
+const TASK_POOL: &str = "task pool";
+
+/// The column the `mise:` roll report aligns its statuses on: the widest of the group names and,
+/// when the report has a line for the task pool, of [`TASK_POOL`]. One answer for the roll and its
+/// dry run, so every line of either report lands on the same column.
+fn report_width(groups: &[MiseGroup], pool: bool) -> usize {
+    groups
+        .iter()
+        .map(|g| g.home.name().chars().count())
+        .chain(pool.then_some(TASK_POOL.chars().count()))
+        .max()
+        .unwrap_or(0)
 }
 
 /// One dot-leader-aligned result line for the `mise:` roll report: the group `name`, a run of dots
