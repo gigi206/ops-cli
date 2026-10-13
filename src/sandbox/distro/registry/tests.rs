@@ -45,6 +45,102 @@ fn a_digest_is_computed_over_the_bytes_that_came_back() {
     assert_ne!(digest_of(b"{}"), digest_of(b"{ }"));
 }
 
+/// Whether `e` says the registry was never heard from, or answered only that this is a bad moment.
+///
+/// The tests below run against a real registry, and only the network's failures are theirs to skip.
+/// Everything else is asserted: a `401`, a `404` or a manifest that does not hash to its pin is the
+/// registry's verdict on what this client sent, and reading it as a bad network turns the
+/// regressions these tests exist for into green runs. A cause this does not recognise is asserted
+/// too, so a message reworded in [`http`] fails the first run that meets it rather than skipping
+/// every run after.
+///
+/// What a registry that was not heard from looks like, as this module's client reports it:
+/// - the socket's own error, with its kind: a reset, an early close, or the read timeout, which
+///   Linux reports as `WouldBlock`;
+/// - `resolving …` and `connecting to …`, which [`http`] wraps the name lookup and the connection
+///   in;
+/// - `no complete response head …`, which any failure while a response head was arriving becomes;
+/// - `answered` with `408`, `429` or a `5xx`, the statuses about the moment rather than the
+///   request, as `tests/common`'s `transient_fetch_failure` splits them for nix's downloads.
+fn transient(e: &io::Error) -> bool {
+    if matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+    ) {
+        return true;
+    }
+    let text = e.to_string();
+    ["resolving ", "connecting to ", "no complete response head "]
+        .iter()
+        .any(|shape| text.starts_with(shape))
+        || answered(e).is_some_and(|status| matches!(status, 408 | 429 | 500..=599))
+}
+
+/// The status in an `… answered <status> …` error, the shape in which [`resolve`], [`token`] and
+/// [`http::get_to_writer`] refuse an answer they received.
+fn answered(e: &io::Error) -> Option<u16> {
+    let text = e.to_string();
+    let (_, after) = text.split_once(" answered ")?;
+    after.get(..3)?.parse().ok()
+}
+
+#[test]
+fn a_registry_never_heard_from_is_told_apart_from_one_that_answered() {
+    // The client's own errors, through its real paths: a port nothing listens on, and a peer that
+    // accepts and closes before the TLS handshake is done.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    let port = listener.local_addr().expect("a bound port").port();
+    let closer = std::thread::spawn(move || drop(listener.accept()));
+    let Err(closed) = http::get(&format!("https://127.0.0.1:{port}/v2/"), &[]) else {
+        panic!("the peer closed without answering, and a response came back");
+    };
+    // A client that failed before it connected leaves the peer waiting in `accept`: one connection
+    // here ends that wait, and is refused when the peer has already gone.
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+    closer.join().expect("the closing peer");
+    assert!(transient(&closed), "{closed}");
+    let Err(refused) = http::get(&format!("https://127.0.0.1:{port}/v2/"), &[]) else {
+        panic!("nothing listens on the port any more, and a response came back");
+    };
+    assert!(transient(&refused), "{refused}");
+
+    // The shapes the network's failures and the moment's statuses take in this module's errors.
+    assert!(transient(&io::Error::from(io::ErrorKind::WouldBlock)));
+    for unheard in [
+        "resolving registry-1.docker.io:443: failed to lookup address information: Temporary \
+         failure in name resolution",
+        "connecting to registry-1.docker.io:443: Network is unreachable (os error 101)",
+        "no complete response head from registry-1.docker.io",
+        "registry-1.docker.io answered 429 for docker.io/library/alpine:3.22",
+        "token endpoint answered 503 (no `distro` credential is configured)",
+        "https://registry-1.docker.io/v2/library/alpine/blobs/sha256:0 answered 502",
+    ] {
+        assert!(transient(&io::Error::other(unheard)), "{unheard}");
+    }
+
+    // A verdict on what the client sent, or on what came back, is never the network's.
+    for verdict in [
+        "registry-1.docker.io answered 401 for docker.io/library/alpine:3.22",
+        "https://registry-1.docker.io/v2/library/alpine/blobs/sha256:0 answered 404",
+        "registry-1.docker.io served a manifest hashing to sha256:0 for the pin sha256:1",
+        "layer sha256:0 came back as sha256:1",
+        "docker.io/library/alpine:3.22 carries no linux/amd64 image",
+    ] {
+        assert!(!transient(&io::Error::other(verdict)), "{verdict}");
+    }
+    let malformed = io::Error::new(
+        io::ErrorKind::InvalidData,
+        "a malformed header line from registry-1.docker.io",
+    );
+    assert!(!transient(&malformed), "{malformed}");
+}
+
 /// One `alpine:3.22` index, named by digest. It is deliberately not what that tag resolves to
 /// today: a tag moves whenever Alpine republishes a patch release, while a digest names one
 /// document for as long as the registry keeps it, which is what a by-digest pin has to be tested
@@ -135,21 +231,12 @@ fn a_layer_is_verified_against_its_digest_as_it_lands() {
     };
     let err =
         fetch_layer(&image, &wrong, dir.path(), None).expect_err("a mismatched digest is refused");
-    // Only a registry that answered can refuse, and a connection that dropped carries no verdict
-    // to read: the error is the socket's, not the registry's, and asserting the refusal's wording
-    // against it reports a broken client where there was a broken connection. That is what the two
-    // fetches above skip on, so it is what this skips on too — the refusal itself stays asserted
-    // for every answer that did arrive.
-    if matches!(
-        err.kind(),
-        io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::UnexpectedEof
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::TimedOut
-    ) {
-        skip_unreachable!("skipping the refusal check: the connection dropped before an answer");
+    // Only a registry that answered can refuse, and a registry never heard from carries no verdict
+    // to read: the error is the network's, and asserting the refusal's wording against it reports
+    // a broken client where there was a broken connection. The refusal itself stays asserted for
+    // every answer that did arrive.
+    if transient(&err) {
+        skip_unreachable!("skipping the refusal check: no verdict came back: {err}");
         return;
     }
     assert!(
