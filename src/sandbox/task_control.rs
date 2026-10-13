@@ -1208,7 +1208,8 @@ fn serve_detach(
     // the result exists: an invocation in that window reads as neither running nor holding a
     // result, and `RESULT <id>` answers "no invocation" or "its result is no longer held", which
     // are both false and both terminal to a caller that asks once. Held, the worst answer in the
-    // window is "still running".
+    // window is "still running" — as long as the reader takes the two in the reverse order, which
+    // [`serve_result`] does.
     let mut admitted = admitted;
     let live = admitted.hold_registration();
     {
@@ -1240,6 +1241,13 @@ fn serve_detach(
 }
 
 /// Answer `RESULT <id>` — the held result, or which of the four other things is true instead.
+///
+/// Whether the invocation is running is read **before** its result, because that is the reverse of
+/// the order a detached run publishes them in: it stores the result, then releases its
+/// registration. So a detached invocation seen not running already has its result stored, and a
+/// result missing after that read was evicted. Read the other way round, an invocation that
+/// finished between the two reads had no result yet and was no longer registered, and was answered
+/// as one whose result had been evicted — false, and final to a caller that asks once.
 fn serve_result(
     writer: &mut UnixStream,
     engine: &TaskEngine,
@@ -1247,6 +1255,7 @@ fn serve_result(
     results: &TaskResults,
     id: u64,
 ) -> io::Result<()> {
+    let running = engine.running().iter().any(|row| row.id == id);
     match results.get(id) {
         Some(Ok(outcome)) => return write_outcome(writer, id, &outcome),
         Some(Err(reason)) => {
@@ -1257,7 +1266,7 @@ fn serve_result(
         }
         None => {}
     }
-    let reason = if engine.running().iter().any(|row| row.id == id) {
+    let reason = if running {
         format!("invocation {id} is still running")
     } else {
         match log.entry(id) {
