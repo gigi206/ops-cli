@@ -511,14 +511,8 @@ fn sync_filesystem_of(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Refuse a tree that does not carry what a distribution has to supply.
-///
-/// The paths in [`crate::sandbox::binds::DISTRO_SUPPLIED`] are the ones sbx stops emitting once an
-/// image is in force, and every one of them is a symlink or the ELF interpreter — neither of which
-/// can be created at launch, because bubblewrap makes them at a destination whose parent is the
-/// image's own read-only tree (`Can't make symlink at …: Read-only file system`). So an image
-/// missing one leaves a cage without it, and the failure would surface much later as an exec error
-/// naming a path nobody declared. Refusing here names the image and every path it lacks.
+/// Whether the image whose root is `root` carries `path`, an absolute path in it, and `image` how
+/// a failure names that image.
 ///
 /// A path is missing when looking it up says it is not there (`ENOENT`, or `ENOTDIR` for a parent
 /// that is a file). Any other failure is not an answer about the image, and is reported as itself
@@ -527,51 +521,62 @@ fn sync_filesystem_of(path: &Path) -> io::Result<()> {
 /// Looked up as the cage will see it: everything but the last component is resolved beneath the
 /// image's root ([`crate::sandbox::attach::open_in_root`]), so a link the image carries reads
 /// `..` and an absolute target as the image's, never the host's, and the last component is looked
-/// at without following it, a link there being the image's business. Resolved on the host, an
-/// image with no loader passed through the host's own `/usr/lib64`, and a valid one whose `lib64`
-/// names `/opt/…` was refused on a host without that directory. A kernel without `openat2` cannot
-/// resolve this way, and the check refuses rather than resolving on the host.
-fn check_supplied(rootfs: &Path, locator: &str) -> io::Result<()> {
+/// at without following it, a link there being the image's business. Resolved on the host instead,
+/// an image with no loader would pass through the host's own `/usr/lib64`, and a valid one whose
+/// `lib64` names `/opt/…` would be refused on a host without that directory. A kernel without
+/// `openat2` cannot resolve this way, and the lookup fails rather than resolving on the host.
+pub(super) fn carries(root: &std::os::fd::OwnedFd, path: &str, image: &str) -> io::Result<bool> {
     const DIR: libc::c_int = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let relative = Path::new(path.trim_start_matches('/'));
+    let parent = relative
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let looked = crate::sandbox::attach::open_in_root(root, parent, DIR).and_then(|dir| {
+        crate::sandbox::attach::lstat_at(&dir, relative.file_name().unwrap_or_default())
+    });
+    match looked {
+        Ok(_) => Ok(true),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => {
+            Err(io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot look up `{path}` in {image} as the cage will see it: this kernel does \
+                     not resolve a path beneath a root (`openat2`, Linux 5.6): {e}"
+                ),
+            ))
+        }
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("cannot look up `{path}` in {image}: {e}"),
+        )),
+    }
+}
+
+/// Refuse a tree that does not carry what a distribution has to supply.
+///
+/// The paths in [`crate::sandbox::binds::DISTRO_SUPPLIED`] are the ones sbx stops emitting once an
+/// image is in force, and every one of them is a symlink or the ELF interpreter — neither of which
+/// can be created at launch, because bubblewrap makes them at a destination whose parent is the
+/// image's own read-only tree (`Can't make symlink at …: Read-only file system`). So an image
+/// missing one leaves a cage without it, and the failure would surface much later as an exec error
+/// naming a path nobody declared. Refusing here names the image and every path it lacks, each
+/// looked up as the cage will see it ([`carries`]).
+fn check_supplied(rootfs: &Path, locator: &str) -> io::Result<()> {
     let root = crate::sandbox::attach::open_dir_path(rootfs)?;
+    let image = format!("the image `{locator}`");
     let mut missing: Vec<&str> = Vec::new();
     for p in crate::sandbox::binds::DISTRO_SUPPLIED.iter().copied() {
-        let relative = Path::new(p.trim_start_matches('/'));
-        let parent = relative
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let looked = crate::sandbox::attach::open_in_root(&root, parent, DIR)
-            .and_then(|dir| {
-                crate::sandbox::attach::lstat_at(&dir, relative.file_name().unwrap_or_default())
-            })
-            .map(|_| ());
-        match looked {
-            Ok(()) => {}
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) =>
-            {
-                missing.push(p)
-            }
-            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => {
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!(
-                        "cannot look up `{p}` in the image `{locator}` as the cage will see it: \
-                         this kernel does not resolve a path beneath a root (`openat2`, Linux \
-                         5.6): {e}"
-                    ),
-                ));
-            }
-            Err(e) => {
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!("cannot look up `{p}` in the image `{locator}`: {e}"),
-                ));
-            }
+        if !carries(&root, p, &image)? {
+            missing.push(p);
         }
     }
     if missing.is_empty() {
