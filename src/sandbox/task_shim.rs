@@ -281,9 +281,12 @@ run_task() {{
             printf 'run\n'
         }} | "$socat" -t "$wait_for_answer" - "UNIX-CONNECT:$sock" 2>/dev/null
     )
+    # The process above, whose status is socat's: read below only when the answer is incomplete.
+    local plane=$!
 
-    local line complete=0 code=0 redacted=0 truncated=0 timed_out=0 stopped=0 elapsed=0 nonce='' refused='' output=''
+    local line heard=0 complete=0 code=0 redacted=0 truncated=0 timed_out=0 stopped=0 elapsed=0 nonce='' refused='' output=''
     while IFS= read -r -u 3 line; do
+        heard=1
         case $line in
             ok) complete=1; break ;;
             'err '*)
@@ -308,8 +311,20 @@ run_task() {{
     done
     exec 3<&-
     # A response that stopped before `ok` was cut short; reporting the command's exit code from a
-    # truncated answer would be inventing a result.
-    [ "$complete" = 1 ] || truncated_answer
+    # truncated answer would be inventing a result. Unless none of it ever came: `$socat` exits 1 on
+    # a connect that does not happen (a missing socket, a refused one, a plane that reset before it
+    # read the request) and 0 on a plane that read the request and then closed, so an exit of 1 and
+    # not a byte of answer mean nothing ran, which is what the host says too. Exactly 1: a `$socat`
+    # killed by a signal may have been killed after the request was sent, and the operation it asked
+    # for may have run. A last line without its newline is read into `line` as `read` reports the end.
+    if [ "$complete" != 1 ]; then
+        [ -n "$line" ] && heard=1
+        if [ "$heard" = 0 ]; then
+            wait "$plane"
+            [ "$?" = 1 ] && unreachable
+        fi
+        truncated_answer
+    fi
 
     [ "$timed_out" = 1 ] &&
         printf 'sbx: warning: the operation was killed at its timeout after %sms\n' "$elapsed" >&2
@@ -541,12 +556,18 @@ mod tests {
     /// and prints `reply` — so the parts of this client that are logic rather than plumbing can be
     /// run rather than only read. Returns the client's path and the directory holding both.
     fn client_answering(reply: &str) -> (crate::testutil::TmpDir, PathBuf) {
+        client_answering_with(reply, 0)
+    }
+
+    /// [`client_answering`], with the stub then exiting `status`, as socat does when it could not
+    /// connect (1) or when the far end closed (0).
+    fn client_answering_with(reply: &str, status: i32) -> (crate::testutil::TmpDir, PathBuf) {
         let dir = crate::testutil::TmpDir::new();
         let socat = dir.path().join("socat");
         std::fs::write(
             &socat,
             format!(
-                "#!/bin/sh\ncat >/dev/null\nprintf '%s' {}\n",
+                "#!/bin/sh\ncat >/dev/null\nprintf '%s' {}\nexit {status}\n",
                 quote_sh(reply)
             ),
         )
@@ -673,6 +694,53 @@ mod tests {
             }
         }
         assert!(misread.is_empty(), "{misread:#?}");
+    }
+
+    /// A run whose socat failed before a byte of the answer arrived never reached the plane, and
+    /// nothing ran: it says so, as the host does when its connect fails. One whose answer stopped
+    /// after the plane had it — socat ending cleanly with nothing said, or failing once something
+    /// had arrived — may well have run, and says that instead, as does one whose socat was killed,
+    /// which can happen after the request was sent. Measured on socat: a missing socket, a refused
+    /// connect and a plane reset before it read the request exit 1; a plane that read the request and
+    /// then closed or died exits 0; a socat sent `SIGTERM` while it waited exits 143.
+    #[test]
+    fn a_run_tells_a_plane_it_never_reached_from_an_answer_cut_short() {
+        let shapes = [
+            (
+                "nothing arrived and socat failed",
+                "",
+                1,
+                "cannot reach the task plane",
+            ),
+            ("nothing arrived and socat ended", "", 0, "stopped early"),
+            (
+                "a line arrived and socat failed",
+                "exit 0\n",
+                1,
+                "stopped early",
+            ),
+            (
+                "part of a line arrived and socat failed",
+                "exi",
+                1,
+                "stopped early",
+            ),
+            (
+                "nothing arrived and socat was killed",
+                "",
+                143,
+                "stopped early",
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (shape, reply, status, says) in shapes {
+            let (_dir, client) = client_answering_with(reply, status);
+            let (code, _, err) = run_client(&client, &["task", "run", "build"]);
+            if code != 1 || !err.contains(says) {
+                wrong.push(format!("{shape}: exit {code}, {err}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// An empty inventory and a filter that matched nothing are different answers, and only the
