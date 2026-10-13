@@ -1312,37 +1312,56 @@ fn cage_frame_budget(spec: &crate::plugins::broker::BrokerSpec) -> std::time::Du
     spec.host_deadline.min(CAGE_FIRST_FRAME)
 }
 
-/// The cage's next frame after its first, or `None` once the connection is done: as long as the
-/// cage likes to begin it, then [`cage_frame_budget`] to finish it. A frame cut short by that
-/// budget ends the connection, as a malformed one does.
+/// What a connection holds once its plugin and its host connection stand, for the report of a
+/// frame the cage did not send in time.
+const HELD_BY_AN_EXCHANGE: &str = "a plugin process, a connection to the host resource, a thread and one of the broker's \
+     connection slots";
+
+/// The cage's next frame after its first, or `Ok(None)` once the connection is done: as long as
+/// the cage likes to begin it, then [`cage_frame_budget`] to finish it.
+///
+/// The same two answers [`cage_first_frame`] gives, on the same rule. A close, or something that
+/// is not a frame, is a client done with us and passes in silence. `Err` is a frame begun and left
+/// unfinished until the budget ran out, which held everything [`HELD_BY_AN_EXCHANGE`] names for
+/// that long, and is therefore reported: the caller records it as a request refused, since none
+/// reached the host resource, and ends the connection.
 fn cage_next_frame(
     cage_r: &mut io::BufReader<std::os::unix::net::UnixStream>,
     cage: &std::os::unix::net::UnixStream,
     spec: &crate::plugins::broker::BrokerSpec,
     typed: bool,
-) -> Option<Vec<u8>> {
+) -> Result<Option<Vec<u8>>, String> {
     use std::io::BufRead as _;
     loop {
         match cage_r.fill_buf() {
-            Ok([]) => return None,
+            Ok([]) => return Ok(None),
             Ok(_) => break,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return None,
+            Err(_) => return Ok(None),
         }
     }
     // The socket timeout bounds each read and the deadline the whole frame: the deadline is asked
     // before each read, so without the timeout a cage that stops sending would block the read that
     // follows before the deadline is consulted again.
     let budget = cage_frame_budget(spec);
+    let deadline = std::time::Instant::now() + budget;
     let _ = cage.set_read_timeout(Some(budget));
     let frame = read_frame(
-        &mut super::deadline::Deadlined::new(cage_r, std::time::Instant::now() + budget),
+        &mut super::deadline::Deadlined::new(cage_r, deadline),
         spec.framing,
         spec.max_frame,
         typed,
     );
     let _ = cage.set_read_timeout(None);
-    frame.ok().flatten()
+    match frame {
+        Ok(frame) => Ok(frame),
+        // A failed read with the budget spent is a read the budget ended, as on the first frame.
+        Err(_) if std::time::Instant::now() >= deadline => Err(format!(
+            "a request the cage began and did not finish within {budget:?}; the connection was \
+             closed, and it was holding {HELD_BY_AN_EXCHANGE}"
+        )),
+        Err(_) => Ok(None),
+    }
 }
 
 /// A running broker's host-side resources. The accept loop is detached and dies with sbx; this
@@ -1925,13 +1944,7 @@ fn serve_exchanges(
     // saying nothing is the one sbx does not trust.
     let mut pending = Some(match first {
         Some(frame) => frame,
-        None => match cage_first_frame(
-            &mut cage_r,
-            &cage_w,
-            spec,
-            "a plugin process, a connection to the host resource, a thread and one of the broker's \
-             connection slots",
-        )? {
+        None => match cage_first_frame(&mut cage_r, &cage_w, spec, HELD_BY_AN_EXCHANGE)? {
             Some(frame) => frame,
             None => return Ok(()),
         },
@@ -1940,11 +1953,17 @@ fn serve_exchanges(
     loop {
         let frame = match pending.take() {
             Some(frame) => frame,
-            // A clean end, a frame that is not one, or one cut short by its budget: either way
-            // the client is done with us.
+            // A clean end, or a frame that is not one: the client is done with us. A frame left
+            // unfinished past its budget is a request refused, recorded and said, and the end of
+            // the connection.
             None => match cage_next_frame(&mut cage_r, &cage_w, spec, cage_typed) {
-                Some(f) => f,
-                None => return Ok(()),
+                Ok(Some(f)) => f,
+                Ok(None) => return Ok(()),
+                Err(why) => {
+                    ring.push(super::broker_control::BrokerKind::Refuse, name, &why, None);
+                    crate::diag::warn(&format!("broker `{name}`: {why}"));
+                    return Ok(());
+                }
             },
         };
         seq += 1;
@@ -4118,6 +4137,63 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             seen,
             Some(vec![b"first".to_vec()]),
             "the first frame was relayed and the half-sent one let the connection go"
+        );
+    }
+
+    /// A frame the cage begins after its first and does not finish within the budget is reported,
+    /// as a first frame it never sends is ([`cage_first_frame`]): both held a thread, a slot, a
+    /// plugin and a connection to the host resource for nothing. A frame that is not one ends the
+    /// connection without a word, as it does on the first frame, since that is a client done with
+    /// us rather than one costing the session anything.
+    #[test]
+    fn a_frame_left_half_sent_is_reported_and_a_malformed_one_is_not() {
+        let mut spec = spec(None);
+        spec.host_deadline = std::time::Duration::from_millis(200);
+        let ring = super::super::broker_control::BrokerRing::new(8);
+
+        let (cage, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let mut client = theirs;
+        write_frame(&mut client, spec.framing, b"first", false).expect("first frame");
+        client
+            .write_all(&[0, 0])
+            .expect("half of the next frame's length");
+        let mut plugin = ScriptedPlugin::new(vec![ScriptedPlugin::forward()]);
+        let mut host = FakeHost::with(vec![vec![0xa1]]);
+        serve_exchanges(&spec, &mut plugin, &mut host, cage, &ring, None, "x", None)
+            .expect("served, then ended");
+        drop(client);
+        assert_eq!(host.seen, vec![b"first".to_vec()]);
+        let refused: Vec<_> = ring
+            .snapshot(None)
+            .events
+            .into_iter()
+            .filter(|e| e.kind == super::super::broker_control::BrokerKind::Refuse)
+            .collect();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].detail.contains("did not finish"),
+            "{:?}",
+            refused[0].detail
+        );
+
+        let ring = super::super::broker_control::BrokerRing::new(8);
+        let (cage, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let mut client = theirs;
+        write_frame(&mut client, spec.framing, b"first", false).expect("first frame");
+        client
+            .write_all(&[0xff, 0xff, 0xff, 0xff])
+            .expect("a length no frame of this broker can have");
+        let mut plugin = ScriptedPlugin::new(vec![ScriptedPlugin::forward()]);
+        let mut host = FakeHost::with(vec![vec![0xa1]]);
+        serve_exchanges(&spec, &mut plugin, &mut host, cage, &ring, None, "x", None)
+            .expect("served, then ended");
+        drop(client);
+        let events = ring.snapshot(None).events;
+        assert!(
+            events
+                .iter()
+                .all(|e| e.kind != super::super::broker_control::BrokerKind::Refuse),
+            "a frame that is not one ends the connection without a record: {events:?}"
         );
     }
 
