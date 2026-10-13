@@ -79,7 +79,13 @@ fn transient(e: &io::Error) -> bool {
     ["resolving ", "connecting to ", "no complete response head "]
         .iter()
         .any(|shape| text.starts_with(shape))
-        || answered(e).is_some_and(|status| matches!(status, 408 | 429 | 500..=599))
+        || answered(e).is_some_and(momentary)
+}
+
+/// Whether `status` is about the moment rather than the request: a timeout, a rate limit, or a
+/// registry that is failing.
+fn momentary(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500..=599)
 }
 
 /// The status in an `… answered <status> …` error, the shape in which [`resolve`], [`token`] and
@@ -162,27 +168,51 @@ const ALPINE_3_22: &str = "sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68af
 fn a_tag_resolves_to_the_digest_the_registry_itself_reports() {
     let image = reference::parse("oci:docker.io/library/alpine:3.22").unwrap();
     let url = v2_url(&image, "manifests", "3.22");
-    let Ok(served) = get_authenticated(&url, Some(MANIFEST_ACCEPT), None) else {
-        skip_unreachable!("skipping the registry resolve: the registry did not answer");
-        return;
+    let served = match get_authenticated(&url, Some(MANIFEST_ACCEPT), None) {
+        Ok(served) => served,
+        Err(e) if transient(&e) => {
+            skip_unreachable!("skipping the registry resolve: no verdict came back: {e}");
+            return;
+        }
+        Err(e) => panic!("fetching the manifest failed, and not on the network: {e}"),
     };
-    if served.status != 200 {
-        skip_unreachable!("skipping the registry resolve: the registry did not serve the manifest");
+    if momentary(served.status) {
+        skip_unreachable!(
+            "skipping the registry resolve: the registry answered {}",
+            served.status
+        );
         return;
     }
-    let Some(advertised) = served.header("docker-content-digest").map(str::to_string) else {
-        skip_unreachable!("skipping the registry resolve: the registry advertised no digest");
-        return;
-    };
+    assert_eq!(
+        served.status, 200,
+        "the registry serves the manifest a tag names"
+    );
+    let advertised = served
+        .header("docker-content-digest")
+        .expect("a registry states the digest of the manifest it serves")
+        .to_string();
     assert_eq!(
         digest_of(&served.body),
         advertised,
         "the manifest is hashed the way the registry that served it hashes it"
     );
 
-    let Ok(resolved) = resolve(&image, None) else {
-        skip_unreachable!("skipping the registry resolve: the registry did not answer");
-        return;
+    // The tag names an index, so resolving it fetches the platform manifest behind it by digest:
+    // this is the test that exercises a by-digest URL against a document the registry still holds.
+    let document: serde_json::Value =
+        serde_json::from_slice(&served.body).expect("the manifest is a JSON document");
+    assert!(
+        document.get("manifests").is_some(),
+        "`alpine:3.22` names an index"
+    );
+
+    let resolved = match resolve(&image, None) {
+        Ok(resolved) => resolved,
+        Err(e) if transient(&e) => {
+            skip_unreachable!("skipping the registry resolve: no verdict came back: {e}");
+            return;
+        }
+        Err(e) => panic!("resolving `alpine:3.22` failed, and not on the network: {e}"),
     };
     assert_eq!(
         resolved.digest, advertised,
@@ -200,9 +230,24 @@ fn a_digest_locator_is_checked_against_the_bytes_the_registry_serves() {
     // Resolving by digest proves the pin rather than trusting it: the manifest that comes back is
     // hashed and compared, so a registry serving something else fails here.
     let image = reference::parse(&format!("oci:docker.io/library/alpine@{ALPINE_3_22}")).unwrap();
-    let Ok(resolved) = resolve(&image, None) else {
-        skip_unreachable!("skipping the resolve by digest: the registry did not answer");
-        return;
+    let resolved = match resolve(&image, None) {
+        Ok(resolved) => resolved,
+        Err(e) if transient(&e) => {
+            skip_unreachable!("skipping the resolve by digest: no verdict came back: {e}");
+            return;
+        }
+        // A registry keeps a document only as long as it chooses to, and this one is no longer what
+        // its tag resolves to. A `404` for it says the pin is gone and nothing about the client: the
+        // URL is the one `a_tag_resolves_to_the_digest_the_registry_itself_reports` fetches a
+        // platform manifest with, so a client that built it wrong fails there.
+        Err(e) if answered(&e) == Some(404) => {
+            skip_unreachable!(
+                "skipping the resolve by digest: the registry no longer serves `ALPINE_3_22`, \
+                 which needs a digest it still holds: {e}"
+            );
+            return;
+        }
+        Err(e) => panic!("resolving a pinned digest failed, and not on the network: {e}"),
     };
     assert_eq!(resolved.digest, ALPINE_3_22);
 }
@@ -210,15 +255,23 @@ fn a_digest_locator_is_checked_against_the_bytes_the_registry_serves() {
 #[test]
 fn a_layer_is_verified_against_its_digest_as_it_lands() {
     let image = reference::parse("oci:docker.io/library/alpine:3.22").unwrap();
-    let Ok(resolved) = resolve(&image, None) else {
-        skip_unreachable!("skipping the layer fetch: the registry did not answer");
-        return;
+    let resolved = match resolve(&image, None) {
+        Ok(resolved) => resolved,
+        Err(e) if transient(&e) => {
+            skip_unreachable!("skipping the layer fetch: no verdict came back: {e}");
+            return;
+        }
+        Err(e) => panic!("resolving `alpine:3.22` failed, and not on the network: {e}"),
     };
     let dir = crate::testutil::TmpDir::new();
     let layer = &resolved.layers[0];
-    let Ok(path) = fetch_layer(&image, layer, dir.path(), None) else {
-        skip_unreachable!("skipping the layer fetch: the blob did not arrive");
-        return;
+    let path = match fetch_layer(&image, layer, dir.path(), None) {
+        Ok(path) => path,
+        Err(e) if transient(&e) => {
+            skip_unreachable!("skipping the layer fetch: no verdict came back: {e}");
+            return;
+        }
+        Err(e) => panic!("fetching a layer the manifest names failed, and not on the network: {e}"),
     };
     let bytes = std::fs::metadata(&path).expect("the layer landed").len();
     assert_eq!(bytes, layer.size, "the blob is the size the manifest names");
@@ -356,9 +409,15 @@ fn the_challenge_probe_does_not_read_the_blob_it_asks_about() {
     let image =
         crate::sandbox::distro::reference::parse("oci:quay.io/prometheus/prometheus:latest")
             .expect("a valid reference");
-    let Ok(resolved) = super::resolve(&image, None) else {
-        skip_unreachable!("skipping the unchallenged-registry probe: the registry did not answer");
-        return;
+    let resolved = match super::resolve(&image, None) {
+        Ok(resolved) => resolved,
+        Err(e) if transient(&e) => {
+            skip_unreachable!(
+                "skipping the unchallenged-registry probe: no verdict came back: {e}"
+            );
+            return;
+        }
+        Err(e) => panic!("resolving a quay.io image failed, and not on the network: {e}"),
     };
     let biggest = resolved
         .layers
