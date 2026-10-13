@@ -74,42 +74,61 @@ fn refused(code: i32, out: &str) -> bool {
 }
 
 /// Every read-only verb, with the arguments it legitimately takes (so the probe appends a token
-/// that can only be surplus). Kept explicit rather than derived from the help pages: a verb added
-/// without a thought for its argv should fail this suite, not be skipped by it.
+/// that can only be surplus). Kept explicit rather than derived from the help pages, so a verb is
+/// swept only once it is listed here: one added later is not swept until someone lists it with the
+/// arguments it takes. `search` is left out, since it asks a package index over the network.
 const READ_ONLY_VERBS: &[&[&str]] = &[
     &["doctor"],
+    &["version"],
     &["path"],
     &["session", "ls"],
     &["app", "list"],
     &["projects", "ls"],
     &["config", "show"],
     &["config", "path"],
+    // The key is the one positional, and a required one.
+    &["config", "get", "env.X"],
     &["net", "rules"],
     &["net", "pending"],
     &["net", "stats"],
-    // A session id is the one positional of `proc ls`, `fs logs` and `ssh-agent logs`, and a store's
-    // name that of `plugins store list`: each is probed after one, since a bare token after the
-    // verb names a session or a store, and one that names nothing is a failure of its own.
+    // A session id is the one positional of `proc ls`, `proc live`, `proc logs`, `logs`, `fs logs`
+    // and `ssh-agent logs`, and a store's name that of `plugins store list`: each is probed after
+    // one, since a bare token after the verb names a session or a store, and one that names nothing
+    // is a failure of its own. `proc live` without a terminal refuses to start, and a probe that
+    // did not end would be named by `PROBE_LIMIT` rather than hold the suite.
     &["proc", "ls", "999999"],
+    &["proc", "live", "999999"],
+    &["proc", "logs", "999999"],
     &["proc", "pending"],
     &["proc", "rules"],
+    &["logs", "999999"],
     &["fs", "logs", "999999"],
     &["ssh-agent", "logs", "999999"],
     &["secret", "list"],
-    // The operation is their one positional, so the probe follows one: a bare token after the verb
-    // is an operation to narrow to, which no session declaring it answers with a failure of its own.
+    // The operation is their one positional (an invocation too, for `show` and `logs`), so the
+    // probe follows one: a bare token after the verb names what to narrow to, which no session
+    // declaring it answers with a failure of its own.
     &["task", "list", "build"],
     &["task", "status", "build"],
+    &["task", "show", "build"],
+    &["task", "logs", "build"],
     &["storage", "status"],
     &["plugins", "list"],
     &["plugins", "store", "list", "nope"],
 ];
 
+/// Read-only verbs whose positionals are names, any number of them. No bare token can be surplus
+/// there, so they are swept for a flag alone.
+const READ_ONLY_VERBS_TAKING_ANY_NUMBER_OF_NAMES: &[&[&str]] = &[&["bundle"], &["net", "groups"]];
+
 #[test]
 fn no_read_only_verb_accepts_a_surplus_flag() {
     let home = TmpDir::new("argv");
     let mut accepted = Vec::new();
-    for verb in READ_ONLY_VERBS {
+    for verb in READ_ONLY_VERBS
+        .iter()
+        .chain(READ_ONLY_VERBS_TAKING_ANY_NUMBER_OF_NAMES)
+    {
         let mut args = verb.to_vec();
         args.push("--zzz-not-a-flag");
         let (code, out) = run(&args, home.path());
