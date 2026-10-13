@@ -394,16 +394,33 @@ fn a_stated_layer_size_cannot_raise_the_write_ceiling() {
     );
 }
 
+/// A sink that takes nothing: its first write records that a body got this far, and is refused.
+struct Refusing {
+    reached: bool,
+}
+
+impl io::Write for Refusing {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        self.reached = true;
+        Err(io::Error::other("the sink takes nothing"))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A registry that does not challenge can still serve a layer larger than the document cap.
 ///
-/// The challenge probe used to be a `GET`: on a registry that answers `401` first, its body is the
-/// small error document, and on one that does not — quay.io, registry.k8s.io, a local `registry:2`
-/// — it is the blob itself, which the document cap then refused. So no layer past four megabytes
-/// could be fetched from those registries at all, and the tests never saw it because they use a
-/// registry that challenges and a layer under the cap. The probe asks with a `HEAD` now.
+/// A fetch first asks the blob's URL whether the registry wants a credential, and asks it with a
+/// `HEAD`. Asked with a `GET`, the answer from a registry that challenges is a small `401`
+/// document, but from one that does not — quay.io, registry.k8s.io, a local `registry:2` — it is
+/// the blob itself, which [`http::get`] refuses past [`http::MAX_DOCUMENT`]. Docker Hub challenges
+/// and its alpine layers are under that cap, so only a registry that does not challenge and a layer
+/// past the cap tell the two apart.
 ///
-/// This asks the question without moving the blob: the manifest is resolved, the largest layer is
-/// picked, and the probe is run against its URL. What it must not be is an error about a cap.
+/// The fetch runs the way [`fetch_layer`] runs it, against the largest layer of an image on
+/// quay.io, into a sink that refuses its first write: a body that reached the sink got past the
+/// probe, and the download stops there rather than moving the blob.
 #[test]
 fn the_challenge_probe_does_not_read_the_blob_it_asks_about() {
     let image =
@@ -425,19 +442,20 @@ fn the_challenge_probe_does_not_read_the_blob_it_asks_about() {
         .max_by_key(|l| l.size)
         .expect("an image has layers");
     assert!(
-        biggest.size > 4 * 1024 * 1024,
+        biggest.size > http::MAX_DOCUMENT,
         "the test needs a layer past the document cap, got {} bytes",
         biggest.size
     );
     let url = v2_url(&image, "blobs", &biggest.digest);
-    let probe = super::super::http::head(&url, &[]).expect("the probe asks and does not read");
-    assert!(
-        (200..400).contains(&probe.status) || probe.status == 401,
-        "the probe reached the registry: status {}",
-        probe.status
-    );
-    assert!(
-        probe.body.is_empty(),
-        "a HEAD carries no body, so nothing was read"
-    );
+    let mut sink = Refusing { reached: false };
+    match get_authenticated_to_writer(&url, None, &mut sink, blob_cap(biggest.size)) {
+        Err(_) if sink.reached => {}
+        Err(e) if transient(&e) => {
+            skip_unreachable!(
+                "skipping the unchallenged-registry probe: no verdict came back: {e}"
+            );
+        }
+        Err(e) => panic!("the fetch stopped before the blob's body, and not on the network: {e}"),
+        Ok(written) => panic!("a sink that takes nothing was reported {written} bytes"),
+    }
 }
