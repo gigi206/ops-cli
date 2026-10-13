@@ -289,6 +289,32 @@ fn a_name_that_names_nothing_is_a_usage_error() {
     ] {
         let (code, out) = run(args, home.path());
         assert_eq!(code, 2, "`sbx {}`:\n{out}", args.join(" "));
+        // The exit is shared with every usage error, a token refused as surplus among them, and
+        // that refusal names the token too. What says the name was looked up is that the refusal
+        // names it and refuses no argument.
+        let name = args
+            .iter()
+            .copied()
+            .find(|a| ["nope", "999999", "0000000000000000"].contains(a))
+            .expect("each case carries the name that names nothing");
+        assert!(
+            out.contains(name),
+            "`sbx {}` did not say which name names nothing:\n{out}",
+            args.join(" ")
+        );
+        for said in [
+            "unexpected argument",
+            "takes no argument",
+            "takes no option",
+            "unknown argument",
+            "is an option",
+        ] {
+            assert!(
+                !out.contains(said),
+                "`sbx {}` refused the name as an argument rather than looking it up:\n{out}",
+                args.join(" ")
+            );
+        }
     }
 }
 
