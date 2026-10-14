@@ -4132,7 +4132,9 @@ pub(super) fn refusing_tls_beside<T>(
 #[test]
 fn a_refusing_listener_waits_for_a_port_free_on_its_own_address() {
     // The first port offered is already held on 127.0.0.2, as a neighbouring test's socket can hold
-    // it: the helper must start the upstream again rather than fail on `AddrInUse`.
+    // it: the helper must start the upstream again rather than fail on `AddrInUse`. The next one is
+    // chosen free on 127.0.0.2 itself, where the helper binds it: a port chosen on 127.0.0.1 can be
+    // held on 127.0.0.2 by that same neighbour, and would be passed over too.
     let taken = TcpListener::bind("127.0.0.2:0").unwrap();
     let taken_port = taken.local_addr().unwrap().port();
     let mut offered = Vec::new();
@@ -4140,7 +4142,7 @@ fn a_refusing_listener_waits_for_a_port_free_on_its_own_address() {
         let port = if offered.is_empty() {
             taken_port
         } else {
-            TcpListener::bind("127.0.0.1:0")
+            TcpListener::bind("127.0.0.2:0")
                 .unwrap()
                 .local_addr()
                 .unwrap()
