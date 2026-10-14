@@ -375,6 +375,9 @@ pub(crate) fn provision_flake(
         .arg("--out-link")
         .arg(gcroot)
         .arg("--print-out-paths")
+        // The target follows a `--`, so one that reads as an option, such as a lock line rewritten
+        // to one, is built as a reference or refused, never obeyed as a flag.
+        .arg("--")
         .arg(target)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -588,6 +591,32 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
     use std::ffi::OsStr;
+
+    /// The target a flake package builds follows a `--`, so a target that reads as an option is
+    /// never obeyed as a flag. The stand-in records its arguments and fails, which is all the
+    /// question needs.
+    #[test]
+    fn a_flake_target_follows_a_double_dash() {
+        let data = TmpDir::new();
+        let nix = data.path().join("nix");
+        crate::testutil::write_script(
+            &nix,
+            "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/argv\"\nexit 1",
+        );
+        let layout = Layout::under(data.path());
+        let gcroot = data.path().join("roots").join("pkg");
+        let built = crate::testutil::result_past_etxtbsy("nix", || {
+            provision_flake(&nix, &layout, &gcroot, "--impure", "pkg", "bin")
+        });
+        assert!(built.is_err(), "the stand-in fails the build: {built:?}");
+        let argv = std::fs::read_to_string(data.path().join("argv")).unwrap();
+        let argv: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            argv[argv.len().saturating_sub(2)..],
+            ["--", "--impure"],
+            "the target is last, behind a `--`: {argv:?}"
+        );
+    }
 
     #[test]
     fn an_unfree_attribute_nix_would_read_as_an_operator_is_refused_before_the_build() {

@@ -162,10 +162,15 @@ fn resolve(nix: &Path, layout: &Layout, reference: &str) -> io::Result<FlakePin>
     let (base, attr) = split_attr(reference);
     // Bounded: this reaches the network, and `output()` waits for as long as the far end keeps the
     // connection open without sending. See [`FLAKE_METADATA_DEADLINE`] for why the window is wide.
+    //
+    // The flake follows a `--`. The reference is the config's, and its flake part is what is left
+    // before the `#`: `--impure#x:y` leaves `--impure`, which nix would take as an option with no
+    // reference after it, and resolve the flake of the directory sbx runs in instead.
     let out = crate::sandbox::resolver::output_within(
         store::nix_command(nix, layout)
             .args(["--extra-experimental-features", "nix-command flakes"])
-            .args(["flake", "metadata", base, "--json"]),
+            .args(["flake", "metadata", "--json", "--"])
+            .arg(base),
         FLAKE_METADATA_DEADLINE,
         &format!("`nix flake metadata {base}`"),
     )?;
@@ -383,6 +388,34 @@ mod tests {
             metadata_failed("path:/nowhere", b" \n\x1b\n").to_string(),
             "`nix flake metadata path:/nowhere` failed"
         );
+    }
+
+    /// The flake handed to `nix flake metadata` follows a `--`, so a flake part that reads as an
+    /// option is taken as a reference. Without it, `--impure#x:y` left nix `--impure` and no
+    /// reference, and nix resolved the flake of the directory sbx ran in, a local one.
+    #[test]
+    fn the_flake_resolved_follows_a_double_dash() {
+        let data = TmpDir::new();
+        let nix = data.path().join("nix");
+        crate::testutil::write_script(
+            &nix,
+            &format!(
+                "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/argv\"\n\
+                 printf '{{\"revision\":\"{REV}\",\"url\":\"github:o/r/{REV}\"}}'"
+            ),
+        );
+        let layout = Layout::under(data.path());
+        let pin =
+            crate::testutil::result_past_etxtbsy("nix", || resolve(&nix, &layout, "--impure#x:y"))
+                .expect("the stand-in answers");
+        let argv = std::fs::read_to_string(data.path().join("argv")).unwrap();
+        let argv: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            argv[argv.len().saturating_sub(2)..],
+            ["--", "--impure"],
+            "the flake is last, behind a `--`: {argv:?}"
+        );
+        assert_eq!(pin.locked_ref, format!("github:o/r/{REV}#x:y"));
     }
 
     #[test]
