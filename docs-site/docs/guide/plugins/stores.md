@@ -250,7 +250,12 @@ consumers refuse a rollback). A publish refuses an empty tree, a subdirectory wi
 a `plugin.toml`, two plugins sharing one name, and a field a consumer would refuse
 (such as a description carrying one of the characters above), named by plugin and
 field; an omitted `--rev` continues the sequence (`1`, then `+1`). It writes
-`.gitattributes` (`* -text`) so the signed bytes survive a clone verbatim. The
+`.gitattributes` (`* -text`) so the signed bytes survive a clone verbatim. The four
+root files it writes (`catalogue.toml`, `catalogue.toml.sig`, `pubkey`,
+`.gitattributes`) are written themselves: one that is a symlink, or anything but a
+regular file, is refused rather than followed, so a tree that came from someone else
+cannot have a publish write over a file outside it. The refusal comes before a key is
+generated or any of the four is written, so the tree is left as it was. The
 **signing key is the store's secret and never leaves the operator's host**; the
 public key it prints is what consumers pin with `add --key`.
 

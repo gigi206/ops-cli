@@ -62,6 +62,9 @@ const REPO_PUBKEY: &str = "pubkey";
 /// every file so the signed catalogue bytes survive a clone unchanged.
 const GITATTRIBUTES: &str = ".gitattributes";
 
+/// The four files a publish writes at the store root.
+const ROOT_FILES: [&str; 4] = [CATALOGUE, CATALOGUE_SIG, REPO_PUBKEY, GITATTRIBUTES];
+
 /// What a successful add cached: the store's name, the verified catalogue it now holds, the
 /// public key that was pinned, and whether that key was accepted on first use — enough for the
 /// command surface to report what was configured (and to warn on a TOFU pin) without re-reading
@@ -457,6 +460,13 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
         );
     }
 
+    // The root files are checked before the revision is read, the key touched, or any of them
+    // written, so a refused publish leaves the tree and the key as they were. `overwrite` refuses
+    // the same shapes at the open, which is the guard; this is what makes the refusal come first.
+    for name in ROOT_FILES {
+        refuse_unwritable(&dir.join(name))?;
+    }
+
     let rev = match rev {
         Some(r) => r,
         None => next_rev(&dir)?,
@@ -540,23 +550,24 @@ fn subdirs_without_manifest(plugins_dir: &Path) -> Result<Vec<String>, String> {
 /// The revision to stamp when none is given: one past the existing catalogue's, or 1 for a first
 /// publish. A present-but-unparseable catalogue is an error (a silent default could roll the store
 /// backwards and a consumer's anti-rollback would then refuse the update).
+///
+/// Read through [`read_store_file_if_present`], so a `catalogue.toml` that is a link is refused
+/// here as [`overwrite`] refuses it: followed, it would stamp the revision of whatever file it
+/// names, and a link to `/dev/zero` would be read until the host ran out of memory.
 fn next_rev(dir: &Path) -> Result<u64, String> {
-    match std::fs::read(dir.join(CATALOGUE)) {
-        Ok(bytes) => {
-            let existing = crate::plugins::catalogue::Catalogue::parse(&bytes).map_err(|e| {
-                format!(
-                    "cannot determine the next revision: the existing `{CATALOGUE}` does not parse \
-                     ({e}) — pass an explicit `--rev`"
-                )
-            })?;
-            existing
-                .rev
-                .checked_add(1)
-                .ok_or_else(|| "the catalogue revision is at its maximum".to_string())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(1),
-        Err(e) => Err(format!("cannot read the existing `{CATALOGUE}`: {e}")),
-    }
+    let Some(bytes) = read_store_file_if_present(&dir.join(CATALOGUE), CATALOGUE)? else {
+        return Ok(1);
+    };
+    let existing = crate::plugins::catalogue::Catalogue::parse(&bytes).map_err(|e| {
+        format!(
+            "cannot determine the next revision: the existing `{CATALOGUE}` does not parse \
+             ({e}) — pass an explicit `--rev`"
+        )
+    })?;
+    existing
+        .rev
+        .checked_add(1)
+        .ok_or_else(|| "the catalogue revision is at its maximum".to_string())
 }
 
 /// Reuse the Ed25519 signing key at `path`, or generate and persist a fresh one if the file does
@@ -600,9 +611,66 @@ fn write_private_key(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// Write (or overwrite) one of the operator's store-repository files. Unlike the owner-only cache
-/// writer, these are public files destined for git, so a plain overwrite is correct.
+/// writer, these are public files destined for git, so an existing one is rewritten in place.
+///
+/// The file itself is written, never what it links to. A publish runs over a tree that may come
+/// from someone else — a contributor's branch, a cloned repository — and git carries a symlink as
+/// faithfully as a file: a `catalogue.toml -> ~/.bashrc` would have the publish write the catalogue
+/// over the operator's file. `O_NOFOLLOW` refuses a link at the leaf, `O_NONBLOCK` keeps a FIFO
+/// from holding the open until a reader comes, and the descriptor must be a regular file before
+/// anything is truncated.
 fn overwrite(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => a_link_is_not_written(path),
+            _ => format!("cannot write {}: {e}", path.display()),
+        })?;
+    let meta = f
+        .metadata()
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(only_a_file_is_written(path));
+    }
+    f.set_len(0)
+        .and_then(|()| f.write_all(bytes))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Refuse, before a publish touches anything, a root file [`overwrite`] would refuse at its open:
+/// a symlink, or anything present that is not a regular file. An absent one is fine, the publish
+/// creates it.
+fn refuse_unwritable(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot write {}: {e}", path.display())),
+        Ok(meta) if meta.file_type().is_symlink() => Err(a_link_is_not_written(path)),
+        Ok(meta) if !meta.file_type().is_file() => Err(only_a_file_is_written(path)),
+        Ok(_) => Ok(()),
+    }
+}
+
+/// The refusal of a root file that is a symlink, worded once for [`refuse_unwritable`] and
+/// [`overwrite`].
+fn a_link_is_not_written(path: &Path) -> String {
+    format!(
+        "refusing to write {}: it is a symlink, and a publish writes the store's own files, never \
+         where a link in the tree points",
+        path.display()
+    )
+}
+
+/// The refusal of a root file that is present but not a regular file, worded once for both.
+fn only_a_file_is_written(path: &Path) -> String {
+    format!(
+        "refusing to write {}: it is not a regular file",
+        path.display()
+    )
 }
 
 /// A configured remote store as recorded in its owner-only cache: where it is fetched from,
@@ -1233,19 +1301,27 @@ const STORE_FILE_MAX: u64 = 8 * 1024 * 1024;
 /// Read a store-root file into memory, refusing a symlink or a non-regular file and bounding the
 /// size — these bytes come from an untrusted fetched repository and are read BEFORE the Ed25519
 /// verification, so the read itself must not be a lever (an unbounded `/dev/zero` symlink, a device
-/// node). `O_NOFOLLOW` refuses a symlink at the leaf without a TOCTOU window; the size is checked on
-/// the open fd. `missing` is the precise message when the file is simply absent.
+/// node). `O_NOFOLLOW` refuses a symlink at the leaf without a TOCTOU window, `O_NONBLOCK` keeps a
+/// FIFO from holding the open until a writer comes, so it reaches the regular-file check; the size
+/// is checked on the open fd. `missing` is the precise message when the file is simply absent.
 fn read_store_file(path: &Path, what: &str, missing: &str) -> Result<Vec<u8>, String> {
+    read_store_file_if_present(path, what)?.ok_or_else(|| missing.to_string())
+}
+
+/// [`read_store_file`], with an absent file answered `None` rather than refused: the form for a
+/// reader to which absence is a state, such as a publish that finds no catalogue yet.
+fn read_store_file_if_present(path: &Path, what: &str) -> Result<Option<Vec<u8>>, String> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    let f = std::fs::OpenOptions::new()
+    let f = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => missing.to_string(),
-            _ => format!("cannot read `{what}`: {e} (a symlink is refused)"),
-        })?;
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read `{what}`: {e} (a symlink is refused)")),
+    };
     let meta = f
         .metadata()
         .map_err(|e| format!("cannot read `{what}`: {e}"))?;
@@ -1262,7 +1338,7 @@ fn read_store_file(path: &Path, what: &str, missing: &str) -> Result<Vec<u8>, St
     f.take(STORE_FILE_MAX)
         .read_to_end(&mut buf)
         .map_err(|e| format!("cannot read `{what}`: {e}"))?;
-    Ok(buf)
+    Ok(Some(buf))
 }
 
 /// Read the detached signature file and decode it from hex. The signature is stored hex-encoded
@@ -2769,6 +2845,155 @@ mod tests {
         assert_eq!(publish(repo.path(), &key, None).unwrap().rev, 1);
         assert_eq!(publish(repo.path(), &key, None).unwrap().rev, 2);
         assert_eq!(publish(repo.path(), &key, None).unwrap().rev, 3);
+    }
+
+    /// Make `path` a FIFO.
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `mkfifo` reads the NUL-terminated path, which outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+    }
+
+    /// Run `f` on another thread and give it ten seconds. A call still running then is waiting on
+    /// `fifo`, so the FIFO is opened read-write, which never blocks on Linux and stands in for
+    /// whichever end the call waits for; the call is let return, and `None` says it waited.
+    fn within_or_released<T: Send + 'static>(
+        fifo: &Path,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let call = std::thread::spawn(move || tx.send(f()));
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(value) => {
+                call.join().unwrap().unwrap();
+                Some(value)
+            }
+            Err(_) => {
+                let _end = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(fifo)
+                    .unwrap();
+                call.join().unwrap().unwrap();
+                None
+            }
+        }
+    }
+
+    /// A root file the publish must not write, a link out of the tree or a FIFO, stops it before
+    /// it touches anything: no key is generated and no root file written, so a refused publish
+    /// leaves the tree as it was. One fresh tree per file and shape, every one checked before the
+    /// test fails.
+    #[test]
+    fn a_root_file_it_must_not_write_stops_a_publish_before_it_touches_anything() {
+        let outside = crate::testutil::TmpDir::new();
+        let mut touched = Vec::new();
+        for name in ROOT_FILES {
+            for shape in ["link", "fifo"] {
+                let repo = crate::testutil::TmpDir::new();
+                write_source_plugin(repo.path(), "pass", "secret-store");
+                let target = outside.path().join(format!("{shape}-{name}"));
+                std::fs::write(&target, b"the operator's file\n").unwrap();
+                if shape == "link" {
+                    std::os::unix::fs::symlink(&target, repo.path().join(name)).unwrap();
+                } else {
+                    mkfifo(&repo.path().join(name));
+                }
+                let key = repo.path().join("store.key");
+                let (dir, key_path) = (repo.path().to_path_buf(), key.clone());
+                let Some(result) = within_or_released(&repo.path().join(name), move || {
+                    publish(&dir, &key_path, Some(1))
+                }) else {
+                    touched.push(format!("{shape} {name}: the publish waited on it"));
+                    continue;
+                };
+                let written: Vec<&str> = ROOT_FILES
+                    .into_iter()
+                    .filter(|other| *other != name && repo.path().join(other).exists())
+                    .collect();
+                if std::fs::read(&target).unwrap() != b"the operator's file\n" {
+                    touched.push(format!(
+                        "{shape} {name}: the publish wrote through the link"
+                    ));
+                } else if result.is_ok() {
+                    touched.push(format!("{shape} {name}: the publish succeeded"));
+                } else if key.exists() {
+                    touched.push(format!(
+                        "{shape} {name}: refused after the key was generated"
+                    ));
+                } else if !written.is_empty() {
+                    touched.push(format!("{shape} {name}: refused after writing {written:?}"));
+                }
+            }
+        }
+        assert!(touched.is_empty(), "{touched:#?}");
+    }
+
+    /// The opens behind a publish are the guard that holds whatever comes between its check and its
+    /// write: the writer neither follows a link nor waits on a FIFO for a reader, and the reader
+    /// does not wait on one for a writer. Every shape is checked before the test fails.
+    #[test]
+    fn a_root_file_is_opened_neither_through_a_link_nor_waiting_on_a_fifo() {
+        let dir = crate::testutil::TmpDir::new();
+        let mut failed = Vec::new();
+
+        let target = dir.path().join("operator-file");
+        std::fs::write(&target, b"the operator's file\n").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let written = overwrite(&link, b"catalogue\n");
+        if std::fs::read(&target).unwrap() != b"the operator's file\n" {
+            failed.push("the writer wrote through a link".to_string());
+        } else if !written.as_ref().is_err_and(|e| e.contains("symlink")) {
+            failed.push(format!("the writer did not refuse a link: {written:?}"));
+        }
+
+        let fifo = dir.path().join("fifo-written");
+        mkfifo(&fifo);
+        let path = fifo.clone();
+        match within_or_released(&fifo, move || overwrite(&path, b"catalogue\n")) {
+            None => failed.push("the writer waited on a FIFO for a reader".to_string()),
+            Some(Ok(())) => failed.push("the writer wrote into a FIFO".to_string()),
+            Some(Err(_)) => {}
+        }
+
+        let fifo = dir.path().join("fifo-read");
+        mkfifo(&fifo);
+        let path = fifo.clone();
+        match within_or_released(&fifo, move || read_store_file_if_present(&path, CATALOGUE)) {
+            None => failed.push("the reader waited on a FIFO for a writer".to_string()),
+            Some(Ok(read)) => failed.push(format!("the reader read a FIFO: {read:?}")),
+            Some(Err(_)) => {}
+        }
+
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// The revision a publish continues from is read from the tree's own catalogue, never through
+    /// a link to another one: followed, it would stamp the revision of whatever file the link names.
+    #[test]
+    fn the_next_revision_is_not_read_through_a_link() {
+        let elsewhere = crate::testutil::TmpDir::new();
+        write_source_plugin(elsewhere.path(), "pass", "secret-store");
+        publish(
+            elsewhere.path(),
+            &elsewhere.path().join("store.key"),
+            Some(41),
+        )
+        .unwrap();
+        let repo = crate::testutil::TmpDir::new();
+        std::os::unix::fs::symlink(
+            elsewhere.path().join(CATALOGUE),
+            repo.path().join(CATALOGUE),
+        )
+        .unwrap();
+
+        let next = next_rev(repo.path());
+        assert!(
+            next.as_ref().is_err_and(|e| e.contains("symlink")),
+            "{next:?}"
+        );
     }
 
     #[test]
