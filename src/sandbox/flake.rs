@@ -341,7 +341,7 @@ pub(crate) fn upgrade(
         trusted: declared,
         all: prune_universe,
     } = declared(cfg, only);
-    let mut lock = pins(layout, project_id)?;
+    let snapshot = pins(layout, project_id)?;
     let mut outcomes = Vec::new();
 
     // Prune entries whose reference is truly no longer declared — measured against ALL declared
@@ -353,21 +353,24 @@ pub(crate) fn upgrade(
     //
     // Not under a selector: pruning says "no layer declares this any more", which is a statement
     // about the project that a roll narrowed to one app never makes.
-    let stale: Vec<String> = if only.is_some() {
+    let stale: Vec<(String, FlakePin)> = if only.is_some() {
         Vec::new()
     } else {
-        lock.keys()
-            .filter(|k| !prune_universe.contains(k.as_str()))
-            .cloned()
+        snapshot
+            .iter()
+            .filter(|(k, _)| !prune_universe.contains(k.as_str()))
+            .map(|(k, pin)| (k.clone(), pin.clone()))
             .collect()
     };
-    for reference in stale {
-        lock.remove(&reference);
-        outcomes.push(FlakeUpgrade::Pruned { reference });
+    for (reference, _) in &stale {
+        outcomes.push(FlakeUpgrade::Pruned {
+            reference: reference.clone(),
+        });
     }
 
+    let mut resolved = BTreeMap::new();
     for reference in &declared {
-        let previous = lock.get(reference).map(|p| p.rev.clone());
+        let previous = snapshot.get(reference).map(|p| p.rev.clone());
         match resolve(nix, layout, reference) {
             Ok(pin) => {
                 let outcome = match &previous {
@@ -385,7 +388,7 @@ pub(crate) fn upgrade(
                         rev: pin.rev.clone(),
                     },
                 };
-                lock.insert(reference.clone(), pin);
+                resolved.insert(reference.clone(), pin);
                 outcomes.push(outcome);
             }
             Err(e) => outcomes.push(FlakeUpgrade::Failed {
@@ -396,8 +399,29 @@ pub(crate) fn upgrade(
         }
     }
 
-    if mode.applies() {
-        write_pins(layout, project_id, &lock)?;
+    if !mode.applies() {
+        return Ok(outcomes);
+    }
+    // Under the lock's writer guard, as the prebuilt rolls write theirs, and from what the lock
+    // holds now rather than from the snapshot: the resolutions above reach the network and can take
+    // minutes, and another `sbx upgrade` of this project (another app's, say) may have written its
+    // pins meanwhile. An entry is pruned only if it is still exactly as the snapshot found it, a
+    // resolution just made lands over whatever its key holds, every other key is left as found, and
+    // a roll that changed nothing leaves the file as it was.
+    let _writing = store::hold_lock_for_write(
+        &lock_path(layout, project_id)?,
+        &store::waiting_for_writer("the flake lock"),
+    )?;
+    let mut disk = pins(layout, project_id)?;
+    let before = disk.clone();
+    for (key, previous) in stale {
+        if disk.get(&key) == Some(&previous) {
+            disk.remove(&key);
+        }
+    }
+    disk.extend(resolved);
+    if disk != before {
+        write_pins(layout, project_id, &disk)?;
     }
     Ok(outcomes)
 }
@@ -628,6 +652,179 @@ mod tests {
         assert!(
             pins(&layout, &id).unwrap().is_empty(),
             "the roll prunes what the dry run named"
+        );
+    }
+
+    /// A roll writes the lock from what it holds once the resolutions are done, under its writer
+    /// guard, not from the snapshot taken before they went to the network. The stand-in nix is
+    /// another sbx here, writing to the lock while this roll resolves its own app: a pin it adds is
+    /// kept, and an entry the roll found stale and would prune is kept too once it has re-pinned it.
+    #[test]
+    fn a_pin_written_while_the_roll_resolves_is_kept() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let project = TmpDir::new();
+        let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+        let (app, other) = ("github:o/app#default", "github:o/other#default");
+        let cfg = resolved(
+            vec![],
+            vec![("alpha", app_with(vec![flake_pkg("a", app, true)]))],
+        );
+        let gone = "github:o/gone#default";
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            gone.to_string(),
+            FlakePin {
+                rev: REV.to_string(),
+                locked_ref: format!("github:o/gone/{REV}#default"),
+            },
+        );
+        write_pins(&layout, &id, &entries).unwrap();
+        let lock = lock_path(&layout, &id).unwrap();
+        let repinned = "22707dc2f618dd54ca8739b309ec4fc024de578b";
+        // The stand-in reads the lock's path and the line to append from files beside it, so the
+        // script names no path a root with a space in it could split.
+        std::fs::write(data.path().join("lockpath"), lock.as_os_str().as_bytes()).unwrap();
+        std::fs::write(
+            data.path().join("meanwhile"),
+            format!(
+                "{other}\t{REV}\tgithub:o/other/{REV}#default\n\
+                 {gone}\t{repinned}\tgithub:o/gone/{repinned}#default\n"
+            ),
+        )
+        .unwrap();
+        let nix = data.path().join("nix");
+        crate::testutil::write_script(
+            &nix,
+            &format!(
+                "here=$(dirname \"$0\")\n\
+                 cat \"$here/meanwhile\" >> \"$(cat \"$here/lockpath\")\"\n\
+                 printf '{{\"revision\":\"{REV}\",\"url\":\"github:o/app/{REV}\"}}'"
+            ),
+        );
+
+        crate::testutil::result_past_etxtbsy("nix", || {
+            upgrade(
+                &nix,
+                &layout,
+                project.path(),
+                &cfg,
+                None,
+                crate::sandbox::RollMode::Apply,
+            )
+        })
+        .expect("the roll resolves its app");
+        let after = pins(&layout, &id).unwrap();
+        assert!(
+            after.contains_key(app),
+            "the roll pinned its app: {after:?}"
+        );
+        assert!(
+            after.contains_key(other),
+            "the pin written meanwhile is kept: {after:?}"
+        );
+        assert_eq!(
+            after.get(gone).map(|pin| pin.rev.as_str()),
+            Some(repinned),
+            "a stale entry re-pinned meanwhile is not pruned"
+        );
+    }
+
+    /// The roll's write waits for the lock's writer guard: while another sbx holds it, the lock is
+    /// neither read again nor written, and the roll lands once the guard is let go. The guard is
+    /// released before the join, so a roll that did not wait fails the test rather than hangs it.
+    #[test]
+    fn a_roll_waits_for_the_lock_writer_guard() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let project = TmpDir::new();
+        let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+        let app = "github:o/app#default";
+        let cfg = resolved(vec![flake_pkg("a", app, true)], vec![]);
+        let nix = data.path().join("nix");
+        crate::testutil::write_script(
+            &nix,
+            &format!("printf '{{\"revision\":\"{REV}\",\"url\":\"github:o/app/{REV}\"}}'"),
+        );
+        let lock = lock_path(&layout, &id).unwrap();
+        let guard = store::hold_lock_for_write(&lock, &|_| {}).expect("the guard");
+
+        let roll = {
+            let (layout, project, nix) =
+                (layout.clone(), project.path().to_path_buf(), nix.clone());
+            std::thread::spawn(move || {
+                crate::testutil::result_past_etxtbsy("nix", || {
+                    upgrade(
+                        &nix,
+                        &layout,
+                        &project,
+                        &cfg,
+                        None,
+                        crate::sandbox::RollMode::Apply,
+                    )
+                })
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let waited = !roll.is_finished();
+        let untouched = !lock.exists();
+        drop(guard);
+        let rolled = roll.join().unwrap();
+
+        assert!(waited, "the roll did not wait for the guard");
+        assert!(untouched, "the lock was written while the guard was held");
+        rolled.expect("the roll lands once the guard is let go");
+        assert!(pins(&layout, &id).unwrap().contains_key(app));
+    }
+
+    /// A roll that changes nothing leaves the lock as it was, the same file: written anyway, it
+    /// would be replaced by a new one each time.
+    #[test]
+    fn a_roll_that_changes_nothing_leaves_the_lock_as_it_was() {
+        use std::os::unix::fs::MetadataExt as _;
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let project = TmpDir::new();
+        let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+        let app = "github:o/app#default";
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            app.to_string(),
+            FlakePin {
+                rev: REV.to_string(),
+                locked_ref: format!("github:o/app/{REV}#default"),
+            },
+        );
+        write_pins(&layout, &id, &entries).unwrap();
+        let cfg = resolved(vec![flake_pkg("a", app, true)], vec![]);
+        let nix = data.path().join("nix");
+        crate::testutil::write_script(
+            &nix,
+            &format!("printf '{{\"revision\":\"{REV}\",\"url\":\"github:o/app/{REV}\"}}'"),
+        );
+        let lock = lock_path(&layout, &id).unwrap();
+        let before = std::fs::metadata(&lock).unwrap().ino();
+
+        let rolled = crate::testutil::result_past_etxtbsy("nix", || {
+            upgrade(
+                &nix,
+                &layout,
+                project.path(),
+                &cfg,
+                None,
+                crate::sandbox::RollMode::Apply,
+            )
+        })
+        .expect("the roll resolves its package");
+        assert!(
+            matches!(rolled.as_slice(), [FlakeUpgrade::Unchanged { .. }]),
+            "the package resolved to the revision it was pinned to"
+        );
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().ino(),
+            before,
+            "the lock is the same file"
         );
     }
 
