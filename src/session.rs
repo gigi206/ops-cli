@@ -450,7 +450,12 @@ pub(crate) fn wait_for_exit(pidfd: libc::c_int, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now().checked_add(timeout);
     let mut remaining = timeout;
     loop {
-        let ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // Rounded up: `poll` counts whole milliseconds, and a remainder under one rounded down to
+        // zero returns at once with the process still running, which reads as the window over.
+        let ms = remaining
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as libc::c_int;
         // SAFETY: polling one fd we own.
         let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
         if rc > 0 {
@@ -1665,6 +1670,33 @@ mod tests {
         assert!(
             exited,
             "the wait must resume across signals and observe the child's exit"
+        );
+    }
+
+    /// A window shorter than a millisecond is waited out, not read as already over.
+    ///
+    /// `poll` takes whole milliseconds, so a window rounded down to zero returned at once with the
+    /// process still running, and [`stop_pinned`] reads that `false` as the grace having run out.
+    /// No door names a window that short, but one is left whenever a signal interrupts the wait
+    /// less than a millisecond before its end.
+    #[test]
+    fn a_window_under_a_millisecond_is_waited_out() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .unwrap();
+        let pidfd = open_pidfd(child.id()).unwrap();
+        let window = Duration::from_micros(500);
+        let start = std::time::Instant::now();
+        let exited = wait_for_exit(pidfd, window);
+        let waited = start.elapsed();
+        close_fd(pidfd);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!exited, "the child outlives the window");
+        assert!(
+            waited >= window,
+            "the wait ended after {waited:?}, inside a window of {window:?}"
         );
     }
 
