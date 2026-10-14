@@ -1137,19 +1137,54 @@ pub(crate) fn update(
 /// The directory is renamed aside first (an atomic step), then the renamed tree is deleted — so a
 /// concurrent reader sees the store either fully present or fully gone, never the half-deleted tree
 /// an in-place `remove_dir_all` would leave if it failed partway.
+///
+/// The name it is set aside to is reserved by the rename itself, with no existence check to race.
+/// What an earlier process that held this pid left there decides the rest: a non-empty directory
+/// or a file refuses the rename, and the next name is tried; an empty directory is replaced, as
+/// rename(2) replaces one. A per-process counter would not tell the two processes apart, since it
+/// restarts at the same value in every process.
 pub(crate) fn remove(layout: &crate::store::Layout, name: &str) -> Result<(), String> {
     crate::plugins::validate_install_name(name)?;
     let dir = layout.store_path(name);
     if !dir.exists() {
         return Err(format!("no store named `{name}` is configured"));
     }
-    let tomb = dir.with_file_name(format!(".{name}.removing.{}", std::process::id()));
-    std::fs::rename(&dir, &tomb).map_err(|e| format!("cannot remove store `{name}`: {e}"))?;
+    let mut set_aside = None;
+    for attempt in 0..TOMB_ATTEMPTS {
+        let candidate = tomb_for(&dir, name, attempt);
+        match std::fs::rename(&dir, &candidate) {
+            Ok(()) => {
+                set_aside = Some(candidate);
+                break;
+            }
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::ENOTEMPTY | libc::EEXIST | libc::ENOTDIR)
+                ) => {}
+            Err(e) => return Err(format!("cannot remove store `{name}`: {e}")),
+        }
+    }
+    let Some(tomb) = set_aside else {
+        return Err(format!(
+            "cannot remove store `{name}`: the {TOMB_ATTEMPTS} names it can be set aside to are \
+             all taken"
+        ));
+    };
     // The store is already gone from its real path; a failure to delete the renamed tree leaves a
     // directory nothing collects — no sweep reads this name — rather than a torn store. The walk
     // that adds write on the way down is used so a read-only directory is not what stops it.
     let _ = crate::sandbox::gc::force_remove_dir_all(&tomb);
     Ok(())
+}
+
+/// How many names [`remove`] tries to set a store aside to before it gives up.
+const TOMB_ATTEMPTS: u32 = 64;
+
+/// The `attempt`-th name [`remove`] sets the store at `dir` aside to: a dot-name beside it, which
+/// [`list`] skips, carrying this process's pid.
+fn tomb_for(dir: &Path, name: &str, attempt: u32) -> PathBuf {
+    dir.with_file_name(format!(".{name}.removing.{}.{attempt}", std::process::id()))
 }
 
 /// Atomically replace the live store directory `dest` with the freshly staged `stage` by
@@ -2178,6 +2213,35 @@ mod tests {
         assert!(!layout.store_path("default").exists());
         // removing a store that is not configured is a clear error
         assert!(remove(&layout, "default").is_err());
+    }
+
+    /// A store is removed past whatever an earlier process left at the name it would be set aside
+    /// to: that process held this pid, its leftover refuses the rename, and the next name is taken
+    /// rather than the removal refused. A directory and a file each refuse it, differently, and
+    /// every shape is checked before the test fails.
+    #[test]
+    fn a_store_is_removed_past_a_leftover_at_its_set_aside_name() {
+        let mut refused = Vec::new();
+        for shape in ["directory", "file"] {
+            let data = crate::testutil::TmpDir::new();
+            let layout = crate::store::Layout::under(data.path());
+            let dir = layout.store_path("default");
+            std::fs::create_dir_all(dir.join(CHECKOUT)).unwrap();
+            let leftover = tomb_for(&dir, "default", 0);
+            if shape == "directory" {
+                std::fs::create_dir_all(leftover.join(CHECKOUT)).unwrap();
+            } else {
+                std::fs::write(&leftover, b"left").unwrap();
+            }
+
+            let removed = remove(&layout, "default");
+            if let Err(e) = removed {
+                refused.push(format!("{shape}: {e}"));
+            } else if dir.exists() {
+                refused.push(format!("{shape}: the store is still at its name"));
+            }
+        }
+        assert!(refused.is_empty(), "{refused:#?}");
     }
 
     #[test]
