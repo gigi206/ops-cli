@@ -32,7 +32,7 @@ FHS, a synthetic identity, and the enforcement stack.
 **absent** from the cage, not merely read-only: a consequence of the same-uid
 model. See [Security model](../concepts/security-model).
 
-**Control plane**, `sbx`'s own state (its config, data, and trust directories). Pinned
+**Control plane**, `sbx`'s own state (its config, data, and trust directories, and on a Lima guest the theme and notification directories mounted from the Mac). Pinned
 read-only, and shown empty, even inside a broad read-write bind. See [Security model](../concepts/security-model#the-control-plane-is-pinned).
 
 **Declared operation**, a fixed command `sbx` runs on a caller's behalf, in an ephemeral

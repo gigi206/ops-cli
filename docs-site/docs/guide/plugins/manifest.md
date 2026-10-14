@@ -67,9 +67,10 @@ brokers     = []                   # broker plugins whose fenced socket replaces
 
   `allow_paths` is held to the other half of that: no entry may name sbx's own
   control plane, which is the data directory (the store caches, the installed
-  plugin trees and every plugin's state), the trust-marker store, and the global
+  plugin trees and every plugin's state), the trust-marker store, the global
   config directory, where `[plugin.<name>] env` carries other plugins'
-  credentials in the clear. An entry inside one of them is refused by name, both
+  credentials in the clear, and on a Lima guest the theme and notification
+  directories mounted from the Mac. An entry inside one of them is refused by name, both
   when the manifest is loaded and again when the cage is built, and so is an entry
   that merely *contains* one: `$HOME` mounts every part of that list along with
   everything else. It is the same list a project config's `binds` is measured

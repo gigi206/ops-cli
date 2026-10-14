@@ -350,7 +350,9 @@ Three differences from a native host are worth knowing before they surprise you:
   Refusals and app notifications are each held to 32 notes waiting for an agent that is not
   running and to 5 raised per run of the agent, so a busy app never crowds out a refusal. The
   agent reads only regular files from that directory, and only their first bytes, because the
-  guest is the one writing there. Neither directory is ever given to a cage.
+  guest is the one writing there. Neither directory is ever given to a cage, not even under a
+  bind that covers its path: both are part of sbx's
+  [control plane](../configuration/binds#the-control-plane-is-protected).
 - **There is no GPU acceleration.** `vmType: vz` gives the guest a virtio-GPU device without
   3D acceleration. `gpu = true` grants its render node, and mesa renders in software
   (`llvmpipe`) behind it; the launch proceeds. The scope this template commits to is CLI plus GUI, and the two

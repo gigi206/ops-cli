@@ -3,7 +3,8 @@
 //!
 //! A guest cannot run a program on the Mac the way a WSL distribution runs one on Windows, so the
 //! two channels are directories the template mounts from the Mac, each at a path that exists only
-//! in the guest and that no cage is given. The theme directory is read-only here: an agent on the
+//! in the guest. Wherever one is mounted it is part of sbx's control plane
+//! ([`mounted_channels`]), so no cage is given it, not even under a bind that covers its path. The theme directory is read-only here: an agent on the
 //! Mac writes the current preference into it. The notification directory is writable: sbx drops
 //! one file per note into it, its own refusals and the notifications a caged app raises through the
 //! relay alike, and an agent on the Mac raises each one and removes it.
@@ -77,6 +78,21 @@ pub(crate) fn is_virtiofs_mount(mountinfo: &str, path: &str) -> bool {
         left.split_whitespace().nth(4) == Some(path)
             && right.split_whitespace().next() == Some("virtiofs")
     })
+}
+
+/// Which channel directories are mounted, read from `mountinfo` (the text of
+/// `/proc/self/mountinfo`). Pure.
+///
+/// They are control-plane roots ([`crate::config::sbx_control_plane_roots`]): sbx writes notes into
+/// the one and reads the preference from the other outside any cage, so a cage that could reach the
+/// notes directory could plant a link there that sbx follows, and write through it on the guest
+/// with words the caged app chose. A channel that is not mounted is not one sbx uses, and is left
+/// out.
+pub(crate) fn mounted_channels(mountinfo: &str) -> Vec<&'static str> {
+    [THEME_MOUNT, NOTIFY_MOUNT]
+        .into_iter()
+        .filter(|path| is_virtiofs_mount(mountinfo, path))
+        .collect()
 }
 
 /// Whether `path` is a virtiofs mount point on this host. A `/proc` that cannot be read answers
@@ -311,6 +327,19 @@ mod tests {
             "garbage without a separator",
             THEME_MOUNT
         ));
+    }
+
+    /// Both channels where both are mounted, and neither where the path is not a virtiofs mount.
+    #[test]
+    fn the_mounted_channels_are_the_ones_on_virtiofs() {
+        assert_eq!(mounted_channels(MOUNTINFO), [THEME_MOUNT, NOTIFY_MOUNT]);
+        let without_theme: String = MOUNTINFO
+            .lines()
+            .filter(|l| !l.contains(THEME_MOUNT))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(mounted_channels(&without_theme), [NOTIFY_MOUNT]);
+        assert!(mounted_channels("").is_empty());
     }
 
     /// The reader agrees with the predicate over this host's own mount table, whichever host it is.

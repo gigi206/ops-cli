@@ -121,7 +121,7 @@ handled fail-closed and warned about; see [`binds`](../configuration/binds).)
 
 ## The control plane is pinned
 
-`sbx`'s own state, its data, trust, and config directories, all under your `$HOME`: is protected even inside a broad read-write bind:
+`sbx`'s own state, its data, trust, and config directories, all under your `$HOME`: is protected even inside a broad read-write bind. On a Lima guest on a Mac it also takes in the two directories the template mounts from the Mac (`/mnt/sbx-mac/theme`, `/mnt/sbx-mac/notify`), wherever they are mounted: a cage that could write the notes directory could leave a link there for `sbx` to follow outside it.
 
 - A read-write bind aimed **at or inside** one of `sbx`'s directories is forced
   read-only, with a warning.

@@ -355,9 +355,18 @@ pub(super) fn canonicalize_binds(
 /// The sbx-owned control-plane roots a read-write config bind must never expose to the cage: the
 /// data directory (its engine binaries are `execve`'d host-side; its plugin and store trees run
 /// host-side too), the trust-marker store (a forged marker would approve another project's config),
-/// and the global-config directory (trusted by location). Resolved from the environment like every
-/// other sbx path; a component whose base does not resolve is simply omitted.
+/// the global-config directory (trusted by location), and, on a Lima guest on a Mac, the channel
+/// directories the template mounts from the Mac (sbx writes into the notes one outside any cage, see
+/// [`crate::sandbox::lima_mac::mounted_channels`]). Resolved from the environment like every other
+/// sbx path; a component whose base does not resolve, or a channel that is not mounted, is simply
+/// omitted.
 pub(crate) fn sbx_control_plane_roots() -> Vec<PathBuf> {
+    control_plane_roots_with(&std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default())
+}
+
+/// [`sbx_control_plane_roots`], with the host's mount table given as the text of
+/// `/proc/self/mountinfo`, so that which channels count is testable on a host that mounts none.
+fn control_plane_roots_with(mountinfo: &str) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(layout) = crate::store::Layout::from_env() {
         roots.push(layout.data_dir().to_path_buf());
@@ -368,6 +377,11 @@ pub(crate) fn sbx_control_plane_roots() -> Vec<PathBuf> {
     if let Some(dir) = global_path().and_then(|p| p.parent().map(Path::to_path_buf)) {
         roots.push(dir);
     }
+    roots.extend(
+        crate::sandbox::lima_mac::mounted_channels(mountinfo)
+            .into_iter()
+            .map(PathBuf::from),
+    );
     // A config bind is compared canonicalized (symlinks resolved), so the roots must be too, or a
     // symlinked `$HOME` component would let a bind slip past the guard. `canonicalize` is
     // all-or-nothing and these roots are routinely absent — the trust store is created by the first
@@ -3367,6 +3381,54 @@ mod tests {
                 .all(|l| !l.chars().any(crate::diag::reorders)),
             "no rendered line may carry a character that reorders it: {:?}",
             preview.summary
+        );
+    }
+
+    /// On a Lima guest, the channel directories mounted from the Mac are control-plane roots, so a
+    /// read-write bind that covers them shows them to the cage pinned and empty.
+    #[test]
+    fn the_mac_channels_are_control_plane_roots_where_they_are_mounted() {
+        let mountinfo = "\
+42 24 0:38 / /mnt/sbx-mac/theme ro,relatime shared:21 - virtiofs lima-1 ro
+43 24 0:39 / /mnt/sbx-mac/notify rw,relatime shared:22 - virtiofs lima-2 rw
+";
+        let roots = control_plane_roots_with(mountinfo);
+        for channel in [
+            crate::sandbox::lima_mac::THEME_MOUNT,
+            crate::sandbox::lima_mac::NOTIFY_MOUNT,
+        ] {
+            assert!(
+                roots.iter().any(|r| r == Path::new(channel)),
+                "{channel} in {roots:?}"
+            );
+        }
+        assert!(
+            !control_plane_roots_with("")
+                .iter()
+                .any(|r| r.starts_with("/mnt/sbx-mac")),
+            "a channel that is not mounted is no root"
+        );
+
+        let binds = vec![Bind {
+            path: PathBuf::from("/mnt"),
+            writable: true,
+        }];
+        let pins = control_plane_pins_for(&binds, &roots);
+        assert!(
+            pins.iter().any(
+                |p| p.path == Path::new(crate::sandbox::lima_mac::NOTIFY_MOUNT) && !p.writable
+            ),
+            "the notes directory is pinned read-only under a read-write `/mnt`: {pins:?}"
+        );
+        let mut warnings = Vec::new();
+        assert!(
+            !control_plane_mode(
+                Path::new(crate::sandbox::lima_mac::NOTIFY_MOUNT),
+                true,
+                &roots,
+                &mut warnings
+            ),
+            "a read-write bind of the notes directory itself is forced read-only"
         );
     }
 

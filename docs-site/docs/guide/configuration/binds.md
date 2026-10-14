@@ -158,7 +158,7 @@ still lands correctly inside it.
 
 ## The control plane is protected
 
-`sbx`'s own state, its data, trust, and config directories, all under your `$HOME`: is protected regardless of what a bind requests:
+`sbx`'s own state, its data, trust, and config directories, all under your `$HOME`: is protected regardless of what a bind requests. On a Lima guest on a Mac, the two directories the template mounts from the Mac, `/mnt/sbx-mac/theme` and `/mnt/sbx-mac/notify`, are part of it wherever they are mounted: `sbx` writes notification notes into the second outside any cage.
 
 - A read-write bind aimed **at or inside** one of `sbx`'s directories is **forced
   read-only**, with a warning.
