@@ -997,6 +997,19 @@ pub(super) fn is_valid_mise_token(token: &str) -> bool {
         })
 }
 
+/// Whether a flake reference names a local source: an explicit local scheme (`path:`, and any
+/// `file:` or `+file:` one) or a bare path nix reads as one (a leading `/`, `.` or `~`). The
+/// declaration is refused on it, and so is the locked url `nix flake metadata` answers for a
+/// declared reference, before it is pinned.
+pub(crate) fn names_a_local_flake_source(reference: &str) -> bool {
+    reference.starts_with("path:")
+        || reference.starts_with("file:")
+        || reference.contains("+file:")
+        || reference.starts_with('/')
+        || reference.starts_with('.')
+        || reference.starts_with('~')
+}
+
 /// A flake reference (the part after `flake:`), e.g. `github:owner/repo#attr`,
 /// `github:owner/repo/rev#attr`, or `git+https://host/repo?ref=main#attr`. It rides the
 /// in-cage build wrapper positionally, so it cannot inject shell whatever it contains; the
@@ -1022,12 +1035,7 @@ fn is_valid_flake_ref(reference: &str, allow_insecure_http: bool) -> bool {
     if reference.is_empty()
         || reference.starts_with('-')
         || reference.starts_with("flake:")
-        || reference.starts_with("path:")
-        || reference.starts_with("file:")
-        || reference.contains("+file:")
-        || reference.starts_with('/')
-        || reference.starts_with('.')
-        || reference.starts_with('~')
+        || names_a_local_flake_source(reference)
         || !flake.contains(':')
     {
         return false;

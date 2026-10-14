@@ -231,10 +231,25 @@ fn resolve(nix: &Path, layout: &Layout, reference: &str) -> io::Result<FlakePin>
         .and_then(serde_json::Value::as_str)
         .filter(|u| is_locked_ref(u))
         .ok_or_else(|| io::Error::other(format!("{base} resolved to no usable locked url")))?;
+    // The last place a local source can be refused before it is pinned and built host-side: the
+    // declaration was refused on one, and so is what nix answered for it.
+    if crate::config::names_a_local_flake_source(url) {
+        return Err(io::Error::other(format!(
+            "{base} resolved to a local source, `{url}`, which a `flake:` package never builds from"
+        )));
+    }
     let locked_ref = match attr {
         Some(attr) => format!("{url}#{attr}"),
         None => url.to_string(),
     };
+    // The reference a launch builds is checked whole, the attribute with it: it is written to the
+    // lock as one field of a line, and read back only if it still is one.
+    if !is_locked_ref(&locked_ref) {
+        return Err(io::Error::other(format!(
+            "{base} resolved to a reference that cannot be locked, whitespace or a control \
+             character in it"
+        )));
+    }
     Ok(FlakePin {
         rev: rev.to_string(),
         locked_ref,
@@ -484,6 +499,35 @@ mod tests {
             "the flake is last, behind a `--`: {argv:?}"
         );
         assert_eq!(pin.locked_ref, format!("github:o/r/{REV}#x:y"));
+    }
+
+    /// What `resolve` pins is checked whole before it is: a reference whose attribute would break
+    /// its lock line is refused, and so is a locked url naming a local source, the last place one
+    /// can be stopped before a launch builds it host-side. Every shape is checked before the test
+    /// fails.
+    #[test]
+    fn resolve_pins_nothing_a_lock_line_or_the_local_source_rule_refuses() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let mut pinned = Vec::new();
+        for (reference, url) in [
+            ("github:o/r#a\tb", format!("github:o/r/{REV}")),
+            ("github:o/r#a b", format!("github:o/r/{REV}")),
+            ("github:o/r", format!("git+file:///srv/r?rev={REV}")),
+            ("github:o/r", format!("path:/srv/r?rev={REV}")),
+        ] {
+            let nix = data.path().join("nix");
+            crate::testutil::write_script(
+                &nix,
+                &format!("printf '{{\"revision\":\"{REV}\",\"url\":\"{url}\"}}'"),
+            );
+            let resolved =
+                crate::testutil::result_past_etxtbsy("nix", || resolve(&nix, &layout, reference));
+            if let Ok(pin) = resolved {
+                pinned.push(format!("{reference:?} -> {:?}", pin.locked_ref));
+            }
+        }
+        assert!(pinned.is_empty(), "{pinned:#?}");
     }
 
     #[test]

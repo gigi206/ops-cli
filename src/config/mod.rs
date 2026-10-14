@@ -56,7 +56,7 @@ pub(crate) use schema::{RawBundle, serialize_bundle, serialize_group};
 // every URL a backend derives is re-validated through the same predicate the declaration passed.
 pub(crate) use tools::{
     is_bare_nix_attr, is_valid_appimage_url, is_valid_attr, is_valid_binary_url, is_valid_deb_url,
-    is_valid_tarball_url,
+    is_valid_tarball_url, names_a_local_flake_source,
 };
 // The per-app overlay engine, which the resolution engine drives once per resolution.
 use apps::resolve_apps;
