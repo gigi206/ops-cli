@@ -89,7 +89,9 @@ fn split_attr(reference: &str) -> (&str, Option<&str>) {
 
 /// The locked pins recorded for a project, keyed by the declared reference. Empty when the lock
 /// is absent (the floating behaviour); a corrupt line self-heals by being dropped, and so does a
-/// line that is not UTF-8, so one bad line never costs the others their pins.
+/// line that is not UTF-8, so one bad line never costs the others their pins. A line is kept only
+/// if [`write_pins`] would write it back: every field one, the declared reference included, or a
+/// roll would carry what it read to a write that refuses it.
 ///
 /// Any other failure to read the lock is an error. Read as "nothing pinned", it would have a launch
 /// build every `flake:` package at its latest upstream revision, and `sbx upgrade` rewrite the lock
@@ -114,6 +116,7 @@ pub(crate) fn pins(layout: &Layout, project_id: &str) -> io::Result<BTreeMap<Str
             continue;
         };
         if let [declared, rev, locked] = line.split('\t').collect::<Vec<_>>()[..]
+            && is_locked_ref(declared)
             && is_rev(rev)
             && is_locked_ref(locked)
         {
@@ -156,12 +159,25 @@ pub(crate) fn pinned_revs(cwd: &Path) -> BTreeMap<String, String> {
 
 /// Write the lock atomically (temp + rename), creating the owner-only parent — so a concurrent
 /// launch reading it sees the old or the new file, never a torn one.
+///
+/// Every entry must read back as the line it is written as, so one that would not is refused before
+/// anything is written: a tab or a line break in the declared reference would split the line, and
+/// [`pins`] would drop it, pin and all. The declaration's charset excludes both, so this holds the
+/// format rather than any input that reaches it today.
 fn write_pins(
     layout: &Layout,
     project_id: &str,
     entries: &BTreeMap<String, FlakePin>,
 ) -> io::Result<()> {
     let path = lock_path(layout, project_id)?;
+    if let Some((declared, _)) = entries.iter().find(|(declared, pin)| {
+        !is_locked_ref(declared) || !is_rev(&pin.rev) || !is_locked_ref(&pin.locked_ref)
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the flake lock entry for {declared:?} would not read back as one line"),
+        ));
+    }
     let mut body = String::new();
     for (declared, pin) in entries {
         body.push_str(&format!("{declared}\t{}\t{}\n", pin.rev, pin.locked_ref));
@@ -699,6 +715,55 @@ mod tests {
         );
     }
 
+    /// A lock line whose declared reference is not one field is dropped on the read, as `write_pins`
+    /// refuses it on the write: kept, a roll narrowed to one app, which prunes nothing, carried the
+    /// line it read back to the write and failed on it whenever it had something to write.
+    #[test]
+    fn a_line_the_writer_refuses_is_dropped_on_the_read() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let project = TmpDir::new();
+        let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+        let app = "github:o/app#default";
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            app.to_string(),
+            FlakePin {
+                rev: REV.to_string(),
+                locked_ref: format!("github:o/app/{REV}#default"),
+            },
+        );
+        write_pins(&layout, &id, &entries).unwrap();
+        let lock = lock_path(&layout, &id).unwrap();
+        let mut bytes = std::fs::read(&lock).unwrap();
+        bytes.extend_from_slice(format!("a b\t{REV}\tgithub:o/x\n").as_bytes());
+        std::fs::write(&lock, bytes).unwrap();
+        let cfg = resolved(
+            vec![],
+            vec![("alpha", app_with(vec![flake_pkg("a", app, true)]))],
+        );
+        // The app resolves to a newer revision, so the roll has something to write.
+        const ROLLED: &str = "22707dc2f618dd54ca8739b309ec4fc024de578b";
+        let nix = data.path().join("nix");
+        crate::testutil::write_script(
+            &nix,
+            &format!("printf '{{\"revision\":\"{ROLLED}\",\"url\":\"github:o/app/{ROLLED}\"}}'"),
+        );
+
+        assert_eq!(pins(&layout, &id).ok(), Some(entries));
+        let rolled = crate::testutil::result_past_etxtbsy("nix", || {
+            upgrade(
+                &nix,
+                &layout,
+                project.path(),
+                &cfg,
+                Some("alpha"),
+                crate::sandbox::RollMode::Apply,
+            )
+        });
+        assert!(rolled.is_ok(), "{:?}", rolled.err());
+    }
+
     /// A roll writes the lock from what it holds once the resolutions are done, under its writer
     /// guard, not from the snapshot taken before they went to the network. The stand-in nix is
     /// another sbx here, writing to the lock while this roll resolves its own app: a pin it adds is
@@ -870,6 +935,35 @@ mod tests {
             before,
             "the lock is the same file"
         );
+    }
+
+    /// An entry that would not read back as the line it is written as is refused before anything is
+    /// written, and the lock keeps what it held. Each shape is checked before the test fails.
+    #[test]
+    fn an_entry_that_would_not_read_back_is_not_written() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let pin = FlakePin {
+            rev: REV.to_string(),
+            locked_ref: format!("github:o/r/{REV}#default"),
+        };
+        let mut seeded = BTreeMap::new();
+        seeded.insert("github:o/r#default".to_string(), pin.clone());
+        write_pins(&layout, PROJ, &seeded).unwrap();
+        let lock = lock_path(&layout, PROJ).unwrap();
+        let before = std::fs::read(&lock).unwrap();
+
+        let mut written = Vec::new();
+        for declared in ["github:o/r#a\tb", "github:o/r#a\nb"] {
+            let mut entries = seeded.clone();
+            entries.insert(declared.to_string(), pin.clone());
+            let wrote = write_pins(&layout, PROJ, &entries);
+            if wrote.is_ok() || std::fs::read(&lock).unwrap() != before {
+                written.push(format!("{declared:?}: {wrote:?}"));
+                write_pins(&layout, PROJ, &seeded).unwrap();
+            }
+        }
+        assert!(written.is_empty(), "{written:#?}");
     }
 
     /// A lock line that is not UTF-8 is dropped like any corrupt line, and the other lines keep
