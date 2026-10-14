@@ -1358,11 +1358,44 @@ fn git_command_over(
 /// the decoded key must be exactly 32 bytes, fail-closed.
 pub(crate) fn parse_pubkey_arg(arg: &str) -> Result<[u8; 32], String> {
     let hex = match arg.strip_prefix('@') {
-        Some(path) => std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read the public key file `{path}`: {e}"))?,
+        Some(path) => read_key_file(Path::new(path))?,
         None => arg.to_string(),
     };
     decode_key(&hex)
+}
+
+/// The most `--key @<file>` reads. A key is 64 hex characters, and the bound is far past any
+/// whitespace a file puts around them.
+const KEY_FILE_MAX: u64 = 4096;
+
+/// Read the file a `--key @<path>` names, bounded by [`KEY_FILE_MAX`]. It is opened as named,
+/// through a symlink too: the path is the user's own argument, and a key kept behind a link is a
+/// key all the same, so neither `O_NOFOLLOW` nor the regular-file check a store's own files get
+/// applies here. The bound is what keeps a path naming `/dev/zero` or a large file from being read
+/// until memory runs out.
+fn read_key_file(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+    let unreadable =
+        |e: std::io::Error| format!("cannot read the public key file `{}`: {e}", path.display());
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(unreadable)?
+        .take(KEY_FILE_MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if bytes.len() as u64 > KEY_FILE_MAX {
+        return Err(format!(
+            "the public key file `{}` is longer than {KEY_FILE_MAX} bytes, far past a \
+             64-character key",
+            path.display()
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        format!(
+            "the public key file `{}` is not valid UTF-8",
+            path.display()
+        )
+    })
 }
 
 /// Decode a hex string into a 32-byte Ed25519 public key, fail-closed on bad hex or the wrong
@@ -1977,6 +2010,31 @@ mod tests {
         // the name is validated before git is ever consulted, so a bad name fails fast
         assert!(add(&layout, "../evil", "file:///x", [0u8; 32], &git).is_err());
         assert!(add(&layout, ".hidden", "file:///x", [0u8; 32], &git).is_err());
+    }
+
+    /// `--key @<file>` reads at most a bound far past a key, so a path naming a device or a large
+    /// file is refused by its size rather than read whole. A key padded up to the bound exactly is
+    /// still read, and so the shape past it differs from it by one byte.
+    #[test]
+    fn a_key_file_past_its_bound_is_refused_by_its_size() {
+        let dir = crate::testutil::TmpDir::new();
+        let key = [0xabu8; 32];
+        let mut padded = to_hex(&key).into_bytes();
+        padded.resize(KEY_FILE_MAX as usize, b'\n');
+        let at_bound = dir.path().join("at-bound.hex");
+        std::fs::write(&at_bound, &padded).unwrap();
+        let read = read_key_file(&at_bound).and_then(|hex| decode_key(&hex));
+        assert_eq!(read, Ok(key), "a key padded up to the bound is read");
+
+        padded.push(b'\n');
+        let past = dir.path().join("past-bound.hex");
+        std::fs::write(&past, &padded).unwrap();
+        let read = read_key_file(&past);
+        assert!(
+            read.as_ref()
+                .is_err_and(|e| e.contains(&KEY_FILE_MAX.to_string())),
+            "{read:?}"
+        );
     }
 
     #[test]

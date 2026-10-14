@@ -164,7 +164,8 @@ required, a store with no verifying key would be unsigned, and is refused
 fail-closed:
 
 - `--key <hex|@file>` **pins a public key you obtained out of band**: the strong
-  form.
+  form. `@file` reads the key from the file it names, through a symlink too, and
+  refuses one longer than 4096 bytes rather than read it whole.
 - `--trust` accepts the key the store ships **on first use** (trust-on-first-use),
   weaker; `sbx` prints the pinned key so you can compare it afterward against a
   source the store does not control.
