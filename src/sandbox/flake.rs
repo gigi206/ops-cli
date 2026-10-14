@@ -40,7 +40,12 @@ pub(crate) struct FlakePin {
 /// back into a flake reference or an on-disk path component. Lowercase-only, matching how nix and
 /// `crate::store::valid_revision` spell a rev — an off-case value is a corrupt lock line, refused.
 fn is_rev(s: &str) -> bool {
-    s.len() == 40
+    lower_hex(s, 40)
+}
+
+/// Exactly `len` lowercase hex characters.
+fn lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -52,12 +57,23 @@ fn is_locked_ref(s: &str) -> bool {
 }
 
 /// The per-project flake lock path, beside the other per-project locks.
-fn lock_path(layout: &Layout, project_id: &str) -> PathBuf {
-    layout
+///
+/// The id must be one `binds::project_id` spells, 16 lowercase hex characters, before it is joined:
+/// it names a directory under the data dir, and a `..` or a `/` in it would name another one. Every
+/// caller passes `project_runtime_id`'s answer today; the check is what keeps the read and the write
+/// of this lock from following one that is not.
+fn lock_path(layout: &Layout, project_id: &str) -> io::Result<PathBuf> {
+    if !lower_hex(project_id, 16) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("`{project_id}` is not a project id"),
+        ));
+    }
+    Ok(layout
         .data_dir()
         .join("projects")
         .join(project_id)
-        .join(FLAKE_LOCK)
+        .join(FLAKE_LOCK))
 }
 
 /// Split a declared `flake:` reference (the value after the `flake:` prefix) into its flake
@@ -80,7 +96,7 @@ fn split_attr(reference: &str) -> (&str, Option<&str>) {
 /// from what it resolved alone, dropping every pin it did not roll: the unpinning the pin model
 /// exists to forbid.
 pub(crate) fn pins(layout: &Layout, project_id: &str) -> io::Result<BTreeMap<String, FlakePin>> {
-    let path = lock_path(layout, project_id);
+    let path = lock_path(layout, project_id)?;
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
@@ -145,7 +161,7 @@ fn write_pins(
     project_id: &str,
     entries: &BTreeMap<String, FlakePin>,
 ) -> io::Result<()> {
-    let path = lock_path(layout, project_id);
+    let path = lock_path(layout, project_id)?;
     let mut body = String::new();
     for (declared, pin) in entries {
         body.push_str(&format!("{declared}\t{}\t{}\n", pin.rev, pin.locked_ref));
@@ -392,6 +408,8 @@ mod tests {
     use crate::testutil::{TmpDir, app_with, resolved};
 
     const REV: &str = "11707dc2f618dd54ca8739b309ec4fc024de578b";
+    /// A project id as `binds::project_id` spells one, for a test that needs no real project.
+    const PROJ: &str = "0123456789abcdef";
 
     /// A `nix flake metadata` that fails is reported with all of nix's message, on one line
     /// nothing in it can drive or reorder, and a message that folds to nothing adds nothing.
@@ -539,21 +557,21 @@ mod tests {
                 locked_ref: format!("github:o/r/{REV}?narHash=sha256-x#default"),
             },
         );
-        write_pins(&layout, "proj", &entries).unwrap();
+        write_pins(&layout, PROJ, &entries).unwrap();
 
         // A round trip preserves the pin.
-        let read = pins(&layout, "proj").unwrap();
+        let read = pins(&layout, PROJ).unwrap();
         assert_eq!(
             read.get("github:o/r#default"),
             entries.get("github:o/r#default")
         );
 
         // A corrupt line (a non-rev second field) is dropped, the valid one kept.
-        let path = lock_path(&layout, "proj");
+        let path = lock_path(&layout, PROJ).unwrap();
         let mut text = std::fs::read_to_string(&path).unwrap();
         text.push_str("github:o/bad\tnot-a-rev\tref\n");
         std::fs::write(&path, text).unwrap();
-        let read = pins(&layout, "proj").unwrap();
+        let read = pins(&layout, PROJ).unwrap();
         assert_eq!(read.len(), 1, "only the valid pin survives");
         assert!(read.contains_key("github:o/r#default"));
     }
@@ -576,7 +594,7 @@ mod tests {
             },
         );
         write_pins(&layout, &id, &entries).unwrap();
-        let seeded = std::fs::read(lock_path(&layout, &id)).unwrap();
+        let seeded = std::fs::read(lock_path(&layout, &id).unwrap()).unwrap();
         let cfg = resolved(vec![], vec![]);
         let nix = Path::new("/nonexistent/nix");
 
@@ -593,7 +611,7 @@ mod tests {
             matches!(dry.as_slice(), [FlakeUpgrade::Pruned { reference: r }] if *r == reference)
         );
         assert_eq!(
-            std::fs::read(lock_path(&layout, &id)).unwrap(),
+            std::fs::read(lock_path(&layout, &id).unwrap()).unwrap(),
             seeded,
             "a dry run writes nothing"
         );
@@ -627,8 +645,8 @@ mod tests {
                 locked_ref: format!("github:o/r/{REV}#default"),
             },
         );
-        write_pins(&layout, "proj", &entries).unwrap();
-        let path = lock_path(&layout, "proj");
+        write_pins(&layout, PROJ, &entries).unwrap();
+        let path = lock_path(&layout, PROJ).unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
         // A line whose declared reference carries a byte that is not UTF-8, then a bare one.
         bytes.extend_from_slice(b"github:o/\xff\t");
@@ -636,7 +654,7 @@ mod tests {
         bytes.extend_from_slice(b"\tgithub:o/x\ngithub:o/\xff\n");
         std::fs::write(&path, bytes).unwrap();
 
-        let read = pins(&layout, "proj");
+        let read = pins(&layout, PROJ);
         assert_eq!(read.ok(), Some(entries), "the valid line keeps its pin");
     }
 
@@ -671,7 +689,7 @@ mod tests {
             &nix,
             &format!("printf '{{\"revision\":\"{REV}\",\"url\":\"github:o/app/{REV}\"}}'"),
         );
-        let lock = lock_path(&layout, &id);
+        let lock = lock_path(&layout, &id).unwrap();
         let seeded = std::fs::read(&lock).unwrap();
 
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -726,7 +744,7 @@ mod tests {
             },
         );
         write_pins(&layout, &id, &entries).unwrap();
-        let lock = lock_path(&layout, &id);
+        let lock = lock_path(&layout, &id).unwrap();
 
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
         // The probe asks this process rather than its uid, and the mode is restored before
@@ -754,6 +772,25 @@ mod tests {
             err.as_deref().is_some_and(|e| e.contains("flake lock")),
             "{err:?}"
         );
+    }
+
+    /// The lock is addressed only by an id `binds::project_id` spells, so a `..` or a `/` in what a
+    /// caller hands over never names a directory beside the project's: the read and the write both
+    /// refuse it, and every shape is checked before the test fails.
+    #[test]
+    fn the_lock_is_addressed_only_by_a_project_id() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let mut followed = Vec::new();
+        for id in ["../x", "0123456789abcde/", "0123456789ABCDEF", ""] {
+            if pins(&layout, id).is_ok() {
+                followed.push(format!("pins read under `{id}`"));
+            }
+            if write_pins(&layout, id, &BTreeMap::new()).is_ok() {
+                followed.push(format!("write_pins wrote under `{id}`"));
+            }
+        }
+        assert!(followed.is_empty(), "{followed:#?}");
     }
 
     #[test]
