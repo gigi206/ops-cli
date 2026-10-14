@@ -57,11 +57,13 @@ impl Kind {
     }
 }
 
-/// Which persistent home a session runs in — the bit `sbx session attach` needs to reproduce the same
-/// environment. A plain `sbx run` uses the project's default home (`Project`); an
-/// `sbx app` uses its own isolated home, keyed by the app name and its scope (`GlobalApp` shared
-/// across projects, `ProjectApp` per project). Owned (unlike the borrowing launch-side `Runtime`),
-/// so a record outlives the launch that wrote it.
+/// Which persistent home a session runs in. A plain `sbx run` uses the project's default home
+/// (`Project`); an `sbx app` uses its own isolated home, keyed by the app name and its scope
+/// (`GlobalApp` shared across projects, `ProjectApp` per project). A record carries it so a listing
+/// can name the app a session runs as, a verb can be narrowed to one app's sessions, and the cage's
+/// name is derived the way the launch derived it. `sbx session attach` reproduces nothing from it:
+/// it joins the running cage's namespaces. Owned (unlike the borrowing launch-side `Runtime`), so a
+/// record outlives the launch that wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionRuntime {
     Project,
@@ -114,7 +116,7 @@ pub(crate) enum StopOutcome {
 
 /// One registered sandbox. The `(pid, start_ticks)` pair identifies the live
 /// process; `project` is the canonical project root (display and identity); `runtime` is the home
-/// it runs in, so `sbx session attach` can reproduce it.
+/// it runs in, which names the app it runs as.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Session {
     pub(crate) project: PathBuf,
