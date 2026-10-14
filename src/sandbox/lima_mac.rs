@@ -4,7 +4,10 @@
 //! A guest cannot run a program on the Mac the way a WSL distribution runs one on Windows, so the
 //! two channels are directories the template mounts from the Mac, each at a path that exists only
 //! in the guest. Wherever one is mounted it is part of sbx's control plane
-//! ([`mounted_channels`]), so no cage is given it, not even under a bind that covers its path. The theme directory is read-only here: an agent on the
+//! ([`mounted_channels`]), so a bind that covers its path does not give it to a cage. The notes
+//! directory is also on the Mac, which a guest that shares more of the Mac's home than the
+//! template's default sees a second time under another path, so [`queue_note`] writes into it
+//! without following a link. The theme directory is read-only here: an agent on the
 //! Mac writes the current preference into it. The notification directory is writable: sbx drops
 //! one file per note into it, its own refusals and the notifications a caged app raises through the
 //! relay alike, and an agent on the Mac raises each one and removes it.
@@ -13,7 +16,10 @@
 //! `/proc/self/mountinfo`. A host where the path is an ordinary directory, or absent, reads and
 //! writes nothing there, which keeps every other Linux host on the behaviour it had.
 
+use super::cagedir;
+use std::ffi::OsString;
 use std::io::Read;
+use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -183,10 +189,11 @@ fn boot_tag() -> &'static str {
 /// process apart from the rest of its guest, and [`NOTE_SEQ`] one note apart from the process's
 /// others. That still leaves a pid the kernel recycled within one boot, which meets the names its
 /// predecessor left waiting, and the rename that publishes a note replaced one of them: a name
-/// already in the queue is passed over. Nothing can take one in between, since within a boot the pid
-/// is this process's alone while it runs. A name whose presence cannot be read is taken, and the
-/// rename then reports what is wrong.
-fn note_name(source: NoteSource, queue: &Path) -> String {
+/// already in the queue is passed over, and so is one left in `staging` by a predecessor that stopped
+/// between writing a note and publishing it, which the exclusive create would otherwise refuse.
+/// Nothing can take one in between, since within a boot the pid is this process's alone while it
+/// runs. A name whose presence cannot be read is taken, and the create then reports what is wrong.
+fn note_name(source: NoteSource, staging: &OwnedFd, queue: &OwnedFd) -> std::io::Result<OsString> {
     loop {
         let name = format!(
             "{}{}-{}-{}.note",
@@ -195,15 +202,25 @@ fn note_name(source: NoteSource, queue: &Path) -> String {
             std::process::id(),
             NOTE_SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        match std::fs::symlink_metadata(queue.join(&name)) {
-            Ok(_) => continue,
-            Err(_) => return name,
+        let name = OsString::from(name);
+        let taken = |dir: &OwnedFd| -> std::io::Result<bool> {
+            Ok(std::fs::symlink_metadata(cagedir::entry(dir, &name)?).is_ok())
+        };
+        if !taken(staging)? && !taken(queue)? {
+            return Ok(name);
         }
     }
 }
 
 /// Queue one note from `source` under `dir`, the notification channel's root. `Ok(false)` when the
 /// queue already holds [`QUEUE_CAP`] notes from that source and nothing was written.
+///
+/// `staging` and `queue` are each reached through a descriptor opened without following a link
+/// ([`cagedir::hold_under`]), one that is not a directory refused, and the note is created through
+/// it exclusively, which follows no link either. The directory is on the Mac, and a guest that
+/// shares more of the Mac's home than the template's default sees it a second time, under a path
+/// the control plane does not name ([`mounted_channels`]): a link left there at the next name would
+/// otherwise take the note, and sbx's write, wherever it pointed.
 pub(crate) fn queue_note(
     dir: &Path,
     source: NoteSource,
@@ -211,21 +228,34 @@ pub(crate) fn queue_note(
     subtitle: &str,
     body: &str,
 ) -> std::io::Result<bool> {
-    let staging = dir.join(STAGING);
-    let queue = dir.join(QUEUE);
-    std::fs::create_dir_all(&staging)?;
-    std::fs::create_dir_all(&queue)?;
-    let waiting = std::fs::read_dir(&queue)?
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+
+    // The mode `create_dir_all` gave these, the umask applying.
+    let staging = cagedir::hold_under(dir, STAGING, 0o777)?;
+    let queue = cagedir::hold_under(dir, QUEUE, 0o777)?;
+    let waiting = std::fs::read_dir(format!("/proc/self/fd/{}", queue.as_raw_fd()))?
         .filter_map(Result::ok)
         .filter(|e| e.file_name().to_string_lossy().starts_with(source.prefix()))
         .count();
     if waiting >= QUEUE_CAP {
         return Ok(false);
     }
-    let name = note_name(source, &queue);
-    let staged = staging.join(&name);
-    std::fs::write(&staged, note_text(title, subtitle, body))?;
-    std::fs::rename(&staged, queue.join(&name)).inspect_err(|_| {
+    let name = note_name(source, &staging, &queue)?;
+    let staged = cagedir::entry(&staging, &name)?;
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .and_then(|mut file| file.write_all(note_text(title, subtitle, body).as_bytes()));
+    if let Err(e) = written {
+        // Only what this call created is removed: an exclusive create that failed made nothing.
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            let _ = std::fs::remove_file(&staged);
+        }
+        return Err(e);
+    }
+    std::fs::rename(&staged, cagedir::entry(&queue, &name)?).inspect_err(|_| {
         let _ = std::fs::remove_file(&staged);
     })?;
     Ok(true)
@@ -488,6 +518,45 @@ mod tests {
             fresh.len() == 1 && fresh[0].starts_with(&format!("sbx-{}-", boot_tag())),
             "{fresh:?}"
         );
+    }
+
+    /// A link left in the channel is not followed: not at a name the next note may be staged
+    /// under, and not in place of `staging` itself.
+    ///
+    /// The channel is a directory on the Mac, and a guest that shares more of the Mac's home than
+    /// the template's default reaches it under a second path the control plane does not name. A
+    /// note written by name followed a link left at the next staged name, and wrote the note's
+    /// lines, which a caged app chooses, into whatever file the link named.
+    #[test]
+    fn a_link_left_in_the_channel_is_not_followed() {
+        let dir = TmpDir::new();
+        let channel = dir.join("notify");
+        let staging = channel.join(STAGING);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(channel.join(QUEUE)).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "kept\n").unwrap();
+        let next = NOTE_SEQ.load(Ordering::Relaxed);
+        for n in next..next + 24 {
+            let name = format!("sbx-{}-{}-{n}.note", boot_tag(), std::process::id());
+            std::os::unix::fs::symlink(&victim, staging.join(name)).unwrap();
+        }
+        let _ = queue_note(&channel, NoteSource::Sbx, "echo written", "", "");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "kept\n",
+            "a staged name that is a link was written through"
+        );
+
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::remove_dir_all(&staging).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &staging).unwrap();
+        assert!(
+            queue_note(&channel, NoteSource::Sbx, "t", "", "b").is_err(),
+            "a link in place of `staging` is refused"
+        );
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
     }
 
     /// A caged app that fills its share of the queue leaves sbx's share untouched, and the other
