@@ -452,6 +452,24 @@ fn the_challenge_probe_does_not_read_the_blob_it_asks_about() {
         biggest.size
     );
     let url = v2_url(&image, "blobs", &biggest.digest);
+    // Only a registry that does not challenge for the blob tells the two probes apart: one that
+    // does answers a `GET` with its small `401` document as well, and either probe then reaches
+    // the body.
+    let asked = match http::head(&url, &[]) {
+        Ok(asked) => asked,
+        Err(e) if transient(&e) => {
+            skip_unreachable!(
+                "skipping the unchallenged-registry probe: no verdict came back: {e}"
+            );
+            return;
+        }
+        Err(e) => panic!("asking quay.io about the blob failed, and not on the network: {e}"),
+    };
+    assert_ne!(
+        asked.status, 401,
+        "quay.io challenges for this blob, so this test no longer tells a probe that reads the \
+         blob from one that does not"
+    );
     let mut sink = Refusing { reached: false };
     match get_authenticated_to_writer(&url, None, &mut sink, blob_cap(biggest.size)) {
         Err(_) if sink.reached => {}
