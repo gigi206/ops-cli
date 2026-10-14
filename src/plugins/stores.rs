@@ -1471,8 +1471,9 @@ fn catalogue_and_signature(checkout: &Path) -> Result<(Vec<u8>, Vec<u8>), String
 ///
 /// The cached tree is a plain content tree, not a working git repository: the `.git` directory
 /// goes so no git metadata (or hooks) sits in the trusted data dir, and the next update re-clones
-/// from scratch. Both files are written into the stage rather than into the live cache, so the
-/// tree that lands at the real name is complete the instant it becomes visible.
+/// from scratch. A `.git` that cannot be dropped refuses the seal, so a cache never carries one; an
+/// absent one is nothing to drop. Both files are written into the stage rather than into the live
+/// cache, so the tree that lands at the real name is complete the instant it becomes visible.
 fn seal_stage(
     stage: &Stage,
     url: &str,
@@ -1480,7 +1481,15 @@ fn seal_stage(
     tofu: bool,
     rev: u64,
 ) -> Result<(), String> {
-    let _ = std::fs::remove_dir_all(stage.0.join(CHECKOUT).join(".git"));
+    match std::fs::remove_dir_all(stage.0.join(CHECKOUT).join(".git")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "cannot drop the fetched repository's git metadata: {e}"
+            ));
+        }
+    }
 
     write_owner_only(
         &stage.0.join(STORE_TOML),
@@ -1493,11 +1502,16 @@ fn seal_stage(
 /// A staging directory removed when it goes out of scope, so a fetch never leaks its tree —
 /// on success (after the atomic rename has consumed it, where the removal is a no-op) or on
 /// any error path.
+///
+/// Through the walk that adds write on the way down, as [`remove`] does: a stage refused because
+/// its `.git` could not be dropped holds the very tree a plain recursive delete stops on, and
+/// nothing sweeps a stage left under the data directory. The asymmetry with [`seal_stage`] is the
+/// point: the seal refuses on any failure to drop `.git`, and the guard leaves nothing behind.
 struct Stage(PathBuf);
 
 impl Drop for Stage {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = crate::sandbox::gc::force_remove_dir_all(&self.0);
     }
 }
 
@@ -2726,6 +2740,61 @@ mod tests {
             "the refusal has to name the component that leaves the checkout: {err}"
         );
         assert!(!layout.plugins_dir().join("pass").exists());
+    }
+
+    /// A stage is sealed only once the fetched repository's `.git` is gone: one that cannot be dropped
+    /// refuses the seal before anything is written, and an absent one is nothing to drop. The
+    /// refused stage is then removed by its guard all the same, closed mode and all.
+    #[test]
+    fn a_stage_is_sealed_only_once_its_git_metadata_is_gone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::testutil::TmpDir::new();
+
+        let bare = Stage(dir.path().join("no-git"));
+        std::fs::create_dir_all(bare.0.join(CHECKOUT)).unwrap();
+        let sealed = seal_stage(&bare, "file:///store", &[7; 32], false, 1);
+        assert!(
+            sealed.is_ok(),
+            "a stage with no `.git` has nothing to drop: {sealed:?}"
+        );
+
+        let stage = Stage(dir.path().join("held-git"));
+        let held = stage.0.join(CHECKOUT).join(".git").join("objects");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::write(held.join("pack"), b"object").unwrap();
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // The failure provoked is a directory whose entries cannot be unlinked, which a process
+        // allowed past the mode (root, or one holding `CAP_DAC_OVERRIDE`) never meets: the probe
+        // asks this process rather than its uid. The mode is restored before anything is asserted.
+        if std::fs::File::create(held.join("probe")).is_ok() {
+            std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o700)).unwrap();
+            skip_incapable!(
+                "skipping the held-`.git` seal test: this process writes into a directory without \
+                 a write bit, so the removal cannot be made to fail"
+            );
+            return;
+        }
+        let sealed = seal_stage(&stage, "file:///store", &[7; 32], false, 1);
+        let wrote = stage.0.join(STORE_TOML).exists();
+        // The guard is dropped with the mode still closed, the shape every caller leaves it in.
+        let root = stage.0.clone();
+        drop(stage);
+        let left = root.exists();
+        if left {
+            std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(
+            sealed.as_ref().is_err_and(|e| e.contains("git metadata")),
+            "{sealed:?}"
+        );
+        assert!(
+            !wrote,
+            "nothing is written into a stage that was not sealed"
+        );
+        assert!(
+            !left,
+            "the guard leaves no stage behind, even one whose `.git` refused a removal"
+        );
     }
 
     /// The walk takes only plain names, on its own account rather than on the parse that refuses
