@@ -753,18 +753,32 @@ pub(crate) fn read_configured(
 /// The names of every configured remote store, sorted. Non-directories and dot-prefixed
 /// bookkeeping entries (a staging tree never fully swapped in) are skipped; a missing stores
 /// directory simply means none is configured.
-pub(crate) fn list(layout: &crate::store::Layout) -> Vec<String> {
-    let mut names: Vec<String> = match std::fs::read_dir(layout.stores_dir()) {
-        Ok(rd) => rd
-            .flatten()
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| !n.starts_with('.'))
-            .collect(),
-        Err(_) => Vec::new(),
+///
+/// Any other failure to read the stores directory is an error, because "none is configured" is an
+/// answer only a directory that was read can give. A name that is not UTF-8 is skipped rather than
+/// rendered lossily: `validate_install_name` holds a store's name to ASCII, so it names no store.
+pub(crate) fn list(layout: &crate::store::Layout) -> Result<Vec<String>, String> {
+    let dir = layout.stores_dir();
+    let unreadable = |e: std::io::Error| format!("cannot read {}: {e}", dir.display());
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(unreadable(e)),
     };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(unreadable)?;
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        if let Ok(name) = entry.file_name().into_string()
+            && !name.starts_with('.')
+        {
+            names.push(name);
+        }
+    }
     names.sort();
-    names
+    Ok(names)
 }
 
 /// Parse the cached catalogue of a configured store, trusting it by location: it was
@@ -2258,7 +2272,44 @@ mod tests {
         // a dot-prefixed entry under the stores dir must be ignored
         std::fs::create_dir_all(layout.stores_dir().join(".scratch")).unwrap();
 
-        assert_eq!(list(&layout), vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            list(&layout),
+            Ok(vec!["alpha".to_string(), "beta".to_string()])
+        );
+    }
+
+    /// A stores directory that cannot be read is an error, not an empty listing: "none is
+    /// configured" is an answer only a directory that was read can give. An absent one is that
+    /// answer.
+    #[test]
+    fn a_stores_directory_that_cannot_be_read_is_not_an_empty_listing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let data = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        assert_eq!(
+            list(&layout),
+            Ok(Vec::new()),
+            "an absent directory configures nothing"
+        );
+
+        let stores = layout.stores_dir();
+        std::fs::create_dir_all(stores.join("default")).unwrap();
+        std::fs::set_permissions(&stores, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // The failure provoked is a directory this process may not read, which a process allowed
+        // past the mode never meets: the probe asks this process rather than its uid. The mode is
+        // restored before anything is asserted.
+        let meets_it = std::fs::read_dir(&stores)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        let listed = meets_it.then(|| list(&layout));
+        std::fs::set_permissions(&stores, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let Some(listed) = listed else {
+            skip_incapable!(
+                "skipping the unreadable-stores test: this process reads a directory without a \
+                 read bit"
+            );
+            return;
+        };
+        assert!(listed.is_err(), "{listed:?}");
     }
 
     #[test]

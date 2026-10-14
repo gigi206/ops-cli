@@ -1233,7 +1233,13 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
     let names: Vec<String> = match only {
         Some(name) => vec![name.to_string()],
         None => {
-            let all = stores::list(&layout);
+            let all = match stores::list(&layout) {
+                Ok(all) => all,
+                Err(why) => {
+                    diag::error(&format!("sbx: cannot list the configured stores: {why}"));
+                    return ExitCode::FAILURE;
+                }
+            };
             if all.is_empty() {
                 let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
                 let (dim, r) = (pal.dim, pal.reset);
@@ -1800,7 +1806,16 @@ fn plugins_store_list(only_installed: bool, only_store: Option<&str>, json: bool
     // Configured stores, read from their owner-only caches (trusted by location). Each is expanded
     // down to its plugins: a bare count would say a store has something to offer without saying
     // what, which is the one question this command exists to answer.
-    let mut names = layout.as_ref().map(stores::list).unwrap_or_default();
+    // The store names are the answer this command gives, so a stores directory that cannot be read
+    // fails it: rendering the listing anyway would print "no remote stores are configured" under
+    // the warning that says they could not be read.
+    let mut names = match layout.as_ref().map(stores::list).transpose() {
+        Ok(names) => names.unwrap_or_default(),
+        Err(why) => {
+            diag::error(&format!("sbx: cannot list the configured stores: {why}"));
+            return ExitCode::FAILURE;
+        }
+    };
     // A name that matches nothing is refused rather than rendered as an empty listing: "no such
     // store" and "this store lists nothing" are different answers, and only one of them is a typo.
     if let Some(want) = only_store {

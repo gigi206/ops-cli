@@ -422,7 +422,7 @@ fn registry_values(kind: &ValueKind) -> Vec<(String, String)> {
             }
         }
         Stores => {
-            for name in stores::list(&layout) {
+            for name in stores::list(&layout).unwrap_or_default() {
                 out.push((name, String::new()));
             }
         }

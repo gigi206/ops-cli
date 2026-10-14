@@ -212,6 +212,48 @@ fn git_run(dir: &Path, args: &[&str]) {
     );
 }
 
+/// A stores directory sbx cannot read fails the two verbs that list it, rather than answer that no
+/// store is configured: that is an answer only a directory that was read can give. Both verbs are
+/// checked before the test fails.
+#[test]
+fn an_unreadable_stores_directory_fails_the_listing_rather_than_reporting_none() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if !git_works() {
+        skip_incapable!("skipping: no working git on PATH");
+        return;
+    }
+    let home = TmpDir::new("plugins");
+    let stores = home.path().join("sbx").join("stores");
+    std::fs::create_dir_all(stores.join("mine")).unwrap();
+    std::fs::set_permissions(&stores, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // The failure provoked is a directory this process may not read, which a process allowed past
+    // the mode never meets: the probe asks this process rather than its uid. The mode is restored
+    // before anything is asserted.
+    if std::fs::read_dir(&stores).is_ok() {
+        std::fs::set_permissions(&stores, std::fs::Permissions::from_mode(0o700)).unwrap();
+        skip_incapable!("skipping: this process reads a directory without a read bit");
+        return;
+    }
+    let runs = [
+        ("list", run_both(&["plugins", "store", "list"], home.path())),
+        (
+            "update",
+            run_both(&["plugins", "store", "update"], home.path()),
+        ),
+    ];
+    std::fs::set_permissions(&stores, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut answered = Vec::new();
+    for (verb, (code, stdout, stderr)) in runs {
+        if code == 0 || !stderr.contains("cannot list the configured stores") {
+            answered.push(format!(
+                "{verb}: exit {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            ));
+        }
+    }
+    assert!(answered.is_empty(), "{}", answered.join("\n\n"));
+}
+
 #[test]
 fn adding_a_store_with_no_trust_anchor_shows_the_key_it_ships_and_configures_nothing() {
     if !git_works() {
