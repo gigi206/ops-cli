@@ -258,9 +258,11 @@ agent = "flake:github:owner/repo#default"
 Built **host-side** with `nix build <ref>` into `sbx`'s shared store: built once
 (content-addressed, so a second project is a cache hit) and seeded into each project's
 store, its `bin/` prepended to the cage `PATH`. Durable and offline-reusable, exactly
-like `nix:`. The flake ref must carry an explicit scheme, **every local-source form is
-rejected** (`path:`/`git+file:`, a leading `/`·`.`·`~`, the bare indirect `nixpkgs`) so a
-config cannot aim the build at a host path. The build fetches its inputs over the **host**
+like `nix:`. The flake ref must carry an explicit scheme in the flake itself, before any
+`#`, and **every local-source form is rejected** (`path:`/`git+file:`, a leading
+`/`·`.`·`~`, the indirect `nixpkgs` bare or as `flake:nixpkgs`, which your nix registry
+can point anywhere) so a config cannot aim the build at a host path. A ref starting with
+`-` is refused too. The build fetches its inputs over the **host**
 network (not the cage allowlist), so a flake whose build self-fetches with its own HTTP
 client (e.g. `bun install`) builds fine: the cage allowlist governs only the app's
 **runtime** egress. Pins advance with

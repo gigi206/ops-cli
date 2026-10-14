@@ -1009,15 +1009,26 @@ pub(super) fn is_valid_mise_token(token: &str) -> bool {
 /// ref starting with `/`, `.`, or `~` as a local path — and an ambiguous registry-indirect ref
 /// (`nixpkgs`), by *requiring an explicit scheme* (a `:`). A real remote ref always carries one
 /// (`github:`, `git+https:`, `gitlab:`, …).
+///
+/// The scheme is the flake's own, so the `:` is looked for before the `#`: one in the attribute
+/// names nothing, and `nixpkgs#a:b` is still the bare `nixpkgs`. The explicit indirect form,
+/// `flake:<id>`, goes through the same registry, which a user's own can point at a local path, so
+/// it is refused with the bare one. And a reference starting with `-` is refused: what is left of
+/// it before the `#` reads as an option to nix (`--impure#x:y` leaves `--impure`).
 fn is_valid_flake_ref(reference: &str, allow_insecure_http: bool) -> bool {
+    let flake = reference
+        .split_once('#')
+        .map_or(reference, |(flake, _)| flake);
     if reference.is_empty()
+        || reference.starts_with('-')
+        || reference.starts_with("flake:")
         || reference.starts_with("path:")
         || reference.starts_with("file:")
         || reference.contains("+file:")
         || reference.starts_with('/')
         || reference.starts_with('.')
         || reference.starts_with('~')
-        || !reference.contains(':')
+        || !flake.contains(':')
     {
         return false;
     }

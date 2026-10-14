@@ -6027,6 +6027,39 @@ fn a_flake_prefixed_package_parses_as_a_flake_backend_and_rejects_local_sources(
     );
 }
 
+/// A flake reference takes its scheme from the flake, before the `#`: a `:` in the attribute is not
+/// one, so `nixpkgs#a:b` is still the bare registry-indirect `nixpkgs`, and `--impure#x:y` leaves
+/// nix an option and no flake. The explicit indirect `flake:<id>` is the same registry, and a
+/// leading `-` reads as an option. Every shape is checked before the test fails, beside two remote
+/// references that must still be admitted.
+#[test]
+fn a_flake_reference_takes_its_scheme_from_the_flake_not_the_attribute() {
+    let refused = [
+        ("attr-colon", "flake:nixpkgs#a:b"),
+        ("option", "flake:--impure#x:y"),
+        ("dash", "flake:-x:y#z"),
+        ("explicit-indirect", "flake:flake:nixpkgs#hello"),
+    ];
+    let admitted = [
+        ("github", "flake:github:o/r#attr"),
+        ("git-https", "flake:git+https://h/r?ref=main#a"),
+    ];
+    let all: Vec<(&str, &str)> = refused.iter().chain(&admitted).copied().collect();
+    let r = resolve_no_plugins(raw_packages(&all), None);
+    let mut wrong = Vec::new();
+    for (name, value) in refused {
+        if pkg(&r.packages, name).is_some() {
+            wrong.push(format!("`{value}` was admitted"));
+        }
+    }
+    for (name, value) in admitted {
+        if pkg(&r.packages, name).is_none() {
+            wrong.push(format!("`{value}` was refused"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 fn raw_flakes(flakes: &[(&str, &str, Option<&str>)]) -> RawConfig {
     RawConfig {
         flakes: flakes
