@@ -813,11 +813,15 @@ pub(crate) fn upgrade_plugin(
 }
 
 /// Where a catalogue entry's `path` lands under a store's cached checkout.
+#[derive(Debug)]
 enum Located {
     /// Every component is a real directory inside the checkout; this is that directory.
     Dir(PathBuf),
     /// The named component is a symlink, so following the path would leave the verified tree.
     Symlink(String),
+    /// The named component is not a plain name (a `..`, a `.`, a root), so the path does not
+    /// stay inside the checkout.
+    NotPlain(String),
     /// A component is missing, or is not a directory at all.
     Absent,
 }
@@ -833,12 +837,18 @@ enum Located {
 ///
 /// `symlink_metadata` rather than an `openat` walk: the checkout lives under the owner-only data
 /// directory, which nothing sbx runs is given writable, so the walk and the read that follows are
-/// not separated by an adversary's write. `rel`'s components are all `Component::Normal` —
-/// `validate_repo_path` refuses anything else when the catalogue is parsed.
+/// not separated by an adversary's write.
+///
+/// Only a `Component::Normal` is walked. `validate_repo_path` refuses anything else when the
+/// catalogue is parsed, and the walk refuses it again rather than lean on that: a `..` climbs out
+/// of the checkout, and pushing a root replaces the whole path with whatever directory it names.
 fn locate_in_checkout(checkout: &Path, rel: &Path) -> Located {
     let mut at = checkout.to_path_buf();
     for component in rel.components() {
-        at.push(component);
+        let std::path::Component::Normal(name) = component else {
+            return Located::NotPlain(component.as_os_str().to_string_lossy().into_owned());
+        };
+        at.push(name);
         let Ok(meta) = std::fs::symlink_metadata(&at) else {
             return Located::Absent;
         };
@@ -876,8 +886,8 @@ fn place_plugin(
     })?;
 
     // The catalogue's `path` is validated repo-relative (no `..`, no absolute part) when the
-    // catalogue is parsed, so the walk below stays inside the store's checkout — every component
-    // of it, not only the last.
+    // catalogue is parsed, and the walk below refuses either again, so it stays inside the store's
+    // checkout — every component of it, not only the last.
     let checkout = layout.store_path(store_name).join(CHECKOUT);
     let plugin_dir = match locate_in_checkout(&checkout, Path::new(&entry.path)) {
         Located::Dir(dir) => dir,
@@ -886,6 +896,13 @@ fn place_plugin(
                 "store `{store_name}` lists plugin `{plugin_name}` at `{}`, but the component \
                  `{component}` of that path is a symlink — a plugin is installed from the verified \
                  checkout itself, never from wherever a link in it points",
+                entry.path
+            ));
+        }
+        Located::NotPlain(component) => {
+            return Err(format!(
+                "store `{store_name}` lists plugin `{plugin_name}` at `{}`, which is not a plain \
+                 path inside the cached checkout: its component `{component}` is not a name",
                 entry.path
             ));
         }
@@ -2709,6 +2726,27 @@ mod tests {
             "the refusal has to name the component that leaves the checkout: {err}"
         );
         assert!(!layout.plugins_dir().join("pass").exists());
+    }
+
+    /// The walk takes only plain names, on its own account rather than on the parse that refuses
+    /// the others first: a `..` climbs out of the checkout, and an absolute path replaces it. Each
+    /// shape names a directory that exists, so a walk that took it would hand back that directory.
+    #[test]
+    fn the_checkout_walk_takes_only_plain_names() {
+        let base = crate::testutil::TmpDir::new();
+        let checkout = base.path().join(CHECKOUT);
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(base.path().join("sibling")).unwrap();
+        let elsewhere = crate::testutil::TmpDir::new();
+
+        let mut walked = Vec::new();
+        for rel in [Path::new("../sibling"), elsewhere.path()] {
+            match locate_in_checkout(&checkout, rel) {
+                Located::NotPlain(_) => {}
+                other => walked.push(format!("{}: {other:?}", rel.display())),
+            }
+        }
+        assert!(walked.is_empty(), "{walked:#?}");
     }
 
     #[test]
