@@ -224,6 +224,90 @@ fn an_interactive_observed_run_records_events_for_proc_logs() {
     );
 }
 
+/// What the terminal and the processes behind it say about a resize that did not arrive, for the
+/// message of a test that waited for one.
+///
+/// The terminal's size and foreground group, read on `master`, then `sbx` (`leader`) and every
+/// process descended from it, the cage's included: each one's group and session, the foreground
+/// group it sees on its terminal, and whether `SIGWINCH` is caught, blocked in every one of its
+/// threads, or pending. Those are the places a resize can stop: delivered to a group the supervisor
+/// is not in, never handled, or held unhandled.
+fn resize_dump(master: libc::c_int, leader: u32) -> String {
+    // SAFETY: `winsize` is four integers, for which all-zero is a valid value.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: `TIOCGWINSZ` writes one `winsize`, which `ws` is and which outlives the call.
+    let size = match unsafe { libc::ioctl(master, libc::TIOCGWINSZ, &mut ws) } {
+        0 => format!("{}x{}", ws.ws_row, ws.ws_col),
+        _ => format!("unreadable ({})", std::io::Error::last_os_error()),
+    };
+    // SAFETY: `tcgetpgrp` takes a descriptor and returns an integer; it touches no memory here.
+    let foreground = unsafe { libc::tcgetpgrp(master) };
+    let mut lines = vec![format!(
+        "the terminal is {size}, its foreground group {foreground}; sbx is {leader}"
+    )];
+
+    // Each process's `stat`, the fields after its parenthesised name: that name may hold spaces
+    // and parentheses, so the fields are read past its last `)`.
+    let stat = |pid: u32| -> Option<(String, Vec<String>)> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (head, rest) = text.rsplit_once(')')?;
+        let name = head.split_once('(').map_or("", |(_, n)| n).to_string();
+        Some((name, rest.split_whitespace().map(str::to_string).collect()))
+    };
+    let all: Vec<(u32, String, Vec<String>)> = std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| stat(pid).map(|(name, fields)| (pid, name, fields)))
+        .collect();
+    // Past the name: state, ppid, pgrp, session, tty_nr, tpgid.
+    let parent = |fields: &[String]| fields.get(1).and_then(|p| p.parse::<u32>().ok());
+    let descends = |mut pid: u32| {
+        while pid > 1 {
+            if pid == leader {
+                return true;
+            }
+            match all.iter().find(|(p, ..)| *p == pid) {
+                Some((_, _, fields)) => pid = parent(fields).unwrap_or(0),
+                None => return false,
+            }
+        }
+        false
+    };
+    let bit = 1u64 << (libc::SIGWINCH - 1);
+    let set = |status: &str, field: &str| -> String {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            .map_or("?".to_string(), |mask| (mask & bit != 0).to_string())
+    };
+    for (pid, name, fields) in all.iter().filter(|(pid, ..)| descends(*pid)) {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let threads: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|t| std::fs::read_to_string(t.path().join("status")).unwrap_or_default())
+            .collect();
+        let blocked_everywhere =
+            !threads.is_empty() && threads.iter().all(|t| set(t, "SigBlk:") == "true");
+        let field = |i: usize| fields.get(i).map_or("?", String::as_str);
+        lines.push(format!(
+            "{pid} {name}: group {} session {} sees foreground {}; SIGWINCH caught {} blocked in \
+             every thread {blocked_everywhere} pending {} shared-pending {}",
+            field(2),
+            field(3),
+            field(5),
+            set(&status, "SigCgt:"),
+            set(&status, "SigPnd:"),
+            set(&status, "ShdPnd:"),
+        ));
+    }
+    lines.join("\n")
+}
+
 #[test]
 fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     // The reported bug: `sbx app <name>` launched interactively "stays small" when the terminal
@@ -354,6 +438,17 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
         }
     }
 
+    // Read while the session still runs: once it ends, the processes that would say where the
+    // resize stopped are gone.
+    let arrived = {
+        let text = String::from_utf8_lossy(&out);
+        text.contains("50 200") && text.contains("WINCH=FIRED")
+    };
+    let dump = match resized && !arrived {
+        true => resize_dump(pty.master(), child.0.id()),
+        false => String::new(),
+    };
+
     pty.send(b"exit\n");
     drop(pty);
     drop(child);
@@ -369,10 +464,10 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     );
     assert!(
         text.contains("50 200"),
-        "the resize did not propagate to the cage pty:\n{text}"
+        "the resize did not propagate to the cage pty:\n{text}\n{dump}"
     );
     assert!(
         text.contains("WINCH=FIRED"),
-        "the inner process was not notified of the resize (SIGWINCH not delivered to the cage):\n{text}"
+        "the inner process was not notified of the resize (SIGWINCH not delivered to the cage):\n{text}\n{dump}"
     );
 }
