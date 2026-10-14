@@ -14,6 +14,7 @@
 
 use std::io::Read;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Where the template mounts the Mac's theme directory, read-only.
@@ -139,16 +140,46 @@ pub(crate) fn note_text(title: &str, subtitle: &str, body: &str) -> String {
     format!("{}\n{}\n{}\n", field(title), field(subtitle), field(body))
 }
 
-/// A name no other note from this process, or from another sbx process, will take, headed by its
-/// source.
-fn note_name(source: NoteSource) -> String {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    format!(
-        "{}{}-{}.note",
-        source.prefix(),
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    )
+/// The counter in a note's name, which keeps one process's notes apart.
+static NOTE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// This guest's boot as the kernel names it, its hex digits only: different on every guest and on
+/// every boot of one. Empty when it cannot be read.
+fn boot_tag() -> &'static str {
+    static TAG: OnceLock<String> = OnceLock::new();
+    TAG.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map(|id| id.chars().filter(char::is_ascii_hexdigit).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// A name for a note from `source` that no note in `queue` holds, headed by its source.
+///
+/// The queue is one directory on the Mac. It outlives the process and the guest, nothing empties
+/// it while the Mac's agent is not running, and every guest started from the template mounts the
+/// same one, so a name has to stay apart from notes other guests write and from notes earlier
+/// processes left. [`boot_tag`] sets one guest's boot apart from every other's, the pid one live
+/// process apart from the rest of its guest, and [`NOTE_SEQ`] one note apart from the process's
+/// others. That still leaves a pid the kernel recycled within one boot, which meets the names its
+/// predecessor left waiting, and the rename that publishes a note replaced one of them: a name
+/// already in the queue is passed over. Nothing can take one in between, since within a boot the pid
+/// is this process's alone while it runs. A name whose presence cannot be read is taken, and the
+/// rename then reports what is wrong.
+fn note_name(source: NoteSource, queue: &Path) -> String {
+    loop {
+        let name = format!(
+            "{}{}-{}-{}.note",
+            source.prefix(),
+            boot_tag(),
+            std::process::id(),
+            NOTE_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        match std::fs::symlink_metadata(queue.join(&name)) {
+            Ok(_) => continue,
+            Err(_) => return name,
+        }
+    }
 }
 
 /// Queue one note from `source` under `dir`, the notification channel's root. `Ok(false)` when the
@@ -171,7 +202,7 @@ pub(crate) fn queue_note(
     if waiting >= QUEUE_CAP {
         return Ok(false);
     }
-    let name = note_name(source);
+    let name = note_name(source, &queue);
     let staged = staging.join(&name);
     std::fs::write(&staged, note_text(title, subtitle, body))?;
     std::fs::rename(&staged, queue.join(&name)).inspect_err(|_| {
@@ -367,6 +398,52 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(dir.join(QUEUE)).unwrap().count(),
             QUEUE_CAP
+        );
+    }
+
+    /// A note an earlier process left waiting is not replaced by a new one.
+    ///
+    /// The queue outlives the process that wrote to it, so a pid the kernel has recycled meets the
+    /// notes its earlier holder left there under the same pid and the same counters, and the rename
+    /// that publishes a note published each new one over one still waiting.
+    #[test]
+    fn a_note_left_waiting_by_an_earlier_process_is_not_replaced() {
+        let dir = TmpDir::new();
+        let queue = dir.join(QUEUE);
+        std::fs::create_dir_all(&queue).unwrap();
+        // The names an earlier holder of this pid gave the notes it left, from the counter this
+        // process is at onwards. Fewer than the cap, so the new note is still let in.
+        let next = NOTE_SEQ.load(Ordering::Relaxed);
+        let left: Vec<String> = (next..next + 24)
+            .map(|n| format!("sbx-{}-{}-{n}.note", boot_tag(), std::process::id()))
+            .collect();
+        for name in &left {
+            std::fs::write(queue.join(name), "left\nwaiting\n\n").unwrap();
+        }
+        assert!(queue_note(dir.path(), NoteSource::Sbx, "new", "", "note").unwrap());
+        for name in &left {
+            assert_eq!(
+                std::fs::read_to_string(queue.join(name)).unwrap(),
+                "left\nwaiting\n\n",
+                "`{name}` was replaced"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&queue).unwrap().count(),
+            left.len() + 1,
+            "the new note is queued beside the ones left waiting"
+        );
+        // Its name sets this guest apart from another one started from the template, which writes
+        // the same queue on the Mac.
+        assert_eq!(boot_tag().len(), 32, "the kernel names this boot");
+        let fresh: Vec<String> = std::fs::read_dir(&queue)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !left.contains(name))
+            .collect();
+        assert!(
+            fresh.len() == 1 && fresh[0].starts_with(&format!("sbx-{}-", boot_tag())),
+            "{fresh:?}"
         );
     }
 
