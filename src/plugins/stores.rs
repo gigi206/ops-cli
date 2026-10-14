@@ -822,6 +822,11 @@ enum Located {
     /// The named component is not a plain name (a `..`, a `.`, a root), so the path does not
     /// stay inside the checkout.
     NotPlain(String),
+    /// The named component could not be read, for a reason other than its absence.
+    Unreadable {
+        component: String,
+        error: std::io::Error,
+    },
     /// A component is missing, or is not a directory at all.
     Absent,
 }
@@ -849,8 +854,15 @@ fn locate_in_checkout(checkout: &Path, rel: &Path) -> Located {
             return Located::NotPlain(component.as_os_str().to_string_lossy().into_owned());
         };
         at.push(name);
-        let Ok(meta) = std::fs::symlink_metadata(&at) else {
-            return Located::Absent;
+        let meta = match std::fs::symlink_metadata(&at) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Located::Absent,
+            Err(error) => {
+                return Located::Unreadable {
+                    component: name.to_string_lossy().into_owned(),
+                    error,
+                };
+            }
         };
         if meta.file_type().is_symlink() {
             return Located::Symlink(component.as_os_str().to_string_lossy().into_owned());
@@ -903,6 +915,13 @@ fn place_plugin(
             return Err(format!(
                 "store `{store_name}` lists plugin `{plugin_name}` at `{}`, which is not a plain \
                  path inside the cached checkout: its component `{component}` is not a name",
+                entry.path
+            ));
+        }
+        Located::Unreadable { component, error } => {
+            return Err(format!(
+                "store `{store_name}` lists plugin `{plugin_name}` at `{}`, but the component \
+                 `{component}` of that path in the cached checkout cannot be read: {error}",
                 entry.path
             ));
         }
@@ -1438,17 +1457,37 @@ fn staged_clone(
     git: &Path,
 ) -> Result<(Stage, PathBuf), String> {
     ensure_owner_only(layout.data_dir())?;
-    let stage = Stage(layout.data_dir().join(format!(
+    let stage = fresh_stage(layout.data_dir().join(format!(
         "{prefix}-{}-{}",
         std::process::id(),
         unique()
-    )));
-    let _ = std::fs::remove_dir_all(&stage.0);
-    ensure_owner_only(&stage.0)?;
+    )))?;
 
     let checkout = stage.0.join(CHECKOUT);
     clone(git, url, &checkout)?;
     Ok((stage, checkout))
+}
+
+/// Claim `path` as an empty, owner-only stage under its guard. A tree already there was left by an
+/// earlier process that held the same pid; it is cleared through the walk that adds write on the
+/// way down, as the guard clears a stage, and a tree that cannot be cleared refuses the stage
+/// rather than be cloned into. Kept, a leftover would fail the clone if it held a non-empty
+/// `checkout/`, fail the seal if it held a `store.toml` or a `catalogue.lock` (both are written
+/// `create_new`), and anything else in it would be renamed into the cache with the rest.
+fn fresh_stage(path: PathBuf) -> Result<Stage, String> {
+    let stage = Stage(path);
+    match crate::sandbox::gc::force_remove_dir_all(&stage.0) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "cannot clear the staging tree {}: {e}",
+                stage.0.display()
+            ));
+        }
+    }
+    ensure_owner_only(&stage.0)?;
+    Ok(stage)
 }
 
 /// Read a fresh checkout's catalogue and its detached signature as a pair, so every verb verifies
@@ -2816,6 +2855,59 @@ mod tests {
             }
         }
         assert!(walked.is_empty(), "{walked:#?}");
+    }
+
+    /// A component the walk cannot read is reported with its error, not as an absent directory
+    /// whose message sends the user to an update that is not what is wrong.
+    #[test]
+    fn a_checkout_component_that_cannot_be_read_is_not_called_absent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = crate::testutil::TmpDir::new();
+        let checkout = base.path().join(CHECKOUT);
+        let closed = checkout.join("plugins");
+        std::fs::create_dir_all(closed.join("pass")).unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // The failure provoked is a lookup refused under a directory with no search bit, which a
+        // process allowed past the mode never meets: the probe asks this process rather than its
+        // uid. The mode is restored before anything is asserted.
+        let probe = std::fs::symlink_metadata(closed.join("pass"));
+        let meets_it = probe.is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        let located = meets_it.then(|| locate_in_checkout(&checkout, Path::new("plugins/pass")));
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let Some(located) = located else {
+            skip_incapable!(
+                "skipping the unreadable-component test: this process looks up a name under a \
+                 directory without a search bit"
+            );
+            return;
+        };
+        assert!(
+            matches!(&located, Located::Unreadable { component, .. } if component == "pass"),
+            "{located:?}"
+        );
+    }
+
+    /// A stage is claimed empty: a tree an earlier process left at the same name is cleared,
+    /// closed directories and all, rather than cloned into and carried into the cache.
+    #[test]
+    fn a_stage_is_claimed_empty_whatever_an_earlier_process_left() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join(format!("{STAGE_PREFIX}-1-0"));
+        let held = path.join("leftover");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::write(held.join("file"), b"left").unwrap();
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let stage = fresh_stage(path.clone());
+        let left = held.exists();
+        if left {
+            std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let stage = stage.expect("a leftover the walk can clear does not refuse the stage");
+        assert!(!left, "the leftover was kept in the stage");
+        let mode = std::fs::metadata(&stage.0).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the stage is owner-only");
     }
 
     #[test]
