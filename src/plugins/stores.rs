@@ -1153,21 +1153,50 @@ fn clone(git: &Path, url: &str, dest: &Path) -> Result<(), String> {
 /// against remote content is a wide attack surface, so the global and system config files are
 /// nulled (defeating `insteadOf` URL rewrites and `core.hooksPath`/template hook injection),
 /// the credential prompt is disabled (a fetch never blocks on a password), and the allowed
-/// transports are restricted to the two a store uses. git also accepts config through the
-/// environment, independent of the config files, so the indexed (`GIT_CONFIG_COUNT` +
-/// `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`) and the legacy `GIT_CONFIG_PARAMETERS` channels
-/// are removed too — otherwise an inherited one would inject arbitrary config straight past the
-/// nulled files. The rest of the environment is kept so the system CA bundle and resolver
+/// transports are restricted to the two a store uses.
+///
+/// git reads the same surface from its environment, so the child gets the caller's environment
+/// without a single `GIT_*` variable and without `SSH_ASKPASS`, then the five above. Removing only
+/// the configuration channels (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`) would leave the rest of
+/// git's namespace in force, and a clone obeys it: `GIT_WORK_TREE` checks the fetched tree out
+/// wherever it names, outside the private stage, `GIT_INDEX_FILE` and `GIT_OBJECT_DIRECTORY` write
+/// the index and the objects at the paths they name, and `GIT_TEMPLATE_DIR` installs hooks whose
+/// `post-checkout` runs on the untrusted tree. Some of these are set without anyone choosing them
+/// for a clone: git exports `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` to the hooks it runs
+/// (githooks(5)), and a hook in a linked worktree is handed that worktree's index as an absolute
+/// `GIT_INDEX_FILE`, which a clone started from the hook would overwrite with the store's. The
+/// others are settings a user or a tool leaves exported. The variables are dropped by prefix
+/// rather than by list, so one git adds later is dropped too.
+///
+/// `SSH_ASKPASS` is dropped for the prompt's sake: git falls back to it for a username and a
+/// password whether the terminal prompt is disabled or not (gitcredentials(7)), so a store that
+/// asks for credentials would open a dialog on the desktop and wait for it. `GIT_SSL_CAINFO` goes
+/// with the rest of the prefix: its configuration form, `http.sslCAInfo`, is already dropped with
+/// the nulled files. The rest of the environment is kept so the system CA bundle and the resolver
 /// remain available for `https`.
 fn git_command(git: &Path) -> Command {
+    git_command_over(git, std::env::vars_os())
+}
+
+/// [`git_command`] over an explicit parent environment, so a test can hand it the variables a
+/// caller's shell or a git hook would.
+fn git_command_over(
+    git: &Path,
+    parent: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Command {
+    use std::os::unix::ffi::OsStrExt as _;
     let mut cmd = Command::new(git);
-    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+    cmd.env_clear()
+        .envs(
+            parent
+                .into_iter()
+                .filter(|(key, _)| !key.as_bytes().starts_with(b"GIT_") && key != "SSH_ASKPASS"),
+        )
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ALLOW_PROTOCOL", "file:https")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS");
+        .env("GIT_ALLOW_PROTOCOL", "file:https");
     cmd
 }
 
@@ -1782,45 +1811,109 @@ mod tests {
 
     #[test]
     fn the_git_command_neutralizes_config_and_credential_surface() {
-        let cmd = git_command(Path::new("/usr/bin/git"));
-        let mut set: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut removed: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (k, v) in cmd.get_envs() {
-            let Some(k) = k.to_str() else { continue };
-            match v {
-                Some(v) => {
-                    set.insert(k.to_string(), v.to_str().unwrap().to_string());
-                }
-                None => {
-                    removed.insert(k.to_string());
-                }
+        // `env` in git's place prints the environment the child is given, so what is compared is
+        // the process's and not the builder's: a variable the builder neither set nor dropped is
+        // still inherited, and only the child shows it.
+        let path = std::env::var_os("PATH").expect("the test runs with a PATH");
+        let parent = [
+            ("HOME", "/home/someone"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "core.hooksPath"),
+            ("GIT_CONFIG_VALUE_0", "/elsewhere"),
+            ("GIT_CONFIG_PARAMETERS", "'core.hookspath'='/elsewhere'"),
+            ("GIT_CONFIG_GLOBAL", "/home/someone/.gitconfig"),
+            ("GIT_WORK_TREE", "/elsewhere"),
+            ("GIT_TEMPLATE_DIR", "/elsewhere"),
+            ("GIT_SSL_NO_VERIFY", "1"),
+            ("SSH_ASKPASS", "/usr/bin/ksshaskpass"),
+        ]
+        .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)))
+        .into_iter()
+        .chain([("PATH".into(), path.clone())]);
+        let out = git_command_over(Path::new("env"), parent)
+            .output()
+            .expect("run env in git's place");
+        assert!(out.status.success(), "{out:?}");
+        let child: std::collections::BTreeSet<String> = String::from_utf8(out.stdout)
+            .expect("an environment of text")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let expected: std::collections::BTreeSet<String> = [
+            format!("PATH={}", path.to_str().expect("a PATH of text")),
+            "HOME=/home/someone".to_string(),
+            "GIT_CONFIG_GLOBAL=/dev/null".to_string(),
+            "GIT_CONFIG_SYSTEM=/dev/null".to_string(),
+            "GIT_CONFIG_NOSYSTEM=1".to_string(),
+            "GIT_TERMINAL_PROMPT=0".to_string(),
+            "GIT_ALLOW_PROTOCOL=file:https".to_string(),
+        ]
+        .into();
+        assert_eq!(child, expected);
+    }
+
+    /// The variables git exports to a hook, and the one that installs hooks, reach no clone sbx
+    /// runs. Each is a real clone of a real store under one variable the caller carries, and every
+    /// shape is checked before the test fails, so the message names each one that got through.
+    #[test]
+    fn a_clone_obeys_no_git_variable_its_caller_carries() {
+        let Some(git) = git_or_skip() else { return };
+        let repo = crate::testutil::TmpDir::new();
+        build_signed_store(repo.path(), 1);
+        let url = commit_repo(&git, repo.path());
+        let base = crate::testutil::TmpDir::new();
+        let hooks = base.path().join("templates").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        // The hook names no path: the marker comes through the environment, which a root with a
+        // space in it cannot split.
+        let hook = hooks.join("post-checkout");
+        std::fs::write(&hook, "#!/bin/sh\n: > \"$SBX_TEST_MARKER\"\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let marker = base.path().join("hook-ran");
+
+        let mut got_through = Vec::new();
+        for (var, value, witness) in [
+            (
+                "GIT_WORK_TREE",
+                base.path().join("work"),
+                base.path().join("work"),
+            ),
+            (
+                "GIT_INDEX_FILE",
+                base.path().join("index"),
+                base.path().join("index"),
+            ),
+            (
+                "GIT_OBJECT_DIRECTORY",
+                base.path().join("objects"),
+                base.path().join("objects"),
+            ),
+            (
+                "GIT_TEMPLATE_DIR",
+                base.path().join("templates"),
+                marker.clone(),
+            ),
+        ] {
+            let dest = base.path().join(format!("clone-{var}"));
+            let parent = std::env::vars_os().chain([
+                (var.into(), value.into_os_string()),
+                ("SBX_TEST_MARKER".into(), marker.clone().into_os_string()),
+            ]);
+            let out = git_command_over(&git, parent)
+                .args(["clone", "--quiet", "--depth", "1", "--single-branch", "--"])
+                .arg(&url)
+                .arg(&dest)
+                .output()
+                .expect("run git clone");
+            if !out.status.success() {
+                got_through.push(format!("{var}: the clone failed: {out:?}"));
+            } else if !dest.join(CATALOGUE).is_file() {
+                got_through.push(format!("{var}: the catalogue is not in the clone"));
+            } else if witness.exists() {
+                got_through.push(format!("{var}: git wrote or ran `{}`", witness.display()));
             }
         }
-        assert_eq!(
-            set.get("GIT_CONFIG_GLOBAL").map(String::as_str),
-            Some("/dev/null")
-        );
-        assert_eq!(
-            set.get("GIT_CONFIG_SYSTEM").map(String::as_str),
-            Some("/dev/null")
-        );
-        assert_eq!(
-            set.get("GIT_TERMINAL_PROMPT").map(String::as_str),
-            Some("0")
-        );
-        assert_eq!(
-            set.get("GIT_ALLOW_PROTOCOL").map(String::as_str),
-            Some("file:https")
-        );
-        // the environment-based config channels must be stripped, not merely the config files
-        assert!(
-            removed.contains("GIT_CONFIG_COUNT"),
-            "GIT_CONFIG_COUNT must be removed"
-        );
-        assert!(
-            removed.contains("GIT_CONFIG_PARAMETERS"),
-            "GIT_CONFIG_PARAMETERS must be removed"
-        );
+        assert!(got_through.is_empty(), "{got_through:#?}");
     }
 
     #[test]
