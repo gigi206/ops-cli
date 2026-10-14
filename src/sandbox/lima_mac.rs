@@ -108,8 +108,9 @@ pub(crate) fn read_color_scheme() -> Option<String> {
     read_scheme_file(&Path::new(THEME_MOUNT).join(THEME_FILE))
 }
 
-/// Read the preference from `path`. Only a regular file is read, and only its first
-/// [`THEME_READ_CAP`] bytes.
+/// Read the preference from `path`. Only a regular file of at most [`THEME_READ_CAP`] bytes is
+/// read; a longer one is refused whatever its head says, and one byte past the cap is all that is
+/// read to tell.
 fn read_scheme_file(path: &Path) -> Option<String> {
     if !std::fs::symlink_metadata(path).ok()?.is_file() {
         return None;
@@ -117,9 +118,12 @@ fn read_scheme_file(path: &Path) -> Option<String> {
     let mut word = String::new();
     std::fs::File::open(path)
         .ok()?
-        .take(THEME_READ_CAP)
+        .take(THEME_READ_CAP + 1)
         .read_to_string(&mut word)
         .ok()?;
+    if word.len() as u64 > THEME_READ_CAP {
+        return None;
+    }
     scheme_name(&word).map(str::to_string)
 }
 
@@ -349,6 +353,16 @@ mod tests {
             None,
             "only the capped head is read"
         );
+
+        // The word at the head of a file longer than the cap is not the agent's either: what the
+        // agent writes is the word alone.
+        let cap = THEME_READ_CAP as usize;
+        let at_cap = dir.join("at-cap");
+        std::fs::write(&at_cap, format!("dark{}", " ".repeat(cap - 4))).unwrap();
+        assert_eq!(read_scheme_file(&at_cap).as_deref(), Some("prefer-dark"));
+        let padded = dir.join("padded");
+        std::fs::write(&padded, format!("dark{}", " ".repeat(cap - 3))).unwrap();
+        assert_eq!(read_scheme_file(&padded), None, "a file past the cap");
     }
 
     /// A field's newline does not become a line of the note, and the note has three lines.
