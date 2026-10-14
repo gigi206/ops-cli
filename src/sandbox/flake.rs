@@ -72,33 +72,53 @@ fn split_attr(reference: &str) -> (&str, Option<&str>) {
 }
 
 /// The locked pins recorded for a project, keyed by the declared reference. Empty when the lock
-/// is absent or unreadable (the floating behaviour); a corrupt line self-heals by being dropped.
-pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, FlakePin> {
+/// is absent (the floating behaviour); a corrupt line self-heals by being dropped, and so does a
+/// line that is not UTF-8, so one bad line never costs the others their pins.
+///
+/// Any other failure to read the lock is an error. Read as "nothing pinned", it would have a launch
+/// build every `flake:` package at its latest upstream revision, and `sbx upgrade` rewrite the lock
+/// from what it resolved alone, dropping every pin it did not roll: the unpinning the pin model
+/// exists to forbid.
+pub(crate) fn pins(layout: &Layout, project_id: &str) -> io::Result<BTreeMap<String, FlakePin>> {
+    let path = lock_path(layout, project_id);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot read the flake lock {}: {e}", path.display()),
+            ));
+        }
+    };
     let mut entries = BTreeMap::new();
-    if let Ok(text) = std::fs::read_to_string(lock_path(layout, project_id)) {
-        for line in text.lines() {
-            if let [declared, rev, locked] = line.split('\t').collect::<Vec<_>>()[..]
-                && is_rev(rev)
-                && is_locked_ref(locked)
-            {
-                entries.insert(
-                    declared.to_string(),
-                    FlakePin {
-                        rev: rev.to_string(),
-                        locked_ref: locked.to_string(),
-                    },
-                );
-            }
+    for line in bytes.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        if let [declared, rev, locked] = line.split('\t').collect::<Vec<_>>()[..]
+            && is_rev(rev)
+            && is_locked_ref(locked)
+        {
+            entries.insert(
+                declared.to_string(),
+                FlakePin {
+                    rev: rev.to_string(),
+                    locked_ref: locked.to_string(),
+                },
+            );
         }
     }
-    entries
+    Ok(entries)
 }
 
 /// The pinned revisions for a project's `flake:` packages, keyed by the declared reference —
 /// which is byte-identical to a package's locator, so a caller can look each up directly. Reads
 /// only the per-project lock, exactly as the launch path does, so surfacing a pin realises and
 /// fetches nothing — the property `sbx config` relies on. Empty when the data dir or the project
-/// identity is unavailable, or nothing is pinned (the floating state).
+/// identity is unavailable, or nothing is pinned (the floating state). A lock that cannot be read is
+/// warned about and shown as no pins: the pins are a detail of the view, not its subject.
 pub(crate) fn pinned_revs(cwd: &Path) -> BTreeMap<String, String> {
     let Some(layout) = store::Layout::from_env() else {
         return BTreeMap::new();
@@ -106,10 +126,16 @@ pub(crate) fn pinned_revs(cwd: &Path) -> BTreeMap<String, String> {
     let Ok(id) = super::binds::project_runtime_id(cwd) else {
         return BTreeMap::new();
     };
-    pins(&layout, &id)
-        .into_iter()
-        .map(|(declared, pin)| (declared, pin.rev))
-        .collect()
+    match pins(&layout, &id) {
+        Ok(pins) => pins
+            .into_iter()
+            .map(|(declared, pin)| (declared, pin.rev))
+            .collect(),
+        Err(e) => {
+            crate::diag::warn(&format!("the `flake:` pins are not shown: {e}"));
+            BTreeMap::new()
+        }
+    }
 }
 
 /// Write the lock atomically (temp + rename), creating the owner-only parent — so a concurrent
@@ -299,7 +325,7 @@ pub(crate) fn upgrade(
         trusted: declared,
         all: prune_universe,
     } = declared(cfg, only);
-    let mut lock = pins(layout, project_id);
+    let mut lock = pins(layout, project_id)?;
     let mut outcomes = Vec::new();
 
     // Prune entries whose reference is truly no longer declared — measured against ALL declared
@@ -516,7 +542,7 @@ mod tests {
         write_pins(&layout, "proj", &entries).unwrap();
 
         // A round trip preserves the pin.
-        let read = pins(&layout, "proj");
+        let read = pins(&layout, "proj").unwrap();
         assert_eq!(
             read.get("github:o/r#default"),
             entries.get("github:o/r#default")
@@ -527,7 +553,7 @@ mod tests {
         let mut text = std::fs::read_to_string(&path).unwrap();
         text.push_str("github:o/bad\tnot-a-rev\tref\n");
         std::fs::write(&path, text).unwrap();
-        let read = pins(&layout, "proj");
+        let read = pins(&layout, "proj").unwrap();
         assert_eq!(read.len(), 1, "only the valid pin survives");
         assert!(read.contains_key("github:o/r#default"));
     }
@@ -582,8 +608,151 @@ mod tests {
         )
         .unwrap();
         assert!(
-            pins(&layout, &id).is_empty(),
+            pins(&layout, &id).unwrap().is_empty(),
             "the roll prunes what the dry run named"
+        );
+    }
+
+    /// A lock line that is not UTF-8 is dropped like any corrupt line, and the other lines keep
+    /// their pins: read whole as text, one such byte cost every pin in the file.
+    #[test]
+    fn a_lock_line_that_is_not_utf8_costs_only_itself() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "github:o/r#default".to_string(),
+            FlakePin {
+                rev: REV.to_string(),
+                locked_ref: format!("github:o/r/{REV}#default"),
+            },
+        );
+        write_pins(&layout, "proj", &entries).unwrap();
+        let path = lock_path(&layout, "proj");
+        let mut bytes = std::fs::read(&path).unwrap();
+        // A line whose declared reference carries a byte that is not UTF-8, then a bare one.
+        bytes.extend_from_slice(b"github:o/\xff\t");
+        bytes.extend_from_slice(REV.as_bytes());
+        bytes.extend_from_slice(b"\tgithub:o/x\ngithub:o/\xff\n");
+        std::fs::write(&path, bytes).unwrap();
+
+        let read = pins(&layout, "proj");
+        assert_eq!(read.ok(), Some(entries), "the valid line keeps its pin");
+    }
+
+    /// A lock that cannot be read fails the roll and is left as it was. Read as "nothing pinned",
+    /// the roll rewrote it from what it resolved alone: narrowed to one app, it dropped the
+    /// baseline's pin, which the next launch then built at its latest revision.
+    #[test]
+    fn an_unreadable_lock_fails_the_roll_and_keeps_every_pin() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let project = TmpDir::new();
+        let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+        let (base, app) = ("github:o/base#default", "github:o/app#default");
+        let entries: BTreeMap<String, FlakePin> = [base, app]
+            .into_iter()
+            .map(|reference| {
+                let pin = FlakePin {
+                    rev: REV.to_string(),
+                    locked_ref: format!("{reference}-{REV}"),
+                };
+                (reference.to_string(), pin)
+            })
+            .collect();
+        write_pins(&layout, &id, &entries).unwrap();
+        let cfg = resolved(
+            vec![flake_pkg("b", base, true)],
+            vec![("alpha", app_with(vec![flake_pkg("a", app, true)]))],
+        );
+        let nix = data.path().join("nix");
+        crate::testutil::write_script(
+            &nix,
+            &format!("printf '{{\"revision\":\"{REV}\",\"url\":\"github:o/app/{REV}\"}}'"),
+        );
+        let lock = lock_path(&layout, &id);
+        let seeded = std::fs::read(&lock).unwrap();
+
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // The failure provoked is a lock this process may not read, which a process allowed past
+        // the mode never meets: the probe asks this process rather than its uid. The mode is
+        // restored before anything is asserted.
+        let meets_it =
+            std::fs::read(&lock).is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+        let rolled = meets_it.then(|| {
+            crate::testutil::result_past_etxtbsy("nix", || {
+                upgrade(
+                    &nix,
+                    &layout,
+                    project.path(),
+                    &cfg,
+                    Some("alpha"),
+                    crate::sandbox::RollMode::Apply,
+                )
+            })
+        });
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let Some(rolled) = rolled else {
+            skip_incapable!(
+                "skipping the unreadable-lock roll: this process reads a file without a read bit"
+            );
+            return;
+        };
+        assert!(rolled.is_err(), "the roll read an unreadable lock as empty");
+        assert_eq!(
+            std::fs::read(&lock).unwrap(),
+            seeded,
+            "the lock is left as it was"
+        );
+    }
+
+    /// A launch whose flake lock cannot be read fails naming the lock, rather than building the
+    /// declared reference at its latest revision as though nothing were pinned.
+    #[test]
+    fn a_launch_over_an_unreadable_lock_fails_rather_than_floats() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let project = TmpDir::new();
+        let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+        let reference = "github:o/r#default";
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            reference.to_string(),
+            FlakePin {
+                rev: REV.to_string(),
+                locked_ref: format!("github:o/r/{REV}#default"),
+            },
+        );
+        write_pins(&layout, &id, &entries).unwrap();
+        let lock = lock_path(&layout, &id);
+
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // The probe asks this process rather than its uid, and the mode is restored before
+        // anything is asserted.
+        let meets_it =
+            std::fs::read(&lock).is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+        let provisioned = meets_it.then(|| {
+            super::super::packages::provision(
+                Path::new("/nonexistent/nix"),
+                &layout,
+                project.path(),
+                &format!("github:NixOS/nixpkgs/{REV}"),
+                &[flake_pkg("tool", reference, true)],
+            )
+        });
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let Some(provisioned) = provisioned else {
+            skip_incapable!(
+                "skipping the unreadable-lock launch: this process reads a file without a read bit"
+            );
+            return;
+        };
+        let err = provisioned.err().map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("flake lock")),
+            "{err:?}"
         );
     }
 
@@ -615,10 +784,10 @@ mod tests {
         write_pins(&layout, &id, &entries).unwrap();
 
         // The owning project reads its pin back, the `rev` flattened exactly as `pinned_revs` does.
-        let read = pins(&layout, &id);
+        let read = pins(&layout, &id).unwrap();
         assert_eq!(read.get(&reference).map(|p| p.rev.as_str()), Some(REV));
 
         // A different project sees nothing — the lock is project-scoped by the runtime id.
-        assert!(pins(&layout, &other_id).is_empty());
+        assert!(pins(&layout, &other_id).unwrap().is_empty());
     }
 }

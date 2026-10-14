@@ -100,7 +100,7 @@ pub(crate) fn provision(
     // content-addressed → a second project is a cache hit; seeded per project). The pin selects the
     // immutable build target — the locked ref when `flake-packages.lock` pins it, else the declared
     // ref (which floats, frozen warm until `sbx upgrade`, like a floating `mise:` tool).
-    let flake_pins = super::flake::pins(layout, &id);
+    let flake_pins = super::flake::pins(layout, &id)?;
 
     let mut bins = Vec::with_capacity(admitted.len());
     let mut roots = Vec::with_capacity(admitted.len());
