@@ -62,6 +62,15 @@ allow = [
     "{GET} https://icons.duckduckgo.com",
     # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
     "@chromium-spellcheck",
+    # The ad images. The free tier is ad-supported and the app reports each impression to the
+    # ads API, so the images it reports are fetched rather than denied. Read-only, and neither
+    # host is in `shared_credential`, so the account bearer never travels to them.
+    # The sidebar billboard: the ads API (`/api/v1/ads`) returns its URL on this CDN host.
+    "{GET} https://freebuffcdn.com/billboards/*",
+    # The sponsored-task creative. A first-party creative is rewritten to the vendor site and
+    # travels under the rules above; a third-party one keeps the absolute URL the ads API
+    # returns, served from the provider's storage bucket.
+    "{GET} https://itbtwqhcbagquwjizsre.supabase.co",
 ]
 # Denied noise, kept out of the default log (still denied, still counted by `sbx net stats`).
 mute = [
@@ -70,11 +79,6 @@ mute = [
     "*.sentry.io",
     "www.redditstatic.com",
     "code.trygravity.ai",
-    # The sponsored-task creative image. A first-party creative is rewritten to the vendor site
-    # and travels under the rules above; a third-party one keeps the absolute URL the ads API
-    # returns, served from the provider's storage bucket. Denied, the sponsored card renders
-    # without its image; nothing else depends on it.
-    "itbtwqhcbagquwjizsre.supabase.co",
     # The in-cage browser's own Google background traffic, none of it required for function. The
     # group includes the leaked-password check, which would send password data to Google: denying
     # it is a feature, not a loss.
@@ -111,10 +115,11 @@ chromium = "nix:chromium"
 
 # The `appimage:resolve` command for the `freebuff` package above. sbx runs it in a HERMETIC
 # sandbox (base tools only; a shared network to reach the vendor) and pins the `.AppImage` URL it
-# prints. `-w '%{redirect_url}'` takes the FIRST hop only — the clean release URL, not the
+# prints. The `linux-appimage` endpoint names the format: the bare `linux` one redirects to the
+# `.deb`. `-w '%{redirect_url}'` takes the FIRST hop only — the clean release URL, not the
 # time-limited storage URL a full `-L` follow would end at. `-fsS` fails closed on an HTTP error,
 # and the printed URL is re-validated as an `.AppImage` URL before it is fetched.
 [appimage.freebuff]
 resolve = ["sh", "-c", '''
-curl -fsS -o /dev/null -w '%{redirect_url}' "https://freebuff.com/api/desktop/download/linux"
+curl -fsS -o /dev/null -w '%{redirect_url}' "https://freebuff.com/api/desktop/download/linux-appimage"
 ''']

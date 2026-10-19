@@ -23,15 +23,16 @@
 #
 # Freebuff is CodebuffAI's free desktop coding agent: an Electron shell whose UI is served by a bundled
 # Bun "orchestrator" child process on the cage loopback, driving the `@codebuff/sdk`. On Linux upstream
-# distributes it ONLY as an `.AppImage` (no `.deb`, no nixpkgs attr, no buildable flake), so sbx packages
-# it with the `appimage:` backend. Confined by sbx it sees only the cage filesystem (the project you
+# distributes it as an `.AppImage` and a `.deb` (no nixpkgs attr, no buildable flake); sbx packages the
+# `.AppImage` with the `appimage:` backend. Confined by sbx it sees only the cage filesystem (the project you
 # launch it from, its own persistent isolated home, and any `binds` below), reaches only the hosts you
 # allow, and its powers stop at the sandbox boundary (bubblewrap + seccomp + an empty netns + the egress
 # allowlist).
 #
 # THE `appimage:resolve` BACKEND (auto-upgrade — why NOT a direct `appimage:<url>`). Freebuff's official
-# Linux download is a STABLE REDIRECT endpoint, `https://freebuff.com/api/desktop/download/linux`, which
-# 302-redirects to the CURRENT versioned `.AppImage` on GitHub (e.g.
+# Linux download is a STABLE REDIRECT endpoint, `https://freebuff.com/api/desktop/download/linux-appimage`,
+# which 302-redirects to the CURRENT versioned `.AppImage` on GitHub (the bare `…/download/linux` one
+# redirects to the `.deb`) (e.g.
 # `…/CodebuffAI/codebuff-community/releases/download/freebuff-desktop-v0.0.30/Freebuff-0.0.30-linux-x86_64.AppImage`).
 # That endpoint is NOT a literal `.AppImage` URL, so a direct `appimage:<url>` is rejected (sbx requires
 # an `appimage:` URL to end in `.AppImage`, a deliberate typo/injection guard — the value is interpolated
@@ -180,9 +181,9 @@ mode = "deny"
 # `sbx test net <url>`).
 allow = [
   # Nothing here: the Codebuff backend, the Freebuff vendor domain, the runtime npm lane, the GitHub
-  # and Google sign-in chains and the favicon services arrive with the bundle and are unioned in at
-  # resolution — inspect them with `sbx bundle freebuff-desktop`, and see the launch's own view
-  # with `sbx config show --app freebuff-desktop`.
+  # and Google sign-in chains, the favicon services and the ad images arrive with the bundle and
+  # are unioned in at resolution — inspect them with `sbx bundle freebuff-desktop`, and see the
+  # launch's own view with `sbx config show --app freebuff-desktop`.
   #
   # OPTIONAL — using your OWN Claude/ChatGPT subscription through Freebuff (not the default Codebuff
   # account). Uncomment the provider(s) you log into; discover exact hosts via `sbx net logs`.
@@ -197,8 +198,7 @@ allow = [
 # the in-cage Chromium's own background phone-home (update / safe-browsing / time / checkin / on-device
 # model / translate) plus telemetry + third-party ad pixels pulled in by page content.
 mute = [
-  # Nothing here: the app/page telemetry, the ad pixels and the sponsored creative's image host,
-  # `@chromium-background`, the translation service and the reachability probe's fallback endpoint
+  # Nothing here: the app/page telemetry, the ad pixels, `@chromium-background`, the translation service and the reachability probe's fallback endpoint
   # all arrive with the bundle and are unioned in at resolution.
 ]
 

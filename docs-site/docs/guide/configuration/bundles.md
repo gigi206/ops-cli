@@ -359,7 +359,7 @@ The 69 shipped bundles, and what each carries:
 | `dirac` | 3 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `droid` | 2 (`mise:`, `nix:`) | 10 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `freebuff` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
-| `freebuff-desktop` | 2 (`appimage:`, `nix:`) | 22 egress entries, an `appimage:` resolver | `chromium-background`, `chromium-spellcheck`, `github`, `github-api`, `google-signin-incage`, `npm-audit`, `npm-jsr`, `npm-runtime` |
+| `freebuff-desktop` | 2 (`appimage:`, `nix:`) | 23 egress entries, an `appimage:` resolver | `chromium-background`, `chromium-spellcheck`, `github`, `github-api`, `google-signin-incage`, `npm-audit`, `npm-jsr`, `npm-runtime` |
 | `goose` | 1 (`mise:`) | 1 egress entry, 2 env vars | `sigstore` |
 | `goose-desktop` | 1 (`deb:`) | 1 egress entry, 2 env vars | `chromium-spellcheck` |
 | `grok` | 1 (`binary:`) | 3 egress entries, 1 env var, a `binary:` resolver | none |
