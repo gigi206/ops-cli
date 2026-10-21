@@ -170,27 +170,29 @@ fn the_holder_waits_for_the_whole_bwrap_report() {
     let report = dir.join("report");
     let unread = dir.join("unread");
     let slow = dir.join("slow-bwrap");
+    // Every path is a shell word (`common::sh`): the fixture root comes from the environment, and a
+    // quote or a `$` in it would otherwise end a string early or run as code.
     let script = format!(
         r#"#!/bin/bash
 [ "$1" = --info-fd ] && [ "$3" = --block-fd ] || exit 99
 info=$2; block=$4; shift 4
 (
 trap '' PIPE
-until grep -q '}}' "{report}" 2>/dev/null; do sleep 0.01; done
-whole=$(cat "{report}")
+until grep -q '}}' {report} 2>/dev/null; do sleep 0.01; done
+whole=$(cat {report})
 pid_part=${{whole%%,*}}
 rest=${{whole#"$pid_part"}}
 tail_ns=${{rest#,}}; first_ns=",${{tail_ns%%,*}}"
-printf '%s' "$pid_part" >&"$info" || echo first >>"{unread}"
-printf '%s' "$first_ns" >&"$info" || echo second >>"{unread}"
+printf '%s' "$pid_part" >&"$info" || echo first >>{unread}
+printf '%s' "$first_ns" >&"$info" || echo second >>{unread}
 sleep 1
-printf '%s\n' "${{rest#"$first_ns"}}" >&"$info" || echo rest >>"{unread}"
+printf '%s\n' "${{rest#"$first_ns"}}" >&"$info" || echo rest >>{unread}
 ) &
-exec "{bwrap}" --info-fd 9 --block-fd "$block" "$@" 9>"{report}" {{info}}>&-
+exec {bwrap} --info-fd 9 --block-fd "$block" "$@" 9>{report} {{info}}>&-
 "#,
-        bwrap = bwrap.display(),
-        report = report.display(),
-        unread = unread.display(),
+        bwrap = common::sh(&bwrap),
+        report = common::sh(&report),
+        unread = common::sh(&unread),
     );
     std::fs::write(&slow, script).expect("write the stand-in");
     {
