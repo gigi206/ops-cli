@@ -37,13 +37,27 @@ fn holder_argv(bwrap: &std::path::Path, cmd: &[OsString]) -> Vec<OsString> {
     argv
 }
 
+/// Whether bwrap, run alone in the namespaces [`holder_argv`] asks for, runs `cmd` to success.
+///
+/// A holder run that never reached its command leaves that question. When bwrap cannot here, the
+/// gap is this host's: a kernel or a policy that refuses an unprivileged user namespace, or a
+/// command the host lacks. When it can, the holder is what failed — a usage error, an argument
+/// list bwrap refuses, a crash — and the test fails rather than skips.
+fn bwrap_runs(bwrap: &std::path::Path, cmd: &[OsString]) -> bool {
+    let argv = holder_argv(bwrap, cmd);
+    Command::new(&argv[0])
+        .args(&argv[1..])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
 /// Run the holder with a shell checker that dumps the two per-netns proc files, returning
 /// `(dev, route)` — the contents of `/proc/net/dev` and `/proc/net/route` as seen *inside* the
 /// configured namespace. `None` means skip, and every one is recorded as one: no bwrap on PATH, a
-/// holder or a cage that never ran the command (this host cannot create a capability-bearing user
-/// namespace, or has no `/bin/sh`), or a namespace the configurer could not join, which leaves the
-/// cage in bwrap's empty one. Those are environment gaps. A command that ran and then failed, or
-/// whose output lacks the route table, fails the test: its first line says it ran.
+/// cage bwrap itself cannot create on this host ([`bwrap_runs`]), or a namespace the configurer
+/// could not join, which leaves the cage in bwrap's empty one. Those are environment gaps. A holder
+/// that did not run a command bwrap runs here fails the test, and so does a command that ran and
+/// then failed, or whose output lacks the route table: the marker it prints first says it ran.
 fn holder_dump() -> Option<(String, String)> {
     let Some(bwrap) = common::bwrap_on_path() else {
         skip_incapable!("skipping netns holder e2e: no bwrap on PATH to create the namespace");
@@ -58,7 +72,7 @@ fn holder_dump() -> Option<(String, String)> {
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
         // The separator the production wrapper always emits (`holder_wrap`), tap or no tap: it is
         // what makes the command unambiguous to parse. Without it the holder exits on a usage
-        // error, which this helper would read as an environment gap and skip.
+        // error, which fails this helper.
         .args(["__netns-holder", "--"])
         .args(holder_argv(&bwrap, &cmd))
         .output()
@@ -68,24 +82,34 @@ fn holder_dump() -> Option<(String, String)> {
     let stderr = String::from_utf8_lossy(&out.stderr);
     // A failed join still releases the cage, into bwrap's empty namespace, and the command then
     // runs and succeeds: the message is what says so, whatever the status.
-    if stderr.contains("could not be joined") || !stdout.starts_with("---DEV---\n") {
+    if stderr.contains("could not be joined") {
         skip_incapable!(
-            "skipping netns holder e2e: the holder did not run ({}{})",
-            stdout,
+            "skipping netns holder e2e: the holder could not join the namespace ({})",
             stderr.trim()
         );
         return None;
     }
+    let Some((_, ran)) = stdout.split_once("---DEV---\n") else {
+        assert!(
+            !bwrap_runs(&bwrap, &cmd),
+            "bwrap runs the command on this host, yet the holder did not ({}): {stdout}{stderr}",
+            out.status
+        );
+        skip_incapable!(
+            "skipping netns holder e2e: bwrap cannot cage the command on this host ({})",
+            stderr.trim()
+        );
+        return None;
+    };
     assert!(
         out.status.success(),
         "the command ran and failed ({}): {stdout}{stderr}",
         out.status
     );
-    let (dev, route) = stdout
+    let (dev, route) = ran
         .split_once("---ROUTE---")
         .unwrap_or_else(|| panic!("the command's output has no route table: {stdout}{stderr}"));
-    let dev = dev.strip_prefix("---DEV---").unwrap_or(dev).to_string();
-    Some((dev, route.to_string()))
+    Some((dev.to_string(), route.to_string()))
 }
 
 /// Whether this kernel has the `dummy` driver once the holder has asked it for a `dummy` link:
@@ -365,11 +389,13 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
 /// read, rather than compared through the namespace link, which takes a ptrace read access the
 /// command does not have on every host.
 ///
-/// A tap that did not start or did not come up fails this test rather than skipping it. The
-/// environment gaps the capture has say so in their own words, and still skip: a kernel that
+/// A tap that did not start or did not come up fails this test rather than skipping it, and so
+/// does a configurer that bwrap left without a report. The environment gaps the capture has say so
+/// in their own words, and still skip: a namespace the configurer may not join, a kernel that
 /// refuses the redirect rules, and one without the `dummy` driver, which leaves no route. So does a
-/// holder or a cage that never ran the command. A command that ran and then failed is this test's
-/// failure: its first line says it ran. So is no route on a kernel that has the driver.
+/// cage bwrap itself cannot create on this host ([`bwrap_runs`]); a holder that did not run a
+/// command bwrap runs here is this test's failure. So is a command that ran and then failed — the
+/// line it prints first says it ran — and no route on a kernel that has the driver.
 #[test]
 fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
     let python = std::path::Path::new("/usr/bin/python3");
@@ -494,28 +520,42 @@ print("report fd", "held" if held else "closed")
     for own in [
         "cannot start the capture tap",
         "the capture tap did not come up",
+        "bwrap did not report its sandbox",
     ] {
         assert!(
             !stderr.contains(own),
             "the capture tap must stand up: {stderr}"
         );
     }
-    // Only a holder or a cage that never ran the command is a gap of this host's. A command that
-    // ran and then failed is this test's failure, whatever it wrote.
-    if stderr.contains("transparent capture unavailable") || !stdout.starts_with("ran\n") {
+    // The two gaps of this host's that the capture names in its warning. A route that could not be
+    // installed is read below, from the query it leaves without one.
+    if stderr.contains("could not be joined") || stderr.contains("nft refused the redirect rules") {
         skip_incapable!(
-            "skipping tap DNS e2e: the holder, the redirect or its route did not stand up ({}{})",
-            stdout,
+            "skipping tap DNS e2e: the namespace or the redirect did not stand up ({})",
             stderr.trim()
         );
         return;
     }
+    let lines: Vec<&str> = stdout.lines().collect();
+    let Some(ran) = lines.iter().position(|l| *l == "ran") else {
+        assert!(
+            !bwrap_runs(&bwrap, &[python.into(), "-c".into(), "pass".into()]),
+            "bwrap runs python on this host, yet the holder did not run the command ({}): \
+             {stdout}{stderr}",
+            out.status
+        );
+        skip_incapable!(
+            "skipping tap DNS e2e: bwrap cannot cage the command on this host ({})",
+            stderr.trim()
+        );
+        return;
+    };
     assert!(
         out.status.success(),
         "the command ran and failed ({}): {stdout}{stderr}",
         out.status
     );
-    let reply = stdout.lines().nth(1).unwrap_or_default();
+    let reply = lines.get(ran + 1).copied().unwrap_or_default();
     if reply.starts_with(&format!("error {} ", libc::ENETUNREACH)) {
         assert!(
             !kernel_has_dummy(),
