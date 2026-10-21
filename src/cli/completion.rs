@@ -555,26 +555,62 @@ fn registry_values(kind: &ValueKind) -> Vec<(String, String)> {
     out
 }
 
-/// The section headers of the project's and the global config files, as written —
-/// `[network]`, `[env]`, `[app.foo]`, `[task.deploy]`. Best-effort line reading: no
-/// parse, no resolution, never a block on a config.
+/// The tables the project's and the global config files declare by a header — `network`, `env`,
+/// `app.foo` — and their tasks, `task.<name>`, flagged as such: the entries of `[task]`, whose
+/// `defaults` is the section's own settings rather than an entry.
+///
+/// Read through the safety gate a launch reads them through
+/// ([`config::safety::read_safe_bytes`]), and parsed. A header then reads as the table it declares
+/// however it is spelled — a trailing comment, spaces around a dot, a quoted key — and neither a line
+/// inside a multi-line string nor a table nested in a task passes for one. A file that gate refuses
+/// offers nothing, and it opens without blocking, so a FIFO standing in for a config is refused
+/// rather than left to stall the prompt. No trust and no resolution: each file is read on its own.
 fn config_tokens() -> Vec<(String, bool)> {
     let mut tokens: Vec<(String, bool)> = Vec::new();
     for path in config_files() {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Some(doc) = config::safety::read_safe_bytes(&path)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        else {
             continue;
         };
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some(inner) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-                let inner = inner.trim();
-                if !inner.is_empty() {
-                    tokens.push((inner.to_string(), inner.starts_with("task.")));
+        if let Some(section) = doc.get("task").and_then(toml_edit::Item::as_table_like) {
+            for (name, entry) in section.iter() {
+                if name != "defaults" && entry.is_table_like() {
+                    tokens.push((format!("task.{name}"), true));
                 }
             }
         }
+        table_headers(doc.as_table(), "", &mut tokens);
     }
     tokens
+}
+
+/// The tables under `table` that a header of their own declares, by dotted path from `prefix`. A
+/// table a deeper header only implies, or a dotted key defines, has none; a task, and whatever it
+/// holds, is reported as the task it is.
+fn table_headers(table: &toml_edit::Table, prefix: &str, out: &mut Vec<(String, bool)>) {
+    for (key, item) in table.iter() {
+        if prefix == "task" && key != "defaults" {
+            continue;
+        }
+        let path = if prefix.is_empty() {
+            key.to_string()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match item {
+            toml_edit::Item::Table(t) => {
+                if !t.is_implicit() {
+                    out.push((path.clone(), false));
+                }
+                table_headers(t, &path, out);
+            }
+            toml_edit::Item::ArrayOfTables(_) => out.push((path, false)),
+            _ => {}
+        }
+    }
 }
 
 /// The names one **global** vocabulary declares, each with `what` as its description: the
@@ -2147,6 +2183,90 @@ mod tests {
             .map(|(n, _)| n)
             .collect();
         assert!(tasks.contains(&"deploy".to_string()), "tasks: {tasks:?}");
+    }
+
+    #[test]
+    fn a_config_file_is_read_as_the_toml_it_is() {
+        // Read off its lines, a file lost the task whose header carries a comment, or spaces
+        // around its dot; offered `defaults`, the `[task]` section's own settings, as a task, and
+        // a table nested in a task as another; took a header line inside a multi-line string for
+        // a table; and named an `[[array]]` with its brackets.
+        let _lock = env_lock();
+        let tmp = TmpDir::new();
+        std::fs::create_dir_all(tmp.join("sbx")).unwrap();
+        std::fs::write(
+            tmp.join("sbx").join("sbx.toml"),
+            "[task]\nnote = \"not an entry\"\n\
+             [task.deploy] # ship it\nrun = \"true\"\n\
+             [ task . spaced ]\nrun = \"true\"\n\
+             [task.\"quoted\"]\nrun = \"true\"\n\
+             [task.defaults]\ntimeout = 5\n\
+             [task.build.env]\nX = \"1\"\n\
+             [app.web]\nimage = \"x\"\n\
+             [notes]\nmeta.k = 1\ntext = \"\"\"\n[task.fake]\n\"\"\"\n\
+             [[things]]\nx = 1\n",
+        )
+        .unwrap();
+        let _config_home = EnvVar::set("XDG_CONFIG_HOME", tmp.path());
+
+        let tokens = config_tokens();
+        let tasks: Vec<&str> = tokens
+            .iter()
+            .filter(|(_, is_task)| *is_task)
+            .filter_map(|(key, _)| key.strip_prefix("task."))
+            .collect();
+        for want in ["deploy", "spaced", "quoted", "build"] {
+            assert!(
+                tasks.contains(&want),
+                "the task {want:?} is missing: {tasks:?}"
+            );
+        }
+        for not in ["defaults", "build.env", "note", "fake"] {
+            assert!(!tasks.contains(&not), "{not:?} is no task: {tasks:?}");
+        }
+        let tables: Vec<&str> = tokens
+            .iter()
+            .filter(|(_, is_task)| !*is_task)
+            .map(|(key, _)| key.as_str())
+            .collect();
+        for want in ["task", "task.defaults", "app.web", "notes", "things"] {
+            assert!(
+                tables.contains(&want),
+                "the table {want:?} is missing: {tables:?}"
+            );
+        }
+        // A table only a header further down implies, or only a dotted key defines, has no
+        // header of its own; nor has anything inside a task.
+        for not in [
+            "app",
+            "notes.meta",
+            "task.deploy",
+            "task.build",
+            "task.build.env",
+        ] {
+            assert!(!tables.contains(&not), "{not:?} is no header: {tables:?}");
+        }
+        assert!(
+            !tables.iter().any(|t| t.contains('[') || t.contains("fake")),
+            "{tables:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_that_is_a_fifo_does_not_stall_the_completion() {
+        // A Tab reads the config files in front of it, and a cloned repository decides what its
+        // `.sbx.toml` is. A FIFO there held the prompt for good: nothing writes to it, and a
+        // blocking open waits for a writer.
+        let _lock = env_lock();
+        let tmp = TmpDir::new();
+        std::fs::create_dir_all(tmp.join("sbx")).unwrap();
+        crate::testutil::make_fifo(&tmp.join("sbx").join("sbx.toml"));
+        let _config_home = EnvVar::set("XDG_CONFIG_HOME", tmp.path());
+        crate::testutil::returns_within(
+            std::time::Duration::from_secs(5),
+            "reading a config file that is a FIFO",
+            config_tokens,
+        );
     }
 
     #[test]
