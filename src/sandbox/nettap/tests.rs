@@ -277,6 +277,13 @@ fn only_a_two_hundred_opens_the_tunnel() {
         b"HTTP/1.1 200 Connection established\r\n\r\n"
     ));
     assert!(head_is_success(b"HTTP/1.0 200 OK\r\n\r\n"));
+    // The other successes are not the one the proxy writes, so they are not taken as it.
+    for other in ["201 Created", "204 No Content", "299 Other"] {
+        assert!(
+            !head_is_success(format!("HTTP/1.1 {other}\r\n\r\n").as_bytes()),
+            "{other} opens no tunnel"
+        );
+    }
     assert!(!head_is_success(b"HTTP/1.1 403 Forbidden\r\n\r\n"));
     assert!(!head_is_success(b"HTTP/1.1 502 Bad Gateway\r\n\r\n"));
     assert!(!head_is_success(b"HTTP/1.1 nonsense\r\n\r\n"));

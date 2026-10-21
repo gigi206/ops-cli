@@ -745,7 +745,7 @@ pub(crate) fn head_is_success(head: &[u8]) -> bool {
     parts
         .next()
         .and_then(|code| code.parse::<u16>().ok())
-        .is_some_and(|code| (200..300).contains(&code))
+        .is_some_and(|code| code == 200)
 }
 
 /// Read a response head, stopping at the blank line that ends it. Bounded by [`HEAD_MAX`] and by
