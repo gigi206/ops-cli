@@ -716,6 +716,10 @@ pub(crate) fn verdict_for_hash(
     };
     let contents = match std::fs::read_to_string(&marker) {
         Ok(c) => c,
+        // A marker that is there and cannot be read still proves a trust was recorded, as a
+        // malformed one does below: `Changed`, which stops a launch, and not `Untrusted`, which
+        // would run it as a project never approved.
+        Err(_) if std::fs::symlink_metadata(&marker).is_ok() => return TrustState::Changed,
         Err(_) => return TrustState::Untrusted,
     };
     // Marker layout: line 1 = canonical path, line 2 = stored content hash. A
@@ -1826,6 +1830,34 @@ mod tests {
         let marker = marker_path(store.path(), &cfg).expect("a UTF-8 fixture path");
         std::fs::write(marker, b"/some/path\n").unwrap();
         assert_eq!(state(store.path(), &cfg), TrustState::Changed);
+    }
+
+    /// A marker that is there and cannot be read is a recorded trust like a malformed one, so it
+    /// reads `Changed`: bytes that are not text, and, where this process is refused the read, a
+    /// marker of mode `000`.
+    #[test]
+    fn an_unreadable_marker_is_changed_not_untrusted() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = TmpDir::new();
+        let proj = TmpDir::new();
+        let cfg = proj.join(".sbx.toml");
+        std::fs::write(&cfg, b"x = 1\n").unwrap();
+        trust(store.path(), &cfg).unwrap();
+        let marker = marker_path(store.path(), &cfg).expect("a UTF-8 fixture path");
+
+        let recorded = std::fs::read(&marker).unwrap();
+        std::fs::write(&marker, b"\xff\xfe not text\n").unwrap();
+        assert_eq!(state(store.path(), &cfg), TrustState::Changed);
+        std::fs::write(&marker, &recorded).unwrap();
+        assert_eq!(state(store.path(), &cfg), TrustState::Trusted);
+
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = std::fs::read(&marker).is_err();
+        let verdict = state(store.path(), &cfg);
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if refused {
+            assert_eq!(verdict, TrustState::Changed);
+        }
     }
 
     #[test]
