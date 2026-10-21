@@ -49,9 +49,15 @@ reasonix-desktop = "deb:resolve"
 # for amd64 alone — and a `deb:` package cannot take a tarball. Moving the whole declaration to
 # `tarball:` is what would open aarch64, at the cost of the dpkg unpacking and the autoPatchelf pass
 # this backend performs; it is not done here because the amd64 `.deb` is what upstream tests.
+#
+# ONE WRITTEN LIMIT: `per_page=100` reads the first page only. The repository releases its other
+# tracks (`v*`, `studio-v*`) far more often than its desktop app — up to 35 other releases between
+# two desktop ones in its newest hundred — so a page of 100 holds the newest `desktop-v*` with
+# room, and it is a page, not a promise. THE TRIGGER: a first page with no `desktop-v*` release
+# fails the resolve by saying so, and the command then needs a `page=2`.
 [deb.reasonix-desktop]
 resolve = [
     "sh",
     "-c",
-    "case \"$(uname -m)\" in x86_64) ;; *) echo \"reasonix-desktop: upstream ships the .deb for amd64 only — its $(uname -m) build is a tarball, which this backend cannot take\" >&2; exit 1 ;; esac; curl -fsSL 'https://api.github.com/repos/esengine/DeepSeek-Reasonix/releases?per_page=30' | jq -r '[.[] | select(.tag_name | startswith(\"desktop-v\"))][0].assets[] | select(.name==\"Reasonix-linux-amd64.deb\") | .browser_download_url'",
+    "case \"$(uname -m)\" in x86_64) ;; *) echo \"reasonix-desktop: upstream ships the .deb for amd64 only — its $(uname -m) build is a tarball, which this backend cannot take\" >&2; exit 1 ;; esac; curl -fsSL 'https://api.github.com/repos/esengine/DeepSeek-Reasonix/releases?per_page=100' | jq -r '[.[] | select(.tag_name | startswith(\"desktop-v\"))] | if length == 0 then error(\"reasonix-desktop: no desktop-v* release among the newest 100 — the desktop track has left the first page\") else .[0].assets[] | select(.name==\"Reasonix-linux-amd64.deb\") | .browser_download_url end'",
 ]
