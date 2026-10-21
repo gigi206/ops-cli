@@ -517,7 +517,7 @@ fn one_dns_connection_serves_several_queries() {
     let served = Arc::clone(&table);
     std::thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
-        let _ = serve_dns_stream(stream, &served, &Reporter::default());
+        let _ = serve_dns_stream(stream, &served, &Reporter::default(), CONNECT_TIMEOUT);
     });
 
     let mut c = TcpStream::connect(addr).expect("connect");
@@ -557,7 +557,7 @@ fn rubbish_on_the_dns_connection_does_not_end_the_service() {
     let served = Arc::clone(&table);
     std::thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
-        let _ = serve_dns_stream(stream, &served, &Reporter::default());
+        let _ = serve_dns_stream(stream, &served, &Reporter::default(), CONNECT_TIMEOUT);
     });
 
     let mut c = TcpStream::connect(addr).expect("connect");
@@ -580,6 +580,64 @@ fn rubbish_on_the_dns_connection_does_not_end_the_service() {
     let mut reply = vec![0u8; usize::from(u16::from_be_bytes(hdr))];
     c.read_exact(&mut reply).expect("reply body");
     assert_eq!(ancount(&reply), 1);
+}
+
+/// Shrink a socket's `option` buffer (`SO_RCVBUF` or `SO_SNDBUF`) to the least the kernel allows,
+/// which also stops it growing the buffer on its own, so that a few answers fill it.
+fn shrink_buffer(socket: &impl AsRawFd, option: libc::c_int) {
+    let size: libc::c_int = 1;
+    // SAFETY: the option takes one `c_int`, passed by pointer with its size, on a socket the
+    // caller holds open for the call.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            std::ptr::addr_of!(size).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "shrink the socket buffer");
+}
+
+/// A peer that keeps asking and never reads its answers is let go once a write has waited as long
+/// as a read may: the answers fill both buffers, and without a bound on the write the connection
+/// would hold its thread and its slot for as long as the cage lives.
+#[test]
+fn a_dns_connection_whose_peer_stops_reading_is_let_go() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (ended, served) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        shrink_buffer(&stream, libc::SO_SNDBUF);
+        let table = Mutex::new(FakeIps::new());
+        let _ = serve_dns_stream(stream, &table, &Reporter::default(), Duration::from_secs(1));
+        let _ = ended.send(());
+    });
+
+    // Held open until the assertion: a peer that closed would end the write with an error, which
+    // says nothing about one that is merely not reading.
+    let client = TcpStream::connect(addr).expect("connect");
+    shrink_buffer(&client, libc::SO_RCVBUF);
+    let mut writer = client.try_clone().expect("a second handle to write with");
+    // Written from a thread of its own, because the writes stop too once the tap stops reading.
+    std::thread::spawn(move || {
+        let q = query("same.test", QTYPE_A);
+        let mut framed = u16::try_from(q.len()).expect("fits").to_be_bytes().to_vec();
+        framed.extend_from_slice(&q);
+        for _ in 0..20_000 {
+            if writer.write_all(&framed).is_err() {
+                return;
+            }
+        }
+    });
+
+    assert!(
+        served.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "the connection must be let go once its answers have nowhere to go"
+    );
+    drop(client);
 }
 
 /// The resolver address the cage is pointed at must never be one the table can hand out, or a name

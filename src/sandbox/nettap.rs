@@ -1090,7 +1090,7 @@ fn serve_dns_tcp(listener: &TcpListener, table: &Arc<Mutex<FakeIps>>, reporter: 
         let reporter = Arc::clone(reporter);
         super::conncap::spawn_conn("net-tap-dns", move || {
             let _slot = slot;
-            let _ = serve_dns_stream(stream, &table, &reporter);
+            let _ = serve_dns_stream(stream, &table, &reporter, CONNECT_TIMEOUT);
         });
     }
 }
@@ -1098,12 +1098,19 @@ fn serve_dns_tcp(listener: &TcpListener, table: &Arc<Mutex<FakeIps>>, reporter: 
 /// Serve one DNS-over-TCP connection: length-prefixed queries, answered in order, until the peer
 /// closes. A message the tap does not answer is dropped and the loop continues — a workload cannot
 /// take its own resolver down (and with it the cage's egress) by writing rubbish at it.
+///
+/// `idle` bounds every read and every write. A peer that keeps asking and never reads its answers
+/// fills both sockets' buffers, and the next answer's write then waits for a reader that is not
+/// coming: without a bound there, the connection would hold its thread and its slot until the cage
+/// exits, and a cage could fill every slot the TCP resolver has that way.
 fn serve_dns_stream(
     mut stream: TcpStream,
     table: &Mutex<FakeIps>,
     reporter: &Reporter,
+    idle: Duration,
 ) -> io::Result<()> {
-    let _ = stream.set_read_timeout(Some(CONNECT_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(idle));
+    let _ = stream.set_write_timeout(Some(idle));
     let mut len = [0u8; 2];
     loop {
         // A short read here is the peer closing between messages, which is ordinary.
