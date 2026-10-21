@@ -405,8 +405,9 @@ fn value_candidates(kind: &ValueKind, prefix: &str) -> Vec<(String, String)> {
 }
 
 /// The registries behind a value position. A registry that cannot be read — no data
-/// directory, a missing file, a closed control plane — is simply empty; the oracle never
-/// prints anything but candidates.
+/// directory, a missing file, a closed control plane — is simply empty, and an entry a listing
+/// cannot read is left out of it, so that list comes back short. Neither is reported: the oracle
+/// never prints anything but candidates.
 fn registry_values(kind: &ValueKind) -> Vec<(String, String)> {
     use ValueKind::*;
     // Resolved **without mounting**: this runs on a keystroke, and the ordinary resolution follows
@@ -617,7 +618,9 @@ fn table_headers(table: &toml_edit::Table, prefix: &str, out: &mut Vec<(String, 
 /// bundles under `…/sbx/bundles/` a `use` names, or the egress groups under
 /// `…/sbx/net-groups/` an `@<name>` reference resolves against. One file per name, its stem
 /// being the name, which is why the directory listing is the whole answer — no file is read,
-/// since this runs on a keystroke and must never block on a config.
+/// since this runs on a keystroke and must never block on a config. A directory that cannot be
+/// listed offers nothing and an entry that cannot be read is left out, as [`registry_values`] says
+/// of every registry.
 ///
 /// Global-only, because both vocabularies are: a group or a bundle declared in a project file
 /// is dropped on load with a warning, so offering one would complete a name that grants
