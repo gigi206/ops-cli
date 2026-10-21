@@ -477,16 +477,20 @@ fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
     assert_eq!(unsafe { libc::fstat(tap_fd, &mut st) }, 0);
     let tap_socket = format!("socket:[{}]", st.st_ino);
     let reported = dir.join("reported");
-    {
+    // The reader is woken through a second handle once the run is over: the tap's end closing does
+    // not end a receive on a datagram pair, so a report that never came would hold it for good.
+    // Shutting the far end's reading side does, with nothing read.
+    let waker = far.try_clone().expect("a second handle on the far end");
+    let reader = {
         let reported = reported.clone();
         std::thread::spawn(move || {
             let mut datagram = [0u8; 512];
-            if let Ok(n) = far.recv(&mut datagram) {
+            if let Ok(n @ 1..) = far.recv(&mut datagram) {
                 let line = String::from_utf8_lossy(&datagram[..n]);
                 let _ = std::fs::write(&reported, line.trim());
             }
-        });
-    }
+        })
+    };
     let query = r#"
 import os, socket, struct, sys, time
 print("ran", flush=True)
@@ -581,6 +585,8 @@ print("report fd", "held" if held else "closed")
         "the tap's end stays close-on-exec here, where another test's command could inherit it"
     );
     drop(tap_end);
+    let _ = waker.shutdown(std::net::Shutdown::Read);
+    reader.join().expect("the report reader");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     for own in [
