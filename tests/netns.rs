@@ -43,6 +43,10 @@ fn holder_argv(bwrap: &std::path::Path, cmd: &[OsString]) -> Vec<OsString> {
 /// gap is this host's: a kernel or a policy that refuses an unprivileged user namespace, or a
 /// command the host lacks. When it can, the holder is what failed — a usage error, an argument
 /// list bwrap refuses, a crash — and the test fails rather than skips.
+///
+/// The question is asked with the test's own namespaces and command rather than by a generic probe
+/// of user namespaces: the binary's own probe is out of an integration test's reach, and what is in
+/// question is whether this cage, with this command, can run here.
 fn bwrap_runs(bwrap: &std::path::Path, cmd: &[OsString]) -> bool {
     let argv = holder_argv(bwrap, cmd);
     Command::new(&argv[0])
