@@ -99,7 +99,9 @@ A **removal verb completes what it can remove**. `sbx net unallow <TAB>` offers 
 rules already written, `undeny` the deny rules, `unmute` the mute rules, and
 `sbx proc unallow`/`undeny` their `[proc]` twins. `--app <name>` moves the offer to that
 app's own profile, the file the removal would edit. The add verbs deliberately offer none
-of them: `sbx net allow` takes precisely a rule that is *not* in the list yet.
+of them: `sbx net allow` takes precisely a rule that is *not* in the list yet. A rule is
+inserted quoted, so `*.example.com` and `{GET,HEAD}api.test` reach the command as the rules
+they are, not as the files a glob matches or as two words.
 
 Only a value sbx cannot enumerate is left to the shell: a filesystem path, and the line a
 launched program receives past a `--`. There the oracle answers with a reserved marker
@@ -163,8 +165,9 @@ does not answer inside it: a menu one item short beats a prompt that stalls.
 
 Only bash and zsh are supported today. Because all of the logic lives in the binary, a
 third shell is a small adapter (collect the words, call `sbx __complete --`, render the
-lines) rather than a second transcription of the command tree; `src/cli/completion.rs`
-holds both existing ones side by side.
+lines, and insert each one quoted the way that shell reads it back) rather than a second
+transcription of the command tree; `src/cli/completion.rs` holds both existing ones side
+by side.
 
 There is no `sh` script, and there cannot be one: POSIX `sh` (dash, ash) has no
 programmable completion mechanism. `complete` is a bash builtin, so "sh completion" in
