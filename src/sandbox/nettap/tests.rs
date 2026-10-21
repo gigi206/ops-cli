@@ -126,6 +126,31 @@ fn a_malformed_question_is_refused_not_parsed() {
     );
 }
 
+/// Only a standard query is a question: a response is never answered, nor a message whose opcode
+/// asks for something other than an address. The flags a client may set on a query do not count
+/// against it.
+#[test]
+fn only_a_standard_query_is_answered() {
+    let good = query("example.test", QTYPE_A);
+
+    let mut flagged = good.clone();
+    flagged[3] |= 0x30; // AD and CD
+    assert!(
+        parse_question(&flagged).is_some(),
+        "a query's own flags do not make it another kind of message"
+    );
+
+    let mut response = good.clone();
+    response[2] |= 0x80;
+    assert!(parse_question(&response).is_none(), "a response");
+
+    for (opcode, what) in [(4u8, "NOTIFY"), (5, "UPDATE")] {
+        let mut other = good.clone();
+        other[2] = (other[2] & 0x87) | (opcode << 3);
+        assert!(parse_question(&other).is_none(), "{what}");
+    }
+}
+
 #[test]
 fn an_a_question_is_answered_with_the_synthetic_address() {
     let table = Mutex::new(FakeIps::new());

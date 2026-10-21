@@ -592,8 +592,9 @@ pub(crate) struct Question {
 const QTYPE_A: u16 = 1;
 
 /// Read the single question out of a query. `None` for anything this tap will not answer: a
-/// truncated message, a header that does not carry exactly one question, a compression pointer
-/// (illegal in a question and a loop risk), an over-long label or name, or a non-ASCII byte.
+/// message that is not a standard query, a truncated message, a header that does not carry exactly
+/// one question, a compression pointer (illegal in a question and a loop risk), an over-long label
+/// or name, or a non-ASCII byte.
 ///
 /// This is the one function in sbx that parses bytes a caged workload chose, so it trusts no length
 /// it reads: every index is bounds-checked against the buffer before use, and the total name length
@@ -605,6 +606,12 @@ const QTYPE_A: u16 = 1;
 /// bytes), which a client that randomises the case of its queries checks.
 pub(crate) fn parse_question(buf: &[u8]) -> Option<Question> {
     if buf.len() < 12 || buf.len() > DNS_MAX {
+        return None;
+    }
+    // A query (QR clear), and a standard one (OPCODE 0). A response is never answered: answering
+    // answers is how two responders that reach each other loop. Any other opcode (NOTIFY, UPDATE)
+    // asks for something other than an address, which this tap does not implement.
+    if buf[2] & 0x80 != 0 || (buf[2] >> 3) & 0x0f != 0 {
         return None;
     }
     // QDCOUNT must be exactly one: a query with none has nothing to answer, and one with several
