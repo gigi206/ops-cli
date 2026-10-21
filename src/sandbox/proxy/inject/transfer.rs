@@ -59,9 +59,9 @@ impl CredentialSet {
         })
     }
 
-    /// The set [`CredentialSet::encode`] handed over. A malformed document, or one whose signers do
-    /// not match the descriptors handed over with it, is an error: a proxy given part of a set
-    /// injects a different one.
+    /// The set [`CredentialSet::encode`] handed over. A malformed document, one whose signers do
+    /// not match the descriptors handed over with it, or one naming a plugin twice, is an error: a
+    /// proxy given part of a set injects a different one.
     pub(crate) fn decode(transfer: Transfer) -> io::Result<Self> {
         let wire: SetWire = from_bytes(&transfer.bytes)?;
         wire.into_set(transfer.signers, None)
@@ -265,6 +265,16 @@ impl SetWire {
                     signers.len(),
                     fds.len()
                 ),
+            ));
+        }
+        // One entry per plugin, as the encoding writes it. A kept conversation is found by the
+        // plugin's number alone ([`asking`]), so a number named twice would have one plugin's
+        // injections asked through another's conversation, and signed with its credential.
+        let mut seen = std::collections::HashSet::new();
+        if let Some(SignerWire { id, .. }) = signers.iter().find(|signer| !seen.insert(signer.id)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("credentials: the document names plugin {id} twice"),
             ));
         }
         let signers: Vec<Signer> = signers
@@ -749,5 +759,32 @@ mod tests {
             !Arc::ptr_eq(&channel_at(&proxys, 1).1, &channel),
             "a new plugin is not asked through another plugin's channel"
         );
+    }
+
+    /// A document naming one plugin twice is refused, on arrival and on a re-resolution alike,
+    /// since the second entry would be asked through the conversation kept for the first: the new
+    /// plugin's requests would be signed by the kept one.
+    #[test]
+    fn a_document_naming_a_plugin_twice_is_refused() {
+        let (kept, _kept_plugin) = stand_in();
+        let proxys = CredentialSet::decode(full_set(&kept).encode().unwrap()).unwrap();
+        let (fresh, _fresh_plugin) = stand_in();
+        let twice = || {
+            let mut again = full_set(&kept);
+            again.injections.push(signed("new.test", &fresh, None));
+            let mut transfer = again.encode().unwrap();
+            let mut doc: serde_json::Value = serde_json::from_slice(&transfer.bytes).unwrap();
+            doc["signers"][1]["id"] = doc["signers"][0]["id"].clone();
+            transfer.bytes = serde_json::to_vec(&doc).unwrap();
+            transfer
+        };
+        let e = CredentialSet::decode_over(twice(), &proxys)
+            .err()
+            .expect("refused over a set");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let e = CredentialSet::decode(twice())
+            .err()
+            .expect("refused on arrival");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 }
