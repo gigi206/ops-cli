@@ -219,6 +219,12 @@ fn candidates(words: &[String]) -> Vec<(String, String)> {
         flags.retain(|(name, _)| name.starts_with(cur));
         flags.sort_by(|a, b| a.0.cmp(&b.0));
         flags
+    } else if on_flag_value(&path, &before[tail_at..]) {
+        // A flag's value: its cells where sbx can name them, else nothing — never the page's own
+        // flags or subcommands, which the parser would read as that value.
+        cursor_value_kind(&path, &before[tail_at..])
+            .map(|kind| value_candidates(&kind, cur))
+            .unwrap_or_default()
     } else if let Some(kind) = cursor_value_kind(&path, &before[tail_at..]) {
         // The page's own verbs share the menu with the value: `sbx bundle <TAB>`
         // offers export|import alongside the bundle names, `sbx projects <TAB>` its
@@ -956,6 +962,9 @@ struct Walk {
     pos: usize,
     /// The value the flag just before the cursor takes, when the cursor word is that value.
     pending_flag: Option<ValueKind>,
+    /// Whether the cursor word is the value of the flag just before it, whether or not sbx can
+    /// name that value's vocabulary ([`Walk::pending_flag`]).
+    on_flag_value: bool,
     /// The first operand typed, for a page whose second value depends on its first
     /// (`plugins store install <store> <plugin>`).
     first_positional: Option<String>,
@@ -975,6 +984,7 @@ fn walk_operands(forms: &[Vec<Operand>], path: &[&str], before: &[String]) -> Wa
         live: (0..forms.len()).collect(),
         pos: 0,
         pending_flag: None,
+        on_flag_value: false,
         first_positional: None,
         app: None,
         operand_typed: false,
@@ -1035,6 +1045,7 @@ fn walk_operands(forms: &[Vec<Operand>], path: &[&str], before: &[String]) -> Wa
         }
         walk.pos += 1;
     }
+    walk.on_flag_value = pending_word.is_some();
     walk
 }
 
@@ -1043,6 +1054,11 @@ fn walk_operands(forms: &[Vec<Operand>], path: &[&str], before: &[String]) -> Wa
 /// the command's, whatever flags it carries.
 fn operand_typed(path: &[&str], before: &[String]) -> bool {
     walk_operands(&operand_forms(path), path, before).operand_typed
+}
+
+/// Whether the word under the cursor is the value of the flag typed just before it.
+fn on_flag_value(path: &[&str], before: &[String]) -> bool {
+    walk_operands(&operand_forms(path), path, before).on_flag_value
 }
 
 /// The value kind of the word under the cursor: the flag value the typed flags want, or what
@@ -1055,12 +1071,15 @@ fn cursor_value_kind(path: &[&str], before: &[String]) -> Option<ValueKind> {
         live,
         pos,
         pending_flag,
+        on_flag_value,
         first_positional,
         app,
         ..
     } = walk_operands(&forms, path, before);
-    if let Some(kind) = pending_flag {
-        return Some(kind);
+    // The word after a flag that takes a value is that value, and nothing behind the flag: a
+    // value sbx cannot name is not the operand or the flag the line would otherwise read on to.
+    if on_flag_value {
+        return pending_flag;
     }
     let mut words: Vec<String> = Vec::new();
     let mut value: Option<&str> = None;
@@ -2838,6 +2857,32 @@ mod tests {
              metavariable in `kind_of_metavar`/`flag_metavar_kind`, or add it to \
              `NOT_ENUMERABLE` with the reason:\n{}",
             holes.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_word_after_a_flag_that_takes_a_value_is_that_value_and_nothing_else() {
+        // A flag that takes the next word for its value owns that word, whether or not sbx can
+        // say what the value may be. Where it could not, the position offered what stands behind
+        // the flag: the page's own flags (`run --env <TAB>`), or the operand the value is not
+        // (`session stop --delay <TAB>` offered session ids for a number of seconds).
+        assert_eq!(names(&["run", "--env", ""]), Vec::<String>::new());
+        assert_eq!(names(&["run", "--package", ""]), Vec::<String>::new());
+        assert_eq!(names(&["net", "logs", "--host", ""]), Vec::<String>::new());
+        assert_eq!(
+            cursor_value_kind(&["session", "stop"], &words(&["--delay"])),
+            None
+        );
+        // Once the value is typed, the line is the page's again.
+        assert_eq!(
+            cursor_value_kind(&["session", "stop"], &words(&["--delay", "5"])),
+            Some(ValueKind::Sessions)
+        );
+        assert!(names(&["run", "--env", "X=1", ""]).contains(&"--detach".to_string()));
+        // A value sbx can name is still offered, and only that.
+        assert_eq!(
+            names(&["run", "--gui", ""]),
+            ["none", "offscreen", "wayland"]
         );
     }
 
