@@ -598,6 +598,11 @@ const QTYPE_A: u16 = 1;
 /// This is the one function in sbx that parses bytes a caged workload chose, so it trusts no length
 /// it reads: every index is bounds-checked against the buffer before use, and the total name length
 /// is capped at the protocol's own 255.
+///
+/// The name comes back in lowercase. DNS compares names without regard to ASCII case, so
+/// `Example.com` and `example.com` are one host: one address in the table and one line in the
+/// record. A reply still echoes the question as it was sent ([`Question::qlen`] spans the raw
+/// bytes), which a client that randomises the case of its queries checks.
 pub(crate) fn parse_question(buf: &[u8]) -> Option<Question> {
     if buf.len() < 12 || buf.len() > DNS_MAX {
         return None;
@@ -647,7 +652,7 @@ pub(crate) fn parse_question(buf: &[u8]) -> Option<Question> {
     let _qclass = u16::from_be_bytes([*buf.get(off + 2)?, *buf.get(off + 3)?]);
     let end = off.checked_add(4)?;
     Some(Question {
-        name: labels.join("."),
+        name: labels.join(".").to_ascii_lowercase(),
         qtype,
         qlen: end - 12,
     })

@@ -729,6 +729,39 @@ fn a_name_is_reported_once_however_often_it_is_asked_for() {
     );
 }
 
+/// A name's case is not part of it: `GitHub.COM` and `github.com` are one host, given one address
+/// and reported once. Each reply still echoes its question in the case it was asked in, which a
+/// client that randomises the case of its queries checks.
+#[test]
+fn a_name_asked_in_another_case_is_the_same_name() {
+    let (tap, far) = channel();
+    let lines = stand_in_report_channel(far);
+    let reporter = Reporter::new(Some(tap));
+    let table = Mutex::new(FakeIps::new());
+
+    let mixed = query("GitHub.COM", QTYPE_A);
+    let first = answer_query(&mixed, &table, &reporter).expect("answered");
+    let second = answer_query(&query("github.com", QTYPE_A), &table, &reporter).expect("answered");
+    assert_eq!(
+        first[first.len() - 4..],
+        second[second.len() - 4..],
+        "one host, one address"
+    );
+    assert_eq!(
+        lines.recv_timeout(Duration::from_secs(5)).expect("report"),
+        "RESOLVED github.com"
+    );
+    assert!(
+        lines.recv_timeout(Duration::from_millis(300)).is_err(),
+        "and one report"
+    );
+    assert_eq!(
+        first[12..mixed.len()],
+        mixed[12..],
+        "the question is echoed as it was asked"
+    );
+}
+
 /// A question the tap cannot route consumes no address, so there is nothing to report either: the
 /// record would otherwise name hosts the cage never got an answer for.
 #[test]
