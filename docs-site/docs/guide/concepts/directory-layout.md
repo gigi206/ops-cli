@@ -52,7 +52,7 @@ The important subtrees:
 | `egress/` | per-launch egress proxy sockets and CA material |
 | `proc/` | per-launch exec-enforcement sockets |
 | `fs/` | per-launch filesystem plumbing: the observation socket, and `mask-<pid>/` holding the two decoys an [`[fs]`](../configuration/fs) policy mounts |
-| `tasks/` | per-launch declared-operation sockets (one directory per session) |
+| `tasks/` | per-launch declared-operation sockets (one directory per session), and `sweep.lock`, which keeps the cleanup of crashed sessions' directories from removing one a launch is creating |
 | `broker/` | per-launch broker-plugin sockets and their record |
 | `signer/` | per-launch signer-plugin record sockets |
 | `ssh-agent/` | per-launch ssh-agent fence sockets and their record |

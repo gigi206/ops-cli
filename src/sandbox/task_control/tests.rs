@@ -698,6 +698,93 @@ fn a_started_plane_records_which_incarnation_owns_its_directory() {
     );
 }
 
+/// A sweep waits for a session that is claiming its directory, and so never removes what the claim
+/// is creating.
+///
+/// The session here reuses the pid of one that crashed: its directory is still there, stamped by
+/// the other incarnation (`u64::MAX`, as above). A sweep that read that stamp and then removed the
+/// directory did so in two steps, and a claim made between them lost its directory a moment after
+/// creating it.
+#[test]
+fn a_sweep_waits_for_a_session_claiming_its_directory() {
+    let data = TmpDir::new();
+    let pid = std::process::id();
+    let ticks = crate::session::read_start_ticks(pid).expect("our own start time");
+    let dir = task_dir(data.path(), pid);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(INCARNATION), u64::MAX.to_string()).unwrap();
+
+    let claim = sweep_lock(&tasks_dir(data.path())).expect("the sweep lock");
+    let (done, finished) = std::sync::mpsc::channel();
+    let sweeper = {
+        let data = data.path().to_path_buf();
+        std::thread::spawn(move || {
+            let pids = session_pids(&data);
+            let _ = done.send(());
+            pids
+        })
+    };
+    assert!(
+        finished.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a sweep must wait while a session claims its directory"
+    );
+    assert!(dir.exists(), "nothing may be removed under a claim");
+
+    std::fs::write(dir.join(INCARNATION), ticks.to_string()).unwrap();
+    std::fs::write(dir.join("control.sock"), "not really a socket").unwrap();
+    drop(claim);
+    assert_eq!(sweeper.join().expect("the sweep"), vec![pid]);
+    assert!(
+        dir.join("control.sock").exists(),
+        "a directory claimed by a running session must survive the sweep that waited for it"
+    );
+}
+
+/// A launch's own claim ([`claim_task_dir`]) holds against sweeps running beside it, round after
+/// round: every claim succeeds, and the directory it made is still there once it returns. Without
+/// the lock on both sides, some claims failed outright and some lost their directory to a sweep
+/// that had read the crashed incarnation's stamp just before.
+#[test]
+fn a_claim_holds_against_sweeps_running_beside_it() {
+    use std::sync::atomic::AtomicBool;
+    let data = TmpDir::new();
+    let pid = std::process::id();
+    let dir = task_dir(data.path(), pid);
+    let stop = Arc::new(AtomicBool::new(false));
+    let sweeper = {
+        let data = data.path().to_path_buf();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                session_pids(&data);
+            }
+        })
+    };
+    let (mut failed, mut lost) = (0, 0);
+    for _ in 0..5000 {
+        // What a crashed session with this pid left behind.
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(INCARNATION), u64::MAX.to_string());
+        if claim_task_dir(data.path(), pid).is_err()
+            || std::fs::write(dir.join("control.sock"), "not really a socket").is_err()
+        {
+            failed += 1;
+            continue;
+        }
+        std::thread::yield_now();
+        if !dir.join("control.sock").exists() {
+            lost += 1;
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    sweeper.join().expect("the sweeper");
+    assert_eq!(
+        (failed, lost),
+        (0, 0),
+        "claims that failed, and claimed directories a sweep removed"
+    );
+}
+
 /// A plane whose invocations take `seconds` to answer, plus the client that talks to it.
 ///
 /// The launcher is a script standing in for bubblewrap: it ignores the cage argv, waits, and

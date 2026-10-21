@@ -706,6 +706,64 @@ pub(crate) fn log_socket(data_dir: &Path, pid: u32) -> PathBuf {
     task_dir(data_dir, pid).join("log.sock")
 }
 
+/// Claim this session's directory under [`tasks_dir`]: sweep the directories of sessions that are
+/// gone, then create this one, owner-only, and stamp it with this incarnation.
+///
+/// The sweep runs for its effect rather than its answer: every launch removes what crashed sessions
+/// left, so the listing stays honest on a machine where nobody runs `sbx task list` between
+/// crashes. The stamp goes in before anything else does. Nothing guarantees a plane gets to clean
+/// up after itself — a `SIGKILL`ed session never runs its `Drop` — so what makes the listing
+/// trustworthy is not tidy shutdown but this stamp, which [`session_pids`] re-checks and which no
+/// reused pid can satisfy.
+///
+/// All of it happens under the sweep lock ([`sweep_lock`]). A sweep decides a directory is stale
+/// and removes it as two steps, and a session reusing the pid of one that crashed finds that
+/// directory stamped by the other incarnation: claimed between another sweep's two steps, it was
+/// removed under the session just after it was created, sockets or no.
+fn claim_task_dir(data_dir: &Path, pid: u32) -> io::Result<PathBuf> {
+    let root = tasks_dir(data_dir);
+    std::fs::create_dir_all(&root)?;
+    let _lock = sweep_lock(&root)?;
+    sweep_stale(&root, true);
+    let dir = task_dir(data_dir, pid);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    if let Some(ticks) = crate::session::read_start_ticks(pid) {
+        std::fs::write(dir.join(INCARNATION), ticks.to_string())?;
+    }
+    Ok(dir)
+}
+
+/// The file under [`tasks_dir`] that [`sweep_lock`] locks. Named so that nothing listing the
+/// directory reads it as an entry: neither a session directory (a pid), nor a record, nor a runtime
+/// entry the store's sweep would take for a session's. That matters beyond tidiness: a lock file
+/// removed while held is created afresh by the next taker, which then holds a lock of its own.
+pub(crate) const SWEEP_LOCK: &str = "sweep.lock";
+
+/// Take the lock that orders the sweeps of [`tasks_dir`] against a session claiming its directory,
+/// held until the returned file is dropped. A `flock(2)`, so it goes with the process that holds
+/// it, however that process ends.
+///
+/// It blocks while another process holds it: for as long as a sweep or a claim takes, which is a
+/// few file operations, or for as long as the holder is stopped — an `sbx task list` suspended in
+/// the middle of its sweep holds every launch that declares a task until it resumes or ends.
+fn sweep_lock(root: &Path) -> io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(root.join(SWEEP_LOCK))?;
+    // SAFETY: `flock` on a descriptor this function owns; it blocks until the lock is granted, and
+    // the lock is released when the returned file is closed.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
 /// Stand up the task plane for one session: bind both sockets and serve each on its own thread.
 ///
 /// The engine is shared (`Arc`) with the serve threads; each invocation runs on the connection's
@@ -717,21 +775,7 @@ pub(crate) fn start(
     client: &ClientPrograms<'_>,
     record: Option<&super::lens::RecordWiring>,
 ) -> io::Result<TaskPlane> {
-    // Sweep first, for its effect rather than its answer: every launch removes the directories of
-    // sessions that are gone, so the listing stays honest on a machine where nobody runs
-    // `sbx task list` between crashes.
-    let _ = session_pids(data_dir);
-
-    let dir = task_dir(data_dir, pid);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    // Stamp which incarnation of this pid owns the directory, before anything else is put in it.
-    // Nothing guarantees a plane gets to clean up after itself — a `SIGKILL`ed session never runs
-    // its `Drop` — so what makes the directory listing trustworthy is not tidy shutdown but this
-    // stamp, which [`session_pids`] re-checks and which no reused pid can satisfy.
-    if let Some(ticks) = crate::session::read_start_ticks(pid) {
-        std::fs::write(dir.join(INCARNATION), ticks.to_string())?;
-    }
+    let dir = claim_task_dir(data_dir, pid)?;
 
     let cage_socket = dir.join("control.sock");
     let log_path = log_socket(data_dir, pid);
@@ -1744,9 +1788,24 @@ pub(crate) fn stop_invocation(socket: &Path, id: u64) -> io::Result<StopReply> {
 ///
 /// The check is the `(pid, start_ticks)` pair, never the pid alone, because the kernel reuses pids
 /// and a reused one would otherwise resurrect a dead session's directory.
+///
+/// The check and the removal run under the sweep lock ([`sweep_lock`]), which a session claiming
+/// its directory holds too ([`claim_task_dir`]), so a directory found stale is not replaced by a
+/// live one before it goes. A directory that does not exist yet is answered empty without being
+/// created; one where the lock cannot be taken is listed without removing anything.
 pub(crate) fn session_pids(data_dir: &Path) -> Vec<u32> {
-    let root = data_dir.join("tasks");
-    let Ok(entries) = std::fs::read_dir(&root) else {
+    let root = tasks_dir(data_dir);
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let lock = sweep_lock(&root).ok();
+    sweep_stale(&root, lock.is_some())
+}
+
+/// The live sessions under `root`, sorted, removing the directory of every one that is gone when
+/// `prune` says so. The caller holds the sweep lock whenever `prune` is set.
+fn sweep_stale(root: &Path, prune: bool) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
     let mut pids: Vec<u32> = Vec::new();
@@ -1757,7 +1816,7 @@ pub(crate) fn session_pids(data_dir: &Path) -> Vec<u32> {
         let dir = root.join(pid.to_string());
         if plane_is_live(&dir, pid) {
             pids.push(pid);
-        } else {
+        } else if prune {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

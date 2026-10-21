@@ -3907,6 +3907,26 @@ mod tests {
         assert!(removed.is_empty(), "{removed:?}");
     }
 
+    /// The task plane's sweep lock lives among the session directories it guards, and holds only
+    /// while nothing removes it: a lock file swept away while held is created afresh by the next
+    /// taker, which then holds a lock of its own beside the first. This sweep takes a dead
+    /// session's directory there and leaves the lock.
+    #[test]
+    fn the_task_planes_sweep_lock_outlives_the_runtime_sweep() {
+        use crate::sandbox::task_control::{SWEEP_LOCK, tasks_dir};
+        let data = TmpDir::new();
+        let tasks = tasks_dir(data.path());
+        std::fs::create_dir_all(tasks.join("4242")).unwrap();
+        std::fs::write(tasks.join(SWEEP_LOCK), b"").unwrap();
+        let removed = sweep_runtime_dirs_with(data.path(), true, &|_| false);
+        assert_eq!(
+            removed,
+            vec![tasks.join("4242")],
+            "a dead session's directory goes"
+        );
+        assert!(tasks.join(SWEEP_LOCK).exists(), "the sweep lock stays");
+    }
+
     #[test]
     fn sweep_runtime_dirs_tolerates_absent_directories() {
         let data = TmpDir::new();
