@@ -146,7 +146,7 @@ pub(crate) struct CliOverrides {
     pub(crate) forward: Vec<String>,
     /// `--limit <key>=<value>` — one cgroup limit each.
     pub(crate) limits: Vec<String>,
-    /// `--package <name>=<backend:locator>` — one package each.
+    /// `--package <package>=<backend:locator>` — one package each.
     pub(crate) packages: Vec<String>,
     /// `--seccomp <token[,token…]>` — relax the mandatory syscall denylist for this launch. Each
     /// value follows the `[seccomp] allow` grammar (a bare name, a `clone`/`ioctl` `:selector`, or a
@@ -1434,7 +1434,21 @@ fn conflicting_limit(limits: &[(String, String)]) -> Option<&str> {
         .map(|(_, (key, _))| key.as_str())
 }
 
-/// Set one cgroup limit on the fragment's `[limits]` table. The key must name a limit field; the
+/// How one limit key lands on the fragment's `[limits]` table.
+pub(crate) type SetLimit = fn(&mut RawLimits, RawLimit);
+
+/// The cgroup limits a one-shot `--limit <key>=<value>` sets, each with the field of the
+/// fragment's `[limits]` table it lands on. One list, so the parser, its refusal, and the
+/// completion that offers the keys cannot disagree.
+pub(crate) const LIMITS: &[(&str, SetLimit)] = &[
+    ("memory_high", |table, value| {
+        table.memory_high = Some(value)
+    }),
+    ("memory_max", |table, value| table.memory_max = Some(value)),
+    ("tasks_max", |table, value| table.tasks_max = Some(value)),
+];
+
+/// Set one cgroup limit on the fragment's `[limits]` table. The key must be one of [`LIMITS`]; the
 /// value parses to a bare number (`RawLimit::Number`) or a string form (`RawLimit::Text`) — exactly
 /// the two TOML shapes — so the downstream systemd-grammar and bare-byte-floor checks apply
 /// unchanged.
@@ -1446,16 +1460,14 @@ fn set_limit(
 ) -> Result<(), String> {
     let table = limits.get_or_insert_with(RawLimits::default);
     let parsed = parse_raw_limit(value);
-    match key {
-        "memory_high" => table.memory_high = Some(parsed),
-        "memory_max" => table.memory_max = Some(parsed),
-        "tasks_max" => table.tasks_max = Some(parsed),
-        other => {
-            return Err(format!(
-                "{label}: unknown limit `{other}` (memory_high | memory_max | tasks_max)"
-            ));
-        }
-    }
+    let Some((_, set)) = LIMITS.iter().find(|(name, _)| *name == key) else {
+        let known: Vec<&str> = LIMITS.iter().map(|(name, _)| *name).collect();
+        return Err(format!(
+            "{label}: unknown limit `{key}` ({})",
+            known.join(" | ")
+        ));
+    };
+    set(table, parsed);
     Ok(())
 }
 

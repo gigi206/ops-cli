@@ -89,7 +89,7 @@ the value. Two kinds:
   its own: `sbx proc pending allow <TAB>` offers the execs parked by `[proc]`, and
   `sbx net pending allow <TAB>` the network requests parked by the egress proxy.
 - **Spelled out by the grammar itself**: a `bash` or `zsh` for this page, an upgrade target,
-  a `--net` posture, a `--gui` or `--notify` mode, a `--verdict`.
+  a `--net` posture, a `--gui` or `--notify` mode, a `--verdict`, a `--limit` key.
 
 A value is offered as many times as the page takes it. Each id of `sbx session stop <id>...`
 completes like the first, while nothing is offered once a verb has all it takes:

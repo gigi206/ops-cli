@@ -1242,6 +1242,17 @@ fn flag_literals(path: &[&str], flag: &str) -> Option<Vec<String>> {
         // What is completed is one name: a shell splits on whitespace, so the value after a comma
         // is inside a single word and is the caller's to type.
         (["logs"], "--feed") => super::logs::FEED_NAMES,
+        // `--limit <key>=<value>` takes one word holding both halves, so what is completed is the
+        // key with its `=`, as `--net` offers `allow=`, and the value is the caller's to type. The
+        // keys are the parser's own table.
+        (["run"] | ["app", "run"], "--limit") => {
+            return Some(
+                config::overrides::LIMITS
+                    .iter()
+                    .map(|(key, _)| format!("{key}="))
+                    .collect(),
+            );
+        }
         _ => return None,
     };
     Some(cells.iter().map(|c| (*c).to_string()).collect())
@@ -2776,6 +2787,9 @@ mod tests {
         "new-name",
         // A filesystem label, which names a mount point rather than anything sbx keeps a list of.
         "fs-label",
+        // The package a one-shot `--package <package>=<backend:locator>` adds: a name the launch
+        // gives it, not one of anything sbx holds.
+        "package",
     ];
 
     #[test]
@@ -2825,6 +2839,45 @@ mod tests {
              `NOT_ENUMERABLE` with the reason:\n{}",
             holes.join("\n")
         );
+    }
+
+    #[test]
+    fn a_key_value_flag_is_not_completed_from_its_key_alone() {
+        // A flag whose value is `<key>=<value>` takes one word holding both halves, so the
+        // vocabulary of the key alone answers it wrongly: `--limit` offered the config's tables
+        // and `--package` the installed apps, neither of them a word the flag takes. Such a value
+        // is a closed set of `key=` cells, or nothing to offer.
+        let mut wrong: Vec<String> = Vec::new();
+        for path in help::all_paths() {
+            for (row, _) in help::options_of(path) {
+                for flag in flag_names(row) {
+                    let Some(tail) = flag_tail(row, flag) else {
+                        continue;
+                    };
+                    if !tail.contains(">=<") {
+                        continue;
+                    }
+                    match flag_value_kind(flag, path) {
+                        None => {}
+                        Some(ValueKind::Literal(cells))
+                            if cells.iter().all(|c| c.ends_with('=')) => {}
+                        Some(kind) => {
+                            wrong.push(format!("sbx {} {flag} {tail}: {kind:?}", path.join(" ")));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        // What the two launch pages now offer for `--limit`: its keys, each with its `=`.
+        for page in [&["run", "--limit"][..], &["app", "run", "--limit"]] {
+            assert_eq!(
+                names_at(page, ""),
+                ["memory_high=", "memory_max=", "tasks_max="],
+                "sbx {}",
+                page.join(" ")
+            );
+        }
     }
 
     #[test]

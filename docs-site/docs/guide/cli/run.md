@@ -27,7 +27,7 @@ See also: [Quick start](../getting-started/quickstart) · [`sbx app`](app) · [O
 | `--nixpkgs <ref>` | one-shot nixpkgs channel or revision |
 | `--bind <path[:ro\|:rw]>` | one-shot host bind (read-only by default); repeatable |
 | `--limit <key>=<value>` | one-shot cgroup limit: `memory_high` \| `memory_max` \| `tasks_max`; repeatable |
-| `--package <name>=<backend:locator>` | one-shot package (e.g. `hello=nix:hello`); repeatable |
+| `--package <package>=<backend:locator>` | one-shot package (e.g. `hello=nix:hello`); repeatable |
 | `--proc <off\|observe\|enforce\|ask>` | one-shot process/exec posture (bare mode); `--config` sets the allow/deny lists |
 | `--notify <off\|once\|always>` | one-shot refusal-notification mode for every event; `--config` sets the per-event table |
 | `--forward <port\|host:cage[,…]>` | one-shot host loopback forward into the cage: a port (`1455`, an OAuth callback) or a `host:cage` remap (`9200:9119`); repeatable, folds onto the config by cage port |

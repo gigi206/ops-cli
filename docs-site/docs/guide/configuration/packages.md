@@ -884,7 +884,7 @@ sbx config show --json   # machine-readable
 ## One-shot override
 
 To add a package for a single launch without editing the file, use `--package
-<name>=<backend:locator>` (repeatable) or `SBX_PACKAGE_<name>`:
+<package>=<backend:locator>` (repeatable) or `SBX_PACKAGE_<name>`:
 
 ```sh
 sbx run --package jq=nix:jq -- ./tool

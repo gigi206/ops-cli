@@ -82,7 +82,7 @@ Ergonomic shorthands for a single field, each with an `SBX_*` environment equiva
 | `--bind <path[:ro\|:rw]>` | `SBX_BIND` | a host bind (read-only by default); repeatable |
 | `--forward <port\|host:cage[,…]>` | `SBX_FORWARD` | host loopback TCP forward(s) into the cage: a port, or a `host:cage` remap; repeatable |
 | `--limit <key>=<value>` | `SBX_LIMIT_<key>` | a cgroup limit (`memory_high`/`memory_max`/`tasks_max`) |
-| `--package <name>=<backend:locator>` | `SBX_PACKAGE_<name>` | a package |
+| `--package <package>=<backend:locator>` | `SBX_PACKAGE_<name>` | a package |
 | `--seccomp <token[,token…]>` | `SBX_SECCOMP` | relax the syscall denylist ([`[seccomp]`](seccomp) grammar); repeatable |
 | `--device <path>` | `SBX_DEVICE` | grant a host device node ([`[devices]`](devices)); repeatable |
 | `--fs <deny=<path>\|readonly=<path>>` | `SBX_FS` | close a project path in the cage ([`[fs]`](fs)); repeatable, and it accumulates |

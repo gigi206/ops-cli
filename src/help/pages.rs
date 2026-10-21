@@ -144,7 +144,7 @@ pub(super) const PAGES: &[Page] = &[
                 "one-shot cgroup limit: memory_high | memory_max | tasks_max; repeatable",
             ),
             (
-                "--package <name>=<backend:locator>",
+                "--package <package>=<backend:locator>",
                 "one-shot package (e.g. hello=nix:hello); repeatable",
             ),
             (
@@ -343,7 +343,7 @@ pub(super) const PAGES: &[Page] = &[
                 "one-shot cgroup limit: memory_high | memory_max | tasks_max; repeatable",
             ),
             (
-                "--package <name>=<backend:locator>",
+                "--package <package>=<backend:locator>",
                 "one-shot package (e.g. hello=nix:hello); repeatable",
             ),
             (
