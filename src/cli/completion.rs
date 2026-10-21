@@ -35,7 +35,7 @@ use crate::{config, diag, help, plugins, session};
 /// The shells a script can be emitted for, and the script for each.
 const SHELLS: &[(&str, &str)] = &[("bash", BASH), ("zsh", ZSH)];
 
-/// How much of a description reaches the completion menu. A help page wraps a long line;
+/// How many characters of a description reach the completion menu. A help page wraps a long line;
 /// a completion menu gives each candidate one line, where the same line crowds out the
 /// list.
 const DESC_WIDTH: usize = 64;
@@ -1275,13 +1275,10 @@ fn describe(desc: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    if flat.len() <= DESC_WIDTH {
+    // The width counts characters, as the menu shows them, and the cut falls after the last one.
+    let Some((end, _)) = flat.char_indices().nth(DESC_WIDTH) else {
         return flat;
-    }
-    let mut end = DESC_WIDTH;
-    while !flat.is_char_boundary(end) {
-        end -= 1;
-    }
+    };
     let head = match flat[..end].rsplit_once(' ') {
         Some((h, _)) => h,
         None => &flat[..end],
@@ -1754,8 +1751,13 @@ mod tests {
 
     #[test]
     fn a_multibyte_description_is_cut_on_a_character_boundary() {
-        let d = describe(&"é".repeat(DESC_WIDTH));
-        assert!(d.ends_with('…'));
+        // The width is in characters, the unit a menu shows: a description of exactly that many
+        // is whole however many bytes each takes, and a longer one is cut at that many.
+        assert_eq!(describe(&"é".repeat(DESC_WIDTH)), "é".repeat(DESC_WIDTH));
+        assert_eq!(
+            describe(&"é".repeat(DESC_WIDTH + 6)),
+            format!("{}…", "é".repeat(DESC_WIDTH))
+        );
     }
 
     // ---- value completion -------------------------------------------------------
