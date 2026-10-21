@@ -295,7 +295,9 @@ not `.`/`..`: because the name keys an on-disk home directory and profile file, 
 name is dropped (fail-closed). A leading `-` is refused because every `sbx app` verb reads
 such an argument as an option, so the app could never be named on the command line, not
 even to remove it; `sbx app import` of a file whose name begins with `-` takes `--as <name>`.
-The verbs `import`/`export`/`rm`/`list` are reserved and cannot be app names.
+A name that coincides with a `sbx app` verb (`run`, `show`, `import`, `rm`, …) is usable:
+launching always goes through `sbx app run <name>`, so the app is never confused with the
+subcommand.
 
 ## Viewing an app
 
