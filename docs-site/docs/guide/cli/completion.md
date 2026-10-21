@@ -91,6 +91,10 @@ the value. Two kinds:
 - **Spelled out by the grammar itself**: a `bash` or `zsh` for this page, an upgrade target,
   a `--net` posture, a `--gui` or `--notify` mode, a `--verdict`.
 
+A value is offered as many times as the page takes it. Each id of `sbx session stop <id>...`
+completes like the first, while nothing is offered once a verb has all it takes:
+`sbx projects list` takes no operand, and `sbx proc pending allow` takes a single id.
+
 A **removal verb completes what it can remove**. `sbx net unallow <TAB>` offers the allow
 rules already written, `undeny` the deny rules, `unmute` the mute rules, and
 `sbx proc unallow`/`undeny` their `[proc]` twins. `--app <name>` moves the offer to that

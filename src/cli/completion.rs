@@ -639,95 +639,72 @@ fn global_config_file() -> Option<PathBuf> {
 /// One position of a page's operand grammar, read off its option rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Operand {
-    /// Words the grammar itself names — `bash` | `zsh` on the completion page, the
-    /// `tarball` of upgrade. A literal lead on a row that names a value span first.
-    Literal(Vec<String>),
+    /// A word the grammar itself names — `bash` on the completion page, a target of
+    /// `upgrade`, the `rm` of `projects`.
+    Literal(String),
     /// A metavariable (`<id>`, `<name>…`, `[name]`) whose value vocabulary the page
-    /// decides.
-    Value(String),
+    /// decides. A repeated one (`<id>...`, `<name>…`) is also every position after its own.
+    Value { name: String, repeats: bool },
 }
 
-/// The union of the literal words a page's grammar is made of, when nothing but
-/// literals remains under the cursor — the completion page (bash|zsh), the upgrade
-/// targets. `None` when the grammar names none.
-fn all_literal_words(slots: &[Operand]) -> Option<Vec<String>> {
-    let words: Vec<String> = slots
-        .iter()
-        .filter_map(|s| match s {
-            Operand::Literal(words) => Some(words),
-            Operand::Value(_) => None,
-        })
-        .flatten()
-        .cloned()
-        .collect();
-    if words.is_empty() { None } else { Some(words) }
-}
-
-/// The operand slots of a page. A flag row (and the `--` row) is skipped; a bare operand
-/// row contributes its metavariables — `<id>`, `[name]`, a `<name>…` repeat; a row of
-/// nothing but prose contributes nothing; a page with metavariables but also literal
-/// rows (`allow <id> | deny <id>`) leads its value span with those words. A page whose
-/// rows are all literal words (`bash`, `zsh`) is a single literal slot.
+/// The operand forms of a page: each one way its rows let the words after the command path
+/// run. A row led by a word is a form of its own for each `|` alternative it writes, since
+/// what follows depends on that word: `projects` takes nothing after `list` and ids after
+/// `rm`, `proc pending` one id after `allow` or `deny`. The rows of nothing but values are
+/// the successive positions of a single form, as `config set` documents `<key>` and
+/// `<value>` on two rows. A flag row, the `--` row, and a row of prose add nothing.
 ///
-/// A bare literal row is a word of the page's first position whether or not another row
-/// also names a value: the `projects` page documents `list` on one row and `rm <id>...` on
-/// the next, and both are words that position takes. Dropping the wordless one would leave
-/// a verb the CLI accepts that nothing can offer.
-fn operand_slots(path: &[&str]) -> Vec<Operand> {
-    let mut slots: Vec<Operand> = Vec::new();
-    let mut pure: Vec<String> = Vec::new();
-    let mut saw_value_row = false;
+/// A bare literal row is a form whether or not another row also names a value: the
+/// `projects` page documents `list` on one row and `rm <id>...` on the next, and both are
+/// words that position takes. Dropping the wordless one would leave a verb the CLI accepts
+/// that nothing can offer.
+fn operand_forms(path: &[&str]) -> Vec<Vec<Operand>> {
+    let mut forms: Vec<Vec<Operand>> = Vec::new();
+    let mut values: Vec<Operand> = Vec::new();
     for (row, _) in help::options_of(path) {
         let toks: Vec<&str> = row.split_whitespace().collect();
         // Flag rows and the separator row belong to the flag grammar.
         if toks.contains(&"--") || toks.iter().any(|t| t.starts_with('-') && *t != "--") {
             continue;
         }
-        let mut row_values: Vec<String> = Vec::new();
-        let mut row_literals: Vec<String> = Vec::new();
-        for tok in toks {
-            if tok == "|" || tok == "(none)" || tok.starts_with('(') || tok.starts_with("->") {
-                continue;
+        for alternative in toks.split(|tok| *tok == "|") {
+            let form: Vec<Operand> = alternative
+                .iter()
+                .filter_map(|tok| operand_of(tok))
+                .collect();
+            match form.first() {
+                Some(Operand::Literal(_)) => forms.push(form),
+                Some(Operand::Value { .. }) => values.extend(form),
+                None => {}
             }
-            if let Some(name) = metavar_of(tok).or_else(|| optional_of(tok)) {
-                row_values.push(name);
-            } else if is_literal(tok) {
-                row_literals.push(tok.to_string());
-            }
-        }
-        if row_values.is_empty() {
-            // A prose row reads as nothing; a page of nothing but `tarball`-style rows
-            // becomes one literal slot.
-            pure.extend(row_literals);
-            continue;
-        }
-        saw_value_row = true;
-        if !row_literals.is_empty() && slots.is_empty() {
-            slots.push(Operand::Literal(row_literals));
-        }
-        for name in row_values {
-            slots.push(Operand::Value(name));
         }
     }
-    if !saw_value_row {
-        return if pure.is_empty() {
-            slots
-        } else {
-            vec![Operand::Literal(pure)]
-        };
+    if !values.is_empty() {
+        forms.push(values);
     }
-    // The wordless rows join the first position they are words of, beside the literals a
-    // value row already led with.
-    if !pure.is_empty() {
-        match slots.first_mut() {
-            Some(Operand::Literal(words)) => words.extend(pure),
-            _ => slots.insert(0, Operand::Literal(pure)),
-        }
-    }
-    slots
+    forms
 }
 
-/// The name of a `<…>` metavariable. A repeat marker (`<name>…`) changes nothing, and the
+/// The operand one token of an operand row writes: a metavariable, a literal word, or
+/// nothing for the prose and the annotations a row carries around them (`(none)`).
+fn operand_of(tok: &str) -> Option<Operand> {
+    if let Some(name) = metavar_of(tok).or_else(|| optional_of(tok)) {
+        let repeats = tok.ends_with("...") || tok.ends_with('…');
+        return Some(Operand::Value { name, repeats });
+    }
+    is_literal(tok).then(|| Operand::Literal(tok.to_string()))
+}
+
+/// What a form takes at position `k`: its own operand there, or its last one when that
+/// one repeats.
+fn operand_at(form: &[Operand], k: usize) -> Option<&Operand> {
+    form.get(k).or_else(|| match form.last() {
+        Some(last @ Operand::Value { repeats: true, .. }) => Some(last),
+        _ => None,
+    })
+}
+
+/// The name of a `<…>` metavariable. A repeat marker (`<name>…`) is no part of it, as the
 /// grammar a metavariable carries is not part of its name: an alternation names its first
 /// cell (`<toml|@file>` is `toml`) and a bracketed suffix is dropped, so `<path[:ro|:rw]>`
 /// and `<port[,port…]>` are `path` and `port` rather than `path[:ro` and `port[,port…]`.
@@ -857,15 +834,15 @@ enum PendingWord {
 
 /// What the words already typed after a command path did to its operand grammar.
 struct Walk {
-    /// The slot the word under the cursor would fill.
+    /// The page's forms the operands typed so far fit, by index into [`operand_forms`].
+    live: Vec<usize>,
+    /// The position the word under the cursor would fill.
     pos: usize,
     /// The value the flag just before the cursor takes, when the cursor word is that value.
     pending_flag: Option<ValueKind>,
-    /// The first word that filled a value slot, for a page whose second value depends on
-    /// its first (`plugins store install <store> <plugin>`).
+    /// The first operand typed, for a page whose second value depends on its first
+    /// (`plugins store install <store> <plugin>`).
     first_positional: Option<String>,
-    /// Whether a word of a literal slot has filled it.
-    literal_consumed: bool,
     /// The `--app` the line names, which scopes what a value position reads.
     app: Option<String>,
     /// Whether any operand of the page's own grammar has been typed. A flag, and the value
@@ -874,14 +851,15 @@ struct Walk {
 }
 
 /// Walk the words typed between a command path and the cursor, against the page's operand
-/// slots. One walk answers both questions asked of a line: which slot the cursor sits on,
-/// and whether the line has left the command's own grammar.
-fn walk_operands(slots: &[Operand], path: &[&str], before: &[String]) -> Walk {
+/// forms. One walk answers both questions asked of a line: which position the cursor sits
+/// on and what the forms still fitting take there, and whether the line has left the
+/// command's own grammar.
+fn walk_operands(forms: &[Vec<Operand>], path: &[&str], before: &[String]) -> Walk {
     let mut walk = Walk {
+        live: (0..forms.len()).collect(),
         pos: 0,
         pending_flag: None,
         first_positional: None,
-        literal_consumed: false,
         app: None,
         operand_typed: false,
     };
@@ -924,17 +902,14 @@ fn walk_operands(slots: &[Operand], path: &[&str], before: &[String]) -> Walk {
             continue;
         }
         walk.operand_typed = true;
-        // A word of a literal slot filling it (`allow`, `tarball`, `list`) occupies
-        // that slot rather than counting as a positional.
-        if let Some(Operand::Literal(words)) = slots.get(walk.pos)
-            && words.iter().any(|w| w == word)
-        {
-            walk.literal_consumed = true;
-            walk.pos += 1;
-            continue;
-        }
-        // A value word of the grammar occupies one value slot; the first one is also
-        // remembered when the page's second value depends on it.
+        // The word keeps the forms it fits: one whose position here is that very word
+        // (`allow`, `list`), or one that takes a value there.
+        walk.live
+            .retain(|&i| match operand_at(&forms[i], walk.pos) {
+                Some(Operand::Literal(w)) => w == word,
+                Some(Operand::Value { .. }) => true,
+                None => false,
+            });
         if walk.first_positional.is_none() {
             walk.first_positional = Some(word.to_string());
         }
@@ -947,40 +922,47 @@ fn walk_operands(slots: &[Operand], path: &[&str], before: &[String]) -> Walk {
 /// word of its operand grammar, or of the command it launches. Until then the line is still
 /// the command's, whatever flags it carries.
 fn operand_typed(path: &[&str], before: &[String]) -> bool {
-    walk_operands(&operand_slots(path), path, before).operand_typed
+    walk_operands(&operand_forms(path), path, before).operand_typed
 }
 
-/// The value kind of the word under the cursor: the flag value the typed flags want, or
-/// the operand slot the positional arguments have reached. `None` means the position
-/// takes no completable value — the cursor sits on a flag or a command name.
+/// The value kind of the word under the cursor: the flag value the typed flags want, or what
+/// the forms the typed operands still fit take at the position they have reached. `None`
+/// means the position takes no completable value — the cursor sits on a flag or a command
+/// name, or past everything the page's grammar takes.
 fn cursor_value_kind(path: &[&str], before: &[String]) -> Option<ValueKind> {
-    let slots = operand_slots(path);
+    let forms = operand_forms(path);
     let Walk {
+        live,
         pos,
         pending_flag,
         first_positional,
-        literal_consumed,
         app,
         ..
-    } = walk_operands(&slots, path, before);
+    } = walk_operands(&forms, path, before);
     if let Some(kind) = pending_flag {
         return Some(kind);
     }
-    // A literal slot the cursor has reached is the vocabulary of that position: the
-    // `allow`/`deny` of `proc pending`, the `list`/`rm` of `projects`. Reading past it would
-    // answer with the value *behind* it — a parked id where only a verb is accepted.
-    if let Some(Operand::Literal(words)) = slots.get(pos) {
-        return Some(ValueKind::Literal(words.clone()));
-    }
-    let Some(Operand::Value(name)) = slots.get(pos) else {
-        // The page's whole remaining grammar is literal — the completion page
-        // (bash|zsh), the upgrade targets: the word under the cursor is one of them.
-        // A literal the user just typed filled the page; nothing is left to offer.
-        if literal_consumed {
-            return None;
+    let mut words: Vec<String> = Vec::new();
+    let mut value: Option<&str> = None;
+    for &i in &live {
+        match operand_at(&forms[i], pos) {
+            Some(Operand::Literal(word)) if !words.contains(word) => words.push(word.clone()),
+            Some(Operand::Value { name, .. }) => {
+                value.get_or_insert(name);
+            }
+            _ => {}
         }
-        return all_literal_words(&slots).map(ValueKind::Literal);
-    };
+    }
+    // The words the forms lead with are the vocabulary of their position: the `allow`/`deny`
+    // of `proc pending`, the `list`/`rm` of `projects`, `bash`/`zsh`. Reading past them would
+    // answer with the value *behind* them — a parked id where only a verb is accepted.
+    if !words.is_empty() {
+        return Some(ValueKind::Literal(words));
+    }
+    // Where two forms reach a position with a value each — `proc pending` writes `<id>` and
+    // `<pid>.*` after `allow` — they name one vocabulary, which
+    // `the_forms_that_meet_at_a_position_agree_on_what_it_takes` holds across the table.
+    let name = value?;
     let kind = kind_of_metavar(name, path);
     // A removal reads the rules of the scope it would edit, which the line's `--app` names.
     if let Some(ValueKind::Rules { which, .. }) = kind {
@@ -1684,6 +1666,89 @@ mod tests {
     }
 
     #[test]
+    fn what_follows_a_verb_is_what_that_verb_takes() {
+        // A verb's row says what comes after it, and only after it: `projects list` takes nothing,
+        // `projects rm` takes ids, `proc pending allow` takes one id. Read as a single sequence,
+        // the rows offered the trees behind `list`, which refuses every operand, and a second
+        // parked id behind `allow`, which takes exactly one.
+        assert_eq!(cursor_value_kind(&["projects"], &words(&["list"])), None);
+        assert_eq!(
+            cursor_value_kind(&["proc", "pending"], &words(&["allow", "1.2"])),
+            None
+        );
+        assert_eq!(
+            cursor_value_kind(&["proc", "pending"], &words(&["deny", "1.*"])),
+            None
+        );
+        // A word no row leads with fits none of them, so nothing stands behind it either.
+        assert_eq!(cursor_value_kind(&["projects"], &words(&["lst"])), None);
+        // A repeated value fills every position after its own: `session stop <id>...` and
+        // `projects rm <id>...` take any number of ids, and the second is completed like the first.
+        assert_eq!(
+            cursor_value_kind(&["session", "stop"], &words(&["1234"])),
+            Some(ValueKind::Sessions)
+        );
+        assert_eq!(
+            cursor_value_kind(&["projects"], &words(&["rm", "a", "b"])),
+            Some(ValueKind::Projects)
+        );
+        // The table writes the repeat both ways, `...` and `…`.
+        assert_eq!(
+            cursor_value_kind(&["bundle"], &words(&["a"])),
+            Some(ValueKind::Bundles)
+        );
+        // A value written once is filled once.
+        assert_eq!(
+            cursor_value_kind(&["session", "attach"], &words(&["1234"])),
+            None
+        );
+    }
+
+    #[test]
+    fn the_forms_that_meet_at_a_position_agree_on_what_it_takes() {
+        // `cursor_value_kind` answers a position from every form the line still fits and reads
+        // the first value it finds there. That holds only while two forms that reach a position
+        // together never ask for two vocabularies there, nor one a word and the other a value.
+        // A page whose rows break it lands here.
+        let mut clashes: Vec<String> = Vec::new();
+        for path in help::all_paths() {
+            let at =
+                |k: usize, what: String| format!("sbx {}: {what} at position {k}", path.join(" "));
+            let forms = operand_forms(path);
+            for a in &forms {
+                for b in &forms {
+                    for k in 0..a.len().max(b.len()) {
+                        match (operand_at(a, k), operand_at(b, k)) {
+                            // Two different words part the forms: nothing further meets.
+                            (Some(Operand::Literal(x)), Some(Operand::Literal(y))) if x != y => {
+                                break;
+                            }
+                            (
+                                Some(Operand::Value { name: x, .. }),
+                                Some(Operand::Value { name: y, .. }),
+                            ) if kind_of_metavar(x, path) != kind_of_metavar(y, path) => {
+                                clashes.push(at(k, format!("<{x}> and <{y}>")));
+                            }
+                            (Some(Operand::Literal(word)), Some(Operand::Value { name, .. })) => {
+                                clashes.push(at(k, format!("`{word}` and <{name}>")));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        clashes.sort();
+        clashes.dedup();
+        assert!(
+            clashes.is_empty(),
+            "these positions are asked for two things at once, and the completion offers only \
+             one of them:\n{}",
+            clashes.join("\n")
+        );
+    }
+
+    #[test]
     fn flag_values_complete_the_cells_of_the_value() {
         // `--net <posture>`: the cells of the posture, with the list shorthands.
         let cells = names_at(&["run", "--net"], "");
@@ -1940,6 +2005,10 @@ mod tests {
         assert!(names.contains(&"hub".to_string()), "stores: {names:?}");
 
         // ... and the store's catalogue plugins answer after its name, with versions.
+        assert_eq!(
+            cursor_value_kind(&["plugins", "store", "install"], &words(&["hub"])),
+            Some(ValueKind::Catalogue("hub".to_string()))
+        );
         let cat: Vec<String> = registry_values(&ValueKind::Catalogue("hub".to_string()))
             .into_iter()
             .map(|(n, d)| format!("{n}={d}"))
@@ -2279,8 +2348,10 @@ mod tests {
         let mut holes: Vec<String> = Vec::new();
         for path in help::all_paths() {
             let named = |what: &str| format!("sbx {}: {what}", path.join(" "));
-            for slot in operand_slots(path) {
-                let Operand::Value(name) = slot else { continue };
+            for operand in operand_forms(path).into_iter().flatten() {
+                let Operand::Value { name, .. } = operand else {
+                    continue;
+                };
                 if kind_of_metavar(&name, path).is_some() || NOT_ENUMERABLE.contains(&&*name) {
                     continue;
                 }
