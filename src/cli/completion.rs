@@ -889,6 +889,7 @@ fn walk_operands(forms: &[Vec<Operand>], path: &[&str], before: &[String]) -> Wa
         operand_typed: false,
     };
     let mut pending_word: Option<PendingWord> = None;
+    let mut options_ended = false;
     for word in before {
         let word = word.as_str();
         // Whatever the last flag's value was, this word consumed it.
@@ -901,11 +902,14 @@ fn walk_operands(forms: &[Vec<Operand>], path: &[&str], before: &[String]) -> Wa
         }
         // A bare `--` ends the flags without standing on an operand slot. Counted as a
         // positional it shifted every later word one place along the grammar, so the page's
-        // own operand was offered one position too far in — or not at all.
-        if word == "--" {
+        // own operand was offered one position too far in — or not at all. Every word after it
+        // is an operand, as the parsers read it, however it is spelled: `sbx net unallow --
+        // --app` removes the rule `--app`, and a second `--` is a word like any other.
+        if word == "--" && !options_ended {
+            options_ended = true;
             continue;
         }
-        if word.starts_with('-') {
+        if word.starts_with('-') && !options_ended {
             let (name, inline) = match word.split_once('=') {
                 Some((flag, value)) => (flag, Some(value)),
                 None => (word, None),
@@ -1637,6 +1641,28 @@ mod tests {
             .collect();
         launching.sort();
         assert_eq!(launching, ["app run", "run", "session attach"]);
+    }
+
+    #[test]
+    fn past_a_double_dash_a_word_that_looks_like_a_flag_is_an_operand() {
+        // `--` ends the options, so the parser reads every word after it as an operand however it
+        // is spelled: `sbx net unallow -- --app` removes the rule `--app`. Read as the flag it
+        // looks like, `--app` took the word under the cursor for its value and offered the apps,
+        // behind a rule that takes nothing more.
+        assert_eq!(
+            cursor_value_kind(&["net", "unallow"], &words(&["--", "--app"])),
+            None
+        );
+        // A second `--` is an operand too, not a second end of the options.
+        assert_eq!(
+            cursor_value_kind(&["net", "unallow"], &words(&["--", "--"])),
+            None
+        );
+        // The first one still stands on no position: the rule it protects is the page's first.
+        assert!(matches!(
+            cursor_value_kind(&["net", "unallow"], &words(&["--"])),
+            Some(ValueKind::Rules { .. })
+        ));
     }
 
     #[test]
