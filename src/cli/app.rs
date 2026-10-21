@@ -1453,6 +1453,24 @@ fn app_rm_purge_one(
     }
 }
 
+/// The names of the imported profiles a listing of their directory holds: the stem of every
+/// `*.toml` in it. An entry the listing could not read is an error, as the directory itself is: a
+/// list without it would say an imported app is not there.
+fn profile_stems(
+    entries: impl IntoIterator<Item = std::io::Result<std::path::PathBuf>>,
+) -> std::io::Result<std::collections::BTreeSet<String>> {
+    let mut stems = std::collections::BTreeSet::new();
+    for path in entries {
+        let path = path?;
+        if path.extension().and_then(|x| x.to_str()) == Some("toml")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            stems.insert(stem.to_string());
+        }
+    }
+    Ok(stems)
+}
+
 /// `sbx app list`: what is on disk to manage, one row per app — whether it has an imported
 /// **profile** (`import`/`rm` artifacts) and whether it has an **installed home** (its mise tools +
 /// login state, with disk size, which `--purge` removes). The two are distinct: an app can have a
@@ -1474,18 +1492,13 @@ fn app_list(json: bool, shared: bool) -> ExitCode {
     let profiles_dir = config::profiles_dir();
     let mut profiles: BTreeSet<String> = BTreeSet::new();
     if let Some(dir) = &profiles_dir {
-        match std::fs::read_dir(dir) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|x| x.to_str()) == Some("toml")
-                        && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-                    {
-                        profiles.insert(stem.to_string());
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        let listed = match std::fs::read_dir(dir) {
+            Ok(entries) => profile_stems(entries.map(|entry| entry.map(|e| e.path()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+            Err(e) => Err(e),
+        };
+        match listed {
+            Ok(stems) => profiles = stems,
             Err(e) => {
                 diag::error(&format!("sbx: cannot read {}: {e}", dir.display()));
                 return ExitCode::FAILURE;
@@ -3222,6 +3235,30 @@ mod tests {
         assert!(
             npm.join("f").exists(),
             "the prune emptied the home of an app whose session it found once it held the locks"
+        );
+    }
+
+    /// The profiles listed are the stems of the `*.toml` files, and an entry the listing could not
+    /// read fails it rather than leaving an imported app out of the list.
+    #[test]
+    fn a_profile_listing_with_an_unreadable_entry_is_an_error_not_a_shorter_list() {
+        use std::path::PathBuf;
+        let read = profile_stems([
+            Ok(PathBuf::from("/p/a.toml")),
+            Ok(PathBuf::from("/p/notes.txt")),
+            Ok(PathBuf::from("/p/b.toml")),
+        ])
+        .expect("every entry was read");
+        assert_eq!(read.into_iter().collect::<Vec<_>>(), ["a", "b"]);
+
+        let unread = profile_stems([
+            Ok(PathBuf::from("/p/a.toml")),
+            Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            Ok(PathBuf::from("/p/b.toml")),
+        ]);
+        assert!(
+            unread.is_err(),
+            "an unreadable entry must fail the listing: {unread:?}"
         );
     }
 
