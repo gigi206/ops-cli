@@ -516,42 +516,91 @@ fn registry_values(kind: &ValueKind) -> Vec<(String, String)> {
         }
         PendingExecs => {
             // A parked request's id is `<session-pid>.<n>`, held by each live session's
-            // own control plane; ask it as `sbx proc pending` does — but on a glance
-            // budget, since this runs on a keystroke and every live session is asked. A
-            // session slow to answer drops out of the menu rather than stalling the prompt. Asked
-            // through `live` for the same reason as `Sessions` above: a keystroke reads, never
-            // reclaims.
+            // own control plane; ask it as `sbx proc pending` does, but every session at once on
+            // one glance budget (see [`asked_at_once`]). Asked through `live` for the same reason
+            // as `Sessions` above: a keystroke reads, never reclaims.
             if let Ok(sessions) = session::Registry::at(layout.data_dir()).live() {
-                for s in sessions {
-                    let socket = proc_control::proc_control_socket(layout.data_dir(), s.pid);
-                    if let Ok(parked) =
-                        proc_control::read_pending_within(&socket, proc_control::GLANCE_TIMEOUT)
-                    {
-                        for p in parked {
-                            out.push((format!("{}.{}", s.pid, p.id), p.path));
-                        }
-                    }
-                }
+                let asks = sessions
+                    .into_iter()
+                    .map(|s| {
+                        let pid = s.pid;
+                        let socket = proc_control::proc_control_socket(layout.data_dir(), pid);
+                        Box::new(move || {
+                            proc_control::read_pending_within(&socket, proc_control::GLANCE_TIMEOUT)
+                                .map(|parked| {
+                                    parked
+                                        .into_iter()
+                                        .map(|p| (format!("{pid}.{}", p.id), p.path))
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        }) as Ask<(String, String)>
+                    })
+                    .collect();
+                out.extend(asked_at_once(asks, proc_control::GLANCE_TIMEOUT));
             }
         }
         PendingRequests => {
             // The egress plane's queue, found as `sbx net pending` finds it: every control socket
-            // in the data directory, a session with no registry record included, each asked on the
-            // same glance budget as the execs above.
-            let budget = proc_control::GLANCE_TIMEOUT;
-            for s in crate::sandbox::control::list_all_within(layout.data_dir(), budget).read {
-                for row in s.rows {
-                    out.push((
-                        crate::sandbox::control::format_id(s.pid, row.seq, s.incarnation),
-                        format!("{}:{}{}", row.host, row.port, row.path),
-                    ));
-                }
-            }
+            // in the data directory, a session with no registry record included, asked at once on
+            // the same glance budget as the execs above.
+            use crate::sandbox::control;
+            let asks = control::session_pids(layout.data_dir())
+                .into_iter()
+                .map(|pid| {
+                    let socket = control::control_socket(layout.data_dir(), pid);
+                    Box::new(move || {
+                        control::session_pending(pid, &socket, proc_control::GLANCE_TIMEOUT)
+                            .map(|s| {
+                                s.rows
+                                    .into_iter()
+                                    .map(|row| {
+                                        (
+                                            control::format_id(s.pid, row.seq, s.incarnation),
+                                            format!("{}:{}{}", row.host, row.port, row.path),
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    }) as Ask<(String, String)>
+                })
+                .collect();
+            out.extend(asked_at_once(asks, proc_control::GLANCE_TIMEOUT));
         }
         // These name no registry — `value_candidates` answers them without coming here.
         // Answering nothing rather than panicking is what keeps the promise above: a panic
         // would write to stderr, in the middle of the user's prompt.
         Files | Literal(_) | Rules { .. } | Bundles | Groups => {}
+    }
+    out
+}
+
+/// One question to one session, asked on a thread of its own by [`asked_at_once`].
+type Ask<T> = Box<dyn FnOnce() -> Vec<T> + Send>;
+
+/// Ask every one of `asks` at once, each on a thread of its own, and keep what answers within
+/// `budget` — one budget for them all, ended early once every question has answered. Asked one
+/// after the other, each with that budget, a Tab waited for the sum of every session's, and a
+/// session asked after slow ones answered too late to count. A thread that cannot be started
+/// asks nothing, and one still waiting when the budget runs out is left behind: each question
+/// carries its own timeout, and the oracle exits as soon as it has printed.
+fn asked_at_once<T: Send + 'static>(asks: Vec<Ask<T>>, budget: std::time::Duration) -> Vec<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for ask in asks {
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new().spawn(move || {
+            let _ = tx.send(ask());
+        });
+    }
+    // Only the questions' own senders are left, so the channel closes when the last one answers.
+    drop(tx);
+    let deadline = std::time::Instant::now() + budget;
+    let mut out = Vec::new();
+    while let Ok(answer) =
+        rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+    {
+        out.extend(answer);
     }
     out
 }
@@ -2102,6 +2151,165 @@ mod tests {
                 "the parked network request is not offered: {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_pending_page_waits_one_budget_however_many_sessions_say_nothing() {
+        // Every session is asked for its parked requests on a keystroke, with a short budget to
+        // answer. Asked one after the other, twenty that accept the connection and never answer
+        // held the prompt for twenty budgets, and the session asked after them answered too late
+        // to count. Asked at once, the Tab waits one budget and keeps the session that answers.
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let _data_dir = EnvVar::set("SBX_DATA_DIR", data.path());
+        let control = crate::sandbox::control::control_dir(data.path());
+        std::fs::create_dir_all(&control).expect("create the control directory");
+        // Bound and never accepted: a connect succeeds, and the answer never comes.
+        let _silent: Vec<UnixListener> = (101..121)
+            .map(|pid| {
+                UnixListener::bind(crate::sandbox::control::control_socket(data.path(), pid))
+                    .expect("bind a silent control socket")
+            })
+            .collect();
+        // The pids are asked in order, so this one comes last.
+        let socket = crate::sandbox::control::control_socket(data.path(), 999);
+        let listener = UnixListener::bind(&socket).expect("bind the answering control socket");
+        let session = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = stream.expect("accept a control connection");
+                let mut cmd = String::new();
+                BufReader::new(&stream)
+                    .read_line(&mut cmd)
+                    .expect("read the command");
+                if cmd.trim_end() != "LIST" {
+                    return;
+                }
+                let _ = (&stream)
+                    .write_all(b"pending seq=4 inc=8 port=443 waiting=1 host=a.test path=/\nok\n");
+            }
+        });
+
+        let offered = crate::testutil::returns_within(
+            std::time::Duration::from_millis(1500),
+            "a Tab over twenty sessions that say nothing",
+            || registry_values(&ValueKind::PendingRequests),
+        );
+        let _ = (&UnixStream::connect(&socket).expect("poke the stand-in")).write_all(b"QUIT\n");
+        session.join().expect("the answering session thread");
+        let names: Vec<&str> = offered.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["999.4@8"],
+            "only the session that answered is offered"
+        );
+    }
+
+    #[test]
+    fn a_proc_pending_page_waits_one_budget_however_many_sessions_say_nothing() {
+        // The `[proc]` side of the test above, reached through the session registry: twenty live
+        // sessions whose exec control sockets accept the connection and never answer.
+        struct Reaped(Vec<std::process::Child>);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                for child in &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let _data_dir = EnvVar::set("SBX_DATA_DIR", data.path());
+        let registry = crate::session::Registry::at(data.path());
+        let mut stand_ins = Reaped(Vec::new());
+        let mut silent = Vec::new();
+        for _ in 0..20 {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn a stand-in session");
+            let pid = child.id();
+            stand_ins.0.push(child);
+            registry
+                .register(&crate::session::Session {
+                    project: PathBuf::from("/tmp"),
+                    pid,
+                    start_ticks: crate::session::read_start_ticks(pid)
+                        .expect("the stand-in's start time"),
+                    kind: crate::session::Kind::Shell,
+                    runtime: crate::session::SessionRuntime::Project,
+                    detached: false,
+                })
+                .expect("register the stand-in session");
+            let socket = proc_control::proc_control_socket(data.path(), pid);
+            std::fs::create_dir_all(socket.parent().expect("a parent"))
+                .expect("create the exec control directory");
+            silent.push(
+                std::os::unix::net::UnixListener::bind(&socket)
+                    .expect("bind a silent exec control socket"),
+            );
+        }
+        let offered = crate::testutil::returns_within(
+            std::time::Duration::from_millis(1500),
+            "a Tab over twenty live sessions that say nothing",
+            || registry_values(&ValueKind::PendingExecs),
+        );
+        assert!(offered.is_empty(), "{offered:?}");
+    }
+
+    #[test]
+    fn asking_at_once_waits_one_budget_and_no_longer_than_the_answers_take() {
+        // Fifty questions that never answer, then one that answers at once. Asked in turn, the
+        // first held the Tab for good; asked in turn with a budget each, for fifty budgets; with
+        // one budget spent in turn, the last was never asked. Asked at once, the Tab waits one
+        // budget and keeps the answer.
+        let mut held = Vec::new();
+        let mut asks: Vec<Ask<&'static str>> = Vec::new();
+        for _ in 0..50 {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            held.push(tx);
+            asks.push(Box::new(move || {
+                let _ = rx.recv();
+                vec!["silent"]
+            }));
+        }
+        asks.push(Box::new(|| vec!["answered"]));
+        let got = crate::testutil::returns_within(
+            std::time::Duration::from_secs(1),
+            "fifty questions that never answer",
+            move || asked_at_once(asks, std::time::Duration::from_millis(100)),
+        );
+        drop(held);
+        assert_eq!(got, ["answered"]);
+        // The budget runs from the asking, not from the last answer: answers that keep arriving
+        // inside it of each other do not stretch it.
+        let asks: Vec<Ask<u64>> = (1..=40u64)
+            .map(|n| {
+                Box::new(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * n));
+                    vec![n]
+                }) as Ask<u64>
+            })
+            .collect();
+        let kept = crate::testutil::returns_within(
+            std::time::Duration::from_secs(1),
+            "forty answers fifty milliseconds apart",
+            move || asked_at_once(asks, std::time::Duration::from_millis(100)),
+        );
+        assert!(kept.len() <= 5, "the budget stretched: {kept:?}");
+        // And once every question has answered, nothing waits for the rest of the budget.
+        let asks: Vec<Ask<u32>> = (0..5u32)
+            .map(|n| Box::new(move || vec![n]) as Ask<u32>)
+            .collect();
+        let mut got = crate::testutil::returns_within(
+            std::time::Duration::from_secs(2),
+            "five questions that answer at once",
+            move || asked_at_once(asks, std::time::Duration::from_secs(10)),
+        );
+        got.sort_unstable();
+        assert_eq!(got, [0, 1, 2, 3, 4]);
     }
 
     #[test]

@@ -121,17 +121,27 @@ pub(crate) fn list_all(data_dir: &Path) -> Swept<SessionPending> {
     list_all_within(data_dir, Duration::from_secs(10))
 }
 
-/// [`list_all`] with each session given `timeout` to answer, for a caller that must not wait on a
-/// slow one: the completion oracle, which runs on a keystroke. A session that does not answer in
-/// time is in [`Swept::unread`], which that caller leaves aside.
+/// [`list_all`] with each session given `timeout` to answer, for a caller that must not wait as
+/// long on a slow one. A session that does not answer in time is in [`Swept::unread`].
 pub(crate) fn list_all_within(data_dir: &Path, timeout: Duration) -> Swept<SessionPending> {
     sweep(data_dir, |pid, socket| {
-        let (rows, incarnation) = query(socket, timeout)?;
-        Ok(SessionPending {
-            pid,
-            incarnation,
-            rows,
-        })
+        session_pending(pid, socket, timeout)
+    })
+}
+
+/// One session's pending requests, asked of its control `socket` with `timeout` to answer: the
+/// step [`list_all_within`] takes for each session in turn, for a caller that asks them all at
+/// once (the completion oracle, which runs on a keystroke).
+pub(crate) fn session_pending(
+    pid: u32,
+    socket: &Path,
+    timeout: Duration,
+) -> io::Result<SessionPending> {
+    let (rows, incarnation) = query(socket, timeout)?;
+    Ok(SessionPending {
+        pid,
+        incarnation,
+        rows,
     })
 }
 

@@ -158,8 +158,10 @@ filesystem; a command you typed is.
 A command path answers from the help table alone and reads nothing. A value position reads
 the registry behind it, and does so fresh rather than from a cache, so a session you just
 started completes without a stale list to refresh. Where a registry is another process
-rather than a file, the oracle gives it a short budget and drops it from the menu if it
-does not answer inside it: a menu one item short beats a prompt that stalls.
+rather than a file, as each session's queue of parked requests is, the oracle asks every
+such process at once under one short budget they share, and drops from the menu any that
+does not answer inside it: a menu one item short beats a prompt that stalls, and twenty
+sessions cost a Tab no more than one.
 
 ## Adding a shell
 
