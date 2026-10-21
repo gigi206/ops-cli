@@ -752,12 +752,11 @@ pub(crate) fn unverifiable_verdict(store_dir: &Path, config_path: &Path) -> Trus
 
 /// Current trust state of `config_path` under `store_dir`. Reads through the same
 /// safety gate the loader uses, so a file the loader would reject (world-writable,
-/// foreign-owned) or cannot read is reported `Untrusted`, never `Trusted` — the
-/// displayed verdict matches what a launch would actually act on. A sibling mise
-/// file, or a sops file the config names, that is present but unsafe cannot yield
-/// `Trusted` either, since the trusted content folds in that file: it is reported
-/// [`unverifiable_verdict`]'s answer, `Changed` for an approved project and `Untrusted`
-/// for one never approved, as the loader reads it.
+/// foreign-owned) or cannot read is never reported `Trusted`. Nor is a sibling mise
+/// file, or a sops file the config names, that is present but unsafe, since the trusted
+/// content folds in that file. Either way the answer is [`unverifiable_verdict`]'s:
+/// `Changed` for an approved project, the verdict a launch stops on as the loader does
+/// for a config it cannot read, and `Untrusted` for one never approved.
 pub(crate) fn state(store_dir: &Path, config_path: &Path) -> TrustState {
     state_with_inputs(store_dir, config_path).0
 }
@@ -808,7 +807,13 @@ pub(crate) fn admission(
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return (TrustState::Untrusted, Vec::new(), ConfigRead::Absent);
         }
-        Err(_) => return (TrustState::Untrusted, Vec::new(), ConfigRead::Unreadable),
+        Err(_) => {
+            return (
+                unverifiable_verdict(store_dir, config_path),
+                Vec::new(),
+                ConfigRead::Unreadable,
+            );
+        }
     };
     let inputs = match trust_inputs_for(config_path, &sbx_bytes) {
         Ok(m) => m,
@@ -2138,6 +2143,28 @@ mod tests {
         assert_eq!(state(store.path(), &cfg), TrustState::Trusted);
         std::fs::set_permissions(&sops, world_writable).unwrap();
         assert_eq!(state(store.path(), &cfg), TrustState::Changed);
+    }
+
+    /// The same holds for the config itself: an approved `.sbx.toml` the safety gate now refuses
+    /// reads `Changed`, as a launch treats it (the loader refuses a config it cannot read), and not
+    /// `Untrusted`, which reads as a project that was never approved.
+    #[test]
+    fn an_approved_config_that_turns_unsafe_reads_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = TmpDir::new();
+        let proj = TmpDir::new();
+        let cfg = proj.join(".sbx.toml");
+        std::fs::write(&cfg, b"network = \"none\"\n").unwrap();
+        trust(store.path(), &cfg).unwrap();
+        assert_eq!(state(store.path(), &cfg), TrustState::Trusted);
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(state(store.path(), &cfg), TrustState::Changed);
+        let (verdict, inputs, read) = admission(store.path(), &cfg);
+        assert_eq!(
+            (verdict, inputs, read),
+            (TrustState::Changed, Vec::new(), ConfigRead::Unreadable),
+            "the write gate reads the same verdict, and still holds nothing it could bless"
+        );
     }
 
     #[test]

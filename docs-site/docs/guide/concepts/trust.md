@@ -28,9 +28,9 @@ of its own beside the global config, where the user owns it, and referenced (`@g
 `use`) from anywhere.
 
 ² A project you approved and that changed since, its `.sbx.toml` or a mise or sops file
-its trust covers, is not treated as one never approved. A covered file the
-[safety gate](#the-safety-gate) now refuses (made world-writable, turned into a link,
-grown past the size ceiling) counts as such a change: it cannot be hashed, so nothing
+its trust covers, is not treated as one never approved. The `.sbx.toml` or a covered file
+the [safety gate](#the-safety-gate) now refuses (made world-writable, turned into a link,
+grown past the size ceiling) counts as such a change, and `sbx trust` reports it changed: it cannot be hashed, so nothing
 confirms it is what you approved. Its security fields are held
 back, and what would run in their place is the layers below, which are not what it
 wrote: it may be what closed its paths or narrowed its network. A launch stops instead,
