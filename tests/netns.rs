@@ -148,27 +148,19 @@ fn a_program_on_path_is_one_this_process_may_execute() {
     );
 }
 
-/// The holder reads bwrap's `--info-fd` report to its end before it closes the pipe.
+/// A stand-in for bwrap, written at `dir/slow-bwrap`, that makes the race of the test below
+/// certain: it becomes `bwrap`, while a copy of it left behind writes bwrap's report to the holder
+/// in the pieces bwrap writes it, with a pause after the first namespace id. It `exec`s `bwrap`
+/// rather than starting it, so the process the report names is a child of the process the holder
+/// started, as the holder checks it is. The copy ignores `SIGPIPE` and records in `dir/unread` each
+/// piece it could not write, the pipe having no reader.
 ///
-/// bwrap writes the report in several writes: the child's pid, each namespace id, the closing
-/// brace. The pid is complete once the first namespace id follows it, and a holder that closed the
-/// pipe then left bwrap's next write facing no reader. bwrap runs with `SIGPIPE` at its default, so
-/// it died of the signal and the cage with it, before running anything — on a loaded host only,
-/// where the holder won that race. A stand-in for bwrap makes the race certain: it becomes the
-/// real one, while a copy of it left behind writes bwrap's report in the same pieces with a pause
-/// after the first namespace id. The stand-in `exec`s bwrap rather than starting it, so the process
-/// the report names is a child of the process the holder started, as the holder checks it is. The
-/// copy ignores `SIGPIPE` and records each piece it could not write, the pipe having no reader:
-/// that write is the one that killed bwrap, and a recorded piece is the failure.
-#[test]
-fn the_holder_waits_for_the_whole_bwrap_report() {
-    let Some(bwrap) = common::bwrap_on_path() else {
-        skip_incapable!("skipping the bwrap report race: no bwrap on PATH");
-        return;
-    };
-    let dir = TmpDir::new("netns-report");
-    let report = dir.join("report");
-    let unread = dir.join("unread");
+/// The copy holds the holder's output streams until it ends, so a test reading that output waits
+/// for it. A `bwrap` that never writes a whole report — one that does not start, or that fails
+/// before reporting — would keep it waiting for good, and the copy running long after the test, so
+/// it gives up once the stand-in has run `give_up` seconds, and says so on the holder's error
+/// stream.
+fn report_stand_in(dir: &TmpDir, bwrap: &std::path::Path, give_up: u32) -> std::path::PathBuf {
     let slow = dir.join("slow-bwrap");
     // Every path is a shell word (`common::sh`): the fixture root comes from the environment, and a
     // quote or a `$` in it would otherwise end a string early or run as code.
@@ -178,7 +170,13 @@ fn the_holder_waits_for_the_whole_bwrap_report() {
 info=$2; block=$4; shift 4
 (
 trap '' PIPE
-until grep -q '}}' {report} 2>/dev/null; do sleep 0.01; done
+until grep -q '}}' {report} 2>/dev/null; do
+    if (( SECONDS >= {give_up} )); then
+        echo "slow-bwrap: no whole report from bwrap within {give_up} s" >&2
+        exit 98
+    fi
+    sleep 0.01
+done
 whole=$(cat {report})
 pid_part=${{whole%%,*}}
 rest=${{whole#"$pid_part"}}
@@ -190,9 +188,9 @@ printf '%s\n' "${{rest#"$first_ns"}}" >&"$info" || echo rest >>{unread}
 ) &
 exec {bwrap} --info-fd 9 --block-fd "$block" "$@" 9>{report} {{info}}>&-
 "#,
-        bwrap = common::sh(&bwrap),
-        report = common::sh(&report),
-        unread = common::sh(&unread),
+        bwrap = common::sh(bwrap),
+        report = common::sh(&dir.join("report")),
+        unread = common::sh(&dir.join("unread")),
     );
     std::fs::write(&slow, script).expect("write the stand-in");
     {
@@ -200,9 +198,31 @@ exec {bwrap} --info-fd 9 --block-fd "$block" "$@" 9>{report} {{info}}>&-
         std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755))
             .expect("make the stand-in executable");
     }
+    slow
+}
+
+/// The holder reads bwrap's `--info-fd` report to its end before it closes the pipe.
+///
+/// bwrap writes the report in several writes: the child's pid, each namespace id, the closing
+/// brace. The pid is complete once the first namespace id follows it, and a holder that closed the
+/// pipe then left bwrap's next write facing no reader. bwrap runs with `SIGPIPE` at its default, so
+/// it died of the signal and the cage with it, before running anything — on a loaded host only,
+/// where the holder won that race. The stand-in [`report_stand_in`] makes the race certain, and a
+/// piece its copy records as unread is the write that killed bwrap: the failure.
+#[test]
+fn the_holder_waits_for_the_whole_bwrap_report() {
+    let Some(bwrap) = common::bwrap_on_path() else {
+        skip_incapable!("skipping the bwrap report race: no bwrap on PATH");
+        return;
+    };
+    let dir = TmpDir::new("netns-report");
+    let unread = dir.join("unread");
+    // bwrap reports within moments of starting; the bound only keeps a bwrap that never does from
+    // holding the test.
+    let slow = report_stand_in(&dir, &bwrap, 30);
     let cmd = ["/bin/sh", "-c", "echo ran"].map(OsString::from);
     let mut argv = holder_argv(&bwrap, &cmd);
-    argv[0] = slow.clone().into();
+    argv[0] = slow.into();
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(["__netns-holder", "--"])
         .args(argv)
@@ -230,6 +250,43 @@ exec {bwrap} --info-fd 9 --block-fd "$block" "$@" 9>{report} {{info}}>&-
         String::from_utf8_lossy(&out.stdout).trim(),
         "ran",
         "{stderr}"
+    );
+}
+
+/// The stand-in gives up on a `bwrap` that never reports, and the holder's output then ends: such
+/// a `bwrap` fails the race test rather than holding it, and leaves no copy of the stand-in
+/// running. The `bwrap` here is a file this process may not execute, so the stand-in's `exec`
+/// fails at once and the holder ends with it; only the copy is left to wait.
+#[test]
+fn the_report_stand_in_gives_up_on_a_bwrap_that_never_starts() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TmpDir::new("netns-giveup");
+    let unrunnable = dir.join("bwrap");
+    std::fs::write(&unrunnable, "#!/bin/sh\n").expect("write the bwrap");
+    std::fs::set_permissions(&unrunnable, std::fs::Permissions::from_mode(0o644))
+        .expect("make the bwrap unrunnable");
+    let mut argv = holder_argv(&unrunnable, &[OsString::from("/bin/true")]);
+    argv[0] = report_stand_in(&dir, &unrunnable, 1).into();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
+    cmd.args(["__netns-holder", "--"]).args(argv);
+    // The race test reads the holder's output with `output`, which waits for every holder of the
+    // two streams, the copy among them: that wait is the one bounded here.
+    let (sent, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sent.send(cmd.output());
+    });
+    let out = received
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the stand-in's copy still holds the holder's output: it waits for a report")
+        .expect("spawn sbx __netns-holder");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a bwrap that never started is a failure: {stderr}"
+    );
+    assert!(
+        stderr.contains("slow-bwrap: no whole report from bwrap within 1 s"),
+        "the stand-in says why it gave up: {stderr}"
     );
 }
 
