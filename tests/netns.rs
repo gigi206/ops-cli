@@ -51,6 +51,18 @@ fn bwrap_runs(bwrap: &std::path::Path, cmd: &[OsString]) -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
+/// The holder's output for `cmd`, a run of `__netns-holder`, read within a bound.
+///
+/// A holder that lets bwrap die before bwrap has signalled its child — of `SIGPIPE`, on a report
+/// nobody reads — leaves that child waiting on bwrap for good, holding the two streams it
+/// inherited, and `output` would wait for it until the job timed out. Here the wait for the streams
+/// ends a few seconds after the holder does ([`common::procs::output_within`]), so the run reads as
+/// one that never reached its command, and a holder still running past the bound fails the test.
+fn holder_output(cmd: &mut Command) -> std::process::Output {
+    common::procs::output_within(cmd, std::time::Duration::from_secs(60))
+        .unwrap_or_else(|| panic!("the holder did not end within 60 s: {cmd:?}"))
+}
+
 /// Run the holder with a shell checker that dumps the two per-netns proc files, returning
 /// `(dev, route)` — the contents of `/proc/net/dev` and `/proc/net/route` as seen *inside* the
 /// configured namespace. `None` means skip, and every one is recorded as one: no bwrap on PATH, a
@@ -69,14 +81,14 @@ fn holder_dump() -> Option<(String, String)> {
         "echo ---DEV---; cat /proc/net/dev; echo ---ROUTE---; cat /proc/net/route",
     ]
     .map(OsString::from);
-    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
-        // The separator the production wrapper always emits (`holder_wrap`), tap or no tap: it is
-        // what makes the command unambiguous to parse. Without it the holder exits on a usage
-        // error, which fails this helper.
-        .args(["__netns-holder", "--"])
-        .args(holder_argv(&bwrap, &cmd))
-        .output()
-        .expect("spawn sbx __netns-holder");
+    let out = holder_output(
+        Command::new(env!("CARGO_BIN_EXE_sbx"))
+            // The separator the production wrapper always emits (`holder_wrap`), tap or no tap: it
+            // is what makes the command unambiguous to parse. Without it the holder exits on a
+            // usage error, which fails this helper.
+            .args(["__netns-holder", "--"])
+            .args(holder_argv(&bwrap, &cmd)),
+    );
 
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -492,28 +504,28 @@ for fd in os.listdir("/proc/self/fd"):
         pass
 print("report fd", "held" if held else "closed")
 "#;
-    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
-        .args(["__netns-holder", "--tap"])
-        .arg(&egress)
-        .arg("--bwrap")
-        .arg(&bwrap)
-        .arg("--nft")
-        .arg(&nft)
-        .arg("--report-fd")
-        .arg(tap_fd.to_string())
-        .arg("--")
-        .args(holder_argv(
-            &bwrap,
-            &[
-                python.into(),
-                "-c".into(),
-                query.into(),
-                reported.clone().into(),
-                tap_socket.clone().into(),
-            ],
-        ))
-        .output()
-        .expect("spawn sbx __netns-holder");
+    let out = holder_output(
+        Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(["__netns-holder", "--tap"])
+            .arg(&egress)
+            .arg("--bwrap")
+            .arg(&bwrap)
+            .arg("--nft")
+            .arg(&nft)
+            .arg("--report-fd")
+            .arg(tap_fd.to_string())
+            .arg("--")
+            .args(holder_argv(
+                &bwrap,
+                &[
+                    python.into(),
+                    "-c".into(),
+                    query.into(),
+                    reported.clone().into(),
+                    tap_socket.clone().into(),
+                ],
+            )),
+    );
     drop(tap_end);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
