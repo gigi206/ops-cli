@@ -186,8 +186,11 @@ file, checks that the project is trusted over those very bytes, and hands `sops`
 private copy of them rather than the path. A file the trust does not cover, or one
 rewritten since, is refused before `sops` runs. So is one **removed** since: a named file
 that is absent is otherwise no source, and a chain goes on to its next one, so reading a
-removal as absence would let the cage choose which source answers. A named file that was
-already absent when you approved the project stays no source, and the chain goes on.
+removal as absence would let the cage choose which source answers. The same holds when the
+`.sbx.toml` that named it can no longer be read, or is gone too, in a project you approved: a
+file absent in the project is then refused, since what the config named cannot be checked. A
+named file that was already absent when you approved the project stays no source, and the
+chain goes on.
 
 A named sops file passes the same [safety gate](#the-safety-gate) as the config, size
 ceiling of 1 MiB included. Together, the sops files a config names in the project come

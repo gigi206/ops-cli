@@ -417,6 +417,11 @@ pub(crate) fn covered_sops_bytes(
 /// when the project was approved changes it by going. Every other absent file is no source, and a
 /// chain goes on to its next one: outside the project, not named, not approved, or absent when it
 /// was approved.
+///
+/// A `.sbx.toml` that cannot be read, or is gone, cannot say whether it names `file`. In a project
+/// that was approved that is a change in itself ([`unverifiable_verdict`]), and the absent file is
+/// refused rather than read as absent: the cage can write the project tree, so it could otherwise
+/// remove the config and the file together and choose which source answers.
 pub(crate) fn sops_removed_since_approval(
     store_dir: Option<&Path>,
     project_root: &Path,
@@ -428,31 +433,55 @@ pub(crate) fn sops_removed_since_approval(
     let (true, Some(store)) = (in_project(&root, &path), store_dir) else {
         return Ok(());
     };
-    let Ok(sbx_bytes) = crate::config::safety::read_safe_bytes(&config) else {
-        return Ok(());
-    };
-    let named = sops_files_named(&sbx_bytes)
-        .iter()
-        .any(|named| crate::sandbox::egress::sops_path(named, &root) == path);
-    if !named {
-        return Ok(());
-    }
-    let changed = match trust_inputs_for(&config, &sbx_bytes) {
-        Ok(inputs) => {
-            verdict_for_hash(store, &config, &content_hash(&sbx_bytes, &inputs))
-                == TrustState::Changed
+    // Whether the config itself is gone, which `sbx trust` cannot re-approve: the stale marker it
+    // leaves is lifted with `sbx untrust`.
+    let mut gone = false;
+    let changed = match crate::config::safety::read_safe_bytes(&config) {
+        Ok(sbx_bytes) => {
+            let named = sops_files_named(&sbx_bytes)
+                .iter()
+                .any(|named| crate::sandbox::egress::sops_path(named, &root) == path);
+            if !named {
+                return Ok(());
+            }
+            match trust_inputs_for(&config, &sbx_bytes) {
+                Ok(inputs) => {
+                    verdict_for_hash(store, &config, &content_hash(&sbx_bytes, &inputs))
+                        == TrustState::Changed
+                }
+                // A file its trust covers can no longer be read: its approval cannot be confirmed.
+                Err(_) => true,
+            }
         }
-        // A file its trust covers can no longer be read: its approval cannot be confirmed.
-        Err(_) => true,
+        Err(e) => {
+            gone = e.kind() == io::ErrorKind::NotFound;
+            unverifiable_verdict(store, &config) == TrustState::Changed
+        }
     };
     if changed {
+        let what = if gone {
+            format!(
+                "the project's trusted {} is gone",
+                crate::config::PROJECT_CONFIG
+            )
+        } else {
+            "the project, or a file its trust covers, changed since it was trusted".to_string()
+        };
+        let remedy = if gone {
+            format!(
+                "Restore {}, run `sbx untrust` if it was removed on purpose, or keep the file \
+                 outside the project",
+                crate::config::PROJECT_CONFIG
+            )
+        } else {
+            "Review the change and run `sbx trust`, or keep the file outside the project"
+                .to_string()
+        };
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "{} is in the project, which the cage can write, and the project, or a file its \
-                 trust covers, changed since it was trusted: it is not read as absent, which would \
-                 let removing it choose which source answers. Review the change and run `sbx \
-                 trust`, or keep the file outside the project",
+                "{} is in the project, which the cage can write, and {what}: it is not read as \
+                 absent, which would let removing it choose which source answers. {remedy}",
                 path.display()
             ),
         ));
@@ -1896,6 +1925,59 @@ mod tests {
         if refused {
             assert_eq!(verdict, TrustState::Changed);
         }
+    }
+
+    /// A sops file the approved config named, gone together with a config that can no longer be
+    /// read or is gone itself, is refused rather than read as absent: what the config named cannot
+    /// be checked, and the project was approved. A project never approved still reads it as absent.
+    #[test]
+    fn a_named_sops_file_gone_with_its_config_is_not_read_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        for shape in ["unreadable", "deleted"] {
+            let store = TmpDir::new();
+            let proj = TmpDir::new();
+            let cfg = proj.join(".sbx.toml");
+            std::fs::write(&cfg, b"x = \"sops://s.enc.yaml#k\"\n").unwrap();
+            std::fs::write(proj.join("s.enc.yaml"), b"k: ENC[...]\n").unwrap();
+            trust(store.path(), &cfg).unwrap();
+            std::fs::remove_file(proj.join("s.enc.yaml")).unwrap();
+            if shape == "unreadable" {
+                std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o000)).unwrap();
+            } else {
+                std::fs::remove_file(&cfg).unwrap();
+            }
+            let refused = std::fs::read(&cfg).is_err();
+            let removed = sops_removed_since_approval(
+                Some(store.path()),
+                proj.path(),
+                Path::new("s.enc.yaml"),
+            );
+            if shape == "unreadable" {
+                std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            if refused {
+                let e = removed.expect_err("the removal must not read as an absence");
+                assert_eq!(
+                    e.kind(),
+                    io::ErrorKind::PermissionDenied,
+                    "the config {shape}"
+                );
+                // A config that is gone cannot be re-approved; its stale marker is lifted with
+                // `sbx untrust`, which is what the refusal must point at.
+                assert_eq!(
+                    e.to_string().contains("sbx untrust"),
+                    shape == "deleted",
+                    "the config {shape}: {e}"
+                );
+            }
+        }
+
+        // Never approved: there is no approval for the absence to undo.
+        let store = TmpDir::new();
+        let proj = TmpDir::new();
+        let removed =
+            sops_removed_since_approval(Some(store.path()), proj.path(), Path::new("s.enc.yaml"));
+        assert!(removed.is_ok(), "{removed:?}");
     }
 
     #[test]
