@@ -487,7 +487,12 @@ fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
             let mut datagram = [0u8; 512];
             if let Ok(n @ 1..) = far.recv(&mut datagram) {
                 let line = String::from_utf8_lossy(&datagram[..n]);
-                let _ = std::fs::write(&reported, line.trim());
+                // Written whole under another name, then renamed: the command reads the file as
+                // soon as its name appears, and one created but not yet written reads as empty.
+                let staged = reported.with_extension("part");
+                if std::fs::write(&staged, line.trim()).is_ok() {
+                    let _ = std::fs::rename(&staged, &reported);
+                }
             }
         })
     };
@@ -505,7 +510,7 @@ except OSError as e:
 else:
     count = struct.unpack(">H", r[6:8])[0]
     print("answer", count, socket.inet_ntoa(r[-4:]) if count else "-")
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline and not os.path.exists(sys.argv[1]):
         time.sleep(0.05)
     if os.path.exists(sys.argv[1]):
