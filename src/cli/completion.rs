@@ -185,17 +185,21 @@ fn candidates(words: &[String]) -> Vec<(String, String)> {
 
     // Past a bare `--` sbx's own names and flags are over. What follows is decided by the
     // page's grammar rather than by the separator, because the separator does not mean the
-    // same thing on every page: on `run` it hands the rest to a launched command, on the
-    // verbs that take an operand a flag could be mistaken for (`sbx session stop -- 1234`,
-    // `sbx net allow -- --all`) it only ends the options, and the words after it are still
-    // sbx's own. Asking the operand grammar answers both without a list to keep in step:
-    // a page with an operand left offers it, a page with none has nothing of its own to
-    // say. The marker rather than an empty list is what leaves `sbx run -- ls <TAB>`
-    // completing the launched command's files instead of nothing at all.
+    // same thing on every page: on `run`, `app run` and `session attach` it hands the rest
+    // to a launched program, on the verbs that take an operand a flag could be mistaken for
+    // (`sbx session stop -- 1234`, `sbx net allow -- --all`) it only ends the options, and
+    // the words after it are still sbx's own. The operand grammar answers first: a page with
+    // a value left offers it. A word that is none of the page's own values is the launched
+    // program's, which the marker rather than an empty list hands to the shell, so
+    // `sbx run -- ls <TAB>` completes files. On a page that launches nothing it is a rule sbx
+    // cannot enumerate or a word the parser refuses, and the shell's files are neither.
     if before[tail_at..].iter().any(|w| w == "--") {
         return match cursor_value_kind(&path, &before[tail_at..]) {
             Some(kind) => value_candidates(&kind, cur),
-            None => vec![(FILES.to_string(), String::new())],
+            None if hands_the_rest_to_a_program(&path) => {
+                vec![(FILES.to_string(), String::new())]
+            }
+            None => Vec::new(),
         };
     }
 
@@ -701,6 +705,27 @@ fn operand_at(form: &[Operand], k: usize) -> Option<&Operand> {
     form.get(k).or_else(|| match form.last() {
         Some(last @ Operand::Value { repeats: true, .. }) => Some(last),
         _ => None,
+    })
+}
+
+/// Whether a page hands the words after its `--` to a program it launches — the command of
+/// `run` and `session attach`, the arguments of `app run` — rather than to operands of its
+/// own, as `session stop` does. Read off the synopsis, where the word the separator
+/// introduces is either one of the page's operands or what the launched program receives.
+fn hands_the_rest_to_a_program(path: &[&str]) -> bool {
+    let own: Vec<String> = operand_forms(path)
+        .into_iter()
+        .flatten()
+        .map(|operand| match operand {
+            Operand::Literal(word) => word,
+            Operand::Value { name, .. } => name,
+        })
+        .collect();
+    let toks: Vec<&str> = help::synopsis_of(path).split_whitespace().collect();
+    toks.windows(2).any(|pair| {
+        let [separator, next] = [pair[0], pair[1]].map(|tok| tok.trim_matches(['[', ']']));
+        let word = metavar_of(next).unwrap_or_else(|| next.to_string());
+        separator == "--" && !own.contains(&word)
     })
 }
 
@@ -1582,6 +1607,36 @@ mod tests {
         // rather than on the ids, so the test says the same thing on a host that has a session
         // running and on one that has none.
         assert_ne!(names(&["session", "stop", "--", ""]), [FILES]);
+    }
+
+    #[test]
+    fn past_a_double_dash_only_a_launched_program_gets_the_shells_files() {
+        // On a page that launches nothing, the words after `--` are still the page's own: a rule
+        // sbx cannot enumerate offers nothing, and a word past the page's last operand is one its
+        // parser refuses. The shell's files answered both, paths where `net allow` takes a rule.
+        assert_eq!(names(&["net", "allow", "--", ""]), Vec::<String>::new());
+        assert_eq!(
+            names(&["net", "allow", "--", "api.example.com", ""]),
+            Vec::<String>::new()
+        );
+        // A page that launches a program hands it the line once its own operands are filled.
+        assert_eq!(names(&["run", "--", ""]), [FILES]);
+        assert_eq!(names(&["session", "attach", "1234", "--", ""]), [FILES]);
+        assert_eq!(names(&["app", "run", "x", "--", ""]), [FILES]);
+    }
+
+    #[test]
+    fn the_pages_that_launch_a_program_are_read_off_their_synopses() {
+        // The three pages whose `--` hands the line to a launched program, as their synopses
+        // write it. `session stop` writes a `--` too, before its own ids, and is not one of them.
+        // A page added with a `-- <command>` of its own lands here.
+        let mut launching: Vec<String> = help::all_paths()
+            .into_iter()
+            .filter(|path| hands_the_rest_to_a_program(path))
+            .map(|path| path.join(" "))
+            .collect();
+        launching.sort();
+        assert_eq!(launching, ["app run", "run", "session attach"]);
     }
 
     #[test]

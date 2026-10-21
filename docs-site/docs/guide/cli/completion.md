@@ -101,10 +101,10 @@ rules already written, `undeny` the deny rules, `unmute` the mute rules, and
 app's own profile, the file the removal would edit. The add verbs deliberately offer none
 of them: `sbx net allow` takes precisely a rule that is *not* in the list yet.
 
-Only a value sbx cannot enumerate is left to the shell: a filesystem path, and the command
-line past a `--`. There the oracle answers with a reserved marker instead of a candidate,
-and the script turns it into the shell's own file completion, so a name holding a space
-stays one candidate.
+Only a value sbx cannot enumerate is left to the shell: a filesystem path, and the line a
+launched program receives past a `--`. There the oracle answers with a reserved marker
+instead of a candidate, and the script turns it into the shell's own file completion, so a
+name holding a space stays one candidate.
 
 A few positions complete nothing on purpose, because the set they name is not one this
 machine holds: a number, free text being composed, a URL or flake ref, an HTTP method, a
@@ -118,8 +118,11 @@ read-only, and no value position reaches for the network or the nix store. A pag
 registry cannot be read simply offers nothing there.
 :::
 
-**Nothing of sbx's is offered past a `--`.** Everything after the separator belongs to the
-launched command, so `sbx run -- ls <TAB>` completes files, not sbx's verbs.
+**Past a `--`, the page decides.** On `sbx run`, `sbx app run` and `sbx session attach`, the
+separator hands the rest of the line to the launched program, so `sbx run -- ls <TAB>`
+completes files, not sbx's verbs. Where it only ends the options, the words after it are
+still the verb's own: `sbx session stop -- <TAB>` offers the live sessions, and
+`sbx net allow -- <TAB>` offers nothing, since a rule is not a file.
 
 ## How it works
 
