@@ -234,6 +234,33 @@ fn a_field_is_charged_the_map_entry_it_becomes() {
     );
 }
 
+/// A payload ends where its length says, on an empty line.
+///
+/// The line after the value was read and thrown away whatever it held. A value longer than declared
+/// was admitted cut to its length, its tail taken for the closing line; one shorter than declared
+/// took the start of the next line into the value. A closing line too long to read was skipped as
+/// well, and the read went on from the middle of it: what followed was taken for a field of its
+/// own, so a request carried a field its framing never declared.
+#[test]
+fn a_payload_that_does_not_end_at_its_declared_length_is_refused() {
+    for request in [&b"param k 3\nabcdef\nrun\n"[..], b"param k 5\nabc\nrun\n"] {
+        assert_eq!(
+            read_payloads_of(request.to_vec()).expect("the read itself succeeds"),
+            Err("payload does not match its declared length"),
+            "{}",
+            String::from_utf8_lossy(request)
+        );
+    }
+    let mut request = b"param k 0\n".to_vec();
+    request.extend(std::iter::repeat_n(b'x', MAX_PAYLOAD_BYTES));
+    request.extend_from_slice(b"param evil 4\nEVIL\nrun\n");
+    assert_eq!(
+        read_payloads_of(request).map_err(|e| e.kind()),
+        Err(io::ErrorKind::InvalidData),
+        "a closing line past the bound ends the request, not the line"
+    );
+}
+
 /// The negative control: an ordinary request is not caught by any of it.
 #[test]
 fn an_ordinary_request_passes_every_bound() {

@@ -1004,10 +1004,16 @@ fn read_payloads(reader: &mut impl io::BufRead) -> io::Result<Result<Payloads, &
         }
         let mut buf = vec![0u8; len];
         reader.read_exact(&mut buf)?;
-        // The newline closing the payload. Bounded like every other line: a caller that writes a
-        // payload and then never ends its line is the same unbounded read as one that never ends
-        // its first, and this one is easy to miss because nothing is done with what it returns.
-        let _ = read_request_line(reader);
+        // The newline closing the payload, and nothing before it: a sender writes the value, then
+        // `\n`. Anything else means the declared length and the value disagree, and reading on
+        // would take the rest of the line for a field of its own. Bounded like every other line: a
+        // caller that writes a payload and then never ends its line is the same unbounded read as
+        // one that never ends its first.
+        match read_request_line(reader)? {
+            Some(end) if end == "\n" => {}
+            Some(_) => return Ok(Err("payload does not match its declared length")),
+            None => return Ok(Err("truncated request")),
+        }
         // Refused rather than repaired. `String::from_utf8_lossy` replaces each invalid byte with a
         // three-byte U+FFFD, so a payload charged `len` above was retained as up to three times that
         // and the ceiling admitted three times what it says it admits — on a thread that belongs to
