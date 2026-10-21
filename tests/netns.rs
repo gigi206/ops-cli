@@ -417,6 +417,18 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
     );
 }
 
+/// How many seccomp filters the calling thread runs under, its status's `Seccomp_filters`. A process
+/// it starts inherits them, under whatever it adds: a test run under a service manager's filter, or
+/// inside a cage, starts from more than none.
+fn own_seccomp_filters() -> u32 {
+    std::fs::read_to_string("/proc/thread-self/status")
+        .expect("this thread's status")
+        .lines()
+        .find_map(|line| line.strip_prefix("Seccomp_filters:"))
+        .and_then(|count| count.trim().parse().ok())
+        .expect("a `Seccomp_filters` count in this thread's status")
+}
+
 /// A query to the cage's resolver is answered through the capture tap, over UDP, and the name
 /// reaches the report channel the holder handed the tap.
 ///
@@ -682,11 +694,13 @@ print("report fd", "held" if held else "closed")
         !threads.is_empty(),
         "the tap was not found: {stdout}{stderr}"
     );
-    // Four filters: the two every cage gets from its bwrap, and the tap's own two (the program that
-    // answers `clone3`, then its list). Without its own, a tap would show the cage's two alone.
+    // Four filters on top of those this thread runs under, which every process it starts inherits:
+    // the two every cage gets from its bwrap, and the tap's own two (the program that answers
+    // `clone3`, then its list). Without its own, a tap would show the cage's two alone.
+    let expected = format!("1 {} 0000000000000000", own_seccomp_filters() + 4);
     for thread in &threads {
         assert_eq!(
-            *thread, "1 4 0000000000000000",
+            *thread, expected,
             "every thread of the tap: no new privileges, its own filters, no capability: {stdout}"
         );
     }
