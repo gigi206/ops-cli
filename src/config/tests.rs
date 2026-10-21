@@ -3981,8 +3981,18 @@ fn an_unknown_home_scope_defaults_to_global_with_a_warning() {
 #[test]
 fn an_app_with_an_unsafe_name_is_dropped_before_it_can_key_a_directory() {
     // An app name keys an on-disk home directory, so a traversal or odd-charset name must
-    // never reach the launcher. It is dropped at resolve time with a baseline warning.
-    for bad in ["../escape", "a/b", "..", ".", "with space", ""] {
+    // never reach the launcher. It is dropped at resolve time with a baseline warning. So is a
+    // name beginning with `-`, which every `sbx app` verb would read as an option.
+    for bad in [
+        "../escape",
+        "a/b",
+        "..",
+        ".",
+        "with space",
+        "",
+        "-x",
+        "--force",
+    ] {
         let global = raw_with_app(bad, raw_app(&["x"], &[], &[], &[], None));
         let r = resolve_no_plugins(global, None);
         assert!(

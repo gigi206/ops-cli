@@ -32,7 +32,9 @@ use super::config_usage;
 /// carry is rejected outright before any rewriting.
 fn app_prefixed_key(name: &str, key: &str) -> Result<String, String> {
     if !config::is_valid_app_name(name) {
-        return Err(format!("invalid app name `{name}`: 1–64 of [A-Za-z0-9._-]"));
+        return Err(format!(
+            "invalid app name `{name}`: 1–64 of [A-Za-z0-9._-], not beginning with `-`"
+        ));
     }
     if name.contains('.') {
         return Ok(format!("app.\"{name}\".{key}"));

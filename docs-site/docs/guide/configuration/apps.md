@@ -290,10 +290,12 @@ credentials are injected host-side. There is no per-app "interactive mode" field
 
 ## Name validation
 
-An app name is 1–64 characters of `[A-Za-z0-9._-]`, and not `.`/`..`: because the
-name keys an on-disk home directory and profile file, an unsafe name is dropped
-(fail-closed). The verbs `import`/`export`/`rm`/`list` are reserved and cannot be app
-names.
+An app name is 1–64 characters of `[A-Za-z0-9._-]`, does not begin with `-`, and is
+not `.`/`..`: because the name keys an on-disk home directory and profile file, an unsafe
+name is dropped (fail-closed). A leading `-` is refused because every `sbx app` verb reads
+such an argument as an option, so the app could never be named on the command line, not
+even to remove it; `sbx app import` of a file whose name begins with `-` takes `--as <name>`.
+The verbs `import`/`export`/`rm`/`list` are reserved and cannot be app names.
 
 ## Viewing an app
 

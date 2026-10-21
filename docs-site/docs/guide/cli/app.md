@@ -252,7 +252,8 @@ cage cannot run it, and the profile stays inert until `sbx app run <name>`. See
 
 `import` reads the same flags as [`sbx bundle import`](bundle#sbx-bundle-import) and
 `sbx net groups import`: `--as <name>` may be written `--as=<name>`, and a `--` ends the flags,
-so a file whose name begins with `-` can still be imported.
+so a file whose name begins with `-` can still be read. Its app is named with `--as`, since an
+app name may not begin with `-` ([name validation](../configuration/apps#name-validation)).
 
 ### What the import says you are still missing
 

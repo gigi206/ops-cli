@@ -1366,6 +1366,38 @@ fn a_forced_import_refuses_when_the_profile_it_would_replace_cannot_be_read() {
     );
 }
 
+/// A file whose name begins with `-` would import as an app every `sbx app` verb reads as an
+/// option, so that not even `sbx app rm` could name it again. The import refuses the name, says how
+/// to give it another, and takes the one it is given.
+#[test]
+fn an_import_refuses_a_name_that_begins_with_a_dash() {
+    let fx = Project::new("app");
+    let source = fx.proj.path().join("-x.toml");
+    std::fs::write(&source, "cmd = \"true\"\n").unwrap();
+
+    let out = fx.run_with_path(&["app", "import", "--"], &source, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a name beginning with `-` must be refused: {}",
+        text(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--as <name>"),
+        "and the refusal must say how to name it: {}",
+        text(&out)
+    );
+    assert!(!fx.profile_path("-x").exists(), "nothing was written");
+
+    let renamed = fx.run_with_path(&["app", "import", "--as", "dashless", "--"], &source, &[]);
+    assert!(
+        renamed.status.success(),
+        "the name `--as` gives is taken: {}",
+        text(&renamed)
+    );
+    assert!(fx.profile_path("dashless").exists());
+}
+
 #[test]
 fn bundle_import_reports_the_groups_the_bundle_itself_references() {
     let fx = Project::new("app");

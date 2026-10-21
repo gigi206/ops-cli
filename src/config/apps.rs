@@ -336,7 +336,8 @@ pub(super) fn resolve_apps(
     for name in names {
         if !is_valid_app_name(&name) {
             warnings.push(format!(
-                "ignoring app `{name}`: a name must be 1–64 of [A-Za-z0-9._-] and not `.`/`..` \
+                "ignoring app `{name}`: a name must be 1–64 of [A-Za-z0-9._-], not begin with \
+                 `-` and not be `.`/`..` \
                  (it keys an on-disk home directory)"
             ));
             continue;
@@ -368,11 +369,16 @@ pub(super) fn resolve_apps(
 /// directory. A name that coincides with a `sbx app` subcommand verb (`run`, `show`, …) is
 /// perfectly valid: launching always goes through `sbx app run <name>`, so the name never collides
 /// with the subcommand.
+///
+/// Nor may a name begin with `-`, the rule a task's name keeps for the same reason: every `sbx app`
+/// verb reads such an argument as an option, so the app could be imported but never named on the
+/// command line again, not even to remove it.
 pub(crate) fn is_valid_app_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name != "."
         && name != ".."
+        && !name.starts_with('-')
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
