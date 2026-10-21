@@ -2491,8 +2491,9 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     let mut held: Vec<String> = Vec::new();
     let mut had_error = false;
 
-    // The live-session guard below reads the registry once for the whole sweep, and an error
-    // reading it refuses the run rather than defaulting to an empty answer. `unwrap_or_default`
+    // The live-session guard below reads the registry here for the whole sweep, and again for each
+    // app once it holds that app's project store locks. An error reading it refuses the run rather
+    // than defaulting to an empty answer. `unwrap_or_default`
     // here would turn "cannot know" into "nothing is running", so the one check standing between
     // `--yes` and a running agent's home would pass by failing. [`session::Registry::scan`] already
     // skips a single unreadable record so one bad entry cannot blank the answer, and treats a
@@ -2541,35 +2542,64 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         // entries and interpreters are in `installs/`, and a cache is written to while the app runs,
         // so work in flight loses a tool or a cache mid-command and reports something that looks
         // nothing like what happened. The preview is always safe, so only the applying form is held
-        // back. Named, it is refused outright: there is no reading of `sbx app prune <name> --yes`
-        // under which deleting a live agent's state is the intent. Under `--all` the app is skipped
-        // and named instead, so one running agent does not stand between the user and the rest.
+        // back ([`live_app`]).
         if apply {
-            let mut pids: Vec<u32> = live_sessions
-                .iter()
-                .filter(|s| s.app() == Some(app_name.as_str()))
-                .map(|s| s.pid)
-                .collect();
-            // The registry sorts by project then pid, so an app with a session in two projects
-            // would list its pids out of order; the message names them ascending either way.
-            pids.sort_unstable();
-            if !pids.is_empty() {
-                let rendered: Vec<String> = pids.iter().map(u32::to_string).collect();
-                let listed = rendered.join(", ");
-                if all {
-                    skipped.push(format!("{app_name} (pid {listed})"));
-                    continue;
+            match live_app(app_name, &live_sessions, all, &mut skipped) {
+                LiveApp::Clear => {}
+                LiveApp::Skipped => continue,
+                LiveApp::Refused => return ExitCode::FAILURE,
+            }
+        }
+        // A launch of the app still setting up is in no record yet, and holds its project's store
+        // lock until it is: the prune holds those locks while it removes from the app's homes, and
+        // reads the registry again once it does, as `sbx app rm --purge` does. They are released
+        // before the next app's are taken.
+        let _locks = if apply {
+            match sandbox::lock_app_projects(&layout, app_name, &|lock| {
+                diag::note(&format!(
+                    "waiting for the project's store lock `{}`, which a launch of '{app_name}' \
+                     holds until its session is recorded",
+                    lock.display()
+                ))
+            }) {
+                Ok(held) => held,
+                Err(e) => {
+                    diag::error(&format!(
+                        "sbx: app prune: cannot lock a project store '{app_name}' has a tree in \
+                         ({e}); not pruning it."
+                    ));
+                    if all {
+                        had_error = true;
+                        continue;
+                    }
+                    return ExitCode::FAILURE;
                 }
-                diag::error(&format!(
-                    "sbx: app prune: {app_name} has a live session (pid {listed}) whose home this \
-                     would delete from — refusing to act under a running agent"
-                ));
-                diag::hint(&format!(
-                    "       stop it with `sbx session stop {}`, or re-run without `--yes` to see \
-                     what would go",
-                    rendered.join(" ")
-                ));
-                return ExitCode::FAILURE;
+            }
+        } else {
+            Vec::new()
+        };
+        if apply {
+            let now = match session::Registry::at(layout.data_dir()).live() {
+                Ok(now) => now,
+                Err(e) => {
+                    let rest = if all { " or the apps after it" } else { "" };
+                    diag::error(&format!(
+                        "sbx app prune: cannot read the session registry ({e}) — not pruning \
+                         '{app_name}'{rest}, because a live session cannot be ruled out."
+                    ));
+                    // Under `--all` the apps already pruned are reported with the rest of the
+                    // sweep; none after this one can be proven idle any more.
+                    if all {
+                        had_error = true;
+                        break;
+                    }
+                    return ExitCode::FAILURE;
+                }
+            };
+            match live_app(app_name, &now, all, &mut skipped) {
+                LiveApp::Clear => {}
+                LiveApp::Skipped => continue,
+                LiveApp::Refused => return ExitCode::FAILURE,
             }
         }
 
@@ -2859,6 +2889,54 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// What `sbx app prune --yes` does with an app, given the sessions the registry reads live.
+enum LiveApp {
+    /// No session of the app is live: its homes are pruned.
+    Clear,
+    /// A session is live and the run is `--all`: the app is left alone and named among the
+    /// skipped, so one running agent does not stand between the user and the rest.
+    Skipped,
+    /// A session is live and the app was named: the run is refused, since no reading of `sbx app
+    /// prune <name> --yes` makes deleting a live agent's state the intent.
+    Refused,
+}
+
+/// Whether app `name` has a live session among `sessions`, and what the prune does about it: under
+/// `all` the app is added to `skipped`, and otherwise the refusal is said.
+fn live_app(
+    name: &str,
+    sessions: &[session::Session],
+    all: bool,
+    skipped: &mut Vec<String>,
+) -> LiveApp {
+    let mut pids: Vec<u32> = sessions
+        .iter()
+        .filter(|s| s.app() == Some(name))
+        .map(|s| s.pid)
+        .collect();
+    if pids.is_empty() {
+        return LiveApp::Clear;
+    }
+    // The registry sorts by project then pid, so an app with a session in two projects would list
+    // its pids out of order; the message names them ascending either way.
+    pids.sort_unstable();
+    let rendered: Vec<String> = pids.iter().map(u32::to_string).collect();
+    let listed = rendered.join(", ");
+    if all {
+        skipped.push(format!("{name} (pid {listed})"));
+        return LiveApp::Skipped;
+    }
+    diag::error(&format!(
+        "sbx: app prune: {name} has a live session (pid {listed}) whose home this would delete \
+         from — refusing to act under a running agent"
+    ));
+    diag::hint(&format!(
+        "       stop it with `sbx session stop {}`, or re-run without `--yes` to see what would go",
+        rendered.join(" ")
+    ));
+    LiveApp::Refused
+}
+
 /// Which of an app's homes a report line is about: its one global home, or the home it has in one
 /// project, named by the project's tree id.
 fn home_location(home: &sandbox::inspect::AppHome) -> String {
@@ -3064,6 +3142,81 @@ mod tests {
         assert!(
             tree.is_dir() && global.join("home").is_dir(),
             "the purge removed the trees of an app whose session it found once it held the locks"
+        );
+    }
+
+    /// The fixture a prune of `demo-app` acts on: a global home holding `.npm/f`, and the app's tree
+    /// in one project, whose store lock a launch of the app holds while it sets up. Returns the
+    /// layout, the project's id and the entry a `--drop .npm` takes.
+    fn prune_fixture() -> (store::Layout, &'static str, std::path::PathBuf) {
+        let layout = store::Layout::from_env().expect("a layout under the fixture root");
+        let data = layout.data_dir();
+        let id = "0123456789abcdef";
+        std::fs::create_dir_all(data.join("projects").join(id).join("apps/demo-app/mise")).unwrap();
+        let npm = data.join("apps/demo-app/home/.npm");
+        std::fs::create_dir_all(&npm).unwrap();
+        std::fs::write(npm.join("f"), b"cache").unwrap();
+        (layout, id, npm)
+    }
+
+    fn prune_drop_npm() -> ExitCode {
+        app_prune(&["--all", "--drop", ".npm", "--yes"].map(OsString::from))
+    }
+
+    /// A launch of the app still setting up holds its project's store lock and is in no session
+    /// record yet. The prune waits for it rather than empty the home under it, and goes ahead once
+    /// the launch lets go.
+    #[test]
+    fn a_prune_waits_for_a_launch_of_the_app_still_setting_up() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        let data = TmpDir::new();
+        let cfg = TmpDir::new();
+        let _lock = env_lock();
+        let _data = EnvVar::set("SBX_DATA_DIR", data.path());
+        let _cfg = EnvVar::set("XDG_CONFIG_HOME", cfg.path());
+        let (layout, id, npm) = prune_fixture();
+        let launch = sandbox::hold_project_store(&layout, id, &|_| {}).unwrap();
+        let prune = std::thread::spawn(prune_drop_npm);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            npm.join("f").exists(),
+            "the prune emptied the home under a launch still holding its project's lock"
+        );
+        drop(launch);
+        let _ = prune.join().unwrap();
+        assert!(!npm.exists(), "the prune went ahead once the launch let go");
+    }
+
+    /// The registry is read again once the prune holds the locks: a launch that recorded its
+    /// session while the prune waited is a running session of the app, which the sweep skips.
+    #[test]
+    fn a_prune_skips_a_session_recorded_while_it_waited() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        let data = TmpDir::new();
+        let cfg = TmpDir::new();
+        let _lock = env_lock();
+        let _data = EnvVar::set("SBX_DATA_DIR", data.path());
+        let _cfg = EnvVar::set("XDG_CONFIG_HOME", cfg.path());
+        let (layout, id, npm) = prune_fixture();
+        let launch = sandbox::hold_project_store(&layout, id, &|_| {}).unwrap();
+        let prune = std::thread::spawn(prune_drop_npm);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // The launch records its session, then lets its lock go. This test process is the
+        // session's process, so the registry reads it live.
+        let session = session::Session::current(
+            data.path().to_path_buf(),
+            session::Kind::Run,
+            session::SessionRuntime::GlobalApp("demo-app".into()),
+        )
+        .expect("the test process itself is a live session");
+        session::Registry::at(layout.data_dir())
+            .register(&session)
+            .expect("a registered session");
+        drop(launch);
+        let _ = prune.join().unwrap();
+        assert!(
+            npm.join("f").exists(),
+            "the prune emptied the home of an app whose session it found once it held the locks"
         );
     }
 

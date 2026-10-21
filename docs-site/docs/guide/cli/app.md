@@ -496,6 +496,11 @@ under a command in flight, and what the agent then reports looks nothing like wh
 happened. Stop it with `sbx session stop` and retry. The preview deletes nothing, so
 it stays available either way.
 
+A launch of the app still setting up has no session yet, and holds its project's store lock
+until it has one. The applying run waits for every project the app has run in, then refuses,
+or skips the app under `--all`, if a session started meanwhile. As with `sbx app rm --purge`,
+a first launch of the app in a project where it has never run is not covered.
+
 The same refusal covers the case where sbx cannot tell: if the session registry itself
 cannot be read, `--yes` refuses and says so rather than treating an unreadable registry
 as an empty one. Under `--all` that refuses the whole sweep, since naming the apps to skip
