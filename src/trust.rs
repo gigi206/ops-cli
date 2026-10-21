@@ -532,8 +532,10 @@ fn approved_path(store_dir: &Path, config_path: &Path) -> Option<PathBuf> {
 ///
 /// This is a display input, never a verdict: whether the project is trusted is the marker's hash
 /// alone ([`verdict_for_hash`]), so a record that was tampered with can mislead a diff but cannot
-/// make anything trusted.
+/// make anything trusted. Nor is a record read without its marker: one outlives its marker only
+/// where [`untrust`] could not remove it, and it then describes an approval that no longer exists.
 pub(crate) fn approved(store_dir: &Path, config_path: &Path) -> Option<(Vec<u8>, TrustInputs)> {
+    std::fs::symlink_metadata(marker_path(store_dir, config_path)?).ok()?;
     let bytes = std::fs::read(approved_path(store_dir, config_path)?).ok()?;
     let mut parts = unframe(&bytes)?.into_iter();
     let (tag, sbx) = parts.next()?;
@@ -989,19 +991,18 @@ pub(crate) fn untrust(store_dir: &Path, config_path: &Path) -> io::Result<bool> 
     let Some(marker) = marker_path(store_dir, config_path) else {
         return Ok(false);
     };
-    // The record of approved contents goes with the trust it documents; without a marker it
-    // describes an approval that no longer exists.
-    if let Some(at) = approved_path(store_dir, config_path)
-        && let Err(e) = std::fs::remove_file(at)
-        && e.kind() != io::ErrorKind::NotFound
-    {
-        return Err(e);
+    // The marker first: it is what grants the trust, so the revocation depends on its removal
+    // alone. The record of approved contents goes with it, as far as it can: one left behind is
+    // never read without its marker ([`approved`]), so it can no longer stand for an approval.
+    let existed = match std::fs::remove_file(marker) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e),
+    };
+    if let Some(at) = approved_path(store_dir, config_path) {
+        let _ = std::fs::remove_file(at);
     }
-    match std::fs::remove_file(marker) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
+    Ok(existed)
 }
 
 #[cfg(test)]
@@ -1628,6 +1629,43 @@ mod tests {
             !untrust(store.path(), &cfg).unwrap(),
             "no marker the second time"
         );
+    }
+
+    /// A record of approved contents that cannot be removed does not keep the trust it documents:
+    /// the marker goes first, so the project is untrusted, and the record left behind is never
+    /// read without it.
+    #[test]
+    fn untrust_revokes_even_when_the_record_of_approved_contents_will_not_go() {
+        let store = TmpDir::new();
+        let proj = TmpDir::new();
+        let cfg = proj.join(".sbx.toml");
+        std::fs::write(&cfg, b"x = 1\n").unwrap();
+        trust(store.path(), &cfg).unwrap();
+        // A non-empty directory where the record belongs, which `remove_file` cannot take.
+        let record = approved_path(store.path(), &cfg).expect("a UTF-8 fixture path");
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir_all(record.join("held")).unwrap();
+
+        assert!(
+            untrust(store.path(), &cfg).expect("the revocation itself succeeds"),
+            "a marker existed"
+        );
+        assert_eq!(state(store.path(), &cfg), TrustState::Untrusted);
+        assert!(record.exists(), "the record could not be removed");
+        assert_eq!(
+            approved(store.path(), &cfg),
+            None,
+            "and it is not read without its marker"
+        );
+
+        // The same with a record that can still be read: a record of contents is no approval once
+        // its marker is gone.
+        trust(store.path(), &cfg).unwrap();
+        std::fs::remove_dir_all(&record).ok();
+        trust(store.path(), &cfg).unwrap();
+        assert!(approved(store.path(), &cfg).is_some(), "a recorded trust");
+        std::fs::remove_file(marker_path(store.path(), &cfg).unwrap()).unwrap();
+        assert_eq!(approved(store.path(), &cfg), None);
     }
 
     #[test]
