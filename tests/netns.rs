@@ -472,9 +472,6 @@ fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
     // report the far end reads is written to `reported`, which the command waits for.
     let (tap_end, far) = std::os::unix::net::UnixDatagram::pair().expect("a report channel");
     let tap_fd = std::os::fd::AsRawFd::as_raw_fd(&tap_end);
-    // SAFETY: `F_SETFD` on this process's own open descriptor clears its close-on-exec flag, so
-    // the holder inherits it; the far end keeps the flag and stays here.
-    assert_eq!(unsafe { libc::fcntl(tap_fd, libc::F_SETFD, 0) }, 0);
     // SAFETY: `fstat` fills the zeroed `stat` on the stack for the open end.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     assert_eq!(unsafe { libc::fstat(tap_fd, &mut st) }, 0);
@@ -544,27 +541,44 @@ for fd in os.listdir("/proc/self/fd"):
         pass
 print("report fd", "held" if held else "closed")
 "#;
-    let out = holder_output(
-        Command::new(env!("CARGO_BIN_EXE_sbx"))
-            .args(["__netns-holder", "--tap"])
-            .arg(&egress)
-            .arg("--bwrap")
-            .arg(&bwrap)
-            .arg("--nft")
-            .arg(&nft)
-            .arg("--report-fd")
-            .arg(tap_fd.to_string())
-            .arg("--")
-            .args(holder_argv(
-                &bwrap,
-                &[
-                    python.into(),
-                    "-c".into(),
-                    query.into(),
-                    reported.clone().into(),
-                    tap_socket.clone().into(),
-                ],
-            )),
+    let mut holder = Command::new(env!("CARGO_BIN_EXE_sbx"));
+    holder
+        .args(["__netns-holder", "--tap"])
+        .arg(&egress)
+        .arg("--bwrap")
+        .arg(&bwrap)
+        .arg("--nft")
+        .arg(&nft)
+        .arg("--report-fd")
+        .arg(tap_fd.to_string())
+        .arg("--")
+        .args(holder_argv(
+            &bwrap,
+            &[
+                python.into(),
+                "-c".into(),
+                query.into(),
+                reported.clone().into(),
+                tap_socket.clone().into(),
+            ],
+        ));
+    // SAFETY: `fcntl` is async-signal-safe and allocates nothing. It clears the close-on-exec flag
+    // of the tap's end in the child alone, so the holder inherits it while this process keeps the
+    // flag: the other tests of this binary start commands of their own at the same time, and none
+    // of them may inherit the end.
+    unsafe {
+        use std::os::unix::process::CommandExt as _;
+        holder.pre_exec(move || match libc::fcntl(tap_fd, libc::F_SETFD, 0) {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+    let out = holder_output(&mut holder);
+    // SAFETY: `F_GETFD` reads the descriptor flags of this process's own open end.
+    let flags = unsafe { libc::fcntl(tap_fd, libc::F_GETFD) };
+    assert!(
+        flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+        "the tap's end stays close-on-exec here, where another test's command could inherit it"
     );
     drop(tap_end);
     let stdout = String::from_utf8_lossy(&out.stdout);
