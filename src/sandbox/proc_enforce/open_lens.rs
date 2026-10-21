@@ -37,6 +37,12 @@ pub(super) enum OpenName {
     /// already met — the substituted name resolved to nothing and the open was answered `ENOENT` —
     /// with the errno now saying which side refused it.
     Unusable,
+    /// Bytes with no NUL in reach, which are not a path ([`super::target::read_path_bytes`]), and
+    /// the errno the kernel fails such an open with. Answered with it, as the kernel would have:
+    /// neither decided under the bytes read, which name a file the cage never finished naming, nor
+    /// allowed unexamined like a read that did not work, where a sibling writing the NUL before the
+    /// kernel's own read would have it open a file the lens never scanned.
+    Unterminated(libc::c_int),
 }
 
 /// The path an open asked for.
@@ -54,7 +60,8 @@ pub(super) fn open_name(
     notif: Option<(libc::c_int, u64)>,
 ) -> OpenName {
     match read_path_bytes(pid, path_addr, notif) {
-        Some(bytes) if !bytes.is_empty() => match String::from_utf8(bytes) {
+        Some(Err(errno)) => return OpenName::Unterminated(errno),
+        Some(Ok(bytes)) if !bytes.is_empty() => match String::from_utf8(bytes) {
             Ok(named) => return OpenName::Named(named),
             Err(_) => {
                 // Once: a cage that keeps naming them would otherwise fill the session's output
@@ -117,6 +124,12 @@ pub(super) fn handle_open(
         // see [`OpenName::Unusable`].
         OpenName::Unusable => {
             respond_errno(notif_fd, req.id, libc::EACCES);
+            return;
+        }
+        // Not a path at all: answered with the kernel's own errno — see
+        // [`OpenName::Unterminated`].
+        OpenName::Unterminated(errno) => {
+            respond_errno(notif_fd, req.id, errno);
             return;
         }
     };

@@ -194,27 +194,39 @@ pub(super) fn open_resolve(
 /// notified *thread* is blocked in the `execve`, so the pointer is valid to read — but only that
 /// thread is stopped: a sibling in the cage can rewrite the buffer between this read and the
 /// `CONTINUE`, which is why allowing a named path is TOCTOU-racy while refusing one is not (module
-/// header). Nothing here closes that window. Returns `None` on any read failure.
+/// header). Nothing here closes that window.
+///
+/// `None` is a read that did not work. `Some(Err(errno))` is bytes this supervisor read with no NUL
+/// among them, which are not a path: the kernel's own copy of that pathname fails, with
+/// `ENAMETOOLONG` where the read filled the `PATH_MAX` window and with `EFAULT` where it stopped
+/// short. A read of `/proc/<pid>/mem` crosses from one mapped page to the next and stops short only
+/// at memory it cannot read, where the kernel's copy faults too. A caller answers such a call with
+/// that errno: deciding it under the bytes read would act on a name the cage never finished
+/// writing, and allowing it unexamined would leave a sibling the time to write the NUL before the
+/// kernel's own read.
 pub(super) fn read_path_bytes(
     pid: u32,
     addr: u64,
     notif: Option<(libc::c_int, u64)>,
-) -> Option<Vec<u8>> {
-    use std::io::Read;
+) -> Option<Result<Vec<u8>, libc::c_int>> {
+    use std::io::{Read, Seek, SeekFrom};
     let mut file = open_target_mem(pid, notif)?;
-    // Seek and read a bounded window; a path is at most PATH_MAX.
-    use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::Start(addr)).ok()?;
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; libc::PATH_MAX as usize];
     let n = file.read(&mut buf).ok()?;
     if n == 0 {
         return None;
     }
-    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
-    Some(buf[..end].to_vec())
+    Some(match buf[..n].iter().position(|&b| b == 0) {
+        Some(end) => Ok(buf[..end].to_vec()),
+        None if n == buf.len() => Err(libc::ENAMETOOLONG),
+        None => Err(libc::EFAULT),
+    })
 }
 
-/// The same read, as a name this supervisor can carry — or `None` where it cannot.
+/// The same read, as a name this supervisor can carry — or `None` where it cannot. Bytes with no
+/// NUL among them come back as the errno the kernel fails the call with, as from
+/// [`read_path_bytes`].
 ///
 /// `from_utf8` and not `from_utf8_lossy`, for the reason [`super::caller_chain`] gives about the program
 /// that issued the call: a Linux path is bytes and every byte the encoding cannot carry becomes the
@@ -234,8 +246,11 @@ pub(super) fn read_exec_path(
     pid: u32,
     addr: u64,
     notif: Option<(libc::c_int, u64)>,
-) -> Option<String> {
-    String::from_utf8(read_path_bytes(pid, addr, notif)?).ok()
+) -> Option<Result<String, libc::c_int>> {
+    match read_path_bytes(pid, addr, notif)? {
+        Ok(bytes) => String::from_utf8(bytes).ok().map(Ok),
+        Err(errno) => Some(Err(errno)),
+    }
 }
 
 /// How many `argv` elements one notified exec is read for.

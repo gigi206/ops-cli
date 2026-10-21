@@ -547,7 +547,19 @@ fn exec_verdict(
     argv_addr: u64,
     notif: Option<(libc::c_int, u64)>,
 ) -> Decided {
-    let read = read_exec_path(pid, addr, notif);
+    let read = match read_exec_path(pid, addr, notif) {
+        // Not a path: refused with the errno the kernel fails it with, rather than decided under
+        // bytes that name nothing or taken to the mode's default like a read that did not work.
+        Some(Err(errno)) => {
+            return Decided {
+                verdict: Verdict::Deny,
+                shown: "<unterminated>".to_string(),
+                probed: "<unterminated>".to_string(),
+                because: Because::Unterminated(errno),
+            };
+        }
+        read => read.and_then(Result::ok),
+    };
     // Whether the target is named by the **descriptor** rather than by a path the syscall carried.
     // It changes how the file is reached below: an object with no name of its own -- a `memfd`, a
     // file already unlinked -- is reachable only through the caller's own `/proc` entry.
@@ -929,6 +941,10 @@ enum Because {
     /// `execve` with `ELOOP`, and the refusal answers with that errno so the cage reads the
     /// kernel's own reason.
     ShebangTooDeep,
+    /// The path the `execve` carried has no NUL in reach ([`target::read_path_bytes`]), so it is
+    /// not a path, and the kernel fails the call with this errno. The refusal answers with it and
+    /// is not announced: no rule refused anything, and nothing was there to be refused.
+    Unterminated(libc::c_int),
 }
 
 /// The final component of an already-folded path, for the loader test.
@@ -1425,10 +1441,7 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
             respond_continue(notif_fd, req.id);
         }
         Verdict::Deny => {
-            let errno = match because {
-                Because::ShebangTooDeep => libc::ELOOP,
-                _ => refusal_errno(req.pid, probed),
-            };
+            let errno = deny_errno(*because, req.pid, probed);
             // A name lookup is one `execve` per `PATH` entry, so a program found in the fourth
             // directory leaves three refusals behind it — of files that were never there. Recorded
             // apart from a refusal of something real, because they are the same event a cage with
@@ -1445,35 +1458,14 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
             // of notifications every time a program is simply found somewhere other than the first
             // entry — while the run succeeded and nothing was kept from it. Same rule the refusal
             // report applies, for the same reason.
-            if recorded == "deny" {
+            if recorded == "deny"
+                && let Some(detail) = refusal_detail(*because, by)
+            {
                 cx.notifier.block(crate::notify::Block {
                     event: crate::notify::NotifyEvent::Proc,
                     subject: shown.to_string(),
                     reason: "denied-by-policy".to_string(),
-                    detail: match because {
-                        // Said apart from a rule's refusal, because it is not one: nothing in the
-                        // policy named this program, and the reader's next move is different.
-                        Because::UnreadableLoaderArgv => "this is a dynamic loader, and the \
-                             program its arguments name could not be read — so the exec policy had \
-                             no name to match and it was refused rather than run"
-                            .to_string(),
-                        Because::UnreadableShebang => "the first bytes of this file could not \
-                             be read, so the interpreter a `#!` line may name could not be \
-                             decided — and a file this sandbox can reach without reading runs its \
-                             interpreter all the same, so it was refused rather than run"
-                            .to_string(),
-                        Because::ShebangTooDeep => format!(
-                            "this file's `#!` chain names more than {SHEBANG_HOPS} interpreters \
-                             in turn, which the kernel refuses to follow, so it was refused \
-                             without the last of them being named"
-                        ),
-                        Because::Policy if by.is_empty() => {
-                            "the exec policy does not allow this program to run".to_string()
-                        }
-                        Because::Policy => {
-                            format!("`{by}` is not allowed to run it by the exec policy")
-                        }
-                    },
+                    detail,
                     // No `sbx proc allow` suggestion: under `enforce` the rule that refused is a
                     // deliberate `deny` entry, and a one-line "allow it" would invite undoing the
                     // very thing that was asked for. `sbx proc logs` is where the decision is read.
@@ -1489,6 +1481,47 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
             cx.pending.park(notif_fd, req.id, req.pid, shown);
         }
     }
+}
+
+/// The errno an exec refusal answers with: the kernel's own where the refusal stands in for one the
+/// kernel would make, and otherwise the one [`refusal_errno`] chooses from the file the syscall
+/// carried.
+fn deny_errno(because: Because, pid: u32, probed: &str) -> libc::c_int {
+    match because {
+        Because::ShebangTooDeep => libc::ELOOP,
+        Because::Unterminated(errno) => errno,
+        Because::Policy | Because::UnreadableLoaderArgv | Because::UnreadableShebang => {
+            refusal_errno(pid, probed)
+        }
+    }
+}
+
+/// What the announcement of an exec refusal says, or `None` for a refusal that is not announced.
+/// `by` is the calling program, empty where the policy does not decide by caller.
+fn refusal_detail(because: Because, by: &str) -> Option<String> {
+    Some(match because {
+        // Said apart from a rule's refusal, because it is not one: nothing in the policy named
+        // this program, and the reader's next move is different.
+        Because::UnreadableLoaderArgv => "this is a dynamic loader, and the program its arguments \
+             name could not be read — so the exec policy had no name to match and it was refused \
+             rather than run"
+            .to_string(),
+        Because::UnreadableShebang => "the first bytes of this file could not be read, so the \
+             interpreter a `#!` line may name could not be decided — and a file this sandbox can \
+             reach without reading runs its interpreter all the same, so it was refused rather than \
+             run"
+            .to_string(),
+        Because::ShebangTooDeep => format!(
+            "this file's `#!` chain names more than {SHEBANG_HOPS} interpreters in turn, which the \
+             kernel refuses to follow, so it was refused without the last of them being named"
+        ),
+        Because::Policy if by.is_empty() => {
+            "the exec policy does not allow this program to run".to_string()
+        }
+        Because::Policy => format!("`{by}` is not allowed to run it by the exec policy"),
+        // The kernel's own refusal, given in its place: see [`Because::Unterminated`].
+        Because::Unterminated(_) => return None,
+    })
 }
 
 /// How the caller of a notified `execve` is addressed, when the policy decides by caller at all.

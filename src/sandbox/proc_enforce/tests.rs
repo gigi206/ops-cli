@@ -2107,8 +2107,8 @@ fn a_target_named_in_bytes_no_name_can_carry_is_not_read_as_a_name_with_them_rep
     let me = std::process::id();
     let good = b"/usr/bin/env\0";
     assert_eq!(
-        read_exec_path(me, good.as_ptr() as u64, None).as_deref(),
-        Some("/usr/bin/env"),
+        read_exec_path(me, good.as_ptr() as u64, None),
+        Some(Ok("/usr/bin/env".to_string())),
         "a path that is a name is still read as one"
     );
 
@@ -2123,7 +2123,7 @@ fn a_target_named_in_bytes_no_name_can_carry_is_not_read_as_a_name_with_them_rep
     );
     assert_eq!(
         read_path_bytes(me, odd.as_ptr() as u64, None),
-        Some(b"/tmp/caf\xe9".to_vec()),
+        Some(Ok(b"/tmp/caf\xe9".to_vec())),
         "the bytes are readable, so this is the conversion refusing and not the read failing"
     );
 }
@@ -2170,6 +2170,171 @@ fn an_open_named_in_bytes_no_name_can_carry_is_refused_rather_than_resolved_unde
     assert!(
         out.contains("just ordinary prose"),
         "and an open the supervisor can name is served exactly as it was: {out}"
+    );
+}
+
+/// Memory holding `bytes` up to the very end of a page with nothing mapped after it: a path written
+/// there has no NUL that this supervisor's read, or the kernel's own copy, can reach. The page is
+/// unmapped when this drops.
+struct AtTheEdge {
+    page: *mut libc::c_void,
+    size: usize,
+    len: usize,
+}
+
+impl AtTheEdge {
+    fn new(bytes: &[u8]) -> AtTheEdge {
+        // SAFETY: `sysconf` reads a constant of the system and has no precondition.
+        let size =
+            usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("page size");
+        assert!(bytes.len() <= size);
+        // SAFETY: a fresh anonymous mapping, which nothing else refers to.
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED, "map two pages");
+        // SAFETY: the second page of the mapping just made, which nothing points into.
+        let unmapped = unsafe { libc::munmap(page.cast::<u8>().add(size).cast(), size) };
+        assert_eq!(unmapped, 0, "unmap the second page");
+        let edge = AtTheEdge {
+            page,
+            size,
+            len: bytes.len(),
+        };
+        // SAFETY: the destination is the last `bytes.len()` bytes of the first page, which is
+        // mapped and writable, and the source is a distinct slice.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), edge.start(), bytes.len()) };
+        edge
+    }
+
+    fn start(&self) -> *mut u8 {
+        // SAFETY: an offset inside the first page of the mapping.
+        unsafe { self.page.cast::<u8>().add(self.size - self.len) }
+    }
+}
+
+impl Drop for AtTheEdge {
+    fn drop(&mut self) {
+        // SAFETY: the first page of the mapping `new` made, the only part still mapped.
+        unsafe { libc::munmap(self.page, self.size) };
+    }
+}
+
+/// The errno the kernel fails an `open` of the pathname at `path` with, or 0 if it opens.
+fn kernel_open_errno(path: *const u8) -> libc::c_int {
+    // SAFETY: `open` reads the pathname through the pointer as the kernel does, faulting rather
+    // than reading past what is mapped; the descriptor it may return is closed at once.
+    let fd = unsafe { libc::open(path.cast(), libc::O_RDONLY) };
+    if fd >= 0 {
+        // SAFETY: the descriptor `open` just returned, closed once.
+        unsafe { libc::close(fd) };
+        return 0;
+    }
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// Bytes with no NUL in reach are not a path, and are read as the errno the kernel fails the call
+/// with rather than as a name made of what was there: `EFAULT` where they stop at memory nothing
+/// can read, `ENAMETOOLONG` where they fill `PATH_MAX`. Each premise is the kernel's own answer,
+/// asked on the same memory.
+#[test]
+fn a_path_with_no_nul_in_reach_reads_as_the_errno_the_kernel_fails_it_with() {
+    let me = std::process::id();
+
+    // The control: a path that runs from one mapped page into the next is read whole.
+    // SAFETY: `sysconf` reads a constant of the system and has no precondition.
+    let size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("page size");
+    let mut span = vec![0u8; 3 * size];
+    let boundary = size - (span.as_ptr() as usize % size);
+    let path = b"/tmp/across-a-page-boundary";
+    let at = boundary - 10;
+    span[at..at + path.len()].copy_from_slice(path);
+    assert_eq!(
+        read_path_bytes(me, span[at..].as_ptr() as u64, None),
+        Some(Ok(path.to_vec())),
+        "a path is read across a page boundary, so a read that stops short has met memory it \
+         cannot read"
+    );
+
+    let edge = AtTheEdge::new(b"/tmp/unterminated");
+    assert_eq!(kernel_open_errno(edge.start()), libc::EFAULT);
+    assert_eq!(
+        read_path_bytes(me, edge.start() as u64, None),
+        Some(Err(libc::EFAULT)),
+        "bytes that stop at unmapped memory name no file: the kernel faults on them"
+    );
+    assert_eq!(
+        read_exec_path(me, edge.start() as u64, None),
+        Some(Err(libc::EFAULT))
+    );
+
+    let mut long = vec![b'a'; libc::PATH_MAX as usize + 100];
+    long.push(0);
+    assert_eq!(kernel_open_errno(long.as_ptr()), libc::ENAMETOOLONG);
+    assert_eq!(
+        read_path_bytes(me, long.as_ptr() as u64, None),
+        Some(Err(libc::ENAMETOOLONG)),
+        "a window of `PATH_MAX` bytes with no NUL in it holds no path the kernel takes"
+    );
+}
+
+/// And neither decision acts on such bytes. The open lens answers the kernel's errno instead of
+/// deciding, scanning or creating under a name the cage never finished writing, and instead of
+/// allowing the open unexamined, which would leave a sibling the time to write the NUL before the
+/// kernel's own read. The exec decision refuses with the same errno, rather than deciding under
+/// those bytes or taking the mode's default, and announces nothing, since no rule refused.
+#[test]
+fn an_open_or_an_exec_of_a_path_with_no_nul_in_reach_is_refused_as_the_kernel_would() {
+    let me = std::process::id();
+    let edge = AtTheEdge::new(b"/tmp/unterminated");
+
+    let armed = DecidingParts::with_lens();
+    assert!(
+        matches!(
+            open_name(true, &armed.undecidable, me, edge.start() as u64, None),
+            OpenName::Unterminated(libc::EFAULT)
+        ),
+        "the open is answered with the kernel's errno, not decided under the bytes read"
+    );
+    assert_eq!(
+        armed.undecidable.open.load(Ordering::Relaxed),
+        0,
+        "and it is not one the lens could not examine"
+    );
+
+    let policy = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
+    let parts = DecidingParts::new();
+    let decided = exec_verdict(
+        &parts.cx(&policy),
+        &[],
+        me,
+        libc::AT_FDCWD,
+        edge.start() as u64,
+        0,
+        None,
+    );
+    assert_eq!(
+        (decided.verdict, decided.because),
+        (Verdict::Deny, Because::Unterminated(libc::EFAULT)),
+        "an empty denylist allows what it reads a name for, so only a refusal here shows the bytes \
+         were not taken as one"
+    );
+    assert_eq!(
+        deny_errno(decided.because, me, &decided.probed),
+        libc::EFAULT,
+        "the refusal answers with the kernel's errno"
+    );
+    assert_eq!(
+        refusal_detail(decided.because, ""),
+        None,
+        "and is not announced as a refusal of a program"
     );
 }
 
