@@ -51,6 +51,41 @@ fn bwrap_runs(bwrap: &std::path::Path, cmd: &[OsString]) -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
+/// Whether `nft`, run in a user and a network namespace of its own, installs a ruleset that asks
+/// the kernel for what the holder's redirect asks: a `nat` chain that redirects, and a `filter`
+/// chain that reads conntrack's `dnat` status and rejects.
+///
+/// A kernel built without them, or one that will not load them for an unprivileged namespace,
+/// refuses both rulesets, and that refusal is this host's gap. A kernel that installs this one and
+/// refuses the holder's has been handed a ruleset that is wrong. Asked through `unshare -rn`, which
+/// maps this user to root in the new user namespace, as the configurer holds `CAP_NET_ADMIN` in the
+/// one that owns the cage's network namespace: a command bwrap starts with `--cap-add` is refused
+/// by nft there.
+fn nft_redirects(nft: &std::path::Path) -> bool {
+    use std::io::Write as _;
+    const PROBE: &str = "table ip probe {\n  \
+        chain o { type nat hook output priority dstnat; policy accept; \
+        udp dport 53 redirect to :5353; }\n  \
+        chain f { type filter hook output priority filter; policy accept; \
+        ct status dnat accept; reject with icmp type net-unreachable; }\n}\n";
+    let Ok(mut child) = Command::new("unshare")
+        .arg("-rn")
+        .arg(nft)
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let written = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(PROBE.as_bytes()).is_ok());
+    child.wait().is_ok_and(|status| written && status.success())
+}
+
 /// The holder's output for `cmd`, a run of `__netns-holder`, read within a bound.
 ///
 /// A holder that lets bwrap die before bwrap has signalled its child — of `SIGPIPE`, on a report
@@ -404,7 +439,8 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
 /// A tap that did not start or did not come up fails this test rather than skipping it, and so
 /// does a configurer that bwrap left without a report. The environment gaps the capture has say so
 /// in their own words, and still skip: a namespace the configurer may not join, a kernel that
-/// refuses the redirect rules, and one without the `dummy` driver, which leaves no route. So does a
+/// refuses what the redirect rules ask of it ([`nft_redirects`]), and one without the `dummy`
+/// driver, which leaves no route. So does a
 /// cage bwrap itself cannot create on this host ([`bwrap_runs`]); a holder that did not run a
 /// command bwrap runs here is this test's failure. So is a command that ran and then failed — the
 /// line it prints first says it ran — and no route on a kernel that has the driver.
@@ -541,9 +577,21 @@ print("report fd", "held" if held else "closed")
     }
     // The two gaps of this host's that the capture names in its warning. A route that could not be
     // installed is read below, from the query it leaves without one.
-    if stderr.contains("could not be joined") || stderr.contains("nft refused the redirect rules") {
+    if stderr.contains("nft refused the redirect rules") {
+        assert!(
+            !nft_redirects(&nft),
+            "nft installs a redirect in a namespace of its own on this host, yet refused the \
+             holder's rules: {stderr}"
+        );
         skip_incapable!(
-            "skipping tap DNS e2e: the namespace or the redirect did not stand up ({})",
+            "skipping tap DNS e2e: this kernel refuses the redirect ({})",
+            stderr.trim()
+        );
+        return;
+    }
+    if stderr.contains("could not be joined") {
+        skip_incapable!(
+            "skipping tap DNS e2e: the holder could not join the namespace ({})",
             stderr.trim()
         );
         return;
