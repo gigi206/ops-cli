@@ -2491,6 +2491,49 @@ fn a_declared_output_longer_than_the_answer_is_an_error() {
     assert_eq!(exact.stdout.as_deref(), Some("ab"));
 }
 
+/// A field of the answer that does not read as what the plane writes is an error, never a default.
+///
+/// The plane writes every one of these itself, so one that does not parse is a plane that
+/// miscounted or an answer that is not the plane's. Read as defaults, `id` became `0`, `exit`
+/// `-1`, a count or a duration `0`, a flag unset, and an `output` line without its path vanished.
+/// A stream length that did not parse read as a hidden stream, and the stream's bytes were then
+/// read as header lines: the last form here rewrote the answer's exit status to `0`.
+#[test]
+fn an_answer_field_that_does_not_parse_is_an_error() {
+    for raw in [
+        &b"id x\nexit 3\nok\n"[..],
+        b"id 4\nexit x\nok\n",
+        b"id 4\nexit 3\nredacted x\nok\n",
+        b"id 4\nexit 3\nelapsed-ms x\nok\n",
+        b"id 4\nexit 3\ntruncated yes\nok\n",
+        b"id 4\nexit 3\ntimed-out 2\nok\n",
+        b"id 4\nexit 3\nstopped -\nok\n",
+        b"id 4\nexit 3\noutput x /out\nok\n",
+        b"id 4\nexit 3\noutput 12\nok\n",
+        b"id 4\nexit 3\nstdout 9x\nexit 0\nok\nok\n",
+    ] {
+        let e = client::parse_run(raw).expect_err(&String::from_utf8_lossy(raw));
+        assert_eq!(
+            e.kind(),
+            io::ErrorKind::InvalidData,
+            "{}",
+            String::from_utf8_lossy(raw)
+        );
+    }
+    // What the plane writes still reads, hidden streams and an output directory included.
+    let whole = client::parse_run(
+        b"id 4\nexit 3\nredacted 0\ntruncated 0\ntimed-out 1\nstopped 0\nelapsed-ms 12\n\
+          output 7 /out dir\nstdout -1\nstderr 2\nno\nok\n",
+    )
+    .expect("an answer the plane wrote");
+    assert_eq!(
+        (whole.id, whole.exit, whole.timed_out, whole.elapsed_ms),
+        (4, 3, true, 12)
+    );
+    assert_eq!(whole.output, Some(("/out dir".to_string(), 7)));
+    assert_eq!((whole.stdout, whole.stderr.as_deref()), (None, Some("no")));
+}
+
 #[test]
 fn the_nonce_crosses_the_wire_out_of_band() {
     let raw = "exit 0\nredacted 1\nnonce a91f3c\nstdout 22\ntok=${DEMO@a91f3c} ok\nstderr -1\nok\n";

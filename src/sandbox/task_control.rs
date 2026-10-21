@@ -2022,13 +2022,13 @@ pub(crate) mod client {
                 continue;
             };
             match key {
-                "id" => out.id = value.parse().unwrap_or(0),
-                "exit" => out.exit = value.parse().unwrap_or(-1),
-                "redacted" => out.redacted = value.parse().unwrap_or(0),
-                "truncated" => out.truncated = value == "1",
-                "timed-out" => out.timed_out = value == "1",
-                "stopped" => out.stopped = value == "1",
-                "elapsed-ms" => out.elapsed_ms = value.parse().unwrap_or(0),
+                "id" => out.id = number(key, value)?,
+                "exit" => out.exit = number(key, value)?,
+                "redacted" => out.redacted = number(key, value)?,
+                "truncated" => out.truncated = flag(key, value)?,
+                "timed-out" => out.timed_out = flag(key, value)?,
+                "stopped" => out.stopped = flag(key, value)?,
+                "elapsed-ms" => out.elapsed_ms = number(key, value)?,
                 "nonce" => out.nonce = Some(value.to_string()),
                 "refused-exec" => {
                     let (caller, target) = value.split_once(' ').unwrap_or(("-", value));
@@ -2041,16 +2041,17 @@ pub(crate) mod client {
                     });
                 }
                 "output" => {
-                    if let Some((bytes, path)) = value.split_once(' ') {
-                        out.output = Some((path.to_string(), bytes.parse().unwrap_or(0)));
-                    }
+                    let (bytes, path) = value.split_once(' ').ok_or_else(|| malformed(key))?;
+                    out.output = Some((path.to_string(), number(key, bytes)?));
                 }
                 "stdout" | "stderr" => {
-                    let len: i64 = value.parse().unwrap_or(-1);
-                    if len < 0 {
-                        continue; // the declaration hides this stream
+                    // `-1` is the one length that is not one: the declaration hides this stream.
+                    // Any other that does not read is an error rather than a hidden stream, whose
+                    // bytes would then be read as header lines of the answer.
+                    if value == "-1" {
+                        continue;
                     }
-                    let len = len as usize;
+                    let len: usize = number(key, value)?;
                     // A declared length longer than what arrived is an error, not a shorter
                     // stream. The whole answer is already in hand (`read_to_end`), so this is a
                     // plane that died mid-write or miscounted, and the two are indistinguishable
@@ -2085,6 +2086,31 @@ pub(crate) mod client {
             io::ErrorKind::UnexpectedEof,
             "the task plane's answer ended before its closing `ok`",
         ))
+    }
+
+    /// A number of the plane's answer. The plane writes each one itself, so one that does not read
+    /// is a plane that miscounted or an answer that is not the plane's, and a default in its place
+    /// would hand the caller a value nobody wrote.
+    fn number<T: std::str::FromStr>(key: &str, value: &str) -> io::Result<T> {
+        value.parse().map_err(|_| malformed(key))
+    }
+
+    /// A flag of the plane's answer, which the plane writes as `0` or `1`.
+    fn flag(key: &str, value: &str) -> io::Result<bool> {
+        match value {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            _ => Err(malformed(key)),
+        }
+    }
+
+    /// The error for a field of the answer that does not read as the plane writes it. The field is
+    /// named and its value is not: a value can be anything the answer carried.
+    fn malformed(key: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the task plane's answer has a malformed `{key}` line"),
+        )
     }
 
     /// Split off one `\n`-terminated line, returning it without the newline.
