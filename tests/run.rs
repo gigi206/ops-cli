@@ -8930,18 +8930,19 @@ fn a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage() {
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    // The host PulseAudio socket is now bound into the cage and named through PULSE_SERVER.
-    let out = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &["run", "--", "sh", "-c", check],
-    );
-    assert!(
-        out.status.success(),
-        "a trusted audio posture must launch a working cage; stderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    // The host PulseAudio socket is now bound into the cage and named through PULSE_SERVER. The
+    // launch provisions `nix:alsa-utils`, a download the untrusted probe never made, so a fetch that
+    // fails twice skips as unreachable; any other failure is the launch's own.
+    let Some(out) = trusted_launch("audio e2e", || {
+        sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["run", "--", "sh", "-c", check],
+        )
+    }) else {
+        return;
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("PULSE-PRESENT"),
