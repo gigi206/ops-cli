@@ -1492,6 +1492,18 @@ fn expand_allow_path(field: &str, raw: &str, exp: &Expansion) -> Result<Option<P
         Some((h, r)) => (h, Some(r)),
         None => (raw, None),
     };
+    let unsupported = || {
+        format!(
+            "`{field}` entry `{raw}` uses an unsupported variable \
+             (only `~`, `$HOME`, `$XDG_RUNTIME_DIR` are expanded)"
+        )
+    };
+    // Only the head is ever expanded, so a `$` past it is refused whatever the head is: past an
+    // expanded one it would bind a name literally spelled `$...` while reading as a variable. Asked
+    // before the head is looked up, so the answer is the manifest's alone, whatever the host sets.
+    if rest.is_some_and(|r| r.contains('$')) {
+        return Err(unsupported());
+    }
     let base = match head {
         // An unset variable **drops the entry** rather than refusing the plugin, which is the
         // same answer the mount already gives: every grant path is a `--ro-bind-try`, so a path
@@ -1517,11 +1529,8 @@ fn expand_allow_path(field: &str, raw: &str, exp: &Expansion) -> Result<Option<P
             }
         },
         other => {
-            if other.contains('$') || rest.is_some_and(|r| r.contains('$')) {
-                return Err(format!(
-                    "`{field}` entry `{raw}` uses an unsupported variable \
-                     (only `~`, `$HOME`, `$XDG_RUNTIME_DIR` are expanded)"
-                ));
+            if other.contains('$') {
+                return Err(unsupported());
             }
             let p = PathBuf::from(raw);
             if !p.is_absolute() {
@@ -3450,6 +3459,31 @@ mod tests {
     fn an_unsupported_path_variable_is_refused() {
         assert!(expand_allow_path("allow_paths", "$SECRET_DIR/x", &Expansion::default()).is_err());
         assert!(expand_allow_path("allow_paths", "/etc/$injected", &Expansion::default()).is_err());
+    }
+
+    /// A `$` past an expanded head is refused as one in a literal path is: only the head is ever
+    /// expanded, so `~/$SECRET` would bind a directory literally named `$SECRET` while reading as a
+    /// variable, which is what the documented rule (any other `$` is refused) exists to rule out.
+    /// Each head is its own branch, and every admitted shape is reported.
+    #[test]
+    fn a_variable_past_an_expanded_head_is_refused() {
+        let exp = Expansion {
+            home: Some(PathBuf::from("/home/u")),
+            runtime: Some(PathBuf::from("/run/user/1000")),
+        };
+        let mut admitted = Vec::new();
+        for entry in ["~/$SECRET", "$HOME/x/$Y", "$XDG_RUNTIME_DIR/$Z/sock"] {
+            match expand_allow_path("allow_paths", entry, &exp) {
+                Err(why) if why.contains(entry) && why.contains("unsupported variable") => {}
+                other => admitted.push(format!("{entry}: {other:?}")),
+            }
+        }
+        assert!(admitted.is_empty(), "a `$` past the head: {admitted:#?}");
+        // The witness: an expanded head with a plain tail still expands.
+        assert_eq!(
+            expand_allow_path("allow_paths", "~/.password-store", &exp),
+            Ok(Some(PathBuf::from("/home/u/.password-store")))
+        );
     }
 
     #[test]
