@@ -748,19 +748,31 @@ fn parse_path_rule(
              constrain them"
         ));
     }
-    // An encoded separator is the fourth spelling of the same mistake. `canonical_segments` decodes
-    // a path before it splits it, on the rule's side exactly as on the request's, so `host/a%2fb`
-    // matches `/a/b` while `sbx test net` prints it back as `a%2fb` — a rule that reads as one
-    // segment and matches two. Percent-encoding itself stays legal, because decoding is the
-    // contract: `/%73ecret` is `/secret` and an author may reasonably write either. It is the
-    // separator alone that changes the shape of what the rule matches.
-    if path.to_ascii_lowercase().contains("%2f") {
+    // An encoded delimiter is the same mistake spelled once more. `canonical_segments` decodes a
+    // path before it splits it at `/` and cuts it at `#` and `;`, on the rule's side exactly as on
+    // the request's, so `host/a%2fb` matches `/a/b` and `host/a%23b` matches `/a`, while `sbx test
+    // net` prints either back as written — a rule that reads as one resource and matches another.
+    // Percent-encoding itself stays legal, because decoding is the contract: `/%73ecret` is
+    // `/secret` and an author may reasonably write either. Only a delimiter changes what the rule
+    // matches.
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("%2f") {
         let opened = opened_path(path);
         return Err(format!(
             "entry `{s}` writes an encoded `/` in a path rule — the path is decoded before it is \
              split, so this matches `{opened}` while reading as one segment. Write the separator \
              literally"
         ));
+    }
+    for (encoded, delimiter) in [("%23", '#'), ("%3b", ';')] {
+        if lower.contains(encoded) {
+            let opened = opened_path(path);
+            return Err(format!(
+                "entry `{s}` writes an encoded `{delimiter}` in a path rule — the path is decoded \
+                 before it is cut at `{delimiter}`, so this matches `{opened}`. Use `re:` to name \
+                 it: a regex is matched against the decoded URL, where it reads `{delimiter}`"
+            ));
+        }
     }
     let subtree = path.ends_with("/*");
     // A `*` anywhere but the trailing `/*` is a literal segment, and silently so: `deny =

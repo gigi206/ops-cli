@@ -429,6 +429,27 @@ fn a_path_rule_may_not_carry_an_encoded_separator() {
     assert!(classify("api.test/a%252fb").is_ok());
 }
 
+/// An encoded `#` or `;` is cut like the delimiter it decodes to, on the rule's path as on the
+/// request's, so a rule carrying one matches the path before it: `host/a%23b` opened `/a` and
+/// printed back as `a%23b`. Refused like the encoded separator, naming the path really opened; a
+/// double-encoded delimiter decodes to a literal `%23` inside one segment and stays admitted.
+#[test]
+fn a_path_rule_may_not_carry_an_encoded_fragment_or_parameter_delimiter() {
+    for (entry, delimiter, opened) in [
+        ("api.test/a%23b", "#", "`/a`"),
+        ("api.test/a%3Bb/c", ";", "`/a/c`"),
+        ("api.test/a%3bb/c", ";", "`/a/c`"),
+    ] {
+        let e = classify(entry).unwrap_err();
+        assert!(
+            e.contains(&format!("encoded `{delimiter}`")) && e.contains(opened),
+            "the refusal names the encoding and the path really opened: {e}"
+        );
+    }
+    assert!(classify("api.test/a%2523b").is_ok());
+    assert!(classify("api.test/a%253Bb").is_ok());
+}
+
 /// `canonical_segments` strips a `#fragment` and a segment's `;parameters` from a request's path,
 /// and from the rule's path with it, so a rule written with either matches the bare path while
 /// displaying a form that names something narrower — the operator reads a rule for one resource

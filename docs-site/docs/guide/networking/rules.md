@@ -194,7 +194,9 @@ would leave it matching the bare path.
 Both the fragment and the parameters are cut **after** decoding, so an encoded `%23` or
 `%3B` counts as the delimiter it decodes to. That is deliberate and it cuts one way: a
 rule may cover one spelling more than a strict reading would give it, and no spelling a
-server folds back onto a denied path escapes the deny.
+server folds back onto a denied path escapes the deny. A *rule* written with `%23`, `%3B`
+or `%2F` in its own path is refused like the delimiter written in clear, because the
+same decoding would make it match a path other than the one it reads as.
 For a query-specific or otherwise arbitrary pattern, use `re:` (which is decoded but
 **not** `.`/`..`-resolved: see below).
 
