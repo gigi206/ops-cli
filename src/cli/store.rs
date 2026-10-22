@@ -122,11 +122,12 @@ struct VolumeView {
 /// The shared nix store, described in its own terms rather than as a plain directory.
 #[derive(serde::Serialize)]
 struct SharedStoreView {
-    /// Realised store paths (the `.links` dedup pool is not one of them).
-    paths: u64,
+    /// Realised store paths (the `.links` dedup pool is not one of them). `None` when the store
+    /// directory could not be listed.
+    paths: Option<u64>,
     /// Entries in nix's `.links` pool. A populated pool means identical files across the store
-    /// already share one inode.
-    deduplicated_files: u64,
+    /// already share one inode. `None` when the pool could not be listed.
+    deduplicated_files: Option<u64>,
 }
 
 /// `sbx store` — report sbx's on-disk footprint.
@@ -415,24 +416,40 @@ fn volume_view() -> Option<VolumeView> {
 }
 
 /// Count the shared store's realised paths and its dedup pool. `None` before the store exists.
+///
+/// A count whose listing fails for any other reason is `None`, which the report states: taken as
+/// empty, an unreadable store would claim no realised path, and an unreadable pool no file shared.
 fn shared_store_view(store_dir: &Path) -> Option<SharedStoreView> {
     let nix_store = store_dir.join("nix/store");
-    let entries = std::fs::read_dir(&nix_store).ok()?;
-    let mut paths = 0;
-    for entry in entries.flatten() {
-        // `.links` is nix's dedup pool, not a realised store path.
-        if entry.file_name() == ".links" {
-            continue;
-        }
-        paths += 1;
-    }
-    let deduplicated_files = std::fs::read_dir(nix_store.join(".links"))
-        .map(|rd| rd.flatten().count() as u64)
-        .unwrap_or(0);
+    // `.links` is nix's dedup pool, not a realised store path.
+    let paths = match count_entries(&nix_store, Some(".links")) {
+        Ok(n) => Some(n),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => None,
+    };
+    // A store nix has not deduplicated into yet has no pool at all.
+    let deduplicated_files = match count_entries(&nix_store.join(".links"), None) {
+        Ok(n) => Some(n),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+        Err(_) => None,
+    };
     Some(SharedStoreView {
         paths,
         deduplicated_files,
     })
+}
+
+/// The number of entries `dir` lists, any named `skip` aside. A listing that fails part-way is an
+/// error, not a smaller count.
+fn count_entries(dir: &Path, skip: Option<&str>) -> std::io::Result<u64> {
+    let mut n = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if skip.is_none_or(|skip| entry.file_name() != skip) {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// Render the report as aligned text.
@@ -521,18 +538,22 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
     }
 
     if let Some(store) = &v.shared_store {
-        let _ = writeln!(
-            s,
-            "\n  {}",
-            style::prose(
-                &format!(
-                    "shared store: {} realised path(s), {} file(s) deduplicated into `.links`",
-                    thousands(store.paths),
-                    thousands(store.deduplicated_files),
-                ),
-                pal
-            )
-        );
+        let line = match (store.paths, store.deduplicated_files) {
+            (Some(paths), Some(files)) => format!(
+                "shared store: {} realised path(s), {} file(s) deduplicated into `.links`",
+                thousands(paths),
+                thousands(files),
+            ),
+            (Some(paths), None) => format!(
+                "shared store: {} realised path(s); `.links` could not be read, so the files \
+                 deduplicated into it are not counted",
+                thousands(paths),
+            ),
+            (None, _) => "shared store: `nix/store` could not be read, so neither its realised \
+                          paths nor the files deduplicated into `.links` are counted"
+                .to_string(),
+        };
+        let _ = writeln!(s, "\n  {}", style::prose(&line, pal));
     }
 
     if let Some(x) = &v.extents {
@@ -638,8 +659,12 @@ mod tests {
         assert_eq!(v.inodes, v.subtrees.iter().map(|t| t.inodes).sum::<u64>());
 
         let store = v.shared_store.expect("the store directory exists");
-        assert_eq!(store.paths, 2, "`.links` is not a realised store path");
-        assert_eq!(store.deduplicated_files, 1);
+        assert_eq!(
+            store.paths,
+            Some(2),
+            "`.links` is not a realised store path"
+        );
+        assert_eq!(store.deduplicated_files, Some(1));
     }
 
     /// The closing note tells the truth about *this* filesystem: exact where storage is not shared,
@@ -1027,6 +1052,69 @@ mod tests {
             "{out}"
         );
         assert!(!row.contains("nix store"), "{out}");
+    }
+
+    /// A shared store whose listing fails is said to be unread, never read as empty: an unreadable
+    /// store claimed no realised path by vanishing from the report, and an unreadable pool claimed
+    /// no file deduplicated. A store with no pool yet has deduplicated nothing.
+    #[test]
+    fn a_shared_store_that_cannot_be_listed_is_not_counted_as_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new();
+        let store_dir = tmp.path().join("store");
+        let nix_store = store_dir.join("nix/store");
+        std::fs::create_dir_all(nix_store.join("aaaa-x")).unwrap();
+        let view = || shared_store_view(&store_dir).expect("the store exists");
+        let counts = |v: SharedStoreView| (v.paths, v.deduplicated_files);
+        assert_eq!(
+            counts(view()),
+            (Some(1), Some(0)),
+            "no pool is nothing deduplicated"
+        );
+
+        let links = nix_store.join(".links");
+        std::fs::create_dir_all(&links).unwrap();
+        std::fs::write(links.join("h1"), b"x").unwrap();
+        let mode = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        mode(&links, 0o000);
+        if std::fs::read_dir(&links).is_ok() {
+            mode(&links, 0o700);
+            skip_incapable!("running as root, which reads a directory its mode refuses");
+            return;
+        }
+        let pool_unread = view();
+        mode(&links, 0o700);
+        mode(&nix_store, 0o000);
+        let store_unread = shared_store_view(&store_dir);
+        mode(&nix_store, 0o700);
+        assert_eq!(counts(pool_unread), (Some(1), None));
+        let store_unread = store_unread.expect("an unreadable store is still a store");
+        assert_eq!(store_unread.paths, None);
+
+        let line = |store| {
+            let v = StoreView {
+                data_dir: "/d".into(),
+                bytes: 0,
+                size: "0 B".into(),
+                inodes: 0,
+                unreadable: 0,
+                shares_storage: Some(false),
+                subtrees: vec![row("store/", 4096)],
+                shared_store: Some(store),
+                volume: None,
+                extents: None,
+            };
+            render(&v, &style::Palette::plain())
+        };
+        let out = line(SharedStoreView {
+            paths: Some(1),
+            deduplicated_files: None,
+        });
+        assert!(out.contains("`.links` could not be read"), "{out}");
+        let out = line(store_unread);
+        assert!(out.contains("`nix/store` could not be read"), "{out}");
     }
 
     /// A data directory that does not exist yet is nothing provisioned, and one that cannot be

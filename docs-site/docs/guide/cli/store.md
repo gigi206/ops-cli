@@ -35,7 +35,8 @@ sbx store — /home/you/.local/share/sbx (34.4 GiB, 589 948 inodes)
 
 The trailing line describes the shared store in its own terms: how many store paths are realised,
 and how many files nix has deduplicated into its `.links` pool (identical content sharing a single
-inode).
+inode). When the store directory or the pool cannot be read, the line says so instead of counting
+nothing, and `--json` carries that count as `null`.
 
 Before anything is provisioned the data directory may not exist yet, and the report says
 `(nothing provisioned yet)`. A data directory that exists but cannot be listed is an error
