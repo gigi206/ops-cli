@@ -2011,12 +2011,18 @@ pub(crate) struct TreeUsage {
     /// Distinct inodes — the metric an inode-bounded filesystem (ext4 sizes its table at mkfs)
     /// actually runs out of.
     pub(crate) inodes: u64,
+    /// Entries the walk could not read — a directory it could not list, an entry it could not
+    /// examine, a tree nested deeper than a path can name — whose bytes and inodes are missing from
+    /// the two figures above. An entry that vanished during the walk is not one of them: it no
+    /// longer holds anything.
+    pub(crate) unreadable: u64,
 }
 
 /// The on-disk usage of a tree — allocated bytes and distinct inodes — walked once.
 ///
 /// Symlinks are not followed. Best-effort: an unreadable entry is skipped rather than failing the
-/// report. A file with several links is counted once per call, tracked by `(dev, ino)`; the set
+/// report, and counted in [`TreeUsage::unreadable`] so the report can say its figures fall short. A
+/// file with several links is counted once per call, tracked by `(dev, ino)`; the set
 /// only ever holds multiply-linked files, so it stays small on a tree with none. Per-call dedup is
 /// the correct scope here because sbx's trees never share inodes with one another: hardlinking the
 /// shared store into a project store was rejected by design (a same-uid write would reach through
@@ -2038,8 +2044,12 @@ pub(crate) fn tree_usage(path: &Path) -> TreeUsage {
     use std::os::unix::fs::MetadataExt;
     let mut usage = TreeUsage::default();
     // The root counts as part of what the tree occupies — removing the tree removes it too.
-    let Ok(root) = path.symlink_metadata() else {
-        return usage;
+    let root = match path.symlink_metadata() {
+        Ok(root) => root,
+        Err(e) => {
+            usage.unreadable += unread(&e);
+            return usage;
+        }
     };
     usage.bytes += root.blocks() * 512;
     usage.inodes += 1;
@@ -2064,24 +2074,36 @@ pub(crate) fn tree_usage(path: &Path) -> TreeUsage {
 /// a caller derives as `total - parts` is exact rather than a difference of independently
 /// deduplicated figures, because the hardlink set is shared across the whole walk.
 ///
-/// A part that does not exist reports zero. A part nested inside another part is not supported: the
-/// two would each count the shared entries once, and the total would count them once.
+/// A part that does not exist reports zero. A part that cannot be examined reports itself unreadable
+/// and is left to the walk of the rest, which meets it where [`tree_usage`] would: every entry is
+/// read by one walk only, so the total's unreadable count is the whole tree's as well. A part nested
+/// inside another part is not supported: the two would each count the shared entries once, and the
+/// total would count them once.
 pub(crate) fn tree_usage_parts(root: &Path, parts: &[PathBuf]) -> (TreeUsage, Vec<TreeUsage>) {
     use std::os::unix::fs::MetadataExt;
     let mut total = TreeUsage::default();
     let mut split = vec![TreeUsage::default(); parts.len()];
     // The root counts as part of what the tree occupies — removing the tree removes it too.
-    let Ok(meta) = root.symlink_metadata() else {
-        return (total, split);
+    let meta = match root.symlink_metadata() {
+        Ok(meta) => meta,
+        Err(e) => {
+            total.unreadable += unread(&e);
+            return (total, split);
+        }
     };
     total.bytes += meta.blocks() * 512;
     total.inodes += 1;
     let mut seen = std::collections::HashSet::new();
     // The named subtrees first, each into its own figures, so a part reports exactly what it would
     // have on its own; the walk of the rest then skips them rather than visiting them again.
+    let mut walked = Vec::with_capacity(parts.len());
     for (usage, part) in split.iter_mut().zip(parts) {
-        let Ok(part_meta) = part.symlink_metadata() else {
-            continue;
+        let part_meta = match part.symlink_metadata() {
+            Ok(part_meta) => part_meta,
+            Err(e) => {
+                usage.unreadable += unread(&e);
+                continue;
+            }
         };
         usage.bytes += part_meta.blocks() * 512;
         usage.inodes += 1;
@@ -2092,12 +2114,20 @@ pub(crate) fn tree_usage_parts(root: &Path, parts: &[PathBuf]) -> (TreeUsage, Ve
         }
         total.bytes += usage.bytes;
         total.inodes += usage.inodes;
+        total.unreadable += usage.unreadable;
+        walked.push(part.clone());
     }
     // ...and the rest of the tree, skipping the parts already accounted for above.
     if meta.is_dir() {
-        accumulate_usage(root, parts, &mut seen, &mut total);
+        accumulate_usage(root, &walked, &mut seen, &mut total);
     }
     (total, split)
+}
+
+/// What an error met by a size walk adds to [`TreeUsage::unreadable`]: one entry whose figures are
+/// missing, unless the entry vanished since it was listed and so holds nothing any longer.
+fn unread(e: &io::Error) -> u64 {
+    u64::from(e.kind() != io::ErrorKind::NotFound)
 }
 
 fn accumulate_usage(
@@ -2107,34 +2137,42 @@ fn accumulate_usage(
     usage: &mut TreeUsage,
 ) {
     use std::os::unix::fs::MetadataExt;
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return;
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            usage.unreadable += unread(&e);
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                usage.unreadable += unread(&e);
+                continue;
+            }
+        };
         let child = entry.path();
         if skip.contains(&child) {
             continue;
         }
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => {
-                if let Ok(m) = child.symlink_metadata() {
-                    usage.bytes += m.blocks() * 512;
-                    usage.inodes += 1;
-                }
-                accumulate_usage(&child, skip, seen, usage);
+        // A directory whose own entry cannot be examined cannot be listed either, so it is counted
+        // once here rather than descended into.
+        let m = match child.symlink_metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                usage.unreadable += unread(&e);
+                continue;
             }
-            Ok(_) => {
-                let Ok(m) = child.symlink_metadata() else {
-                    continue;
-                };
-                // Only a multiply-linked file can be reached twice, so only those need remembering.
-                if m.nlink() > 1 && !seen.insert((m.dev(), m.ino())) {
-                    continue;
-                }
-                usage.bytes += m.blocks() * 512;
-                usage.inodes += 1;
-            }
-            Err(_) => {}
+        };
+        // Only a multiply-linked file can be reached twice, so only those need remembering.
+        if !m.is_dir() && m.nlink() > 1 && !seen.insert((m.dev(), m.ino())) {
+            continue;
+        }
+        usage.bytes += m.blocks() * 512;
+        usage.inodes += 1;
+        if m.is_dir() {
+            accumulate_usage(&child, skip, seen, usage);
         }
     }
 }
@@ -3602,6 +3640,72 @@ mod tests {
         let (again, missing) = tree_usage_parts(&root, &[root.join("absent")]);
         assert_eq!(missing[0], TreeUsage::default());
         assert_eq!(again, total);
+    }
+
+    /// An entry the size walk cannot read is counted, never passed over in silence: its bytes are
+    /// missing from the figures, and a report has to be able to say so. One shape per place the walk
+    /// can fail, each also read through the breakdown, whose total stays the whole tree's.
+    #[test]
+    fn an_entry_the_size_walk_cannot_read_is_counted() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        let tmp = TmpDir::new();
+        let outer = tmp.path().join("outer");
+        let root = outer.join("tree");
+        for sub in ["store", "home"] {
+            std::fs::create_dir_all(root.join(sub).join("deep")).unwrap();
+            std::fs::write(root.join(sub).join("payload"), b"x").unwrap();
+        }
+        let parts = [root.join("store"), root.join("home")];
+        let walk = || (tree_usage(&root), tree_usage_parts(&root, &parts));
+
+        // A directory that cannot be listed, inside a part.
+        let deep = root.join("home/deep");
+        mode(&deep, 0o000);
+        if std::fs::read_dir(&deep).is_ok() {
+            mode(&deep, 0o700);
+            skip_incapable!("running as root, which reads a directory its mode refuses");
+            return;
+        }
+        let (whole, (total, split)) = walk();
+        mode(&deep, 0o700);
+        assert_eq!(whole.unreadable, 1, "{whole:?}");
+        assert_eq!(split[1].unreadable, 1, "the part that holds it: {split:?}");
+        assert_eq!(total, whole, "the breakdown's total is the whole tree's");
+
+        // A directory that can be listed but not searched: each entry in it, a file and a directory
+        // alike, cannot be examined, and each counts once.
+        mode(&root.join("home"), 0o400);
+        let (whole, (total, split)) = walk();
+        mode(&root.join("home"), 0o700);
+        assert_eq!(whole.unreadable, 2, "{whole:?}");
+        assert_eq!(split[1].unreadable, 2, "{split:?}");
+        assert_eq!(total, whole);
+
+        // A part that cannot be examined, the tree above it not searchable: the part says so, and
+        // the walk of the rest counts it where the whole tree's walk does.
+        mode(&root, 0o400);
+        let (whole, (total, split)) = walk();
+        mode(&root, 0o700);
+        assert_eq!(whole.unreadable, 2, "{whole:?}");
+        assert_eq!(
+            (split[0].unreadable, split[1].unreadable),
+            (1, 1),
+            "{split:?}"
+        );
+        assert_eq!(total, whole);
+
+        // A root that cannot be examined at all.
+        mode(&outer, 0o600);
+        let (whole, (total, _)) = walk();
+        mode(&outer, 0o700);
+        assert_eq!(whole.unreadable, 1, "{whole:?}");
+        assert_eq!(total, whole);
+
+        // A root that is not there is nothing unread.
+        assert_eq!(tree_usage(&tmp.path().join("absent")), TreeUsage::default());
     }
 
     /// A symlink is sized as the link, never as the tree it points at — the root of the walk as

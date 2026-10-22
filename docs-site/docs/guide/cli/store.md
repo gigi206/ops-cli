@@ -56,7 +56,8 @@ the `btrfs volume` line is the *real* figure: the same `on host` number
 [`sbx storage status`](storage) reports.
 
 `--json` emits the same data as a document, with the raw `bytes` and `inodes` alongside the
-rendered size; on a volume it carries a `volume` object (`image`, `host_bytes`, `host_size`).
+rendered size, and `unreadable`, the number of entries that could not be read; on a volume it
+carries a `volume` object (`image`, `host_bytes`, `host_size`).
 
 ## What each subtree holds alone: `--shared`
 
@@ -164,6 +165,14 @@ Two properties always hold, because they decide whether the numbers agree with o
 - **A hardlinked file counts once**, however many names point at it. This is essential here: a nix
   store deduplicates identical files into `.links`, so counting each name would roughly *double*
   the reported size of any store.
+
+An entry the walk cannot read, such as a directory whose mode refuses you or a tree nested deeper
+than a path can name, is counted rather than skipped in silence. Its bytes are missing from every
+size, so a line under the rows says how many such entries there are:
+
+```
+  1 entry could not be read; its bytes are missing from these figures.
+```
 
 Whether a size is **exact or an upper bound** then depends on the filesystem, and the last line of
 the report says which case yours is:

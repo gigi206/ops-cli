@@ -46,6 +46,10 @@ struct StoreView {
     bytes: u64,
     size: String,
     inodes: u64,
+    /// Entries that could not be read, whose bytes and inodes are missing from every size above: a
+    /// directory whose mode refuses sbx, a tree nested deeper than a path can name. With `--shared`,
+    /// the extent walk's own count.
+    unreadable: u64,
     /// Whether the data directory's filesystem shares storage between files (reflink/copy-on-write).
     /// When it does, the reported sizes are upper bounds rather than exact; when it does not, each
     /// file's blocks are its own and the sizes are exact.
@@ -193,32 +197,43 @@ pub(crate) fn store_cmd(args: &[OsString]) -> ExitCode {
 /// restates each of them from its extent walk ([`apply_extents`]), and a block walk before it would
 /// be thrown away.
 fn build(data_dir: &Path, store_dir: &Path, sized: bool) -> std::io::Result<StoreView> {
-    let mut subtrees: Vec<SubtreeView> = match std::fs::read_dir(data_dir) {
-        Ok(rd) => rd
-            .flatten()
-            .map(|e| {
-                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                let name = e.file_name().to_string_lossy().into_owned();
-                let (bytes, inodes) = if sized {
-                    let usage = sandbox::tree_usage(&e.path());
-                    (usage.bytes, usage.inodes)
-                } else {
-                    (0, 0)
-                };
-                SubtreeView {
-                    label: if is_dir { format!("{name}/") } else { name },
-                    bytes,
-                    size: sandbox::human_bytes(bytes),
-                    inodes,
-                    purpose: paths::data_entry_purpose(&e.file_name().to_string_lossy()),
-                    exclusive_bytes: None,
-                    path: e.path(),
+    let mut entries = Vec::new();
+    let mut unreadable = 0;
+    match std::fs::read_dir(data_dir) {
+        Ok(rd) => {
+            for entry in rd {
+                match entry {
+                    Ok(e) => entries.push(e),
+                    // An entry the listing could not return is missing from every figure, like one
+                    // the walk below could not read.
+                    Err(_) => unreadable += 1,
                 }
-            })
-            .collect(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
-    };
+    }
+    let mut subtrees = Vec::with_capacity(entries.len());
+    for e in &entries {
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let name = e.file_name().to_string_lossy().into_owned();
+        let (bytes, inodes) = if sized {
+            let usage = sandbox::tree_usage(&e.path());
+            unreadable += usage.unreadable;
+            (usage.bytes, usage.inodes)
+        } else {
+            (0, 0)
+        };
+        subtrees.push(SubtreeView {
+            label: if is_dir { format!("{name}/") } else { name },
+            bytes,
+            size: sandbox::human_bytes(bytes),
+            inodes,
+            purpose: paths::data_entry_purpose(&e.file_name().to_string_lossy()),
+            exclusive_bytes: None,
+            path: e.path(),
+        });
+    }
     // Largest first: the point of the report is to show where the space went.
     subtrees.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.label.cmp(&b.label)));
 
@@ -228,6 +243,7 @@ fn build(data_dir: &Path, store_dir: &Path, sized: bool) -> std::io::Result<Stor
         bytes,
         size: sandbox::human_bytes(bytes),
         inodes: subtrees.iter().map(|s| s.inodes).sum(),
+        unreadable,
         // Probe the real filesystem, capability rather than name, so the honesty of the sizes is
         // decided by what this filesystem actually does — not a hardcoded list of filesystem types.
         // `reflink_verdict` rather than `supports_reflink`: the latter collapses "could not probe"
@@ -264,6 +280,7 @@ fn apply_extents(
     view.bytes = total.blocks;
     view.size = sandbox::human_bytes(total.blocks);
     view.inodes = total.inodes;
+    view.unreadable = report.unreadable;
     view.extents = Some(ExtentView {
         referenced_bytes: total.extent_bytes,
         distinct_bytes: report.distinct_bytes,
@@ -337,21 +354,22 @@ fn render_extents(x: &ExtentView, pal: &style::Palette) -> String {
          compression; the host gets it back once that space is discarded (`sbx storage status`).{r}"
     );
     if x.unreadable > 0 {
-        let _ = writeln!(
-            s,
-            "  {}",
-            style::prose(
-                &format!(
-                    "{} entr{} could not be read; {} bytes are missing from these figures.",
-                    thousands(x.unreadable),
-                    if x.unreadable == 1 { "y" } else { "ies" },
-                    if x.unreadable == 1 { "its" } else { "their" },
-                ),
-                pal
-            )
-        );
+        let _ = writeln!(s, "  {}", unread_line(x.unreadable, pal));
     }
     s
+}
+
+/// The sentence that says how many entries a walk could not read, whose bytes every figure lacks.
+fn unread_line(n: u64, pal: &style::Palette) -> String {
+    style::prose(
+        &format!(
+            "{} entr{} could not be read; {} bytes are missing from these figures.",
+            thousands(n),
+            if n == 1 { "y" } else { "ies" },
+            if n == 1 { "its" } else { "their" },
+        ),
+        pal,
+    )
 }
 
 /// The storage volume sbx is currently following, if any — for the real host cost of its image.
@@ -418,7 +436,8 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
             vol.host_size, vol.image
         );
     }
-    if v.subtrees.is_empty() {
+    // Nothing to show is nothing provisioned only when nothing was left unread.
+    if v.subtrees.is_empty() && v.unreadable == 0 {
         let _ = writeln!(s, "  {dim}(nothing provisioned yet){r}");
         return s;
     }
@@ -461,6 +480,10 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
             size = t.size,
             inodes = thousands(t.inodes),
         );
+    }
+    // With `--shared` the breakdown states its own walk's count, which this one then is.
+    if v.extents.is_none() && v.unreadable > 0 {
+        let _ = writeln!(s, "  {}", unread_line(v.unreadable, pal));
     }
 
     if let Some(store) = &v.shared_store {
@@ -604,6 +627,7 @@ mod tests {
             bytes: 4096,
             size: "4.0 KiB".into(),
             inodes: 1,
+            unreadable: 0,
             shares_storage: Some(false),
             subtrees: vec![one],
             shared_store: None,
@@ -663,6 +687,7 @@ mod tests {
             bytes: 4096,
             size: "4.0 KiB".into(),
             inodes: 1,
+            unreadable: 0,
             shares_storage: Some(true),
             subtrees: vec![one],
             shared_store: None,
@@ -744,6 +769,7 @@ mod tests {
             bytes: 300,
             size: String::new(),
             inodes: 2,
+            unreadable: 5,
             shares_storage: Some(true),
             subtrees: vec![row("store/", 200), row("apps/", 100)],
             shared_store: None,
@@ -754,7 +780,7 @@ mod tests {
             // The rest of the tree comes last and has no row.
             owners: vec![usage(1000, 10), usage(5000, 4000), usage(4, 0)],
             distinct_bytes: 4500,
-            unreadable: 0,
+            unreadable: 2,
         };
         apply_extents(&mut v, &report, None);
 
@@ -769,9 +795,9 @@ mod tests {
             "the walk's figures, ranked again"
         );
         assert_eq!(
-            (v.bytes, v.inodes),
-            (6004, 30),
-            "the header is the walk's total"
+            (v.bytes, v.inodes, v.unreadable),
+            (6004, 30, 2),
+            "the header is the walk's total, and so is what it could not read"
         );
         let x = v.extents.as_ref().expect("the breakdown");
         assert_eq!((x.referenced_bytes, x.distinct_bytes), (6004, 4500));
@@ -783,6 +809,11 @@ mod tests {
 
         let out = render(&v, &style::Palette::plain());
         assert!(out.contains("3.9 KiB exclusive"), "{out}");
+        assert_eq!(
+            out.matches("2 entries could not be read").count(),
+            1,
+            "the count is stated once, under the breakdown: {out}"
+        );
         assert!(
             out.contains("distinct file data, before compression"),
             "{out}"
@@ -851,6 +882,43 @@ mod tests {
         assert!(v.shared_store.is_none());
         let out = render(&v, &style::Palette::plain());
         assert!(out.contains("nothing provisioned yet"), "{out}");
+    }
+
+    /// An entry the walk cannot read is counted and said: its bytes are missing from every size, so
+    /// the closing note on how exact the sizes are never stands alone.
+    #[test]
+    fn an_entry_that_cannot_be_read_is_counted_and_said() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new();
+        let data = tmp.path().join("data");
+        let hidden = data.join("apps/a");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("blob"), vec![b'x'; 200_000]).unwrap();
+        let mode = |m| std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(m));
+        mode(0o000).unwrap();
+        if std::fs::read_dir(&hidden).is_ok() {
+            mode(0o700).unwrap();
+            skip_incapable!("running as root, which reads a directory its mode refuses");
+            return;
+        }
+        let built = build(&data, &data.join("store"), true);
+        mode(0o700).unwrap();
+        let mut v = built.unwrap();
+        assert_eq!(v.unreadable, 1);
+
+        v.shares_storage = Some(false);
+        let out = render(&v, &style::Palette::plain());
+        assert!(
+            out.contains("1 entry could not be read; its bytes are missing from these figures."),
+            "{out}"
+        );
+        assert!(out.contains("they are exact"), "{out}");
+
+        // With no entry left to show, the count still stands in for them.
+        v.subtrees.clear();
+        let out = render(&v, &style::Palette::plain());
+        assert!(!out.contains("nothing provisioned"), "{out}");
+        assert!(out.contains("1 entry could not be read"), "{out}");
     }
 
     /// A data directory that does not exist yet is nothing provisioned, and one that cannot be
