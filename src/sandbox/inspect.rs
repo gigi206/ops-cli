@@ -141,20 +141,21 @@ pub(crate) fn mise_installed_in(installs: &Path) -> Vec<InstalledTool> {
 
 /// The real backend token mise recorded for the tool installed at `tool_dir` — the `short` (or
 /// `full`) key of its `.mise.backend.toml` (`short = "pipx:demo-agent"`). This recovers the
-/// provider the munged directory name hides. Parsed line-wise (the file is a tiny flat table), so no
-/// TOML dependency. `None` when the metadata is absent or unparsable.
+/// provider the munged directory name hides. Parsed as the TOML mise writes it in, so a literal
+/// string, an escape or a trailing comment reads as mise meant it: a token missed here is matched
+/// by its munged directory name alone, which is not always the name mise gave the directory. `None`
+/// when the metadata is absent or does not parse.
 fn backend_token(tool_dir: &Path) -> Option<String> {
     let body = read_cage_metadata(&tool_dir.join(".mise.backend.toml"))?;
+    let doc = body.parse::<toml::Table>().ok()?;
     let value = |key: &str| {
-        body.lines().find_map(|line| {
-            let rest = line.trim().strip_prefix(key)?.trim_start();
-            let rest = rest.strip_prefix('=')?.trim();
-            let quoted = rest.strip_prefix('"')?.strip_suffix('"')?;
-            // The file sits in the cage's writable home, so its value is payload-chosen; it is
-            // displayed in place of the directory name, so it gets the same filter (see
-            // [`mise_installed_in`]).
-            (!quoted.is_empty()).then(|| crate::sandbox::sanitize(quoted))
-        })
+        // The file sits in the cage's writable home, so its value is payload-chosen; it is
+        // displayed in place of the directory name, so it gets the same filter (see
+        // [`mise_installed_in`]).
+        doc.get(key)
+            .and_then(toml::Value::as_str)
+            .filter(|token| !token.is_empty())
+            .map(crate::sandbox::sanitize)
     };
     value("short").or_else(|| value("full"))
 }
@@ -940,9 +941,11 @@ mod tests {
         let installs = tmp.join(".local/share/mise/installs");
         let tool = "evil\u{1b}[2Ktool";
         std::fs::create_dir_all(installs.join(tool).join("1.0\rfake")).unwrap();
+        // Written with the escape TOML uses for a control character, the form a TOML writer puts
+        // one in: a raw one is not TOML, and the file is then not read at all.
         std::fs::write(
             installs.join(tool).join(".mise.backend.toml"),
-            "short = \"npm:evil\u{1b}[31mpkg\"\n",
+            "short = \"npm:evil\\u001b[31mpkg\"\n",
         )
         .unwrap();
 
@@ -1090,6 +1093,54 @@ mod tests {
             token("bare-tool").as_deref(),
             Some("npm:bare-tool"),
             "an ordinary metadata file still reads back"
+        );
+    }
+
+    /// The token behind one tool directory whose `.mise.backend.toml` says `body`.
+    fn token_recorded_as(body: &str) -> Option<String> {
+        let dir = crate::testutil::TmpDir::new();
+        let installs = dir.path().join(".local/share/mise/installs");
+        std::fs::create_dir_all(installs.join("aqua-burnt-sushi-ripgrep")).unwrap();
+        std::fs::write(
+            installs.join("aqua-burnt-sushi-ripgrep/.mise.backend.toml"),
+            body,
+        )
+        .unwrap();
+        mise_installed(dir.path()).pop()?.token
+    }
+
+    /// A token written as a TOML literal string is read: the directory name mise gave it does not
+    /// munge back from the token, so a missed token is a tool no declaration recognises.
+    #[test]
+    fn a_backend_token_in_a_literal_string_is_read() {
+        assert_eq!(
+            token_recorded_as("short = 'aqua:BurntSushi/ripgrep'\n").as_deref(),
+            Some("aqua:BurntSushi/ripgrep")
+        );
+    }
+
+    /// A token followed by a comment on its line is read without it.
+    #[test]
+    fn a_backend_token_followed_by_a_comment_is_read() {
+        assert_eq!(
+            token_recorded_as("short = \"aqua:BurntSushi/ripgrep\" # recorded by mise\n")
+                .as_deref(),
+            Some("aqua:BurntSushi/ripgrep")
+        );
+    }
+
+    /// The `full` key stands in for a `short` one that is absent or empty.
+    #[test]
+    fn a_backend_token_falls_back_to_full() {
+        assert_eq!(
+            token_recorded_as("full = 'aqua:BurntSushi/ripgrep'\n").as_deref(),
+            Some("aqua:BurntSushi/ripgrep"),
+            "no `short` key"
+        );
+        assert_eq!(
+            token_recorded_as("short = ''\nfull = 'aqua:BurntSushi/ripgrep'\n").as_deref(),
+            Some("aqua:BurntSushi/ripgrep"),
+            "an empty `short` key"
         );
     }
 
