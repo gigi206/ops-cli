@@ -1045,10 +1045,10 @@ fn a_second_detached_writer_is_refused_before_it_is_given_an_id() {
         third.error, None,
         "the directory must be free once the invocation holding it has ended"
     );
-    assert_eq!(
-        stop_invocation(&host, third.id).expect("stop"),
-        StopReply::Stopped,
-        "a stop that did not land would leave this writer running past the test"
+    stop_and_wait_out(
+        &host,
+        third.id,
+        "a stop that did not land would leave this writer running past the test",
     );
 }
 
@@ -1093,6 +1093,32 @@ fn eventually<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
         std::thread::sleep(Duration::from_millis(25));
     }
     None
+}
+
+/// Stop invocation `id`, whose launcher double runs a command it does not `exec`, and wait until
+/// the invocation has left the plane.
+///
+/// The double has no pid namespace and no `--die-with-parent`: the stop kills bash, and the command
+/// bash started runs on, holding the capture pipes, until it ends. When that outlasts the plane's
+/// grace, the plane answers `Stopping`, its honest answer for an invocation that has not ended yet,
+/// and the invocation leaves once the command does. A real cage carries `--die-with-parent`, so the
+/// kill takes the whole cage down there. Either answer is a stop that landed once the invocation is
+/// gone; anything else fails with `why`.
+#[track_caller]
+fn stop_and_wait_out(host: &Path, id: u64, why: &str) {
+    match stop_invocation(host, id).expect("stop") {
+        StopReply::Stopped => {}
+        StopReply::Stopping => {
+            let gone = eventually(|| {
+                let rows = read_status(host).expect("status");
+                (!rows.iter().any(|row| row.id == id)).then_some(())
+            });
+            if gone.is_none() {
+                panic!("{why}: invocation {id} was still running after the stop");
+            }
+        }
+        other => panic!("{why}: {other:?}"),
+    }
 }
 
 /// The whole of `--detach`: the caller is answered with an id while the command is still running,
