@@ -1840,8 +1840,11 @@ fn install_inner(
         layout
             .data_dir()
             .join(format!(".plugin-stage-{}-{}", std::process::id(), unique()));
-    let _ = std::fs::remove_dir_all(&stage);
-    if let Err(e) = copy_tree(source, &stage) {
+    // Created fresh rather than cleared first: the name is predictable, so whatever already sits
+    // there is not this install's, and neither deleting it nor copying through it is. A refusal
+    // here has created nothing, so it leaves nothing to clean up.
+    create_fresh_dir(&stage)?;
+    if let Err(e) = copy_into(source, &stage) {
         let _ = std::fs::remove_dir_all(&stage);
         return Err(e);
     }
@@ -2143,13 +2146,32 @@ pub(crate) fn validate_install_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Recursively copy a plugin source tree into `dst` (which must not yet exist). Only directories
-/// (created owner-only) and regular files (copied with their mode, preserving the executable bit)
-/// are reproduced; a symlink, device, socket, or fifo is refused — a resolver plugin is a small
-/// tree of real files, and copying a link by reference or following it into the host would defeat
-/// the point of staging a self-contained, validated artifact.
+/// Copy a plugin source tree to `dst`, which must not exist yet: [`create_fresh_dir`], then
+/// [`copy_into`].
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    create_fresh_dir(dst)?;
+    copy_into(src, dst)
+}
+
+/// Create `dir` owner-only, and only if nothing is there. A recursive create accepts a name that
+/// already resolves to a directory, a link to one included, so a link planted where a staging tree
+/// is about to be made would carry the copy into its target; `mkdir` refuses any existing entry,
+/// a link among them, without following it.
+fn create_fresh_dir(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))
+}
+
+/// Recursively copy a plugin source tree into the directory `dst`, which [`create_fresh_dir`] has
+/// just made. Only directories (each created fresh, owner-only) and regular files (copied with
+/// their mode, preserving the executable bit) are reproduced; a symlink, device, socket, or fifo is
+/// refused — a resolver plugin is a small tree of real files, and copying a link by reference or
+/// following it into the host would defeat the point of staging a self-contained, validated
+/// artifact.
+fn copy_into(src: &Path, dst: &Path) -> Result<(), String> {
     // Refuse a symlinked source root: `read_dir` would follow it and copy whatever it points at.
     // A plugin source is a real, self-contained directory (the recursive descent below only enters
     // entries already confirmed to be non-symlink directories, so this guards the root each caller
@@ -2162,11 +2184,6 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
             src.display()
         ));
     }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dst)
-        .map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
     let entries =
         std::fs::read_dir(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
     for entry in entries {
@@ -4025,6 +4042,46 @@ mod tests {
         assert!(!layout.plugins_dir().join("pass").exists());
     }
 
+    /// A staging directory, and every directory the copy makes in it, is created fresh and never
+    /// adopted. A recursive create accepts a name that already resolves to a directory, a link to
+    /// one included, so a link planted at the destination redirected the whole copy into its
+    /// target. Both shapes refuse now and leave what was there untouched; a fresh destination, the
+    /// witness, still receives the tree.
+    #[test]
+    fn a_copy_never_adopts_what_already_sits_at_its_destination() {
+        let src_root = crate::testutil::TmpDir::new();
+        let elsewhere = crate::testutil::TmpDir::new();
+        let source = source_plugin(
+            src_root.path(),
+            "pass",
+            "type=\"resolver\"\nscheme=\"pass\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        let data = crate::testutil::TmpDir::new();
+        let link = data.path().join("linked-stage");
+        std::os::unix::fs::symlink(elsewhere.path(), &link).unwrap();
+        let existing = data.path().join("existing-stage");
+        fs::create_dir(&existing).unwrap();
+
+        let mut adopted = Vec::new();
+        for (shape, at) in [("a link", &link), ("a directory", &existing)] {
+            if copy_tree(&source, at).is_ok() {
+                adopted.push(shape);
+            }
+        }
+        assert!(adopted.is_empty(), "the copy adopted {adopted:?}");
+        assert_eq!(
+            fs::read_dir(elsewhere.path()).unwrap().count(),
+            0,
+            "nothing was copied through the link"
+        );
+        assert_eq!(fs::read_dir(&existing).unwrap().count(), 0);
+
+        let fresh = data.path().join("fresh-stage");
+        copy_tree(&source, &fresh).expect("a fresh destination receives the tree");
+        assert!(fresh.join("plugin.toml").is_file() && fresh.join("resolve").is_file());
+    }
+
     #[test]
     fn install_refuses_a_symlink_in_the_tree() {
         let data = crate::testutil::TmpDir::new();
@@ -4236,6 +4293,7 @@ mod tests {
                 &format!("name=\"{n}\"\ntype=\"resolver\"\nscheme=\"vault\"\nexec=\"resolve\"\n"),
                 0o755,
             );
+            fs::create_dir_all(layout.plugins_dir()).unwrap();
             copy_tree(&src, &layout.plugins_dir().join(n)).expect("hand-place");
         }
         let third = source_plugin(
