@@ -7,18 +7,16 @@ use common::fixture::TmpDir;
 use std::path::Path;
 use std::process::Command;
 
-/// The built binary, with the global config isolated the way every other suite isolates it.
+/// The built binary, with the global config and the trust store isolated the way every other suite
+/// isolates them, by [`common::isolated_sbx`].
 ///
 /// Without it, `sbx upgrade` reads the developer's own `~/.config/sbx` and rolls every app declared
 /// there: each launches a cage in the fixture project, provisions that project's packages, and the
 /// suite then measures that machine's catalogue — and its network — rather than the one package the
-/// test declares.
+/// test declares. A test that needs a config or a trust store of its own sets the variable again,
+/// and that later value is the one the command keeps.
 fn sbx() -> Command {
-    let config = common::fixtures_root().join("upgrade-isolated-config");
-    let _ = std::fs::create_dir_all(&config);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
-    cmd.env("XDG_CONFIG_HOME", config);
-    cmd
+    common::isolated_sbx("upgrade-")
 }
 
 #[test]
@@ -285,7 +283,6 @@ fn app_upgrade(config: &Path, data: &Path, proj: &Path, name: &str) -> std::proc
         .current_dir(proj)
         .env("XDG_CONFIG_HOME", config)
         .env("XDG_DATA_HOME", data)
-        .env("LC_ALL", "C.UTF-8")
         .output()
         .expect("spawn sbx app upgrade")
 }
@@ -410,7 +407,6 @@ fn a_name_is_refused_without_a_store_and_the_roll_needs_one() {
             .current_dir(proj.path())
             .env("XDG_CONFIG_HOME", config.path())
             .env("XDG_DATA_HOME", &long)
-            .env("LC_ALL", "C.UTF-8")
             .output()
             .expect("spawn sbx")
     };
@@ -456,7 +452,6 @@ fn narrowed_roll(
         .current_dir(proj)
         .env("XDG_CONFIG_HOME", config)
         .env("XDG_DATA_HOME", data)
-        .env("LC_ALL", "C.UTF-8")
         .output()
         .expect("spawn sbx upgrade");
     let log = format!(
