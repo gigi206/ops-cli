@@ -2490,7 +2490,11 @@ fn join_readers(
 /// margin back off.
 ///
 /// `cut` reports what the **caller** loses, so it is `total > cap` — the margin is not output.
-fn read_capped(pipe: &mut impl Read, cap: usize, margin: usize) -> io::Result<(Vec<u8>, bool)> {
+pub(super) fn read_capped(
+    pipe: &mut impl Read,
+    cap: usize,
+    margin: usize,
+) -> io::Result<(Vec<u8>, bool)> {
     let keep = cap.saturating_add(margin);
     let mut kept = Vec::new();
     let mut total = 0usize;

@@ -191,17 +191,59 @@ pub(crate) fn resolve_env(
         &format!("{slug}-mise"),
     )?
     .into_command();
-    let out = cmd.output()?;
-    if !out.status.success() {
+    let (status, stdout, stderr) = output_capped(&mut cmd)?;
+    if !status.success() {
         return Err(io::Error::other(format!(
             "mise env failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            String::from_utf8_lossy(&stderr).trim()
         )));
     }
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+    let value: serde_json::Value = serde_json::from_slice(&stdout)
         .map_err(|e| io::Error::other(format!("parsing mise env output: {e}")))?;
     let authorized: Vec<&Path> = binds.iter().map(|b| b.dest.as_path()).collect();
     Ok(project_env_from_json(&value, &authorized))
+}
+
+/// The most of `mise env`'s standard output sbx holds: far past what any project's `[env]` comes to
+/// as JSON, and a bound on the memory the read takes in sbx itself, outside the cgroup that bounds
+/// mise's own.
+const MISE_STDOUT_MAX: usize = 4 << 20;
+
+/// The most of mise's standard error kept, for the message a failure carries.
+const MISE_STDERR_MAX: usize = 64 << 10;
+
+/// Run `cmd` to its end with both streams read up to their ceilings ([`super::task::read_capped`],
+/// which drains the rest so mise is never blocked on a full pipe): its status, its standard output
+/// — an error when that ran past [`MISE_STDOUT_MAX`], since a cut JSON document is no answer — and
+/// the head of its standard error.
+fn output_capped(
+    cmd: &mut std::process::Command,
+) -> io::Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err(io::Error::other("mise's streams were not piped"));
+    };
+    let out = std::thread::spawn(move || super::task::read_capped(&mut out, MISE_STDOUT_MAX, 0));
+    let err = std::thread::spawn(move || super::task::read_capped(&mut err, MISE_STDERR_MAX, 0));
+    let status = child.wait()?;
+    let joined = |reader: std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>>| {
+        reader
+            .join()
+            .map_err(|_| io::Error::other("a reader of mise's output panicked"))?
+    };
+    let (stdout, cut) = joined(out)?;
+    let (stderr, _) = joined(err)?;
+    if cut {
+        return Err(io::Error::other(format!(
+            "mise env wrote more than {MISE_STDOUT_MAX} bytes"
+        )));
+    }
+    Ok((status, stdout, stderr))
 }
 
 /// One call's staging directory, `<root>/<pid>-<n>`, removed when it drops.
@@ -828,6 +870,34 @@ mod tests {
                 ("FOO".to_string(), "bar".to_string()),
                 ("GREETING".to_string(), "hello world".to_string()),
             ]
+        );
+    }
+
+    /// What `mise env` prints is read into sbx's own memory, outside the cgroup bounding mise, so
+    /// it is held to a ceiling: standard output past it is an error rather than a cut document,
+    /// and only the head of standard error is kept for the message.
+    #[test]
+    fn mise_output_is_read_up_to_its_ceilings() {
+        let sh = |script: String| {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", &script]);
+            output_capped(&mut cmd)
+        };
+        let past = sh(format!("head -c {} /dev/zero", MISE_STDOUT_MAX + 1))
+            .expect_err("standard output past the ceiling");
+        assert!(past.to_string().contains("more than"), "{past}");
+
+        let (status, stdout, stderr) = sh(format!(
+            "printf '{{}}'; head -c {} /dev/zero >&2; exit 3",
+            MISE_STDERR_MAX * 2
+        ))
+        .expect("a run whose output fits");
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(stdout, b"{}");
+        assert_eq!(
+            stderr.len(),
+            MISE_STDERR_MAX,
+            "the head of standard error, no more"
         );
     }
 
