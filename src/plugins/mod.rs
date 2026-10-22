@@ -3882,6 +3882,36 @@ mod tests {
         assert!(reg.resolver("pass").unwrap().check_exec().is_ok());
     }
 
+    /// A local source whose executable is a link is refused by the source check, before anything
+    /// is copied: the check reaches the executable as the runner does, through no link, rather than
+    /// reading its target and leaving the refusal to the copy's walk of the tree.
+    #[test]
+    fn install_refuses_a_source_whose_executable_is_a_link_before_copying_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let outside = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let source = source_plugin(
+            src_root.path(),
+            "pass",
+            "type=\"resolver\"\nscheme=\"pass\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        let tool = outside.path().join("tool");
+        fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_file(source.join("resolve")).unwrap();
+        std::os::unix::fs::symlink(&tool, source.join("resolve")).unwrap();
+
+        let err = install(&layout, &source).unwrap_err();
+        assert!(
+            err.contains("cannot use the plugin's executable") && err.contains("a symbolic link"),
+            "the source check names the link: {err}"
+        );
+        assert!(!layout.plugins_dir().join("pass").exists());
+    }
+
     #[test]
     fn install_refuses_a_symlink_in_the_tree() {
         let data = crate::testutil::TmpDir::new();
