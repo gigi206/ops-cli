@@ -514,16 +514,22 @@ fn enumerate(
 /// Format a `SystemTime` as a stable `YYYY-MM-DD` (UTC) — the column `sbx path` shows beside each
 /// project's liveness state. Civil-from-days-since-epoch via the Howard Hinnant algorithm, so no
 /// `chrono` dependency; UTC is the right choice for a date-only column (a local day would shift by
-/// your timezone and mislead across a midnight boundary). `UNIX_EPOCH` falls back to `-`.
+/// your timezone and mislead across a midnight boundary). `UNIX_EPOCH` alone falls back to `-`: it
+/// is the stamp [`sandbox::classify_tree`] reports when no mtime reads. Any other moment is dated on
+/// the day it falls in, a moment before the epoch included.
 pub(crate) fn civil_date(t: SystemTime) -> String {
-    let secs = t
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if secs == 0 {
-        return "-".to_string();
-    }
-    let days = (secs / 86_400) as i64;
+    // Whole days since 1970-01-01, rounded down: a moment before the epoch is on a negative day,
+    // counted down from it rather than toward zero.
+    let days = match t.duration_since(UNIX_EPOCH) {
+        Ok(d) if d.is_zero() => return "-".to_string(),
+        Ok(d) => (d.as_secs() / 86_400) as i64,
+        Err(before) => {
+            let d = before.duration();
+            // A partial second before the epoch reaches back into the second before it.
+            let secs_before = d.as_secs() + u64::from(d.subsec_nanos() > 0);
+            -(secs_before.div_ceil(86_400) as i64)
+        }
+    };
     // Howard Hinnant's civil-from-days — maps a count of days since 1970-01-01 to a (y, m, d).
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -1149,5 +1155,31 @@ mod tests {
         // (no wall-clock dependency): 1_783_209_600 s since the epoch.
         let t = UNIX_EPOCH + std::time::Duration::from_secs(1_783_209_600);
         assert_eq!(civil_date(t), "2026-07-05");
+    }
+
+    /// `-` stands for `UNIX_EPOCH` alone, the stamp [`sandbox::classify_tree`] falls back to when no
+    /// mtime reads. Any other moment is dated on the day it falls in: one within the epoch's first
+    /// second is on 1970-01-01, and one before the epoch on the day before it, counted down rather
+    /// than toward zero. Every case is checked before failing, so each one is seen on its own.
+    #[test]
+    fn only_the_epoch_itself_is_undated() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let cases = [
+            (UNIX_EPOCH + ms(500), "1970-01-01"),
+            (UNIX_EPOCH - ms(500), "1969-12-31"),
+            (UNIX_EPOCH - ms(1_000), "1969-12-31"),
+            (UNIX_EPOCH - ms(86_400_000), "1969-12-31"),
+            (UNIX_EPOCH - ms(86_400_500), "1969-12-30"),
+            (UNIX_EPOCH - ms(2_208_988_800_000), "1900-01-01"),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|&(t, want)| {
+                let got = civil_date(t);
+                (got != want).then(|| format!("{t:?}: {got}, want {want}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
