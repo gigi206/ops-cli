@@ -142,7 +142,7 @@ const STOPPED_EXIT: i32 = 128 + libc::SIGKILL;
 /// next poll, and everything before the spawn — a credential resolving through `sops`, a proxy being
 /// stood up — completes first. Long enough to cover the poll interval and a kill many times over, so
 /// "still finishing" means something is genuinely holding it rather than that the wait was stingy.
-const STOP_GRACE: Duration = Duration::from_secs(3);
+pub(crate) const STOP_GRACE: Duration = Duration::from_secs(3);
 
 /// The in-cage destinations a task cage keeps from the agent cage's mount set, on top of the
 /// substrate that cage runs on ([`super::binds::substrate`], kept by rule rather than by entry:

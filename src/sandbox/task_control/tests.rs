@@ -478,6 +478,45 @@ fn host_conn(budget: Duration) -> (UnixStream, std::sync::mpsc::Receiver<io::Res
     (client, rx)
 }
 
+/// A host-side reader gives up on a plane that never answers rather than waiting with it.
+///
+/// The plane here is a socket that is bound and never served: a connect succeeds into its backlog,
+/// the request fits the buffer, and the answer never comes, as from a session that is stopped or
+/// wedged. Each reader that sends a verb executing nothing — a stop, a status read, a held result,
+/// the inventory — returns an error; a `RUN` is not among them, because it answers only when its
+/// command ends.
+#[test]
+fn a_reader_gives_up_on_a_plane_that_never_answers() {
+    let dir = TmpDir::new();
+    let socket = dir.join("silent.sock");
+    let _plane = UnixListener::bind(&socket).expect("bind a plane that never answers");
+    type Reader = fn(&Path) -> io::Result<()>;
+    let readers: [(&str, Reader); 4] = [
+        ("stop", |s| stop_invocation(s, 1).map(drop)),
+        ("status", |s| read_status(s).map(drop)),
+        ("result", |s| client::result(s, 1).map(drop)),
+        ("list", |s| client::list(s).map(drop)),
+    ];
+    let (done, finished) = std::sync::mpsc::channel();
+    for (name, read) in readers {
+        let (socket, done) = (socket.clone(), done.clone());
+        std::thread::spawn(move || {
+            let _ = done.send((name, read(&socket).is_err()));
+        });
+    }
+    let deadline = std::time::Instant::now() + PLANE_IO_TIMEOUT + Duration::from_secs(10);
+    for _ in 0..4 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let (name, failed) = finished
+            .recv_timeout(left)
+            .expect("a reader still waits on a plane that never answers");
+        assert!(
+            failed,
+            "`{name}` read an answer from a plane that never gave one"
+        );
+    }
+}
+
 /// A `LOG` is the verb alone, or with the one `after=<seq>` cursor its client sends.
 ///
 /// Anything else is refused. A verb that merely began `LOG` was read as one, and a cursor that did

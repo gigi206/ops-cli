@@ -26,7 +26,7 @@ a name nothing declares is refused on either side with the names that are declar
 any [name that names nothing](../reference/exit-codes#a-name-that-names-nothing-exits-2), and so is
 a `--session` no live session answers to. A session that could not be asked is not such a name:
 `sbx task show <name>` exits 1 when no session answered and one could not be read, its socket
-gone or its answer cut off before its end. Nor is a session that could not say what it declares:
+gone, its answer cut off before its end, or nothing heard from it for ten seconds. Nor is a session that could not say what it declares:
 `sbx task secrets`, `status`, `logs` and `stop` name it and exit 1 rather than refuse an operation
 it may declare, and pass over a session that has ended since. `--session` is host-only, since a cage reaches exactly
 one plane, its own (the plane address travels as `SBX_TASK_SOCKET`, which is also how `--session` is refused inside a cage rather than

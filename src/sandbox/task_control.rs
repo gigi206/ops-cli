@@ -1623,9 +1623,29 @@ fn serve_host(
     writeln!(writer, "ok")
 }
 
+/// How long a reader of the plane waits on one read or one write before it gives up.
+///
+/// Every verb these readers send is answered at once but `STOP`, which waits up to
+/// [`super::task::STOP_GRACE`] for the invocation to leave, so the bound sits well past that. The
+/// plane is sbx's own supervisor: this is against one that is stuck — a session stopped by
+/// `SIGSTOP`, or wedged — rather than one that is hostile, and a `sbx task` verb then says it got no
+/// answer instead of waiting with it. `RUN` is not bounded by it: an invocation answers when its
+/// command ends, as late as the task's own timeout.
+const PLANE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const _: () = assert!(PLANE_IO_TIMEOUT.as_millis() > super::task::STOP_GRACE.as_millis());
+
+/// Connect to one of the plane's sockets for a verb that executes nothing, both directions bounded
+/// by [`PLANE_IO_TIMEOUT`].
+fn connect_bounded(socket: &Path) -> io::Result<UnixStream> {
+    let stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(PLANE_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(PLANE_IO_TIMEOUT))?;
+    Ok(stream)
+}
+
 /// Ask a session's host-only socket one thing and read the whole answer.
 fn ask_host(socket: &Path, command: &str) -> io::Result<Vec<String>> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = connect_bounded(socket)?;
     writeln!(stream, "{command}")?;
     stream.flush()?;
     let mut text = String::new();
@@ -1636,7 +1656,7 @@ fn ask_host(socket: &Path, command: &str) -> io::Result<Vec<String>> {
 /// Ask a session's host-only socket a verb that only reads, and take its answer only once it is
 /// whole ([`super::reply`]): the lines before the closing `ok`, or a cut answer as an error.
 fn read_host(socket: &Path, command: &str) -> io::Result<Vec<String>> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = connect_bounded(socket)?;
     writeln!(stream, "{command}")?;
     stream.flush()?;
     super::reply::answer(BufReader::new(stream)).collect()
@@ -1966,7 +1986,7 @@ pub(crate) mod client {
 
     /// Collect what a detached invocation produced, in the same shape [`run`] returns.
     pub(crate) fn result(socket: &Path, id: u64) -> io::Result<RunResult> {
-        let mut stream = UnixStream::connect(socket)?;
+        let mut stream = connect_bounded(socket)?;
         writeln!(stream, "RESULT {id}")?;
         stream.flush()?;
         let mut raw = Vec::new();
@@ -2131,7 +2151,7 @@ pub(crate) mod client {
     /// Send a payload-free command and return its response lines (without the trailing `ok`), an
     /// answer cut before that `ok` being an error ([`crate::sandbox::reply`]).
     fn exchange(socket: &Path, command: &str, payload: &[String]) -> io::Result<Vec<String>> {
-        let mut stream = UnixStream::connect(socket)?;
+        let mut stream = connect_bounded(socket)?;
         writeln!(stream, "{command}")?;
         for line in payload {
             writeln!(stream, "{line}")?;
