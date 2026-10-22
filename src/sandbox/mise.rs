@@ -165,9 +165,9 @@ fn command(
 /// dotenv directive) could never ride along.
 ///
 /// `files` are the validated `(filename, bytes)` captured at config load; they are
-/// materialized owner-only into `stage_dir` — which must lie outside every writable
-/// mount — so mise reads exactly those bytes and cannot rewrite them through a
-/// writable alias.
+/// materialized owner-only into a directory of this call's own under `stage_dir` ([`Stage`]) —
+/// which must lie outside every writable mount — so mise reads exactly those bytes and cannot
+/// rewrite them through a writable alias, nor read another launch's.
 pub(crate) fn resolve_env(
     bwrap: &Path,
     layout: &Layout,
@@ -177,7 +177,9 @@ pub(crate) fn resolve_env(
     limits: &super::cgroup::Limits,
     slug: &str,
 ) -> io::Result<Vec<(String, String)>> {
-    let binds = stage_files(stage_dir, files)?;
+    // Held until mise has run: the binds point into it.
+    let stage = Stage::claim(stage_dir)?;
+    let binds = stage_files(stage.path(), files)?;
     let args = [OsString::from("env"), OsString::from("--json-extended")];
     let mut cmd = command(
         bwrap,
@@ -200,6 +202,60 @@ pub(crate) fn resolve_env(
         .map_err(|e| io::Error::other(format!("parsing mise env output: {e}")))?;
     let authorized: Vec<&Path> = binds.iter().map(|b| b.dest.as_path()).collect();
     Ok(project_env_from_json(&value, &authorized))
+}
+
+/// One call's staging directory, `<root>/<pid>-<n>`, removed when it drops.
+///
+/// The root is per project, and two launches of one project at once each stage what their own
+/// trust check passed: in one shared directory the second's files replaced the first's, which
+/// then resolved its `[env]` from bytes it had not hashed. A directory per call keeps them apart,
+/// and goes once its mise has run. What a launch killed before that leaves is taken by the next
+/// claim under the same root: every entry but a live process's own.
+pub(super) struct Stage(PathBuf);
+
+impl Stage {
+    /// Create the owner-only `root` if it is not there, sweep what dead launches left in it, and
+    /// create this call's own directory in it, exclusively.
+    pub(super) fn claim(root: &Path) -> io::Result<Stage> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(root)?;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let live = name
+                    .to_str()
+                    .and_then(|n| n.split_once('-'))
+                    .and_then(|(pid, _)| pid.parse::<u32>().ok())
+                    .is_some_and(crate::session::pid_is_live);
+                if !live {
+                    let path = entry.path();
+                    if std::fs::remove_file(&path).is_err() {
+                        let _ = std::fs::remove_dir_all(&path);
+                    }
+                }
+            }
+        }
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = root.join(format!("{}-{n}", std::process::id()));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        Ok(Stage(dir))
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Stage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Materialize each validated mise file into `stage_dir` (created owner-only) and
@@ -772,6 +828,59 @@ mod tests {
                 ("FOO".to_string(), "bar".to_string()),
                 ("GREETING".to_string(), "hello world".to_string()),
             ]
+        );
+    }
+
+    /// Two launches of one project stage under the same root at once, and each resolves its
+    /// `[env]` from the bytes its own trust check passed: the second's files do not replace the
+    /// first's. In one shared directory they did, and the first then read bytes it had not hashed.
+    #[test]
+    fn two_stages_under_one_root_keep_their_own_bytes() {
+        let base = TmpDir::new();
+        let root = base.join("mise-config");
+        let (a, b) = (Stage::claim(&root).unwrap(), Stage::claim(&root).unwrap());
+        assert_ne!(a.path(), b.path());
+        let first = stage_files(a.path(), &[(".mise.toml".to_string(), b"A".to_vec())]).unwrap();
+        let _second = stage_files(b.path(), &[(".mise.toml".to_string(), b"B".to_vec())]).unwrap();
+        assert_eq!(std::fs::read(&first[0].src).unwrap(), b"A");
+        let gone = a.path().to_path_buf();
+        drop(a);
+        assert!(!gone.exists(), "a stage goes once its mise has run");
+    }
+
+    /// What a launch killed before its stage dropped is taken by the next claim under the same
+    /// root, and a live launch's stage is not.
+    #[test]
+    fn a_claim_sweeps_what_a_dead_launch_left_and_keeps_a_live_ones() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = TmpDir::new();
+        let root = base.join("mise-config");
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a process");
+        let dead = child.id();
+        child.wait().expect("reap it");
+        let left = root.join(format!("{dead}-0"));
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join(".mise.toml"), b"old").unwrap();
+        let live = root.join(format!("{}-999", std::process::id()));
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(root.join(".mise.toml"), b"from the shared layout").unwrap();
+
+        let stage = Stage::claim(&root).unwrap();
+        assert!(!left.exists(), "a dead launch's stage is swept");
+        assert!(
+            !root.join(".mise.toml").exists(),
+            "so is a file no launch owns"
+        );
+        assert!(live.exists(), "a live launch's stage is kept");
+        assert_eq!(
+            std::fs::metadata(stage.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
         );
     }
 
