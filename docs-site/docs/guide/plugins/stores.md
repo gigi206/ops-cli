@@ -97,6 +97,8 @@ mark each entry:
 | `[scheme x:// taken by …]` | the name is free, but an installed plugin already claims that scheme |
 | `[scheme x:// in conflict between …]` | several installed plugins claim it: nothing resolves it, and an install is refused all the same |
 | `[installed, disabled: scheme x:// in conflict]` | in place from this store, but contesting a scheme: it resolves nothing |
+| `[name in conflict between …]` | several installed plugins declare that name: all of them are disabled, and an install is refused all the same |
+| `[installed, disabled: the name x claimed twice]` | in place from this store, but another plugin declares its name too: every claimant is disabled |
 
 `[name taken by …]` and `[scheme x:// taken by …]` are the **two stores, one
 plugin name** case. The install namespace is flat: only one plugin can hold a
