@@ -3381,6 +3381,35 @@ mod tests {
         assert!(!key.exists());
     }
 
+    /// A plugin directory that is a link is refused by a publish, as by every reader of a plugins
+    /// tree, and the refusal names the link with a way out a publisher can take: the catalogue
+    /// pins the tree sitting under `plugins/`, so the link has to give way to that tree.
+    #[test]
+    fn publish_refuses_a_plugin_directory_that_is_a_link() {
+        let repo = crate::testutil::TmpDir::new();
+        let elsewhere = crate::testutil::TmpDir::new();
+        write_source_plugin(repo.path(), "pass", "secret-store");
+        write_source_plugin(elsewhere.path(), "otp", "otp");
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("plugins/otp"),
+            repo.path().join("plugins/otp"),
+        )
+        .unwrap();
+        let key = repo.path().join("store.key");
+
+        let err = publish(repo.path(), &key, Some(1)).unwrap_err();
+        assert!(
+            err.contains("`otp`") && err.contains("symbolic link"),
+            "the link is named: {err}"
+        );
+        assert!(
+            err.contains("replace the link with the tree it points at")
+                && !err.contains("plugins install"),
+            "with a way out a publisher can take: {err}"
+        );
+        assert!(!key.exists(), "a refused publish touches no key");
+    }
+
     #[test]
     fn publish_refuses_a_subdir_without_a_manifest() {
         let repo = crate::testutil::TmpDir::new();

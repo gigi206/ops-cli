@@ -727,9 +727,9 @@ impl PluginRegistry {
             if link {
                 let name = dir.file_name().and_then(OsStr::to_str).unwrap_or("?");
                 warnings.push(format!(
-                    "plugins: ignoring `{name}` — it is a symbolic link, and a plugin is trusted \
-                     by where its tree sits: remove the link and install the tree it points at \
-                     with `sbx plugins install <dir>`"
+                    "plugins: ignoring `{name}` — it is a symbolic link, and a plugin is read \
+                     only from a tree that sits here itself: replace the link with the tree it \
+                     points at"
                 ));
                 continue;
             }
