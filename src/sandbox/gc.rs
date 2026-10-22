@@ -1797,6 +1797,13 @@ impl TreeState {
     }
 }
 
+/// Written as its [`label`](TreeState::label), the same word the text listings print.
+impl serde::Serialize for TreeState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.label())
+    }
+}
+
 /// A project tree's classification plus the last time it was touched, for `sbx path`'s per-project
 /// annotation. `last_used` is the marker file's mtime when present (the last launch, since the
 /// marker is rewritten each seed), else the tree directory's mtime — the best available proxy for

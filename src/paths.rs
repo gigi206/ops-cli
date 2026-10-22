@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::sandbox::gc::TreeState;
 use crate::{config, sandbox, session, store::Layout, trust};
 
 /// What to list under an entry when it exists. `None` lists nothing; `Dirs` lists
@@ -283,10 +284,10 @@ struct ChildView {
     /// (the `.toml` suffix stripped).
     name: String,
     path: PathBuf,
-    /// Only set for per-project trees: `live`/`idle`/`dead`/`markerless`/`unknown`/`unreadable`. `None` for app homes and
-    /// profiles, which have no liveness state.
+    /// Only set for per-project trees: `live`/`idle`/`dead`/`markerless`/`unknown`/`unreadable`, the
+    /// state's label. `None` for app homes and profiles, which have no liveness state.
     #[serde(skip_serializing_if = "Option::is_none")]
-    state: Option<&'static str>,
+    state: Option<TreeState>,
     /// Only set for per-project trees: the last-used date as `YYYY-MM-DD` (the marker's mtime, or
     /// the tree dir's mtime when there is no marker). `None` for app homes and profiles.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -498,7 +499,7 @@ fn enumerate(
                         current: current_id == Some(name.as_str()),
                         name,
                         path,
-                        state: Some(class.state.label()),
+                        state: Some(class.state),
                         last_used: Some(civil_date(class.last_used)),
                         project_path: class.project_path,
                     })
@@ -619,15 +620,17 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
                     // Per-project trees carry a liveness state + a last-used date; app homes and
                     // profiles carry neither, so the line ends at the path. The state is colored:
                     // live/idle in ok (green), dead/markerless in dim — the stale hues — and
-                    // unknown in warn, because it is neither: nothing read the registry that would
-                    // have told them apart.
+                    // unknown/unreadable in warn, because they are neither: nothing that was read
+                    // told which one the tree is. The match names every state, so a new one is
+                    // given its hue where it is added rather than falling into another's.
                     match (c.state, c.last_used.as_deref()) {
                         (Some(st), Some(date)) => {
                             let hue = match st {
-                                "live" | "idle" => ok,
-                                "unknown" | "unreadable" => warn,
-                                _ => dim,
+                                TreeState::Live | TreeState::Idle => ok,
+                                TreeState::Unknown | TreeState::Unreadable => warn,
+                                TreeState::Dead | TreeState::Markerless => dim,
                             };
+                            let st = st.label();
                             // The project tree line: id, tree path, (state), date, recorded
                             // project path (or "(unknown)" for markerless), and a `*` when it is
                             // the tree of the cwd sbx path was launched from. The project path is
@@ -1023,11 +1026,11 @@ mod tests {
             .iter()
             .map(|c| (c.name.as_str(), c))
             .collect();
-        assert_eq!(by_name["idleid"].state, Some("idle"), "idle");
-        assert_eq!(by_name["deadid"].state, Some("dead"), "dead");
+        assert_eq!(by_name["idleid"].state, Some(TreeState::Idle), "idle");
+        assert_eq!(by_name["deadid"].state, Some(TreeState::Dead), "dead");
         assert_eq!(
             by_name["markerlessid"].state,
-            Some("markerless"),
+            Some(TreeState::Markerless),
             "markerless"
         );
         // The marker carries the canonical project path, so `sbx path` answers "which project
@@ -1181,5 +1184,74 @@ mod tests {
             })
             .collect();
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Each liveness state is drawn in the hue its meaning calls for: a tree in use or still
+    /// claimed by its project in `ok`, one whose state nothing established in `warn`, a stale one
+    /// in `dim`. One tree per state, classified from disk as `sbx path` classifies it.
+    #[test]
+    fn each_tree_state_is_drawn_in_its_own_hue() {
+        use std::os::unix::ffi::OsStrExt;
+        let data = TmpDir::new();
+        let kept = data.join("kept");
+        std::fs::create_dir_all(&kept).unwrap();
+        let gone = data.join("gone");
+        let tree = |projects: &Path, id: &str, marker: Option<&[u8]>| {
+            std::fs::create_dir_all(projects.join(id)).unwrap();
+            if let Some(bytes) = marker {
+                std::fs::write(projects.join(id).join("project"), bytes).unwrap();
+            }
+        };
+        let projects = data.join("projects");
+        tree(&projects, "live0", Some(kept.as_os_str().as_bytes()));
+        tree(&projects, "idle0", Some(kept.as_os_str().as_bytes()));
+        tree(&projects, "dead0", Some(gone.as_os_str().as_bytes()));
+        tree(&projects, "bare0", None);
+        tree(&projects, "junk0", Some(b""));
+        // A registry that could not be read leaves every tree `unknown`, so that one is listed
+        // from a directory of its own.
+        let unasked = data.join("unasked");
+        tree(&unasked, "unk0", None);
+        let live = BTreeSet::from(["live0".to_string()]);
+        let mut children = enumerate(&projects, Enumerate::Projects, Some(&live), None);
+        children.extend(enumerate(&unasked, Enumerate::Projects, None, None));
+        let v = PathView {
+            bases: vec![BaseView {
+                label: "data",
+                env_hint: "",
+                root: Some(data.path().to_path_buf()),
+                exists: true,
+                entries: vec![EntryView {
+                    label: "projects/",
+                    path: Some(projects.clone()),
+                    desc: "",
+                    exists: true,
+                    children,
+                }],
+            }],
+        };
+        let pal = crate::style::Palette::colored();
+        let s = render(&v, &pal);
+        let (nm, ok, warn, dim, r) = (pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
+        for (id, state, hue) in [
+            ("live0", "live", ok),
+            ("idle0", "idle", ok),
+            ("dead0", "dead", dim),
+            ("bare0", "markerless", dim),
+            ("junk0", "unreadable", warn),
+            ("unk0", "unknown", warn),
+        ] {
+            let line = s
+                .lines()
+                .find(|l| {
+                    let name = l.split_once(nm).and_then(|(_, rest)| rest.split_once(r));
+                    name.is_some_and(|(name, _)| name.trim_end() == id)
+                })
+                .unwrap_or_else(|| panic!("no line for {id}:\n{s}"));
+            assert!(
+                line.contains(&format!("{hue}({state}){r}")),
+                "{id} is not drawn `{state}` in its hue: {line:?}"
+            );
+        }
     }
 }
