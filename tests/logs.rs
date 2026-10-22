@@ -186,13 +186,22 @@ impl Drop for Standin {
     }
 }
 
+/// Run a view to its end within a bound. A `--follow` ends when its session does, and one that
+/// missed the end would otherwise hold the suite until the job timed out: past the bound the view
+/// is killed and the test fails naming it.
+fn run_view(cmd: &mut Command) -> std::process::Output {
+    let shown = format!("{:?}", cmd.get_args().collect::<Vec<_>>());
+    common::procs::output_within(cmd, std::time::Duration::from_secs(60))
+        .unwrap_or_else(|| panic!("the view {shown} did not end within 60 s"))
+}
+
 /// Run one lens's `logs` view against a session whose socket is being served, and return stdout.
 fn read_feed(data: &Path, args: &[&str]) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
-        .args(args)
-        .env("XDG_DATA_HOME", data)
-        .output()
-        .expect("run the logs view");
+    let out = run_view(
+        Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(args)
+            .env("XDG_DATA_HOME", data),
+    );
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -380,11 +389,11 @@ fn a_follow_names_a_session_each_time_it_stops_answering() {
         argv.push(&pid);
         argv.push("--follow");
 
-        let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
-            .args(&argv)
-            .env("XDG_DATA_HOME", data.path())
-            .output()
-            .expect("run the follow");
+        let out = run_view(
+            Command::new(env!("CARGO_BIN_EXE_sbx"))
+                .args(&argv)
+                .env("XDG_DATA_HOME", data.path()),
+        );
         let (stdout, stderr) = (
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
@@ -454,11 +463,11 @@ fn a_merged_follow_asks_again_a_feed_that_did_not_answer_at_first() {
             args.push("--json");
         }
 
-        let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
-            .args(&args)
-            .env("XDG_DATA_HOME", data)
-            .output()
-            .expect("run the follow");
+        let out = run_view(
+            Command::new(env!("CARGO_BIN_EXE_sbx"))
+                .args(&args)
+                .env("XDG_DATA_HOME", data),
+        );
         let (stdout, stderr) = (
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
