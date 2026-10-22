@@ -426,8 +426,13 @@ of, and each declared package annotated with whether it is **actually installed*
 | Package | Installed reads |
 |---|---|
 | `mise:` | `installed <version>` (read from the app's home) or `not installed` |
-| `deb:` / `appimage:` / `tarball:` | `pinned in N tree(s) (<hash>)`, the build lives in the [per-project store](../concepts/directory-layout); see [`sbx projects show`](projects), or `not built` |
-| `nix:` / `flake:` | `built in N tree(s)`, built host-side into the shared store, seeded per project; or `not built` |
+| `deb:` / `appimage:` / `tarball:` / `binary:` | `pinned in N tree(s) (<hash>)`, the build lives in the [per-project store](../concepts/directory-layout); see [`sbx projects show`](projects), or `not installed` |
+| `nix:` / `flake:` | `built in N tree(s)`, built host-side into the shared store, seeded per project; or `not installed` |
+| inline `[flakes.<name>]` | `built <pname-version>`, read from the out-link the build leaves in the app's home; or `not installed` |
+
+The trees a package is built in are read from the data directory's `projects/` and `gcroots/`.
+When one of those, or a tree in it, cannot be read, `show` names it and exits 1 rather than
+report a built package `not installed`.
 
 ### What a home is made of
 

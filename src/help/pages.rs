@@ -2502,18 +2502,18 @@ pub(super) const PAGES: &[Page] = &[
         ],
         details: "The realized-on-disk detail for one per-project runtime tree: its state and size (broken\n\
             down store / home / other), the nixpkgs channel or pin it resolves against, the store\n\
-            roots built in its (shared) store grouped by backend — `nix`, `deb`, `appimage` (a\n\
-            host-side `flake:` or `tarball:` build is provisioned like a `nix:` one, so it appears\n\
-            under `nix`; only `deb-`/`appimage-` gcroots get their own group) — the\n\
-            mise tools in its own home, and, when the project directory still exists, the project's\n\
+            roots built in its (shared) store grouped by backend — `nix`, `deb`, `appimage`,\n\
+            `tarball`, `binary` (a host-side `flake:` build is provisioned like a `nix:` one, so it\n\
+            appears under `nix`) — the mise tools in its own home, and, when the project directory still exists, the project's\n\
             declared packages/tools that are **not** built yet (an untrusted one flagged `withheld`,\n\
             distinct from a trusted one simply not equipped yet). The store is shared by the project\n\
             and every app launched in it, so the roots include app packages. A dead tree (its project\n\
             directory gone) shows realized state only. The `disk` line leads with what the tree holds\n\
             **on its own** (its app mise pools, its home, and whatever was built into its store) and\n\
             reports the store separately, since a store seeded from the shared one is not freed by\n\
-            removing the tree. Read-only: no sandbox, no nix, no network. For an app rather than a\n\
-            tree, see `sbx app show <name>`.",
+            removing the tree. Store roots that cannot be read are an error naming the directory,\n\
+            not a tree with none. Read-only: no sandbox, no nix, no network. For an app rather than\n\
+            a tree, see `sbx app show <name>`.",
     },
     Page {
         path: &["app", "prune"],
@@ -2610,10 +2610,13 @@ pub(super) const PAGES: &[Page] = &[
         details: "The realized-on-disk detail for one app: its profile source, its isolated home(s) with\n\
             on-disk size (and the mise-tools share broken out), and each declared package annotated\n\
             with whether it is actually installed. A `mise:` tool is read from the app's home; a\n\
-            `deb:`/`appimage:`/`flake:` build lives in the per-project nix store, so it is reported\n\
-            as pinned in N project tree(s) (see `sbx projects show`); a `nix:` package is built\n\
-            per-project. A package a launch would not provision because an untrusted layer declared\n\
-            it reads `withheld`, distinct from `not installed`. Every size in the disk breakdown is\n\
+            `deb:`/`appimage:`/`tarball:`/`binary:` build lives in the per-project nix store, so it\n\
+            is reported as pinned in N project tree(s) (see `sbx projects show`); a `nix:` or remote\n\
+            `flake:` package as built in N tree(s); an inline `[flakes.<name>]` one by the out-link\n\
+            its build leaves in the home. A place those trees are read from that cannot be read is\n\
+            an error naming it, not a package reported `not installed`. A package a launch would\n\
+            not provision because an untrusted layer declared it reads `withheld`, distinct from\n\
+            `not installed`. Every size in the disk breakdown is\n\
             the size of the **data** held, not the space removing it returns: a compressing volume\n\
             stored those bytes smaller, and a block shared with another tree survives until its\n\
             last reference goes; `sbx storage status` reports what the volume holds. Read-only: no\n\

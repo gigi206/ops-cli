@@ -77,9 +77,10 @@ rather than seeded:
 - its **state** and **size**, the own figure broken down `app mise pools` / `home` /
   `other`, with the store reported beside it;
 - the **nixpkgs** channel or per-project pin it resolves against;
-- the **store roots** built in its store, grouped by backend (`nix`, `deb`, `appimage`), a host-side `flake:` build is provisioned like a `nix:` one, so it appears under `nix`; a `tarball:` build's gcroot likewise lands under `nix`; only `deb-`/`appimage-` gcroots get their own group. The
-  store is **shared** by the project and every app launched in it, so the roots include
-  app packages;
+- the **store roots** built in its store, grouped by backend (`nix`, `deb`, `appimage`,
+  `tarball`, `binary`); a host-side `flake:` build is provisioned like a `nix:` one, so it
+  appears under `nix`. The store is **shared** by the project and every app launched in it, so
+  the roots include app packages;
 - the **mise tools** in the project's own home;
 - when the project directory still exists, the project's declared packages/tools that are
   **not built yet**, an untrusted declaration is flagged `withheld` (a launch would not
@@ -90,7 +91,8 @@ rather than seeded:
   break as `\x0a`).
 
 Read-only (no sandbox, no nix, no network). `--json` emits the same model, with the bytes the
-files hold. For an app rather
+files hold. A tree whose store roots cannot be read is not reported as one with none: `show`
+names the directory and exits 1. For an app rather
 than a tree, see [`sbx app show`](app).
 
 ## `rm`
