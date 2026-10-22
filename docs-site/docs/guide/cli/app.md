@@ -469,7 +469,7 @@ A package a launch would not provision because an untrusted layer declared it re
 If the home holds mise tools that **no declared package accounts for**: a leftover from a
 removed profile, or a dependency a `mise:` backend pulled in: they are listed under
 `installed (undeclared)`, named by their real backend token (its provider, e.g.
-`pipx:hermes-agent`, recovered from mise's metadata rather than the munged directory name), so
+`pipx:hermes-agent`, recovered from mise's metadata rather than the directory name mise gave it), so
 the report shows everything that is actually installed, not only what the profile names.
 
 For a `"global"`-scope app, the report also surfaces its **per-project mise pools**: where
@@ -495,6 +495,12 @@ the same and a warning names the file, since the next launch installs them again
 `--yes`. The app's declared tools, its login/session state, and any `nix:`/`deb:`/`flake:`
 build are left untouched: to remove the whole home instead, use
 [`sbx app rm --purge`](#removing-an-app).
+
+A tool is recognised as declared by the backend token mise recorded beside it, and otherwise by
+its directory name, compared with the declaration on letters and digits alone, case aside: mise
+installs `github:vinhnx/VTCode` as `github-vinhnx-vt-code`, which the token does not spell. Two
+tools whose names differ only by punctuation and case would therefore both count as declared, and
+both be kept.
 
 `--yes` (`-y`) is **refused while a session of that app is running**: the tools are in the home
 that session is using, so deleting them takes an interpreter or a `PATH` entry out from
