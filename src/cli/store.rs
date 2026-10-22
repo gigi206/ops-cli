@@ -420,10 +420,12 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     let mut s = String::new();
 
+    // A name or a path read from the filesystem is any bytes, so it is written escaped, as `sbx
+    // projects list` writes a project path; `--json` keeps it as it is.
     let _ = writeln!(
         s,
         "{h}sbx store{r} {dim}— {} ({}, {} inodes){r}",
-        v.data_dir,
+        diag::visible(&v.data_dir),
         v.size,
         thousands(v.inodes)
     );
@@ -433,7 +435,8 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
         let _ = writeln!(
             s,
             "  {dim}btrfs volume — {r}{}{dim} on host ({}){r}",
-            vol.host_size, vol.image
+            vol.host_size,
+            diag::visible(&vol.image)
         );
     }
     // Nothing to show is nothing provisioned only when nothing was left unread.
@@ -442,7 +445,9 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
         return s;
     }
 
-    let label_w = v.subtrees.iter().map(|t| t.label.len()).max().unwrap_or(0);
+    let labels: Vec<String> = v.subtrees.iter().map(|t| diag::visible(&t.label)).collect();
+    // Padding counts characters, so the width does too.
+    let label_w = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     let size_w = v.subtrees.iter().map(|t| t.size.len()).max().unwrap_or(0);
     let inode_w = v
         .subtrees
@@ -466,7 +471,7 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
         .map(|e| e.len())
         .max()
         .unwrap_or(0);
-    for (t, excl) in v.subtrees.iter().zip(&exclusive) {
+    for ((t, label), excl) in v.subtrees.iter().zip(&labels).zip(&exclusive) {
         let purpose = t.purpose.unwrap_or("");
         let unit = if t.inodes == 1 { "inode " } else { "inodes" };
         let excl = match excl {
@@ -476,7 +481,6 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
         let _ = writeln!(
             s,
             "  {n}{label:<label_w$}{r}  {size:>size_w$}  {dim}{inodes:>inode_w$} {unit}{r}  {excl}{dim}{purpose}{r}",
-            label = t.label,
             size = t.size,
             inodes = thousands(t.inodes),
         );
@@ -823,6 +827,42 @@ mod tests {
             !out.contains("--shared` reads"),
             "the note does not point at the option the report already used: {out}"
         );
+    }
+
+    /// A name or a path read from the filesystem is written escaped, so an escape sequence in it
+    /// cannot drive the terminal, and the columns line up on what is shown: characters, not bytes,
+    /// of the escaped name.
+    #[test]
+    fn names_and_paths_are_written_escaped_and_aligned() {
+        let v = StoreView {
+            data_dir: "/d/\x1b]0;title\x07".into(),
+            bytes: 300,
+            size: "300 B".into(),
+            inodes: 2,
+            unreadable: 0,
+            shares_storage: Some(false),
+            // Widest once escaped, and the other one widest in bytes.
+            subtrees: vec![row("x\x1b[31mRED/", 200), row("éééééééé/", 100)],
+            shared_store: None,
+            volume: Some(VolumeView {
+                image: "/i/\x1b[2Jimg".into(),
+                host_bytes: 1,
+                host_size: "1 B".into(),
+            }),
+            extents: None,
+        };
+        let out = render(&v, &style::Palette::plain());
+        assert!(!out.contains('\x1b') && !out.contains('\x07'), "{out:?}");
+        for shown in [r"x\x1b[31mRED/", r"/d/\x1b]0;title\x07", r"/i/\x1b[2Jimg"] {
+            assert!(out.contains(shown), "{shown} missing:\n{out}");
+        }
+        // Where each size starts, in characters: the indent, the widest shown name, the gap.
+        let starts: Vec<usize> = out
+            .lines()
+            .filter(|l| l.starts_with("  ") && l.contains("inode"))
+            .map(|l| l[..l.find("00 B").unwrap()].chars().count() - 1)
+            .collect();
+        assert_eq!(starts, vec![2 + 13 + 2; 2], "{out}");
     }
 
     /// On the volume the breakdown runs on to what the filesystem stores. The step between the
