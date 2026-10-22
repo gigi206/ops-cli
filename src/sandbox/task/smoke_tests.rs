@@ -5,12 +5,12 @@ use crate::testutil::{EnvVar, TmpDir, env_lock};
 /// The engine, wired to a real provisioned userland — or `None` to skip. `pool`, when given,
 /// points the engine at a task tool pool already realized on disk.
 fn engine_with(
-    tasks: Vec<TaskSpec>,
     project: &Path,
     pool: Option<&Path>,
     slug: &str,
+    tasks: impl FnOnce(&str) -> Vec<TaskSpec>,
 ) -> Option<(TaskEngine, TmpDir)> {
-    let (engine, data) = engine_for(tasks, project, slug)?;
+    let (engine, data) = engine_for(project, slug, tasks)?;
     Some(match pool {
         Some(p) => (
             engine.with_pool(p.to_path_buf(), PathBuf::from("/nonexistent/mise")),
@@ -27,18 +27,28 @@ fn engine_with(
 /// slug is what keeps each test's cages legible as its own; the scope name would stay unique
 /// without it, since the launcher counts the scopes it asks for, but two tests sharing a slug
 /// would then be indistinguishable in `systemctl --user` and would share a tool pool.
-fn engine_for(tasks: Vec<TaskSpec>, project: &Path, slug: &str) -> Option<(TaskEngine, TmpDir)> {
-    engine_on(tasks, project, slug, None)
+///
+/// `tasks` builds the session's tasks from the userland's shell, the one a task command can name
+/// inside the cage. The userland is resolved once, in the data directory the engine then reads:
+/// provisioning a fresh store downloads the base closure and compiles the cage's locale archive,
+/// which no binary cache carries, so resolving a second store only to learn the shell's path would
+/// double what each test costs.
+fn engine_for(
+    project: &Path,
+    slug: &str,
+    tasks: impl FnOnce(&str) -> Vec<TaskSpec>,
+) -> Option<(TaskEngine, TmpDir)> {
+    engine_on(project, slug, None, tasks)
 }
 
 /// [`engine_for`] against a declared distribution, so what the engine derives from is an agent cage
 /// whose root is an image rather than bubblewrap's own tmpfs. `distro` is the image locator; `None`
 /// is the hermetic userland.
 fn engine_on(
-    tasks: Vec<TaskSpec>,
     project: &Path,
     slug: &str,
     distro: Option<&str>,
+    tasks: impl FnOnce(&str) -> Vec<TaskSpec>,
 ) -> Option<(TaskEngine, TmpDir)> {
     let bwrap = crate::pathfind::find_on_path("bwrap")?;
     if !matches!(crate::probe_userns(), crate::Userns::Ok) {
@@ -61,6 +71,7 @@ fn engine_on(
             .ok()?,
         );
     }
+    let tasks = tasks(userland.shell_bin.to_str().expect("a store path is ASCII"));
 
     // Assemble an agent cage exactly as the launcher would, then derive the engine from it — the
     // same path production takes, so what this exercises is the real derivation.
@@ -116,22 +127,6 @@ fn engine_on(
         crate::sandbox::redact::MIN_LEN_DEFAULT,
     );
     Some((engine, data))
-}
-
-/// The userland's shell, for a task command a cage can run, or `None` without bwrap or nix.
-fn userland_shell() -> Option<PathBuf> {
-    crate::pathfind::find_on_path("bwrap")
-        .and(crate::store::resolve_nix(None))
-        .and_then(|nix| {
-            let data = TmpDir::new();
-            let layout = crate::store::Layout::under(data.path());
-            let nixpkgs = crate::store::LockTarget::global(&layout, None)
-                .resolve(&nix, &layout)
-                .ok()?;
-            super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
-                .ok()
-                .map(|u| u.shell_bin)
-        })
 }
 
 /// A task that prints its credential and its parameter, so both paths are observable at once.
@@ -195,28 +190,10 @@ fn a_declared_task_runs_in_a_sibling_cage_and_comes_back_substituted() {
     let _lock = env_lock();
     let _token = EnvVar::set("SBX_SMOKE_TASK_TOKEN", "smoke-token-abcdef");
 
-    let shell = match crate::store::resolve_nix(None).and_then(|nix| {
-        let data = TmpDir::new();
-        let layout = crate::store::Layout::under(data.path());
-        let nixpkgs = crate::store::LockTarget::global(&layout, None)
-            .resolve(&nix, &layout)
-            .ok()?;
-        super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
-            .ok()
-            .map(|u| u.shell_bin)
-    }) {
-        Some(shell) => shell,
-        None => {
-            skip_incapable!("skipping task smoke: need nix and a provisioned userland");
-            return;
-        }
-    };
-    let Some((engine, _data)) = engine_for(
-        vec![echo_task(&shell.to_string_lossy())],
-        project.path(),
-        "smoke-declared",
-    ) else {
-        skip_incapable!("skipping task smoke: need bwrap, userns, and nix");
+    let Some((engine, _data)) = engine_for(project.path(), "smoke-declared", |shell| {
+        vec![echo_task(shell)]
+    }) else {
+        skip_incapable!("skipping task smoke: need bwrap, userns, nix, and a provisioned userland");
         return;
     };
 
@@ -274,44 +251,30 @@ fn a_withheld_streams_substitution_count_stays_host_side() {
     let _lock = env_lock();
     let _token = EnvVar::set("SBX_SMOKE_COUNT_TOKEN", "count-token-abcdef");
 
-    let shell = match crate::store::resolve_nix(None).and_then(|nix| {
-        let data = TmpDir::new();
-        let layout = crate::store::Layout::under(data.path());
-        let nixpkgs = crate::store::LockTarget::global(&layout, None)
-            .resolve(&nix, &layout)
-            .ok()?;
-        super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
-            .ok()
-            .map(|u| u.shell_bin)
-    }) {
-        Some(shell) => shell,
-        None => {
-            skip_incapable!("skipping count smoke: need nix and a provisioned userland");
-            return;
-        }
-    };
-
-    let mut task = echo_task(&shell.to_string_lossy());
-    task.name = "print-both".into();
-    task.cmd = vec![
-        shell.to_string_lossy().into_owned(),
-        "-c".into(),
-        "echo \"$DEMO_TOKEN\"; echo \"$DEMO_TOKEN\" >&2".into(),
-    ];
-    task.params = vec![];
-    task.secrets = vec![TaskSecret {
-        var: "DEMO_TOKEN".into(),
-        sources: vec![crate::config::SecretSource::Env(
-            "SBX_SMOKE_COUNT_TOKEN".into(),
-        )],
-        encode: Encoding::Raw,
-        description: None,
-    }];
-    task.stdout = OutputDisposition::Hide;
-    task.stderr = OutputDisposition::Show;
-
-    let Some((engine, _data)) = engine_for(vec![task], project.path(), "smoke-withheld") else {
-        skip_incapable!("skipping count smoke: need bwrap, userns, and nix");
+    let Some((engine, _data)) = engine_for(project.path(), "smoke-withheld", |shell| {
+        let mut task = echo_task(shell);
+        task.name = "print-both".into();
+        task.cmd = vec![
+            shell.into(),
+            "-c".into(),
+            "echo \"$DEMO_TOKEN\"; echo \"$DEMO_TOKEN\" >&2".into(),
+        ];
+        task.params = vec![];
+        task.secrets = vec![TaskSecret {
+            var: "DEMO_TOKEN".into(),
+            sources: vec![crate::config::SecretSource::Env(
+                "SBX_SMOKE_COUNT_TOKEN".into(),
+            )],
+            encode: Encoding::Raw,
+            description: None,
+        }];
+        task.stdout = OutputDisposition::Hide;
+        task.stderr = OutputDisposition::Show;
+        vec![task]
+    }) else {
+        skip_incapable!(
+            "skipping count smoke: need bwrap, userns, nix, and a provisioned userland"
+        );
         return;
     };
 
@@ -347,44 +310,30 @@ fn a_credential_in_a_refused_exec_path_is_substituted_by_the_real_supervisor() {
     let _lock = env_lock();
     let _token = EnvVar::set("SBX_SMOKE_REFUSAL_TOKEN", "refusal-token-abcdef");
 
-    let shell = match crate::store::resolve_nix(None).and_then(|nix| {
-        let data = TmpDir::new();
-        let layout = crate::store::Layout::under(data.path());
-        let nixpkgs = crate::store::LockTarget::global(&layout, None)
-            .resolve(&nix, &layout)
-            .ok()?;
-        super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
-            .ok()
-            .map(|u| u.shell_bin)
-    }) {
-        Some(shell) => shell,
-        None => {
-            skip_incapable!("skipping refusal smoke: need nix and a provisioned userland");
-            return;
-        }
-    };
-
-    let mut task = echo_task(&shell.to_string_lossy());
-    task.name = "reach-for-it".into();
-    task.secrets = vec![TaskSecret {
-        var: "DEMO_TOKEN".into(),
-        sources: vec![crate::config::SecretSource::Env(
-            "SBX_SMOKE_REFUSAL_TOKEN".into(),
-        )],
-        encode: Encoding::Raw,
-        description: None,
-    }];
-    task.cmd = vec![
-        shell.to_string_lossy().into_owned(),
-        "-c".into(),
-        ": > \"/tmp/$DEMO_TOKEN\"; exec \"/tmp/$DEMO_TOKEN\"".into(),
-    ];
-    task.params = vec![];
-    // Declared and empty: stand the supervisor up, and let the command run nothing further.
-    task.spawn = Some(vec![]);
-
-    let Some((engine, _data)) = engine_for(vec![task], project.path(), "smoke-refusal") else {
-        skip_incapable!("skipping refusal smoke: need bwrap, userns, and nix");
+    let Some((engine, _data)) = engine_for(project.path(), "smoke-refusal", |shell| {
+        let mut task = echo_task(shell);
+        task.name = "reach-for-it".into();
+        task.secrets = vec![TaskSecret {
+            var: "DEMO_TOKEN".into(),
+            sources: vec![crate::config::SecretSource::Env(
+                "SBX_SMOKE_REFUSAL_TOKEN".into(),
+            )],
+            encode: Encoding::Raw,
+            description: None,
+        }];
+        task.cmd = vec![
+            shell.into(),
+            "-c".into(),
+            ": > \"/tmp/$DEMO_TOKEN\"; exec \"/tmp/$DEMO_TOKEN\"".into(),
+        ];
+        task.params = vec![];
+        // Declared and empty: stand the supervisor up, and let the command run nothing further.
+        task.spawn = Some(vec![]);
+        vec![task]
+    }) else {
+        skip_incapable!(
+            "skipping refusal smoke: need bwrap, userns, nix, and a provisioned userland"
+        );
         return;
     };
 
@@ -480,7 +429,8 @@ fn a_pool_tool_runs_by_name_and_its_pool_is_read_only() {
         max_output_from: crate::config::Ceiling::Declared,
     };
 
-    let Some((engine, _data)) = engine_with(vec![spec], project.path(), Some(&pool), "smoke-pool")
+    let Some((engine, _data)) =
+        engine_with(project.path(), Some(&pool), "smoke-pool", |_| vec![spec])
     else {
         skip_incapable!("skipping task pool smoke: need bwrap, userns, and nix");
         return;
@@ -512,39 +462,29 @@ fn a_pool_tool_runs_by_name_and_its_pool_is_read_only() {
 #[test]
 fn the_timeout_kills_a_hanging_task_and_the_cap_truncates_a_loud_one() {
     let project = TmpDir::new();
-    let shell = match userland_shell() {
-        Some(shell) => shell,
-        None => {
-            skip_incapable!("skipping task ceiling smoke: need bwrap, userns, and nix");
-            return;
-        }
-    };
+    let Some((engine, _data)) = engine_for(project.path(), "smoke-timeout", |shell| {
+        let mut hang = echo_task(shell);
+        hang.name = "hang".into();
+        hang.cmd = vec![shell.into(), "-c".into(), "sleep 30".into()];
+        hang.params.clear();
+        hang.secrets.clear();
+        hang.timeout = Duration::from_millis(600);
 
-    let mut hang = echo_task(&shell.to_string_lossy());
-    hang.name = "hang".into();
-    hang.cmd = vec![
-        shell.to_string_lossy().into_owned(),
-        "-c".into(),
-        "sleep 30".into(),
-    ];
-    hang.params.clear();
-    hang.secrets.clear();
-    hang.timeout = Duration::from_millis(600);
-
-    let mut loud = echo_task(&shell.to_string_lossy());
-    loud.name = "loud".into();
-    loud.cmd = vec![
-        shell.to_string_lossy().into_owned(),
-        "-c".into(),
-        "yes abcdefghij | head -c 20000".into(),
-    ];
-    loud.params.clear();
-    loud.secrets.clear();
-    loud.max_output = 256;
-
-    let Some((engine, _data)) = engine_for(vec![hang, loud], project.path(), "smoke-timeout")
-    else {
-        skip_incapable!("skipping task ceiling smoke: prerequisites absent");
+        let mut loud = echo_task(shell);
+        loud.name = "loud".into();
+        loud.cmd = vec![
+            shell.into(),
+            "-c".into(),
+            "yes abcdefghij | head -c 20000".into(),
+        ];
+        loud.params.clear();
+        loud.secrets.clear();
+        loud.max_output = 256;
+        vec![hang, loud]
+    }) else {
+        skip_incapable!(
+            "skipping task ceiling smoke: need bwrap, userns, nix, and a provisioned userland"
+        );
         return;
     };
 
@@ -627,10 +567,10 @@ fn a_declared_task_runs_on_the_distribution_the_session_declared() {
         return;
     }
     let Some((engine, _data)) = engine_on(
-        vec![task],
         project.path(),
         "smoke-distro",
         Some("oci:docker.io/library/debian:10-slim"),
+        |_| vec![task],
     ) else {
         skip_unreachable!("skipping the distribution task smoke: the registry did not answer");
         return;
@@ -662,25 +602,25 @@ fn a_declared_task_runs_on_the_distribution_the_session_declared() {
 #[test]
 fn an_output_task_writes_its_artifact_through_the_cage() {
     let project = TmpDir::new();
-    let Some(shell) = userland_shell() else {
-        skip_incapable!("skipping task output smoke: need bwrap, userns, and nix");
+    let Some((engine, _data)) = engine_for(project.path(), "smoke-output", |shell| {
+        let mut dump = echo_task(shell);
+        dump.name = "dump".into();
+        dump.cmd = vec![
+            shell.into(),
+            "-c".into(),
+            "printf hello > \"$SBX_TASK_OUT/a.txt\"".into(),
+        ];
+        dump.params.clear();
+        dump.secrets.clear();
+        dump.output = true;
+        vec![dump]
+    }) else {
+        skip_incapable!(
+            "skipping task output smoke: need bwrap, userns, nix, and a provisioned userland"
+        );
         return;
     };
-    let mut dump = echo_task(&shell.to_string_lossy());
-    dump.name = "dump".into();
-    dump.cmd = vec![
-        shell.to_string_lossy().into_owned(),
-        "-c".into(),
-        "printf hello > \"$SBX_TASK_OUT/a.txt\"".into(),
-    ];
-    dump.params.clear();
-    dump.secrets.clear();
-    dump.output = true;
-    let Some((engine, _data)) = engine_for(vec![dump.clone()], project.path(), "smoke-output")
-    else {
-        skip_incapable!("skipping task output smoke: prerequisites absent");
-        return;
-    };
+    let dump = engine.tasks()[0].clone();
     let earlier = engine.claim_output(&dump).expect("an earlier claim");
     earlier.prepare().expect("prepare the directory");
     std::fs::write(earlier.dir.join("stale.txt"), b"yesterday").expect("an earlier artifact");
@@ -718,22 +658,18 @@ fn an_output_task_writes_its_artifact_through_the_cage() {
 #[test]
 fn a_networked_task_resolves_its_own_destination_and_leaves_no_file_behind() {
     let project = TmpDir::new();
-    let Some(shell) = userland_shell() else {
-        skip_incapable!("skipping networked task smoke: need bwrap, userns, and nix");
-        return;
-    };
-    let mut lookup = echo_task(&shell.to_string_lossy());
-    lookup.name = "lookup".into();
-    lookup.cmd = vec![
-        shell.to_string_lossy().into_owned(),
-        "-c".into(),
-        "cat /etc/hosts".into(),
-    ];
-    lookup.params.clear();
-    lookup.secrets.clear();
-    lookup.network = vec![crate::allowlist::classify("tcp://db.smoke.test:15432").unwrap()];
-    let Some((engine, data)) = engine_for(vec![lookup], project.path(), "smoke-net") else {
-        skip_incapable!("skipping networked task smoke: prerequisites absent");
+    let Some((engine, data)) = engine_for(project.path(), "smoke-net", |shell| {
+        let mut lookup = echo_task(shell);
+        lookup.name = "lookup".into();
+        lookup.cmd = vec![shell.into(), "-c".into(), "cat /etc/hosts".into()];
+        lookup.params.clear();
+        lookup.secrets.clear();
+        lookup.network = vec![crate::allowlist::classify("tcp://db.smoke.test:15432").unwrap()];
+        vec![lookup]
+    }) else {
+        skip_incapable!(
+            "skipping networked task smoke: need bwrap, userns, nix, and a provisioned userland"
+        );
         return;
     };
 
