@@ -55,6 +55,18 @@ fn err(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// Where `got` first parts from `want`, byte for byte, or `None` when the two are the same. A long
+/// body is compared whole this way rather than by its ends and its line count, which let a change
+/// inside it through, and the failure names an offset instead of printing megabytes.
+fn first_difference(got: &[u8], want: &[u8]) -> Option<usize> {
+    (got != want).then(|| {
+        got.iter()
+            .zip(want)
+            .position(|(a, b)| a != b)
+            .unwrap_or(got.len().min(want.len()))
+    })
+}
+
 /// Two sessions in one log, the way a reused pid leaves them.
 const HEAD_OLD: &str = "=== sbx session 4242 started=1699999000 ===\n";
 const HEAD_NEW: &str = "=== sbx session 4242 started=1700000100 ===\n";
@@ -213,9 +225,11 @@ fn a_session_past_the_window_reads_the_same_and_still_names_its_date() {
     whole.push_str(OLD_BODY);
     whole.push_str(HEAD_NEW);
     // Comfortably past the 64 KiB read chunk.
+    let mut session = String::new();
     for i in 0..20_000 {
-        whole.push_str(&format!("chatty line {i}\n"));
+        session.push_str(&format!("chatty line {i}\n"));
     }
+    whole.push_str(&session);
     // Past one read chunk and inside the window: the first window, sized by the line limit, then
     // holds the two lines and not the header, which is the shape under test. A smaller fixture
     // reaches the header in that window and passes without testing anything. The two sizes are
@@ -236,19 +250,17 @@ fn a_session_past_the_window_reads_the_same_and_still_names_its_date() {
         err(&o)
     );
 
-    // And the unlimited reading of that same session is complete: every line, no header.
+    // And the unlimited reading of that same session is that session, byte for byte: every line in
+    // order, no header, and nothing of the session whose pid it reused.
     let o = sbx_in(data.0.path(), &["session", "logs", "4242"]);
     assert!(o.status.success(), "{}", err(&o));
-    let body = out(&o);
-    assert!(
-        body.starts_with("chatty line 0\n") && body.ends_with("chatty line 19999\n"),
-        "the whole session, from its first line to its last"
+    assert_eq!(
+        first_difference(&o.stdout, session.as_bytes()),
+        None,
+        "the reading must be the whole session and nothing else ({} bytes read, {} written)",
+        o.stdout.len(),
+        session.len()
     );
-    assert!(
-        !body.contains("=== sbx session") && !body.contains("old-1"),
-        "and nothing of the session whose pid it reused"
-    );
-    assert_eq!(body.lines().count(), 20_000);
 }
 
 /// The one shape a window can never answer: a session longer than the window itself.
@@ -264,10 +276,11 @@ fn a_session_longer_than_the_window_is_streamed_from_its_own_header() {
     whole.push_str(OLD_BODY);
     whole.push_str(HEAD_NEW);
     // Past `TAIL_WINDOW_MAX` (8 MiB), so the window gives up on finding the header.
-    let lines = 600_000;
-    for i in 0..lines {
-        whole.push_str(&format!("a chatty line number {i}\n"));
+    let mut session = String::new();
+    for i in 0..600_000 {
+        session.push_str(&format!("a chatty line number {i}\n"));
     }
+    whole.push_str(&session);
     assert!(
         whole.len() > 9 * 1024 * 1024,
         "the fixture must clear the ceiling"
@@ -276,13 +289,13 @@ fn a_session_longer_than_the_window_is_streamed_from_its_own_header() {
 
     let o = sbx_in(data.0.path(), &["session", "logs", "4242"]);
     assert!(o.status.success(), "{}", err(&o));
-    let body = out(&o);
-    assert_eq!(body.lines().count(), lines, "every line of the session");
-    assert!(body.starts_with("a chatty line number 0\n"));
-    assert!(body.ends_with(&format!("a chatty line number {}\n", lines - 1)));
-    assert!(
-        !body.contains("=== sbx session") && !body.contains("old-1"),
-        "and nothing above its header: the stream starts where the session does"
+    assert_eq!(
+        first_difference(&o.stdout, session.as_bytes()),
+        None,
+        "the stream must be the whole session, starting where it does and nothing above its \
+         header ({} bytes read, {} written)",
+        o.stdout.len(),
+        session.len()
     );
     assert!(
         !err(&o).contains("started ?"),
