@@ -33,7 +33,7 @@ mode = "deny"
 allow = [
   "api.anthropic.com",
   "*.githubusercontent.com",
-  "re:^stats\\.example\\.com$",
+  "re:^https://stats\\.example\\.com/",
   "tcp://db.internal:5432",
 ]
 ```
