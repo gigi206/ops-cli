@@ -1880,15 +1880,6 @@ fn install_inner(
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
-    // A source tree carries whatever modes produced it — a `git clone` or a checkout under the
-    // caller's umask — while git records only the executable bit. Canonicalize the staged copy so
-    // an installed plugin's permissions are deterministic and owner-clean (an executable file
-    // `0755`, everything else `0644`), whatever the source looked like. The distinction that
-    // matters is preserved, and the strict check below runs on the result.
-    if let Err(e) = canonicalize_modes(&stage) {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(e);
-    }
     // The staged copy is the real artifact: validate it, not just the source, and hold it to the
     // identity every check above was run against.
     let staged_ok = load_one(&stage, &exp)
@@ -1906,8 +1897,8 @@ fn install_inner(
     // A store install is held to the catalogue's digest once more, on the staged copy, the bytes
     // that get placed. The caller checked the checkout, but `sbx plugins store update` replaces
     // that checkout in one rename and takes no lock an install waits on, so the tree copied need
-    // not be the tree checked. The modes canonicalized above do not move the digest: it reads the
-    // executable bit, which they keep.
+    // not be the tree checked. The modes the copy gave its files do not move the digest: it reads
+    // the executable bit, which they keep.
     if let Some(claim) = &expect {
         let refusal = match catalogue::dir_digest_hex(&stage) {
             Ok(got) if got == claim.sha256 => None,
@@ -2231,8 +2222,8 @@ fn create_fresh_sibling(
 }
 
 /// Recursively copy a plugin source tree into the directory `dst`, which [`create_fresh_dir`] has
-/// just made. Only directories (each created fresh, owner-only) and regular files (copied with
-/// their mode, preserving the executable bit) are reproduced; a symlink, device, socket, or fifo is
+/// just made. Only directories (each created fresh, owner-only) and regular files (each given the
+/// canonical mode [`copy_file`] states) are reproduced; a symlink, device, socket, or fifo is
 /// refused — a resolver plugin is a small tree of real files, and copying a link by reference or
 /// following it into the host would defeat the point of staging a self-contained, validated
 /// artifact.
@@ -2345,16 +2336,23 @@ fn copy_from(root: std::os::fd::OwnedFd, shown: &Path, dst: &Path) -> Result<(),
     Ok(())
 }
 
-/// Copy the regular file `file` is open on, `from` in a message, to the new file `to`, with its
-/// permission bits. `to` is created, never opened if it exists, so the copy cannot write through a
-/// name it did not make.
+/// Copy the regular file `file` is open on, `from` in a message, to the new file `to`. `to` is
+/// created, never opened if it exists, so the copy cannot write through a name it did not make.
+///
+/// Its mode is canonical: `0755` if the source carries any executable bit, `0644` otherwise. A
+/// source tree carries whatever modes produced it — a `git clone` or a checkout under the caller's
+/// umask — while git records only the executable bit, which is also what a catalogue's digest pins.
+/// The rest is umask noise, so an installed plugin's permissions are deterministic and owner-clean
+/// whatever the source looked like, and the strict executable check runs on the result. The mode is
+/// set through the descriptor the copy holds, on a file created owner-only, so no path is resolved
+/// again to set it.
 fn copy_file(
     mut file: std::fs::File,
     meta: &std::fs::Metadata,
     from: &Path,
     to: &Path,
 ) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2363,41 +2361,13 @@ fn copy_file(
         .map_err(|e| format!("cannot create {}: {e}", to.display()))?;
     std::io::copy(&mut file, &mut out)
         .map_err(|e| format!("cannot copy {}: {e}", from.display()))?;
-    out.set_permissions(meta.permissions())
+    let canonical = if meta.permissions().mode() & 0o111 != 0 {
+        0o755
+    } else {
+        0o644
+    };
+    out.set_permissions(std::fs::Permissions::from_mode(canonical))
         .map_err(|e| format!("cannot set the mode of {}: {e}", to.display()))
-}
-
-/// Canonicalize a staged store plugin's file modes in place: a regular file becomes `0755` if it
-/// carries any executable bit, `0644` otherwise. A store is fetched with `git`, whose checkout
-/// applies the local umask and records only whether a file is executable — and that executable bit
-/// is exactly what the catalogue's content hash pinned (and `verify_entry` checked). The remaining
-/// mode bits are therefore umask noise; normalizing them makes an installed store plugin's
-/// permissions deterministic and owner-clean, matching a built-in install, instead of inheriting
-/// whatever umask the fetch ran under. Only directories and regular files are present (`copy_into`
-/// already refused symlinks and special files).
-fn canonicalize_modes(dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("cannot read an entry of {}: {e}", dir.display()))?;
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
-        if file_type.is_dir() {
-            canonicalize_modes(&path)?;
-        } else if file_type.is_file() {
-            let mode = std::fs::metadata(&path)
-                .map_err(|e| format!("cannot stat {}: {e}", path.display()))?
-                .permissions()
-                .mode();
-            let canonical = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(canonical))
-                .map_err(|e| format!("cannot set the mode of {}: {e}", path.display()))?;
-        }
-    }
-    Ok(())
 }
 
 /// Create `dir` (and any missing parents) owner-only, tightening it if it already existed with
@@ -4098,6 +4068,13 @@ mod tests {
             0o755,
             "the copy must preserve the executable bit"
         );
+        // And a file without one is given none: the canonical `0644`, not the owner-only mode the
+        // copy creates it with, nor the executable's.
+        let manifest_mode = std::fs::metadata(dest.join("plugin.toml"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(manifest_mode & 0o777, 0o644, "a plain file is 0644");
 
         // teeth: the live registry surfaces it under its scheme with zero warnings
         let (reg, warnings) = load(&layout.plugins_dir());
