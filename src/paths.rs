@@ -267,7 +267,10 @@ struct BaseView {
 #[derive(Serialize)]
 struct EntryView {
     label: &'static str,
-    path: PathBuf,
+    /// The entry's location under its base. `None` when the base has no root: there is nothing to
+    /// name, and `null` says so where an empty string would read as a path — `cd ""` stays in the
+    /// working directory under zsh and dash.
+    path: Option<PathBuf>,
     desc: &'static str,
     exists: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -415,18 +418,15 @@ fn probe_base(
 
     let mut views = Vec::with_capacity(entries.len());
     for e in entries {
-        let (path, entry_exists) = match &root {
-            Some(r) => {
-                let p = r.join(e.rel);
-                let exists = p.try_exists().unwrap_or(false);
-                (p, exists)
+        let path = root.as_ref().map(|r| r.join(e.rel));
+        let entry_exists = path
+            .as_ref()
+            .is_some_and(|p| p.try_exists().unwrap_or(false));
+        let children = match &path {
+            Some(p) if e.enumerate != Enumerate::None && entry_exists => {
+                enumerate(p, e.enumerate, live_ids, current_id)
             }
-            None => (PathBuf::new(), false),
-        };
-        let children = if e.enumerate != Enumerate::None && entry_exists {
-            enumerate(&path, e.enumerate, live_ids, current_id)
-        } else {
-            Vec::new()
+            _ => Vec::new(),
         };
         views.push(EntryView {
             label: e.label,
@@ -592,6 +592,9 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
             .max()
             .unwrap_or(0);
         for e in &base.entries {
+            // An entry has a path exactly when its base has a root, and a rootless base stopped
+            // at its header above.
+            let Some(path) = &e.path else { continue };
             let (state, hue) = if e.exists {
                 ("present", ok)
             } else {
@@ -601,7 +604,7 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
                 o,
                 "  {nm}{:<width$}{r}  {}  {hue}({state}){r}  {dim}{}{r}",
                 e.label,
-                e.path.display(),
+                path.display(),
                 e.desc,
             );
             if !e.children.is_empty() {
@@ -863,6 +866,27 @@ mod tests {
         assert!(data.root.is_none(), "no data root");
         assert!(!data.exists);
         assert!(data.entries.iter().all(|e| !e.exists), "all entries absent");
+    }
+
+    /// A base with no root has no path to give its entries, and `--json` says so with `null`, as it
+    /// does for the root. An empty string reads as a path to whatever consumes it: `cd ""` stays in
+    /// the working directory under zsh and dash, so the page's own `cd "$(sbx path --json | jq …)"`
+    /// would go on in the wrong place instead of failing.
+    #[test]
+    fn a_base_with_no_root_names_no_path_for_its_entries() {
+        let v = view_with_roots(None, None, None);
+        let doc = serde_json::to_value(&v).expect("serialize");
+        let bases = doc["bases"].as_array().expect("bases array");
+        assert_eq!(bases.len(), 3, "three bases");
+        for base in bases {
+            assert!(base["root"].is_null(), "no root: {base}");
+            let entries = base["entries"].as_array().expect("entries array");
+            assert!(!entries.is_empty(), "the known entries are still listed");
+            for e in entries {
+                assert!(e["path"].is_null(), "an entry of a rootless base: {e}");
+                assert_eq!(e["exists"], false, "{e}");
+            }
+        }
     }
 
     /// The text render is plain (no ANSI) when the palette is plain — the

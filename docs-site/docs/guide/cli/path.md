@@ -15,7 +15,9 @@ and the **state root** (the trust markers).
 
 Read-only and free: a path listing. No nix, no network, no sandbox.
 
-`--json` prints the same view as JSON.
+`--json` prints the same view as JSON. A base that resolves to no directory (no `$HOME` and no
+XDG variable to name it) has a `null` root, and every entry under it a `null` path; the text
+render marks that base `no base` and lists no entries under it.
 
 See also: [`sbx store`](store) · [`sbx projects`](projects) · [`sbx storage`](storage) · [Directory layout](../concepts/directory-layout).
 
