@@ -407,12 +407,19 @@ fn a_pool_tool_runs_by_name_and_its_pool_is_read_only() {
     // path, the `PATH` prefix — and driving mise here would make this a network test of its
     // backends. It is a `#!/bin/sh` script, so it also proves the cage kept the synthetic shell
     // that a mise-installed tool's shebang almost always needs.
+    //
+    // It reaches the pool where the task cage binds it, and reads the pool's own record there before
+    // it tries to write: a write aimed at a path where nothing is mounted fails on the missing
+    // directory, and would pass for the read-only mount it is meant to prove.
+    let incage = super::super::taskpool::POOL_INCAGE;
     let shims = pool.join("shims");
     std::fs::create_dir_all(&shims).unwrap();
     std::fs::write(
         shims.join("demo-tool"),
-        "#!/bin/sh\necho \"pool-tool ran\"\n\
-         if echo x > /opt/sbx/task-mise/probe 2>/dev/null; then echo POOL-WRITABLE; fi\n",
+        format!(
+            "#!/bin/sh\necho \"pool-tool ran\"\ncat {incage}/config/config.toml\n\
+             if echo x > {incage}/probe 2>/dev/null; then echo POOL-WRITABLE; fi\n"
+        ),
     )
     .unwrap();
     {
@@ -467,6 +474,10 @@ fn a_pool_tool_runs_by_name_and_its_pool_is_read_only() {
     assert!(
         stdout.contains("pool-tool ran"),
         "the pool's tool must resolve by name on PATH: {stdout}"
+    );
+    assert!(
+        stdout.contains("demo-tool = \"latest\""),
+        "the tool must read the pool at {incage}, where the write is then refused: {stdout}"
     );
     assert!(
         !stdout.contains("POOL-WRITABLE"),
