@@ -70,7 +70,8 @@ pub(crate) enum ManageError {
     ///
     /// Writing the entry here would produce a rule that looks set and decides nothing, so the verb
     /// that knows better is named instead. Removal is not redirected: taking a rule out cannot
-    /// create an inert one, and neither `sbx net` nor `sbx proc` has a verb that removes one.
+    /// create an inert one, so `sbx config rm` takes it out as `sbx net unallow|undeny|unmute` and
+    /// `sbx proc unallow|undeny` do.
     UseRuleVerb(String, String),
     /// The value would make the whole layer unparseable (a type the schema rejects), so the write
     /// was refused rather than committed — a committed invalid layer is silently dropped at load.
@@ -3364,7 +3365,7 @@ mod tests {
         // `sbx net allow` carries a posture matrix this generic path has no idea about (bootstrap a
         // deny-by-default posture, refuse a deny that would be inert, never flip a deliberate
         // `shared`). So adding is redirected there. Removal is not: taking a rule out cannot create
-        // an inert one, and `sbx net` has no verb that removes an allow/deny rule at all.
+        // an inert one, so `config rm` stays open beside `sbx net unallow|undeny|unmute`.
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(
             tmp.path(),
