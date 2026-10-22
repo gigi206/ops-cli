@@ -2098,7 +2098,7 @@ fn package_installed(
         // the shared store and is seeded into each project's per-project store, gcrooted
         // per tree (bare `<name>`), so its realized signal is which trees built it,
         // mirroring the deb:/appimage: per-tree report above.
-        let trees = sandbox::inspect::nix_built_trees(data_dir, &pkg.name);
+        let trees = sandbox::inspect::nix_built_trees(data_dir, &pkg.name)?;
         match trees.len() {
             0 => PackageInstalled::NotInstalled,
             n => PackageInstalled::Installed {

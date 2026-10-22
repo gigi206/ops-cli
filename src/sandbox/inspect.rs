@@ -667,47 +667,76 @@ pub(crate) fn store_built_here_against(
 /// declares. The `.expr` derivation-source stamp beside a prebuilt root is a plain file and is skipped
 /// by name, as before.
 ///
-/// Read-only; an absent gcroot dir is simply no roots.
-pub(crate) fn gcroot_names(data_dir: &Path, tree_id: &str) -> Vec<String> {
+/// Read-only; an absent gcroot dir is simply no roots. One that cannot be read whole is an error
+/// naming it: a short list would report built packages as not built.
+pub(crate) fn gcroot_names(data_dir: &Path, tree_id: &str) -> io::Result<Vec<String>> {
     let dir = data_dir.join("gcroots").join("projects").join(tree_id);
-    let mut names: Vec<String> = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries
-            .flatten()
-            .filter(|e| !e.file_type().is_ok_and(|t| t.is_dir()))
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| !n.ends_with(".expr"))
-            .collect(),
-        Err(_) => Vec::new(),
+    let unread =
+        |e: io::Error| io::Error::new(e.kind(), format!("cannot read {}: {e}", dir.display()));
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(unread(e)),
     };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(unread)?;
+        if entry.file_type().map_err(unread)?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".expr") {
+            names.push(name);
+        }
+    }
     names.sort();
-    names
+    Ok(names)
 }
 
 /// Which project trees have realized the `nix:` package named `name` — its per-tree "installed"
 /// signal, the analogue of [`prebuilt_pin_trees`] for the prebuilt backends. A `nix:` package builds
 /// host-side into the shared store and is seeded into each project's own store, gcrooted per tree at
 /// `<data>/gcroots/projects/<id>/<name>` (the launch keys the gcroot on the package's declared name).
-/// Scans every tree for that gcroot and returns the matching tree ids, sorted. Read-only; an absent
-/// gcroots dir is simply no trees.
-pub(crate) fn nix_built_trees(data_dir: &Path, name: &str) -> Vec<String> {
-    let Ok(trees) = std::fs::read_dir(data_dir.join("gcroots").join("projects")) else {
-        return Vec::new();
+/// Each tree is asked for that one entry, a root by the rule [`gcroot_names`] lists them by, rather
+/// than listed and sorted whole. Returns the matching tree ids, sorted.
+///
+/// Read-only; an absent gcroots dir is simply no trees. A gcroots dir, or a tree in it, that cannot
+/// be read is an error naming it, as in [`gcroot_names`]: a tree missing from the answer would
+/// report a built package as not built.
+pub(crate) fn nix_built_trees(data_dir: &Path, name: &str) -> io::Result<Vec<String>> {
+    // A name no root can carry matches none, and is never joined to a path.
+    if name.is_empty()
+        || name.contains('/')
+        || name == "."
+        || name == ".."
+        || name.ends_with(".expr")
+    {
+        return Ok(Vec::new());
+    }
+    let projects = data_dir.join("gcroots").join("projects");
+    let unread = |dir: &Path, e: io::Error| {
+        io::Error::new(e.kind(), format!("cannot read {}: {e}", dir.display()))
     };
-    let mut ids: Vec<String> = trees
-        .flatten()
-        .filter_map(|t| {
-            if !t.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                return None;
-            }
-            let id = t.file_name().to_string_lossy().into_owned();
-            gcroot_names(data_dir, &id)
-                .iter()
-                .any(|n| n == name)
-                .then_some(id)
-        })
-        .collect();
+    let trees = match std::fs::read_dir(&projects) {
+        Ok(trees) => trees,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(unread(&projects, e)),
+    };
+    let mut ids = Vec::new();
+    for tree in trees {
+        let tree = tree.map_err(|e| unread(&projects, e))?;
+        if !tree.file_type().map_err(|e| unread(&projects, e))?.is_dir() {
+            continue;
+        }
+        match std::fs::symlink_metadata(tree.path().join(name)) {
+            Ok(meta) if !meta.is_dir() => ids.push(tree.file_name().to_string_lossy().into_owned()),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(unread(&tree.path(), e)),
+        }
+    }
     ids.sort();
-    ids
+    Ok(ids)
 }
 
 /// The `nix:` mise tools a project tree has resolved — `<tree_dir>/tools.lock`, mapping each
@@ -1423,7 +1452,7 @@ mod tests {
         std::fs::create_dir_all(&nix_tools).unwrap();
         std::os::unix::fs::symlink("/nix/store/hash-jq", nix_tools.join("jq")).unwrap();
 
-        let names = gcroot_names(data, "abc123");
+        let names = gcroot_names(data, "abc123").unwrap();
         assert_eq!(
             names,
             vec!["chromium", "deb-demo-app", "node"],
@@ -1432,7 +1461,7 @@ mod tests {
         // The `nix:` tool rooted inside `nix-tools/` is not a project package root either — it must
         // not be pulled up a level and reported as one.
         assert!(!names.iter().any(|n| n == "jq"));
-        assert!(gcroot_names(data, "absent").is_empty());
+        assert!(gcroot_names(data, "absent").unwrap().is_empty());
     }
 
     #[test]
@@ -1596,15 +1625,31 @@ mod tests {
         std::fs::create_dir_all(&t2).unwrap();
         std::os::unix::fs::symlink("/nix/store/hash-jq", t2.join("jq")).unwrap();
 
+        std::fs::create_dir_all(data.join("gcroots/projects/t1/nix-tools")).unwrap();
         assert_eq!(
-            nix_built_trees(data, "chromium"),
+            nix_built_trees(data, "chromium").unwrap(),
             vec!["t1".to_string(), "t3".to_string()],
             "the trees that gcrooted the package, sorted"
         );
-        assert_eq!(nix_built_trees(data, "jq"), vec!["t2".to_string()]);
+        assert_eq!(nix_built_trees(data, "jq").unwrap(), vec!["t2".to_string()]);
+        // What `gcroot_names` does not count as a root is not one here either: the `nix-tools`
+        // directory, and a `.expr` stamp.
+        assert!(nix_built_trees(data, "nix-tools").unwrap().is_empty());
+        assert!(nix_built_trees(data, "chromium.expr").unwrap().is_empty());
+        // Nor is a name no root can carry, which is never joined below a tree: joined, this one
+        // would look below the `.expr` stamp, a plain file.
+        assert!(
+            nix_built_trees(data, "chromium.expr/bin")
+                .unwrap()
+                .is_empty()
+        );
         // A package no tree built, and an absent gcroots dir, are both empty.
-        assert!(nix_built_trees(data, "ripgrep").is_empty());
-        assert!(nix_built_trees(&data.join("nope"), "chromium").is_empty());
+        assert!(nix_built_trees(data, "ripgrep").unwrap().is_empty());
+        assert!(
+            nix_built_trees(&data.join("nope"), "chromium")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

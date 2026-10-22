@@ -232,6 +232,35 @@ fn show_reports_store_roots_and_declared_but_not_built() {
     );
 }
 
+/// A tree's store roots that cannot be listed are not a tree with none: the verb names the
+/// directory and fails, rather than report `store roots: none` and every declared package unbuilt.
+#[test]
+fn show_fails_when_the_trees_store_roots_cannot_be_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fx = Project::new("projects");
+    let proj = fx.proj.path().canonicalize().unwrap();
+    let tree = "1111111111111111";
+    fx.make_tree(tree, Some(&proj));
+    fx.make_gcroot(tree, "built");
+    let roots = fx.data_home.path().join("sbx/gcroots/projects").join(tree);
+    let mode = |m| std::fs::set_permissions(&roots, std::fs::Permissions::from_mode(m));
+    mode(0o000).unwrap();
+    if std::fs::read_dir(&roots).is_ok() {
+        mode(0o700).unwrap();
+        skip_incapable!("running as root, which reads a directory its mode refuses");
+        return;
+    }
+    let out = fx.run(&["projects", "show", tree]);
+    mode(0o700).unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot read"),
+        "the directory that was not read must be named: {}",
+        text(&out)
+    );
+}
+
 #[test]
 fn show_counts_a_remote_flake_built_into_the_store_as_realized() {
     let fx = Project::new("projects");

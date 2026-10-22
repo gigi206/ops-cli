@@ -464,7 +464,17 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
     let own_bytes = reclaim.given_figures(&dir, total_bytes, store_bytes, store_built_here_bytes);
 
     // Realized signals, read once from the tree.
-    let gcroots = super::inspect::gcroot_names(data, id);
+    let gcroots = match super::inspect::gcroot_names(data, id) {
+        Ok(names) => names,
+        // A tree whose roots cannot be read is not one with none: every declared package would
+        // read as not built.
+        Err(e) => {
+            crate::diag::error(&format!(
+                "sbx projects show: {e}, so what tree `{id}` has built cannot be shown"
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
     let gcroot_set: std::collections::BTreeSet<&str> = gcroots.iter().map(String::as_str).collect();
     let tools_locked = super::inspect::nix_tools_locked(&dir);
     let home_tools = super::inspect::mise_installed(&dir.join("home"));

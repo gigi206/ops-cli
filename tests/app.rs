@@ -279,6 +279,68 @@ fn show_detects_a_remote_flake_built_into_the_per_project_store() {
     assert_installed(&show_json(&fx, "demo-app"), "flake", "tree");
 }
 
+/// The project trees' `nix:` roots that cannot be listed are not trees where nothing is built:
+/// `app show` names the directory and fails, rather than report a built package `not installed`.
+#[test]
+fn show_fails_when_the_nix_roots_cannot_be_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fx = Project::new("app");
+    fx.write_profile(
+        "demo-app",
+        "cmd = \"demo\"\n\n[packages]\ncore = \"nix:hello\"\n",
+    );
+    fx.build_nix("aaaaaaaaaaaaaaaa", "core");
+    let roots = fx.data_home.path().join("sbx/gcroots/projects");
+    let mode = |m| std::fs::set_permissions(&roots, std::fs::Permissions::from_mode(m));
+    mode(0o000).unwrap();
+    if std::fs::read_dir(&roots).is_ok() {
+        mode(0o700).unwrap();
+        skip_incapable!("running as root, which reads a directory its mode refuses");
+        return;
+    }
+    let out = fx.run(&["app", "show", "demo-app"]);
+    mode(0o700).unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot read"),
+        "the directory that was not read must be named: {}",
+        text(&out)
+    );
+}
+
+/// The same for one tree whose roots cannot be read, among trees that can.
+#[test]
+fn show_fails_when_a_trees_nix_roots_cannot_be_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fx = Project::new("app");
+    fx.write_profile(
+        "demo-app",
+        "cmd = \"demo\"\n\n[packages]\ncore = \"nix:hello\"\n",
+    );
+    fx.build_nix("aaaaaaaaaaaaaaaa", "core");
+    let tree = fx
+        .data_home
+        .path()
+        .join("sbx/gcroots/projects/aaaaaaaaaaaaaaaa");
+    let mode = |m| std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(m));
+    mode(0o000).unwrap();
+    if std::fs::read_dir(&tree).is_ok() {
+        mode(0o700).unwrap();
+        skip_incapable!("running as root, which reads a directory its mode refuses");
+        return;
+    }
+    let out = fx.run(&["app", "show", "demo-app"]);
+    mode(0o700).unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot read"),
+        "the directory that was not read must be named: {}",
+        text(&out)
+    );
+}
+
 #[test]
 fn show_detects_an_inline_flake_built_into_the_home() {
     let fx = Project::new("app");
