@@ -22,12 +22,19 @@
 
 use super::*;
 
-/// Record this sandbox in the on-disk registry so `sbx session ls` can list it. Best
-/// effort: the registry is observability, not a security control, so a failure to
-/// register degrades visibility but never blocks the sandbox. The session is keyed
-/// on `spec.workdir` — the canonical project root, the same identity the runtime
-/// layout derives from. Returns the record's path (to hand to a [`RecordGuard`])
-/// when it was written.
+/// Record this sandbox in the on-disk registry, which is how sbx knows it is running. `sbx session`
+/// lists, attaches to and stops it from there, and the commands scoped to an app or a project find
+/// it there. So does what must not remove or move what a running sandbox uses: `sbx gc` refuses to
+/// collect its project's store and keeps the distribution tree it runs from, `sbx projects rm`,
+/// `sbx app rm --purge` and `sbx app prune` refuse its project or its app, `sbx storage use` and
+/// `sbx storage migrate` refuse to switch or copy the data directory it runs from, and the trim a
+/// detached launch makes of old logs keeps its log. Best effort: a record that cannot be written
+/// never blocks the sandbox, but it is said ([`unrecorded_warning`]), since all of these then take
+/// the session for one that is not running.
+///
+/// The session is keyed on `spec.workdir` — the canonical project root, the same identity the
+/// runtime layout derives from. Returns the record's path (to hand to a [`RecordGuard`]) when it
+/// was written.
 ///
 /// `detached` records where this session's output went, which is the one thing a listing cannot
 /// infer from the other fields: a detached session's stdout/stderr is redirected to
@@ -46,21 +53,65 @@ pub(super) fn register(
     detached: bool,
     store_lock: Option<crate::sandbox::projectstore::ProjectStoreLock>,
 ) -> Option<PathBuf> {
-    let recorded = Session::current(spec.workdir.clone(), kind, session_runtime(runtime))
-        .ok()
-        .and_then(|session| {
-            let session = if detached {
-                session.detached()
-            } else {
-                session
-            };
-            crate::session::Registry::at(data_dir)
-                .register(&session)
-                .ok()
-        });
+    let recorded = match record_or_warning(data_dir, spec.workdir.clone(), kind, runtime, detached)
+    {
+        Ok(path) => Some(path),
+        Err(warning) => {
+            crate::diag::warn(&warning);
+            None
+        }
+    };
     // Let go only now: an `sbx gc` of the project waiting on it finds this session and refuses.
     drop(store_lock);
     recorded
+}
+
+/// [`record_session`], with what the launch says when it fails ([`unrecorded_warning`]) in place of
+/// the error.
+fn record_or_warning(
+    data_dir: &Path,
+    workdir: PathBuf,
+    kind: Kind,
+    runtime: binds::Runtime,
+    detached: bool,
+) -> Result<PathBuf, String> {
+    record_session(data_dir, workdir, kind, runtime, detached)
+        .map_err(|e| unrecorded_warning(&e, detached))
+}
+
+/// The record [`register`] writes for this process's session in `workdir`, or why it could not be
+/// written: this process's start time unreadable, or the registry refusing the file.
+fn record_session(
+    data_dir: &Path,
+    workdir: PathBuf,
+    kind: Kind,
+    runtime: binds::Runtime,
+    detached: bool,
+) -> io::Result<PathBuf> {
+    let session = Session::current(workdir, kind, session_runtime(runtime))?;
+    let session = if detached {
+        session.detached()
+    } else {
+        session
+    };
+    crate::session::Registry::at(data_dir).register(&session)
+}
+
+/// What a launch says when its session could not be recorded: that sbx will take it for one that is
+/// not running, the listing that will not show it, and what will then act on what it uses — the
+/// verbs that remove or move it, and for a `detached` session the trim of old logs.
+fn unrecorded_warning(e: &io::Error, detached: bool) -> String {
+    let log = if detached {
+        ", and a later detached launch may delete its log"
+    } else {
+        ""
+    };
+    format!(
+        "this session could not be recorded ({e}), so sbx will take it for one that is not \
+         running: `sbx session ls` will not list it, and `sbx gc`, `sbx projects rm`, \
+         `sbx app rm --purge`, `sbx app prune`, `sbx storage use` and `sbx storage migrate` will \
+         not refuse to act on what it uses{log}"
+    )
 }
 
 /// The owned [`crate::session::SessionRuntime`] for a launch's borrowing [`binds::Runtime`], so the

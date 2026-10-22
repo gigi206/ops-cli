@@ -345,3 +345,54 @@ fn bubblewraps_report_tells_a_refused_setup_from_a_command_that_failed() {
         "a program bubblewrap cannot run: it ends 1 and reports no exit-code"
     );
 }
+
+/// A session the registry cannot take comes back as an error with its reason: `sessions` here is a
+/// plain file, so the record has nowhere to go. What the launch then says is that sbx will take the
+/// session for one that is not running, and names the listing that will not show it and each verb
+/// that will act on what it uses; a detached session's warning adds the log a later launch may trim.
+#[test]
+fn a_session_the_registry_cannot_take_comes_back_as_an_error() {
+    let data = crate::testutil::TmpDir::new();
+    std::fs::write(data.join("sessions"), "").unwrap();
+    let err = record_session(
+        data.path(),
+        data.path().to_path_buf(),
+        Kind::Run,
+        binds::Runtime::ProjectDefault,
+        false,
+    )
+    .expect_err("a registry whose directory is a file takes no record");
+    let said = unrecorded_warning(&err, false);
+    assert!(said.contains(&err.to_string()), "{said}");
+    assert!(said.contains("not running"), "{said}");
+    for verb in [
+        "sbx session ls",
+        "sbx gc",
+        "sbx projects rm",
+        "sbx app rm --purge",
+        "sbx app prune",
+        "sbx storage use",
+        "sbx storage migrate",
+    ] {
+        assert!(said.contains(verb), "{verb} is not named: {said}");
+    }
+    assert!(
+        !said.contains("its log"),
+        "a foreground session has no log: {said}"
+    );
+    let detached = unrecorded_warning(&err, true);
+    assert!(detached.starts_with(&said), "{detached}");
+    assert!(detached.contains("its log"), "{detached}");
+    let warned = |detached| {
+        record_or_warning(
+            data.path(),
+            data.path().to_path_buf(),
+            Kind::Run,
+            binds::Runtime::ProjectDefault,
+            detached,
+        )
+        .expect_err("the same registry takes no record either way")
+    };
+    assert_eq!(warned(false), said);
+    assert_eq!(warned(true), detached);
+}
