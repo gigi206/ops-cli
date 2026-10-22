@@ -1348,10 +1348,10 @@ fn parse_net(value: &str, label: &str) -> Result<NetworkField, String> {
 /// mixing hosts with an intact pattern (`allow=github.com,re:^https://api\.`).
 fn split_hosts(hosts: &str, label: &str, kind: &str) -> Result<Vec<String>, String> {
     if hosts.contains(',')
-        && hosts
-            .split(',')
-            .map(str::trim)
-            .any(|p| p.starts_with("re:") && crate::allowlist::classify(p).is_err())
+        && hosts.split(',').map(str::trim).any(|p| {
+            p.strip_prefix("re:")
+                .is_some_and(|pattern| regex::Regex::new(pattern).is_err())
+        })
     {
         return Err(format!(
             "{label}: a `re:` pattern containing a comma cannot go through `{kind}=` — the value is \
@@ -2490,10 +2490,13 @@ mod tests {
         );
 
         // The guard keys on *damage*, not on the presence of a regex: a list mixing hosts with an
-        // intact pattern still parses, and so does a comma-free catch-all.
+        // intact pattern still parses, and so does a comma-free catch-all. So does an intact
+        // pattern the grammar refuses for another reason: it reaches the rule loader, which names
+        // that reason, rather than being blamed on a comma it does not contain.
         for ok in [
             "allow=github.com,re:^https://api\\.example\\.test",
             "allow=re:.*",
+            "allow=github.com,re:^http://x\\.test/",
         ] {
             assert!(
                 collect_cli(Cli {
