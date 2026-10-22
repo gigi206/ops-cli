@@ -4,7 +4,7 @@
 mod common;
 use common::fixture::TmpDir;
 
-use std::process::Command;
+use std::process::{Command, Output};
 
 /// The built binary, with the global config and the trust store isolated the way every other suite
 /// isolates them, by [`common::isolated_sbx`], so a report never depends on the developer's own
@@ -64,6 +64,52 @@ fn the_check<'a>(report: &'a str, name: &str) -> Reported<'a> {
     }
 }
 
+/// The exit status a human `doctor` run took, asserted to agree with what it printed.
+///
+/// `0` and `1` are both legitimate, depending on the host, so a status read alone passes a run that
+/// failed with every check green, or one that succeeded over a failed check. Every failed check
+/// records the remediation the summary prints, so a `1` comes with a `[FAIL]` check and the
+/// missing-prerequisites header on stderr, and a `0` with neither, and the all-clear on stdout.
+#[track_caller]
+fn verdict(out: &Output) -> i32 {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let says = format!(
+        "{}; stdout was:\n{stdout}\nstderr was:\n{stderr}",
+        out.status
+    );
+    let failed = reported(&stdout).iter().any(|c| c.tag == "FAIL");
+    let all_clear = stdout.contains("sbx: prerequisites OK.");
+    let missing = stderr.contains("sbx: missing prerequisite(s)");
+    match out.status.code() {
+        Some(0) => {
+            assert!(
+                !failed,
+                "a run that succeeded printed a failed check: {says}"
+            );
+            assert!(all_clear, "a run that succeeded did not say so: {says}");
+            assert!(
+                !missing,
+                "a run that succeeded named a missing prerequisite: {says}"
+            );
+            0
+        }
+        Some(1) => {
+            assert!(failed, "a run that failed printed no failed check: {says}");
+            assert!(
+                missing,
+                "a run that failed did not name what is missing: {says}"
+            );
+            assert!(
+                !all_clear,
+                "a run that failed said the prerequisites are OK: {says}"
+            );
+            1
+        }
+        _ => panic!("doctor exits 0 or 1: {says}"),
+    }
+}
+
 #[test]
 fn doctor_prints_the_preflight_structure() {
     // Redirect sbx's data dir to a throwaway location so the asserted store path
@@ -76,13 +122,15 @@ fn doctor_prints_the_preflight_structure() {
         .expect("spawn sbx doctor");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("runtime preflight"), "stdout was: {stdout}");
-    assert!(stdout.contains("bubblewrap"), "stdout was: {stdout}");
+    the_check(&stdout, "bubblewrap");
+    // A check of its own where the boundary failed, a note under the launch that proved it
+    // elsewhere, so it is looked for as a phrase.
     assert!(stdout.contains("user namespaces"), "stdout was: {stdout}");
-    assert!(stdout.contains("nix"), "stdout was: {stdout}");
+    the_check(&stdout, "nix");
     // the channel line is present; with a fresh data dir nothing is locked yet
-    assert!(stdout.contains("channel"), "stdout was: {stdout}");
     assert!(
-        stdout.contains("not yet resolved"),
+        detail(the_check(&stdout, "channel").text, "channel")
+            .is_some_and(|d| d.starts_with("not yet resolved")),
         "a fresh data dir has no locked channel: {stdout}"
     );
 
@@ -90,20 +138,30 @@ fn doctor_prints_the_preflight_structure() {
     // it reports the path without creating it.
     let store_path = data.path().join("sbx/store");
     assert!(
-        stdout.contains(&*store_path.to_string_lossy()),
-        "store line should mention {}; stdout was: {stdout}",
+        detail(the_check(&stdout, "store").text, "store")
+            .is_some_and(|d| d.starts_with(&*store_path.to_string_lossy())),
+        "store line should name {}; stdout was: {stdout}",
         store_path.display()
     );
-    assert!(
-        !store_path.exists(),
-        "doctor must not create the store (read-only); found {}",
-        store_path.display()
-    );
+    // Absent is a `NotFound` or a `NotADirectory`, and nothing else: `exists()` answers no to any
+    // error, so a store created under a directory made unreadable, or a link left dangling in its
+    // place, would pass for one never created.
+    match std::fs::symlink_metadata(&store_path) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) => {}
+        Ok(_) => panic!(
+            "doctor must not create the store (read-only); found {}",
+            store_path.display()
+        ),
+        Err(e) => panic!("cannot tell whether {} exists: {e}", store_path.display()),
+    }
 
-    // 0 (all prerequisites OK) or 1 (a hard requirement missing) — both valid
-    // depending on the host; anything else is a bug.
-    let code = out.status.code().expect("exited normally");
-    assert!(code == 0 || code == 1, "unexpected exit code {code}");
+    // 0 (all prerequisites OK) or 1 (a hard requirement missing), depending on the host, and
+    // either one agreeing with the report.
+    verdict(&out);
 }
 
 #[test]
@@ -130,8 +188,8 @@ fn doctor_proves_the_boundary_by_a_real_launch_where_supported() {
         .expect("spawn sbx doctor");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
-        out.status.code(),
-        Some(0),
+        verdict(&out),
+        0,
         "doctor should be green on a host that can sandbox; stdout was:\n{stdout}"
     );
     assert!(
@@ -164,16 +222,17 @@ fn doctor_reports_a_refused_engine_override_as_refused_not_missing() {
         .expect("spawn sbx doctor");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stdout.contains(&format!(
-            "nix               refused: SBX_NIX_BIN={}",
-            nix.display()
-        )),
-        "the nix line must name the refusal and the path; stdout was:\n{stdout}"
+    // One nix check, a failed one, whose whole detail is the refusal: a refused override is not a
+    // missing engine. Read whatever the padding between the name and the detail.
+    let nix_check = the_check(&stdout, "nix");
+    assert_eq!(
+        nix_check.tag, "FAIL",
+        "a refused engine is a failed check; stdout was:\n{stdout}"
     );
-    assert!(
-        !stdout.contains("nix               not found"),
-        "a refused override is not a missing engine; stdout was:\n{stdout}"
+    assert_eq!(
+        detail(nix_check.text, "nix"),
+        Some(&*format!("refused: SBX_NIX_BIN={}", nix.display())),
+        "the nix line must name the refusal and the path; stdout was:\n{stdout}"
     );
     assert!(
         !stderr.contains("install nix"),
@@ -182,6 +241,11 @@ fn doctor_reports_a_refused_engine_override_as_refused_not_missing() {
     assert!(
         stderr.contains("unset SBX_NIX_BIN"),
         "the remediation must name the way out; stderr was:\n{stderr}"
+    );
+    assert_eq!(
+        verdict(&out),
+        1,
+        "a refused engine is a missing prerequisite"
     );
 }
 
@@ -279,8 +343,8 @@ fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
         .expect("spawn sbx doctor");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
-        out.status.code(),
-        Some(1),
+        verdict(&out),
+        1,
         "a failed launch is a hard failure; stdout was:\n{stdout}"
     );
     if !unprivileged_namespace_bears_capabilities() {
@@ -371,6 +435,10 @@ fn doctor_json_carries_every_check_the_report_prints() {
     // The document and the report come from one pass, so the two must agree on *what was checked*.
     // Asserting that correspondence is what keeps a future check from being added to one and not
     // the other: the `Report` makes that hard, and this makes it visible if it happens anyway.
+    //
+    // Both runs read the same data directory, which is what makes them comparable: the store's
+    // check names its path, and doctor creates nothing there. They are still two launches of the
+    // host, so the checks are paired by name, in order, and not by status or detail.
     let data = TmpDir::new("dr");
     let run = |json: bool| {
         let mut cmd = sbx();
@@ -378,24 +446,31 @@ fn doctor_json_carries_every_check_the_report_prints() {
         if json {
             cmd.arg("--json");
         }
-        let out = cmd.output().expect("run sbx doctor");
-        String::from_utf8_lossy(&out.stdout).to_string()
+        cmd.output().expect("run sbx doctor")
     };
 
-    let human = run(false);
-    let doc: serde_json::Value =
-        serde_json::from_str(&run(true)).expect("`sbx doctor --json` emits a document");
+    let human = common::stdout_of(&run(false));
+    let doc = common::json_of(&run(true));
 
-    let checks = doc["checks"].as_array().expect("a checks array");
+    let checks = doc["checks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a checks array: {doc:#}"));
     assert!(
         checks.len() >= 5,
         "a preflight reports more than a handful of checks: {checks:?}"
     );
-    for c in checks {
+    let printed = reported(&human);
+    assert_eq!(
+        printed.len(),
+        checks.len(),
+        "the report and the document list different checks:\n{human}\n{doc:#}"
+    );
+    for (c, line) in checks.iter().zip(&printed) {
         let name = c["name"].as_str().expect("each check is named");
         assert!(
-            human.contains(name),
-            "`{name}` is in the document but not in the report:\n{human}"
+            detail(line.text, name).is_some(),
+            "`{name}` is in the document where the report prints `{}`:\n{human}",
+            line.text
         );
         assert!(
             matches!(c["status"].as_str(), Some("ok" | "warn" | "fail")),
@@ -404,11 +479,15 @@ fn doctor_json_carries_every_check_the_report_prints() {
         );
     }
     // `ok` is the single boolean a gate reads, and it must agree with the exit status the human
-    // run would have taken: no remediation means nothing is missing.
+    // run would have taken: no remediation means nothing is missing. The list is read as one, so a
+    // document that lost it is not taken for a failing run that has nothing to say.
+    let remediation = doc["remediation"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a remediation array: {doc:#}"));
     assert_eq!(
         doc["ok"].as_bool(),
-        Some(doc["remediation"].as_array().is_some_and(Vec::is_empty)),
-        "`ok` must mean `remediation` is empty"
+        Some(remediation.is_empty()),
+        "`ok` must mean `remediation` is empty: {doc:#}"
     );
 }
 
@@ -428,6 +507,6 @@ fn doctor_json_prints_no_prose_beside_the_document() {
         !stdout.contains("runtime preflight") && !stdout.contains("prerequisites OK"),
         "the human banner and summary must not ride along:\n{stdout}"
     );
-    serde_json::from_str::<serde_json::Value>(&stdout)
-        .expect("stdout parses whole, with nothing before or after the document");
+    // Parsed whole: a byte before or after the document fails it, with both streams printed.
+    common::json_of(&out);
 }
