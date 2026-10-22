@@ -2145,7 +2145,9 @@ pub(crate) fn validate_install_name(name: &str) -> Result<(), String> {
 }
 
 /// Copy a plugin source tree to `dst`, which must not exist yet: [`create_fresh_dir`], then
-/// [`copy_into`].
+/// [`copy_into`]. The tests' way to place a tree by hand; an install makes its staging directory
+/// with [`create_fresh_sibling`] instead.
+#[cfg(test)]
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     create_fresh_dir(dst)?;
     copy_into(src, dst)
@@ -2196,42 +2198,135 @@ fn create_fresh_sibling(
 /// refused — a resolver plugin is a small tree of real files, and copying a link by reference or
 /// following it into the host would defeat the point of staging a self-contained, validated
 /// artifact.
+///
+/// The source is whatever directory the user named, which may be a project a cage writes while the
+/// copy runs, so it is read by descriptor rather than by path: the root is opened refusing a link,
+/// and [`copy_from`] does the rest from that descriptor.
 fn copy_into(src: &Path, dst: &Path) -> Result<(), String> {
-    // Refuse a symlinked source root: `read_dir` would follow it and copy whatever it points at.
-    // A plugin source is a real, self-contained directory (the recursive descent below only enters
-    // entries already confirmed to be non-symlink directories, so this guards the root each caller
-    // hands in).
-    let src_meta = std::fs::symlink_metadata(src)
-        .map_err(|e| format!("cannot stat {}: {e}", src.display()))?;
-    if src_meta.file_type().is_symlink() {
-        return Err(format!(
-            "{} is a symlink (a plugin source must be a real directory)",
-            src.display()
-        ));
-    }
-    let entries =
-        std::fs::read_dir(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("cannot read an entry of {}: {e}", src.display()))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("cannot stat {}: {e}", entry.path().display()))?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_tree(&from, &to)?;
-        } else if file_type.is_file() {
-            std::fs::copy(&from, &to)
-                .map_err(|e| format!("cannot copy {}: {e}", from.display()))?;
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(src.as_os_str().as_bytes())
+        .map_err(|_| format!("{} holds a NUL byte", src.display()))?;
+    // A link at the root fails the open with `ELOOP`, or with `ENOTDIR` when it points at a
+    // directory, so the failure is asked what was there rather than read off its code.
+    let root = crate::sandbox::gc::open_dir_nofollow(None, &c).map_err(|e| {
+        if std::fs::symlink_metadata(src).is_ok_and(|m| m.file_type().is_symlink()) {
+            format!(
+                "{} is a symlink (a plugin source must be a real directory)",
+                src.display()
+            )
         } else {
-            return Err(format!(
-                "{} is not a regular file or directory (a plugin may not ship symlinks or \
-                 special files)",
-                from.display()
-            ));
+            format!("cannot open {}: {e}", src.display())
+        }
+    })?;
+    copy_from(root, src, dst)
+}
+
+/// [`copy_into`] from the directory `root` is open on, which `shown` names in a message.
+///
+/// Every entry is opened from the descriptor of the directory listing it, refusing a link at its
+/// name, and judged by the opened descriptor's own `fstat`, never by a path resolved again: an
+/// entry the listing reported as a file or a directory and that a cage swapped for a link since is
+/// refused where it is met, and what was opened is what is copied. Each directory is listed through
+/// `/proc/self/fd/<n>`, which names the inode its handle holds. The walk is a loop over a stack of
+/// levels on the heap, not a recursion: a cage can make a source tree as deep as it likes, and one
+/// native stack frame per level aborts the process on a stack overflow, which nothing reports. Each
+/// level holds its handle, so a tree deeper than the descriptor limit stops with `EMFILE`.
+fn copy_from(root: std::os::fd::OwnedFd, shown: &Path, dst: &Path) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    /// A directory being copied: its handle, the entries still to copy with the type the listing
+    /// gave each, and the paths it is shown as and copied to.
+    struct Level {
+        handle: std::os::fd::OwnedFd,
+        pending: Vec<(std::ffi::OsString, std::fs::FileType)>,
+        shown: PathBuf,
+        dst: PathBuf,
+    }
+    let read = |handle: std::os::fd::OwnedFd, shown: PathBuf, dst: PathBuf| {
+        let held = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
+        let pending = std::fs::read_dir(&held)
+            .and_then(|entries| {
+                entries
+                    .map(|entry| entry.and_then(|e| Ok((e.file_name(), e.file_type()?))))
+                    .collect::<std::io::Result<Vec<_>>>()
+            })
+            .map_err(|e| format!("cannot read {}: {e}", shown.display()))?;
+        Ok::<_, String>(Level {
+            handle,
+            pending,
+            shown,
+            dst,
+        })
+    };
+    let refused = |from: &Path| {
+        format!(
+            "{} is not a regular file or directory (a plugin may not ship symlinks or special \
+             files)",
+            from.display()
+        )
+    };
+
+    let mut stack = vec![read(root, shown.to_path_buf(), dst.to_path_buf())?];
+    while let Some(mut level) = stack.pop() {
+        let Some((name, listed)) = level.pending.pop() else {
+            continue;
+        };
+        let from = level.shown.join(&name);
+        let to = level.dst.join(&name);
+        // What the listing says decides what is opened at all: a link, a device, a socket or a FIFO
+        // is refused without an open, which on a device could act.
+        if !listed.is_dir() && !listed.is_file() {
+            return Err(refused(&from));
+        }
+        let c = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| format!("{} holds a NUL byte", from.display()))?;
+        let entry =
+            crate::sandbox::gc::open_entry_nofollow(&level.handle, &c).map_err(|e| {
+                match e.raw_os_error() {
+                    Some(libc::ELOOP) | Some(libc::ENXIO) => refused(&from),
+                    _ => format!("cannot open {}: {e}", from.display()),
+                }
+            })?;
+        let file = std::fs::File::from(entry);
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("cannot stat {}: {e}", from.display()))?;
+        if meta.is_dir() {
+            create_fresh_dir(&to)?;
+            let below = read(file.into(), from, to)?;
+            stack.push(level);
+            stack.push(below);
+        } else if meta.is_file() {
+            copy_file(file, &meta, &from, &to)?;
+            stack.push(level);
+        } else {
+            return Err(refused(&from));
         }
     }
     Ok(())
+}
+
+/// Copy the regular file `file` is open on, `from` in a message, to the new file `to`, with its
+/// permission bits. `to` is created, never opened if it exists, so the copy cannot write through a
+/// name it did not make.
+fn copy_file(
+    mut file: std::fs::File,
+    meta: &std::fs::Metadata,
+    from: &Path,
+    to: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(to)
+        .map_err(|e| format!("cannot create {}: {e}", to.display()))?;
+    std::io::copy(&mut file, &mut out)
+        .map_err(|e| format!("cannot copy {}: {e}", from.display()))?;
+    out.set_permissions(meta.permissions())
+        .map_err(|e| format!("cannot set the mode of {}: {e}", to.display()))
 }
 
 /// Canonicalize a staged store plugin's file modes in place: a regular file becomes `0755` if it
@@ -2240,7 +2335,7 @@ fn copy_into(src: &Path, dst: &Path) -> Result<(), String> {
 /// is exactly what the catalogue's content hash pinned (and `verify_entry` checked). The remaining
 /// mode bits are therefore umask noise; normalizing them makes an installed store plugin's
 /// permissions deterministic and owner-clean, matching a built-in install, instead of inheriting
-/// whatever umask the fetch ran under. Only directories and regular files are present (`copy_tree`
+/// whatever umask the fetch ran under. Only directories and regular files are present (`copy_into`
 /// already refused symlinks and special files).
 fn canonicalize_modes(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
@@ -3951,7 +4046,7 @@ mod tests {
         let dest = layout.plugins_dir().join("pass");
         assert!(dest.join("plugin.toml").is_file());
         assert!(dest.join("resolve").is_file());
-        // the executable bit must survive the copy — the load-bearing property of `copy_tree` for
+        // the executable bit must survive the copy — the load-bearing property of `copy_into` for
         // an executable plugin. `check_exec` does not test it (it checks ownership / regular-file /
         // not-group-or-world-writable), so assert the mode directly: a future copy that lost the bit
         // (e.g. a read+write rewrite under a 0644 umask) would silently break every install.
@@ -3963,7 +4058,7 @@ mod tests {
         assert_eq!(
             mode & 0o777,
             0o755,
-            "copy_tree must preserve the executable bit"
+            "the copy must preserve the executable bit"
         );
 
         // teeth: the live registry surfaces it under its scheme with zero warnings
@@ -4130,6 +4225,119 @@ mod tests {
         let why = create_fresh_sibling(data.path(), || "taken".to_string())
             .expect_err("every name taken");
         assert!(why.contains("all taken"), "{why}");
+    }
+
+    /// The source is read from the descriptor it was opened on, never by its path again. With the
+    /// path swapped for a link to another tree once the root is open, as a cage writing the source
+    /// during an install could, the copy still takes the tree that was opened, down to a file in a
+    /// subdirectory: a path walk resolved the link and copied the decoy instead.
+    #[test]
+    fn a_source_swapped_for_a_link_after_it_was_opened_is_not_followed() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = crate::testutil::TmpDir::new();
+        let source = root.path().join("src");
+        fs::create_dir_all(source.join("sub")).unwrap();
+        fs::write(source.join("sub/data"), "original").unwrap();
+        let decoy = root.path().join("decoy");
+        fs::create_dir_all(decoy.join("sub")).unwrap();
+        fs::write(decoy.join("sub/data"), "decoy").unwrap();
+
+        let c = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+        let opened = crate::sandbox::gc::open_dir_nofollow(None, &c).unwrap();
+        fs::rename(&source, root.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&decoy, &source).unwrap();
+
+        let dst = root.path().join("dst");
+        create_fresh_dir(&dst).unwrap();
+        copy_from(opened, &source, &dst).expect("the opened tree copies");
+        assert_eq!(
+            fs::read_to_string(dst.join("sub/data")).unwrap(),
+            "original"
+        );
+    }
+
+    /// A source can be as deep as whatever wrote it made it, and a cage writing a project can make
+    /// a chain of any depth, so the copy is a loop over a stack on the heap: one native stack frame
+    /// per level aborts the process on a stack overflow, which nothing reports. Run on a small stack
+    /// that a few thousand levels of recursion overflow, the tree kept short enough for every path
+    /// in it to resolve (a descriptor on a path past `PATH_MAX` fails nix's root search for a test
+    /// running nix at the same time).
+    #[test]
+    fn a_source_deeper_than_its_stack_is_copied() {
+        let tmp = crate::testutil::TmpDir::new();
+        let source = tmp.path().join("deep");
+        let mut dir = source.clone();
+        for _ in 0..1_800 {
+            dir.push("a");
+        }
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("bottom"), b"x").unwrap();
+
+        let dst = tmp.path().join("copy");
+        let (from, to) = (source.clone(), dst.clone());
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || copy_tree(&from, &to))
+            .unwrap()
+            .join()
+            .unwrap()
+            .expect("the deep tree is copied");
+        let mut bottom = dst;
+        for _ in 0..1_800 {
+            bottom.push("a");
+        }
+        assert_eq!(fs::read(bottom.join("bottom")).unwrap(), b"x");
+    }
+
+    /// A source root that is a link is refused rather than followed: the copy would otherwise take
+    /// whatever tree the link points at, which the user did not name.
+    #[test]
+    fn a_source_root_that_is_a_link_is_refused() {
+        let root = crate::testutil::TmpDir::new();
+        let source = source_plugin(
+            root.path(),
+            "real",
+            "type=\"resolver\"\nscheme=\"pass\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        let dst = root.path().join("dst");
+        let err = copy_tree(&link, &dst).expect_err("a linked root is not copied");
+        assert!(err.contains("is a symlink"), "{err}");
+        assert_eq!(fs::read_dir(&dst).unwrap().count(), 0, "nothing was copied");
+    }
+
+    /// An entry is opened refusing a link at its name, and without waiting. A link answers
+    /// `ELOOP`, so one swapped in under a name the listing reported as a file is refused where it is
+    /// met; a FIFO opens at once and is told apart by its own `fstat`, so one swapped in does not
+    /// hold the copy until a writer appears.
+    #[test]
+    fn an_entry_open_refuses_a_link_and_does_not_wait_on_a_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+        let dir = crate::testutil::TmpDir::new();
+        fs::write(dir.path().join("target"), "x").unwrap();
+        std::os::unix::fs::symlink("target", dir.path().join("link")).unwrap();
+        crate::testutil::make_fifo(&dir.path().join("fifo"));
+        let c = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        let handle = crate::sandbox::gc::open_dir_nofollow(None, &c).unwrap();
+
+        let err = crate::sandbox::gc::open_entry_nofollow(&handle, c"link")
+            .expect_err("a link is not opened");
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+
+        let fifo = crate::testutil::returns_within(
+            std::time::Duration::from_secs(10),
+            "opening a FIFO with no writer",
+            move || {
+                crate::sandbox::gc::open_entry_nofollow(&handle, c"fifo")
+                    .and_then(|fd| fs::File::from(fd).metadata())
+                    .map(|meta| meta.file_type().is_fifo())
+                    .map_err(|e| e.to_string())
+            },
+        );
+        assert_eq!(fifo, Ok(true), "the FIFO is opened at once and seen as one");
     }
 
     #[test]

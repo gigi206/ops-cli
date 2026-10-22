@@ -1172,11 +1172,29 @@ fn contained_in(root: &Path, candidate: &Path) -> Option<PathBuf> {
 
 /// Open `name` as a directory, refusing a symlink at that component — relative to `parent` when one
 /// is given, and from the filesystem root otherwise.
-pub(in crate::sandbox) fn open_dir_nofollow(
+pub(crate) fn open_dir_nofollow(
     parent: Option<&OwnedFd>,
     name: &std::ffi::CStr,
 ) -> io::Result<OwnedFd> {
     open_dir_as(libc::O_RDONLY, parent, name)
+}
+
+/// Open the entry `name` of the directory `parent` for reading, whatever it is, refusing a symlink
+/// at that component (`ELOOP`): the caller reads what it got from the descriptor's own `fstat`. The
+/// open does not wait, so a FIFO swapped in under the name answers at once rather than holding the
+/// caller until a writer appears, and the descriptor does not survive an `exec`.
+pub(crate) fn open_entry_nofollow(parent: &OwnedFd, name: &std::ffi::CStr) -> io::Result<OwnedFd> {
+    use std::os::fd::FromRawFd;
+
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    // SAFETY: `parent` is a live descriptor and `name` is NUL-terminated and valid for the call. The
+    // returned descriptor is taken ownership of immediately below.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh, owned descriptor this thread just opened.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// [`open_dir_nofollow`] as an `O_PATH` handle, which opens a directory whatever its mode: a
