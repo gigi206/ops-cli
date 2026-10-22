@@ -94,6 +94,7 @@ mark each entry:
 | `[installed vX, the store lists a different build …]` | a different tree the versions cannot separate: a republish, or an unorderable pair |
 | `[ahead of the store: …]` | you hold a newer version than the store lists (it rolled back) |
 | `[name taken by …]` | another plugin holds the name (another store, or a local install) |
+| `[name taken by a symbolic link]`, `[name taken by a file]` | no plugin, but something sits under that name in `<data>/plugins/`: sbx neither follows nor removes it, so an install is refused until you remove it by hand |
 | `[scheme x:// taken by …]` | the name is free, but an installed plugin already claims that scheme |
 | `[scheme x:// in conflict between …]` | several installed plugins claim it: nothing resolves it, and an install is refused all the same |
 | `[installed, disabled: scheme x:// in conflict]` | in place from this store, but contesting a scheme: it resolves nothing |

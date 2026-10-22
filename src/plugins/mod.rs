@@ -1649,6 +1649,25 @@ fn install_inner(
     ensure_owner_only(&plugins_dir)?;
 
     let dest = plugins_dir.join(&name);
+    // What already sits under the name is looked at itself, never through a link. Anything but a
+    // directory is no plugin: discovery names a link and skips it, and `plugins rm` removes only a
+    // plugin directory. So it is refused with the one way out that works, rather than with the
+    // "already installed" remedy a followed link reached, which sends the user to a command that
+    // refuses it too.
+    if let Ok(meta) = std::fs::symlink_metadata(&dest)
+        && !meta.is_dir()
+    {
+        let what = if meta.file_type().is_symlink() {
+            "a symbolic link"
+        } else {
+            "a file"
+        };
+        return Err(format!(
+            "{} is {what}, not a plugin directory, and sbx neither follows nor removes it — \
+             remove it by hand, then install again",
+            dest.display()
+        ));
+    }
     if dest.exists() && placement == Placement::Fresh {
         let held = origin::read(layout, &name);
         // The same source again is a re-install — what a user reaches for when a store's listing
@@ -3842,6 +3861,64 @@ mod tests {
         // Both are local installs — the same source — so the refusal offers the way to replace it
         // rather than only naming the collision.
         assert!(err.contains("then install it again"), "{err}");
+    }
+
+    /// Something other than a plugin directory under the name an install takes is refused with
+    /// the one way out that works. Discovery names a link and skips it, and `sbx plugins rm`
+    /// removes only a plugin directory, so the "already installed — remove it first with
+    /// `sbx plugins rm`" remedy, reached by following the link, sent the user to a command that
+    /// refuses it. Each shape sits in a tree of its own and every miss is reported.
+    #[test]
+    fn install_refuses_a_link_or_a_file_under_its_name_with_a_way_out_that_works() {
+        let src_root = crate::testutil::TmpDir::new();
+        let outside = crate::testutil::TmpDir::new();
+        let source = source_plugin(
+            src_root.path(),
+            "checkout",
+            "name=\"kp\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        let tree = source_plugin(
+            outside.path(),
+            "tree",
+            "name=\"kp\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        let mut missed = Vec::new();
+        for (shape, says) in [
+            ("a link to a plugin tree", "a symbolic link"),
+            ("a dangling link", "a symbolic link"),
+            ("a file", "a file"),
+        ] {
+            let data = crate::testutil::TmpDir::new();
+            let layout = crate::store::Layout::under(data.path());
+            fs::create_dir_all(layout.plugins_dir()).unwrap();
+            let at = layout.plugins_dir().join("kp");
+            match shape {
+                "a link to a plugin tree" => std::os::unix::fs::symlink(&tree, &at).unwrap(),
+                "a dangling link" => {
+                    std::os::unix::fs::symlink(outside.path().join("gone"), &at).unwrap()
+                }
+                _ => fs::write(&at, "").unwrap(),
+            }
+            assert!(
+                remove(&layout, "kp").is_err(),
+                "{shape}: `plugins rm` is no way out"
+            );
+            match install(&layout, &source) {
+                Err(err) if err.contains(says) && err.contains("remove it by hand") => {}
+                other => missed.push(format!("{shape}: {other:?}")),
+            }
+            assert!(
+                fs::symlink_metadata(&at).is_ok_and(|m| !m.is_dir()),
+                "{shape}: what sits there is left as it was"
+            );
+        }
+        assert!(
+            tree.join("plugin.toml").is_file(),
+            "the linked tree is untouched"
+        );
+        assert!(missed.is_empty(), "no way out that works: {missed:#?}");
     }
 
     #[test]

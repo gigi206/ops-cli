@@ -119,6 +119,10 @@ struct InstalledIndex {
     /// Manifest name → every directory name claiming it, when more than one does — the name-side
     /// counterpart of `conflicts`, and refused by an install for the same reason.
     name_conflicts: std::collections::BTreeMap<String, Vec<String>>,
+    /// Entry name → what sits there, for an entry of `<data>/plugins` that is no directory: a link,
+    /// which discovery names and skips rather than follows, or a file. Neither is a plugin, so no
+    /// other index holds it, and yet the install refuses the name it sits under.
+    strays: std::collections::BTreeMap<String, &'static str>,
 }
 
 /// How to phrase an installed build the store no longer lists. The *fact* is always the digest
@@ -257,11 +261,12 @@ impl InstalledIndex {
         }
 
         let mut by_name = std::collections::BTreeMap::new();
+        let mut strays = std::collections::BTreeMap::new();
         if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
             for e in entries.flatten() {
-                if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let Ok(ft) = e.file_type() else {
                     continue;
-                }
+                };
                 let Ok(name) = e.file_name().into_string() else {
                     continue;
                 };
@@ -269,6 +274,15 @@ impl InstalledIndex {
                 // tree caught mid-install), never a plugin: an install name may not begin with a
                 // dot.
                 if name.starts_with('.') {
+                    continue;
+                }
+                if !ft.is_dir() {
+                    let what = if ft.is_symlink() {
+                        "a symbolic link"
+                    } else {
+                        "a file"
+                    };
+                    strays.insert(name, what);
                     continue;
                 }
                 let version = versions.get(&name).cloned().flatten();
@@ -292,6 +306,7 @@ impl InstalledIndex {
             conflicts,
             by_plugin_name,
             name_conflicts,
+            strays,
         }
     }
 
@@ -317,6 +332,11 @@ impl InstalledIndex {
         pal: &style::Palette,
     ) -> String {
         let r = pal.reset;
+        // A link or a file under the name is no plugin, but the install refuses the name all the
+        // same, and says what is there: so does this.
+        if let Some(what) = self.strays.get(name) {
+            return format!("  {}[name taken by {what}]{r}", pal.warn);
+        }
         if let Some(installed) = self.by_name.get(name) {
             if !self.installed_from(name, store) {
                 // The two-stores-one-name case (and the local-install-shadows-a-store case): the
@@ -3049,6 +3069,7 @@ mod tests {
             conflicts: BTreeMap::new(),
             by_plugin_name: BTreeMap::new(),
             name_conflicts: BTreeMap::new(),
+            strays: BTreeMap::new(),
         }
     }
 
@@ -3077,6 +3098,7 @@ mod tests {
             )]),
             by_plugin_name: BTreeMap::new(),
             name_conflicts: BTreeMap::new(),
+            strays: BTreeMap::new(),
         }
     }
 
@@ -3098,6 +3120,7 @@ mod tests {
             conflicts: BTreeMap::new(),
             by_plugin_name: BTreeMap::from([(manifest_name.to_string(), dir_name.to_string())]),
             name_conflicts: BTreeMap::new(),
+            strays: BTreeMap::new(),
         }
     }
 
@@ -3442,6 +3465,34 @@ mod tests {
         assert_eq!(
             idx.marker("kp", Some("kp"), None, None, "mine", &plain()),
             "  [name in conflict between `vault-dev`, `vault-fork`]"
+        );
+    }
+
+    /// A link or a file under an entry's name is not a plugin, so neither the registry nor the
+    /// directory index holds it, and yet the install refuses the name it sits under. The listing
+    /// names what is there, as the install's refusal does, rather than offering the entry.
+    #[test]
+    fn an_entry_whose_name_a_link_or_a_file_holds_is_not_offered() {
+        let data = crate::testutil::TmpDir::new();
+        let outside = crate::testutil::TmpDir::new();
+        let layout = store::Layout::under(data.path());
+        std::fs::create_dir_all(layout.plugins_dir()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), layout.plugins_dir().join("kp")).unwrap();
+        std::fs::write(layout.plugins_dir().join("pass"), "").unwrap();
+
+        let idx = InstalledIndex::scan(&layout);
+        assert_eq!(
+            idx.marker("kp", Some("kp"), None, None, "mine", &plain()),
+            "  [name taken by a symbolic link]"
+        );
+        assert_eq!(
+            idx.marker("pass", None, None, None, "mine", &plain()),
+            "  [name taken by a file]"
+        );
+        // A name nothing sits under stays installable.
+        assert_eq!(
+            idx.marker("otp", Some("otp"), None, None, "mine", &plain()),
+            ""
         );
     }
 
