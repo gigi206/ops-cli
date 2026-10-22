@@ -810,6 +810,47 @@ fn top_level_commands_are_listed_alphabetically() {
     );
 }
 
+/// Whether the sentence a run of flags sits in denies it rather than offering it ("There is no
+/// `--purge`/`--gc` pair here"): the word `no`, whatever its case, in the prose from the start of
+/// that sentence (a `.`, `!`, `?` or line break ends one) up to the run. The prose only, and the
+/// word only: a `no` inside a code span, a flag (`--no-trust`) or a hyphenated word (`no-op`)
+/// denies nothing, nor does a word that merely ends in it.
+fn denies_the_run(details: &str, at: usize) -> bool {
+    let sentence_start = details[..at]
+        .rfind(['.', '!', '?', '\n'])
+        .map_or(0, |i| i + 1);
+    details[sentence_start..at]
+        .split('`')
+        .step_by(2)
+        .flat_map(|prose| prose.split(|c: char| !c.is_alphanumeric() && c != '-'))
+        .any(|word| word.eq_ignore_ascii_case("no"))
+}
+
+/// A run is denied only by the word `no` in its own sentence, whatever its case, and not by a word
+/// that merely ends in it, by a `no` inside a flag or a code span, or by a `no` in the sentence
+/// before, however that one ends.
+#[test]
+fn only_its_own_sentence_saying_no_denies_a_run() {
+    let cases = [
+        ("There is no `--purge`/`--gc` pair here", true),
+        ("No `--purge`/`--gc` pair here", true),
+        ("Play the piano with `-l`/`-g`", false),
+        ("Pass `--no-trust`/`--trust`", false),
+        ("A no-op unless `-l`/`-g`", false),
+        ("Set `mode = no`, then pass `-l`/`-g`", false),
+        ("Is there no default? Pass `-l`/`-g`", false),
+        ("There is no default! Pass `-l`/`-g`", false),
+        ("There is no default. Pass `-l`/`-g`", false),
+        ("There is no default\nPass `-l`/`-g`", false),
+    ];
+    let wrong: Vec<&str> = cases
+        .iter()
+        .filter(|(text, denied)| denies_the_run(text, text.find("`/`").unwrap()) != *denied)
+        .map(|(text, _)| *text)
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A run of flags the prose offers together must be flags that page actually takes.
 ///
 /// `net allow` and `net deny` described "the config-scope flags (`-l`/`-g`/`-c`)". Two of the three
@@ -853,8 +894,7 @@ fn no_page_offers_a_run_of_flags_one_of_which_it_does_not_take() {
             .match_indices("`/`")
             .map(|(i, _)| (i, &details[i..]))
         {
-            let sentence_start = details[..at].rfind(['.', '\n']).map_or(0, |i| i + 1);
-            if details[sentence_start..at].contains("no ") {
+            if denies_the_run(details, at) {
                 continue;
             }
             // Rebuild each side of a separator into the token it names.
