@@ -55,8 +55,9 @@ writes only the project directory) cannot plant into: so the registry is
 `<data>/plugins/` reaches a tree outside that directory, so it is skipped with a
 warning rather than followed. Loading a plugin *neither runs nor provisions* anything;
 before it execs a resolver, the runner re-checks the executable is a regular file
-owned by you and not writable by group or other (stricter than the config-file
-safety gate, because this is code about to run in the TCB).
+owned by you and not writable by group or other, reached inside the plugin's own
+tree through no symbolic link (stricter than the config-file safety gate, because
+this is code about to run in the TCB).
 
 Loading is **infallible and fail-closed**. A malformed manifest, an unsupported
 type or a reserved or ill-formed scheme produces a warning and skips that plugin, never a failed launch, and never a silently-honored bad plugin. **Two plugins

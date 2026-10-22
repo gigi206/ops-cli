@@ -189,7 +189,7 @@ impl SignerPlugin {
     /// writable by group or other. The very check the runner enforces, so `sbx plugins` can
     /// surface a gap the runner would refuse on.
     pub(crate) fn check_exec(&self) -> Result<(), String> {
-        super::check_exec_at(&self.exec)
+        super::check_exec_at(&self.dir, &self.exec)
     }
 }
 

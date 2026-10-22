@@ -250,9 +250,10 @@ pub(super) fn cage_spec_for(plan: &CagePlan<'_>) -> io::Result<SandboxSpec> {
     // The executable is in the trusted computing base. The perimeter is the data directory's
     // owner-only permissions (a project cannot write there), but defend the thing we actually
     // exec directly: refuse it unless it is a regular file owned by us and not writable by group
-    // or other. An attacker can only create files owned by *their* uid, so the owner check is the
-    // load-bearing one against a planted executable. (`sbx plugins` surfaces the same verdict.)
-    crate::plugins::check_exec_at(plan.exec).map_err(|why| {
+    // or other, reached inside the plugin's own tree through no link. An attacker can only create
+    // files owned by *their* uid, so the owner check is the load-bearing one against a planted
+    // executable. (`sbx plugins` surfaces the same verdict.)
+    crate::plugins::check_exec_at(plan.dir, plan.exec).map_err(|why| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("refusing to run the plugin {}: {why}", plan.exec.display()),
@@ -1685,6 +1686,31 @@ mod tests {
         );
         cage_spec_for(&plan_for(&plugin, "test://x"))
             .expect("a resolver may reach the network; the type guard must not touch it");
+    }
+
+    /// An executable that is a link to a file a grant path reaches is refused before its cage is
+    /// composed. Lexically `exec` names a file inside the plugin, and the cage, which binds the
+    /// grant path, would run the link's target: whatever can write there would run as the plugin.
+    #[test]
+    fn an_executable_linked_to_a_granted_file_is_refused_before_the_cage() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::testutil::TmpDir::new();
+        let granted = crate::testutil::TmpDir::new();
+        let target = granted.path().join("tool");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("resolve")).unwrap();
+        let plugin = plugin_in(
+            dir.path(),
+            SandboxGrant {
+                allow_paths: vec![granted.path().to_path_buf()],
+                ..Default::default()
+            },
+        );
+        let err = cage_spec_for(&plan_for(&plugin, "test://x"))
+            .expect_err("a linked executable never reaches the cage");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("symbolic link"), "{err}");
     }
 
     fn plugin_in(dir: &Path, grant: SandboxGrant) -> ResolverPlugin {

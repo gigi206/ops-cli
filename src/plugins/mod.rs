@@ -376,7 +376,7 @@ impl ResolverPlugin {
     /// manifest is well-formed) yet fail this — so `sbx plugins` surfaces the gap, using the very
     /// check the runner enforces. Returns the refusal reason on failure.
     pub(crate) fn check_exec(&self) -> Result<(), String> {
-        check_exec_at(&self.exec)
+        check_exec_at(&self.dir, &self.exec)
     }
 }
 
@@ -388,15 +388,50 @@ fn dir_name_of<'a>(dir: &'a Path, name: &'a str) -> &'a str {
     dir.file_name().and_then(OsStr::to_str).unwrap_or(name)
 }
 
+/// The executable's own metadata, reached from the plugin directory without following a link at
+/// any step. `exec` is held to plain components by the manifest's rules, but only lexically: a
+/// link as the executable, or as a directory on the way to it, would run a file outside the tree
+/// the registry is trusted for, and the cage runs it whenever a grant path reaches the target. An
+/// install never places a link, so only a tree placed by hand, or edited since, carries one. The
+/// reason names the link by its path inside the plugin, never the executable's: callers name that.
+fn exec_metadata(dir: &Path, exec: &Path) -> Result<std::fs::Metadata, String> {
+    let rel = exec
+        .strip_prefix(dir)
+        .map_err(|_| "not inside the plugin's directory".to_string())?;
+    let mut at = dir.to_path_buf();
+    let mut parts = rel.components().peekable();
+    while let Some(part) = parts.next() {
+        at.push(part);
+        let meta = std::fs::symlink_metadata(&at).map_err(|e| e.to_string())?;
+        let last = parts.peek().is_none();
+        if meta.file_type().is_symlink() {
+            return Err(if last {
+                "a symbolic link, which is never followed".to_string()
+            } else {
+                let link = at.strip_prefix(dir).unwrap_or(&at);
+                format!(
+                    "reached through the symbolic link `{}`, which is never followed",
+                    link.display()
+                )
+            });
+        }
+        if last {
+            return Ok(meta);
+        }
+    }
+    Err("the plugin's directory itself".to_string())
+}
+
 /// Whether an executable would be accepted by a runner: a regular file owned by us and not
-/// writable by group or other. Shared by both plugin types and by `sbx plugins`, so what a
-/// listing flags and what a runner refuses can never disagree.
+/// writable by group or other, reached from the plugin's directory `dir` through no link (see
+/// [`exec_metadata`]). Shared by every plugin type and by `sbx plugins`, so what a listing flags
+/// and what a runner refuses can never disagree.
 ///
 /// The reason carries no path: callers already name the plugin or its executable, so prefixing it
 /// here would print the path twice.
-pub(crate) fn check_exec_at(exec: &Path) -> Result<(), String> {
+pub(crate) fn check_exec_at(dir: &Path, exec: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(exec).map_err(|e| e.to_string())?;
+    let meta = exec_metadata(dir, exec)?;
     // SAFETY: `geteuid` has no pointer argument and no failure mode; it reads the effective uid
     // `verdict_exec` compares the executable's owner to.
     let euid = unsafe { libc::geteuid() };
@@ -408,11 +443,11 @@ pub(crate) fn check_exec_at(exec: &Path) -> Result<(), String> {
 /// — a checkout under `umask 002` is group-writable, and refusing that would make a plugin
 /// uninstallable from its own repository, while the copy that is actually executed is placed
 /// `0755` under an owner-only tree.
-fn verdict_source(exec: &Path) -> Result<(), String> {
+fn verdict_source(dir: &Path, exec: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(exec).map_err(|e| {
+    let meta = exec_metadata(dir, exec).map_err(|why| {
         format!(
-            "cannot read the plugin's executable {}: {e}",
+            "cannot use the plugin's executable {}: {why}",
             exec.display()
         )
     })?;
@@ -1015,6 +1050,15 @@ impl Plugin {
         }
     }
 
+    /// The directory the plugin was read from, which its executable is reached from.
+    fn dir(&self) -> &Path {
+        match self {
+            Plugin::Resolver(p) => &p.dir,
+            Plugin::Broker(p) => &p.dir,
+            Plugin::Signer(p) => &p.dir,
+        }
+    }
+
     /// The executable a runner would launch.
     fn exec(&self) -> &Path {
         match self {
@@ -1027,7 +1071,7 @@ impl Plugin {
     /// Whether the executable would be accepted by a runner. Applied to the *staged* copy during
     /// an install, so what lands is held to the rule the runner enforces.
     fn check_exec(&self) -> Result<(), String> {
-        check_exec_at(self.exec())
+        check_exec_at(self.dir(), self.exec())
     }
 
     /// What kind this is, for a message (or a listing) that has to say what was read.
@@ -1635,7 +1679,7 @@ fn install_inner(
     // out of its own repository. What stays refused is the case that is actually dangerous —
     // an executable *anyone* on the machine can rewrite between reading it and installing it.
     if expect.is_none() {
-        verdict_source(probe.exec())?;
+        verdict_source(source, probe.exec())?;
     }
 
     let name = probe.name().to_string();
@@ -3650,6 +3694,51 @@ mod tests {
 
         std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o775)).unwrap();
         assert!(p.check_exec().unwrap_err().contains("group or other"));
+    }
+
+    /// The executable is reached from the plugin directory without following a link at any step.
+    /// `exec` is held to plain components, but only lexically: a link as the executable, or as a
+    /// directory on the way to it, runs a file outside the tree the registry is trusted for, and
+    /// the cage runs it whenever a grant path reaches its target. The check every runner and
+    /// listing applies refuses both, naming where the link is; a plain executable, the witness,
+    /// still passes. Every admitted shape is reported.
+    #[test]
+    fn an_executable_reached_through_a_link_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let outside = crate::testutil::TmpDir::new();
+        let tool = outside.path().join("tool");
+        fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let root = crate::testutil::TmpDir::new();
+        let manifest = |name: &str, exec: &str| {
+            format!("name=\"{name}\"\ntype=\"resolver\"\nscheme=\"{name}\"\nexec=\"{exec}\"\n")
+        };
+        write_plugin(root.path(), "plain", &manifest("plain", "bin/tool"));
+        fs::create_dir_all(root.path().join("plain/bin")).unwrap();
+        fs::copy(&tool, root.path().join("plain/bin/tool")).unwrap();
+        write_plugin(root.path(), "leaf", &manifest("leaf", "run"));
+        std::os::unix::fs::symlink(&tool, root.path().join("leaf/run")).unwrap();
+        write_plugin(root.path(), "via", &manifest("via", "bin/tool"));
+        std::os::unix::fs::symlink(outside.path(), root.path().join("via/bin")).unwrap();
+
+        let (reg, warnings) = load(root.path());
+        let check = |scheme: &str| {
+            reg.resolver(scheme)
+                .unwrap_or_else(|| panic!("`{scheme}` loads: {warnings:?}"))
+                .check_exec()
+        };
+        assert_eq!(check("plain"), Ok(()), "a plain executable is runnable");
+        let mut admitted = Vec::new();
+        for (scheme, says) in [("leaf", "a symbolic link"), ("via", "`bin`")] {
+            match check(scheme) {
+                Err(why) if why.contains(says) => {}
+                other => admitted.push(format!("{scheme}: {other:?}")),
+            }
+        }
+        assert!(
+            admitted.is_empty(),
+            "an executable reached through a link: {admitted:?}"
+        );
     }
 
     /// The claim a store makes about a resolver, as its catalogue would carry it: pinned to the
