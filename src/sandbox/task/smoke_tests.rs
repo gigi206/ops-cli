@@ -483,10 +483,14 @@ fn a_pool_tool_runs_by_name_and_its_pool_is_read_only() {
         !stdout.contains("POOL-WRITABLE"),
         "the pool must be read-only inside the cage: {stdout}"
     );
-    assert!(
-        !pool.join("probe").exists(),
-        "nothing in the cage may write through to the pool on the host"
-    );
+    // Absent is a `NotFound` and nothing else: `exists()` answers no to any error, so a probe the
+    // host cannot look up, or a link the cage left dangling in its place, would pass for one never
+    // written.
+    match std::fs::symlink_metadata(pool.join("probe")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => panic!("nothing in the cage may write through to the pool on the host"),
+        Err(e) => panic!("cannot tell whether the cage wrote through to the pool: {e}"),
+    }
 }
 
 #[test]
