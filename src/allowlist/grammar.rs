@@ -586,12 +586,15 @@ fn parse_ports(spec: &str) -> Result<Ports, String> {
     Ok(Ports::Ranges(ranges))
 }
 
-/// Parse one port (`1..=65535`); reject 0 and non-numeric.
+/// Parse one port (`1..=65535`) written in ASCII digits, as a request's port must be
+/// ([`split_request_authority`]); reject 0, a sign (`+80`, which `u16::from_str` takes) and anything
+/// else non-numeric.
 fn parse_port(s: &str) -> Result<u16, String> {
-    let port: u16 = s
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid port `{s}`"))?;
+    let digits = s.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid port `{s}`"));
+    }
+    let port: u16 = digits.parse().map_err(|_| format!("invalid port `{s}`"))?;
     if port == 0 {
         return Err("port 0 is not a valid port".to_string());
     }

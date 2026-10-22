@@ -479,6 +479,24 @@ fn a_path_rule_may_not_carry_an_encoded_dot_segment() {
     }
 }
 
+/// A rule's port is written in ASCII digits, as a request's must be: `u16::from_str` takes a sign,
+/// so `host:+80` and `host:80-+90` were accepted and printed back without it, while a request
+/// carrying `:+80` is refused.
+#[test]
+fn a_rule_port_written_with_a_sign_is_refused() {
+    for entry in [
+        "files.test:+80",
+        "files.test:80-+90",
+        "files.test:+80-90",
+        "tcp://db.test:+22",
+    ] {
+        let e = classify(entry).unwrap_err();
+        assert!(e.contains("invalid port"), "{entry}: {e}");
+    }
+    assert!(classify("files.test:80-90").is_ok());
+    assert!(classify("files.test:080").is_ok());
+}
+
 /// `canonical_segments` strips a `#fragment` and a segment's `;parameters` from a request's path,
 /// and from the rule's path with it, so a rule written with either matches the bare path while
 /// displaying a form that names something narrower — the operator reads a rule for one resource
