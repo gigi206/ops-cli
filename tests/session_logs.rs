@@ -10,32 +10,27 @@
 //! The split the assertions rely on is the command's own: the body goes to stdout so a redirect
 //! gives exactly what the agent wrote, and the context line goes to stderr.
 
+#[macro_use]
+mod common;
+
+use common::fixture::TmpDir;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// A data directory that cleans itself up, with the log directory made.
-struct Data(PathBuf);
+/// A data directory with the log directory made: a fixture under the suites' own root, created
+/// afresh and removed when it drops ([`TmpDir`]), never a name in the shared temporary directory
+/// that another user could have made first.
+struct Data(TmpDir);
 
 impl Data {
     fn new(tag: &str) -> Data {
-        let base = std::env::temp_dir().join(format!(
-            "sbx-session-logs-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("logs")).expect("make the log directory");
-        Data(base)
+        let dir = TmpDir::prefixed("slogs", tag);
+        std::fs::create_dir(dir.join("logs")).expect("make the log directory");
+        Data(dir)
     }
 
     fn log(&self, pid: u32) -> PathBuf {
         self.0.join("logs").join(format!("{pid}.log"))
-    }
-}
-
-impl Drop for Data {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -73,7 +68,7 @@ fn each_reading_prints_exactly_what_it_names() {
     let whole = two_sessions(&data);
 
     // The default: the last session's body, and nothing of the one whose pid it reused.
-    let o = sbx_in(&data.0, &["session", "logs", "4242"]);
+    let o = sbx_in(data.0.path(), &["session", "logs", "4242"]);
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(out(&o), NEW_BODY, "the default reading is the last session");
     assert!(
@@ -83,18 +78,21 @@ fn each_reading_prints_exactly_what_it_names() {
     );
 
     // A line limit counts inside that session.
-    let o = sbx_in(&data.0, &["session", "logs", "4242", "-n", "2"]);
+    let o = sbx_in(data.0.path(), &["session", "logs", "4242", "-n", "2"]);
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(out(&o), "new-2\nnew-3\n");
 
     // `--all` is every byte in the file, headers included.
-    let o = sbx_in(&data.0, &["session", "logs", "4242", "--all"]);
+    let o = sbx_in(data.0.path(), &["session", "logs", "4242", "--all"]);
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(out(&o), whole, "--all copies the file");
     assert!(err(&o).contains("all sessions"));
 
     // `--all` with a limit counts back across the header into the session above.
-    let o = sbx_in(&data.0, &["session", "logs", "4242", "--all", "-n", "4"]);
+    let o = sbx_in(
+        data.0.path(),
+        &["session", "logs", "4242", "--all", "-n", "4"],
+    );
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(
         out(&o),
@@ -104,7 +102,7 @@ fn each_reading_prints_exactly_what_it_names() {
 
     // Following a session that has exited says so instead of waiting on a file nothing will append
     // to — and still prints the body first.
-    let o = sbx_in(&data.0, &["session", "logs", "4242", "-f"]);
+    let o = sbx_in(data.0.path(), &["session", "logs", "4242", "-f"]);
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(out(&o), NEW_BODY);
     assert!(
@@ -115,7 +113,7 @@ fn each_reading_prints_exactly_what_it_names() {
 
     // A log that is not there is explained rather than reported as empty, and an id the registry
     // does not hold is a name that names nothing.
-    let o = sbx_in(&data.0, &["session", "logs", "9999"]);
+    let o = sbx_in(data.0.path(), &["session", "logs", "9999"]);
     assert_eq!(o.status.code(), Some(2), "{}", err(&o));
     assert!(err(&o).contains("no log for session 9999"), "{}", err(&o));
     assert!(out(&o).is_empty());
@@ -128,7 +126,7 @@ fn each_reading_prints_exactly_what_it_names() {
 fn a_missing_log_under_an_unreadable_registry_is_a_failure_not_a_usage_error() {
     let data = Data::new("missing");
     std::fs::write(data.0.join("sessions"), b"not a directory").expect("write the registry");
-    let o = sbx_in(&data.0, &["session", "logs", "9999"]);
+    let o = sbx_in(data.0.path(), &["session", "logs", "9999"]);
     assert_eq!(o.status.code(), Some(1), "{}", err(&o));
     assert!(
         err(&o).contains("no log for session 9999")
@@ -153,7 +151,7 @@ fn an_unreadable_registry_leaves_the_state_unknown_and_refuses_a_follow() {
     two_sessions(&data);
     std::fs::write(data.0.join("sessions"), b"not a directory").expect("write the registry");
 
-    let o = sbx_in(&data.0, &["session", "logs", "4242"]);
+    let o = sbx_in(data.0.path(), &["session", "logs", "4242"]);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert_eq!(out(&o), NEW_BODY);
     assert!(
@@ -162,7 +160,7 @@ fn an_unreadable_registry_leaves_the_state_unknown_and_refuses_a_follow() {
         err(&o)
     );
 
-    let o = sbx_in(&data.0, &["session", "logs", "4242", "-f"]);
+    let o = sbx_in(data.0.path(), &["session", "logs", "4242", "-f"]);
     assert_eq!(o.status.code(), Some(1), "{}", err(&o));
     assert_eq!(out(&o), NEW_BODY, "the body comes before the refusal");
     assert!(
@@ -175,7 +173,7 @@ fn an_unreadable_registry_leaves_the_state_unknown_and_refuses_a_follow() {
         &["session", "logs", "4242"][..],
         &["session", "logs", "4242", "-f"],
     ] {
-        let o = sbx_in(&data.0, args);
+        let o = sbx_in(data.0.path(), args);
         assert_eq!(
             err(&o).matches("cannot read the session registry").count(),
             1,
@@ -203,7 +201,7 @@ fn a_session_past_the_window_reads_the_same_and_still_names_its_date() {
     }
     std::fs::write(data.log(4242), &whole).expect("write the log");
 
-    let o = sbx_in(&data.0, &["session", "logs", "4242", "-n", "2"]);
+    let o = sbx_in(data.0.path(), &["session", "logs", "4242", "-n", "2"]);
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(out(&o), "chatty line 19998\nchatty line 19999\n");
     assert!(
@@ -213,7 +211,7 @@ fn a_session_past_the_window_reads_the_same_and_still_names_its_date() {
     );
 
     // And the unlimited reading of that same session is complete: every line, no header.
-    let o = sbx_in(&data.0, &["session", "logs", "4242"]);
+    let o = sbx_in(data.0.path(), &["session", "logs", "4242"]);
     assert!(o.status.success(), "{}", err(&o));
     let body = out(&o);
     assert!(
@@ -250,7 +248,7 @@ fn a_session_longer_than_the_window_is_streamed_from_its_own_header() {
     );
     std::fs::write(data.log(4242), &whole).expect("write the log");
 
-    let o = sbx_in(&data.0, &["session", "logs", "4242"]);
+    let o = sbx_in(data.0.path(), &["session", "logs", "4242"]);
     assert!(o.status.success(), "{}", err(&o));
     let body = out(&o);
     assert_eq!(body.lines().count(), lines, "every line of the session");
@@ -282,7 +280,7 @@ fn a_header_stamp_the_agent_chose_cannot_stop_the_log_being_read() {
     let head = "=== sbx session 4242 started=9300000000000000000 ===\n";
     std::fs::write(data.log(4242), format!("{head}{NEW_BODY}")).expect("write the log");
 
-    let o = sbx_in(&data.0, &["session", "logs", "4242"]);
+    let o = sbx_in(data.0.path(), &["session", "logs", "4242"]);
     assert!(
         o.status.success(),
         "an out-of-range stamp must not fail the command: {}",
