@@ -1906,8 +1906,15 @@ fn install_inner(
     // The copy lands under the name it is placed as, so it is read below exactly as the placed
     // plugin will be: a manifest that declares no `name` is named after its directory.
     let stage = staging.join(&name);
+    // Every tree this install sets up and then no longer needs is removed through one door, which
+    // says what it could not remove rather than leaving it in silence.
+    let tidy = |tree: &Path| {
+        if let Err(why) = discard(tree) {
+            crate::diag::warn(&why);
+        }
+    };
     if let Err(e) = create_fresh_dir(&stage).and_then(|()| copy_into(source, &stage)) {
-        let _ = std::fs::remove_dir_all(&staging);
+        tidy(&staging);
         return Err(e);
     }
     // The staged copy is the real artifact: validate it, not just the source, and hold it to the
@@ -1921,7 +1928,7 @@ fn install_inner(
                 .map_err(|why| format!("the staged executable is {why}"))
         });
     if let Err(e) = staged_ok {
-        let _ = std::fs::remove_dir_all(&staging);
+        tidy(&staging);
         return Err(e);
     }
     // A store install is held to the catalogue's digest once more, on the staged copy, the bytes
@@ -1940,7 +1947,7 @@ fn install_inner(
             Err(e) => Some(format!("the staged plugin cannot be hashed: {e}")),
         };
         if let Some(refusal) = refusal {
-            let _ = std::fs::remove_dir_all(&staging);
+            tidy(&staging);
             return Err(refusal);
         }
     }
@@ -1955,7 +1962,7 @@ fn install_inner(
                 .data_dir()
                 .join(format!(".plugin-old-{}-{}", std::process::id(), unique()));
         if let Err(e) = std::fs::rename(&dest, &aside) {
-            let _ = std::fs::remove_dir_all(&staging);
+            tidy(&staging);
             return Err(format!("could not set the installed plugin aside: {e}"));
         }
         Some(aside)
@@ -1965,10 +1972,11 @@ fn install_inner(
 
     match std::fs::rename(&stage, &dest) {
         Ok(()) => {
-            // The staged tree has moved out, leaving its now empty parent.
-            let _ = std::fs::remove_dir(&staging);
+            // The staged tree has moved out, leaving its now empty parent, and the plugin it
+            // replaced is no longer needed.
+            tidy(&staging);
             if let Some(aside) = &displaced {
-                let _ = std::fs::remove_dir_all(aside);
+                tidy(aside);
             }
             // Record the provenance only once the plugin is in place: a record without a plugin
             // would be inherited by a later install of that name, so a wrong origin is worse than
@@ -1992,7 +2000,7 @@ fn install_inner(
             })
         }
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&staging);
+            tidy(&staging);
             // Put the displaced plugin back before reporting: the caller asked for a newer tree,
             // not for the loss of the one they had.
             if let Some(aside) = &displaced {
@@ -2225,6 +2233,20 @@ fn create_fresh_dir(dir: &Path) -> Result<(), String> {
 fn make_fresh_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
+/// Remove a tree an install set up and no longer needs — its staging directory, a replaced plugin
+/// moved aside — or say why not. What is left sits under the data directory under a dot-name no
+/// listing shows, and nothing sweeps it, so a removal that fails names the path to remove by hand.
+/// Removed as `plugins rm` removes a plugin, through [`crate::sandbox::gc::force_remove_dir_all`],
+/// which never follows a link and makes each directory writable on the way down.
+fn discard(tree: &Path) -> Result<(), String> {
+    crate::sandbox::gc::force_remove_dir_all(tree).map_err(|why| {
+        format!(
+            "plugins: could not remove {} ({why}) — it is left in place; remove it by hand",
+            tree.display()
+        )
+    })
 }
 
 /// A fresh directory under `parent`, named by `name`: a name already taken is passed over for the
@@ -4475,6 +4497,37 @@ mod tests {
             },
         );
         assert_eq!(fifo, Ok(true), "the FIFO is opened at once and seen as one");
+    }
+
+    /// A tree an install no longer needs and cannot remove is said, naming where it is left: it
+    /// sits under a dot-name no listing shows, and nothing sweeps it. Once it can be removed, it
+    /// goes, which is the witness.
+    #[test]
+    fn a_tree_that_cannot_be_discarded_is_named() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::testutil::TmpDir::new();
+        let held = root.path().join("held");
+        let tree = held.join(".plugin-old-1-1");
+        fs::create_dir_all(tree.join("inner")).unwrap();
+        fs::write(tree.join("inner/file"), "x").unwrap();
+        fs::set_permissions(&held, fs::Permissions::from_mode(0o500)).unwrap();
+        // A tree is unlinked from its parent, which this process may not write now; a process
+        // allowed past the mode never meets the failure. The mode is restored before asserting.
+        if fs::write(held.join("probe"), "").is_ok() {
+            fs::set_permissions(&held, fs::Permissions::from_mode(0o700)).unwrap();
+            skip_incapable!("skipping: this process writes a directory without a write bit");
+            return;
+        }
+        let refused = discard(&tree);
+        fs::set_permissions(&held, fs::Permissions::from_mode(0o700)).unwrap();
+        let why = refused.expect_err("the tree cannot be unlinked from its parent");
+        assert!(
+            why.contains(&tree.display().to_string()) && why.contains("by hand"),
+            "the leftover is named: {why}"
+        );
+
+        discard(&tree).expect("removable once its parent is writable");
+        assert!(!tree.exists());
     }
 
     #[test]
