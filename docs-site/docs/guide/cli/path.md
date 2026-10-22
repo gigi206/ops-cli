@@ -15,9 +15,13 @@ and the **state root** (the trust markers).
 
 Read-only and free: a path listing. No nix, no network, no sandbox.
 
-`--json` prints the same view as JSON. A base that resolves to no directory (no `$HOME` and no
-XDG variable to name it) has a `null` root, and every entry under it a `null` path; the text
-render marks that base `no base` and lists no entries under it.
+`--json` prints the same view as JSON. A base that resolves to no directory has a `null` root,
+and every entry under it a `null` path; the text render marks that base `no base` and lists no
+entries under it. That happens when neither the base's variables nor `$HOME` name an absolute
+directory, and for the data base also when sbx refused the directory it resolved (a relative or
+overlong `$SBX_DATA_DIR`, a relative `$HOME`, a volume that could not be mounted, a directory too
+long for the sockets sbx binds under it): the refusal prints its own diagnostic, and `sbx path`
+then exits non-zero.
 
 See also: [`sbx store`](store) · [`sbx projects`](projects) · [`sbx storage`](storage) · [Directory layout](../concepts/directory-layout).
 
