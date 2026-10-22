@@ -853,10 +853,10 @@ fn apply_host_env(
         allow_env.retain(|(k, _)| k != key);
         if path_valued {
             env_paths.retain(|(k, _)| k != key);
-            if !Path::new(value).is_absolute() {
+            if let Some(why) = unbindable(value) {
                 crate::diag::warn(&format!(
                     "not passing ${key} to the `{called}` plugin — the value `{value}` configured \
-                     for it is not an absolute path, so there is nothing in the cage for it to name"
+                     for it {why}, so there is nothing in the cage for it to name"
                 ));
                 continue;
             }
@@ -876,22 +876,38 @@ fn apply_host_env(
 /// cage does not share, so it would silently mean something other than what the user wrote. This
 /// mirrors the posture `$SBX_DATA_DIR` takes on a relative override.
 ///
+/// A value that climbs with `..` is dropped the same way: the control-plane check cannot judge it
+/// (see [`crate::plugins::climbs`]).
+///
 /// A value naming a path that does not exist is kept for the environment and simply binds
 /// nothing (the mount is a `try`): the tool then reports what it could not find, which is a
 /// better diagnostic than a bind failure the user cannot place.
 fn resolve_env_paths(keys: &[String]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (key, value) in resolve_allow_env(keys) {
-        if !Path::new(&value).is_absolute() {
+        if let Some(why) = unbindable(&value) {
             crate::diag::warn(&format!(
-                "not binding ${key} for a resolver plugin — its value `{value}` is not an \
-                 absolute path"
+                "not binding ${key} for a resolver plugin — its value `{value}` {why}"
             ));
             continue;
         }
         out.push((key, value));
     }
     out
+}
+
+/// Why a path-valued variable's value cannot be bound, or `None` when it can: one answer for a
+/// value read from sbx's environment and one configured in a `[plugin.<name>]` table, so the two
+/// doors into the mount list drop the same values.
+fn unbindable(value: &str) -> Option<&'static str> {
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        Some("is not an absolute path")
+    } else if crate::plugins::climbs(path) {
+        Some("climbs with `..`")
+    } else {
+        None
+    }
 }
 
 /// Locate every program the manifest declares, on **sbx's own `PATH`** — the one the user's
@@ -2567,6 +2583,37 @@ printf 'run-%s' "$n""#,
             vec![("MODE".to_string(), "relative/whatever".to_string())]
         );
         assert!(env_paths.is_empty());
+    }
+
+    /// A path-valued variable whose value climbs with `..` is dropped, as a relative one is,
+    /// whether sbx's environment or a `[plugin.<name>]` table set it. The control-plane check cannot
+    /// place a `..` behind a missing component, and it is the user's own value, so it goes with its
+    /// bind rather than refusing the plugin, and the plugin is never handed a path the cage lacks.
+    #[test]
+    fn a_path_valued_variable_that_climbs_is_dropped_like_a_relative_one() {
+        const VAR: &str = "SBX_TEST_RESOLVER_CLIMBING_STORE";
+        let climbing = "/srv/nope/../store";
+        {
+            let _lock = env_lock();
+            let _var = EnvVar::set(VAR, climbing);
+            assert_eq!(
+                resolve_env_paths(&[VAR.to_string()]),
+                Vec::<(String, String)>::new(),
+                "a value read from sbx's environment is dropped"
+            );
+        }
+        let (mut allow_env, mut env_paths) = (Vec::new(), Vec::new());
+        apply_host_env(
+            &[(VAR.to_string(), climbing.to_string())],
+            &[VAR.to_string()],
+            "test",
+            &mut allow_env,
+            &mut env_paths,
+        );
+        assert!(
+            allow_env.is_empty() && env_paths.is_empty(),
+            "a configured value is dropped with its bind: {allow_env:?} {env_paths:?}"
+        );
     }
 
     /// The same rule for a value that comes from a `[plugin.<name>]` table rather than from sbx's

@@ -117,8 +117,9 @@ brokers     = []                   # broker plugins whose fenced socket replaces
     launch naming why, rather than binding nothing and dying later at `execve`.
 - `allow_paths` is for the plugin's **data**: a token file, a database, a
   socket. Only `~`, `$HOME` and `$XDG_RUNTIME_DIR` are expanded; any other `$` is
-  refused, a literal must be absolute, and a variable that is not set drops just that
-  entry with a warning. `HOME` in the cage is a private tmpfs, so a tool that derives a
+  refused, a literal must be absolute, no entry may climb with `..` (here and in
+  `mask_paths`: what a grant reaches has to be known before it is mounted), and a
+  variable that is not set drops just that entry with a warning. `HOME` in the cage is a private tmpfs, so a tool that derives a
   location from it (a password store, a GnuPG keyring, a token file) looks where
   nothing exists: bind the host path and point the tool at it. Naming `PATH` in `allow_env` has no effect; the structural value wins.
   - On a **broker** or a **signer** the entry must be a regular file. A socket, a
@@ -175,8 +176,9 @@ brokers     = []                   # broker plugins whose fenced socket replaces
     carrying two declarations of one grant that a later edit can make disagree.
   - The value is the user's, so it is checked at invocation: it must be
     **absolute**, since a relative bind argument would silently mean something
-    other than what it says inside a cage that shares no working directory. A
-    relative value is dropped with a warning, and the variable with it. An unset
+    other than what it says inside a cage that shares no working directory, and
+    it must not climb with `..`. A value that breaks either rule is dropped with
+    a warning, and the variable with it. An unset
     variable simply leaves the manifest's own `allow_paths` in force.
   - `sbx plugins info <name>` prints what each variable currently names, so a
     relocated store can be confirmed reachable before the first secret.

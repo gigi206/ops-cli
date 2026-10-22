@@ -184,6 +184,16 @@ fn describe_file_type(ft: &std::fs::FileType) -> &'static str {
     }
 }
 
+/// Whether a path climbs with a `..` component. A grant path is judged against sbx's control plane
+/// by resolving it as far as it exists, and a `..` behind a component that does not exist stops
+/// that walk: the path comes back as written, inside no root component by component, whatever the
+/// kernel would make of it once the component appeared. No grant needs one, so a path that has one
+/// is refused (a manifest's entry) or dropped (a variable's value) rather than judged.
+pub(crate) fn climbs(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
 /// Refuse a grant path that names sbx's own control plane, whatever kind of plugin declared it.
 ///
 /// The `state` grant is a boolean and never a path precisely so that a plugin cannot pick a
@@ -211,6 +221,15 @@ pub(crate) fn check_grant_control_plane_for<'a>(
     roots: &[PathBuf],
 ) -> Result<(), String> {
     for (field, path) in paths {
+        // Before anything is resolved: a `..` is what can leave the resolution short of the root
+        // the kernel reaches, so a path that has one is not judged at all (see [`climbs`]).
+        if climbs(path) {
+            return Err(format!(
+                "an `{field}` entry names `{}`, which climbs with `..` — a grant path names its \
+                 target directly, so what it reaches is known before it is mounted",
+                path.display()
+            ));
+        }
         let canon = crate::trust::canonicalize_existing_prefix(path);
         if let Some(root) = roots.iter().find(|r| canon.starts_with(r)) {
             return Err(format!(
@@ -1458,6 +1477,17 @@ fn expand_allow_path(field: &str, raw: &str, exp: &Expansion) -> Result<Option<P
     if raw.is_empty() {
         return Err(format!("an `{field}` entry is empty"));
     }
+    // Asked of the expanded path, so a `..` after `~` is caught as surely as a literal one, and
+    // for both lists: a mask that climbs would hide something other than what its author named.
+    let plain = |path: PathBuf| {
+        if climbs(&path) {
+            Err(format!(
+                "`{field}` entry `{raw}` climbs with `..` — a grant path names its target directly"
+            ))
+        } else {
+            Ok(Some(path))
+        }
+    };
     let (head, rest) = match raw.split_once('/') {
         Some((h, r)) => (h, Some(r)),
         None => (raw, None),
@@ -1497,13 +1527,13 @@ fn expand_allow_path(field: &str, raw: &str, exp: &Expansion) -> Result<Option<P
             if !p.is_absolute() {
                 return Err(format!("`{field}` entry `{raw}` is not an absolute path"));
             }
-            return Ok(Some(p));
+            return plain(p);
         }
     };
-    Ok(Some(match rest {
+    plain(match rest {
         Some(r) => base.join(r),
         None => base,
-    }))
+    })
 }
 
 /// A POSIX-ish environment variable name: a non-empty run of letters, digits, and `_` not
@@ -3439,6 +3469,46 @@ mod tests {
                 "the refusal must name the field the entry is in: {why}"
             );
         }
+    }
+
+    /// A grant path that climbs with `..` is refused, at admission and by the control-plane check
+    /// every spawn applies. That check resolves a path as far as it exists, and a `..` behind a
+    /// missing component stops the walk: `/h/.config/nope/../sbx` came back as written and,
+    /// compared component by component, was inside no root. The mount is a `try`, so it bound
+    /// nothing while `nope` was missing and the check refused it once `nope` existed; a component
+    /// appearing between the two was the one way to the root. No manifest needs `..`, so it is
+    /// refused rather than resolved. Every admitted shape is reported.
+    #[test]
+    fn a_grant_path_that_climbs_with_dot_dot_is_refused() {
+        let roots = vec![PathBuf::from("/h/.config/sbx")];
+        let mut admitted = Vec::new();
+        for entry in [
+            "/h/.config/nope/../sbx",
+            "/h/.config/nope/../sbx/sbx.toml",
+            "/srv/a/../b",
+        ] {
+            match check_grant_control_plane_for([("allow_paths", Path::new(entry))], &roots) {
+                Err(why) if why.contains(entry) && why.contains("`..`") => {}
+                other => admitted.push(format!("check {entry}: {other:?}")),
+            }
+        }
+        let exp = Expansion {
+            home: Some(PathBuf::from("/home/u")),
+            runtime: None,
+        };
+        for (field, entry) in [
+            ("allow_paths", "~/nope/../.config/sbx"),
+            ("mask_paths", "/etc/x/../shadow"),
+        ] {
+            match expand_allow_path(field, entry, &exp) {
+                Err(why) if why.contains(field) && why.contains("`..`") => {}
+                other => admitted.push(format!("{field} {entry}: {other:?}")),
+            }
+        }
+        assert!(admitted.is_empty(), "a climbing grant path: {admitted:#?}");
+        // The witness: a plain path is untouched by the rule.
+        check_grant_control_plane_for([("allow_paths", Path::new("/srv/a/b"))], &roots)
+            .expect("a plain path passes");
     }
 
     #[test]
