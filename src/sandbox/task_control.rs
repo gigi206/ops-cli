@@ -1673,6 +1673,22 @@ pub(crate) fn read_log(socket: &Path) -> io::Result<Vec<String>> {
     ask_host(socket, "LOG")
 }
 
+/// A number of the plane's answer. The plane writes each one itself, so one that does not read is a
+/// plane that miscounted or an answer that is not the plane's, and a default in its place would
+/// hand the caller a value nobody wrote.
+fn number<T: std::str::FromStr>(key: &str, value: &str) -> io::Result<T> {
+    value.parse().map_err(|_| malformed(key))
+}
+
+/// The error for a field of the answer that does not read as the plane writes it. The field is
+/// named and its value is not: a value can be anything the answer carried.
+fn malformed(key: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("the task plane's answer has a malformed `{key}` line"),
+    )
+}
+
 /// One read of the invocation log as parsed entries: what is past `after`, the head to come back
 /// with, and how many fell out of the ring — in that order, which is not the order
 /// [`TaskLog::since`] returns its three in. The two are read by different callers and the tuple a
@@ -1694,10 +1710,13 @@ pub(crate) fn read_entries(
     let mut dropped = 0;
     let mut head = 0;
     for line in &lines {
+        // Absent, either one reads as `0`: the plane predates it. Present, it is what the plane
+        // wrote, and one that does not read is an error rather than a `0` that would send a follow
+        // read back to the start of the log or hide what the ring lost.
         if let Some(n) = line.strip_prefix("dropped=") {
-            dropped = n.trim().parse().unwrap_or(0);
+            dropped = number("dropped", n)?;
         } else if let Some(n) = line.strip_prefix("head=") {
-            head = n.trim().parse().unwrap_or(0);
+            head = number("head", n)?;
         } else if let Some(entry) = LogEntry::from_line(line) {
             entries.push(entry);
         }
@@ -2115,13 +2134,6 @@ pub(crate) mod client {
         ))
     }
 
-    /// A number of the plane's answer. The plane writes each one itself, so one that does not read
-    /// is a plane that miscounted or an answer that is not the plane's, and a default in its place
-    /// would hand the caller a value nobody wrote.
-    fn number<T: std::str::FromStr>(key: &str, value: &str) -> io::Result<T> {
-        value.parse().map_err(|_| malformed(key))
-    }
-
     /// A flag of the plane's answer, which the plane writes as `0` or `1`.
     fn flag(key: &str, value: &str) -> io::Result<bool> {
         match value {
@@ -2129,15 +2141,6 @@ pub(crate) mod client {
             "1" => Ok(true),
             _ => Err(malformed(key)),
         }
-    }
-
-    /// The error for a field of the answer that does not read as the plane writes it. The field is
-    /// named and its value is not: a value can be anything the answer carried.
-    fn malformed(key: &str) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("the task plane's answer has a malformed `{key}` line"),
-        )
     }
 
     /// Split off one `\n`-terminated line, returning it without the newline.

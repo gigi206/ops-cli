@@ -517,6 +517,46 @@ fn a_reader_gives_up_on_a_plane_that_never_answers() {
     }
 }
 
+/// A `head=` or `dropped=` the plane sent that does not read is an error, never `0`.
+///
+/// Read as `0`, a `head` that did not parse sent a follow read back to the start of the log, which
+/// then showed every entry again, and a `dropped` that did not parse hid the entries the ring had
+/// lost. A plane too old to send either line is another matter, and still reads as `0`: the
+/// reader then declines to follow it.
+#[test]
+fn a_log_head_or_dropped_count_that_does_not_parse_is_an_error() {
+    let read = |answer: &'static [u8]| {
+        let dir = TmpDir::new();
+        let socket = dir.join("plane.sock");
+        let listener = UnixListener::bind(&socket).expect("bind the plane");
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut request = String::new();
+                let _ = BufReader::new(&conn).read_line(&mut request);
+                let _ = conn.write_all(answer);
+            }
+        });
+        read_entries(&socket, None)
+    };
+    for answer in [&b"head=x\nok\n"[..], b"dropped=x\nhead=3\nok\n"] {
+        let e = read(answer).expect_err(&String::from_utf8_lossy(answer));
+        assert_eq!(
+            e.kind(),
+            io::ErrorKind::InvalidData,
+            "{}",
+            String::from_utf8_lossy(answer)
+        );
+    }
+    let (_, head, dropped) = read(b"dropped=2\nhead=5\nok\n").expect("a whole answer");
+    assert_eq!((head, dropped), (5, 2));
+    let (_, head, dropped) = read(b"ok\n").expect("an older plane's answer");
+    assert_eq!(
+        (head, dropped),
+        (0, 0),
+        "an older plane is read, and not followed"
+    );
+}
+
 /// A `LOG` is the verb alone, or with the one `after=<seq>` cursor its client sends.
 ///
 /// Anything else is refused. A verb that merely began `LOG` was read as one, and a cursor that did
