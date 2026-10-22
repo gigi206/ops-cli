@@ -398,21 +398,42 @@ fn no_source_names_a_command_the_binary_does_not_have() {
 /// `sbx config rm` was the only way out, while `sbx net unallow|undeny|unmute` and `sbx proc
 /// unallow|undeny` each had a page, each was dispatched, and the `config rm` page said so.
 ///
-/// Asserted against the removal verbs the table declares rather than a list kept here, so a
-/// verb added tomorrow is one this paragraph has to account for.
+/// Asserted against what the code declares rather than against lists kept here. The namespaces
+/// are those whose rule lists `config add` hands to their own verbs
+/// ([`crate::config::manage::RULE_LISTS`]), so a rule list redirected tomorrow is one this
+/// paragraph has to account for; and a removal verb is the `un` form of one of those verbs that the
+/// namespace has, so an `unlock` or an `unuse` is not taken for one. Each is looked for under its
+/// own namespace, in a quoted command whose verb may be an alternation (`sbx net
+/// unallow|undeny|unmute`): a `sbx net unallow` on the page does not account for `sbx proc
+/// unallow`.
 #[test]
 fn the_config_add_page_accounts_for_every_rule_removal_verb() {
     let page = find(&["config", "add"]).expect("the `config add` page");
+    // Every `(namespace, verb)` a quoted `sbx <namespace> <verb>[|<verb>…]` on the page names.
+    let named: Vec<(&str, &str)> = code_spans_of(page)
+        .into_iter()
+        .flat_map(|span| {
+            let mut words = span.split_whitespace();
+            match (words.next(), words.next(), words.next()) {
+                (Some("sbx"), Some(namespace), Some(verbs)) => {
+                    verbs.split('|').map(|verb| (namespace, verb)).collect()
+                }
+                _ => Vec::new(),
+            }
+        })
+        .collect();
     let mut unnamed: Vec<String> = Vec::new();
     let mut removals = 0usize;
-    for namespace in ["net", "proc"] {
-        for (verb, _) in subcommands_of(&[namespace]) {
-            if !verb.starts_with("un") {
+    for &(_, namespace, verbs) in crate::config::manage::RULE_LISTS {
+        let offered = subcommands_of(&[namespace]);
+        for verb in verbs {
+            let removal = format!("un{verb}");
+            if !offered.iter().any(|(name, _)| *name == removal) {
                 continue;
             }
             removals += 1;
-            if !page.details.contains(verb) {
-                unnamed.push(format!("sbx {namespace} {verb}"));
+            if !named.contains(&(namespace, removal.as_str())) {
+                unnamed.push(format!("sbx {namespace} {removal}"));
             }
         }
     }

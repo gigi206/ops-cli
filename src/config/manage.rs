@@ -631,8 +631,8 @@ fn list_at<'d>(doc: &'d mut DocumentMut, key: &str) -> Result<&'d mut Array, Man
     }
 }
 
-/// The `sbx` verb owning a rule list, if `key` names one — matched on the tail so an app's own list
-/// (`app.demo.network.allow`) is caught alongside the baseline's.
+/// The rule lists `sbx config add` hands to their own verbs, as `(table, namespace, verbs)`: the
+/// `[table]` whose `<verb>` list is one, and the `sbx <namespace> <verb>` that writes it instead.
 ///
 /// Both `[network]` and `[proc]` gate their rules behind a posture, and the two dedicated verbs
 /// carry that matrix: an `allow` on a config with no posture bootstraps the restrictive one, a rule
@@ -641,24 +641,25 @@ fn list_at<'d>(doc: &'d mut DocumentMut, key: &str) -> Result<&'d mut Array, Man
 /// group is a named set of entries with no posture of its own, so adding to one cannot produce an
 /// inert rule. It is out of reach of the tail match too — `network.groups.<name>` leaves
 /// `groups.<name>` after the table prefix, never a bare verb.
+///
+/// The `config add` page says how each of these rules comes back out, and its guard reads this
+/// table for the namespaces it must account for.
+pub(crate) const RULE_LISTS: &[(&str, &str, &[&str])] = &[
+    ("network", "net", &["allow", "deny", "mute"]),
+    ("proc", "proc", &["allow", "deny"]),
+];
+
+/// The `sbx` verb owning a rule list ([`RULE_LISTS`]), if `key` names one — matched on the tail so
+/// an app's own list (`app.demo.network.allow`) is caught alongside the baseline's.
 fn rule_list_verb(key: &str) -> Option<String> {
-    for (table, verbs) in [
-        ("network.", &["allow", "deny", "mute"][..]),
-        ("proc.", &["allow", "deny"][..]),
-    ] {
+    for &(table, namespace, verbs) in RULE_LISTS {
         // The table name must be a whole segment: `anetwork.allow` names no `[network]` list.
         if let Some(tail) = key
-            .rsplit_once(table)
+            .rsplit_once(&format!("{table}."))
             .filter(|(head, _)| head.is_empty() || head.ends_with('.'))
             .map(|(_, tail)| tail)
             && let Some(verb) = verbs.iter().find(|v| **v == tail)
         {
-            let namespace = table.trim_end_matches('.');
-            let namespace = if namespace == "network" {
-                "net"
-            } else {
-                namespace
-            };
             return Some(format!("{namespace} {verb}"));
         }
     }
