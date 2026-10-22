@@ -259,8 +259,14 @@ struct BaseView {
     /// diagnostic and make `sbx path` exit non-zero, so this field alone does not distinguish
     /// them.
     root: Option<PathBuf>,
-    /// Whether the base directory itself exists on disk.
-    exists: bool,
+    /// Whether the base directory itself exists on disk: `false` when it does not, or when there is
+    /// no root to look at, and `None` only when the lookup itself failed (a directory above it this
+    /// user may not search). A failed lookup is not an answer, so `select(.exists == false)` never
+    /// returns a directory that may well be there.
+    exists: Option<bool>,
+    /// Why something here could not be read, when it could not. See [`EntryView::unreadable`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unreadable: Option<String>,
     /// The known entries under this base, in canonical order.
     entries: Vec<EntryView>,
 }
@@ -273,7 +279,13 @@ struct EntryView {
     /// working directory under zsh and dash.
     path: Option<PathBuf>,
     desc: &'static str,
-    exists: bool,
+    /// Whether the entry exists, by the rule [`BaseView::exists`] states.
+    exists: Option<bool>,
+    /// Why something here could not be read, when it could not: whether the entry exists at all,
+    /// or part of what it holds (a listing that could not be opened or stopped short, a child whose
+    /// kind could not be told). The children listed are then only those that were read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unreadable: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     children: Vec<ChildView>,
 }
@@ -397,9 +409,10 @@ fn live_project_ids(data_dir: &Path) -> Option<BTreeSet<String>> {
 }
 
 /// Probe one base: its root's existence, then each entry's existence and (for
-/// enumerated entries) the children found on disk. Best-effort throughout — a
-/// `read_dir` that fails (a race, a permission wall) yields no children rather
-/// than failing the whole overview, since `sbx path` is read-only and advisory.
+/// enumerated entries) the children found on disk. Best-effort throughout, since `sbx path` is
+/// read-only and advisory: a lookup or a `read_dir` that fails (a race, a permission wall) costs
+/// that entry its answer or its children, never the whole overview, and the entry says what could
+/// not be read rather than passing for absent or empty.
 ///
 /// `live_ids` is the live-session project-id set, consulted only by the `projects/`
 /// enumeration. `current_id` is the cwd's project id, so the matching tree is marked
@@ -412,20 +425,18 @@ fn probe_base(
     live_ids: Option<&BTreeSet<String>>,
     current_id: Option<&str>,
 ) -> BaseView {
-    let exists = root
-        .as_ref()
-        .map(|r| r.try_exists().unwrap_or(false))
-        .unwrap_or(false);
+    // Without a root there is nothing to look up, and nothing exists there.
+    let (exists, unreadable) = root.as_deref().map_or((Some(false), None), existence);
 
     let mut views = Vec::with_capacity(entries.len());
     for e in entries {
         let path = root.as_ref().map(|r| r.join(e.rel));
-        let entry_exists = path
-            .as_ref()
-            .is_some_and(|p| p.try_exists().unwrap_or(false));
+        let (entry_exists, mut unreadable) = path.as_deref().map_or((Some(false), None), existence);
         let children = match &path {
-            Some(p) if e.enumerate != Enumerate::None && entry_exists => {
-                enumerate(p, e.enumerate, live_ids, current_id)
+            Some(p) if e.enumerate != Enumerate::None && entry_exists == Some(true) => {
+                let (children, missed) = enumerate(p, e.enumerate, live_ids, current_id);
+                unreadable = missed;
+                children
             }
             _ => Vec::new(),
         };
@@ -434,6 +445,7 @@ fn probe_base(
             path,
             desc: e.desc,
             exists: entry_exists,
+            unreadable,
             children,
         });
     }
@@ -443,8 +455,49 @@ fn probe_base(
         env_hint,
         root,
         exists,
+        unreadable,
         entries: views,
     }
+}
+
+/// Whether `path` exists, or why that could not be told. A lookup that could not be made is not an
+/// answer: read as `false`, it printed `(absent)` beside a directory a permission wall above it only
+/// hid. One that found the path leads nowhere is ([`leads_nowhere`]), and answers `false`.
+fn existence(path: &Path) -> (Option<bool>, Option<String>) {
+    match path.try_exists() {
+        Ok(found) => (Some(found), None),
+        Err(e) if leads_nowhere(&e) => (Some(false), None),
+        Err(e) => (None, Some(format!("cannot tell whether it exists: {e}"))),
+    }
+}
+
+/// Whether a failed lookup is an answer after all: the path leads nowhere (nothing at its end, a
+/// file where a directory should be, a loop of links), so nothing is there to find. Any other
+/// failure (a permission wall, an I/O error) means the lookup could not be made at all.
+fn leads_nowhere(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    ) || e.raw_os_error() == Some(libc::ELOOP)
+}
+
+/// The items of a listing that could be read, and the error that ended it early if one did. On
+/// Linux an error from `readdir` ends the stream, so what was read before it is all there is, and
+/// the error is the one sign that the listing is not whole.
+fn readable<T, E: std::fmt::Display>(
+    items: impl Iterator<Item = Result<T, E>>,
+) -> (Vec<T>, Option<String>) {
+    let mut read = Vec::new();
+    let mut cut = None;
+    for item in items {
+        match item {
+            Ok(item) => read.push(item),
+            Err(e) => {
+                cut.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+    (read, cut)
 }
 
 /// List the on-disk children of `dir` that match `what`: subdirectories (`Dirs`),
@@ -452,23 +505,42 @@ fn probe_base(
 /// per-project runtime trees (`Projects`, each classified by liveness, dated, and carrying its
 /// recorded project path). Sorted by name for a stable, readable listing. `live_ids` and
 /// `current_id` are consulted only by `Projects`.
+///
+/// Also answers what could not be read, if anything: a directory that cannot be opened, a listing
+/// that stopped short, or a child whose kind cannot be told (a directory that may be read but not
+/// searched answers its names and refuses every lookup under them). A link that leads nowhere (its
+/// target gone, a file on its way, a loop) is not one of these: it is no directory and no file, so
+/// it is skipped as it always was.
 fn enumerate(
     dir: &Path,
     what: Enumerate,
     live_ids: Option<&BTreeSet<String>>,
     current_id: Option<&str>,
-) -> Vec<ChildView> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Vec::new();
+) -> (Vec<ChildView>, Option<String>) {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => return (Vec::new(), Some(format!("cannot be listed: {e}"))),
     };
-    let mut out: Vec<ChildView> = rd
-        .flatten()
+    let (entries, cut) = readable(rd);
+    let mut missed = cut.map(|e| format!("its listing stopped short: {e}"));
+    let mut out: Vec<ChildView> = entries
+        .into_iter()
         .filter_map(|ent| {
             let raw = ent.file_name();
             let name = raw.to_string_lossy().into_owned();
             let path = ent.path();
+            // Followed, as `is_dir` follows: a profile placed as a link by a dotfile manager is
+            // still a profile.
+            let kind = match std::fs::metadata(&path) {
+                Ok(meta) => meta,
+                Err(e) if leads_nowhere(&e) => return None,
+                Err(e) => {
+                    missed.get_or_insert_with(|| format!("a child's kind cannot be told: {e}"));
+                    return None;
+                }
+            };
             match what {
-                Enumerate::Dirs if path.is_dir() => Some(ChildView {
+                Enumerate::Dirs if kind.is_dir() => Some(ChildView {
                     name,
                     path,
                     state: None,
@@ -476,7 +548,7 @@ fn enumerate(
                     project_path: None,
                     current: false,
                 }),
-                Enumerate::Profiles if path.is_file() && name.ends_with(".toml") => {
+                Enumerate::Profiles if kind.is_file() && name.ends_with(".toml") => {
                     Some(ChildView {
                         // One suffix, not every trailing one: an app may be named `x.toml`, whose
                         // profile is `x.toml.toml`, and `trim_end_matches` ate both — so `sbx path`
@@ -493,7 +565,7 @@ fn enumerate(
                         current: false,
                     })
                 }
-                Enumerate::Projects if path.is_dir() => {
+                Enumerate::Projects if kind.is_dir() => {
                     let class = sandbox::classify_tree(&path, live_ids);
                     Some(ChildView {
                         current: current_id == Some(name.as_str()),
@@ -509,7 +581,7 @@ fn enumerate(
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    (out, missed)
 }
 
 /// Format a `SystemTime` as a stable `YYYY-MM-DD` (UTC) — the column `sbx path` shows beside each
@@ -545,9 +617,20 @@ pub(crate) fn civil_date(t: SystemTime) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// The tag beside a base or an entry and its hue, from what its lookup answered: `unreadable` in
+/// warn when there was no answer, since that is neither of the other two.
+fn presence(exists: Option<bool>, pal: &crate::style::Palette) -> (&'static str, &'static str) {
+    match exists {
+        Some(true) => ("present", pal.ok),
+        Some(false) => ("absent", pal.dim),
+        None => ("unreadable", pal.warn),
+    }
+}
+
 /// Render the layout as aligned, optionally colored text. Mirrors the shape of
 /// `sbx config path`'s resolution overview: a header per base, then each entry
-/// with its path and a `(present)`/`(absent)`/`(no base)` tag, and enumerated
+/// with its path and a `(present)`/`(absent)`/`(unreadable)`/`(no base)` tag, the reason on the
+/// next line when something could not be read, and enumerated
 /// children indented under their parent. Color spans are empty when the palette
 /// is plain, so a captured test stream is byte-for-byte plain text.
 pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
@@ -567,11 +650,7 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
         let label = format!("{}:", base.label);
         match &base.root {
             Some(root) => {
-                let (state, hue) = if base.exists {
-                    ("present", ok)
-                } else {
-                    ("absent", dim)
-                };
+                let (state, hue) = presence(base.exists, pal);
                 let _ = writeln!(
                     o,
                     "{nm}{:<7}{r}  {}  {hue}({state}){r}  {dim}{}{r}",
@@ -579,6 +658,9 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
                     root.display(),
                     base.env_hint,
                 );
+                if let Some(why) = &base.unreadable {
+                    let _ = writeln!(o, "  {warn}({why}){r}");
+                }
             }
             None => {
                 let _ = writeln!(
@@ -602,11 +684,7 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
             // An entry has a path exactly when its base has a root, and a rootless base stopped
             // at its header above.
             let Some(path) = &e.path else { continue };
-            let (state, hue) = if e.exists {
-                ("present", ok)
-            } else {
-                ("absent", dim)
-            };
+            let (state, hue) = presence(e.exists, pal);
             let _ = writeln!(
                 o,
                 "  {nm}{:<width$}{r}  {}  {hue}({state}){r}  {dim}{}{r}",
@@ -614,6 +692,9 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
                 path.display(),
                 e.desc,
             );
+            if let Some(why) = &e.unreadable {
+                let _ = writeln!(o, "    {warn}({why}){r}");
+            }
             if !e.children.is_empty() {
                 let cw = e.children.iter().map(|c| c.name.len()).max().unwrap_or(0);
                 for c in &e.children {
@@ -873,8 +954,11 @@ mod tests {
             .find(|b| b.label == "data")
             .expect("data base");
         assert!(data.root.is_none(), "no data root");
-        assert!(!data.exists);
-        assert!(data.entries.iter().all(|e| !e.exists), "all entries absent");
+        assert_eq!(data.exists, Some(false));
+        assert!(
+            data.entries.iter().all(|e| e.exists == Some(false)),
+            "all entries absent"
+        );
     }
 
     /// A base with no root has no path to give its entries, and `--json` says so with `null`, as it
@@ -963,7 +1047,8 @@ mod tests {
         std::fs::write(apps.join("demo-app.toml"), "").unwrap();
         std::fs::write(apps.join("not-a-profile.txt"), "").unwrap();
         let live = BTreeSet::new();
-        let kids = enumerate(&apps, Enumerate::Profiles, Some(&live), None);
+        let (kids, missed) = enumerate(&apps, Enumerate::Profiles, Some(&live), None);
+        assert_eq!(missed, None, "everything was read");
         assert_eq!(kids.len(), 1, "only .toml files kept");
         assert_eq!(kids[0].name, "demo-app", "suffix stripped");
         assert!(kids[0].path.ends_with("demo-app.toml"), "full path kept");
@@ -979,7 +1064,8 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("subdir")).unwrap();
         std::fs::write(tmp.path().join("a-file"), "").unwrap();
         let live = BTreeSet::new();
-        let kids = enumerate(tmp.path(), Enumerate::Dirs, Some(&live), None);
+        let (kids, missed) = enumerate(tmp.path(), Enumerate::Dirs, Some(&live), None);
+        assert_eq!(missed, None, "everything was read");
         assert_eq!(kids.len(), 1, "only the directory kept");
         assert_eq!(kids[0].name, "subdir");
         assert!(kids[0].state.is_none() && kids[0].last_used.is_none());
@@ -1213,19 +1299,21 @@ mod tests {
         let unasked = data.join("unasked");
         tree(&unasked, "unk0", None);
         let live = BTreeSet::from(["live0".to_string()]);
-        let mut children = enumerate(&projects, Enumerate::Projects, Some(&live), None);
-        children.extend(enumerate(&unasked, Enumerate::Projects, None, None));
+        let (mut children, _) = enumerate(&projects, Enumerate::Projects, Some(&live), None);
+        children.extend(enumerate(&unasked, Enumerate::Projects, None, None).0);
         let v = PathView {
             bases: vec![BaseView {
                 label: "data",
                 env_hint: "",
                 root: Some(data.path().to_path_buf()),
-                exists: true,
+                exists: Some(true),
+                unreadable: None,
                 entries: vec![EntryView {
                     label: "projects/",
                     path: Some(projects.clone()),
                     desc: "",
-                    exists: true,
+                    exists: Some(true),
+                    unreadable: None,
                     children,
                 }],
             }],
@@ -1253,5 +1341,167 @@ mod tests {
                 "{id} is not drawn `{state}` in its hue: {line:?}"
             );
         }
+    }
+
+    /// Set `dir`'s mode, for a test that needs a directory this user cannot read or search.
+    fn chmod(dir: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A lookup that fails is not an answer. A base or an entry whose `stat` this user may not make,
+    /// because a directory above it refuses the search, is shown `(unreadable)` with the reason and
+    /// is `null` in `--json`: read as `false`, the failure printed `(absent)` beside a directory that
+    /// is there. Every shape is checked before failing, so each one is seen on its own.
+    #[test]
+    fn what_cannot_be_looked_up_is_not_called_absent() {
+        if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!("running as root, which searches a directory its mode refuses");
+            return;
+        }
+        let tmp = TmpDir::new();
+        // The base itself cannot be looked up: the directory holding it refuses the search.
+        let locked = tmp.join("locked");
+        let behind = locked.join("data");
+        std::fs::create_dir_all(behind.join("projects")).unwrap();
+        // The base can, its entries cannot: the base refuses the search into it.
+        let shut = tmp.join("shut");
+        std::fs::create_dir_all(shut.join("projects")).unwrap();
+        chmod(&locked, 0o000);
+        chmod(&shut, 0o000);
+        let views = [
+            ("base", view_with_roots(Some(behind), None, None)),
+            ("entries", view_with_roots(Some(shut.clone()), None, None)),
+        ];
+        chmod(&locked, 0o700);
+        chmod(&shut, 0o700);
+        let pal = crate::style::Palette::plain();
+        let mut wrong = Vec::new();
+        for (shape, v) in &views {
+            let doc = serde_json::to_value(v).expect("serialize");
+            let text = render(v, &pal);
+            let data = &doc["bases"][0];
+            let projects = data["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .find(|e| e["label"] == "projects/")
+                .expect("projects/ entry");
+            let lines: Vec<&str> = text.lines().collect();
+            // The tag on the line itself, the reason on the one right under it.
+            let said = |what: &str, view: &serde_json::Value, at: Option<usize>| {
+                let mut off = Vec::new();
+                let reason = view["unreadable"].as_str().filter(|r| !r.is_empty());
+                if !view["exists"].is_null() || reason.is_none() {
+                    off.push(format!("{shape}: {what} in json: {view}"));
+                }
+                let line = at.map(|i| lines[i]);
+                let next = at.and_then(|i| lines.get(i + 1)).copied();
+                let shown = line.is_some_and(|l| l.contains("(unreadable)"))
+                    && next.zip(reason).is_some_and(|(n, r)| n.contains(r));
+                if !shown {
+                    off.push(format!("{shape}: {what} in text: {line:?} then {next:?}"));
+                }
+                off
+            };
+            let entry_line = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("projects/"));
+            if *shape == "base" {
+                let base_line = lines.iter().position(|l| l.starts_with("data:"));
+                wrong.extend(said("the base", data, base_line));
+            } else if data["exists"] != true {
+                wrong.push(format!("{shape}: the base it can look up: {data}"));
+            }
+            wrong.extend(said("projects/", projects, entry_line));
+        }
+        // A lookup that finds the path leads nowhere is an answer: under a base that is a file no
+        // entry can exist, and none is called unreadable.
+        let file = tmp.join("file");
+        std::fs::write(&file, "").unwrap();
+        let doc = serde_json::to_value(view_with_roots(Some(file), None, None)).expect("serialize");
+        for e in doc["bases"][0]["entries"].as_array().expect("entries") {
+            if e["exists"] != false || e.get("unreadable").is_some() {
+                wrong.push(format!("file: an entry under a file: {e}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// An error met partway through a listing is kept, with what was read before it. On Linux it
+    /// ends the stream, so it is the only sign the listing is not whole, and dropping it, as a
+    /// `flatten()` does, showed a listing cut short as the complete one. No real directory can be
+    /// made to fail mid-stream on demand, so the collection is asked directly.
+    #[test]
+    fn a_listing_cut_short_keeps_what_it_read_and_why() {
+        let cut: Vec<Result<u8, &str>> = vec![Ok(1), Ok(2), Err("EIO")];
+        assert_eq!(
+            readable(cut.into_iter()),
+            (vec![1, 2], Some("EIO".to_string()))
+        );
+        let whole: Vec<Result<u8, &str>> = vec![Ok(1), Ok(2)];
+        assert_eq!(readable(whole.into_iter()), (vec![1, 2], None));
+    }
+
+    /// A listing that could not be read whole says so instead of passing for the whole of it: one
+    /// that cannot be opened, and one whose children's kind cannot be told (a directory that may be
+    /// read but not searched), each show the entry present with the reason beside it, and nothing
+    /// under it that was not read. A link that leads nowhere (its target gone, a file on its way, a
+    /// loop) is not one of them: it is not a directory, and is skipped without a word, as before.
+    /// Every shape is checked before failing.
+    #[test]
+    fn a_listing_that_cannot_be_read_whole_says_so() {
+        if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!("running as root, which reads a directory its mode refuses");
+            return;
+        }
+        let data = TmpDir::new();
+        let closed = data.join("projects");
+        std::fs::create_dir_all(closed.join("0123456789abcdef")).unwrap();
+        let unsearchable = data.join("apps");
+        std::fs::create_dir_all(unsearchable.join("claude-code")).unwrap();
+        let dangling = data.join("plugin-state");
+        std::fs::create_dir_all(dangling.join("kept")).unwrap();
+        std::os::unix::fs::symlink(data.join("gone"), dangling.join("link")).unwrap();
+        std::os::unix::fs::symlink("loop", dangling.join("loop")).unwrap();
+        let file = data.join("file");
+        std::fs::write(&file, "").unwrap();
+        std::os::unix::fs::symlink(file.join("x"), dangling.join("through")).unwrap();
+        chmod(&closed, 0o000);
+        chmod(&unsearchable, 0o400);
+        let v = view_with_roots(Some(data.path().to_path_buf()), None, None);
+        chmod(&closed, 0o700);
+        chmod(&unsearchable, 0o700);
+        let doc = serde_json::to_value(&v).expect("serialize");
+        let text = render(&v, &crate::style::Palette::plain());
+        let entry = |label: &str| {
+            doc["bases"][0]["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .find(|e| e["label"] == label)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {label} entry"))
+        };
+        let mut wrong = Vec::new();
+        for label in ["projects/", "apps/"] {
+            let e = entry(label);
+            let reason = e["unreadable"].as_str().filter(|r| !r.is_empty());
+            if e["exists"] != true || reason.is_none() || e.get("children").is_some() {
+                wrong.push(format!("{label} in json: {e}"));
+            }
+            if !reason.is_some_and(|r| text.contains(r)) {
+                wrong.push(format!("{label}: its reason is not in the text:\n{text}"));
+            }
+        }
+        let e = entry("plugin-state/");
+        let kids: Vec<&str> = e["children"]
+            .as_array()
+            .map(|k| k.iter().filter_map(|c| c["name"].as_str()).collect())
+            .unwrap_or_default();
+        if e.get("unreadable").is_some() || kids != ["kept"] {
+            wrong.push(format!("a link that leads nowhere is not a reason: {e}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

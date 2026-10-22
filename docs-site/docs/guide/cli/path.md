@@ -50,7 +50,13 @@ gone (sweepable with [`sbx projects rm --dead`](projects)). The project path on 
 one the tree's marker records, written as [`sbx config show`](config) writes a value: a control
 character or a character that reorders a line is written out as an escape, and `--json` keeps
 the path as it is. An `(absent)` on an
-entry simply means nothing has needed it yet. Two more bases follow the `data` one:
+entry simply means nothing has needed it yet. An `(unreadable)` one means sbx could not tell,
+because a directory above it refuses the lookup; the reason is printed on the next line, and
+the same line follows an entry that is present but could not be listed whole (a directory that
+cannot be opened, or that may be read but not searched), whose rows are then only those that
+could be read. In `--json`, such an entry has a `null` `exists` and carries the reason in
+`unreadable`, so `select(.exists == false)` lists only what is really absent. Two more bases
+follow the `data` one:
 `config:` (the profiles directory and its siblings) and `state:` (the trust
 markers).
 
