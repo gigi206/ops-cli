@@ -362,10 +362,7 @@ fn a_follow_walks_its_cursor_reports_the_gap_and_stops_when_the_session_ends() {
 /// Every follow went quiet there, which read exactly like a session with nothing new.
 #[test]
 fn a_follow_names_a_session_each_time_it_stops_answering() {
-    for args in [
-        &["fs", "logs", "--follow"][..],
-        &["logs", "--feed", "fs", "--follow"][..],
-    ] {
+    for args in [&["fs", "logs"][..], &["logs", "--feed", "fs"][..]] {
         let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
         let child = Standin::new();
         common::write_session_record(data.path(), child.pid(), "project", project.path());
@@ -379,7 +376,7 @@ fn a_follow_names_a_session_each_time_it_stops_answering() {
             ),
         );
         let pid = child.pid().to_string();
-        let mut argv: Vec<&str> = args[..args.len() - 1].to_vec();
+        let mut argv: Vec<&str> = args.to_vec();
         argv.push(&pid);
         argv.push("--follow");
 
