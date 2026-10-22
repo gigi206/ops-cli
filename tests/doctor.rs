@@ -6,19 +6,13 @@ use common::fixture::TmpDir;
 
 use std::process::Command;
 
+/// The built binary, with the global config and the trust store isolated the way every other suite
+/// isolates them, by [`common::isolated_sbx`], so a report never depends on the developer's own
+/// `~/.config/sbx`. No test here writes either, so the suite's fixed empty directories are shared
+/// without a race.
 fn sbx() -> Command {
-    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/sbx` so an e2e never depends on
-    // the developer's global sbx config; default it to a fixed empty dir under the test tree
-    // (no test here writes a global config, so a shared empty dir is race-free).
-    let cfg = fixture_root().join("isolated-config");
-    let _ = std::fs::create_dir_all(&cfg);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
-    cmd.env("XDG_CONFIG_HOME", cfg);
-    cmd
+    common::isolated_sbx("doctor-")
 }
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
 
 #[test]
 fn doctor_prints_the_preflight_structure() {
