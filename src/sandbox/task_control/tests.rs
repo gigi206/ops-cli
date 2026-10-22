@@ -894,6 +894,31 @@ fn a_claim_holds_against_sweeps_running_beside_it() {
     );
 }
 
+/// A claim leaves `tasks/` owner-only, as its documentation says, whatever the umask made it or a
+/// looser directory left there: the session records live in it beside the session directories.
+#[test]
+fn a_claim_leaves_the_task_planes_directory_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+    let fresh = TmpDir::new();
+    claim_task_dir(fresh.path(), std::process::id()).expect("a claim");
+    assert_eq!(mode(&tasks_dir(fresh.path())), 0o700, "created owner-only");
+
+    let loose = TmpDir::new();
+    std::fs::create_dir_all(tasks_dir(loose.path())).unwrap();
+    std::fs::set_permissions(
+        tasks_dir(loose.path()),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    claim_task_dir(loose.path(), std::process::id()).expect("a claim");
+    assert_eq!(
+        mode(&tasks_dir(loose.path())),
+        0o700,
+        "tightened where looser"
+    );
+}
+
 /// A plane whose invocations take `seconds` to answer, plus the client that talks to it.
 ///
 /// The launcher is a script standing in for bubblewrap: it ignores the cage argv, waits, and

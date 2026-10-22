@@ -722,7 +722,9 @@ pub(crate) fn log_socket(data_dir: &Path, pid: u32) -> PathBuf {
 /// removed under the session just after it was created, sockets or no.
 fn claim_task_dir(data_dir: &Path, pid: u32) -> io::Result<PathBuf> {
     let root = tasks_dir(data_dir);
-    std::fs::create_dir_all(&root)?;
+    // Owner-only, as [`tasks_dir`] says it is, and tightened where an earlier one was left looser:
+    // the session records live here beside the session directories.
+    super::lens::ensure_control_dir(&root)?;
     let _lock = sweep_lock(&root)?;
     sweep_stale(&root, true);
     let dir = task_dir(data_dir, pid);
