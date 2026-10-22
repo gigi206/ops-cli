@@ -821,11 +821,12 @@ fn a_live_snapshot_names_a_session_that_did_not_answer() {
             let _ = BufReader::new(stdout).read_line(&mut line);
             let _ = tx.send(line);
         });
-        let line = rx
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .unwrap_or_default();
+        let line = rx.recv_timeout(std::time::Duration::from_secs(60));
         let _ = child.kill();
         let _ = child.wait();
+        // A view that wrote nothing is named as such, not read as an empty line that then fails
+        // to parse.
+        let line = line.unwrap_or_else(|_| panic!("{args:?}: no first snapshot within 60 s"));
         serde_json::from_str::<serde_json::Value>(&line)
             .unwrap_or_else(|e| panic!("{args:?}: one JSON object per tick ({e}): {line:?}"))
     };
