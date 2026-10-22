@@ -110,10 +110,11 @@ struct InstalledIndex {
     /// resolves to nothing, so it is absent from `by_scheme` — but an install is refused on it all
     /// the same, so a listing that stayed silent here would offer an entry that cannot be placed.
     conflicts: std::collections::BTreeMap<String, Vec<String>>,
-    /// Manifest name → the directory name claiming it, for the kinds whose namespace *is* their
-    /// name (a broker, a signer). Separate from `by_name` because the two can differ: an install
-    /// sbx performed names the directory after the manifest, but a hand-placed tree may not, and
-    /// the install checks the manifest name as its own refusal (see `install_inner`).
+    /// Manifest name → the directory name claiming it, for every kind: the name is one namespace
+    /// across them, and a resolver claims it besides its scheme. Separate from `by_name` because the
+    /// two can differ: an install sbx performed names the directory after the manifest, but a
+    /// hand-placed tree may not, and the install checks the manifest name as its own refusal (see
+    /// `install_inner`).
     by_plugin_name: std::collections::BTreeMap<String, String>,
     /// Manifest name → every directory name claiming it, when more than one does — the name-side
     /// counterpart of `conflicts`, and refused by an install for the same reason.
@@ -207,17 +208,19 @@ impl InstalledIndex {
         // hand-placed plugin may declare a manifest `name` that differs from its directory.
         let mut versions = std::collections::BTreeMap::new();
         let mut by_scheme = std::collections::BTreeMap::new();
-        for p in registry.resolvers() {
-            versions.insert(p.dir_name().to_string(), p.version.clone());
-            by_scheme.insert(p.scheme.clone(), p.dir_name().to_string());
-        }
-        // Every kind carries a version, and a listing that only read the resolvers would call a
-        // broker or a signer versionless whatever its manifest declared. Only the scheme index is
-        // a resolver's alone: the scheme-less kinds claim their *name*, which is indexed here
-        // rather than read off `by_name` below, because the two are not the same key — a
+        // Every kind claims its manifest *name*, a resolver as well as the scheme-less kinds, so it
+        // is indexed here rather than read off `by_name` below: the two are not the same key — a
         // hand-placed tree may declare a manifest name its directory does not carry, and the
         // manifest name is what an install refuses on.
         let mut by_plugin_name = std::collections::BTreeMap::new();
+        for p in registry.resolvers() {
+            versions.insert(p.dir_name().to_string(), p.version.clone());
+            by_scheme.insert(p.scheme.clone(), p.dir_name().to_string());
+            by_plugin_name.insert(p.name.clone(), p.dir_name().to_string());
+        }
+        // Every kind carries a version, and a listing that only read the resolvers would call a
+        // broker or a signer versionless whatever its manifest declared. Only the scheme index is
+        // a resolver's alone.
         for (name, dir_name, version) in registry
             .brokers()
             .map(|p| (p.name.clone(), p.dir_name(), p.version.clone()))
@@ -349,39 +352,38 @@ impl InstalledIndex {
             }
             return format!("  {}[installed]{r}", pal.ok);
         }
-        // A broker and a signer claim no scheme: their namespace is the *manifest* name, which the
-        // `by_name` check above does not answer — that one is keyed by directory, and the two part
-        // company for a hand-placed tree. The install checks the manifest name separately, so this
-        // has to as well, or a listing offers an entry the install refuses.
-        let Some(scheme) = scheme else {
-            if let Some(other) = self.by_plugin_name.get(name) {
+        if let Some(scheme) = scheme {
+            // The name is free, but a scheme is claimed by exactly one plugin — an install would be
+            // refused for the scheme instead, which is far from obvious from a listing.
+            if let Some(other) = self.by_scheme.get(scheme) {
                 return format!(
-                    "  {}[name taken by the installed plugin '{other}']{r}",
+                    "  {}[scheme {scheme}:// taken by the installed plugin '{other}']{r}",
                     pal.warn
                 );
             }
-            if let Some(claimants) = self.name_conflicts.get(name) {
+            // The name is free and nothing *resolves* that scheme — but several plugins claim it,
+            // and an install is refused on that too.
+            if let Some(claimants) = self.conflicts.get(scheme) {
                 return format!(
-                    "  {}[name in conflict between {}]{r}",
+                    "  {}[scheme {scheme}:// in conflict between {}]{r}",
                     pal.err,
                     plugins::quoted_list(claimants)
                 );
             }
-            return String::new();
-        };
-        // The name is free, but a scheme is claimed by exactly one plugin — an install would be
-        // refused for the scheme instead, which is far from obvious from a listing.
-        if let Some(other) = self.by_scheme.get(scheme) {
+        }
+        // Every kind also claims its *manifest* name, which the `by_name` check above does not
+        // answer — that one is keyed by directory, and the two part company for a hand-placed tree.
+        // The install checks the manifest name after a resolver's scheme, so this does too, or a
+        // listing offers an entry the install refuses, or names another reason than the refusal.
+        if let Some(other) = self.by_plugin_name.get(name) {
             return format!(
-                "  {}[scheme {scheme}:// taken by the installed plugin '{other}']{r}",
+                "  {}[name taken by the installed plugin '{other}']{r}",
                 pal.warn
             );
         }
-        // The name is free and nothing *resolves* that scheme — but several plugins claim it, and
-        // an install is refused on that too.
-        if let Some(claimants) = self.conflicts.get(scheme) {
+        if let Some(claimants) = self.name_conflicts.get(name) {
             return format!(
-                "  {}[scheme {scheme}:// in conflict between {}]{r}",
+                "  {}[name in conflict between {}]{r}",
                 pal.err,
                 plugins::quoted_list(claimants)
             );
@@ -3391,6 +3393,54 @@ mod tests {
         );
         assert_eq!(
             idx.marker("vault-broker", None, None, None, "mine", &plain()),
+            "  [name in conflict between `vault-dev`, `vault-fork`]"
+        );
+    }
+
+    /// A resolver claims its manifest name besides its scheme, and an install refuses it on either,
+    /// the scheme first. A listing that answered the name for the scheme-less kinds alone offered a
+    /// resolver entry whose name a hand-placed resolver declares, and the install then refused it.
+    /// Read from a scanned tree, so the index a listing is built from is what answers.
+    #[test]
+    fn a_resolver_entry_whose_manifest_name_is_taken_is_not_offered() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let data = crate::testutil::TmpDir::new();
+        let layout = store::Layout::under(data.path());
+        let place = |dir: &str, name: &str, scheme: &str| {
+            let at = layout.plugins_dir().join(dir);
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(
+                at.join("plugin.toml"),
+                format!("name=\"{name}\"\ntype=\"resolver\"\nscheme=\"{scheme}\"\nexec=\"run\"\n"),
+            )
+            .unwrap();
+            std::fs::write(at.join("run"), "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(at.join("run"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        };
+        place("vault-dev", "kp", "vault");
+
+        let idx = InstalledIndex::scan(&layout);
+        assert_eq!(
+            idx.marker("kp", Some("kp"), Some("1.0.0"), None, "mine", &plain()),
+            "  [name taken by the installed plugin 'vault-dev']"
+        );
+        // The scheme is named first when both are held, as the install's refusal names it.
+        assert_eq!(
+            idx.marker("kp", Some("vault"), None, None, "mine", &plain()),
+            "  [scheme vault:// taken by the installed plugin 'vault-dev']"
+        );
+        // A name no installed plugin declares stays installable.
+        assert_eq!(
+            idx.marker("pass", Some("pass"), None, None, "mine", &plain()),
+            ""
+        );
+
+        // A second resolver under that name contests it, and the entry names both claimants.
+        place("vault-fork", "kp", "vaultb");
+        let idx = InstalledIndex::scan(&layout);
+        assert_eq!(
+            idx.marker("kp", Some("kp"), None, None, "mine", &plain()),
             "  [name in conflict between `vault-dev`, `vault-fork`]"
         );
     }

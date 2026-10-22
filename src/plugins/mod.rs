@@ -1476,8 +1476,8 @@ pub(crate) struct Installed {
 /// a symlink or special file is refused), then the *staged copy* — the artifact that will actually
 /// run — is re-validated exactly as the registry and runner would. Fail-closed at every step: a
 /// malformed manifest, an executable that is not an owner-only regular file, an install name that
-/// is not a safe directory component, an already-installed plugin of that name, or a scheme already
-/// claimed by another installed plugin each refuse before anything is placed.
+/// is not a safe directory component, an already-installed plugin of that name, or a scheme or a
+/// name already claimed by another installed plugin each refuse before anything is placed.
 pub(crate) fn install(layout: &crate::store::Layout, source: &Path) -> Result<Installed, String> {
     // The recorded path is the source's canonical location, so a listing names a stable directory
     // rather than whatever relative form the command line used. A path that does not canonicalize
@@ -1652,63 +1652,66 @@ fn install_inner(
         });
     }
 
-    // Refuse a scheme another installed plugin already claims: placing it would make the registry
+    // Refuse a key another installed plugin already claims: placing it would make the registry
     // drop *both* as ambiguous, so the install would "succeed" into a silently dead plugin. Both
-    // states are refused — a scheme claimed by one plugin, and a scheme already ambiguous — so an
-    // install never adds a claimant to a namespace that is broken or about to be.
+    // states are refused for each key — one claimed by another plugin, and one already ambiguous —
+    // so an install never adds a claimant to a namespace that is broken or about to be. A resolver
+    // holds two keys, its scheme and its name; a broker and a signer hold their name alone.
     let mut warnings = Vec::new();
     let installed = PluginRegistry::load_with(&plugins_dir, &exp, &mut warnings);
-    match probe.scheme() {
-        Some(scheme) => {
-            if let Some(claimants) = installed.conflict(scheme) {
-                return Err(format!(
-                    "scheme `{scheme}://` is claimed by more than one installed plugin ({}) — \
-                     they are all disabled; remove all but one with `sbx plugins rm <name>` first",
-                    quoted_list(claimants)
-                ));
-            }
-            if let Some(other) = installed.resolver(scheme)
-                && other.dir != dest
-            {
-                let holder = other.dir_name();
-                return Err(format!(
-                    "scheme `{scheme}://` is already claimed by the installed plugin `{}` (from \
-                     {}) — remove it first with `sbx plugins rm {holder}`",
-                    other.name,
-                    origin::read(layout, holder).short()
-                ));
-            }
+    if let Some(scheme) = probe.scheme() {
+        if let Some(claimants) = installed.conflict(scheme) {
+            return Err(format!(
+                "scheme `{scheme}://` is claimed by more than one installed plugin ({}) — \
+                 they are all disabled; remove all but one with `sbx plugins rm <name>` first",
+                quoted_list(claimants)
+            ));
         }
-        // A broker and a signer share one namespace — their name — and the same two states are
-        // refused for the same reason: a name already ambiguous, and a name another installed
-        // plugin holds. Across both types, not within one: two plugins under one name are what the
-        // registry disables, and installing into that state is what this refusal exists to stop.
-        None => {
-            if let Some(claimants) = installed.name_conflict(&name) {
-                return Err(format!(
-                    "the plugin name `{name}` is claimed by more than one installed plugin ({}) — \
-                     they are all disabled; remove all but one with `sbx plugins rm <name>` first",
-                    quoted_list(claimants)
-                ));
-            }
-            let held = installed
+        if let Some(other) = installed.resolver(scheme)
+            && other.dir != dest
+        {
+            let holder = other.dir_name();
+            return Err(format!(
+                "scheme `{scheme}://` is already claimed by the installed plugin `{}` (from \
+                 {}) — remove it first with `sbx plugins rm {holder}`",
+                other.name,
+                origin::read(layout, holder).short()
+            ));
+        }
+    }
+    // The name is one namespace across every type: `[plugin.<name>]` is applied to every plugin of
+    // that name, so the registry disables all the claimants of a shared one, a resolver among them.
+    // The holder is therefore looked for in all three indexes, whichever one the newcomer files
+    // into.
+    if let Some(claimants) = installed.name_conflict(&name) {
+        return Err(format!(
+            "the plugin name `{name}` is claimed by more than one installed plugin ({}) — \
+             they are all disabled; remove all but one with `sbx plugins rm <name>` first",
+            quoted_list(claimants)
+        ));
+    }
+    let held = installed
+        .resolvers()
+        .find(|p| p.name == name)
+        .map(|p| (p.dir.as_path(), p.dir_name()))
+        .or_else(|| {
+            installed
                 .broker(&name)
                 .map(|p| (p.dir.as_path(), p.dir_name()))
-                .or_else(|| {
-                    installed
-                        .signer(&name)
-                        .map(|p| (p.dir.as_path(), p.dir_name()))
-                });
-            if let Some((dir, holder)) = held
-                && dir != dest
-            {
-                return Err(format!(
-                    "the plugin name `{name}` is already taken by the installed plugin from {} — \
-                     remove it first with `sbx plugins rm {holder}`",
-                    origin::read(layout, holder).short()
-                ));
-            }
-        }
+        })
+        .or_else(|| {
+            installed
+                .signer(&name)
+                .map(|p| (p.dir.as_path(), p.dir_name()))
+        });
+    if let Some((dir, holder)) = held
+        && dir != dest
+    {
+        return Err(format!(
+            "the plugin name `{name}` is already taken by the installed plugin from {} — \
+             remove it first with `sbx plugins rm {holder}`",
+            origin::read(layout, holder).short()
+        ));
     }
 
     // Stage into a temp sibling *outside* the plugins directory (so a concurrent `list` never scans
@@ -4039,6 +4042,115 @@ mod tests {
         assert!(reg.broker("gpg-agent").is_some());
         assert!(reg.name_conflict("gpg-agent").is_none());
         assert!(!layout.plugins_dir().join("gpg-agent").exists());
+    }
+
+    /// A plugin's name is one namespace across every type, so a name held by a plugin of *another*
+    /// type, or one already contested, refuses the install as a broker's name does. The registry
+    /// disables a resolver that shares its name with any plugin, because `[plugin.<name>] env` is
+    /// applied to every plugin of that name; an install that only weighed a resolver's scheme, and
+    /// a broker's or signer's name against those two types, succeeded into that disabled state.
+    /// Each shape is placed in a tree of its own and every admission is reported, so a guard that
+    /// covers one shape cannot stand in for the others.
+    #[test]
+    fn install_refuses_a_name_another_type_holds_or_that_is_contested() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let place = |plugins: &Path, sub: &str, manifest: &str, exec: &str| {
+            let at = plugins.join(sub);
+            fs::create_dir_all(&at).unwrap();
+            fs::write(at.join("plugin.toml"), manifest).unwrap();
+            fs::write(at.join(exec), "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(at.join(exec), fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let resolver = |name: &str, scheme: &str| {
+            format!("name=\"{name}\"\ntype=\"resolver\"\nscheme=\"{scheme}\"\nexec=\"resolve\"\n")
+        };
+        let signer = "name=\"pass\"\ntype=\"signer\"\nexec=\"sign\"\n\
+                      [signer]\nsets_headers=[\"Authorization\"]\n";
+        // (shape, the hand-placed holders, whether the newcomer is a broker, the name at stake,
+        // what the refusal must say)
+        let shapes = [
+            (
+                "a broker under a resolver's name",
+                vec![("hand-placed", resolver("gpg-agent", "vault"), "resolve")],
+                true,
+                "gpg-agent",
+                "hand-placed",
+            ),
+            (
+                "a resolver under a broker's name",
+                vec![(
+                    "hand-placed",
+                    broker_manifest("").replace("gpg-agent", "pass"),
+                    "broker",
+                )],
+                false,
+                "pass",
+                "hand-placed",
+            ),
+            (
+                "a resolver under a signer's name",
+                vec![("hand-placed", signer.to_string(), "sign")],
+                false,
+                "pass",
+                "hand-placed",
+            ),
+            (
+                "a resolver under another resolver's name",
+                vec![("hand-placed", resolver("pass", "vault"), "resolve")],
+                false,
+                "pass",
+                "hand-placed",
+            ),
+            (
+                "a resolver under a name already contested",
+                vec![
+                    ("va", resolver("pass", "va"), "resolve"),
+                    ("vb", resolver("pass", "vb"), "resolve"),
+                ],
+                false,
+                "pass",
+                "more than one installed plugin (`va`, `vb`)",
+            ),
+        ];
+
+        let mut admitted = Vec::new();
+        for (shape, holders, broker, name, says) in shapes {
+            let data = crate::testutil::TmpDir::new();
+            let src_root = crate::testutil::TmpDir::new();
+            let layout = crate::store::Layout::under(data.path());
+            for (sub, manifest, exec) in &holders {
+                place(&layout.plugins_dir(), sub, manifest, exec);
+            }
+            let source = if broker {
+                source_broker(src_root.path(), "checkout", name)
+            } else {
+                source_plugin(src_root.path(), "checkout", &resolver(name, "pass"), 0o755)
+            };
+            match install(&layout, &source) {
+                Ok(_) => {
+                    let (reg, _) = load(&layout.plugins_dir());
+                    admitted.push(format!(
+                        "{shape}, contested by {:?}",
+                        reg.name_conflict(name)
+                    ));
+                }
+                Err(err) => {
+                    assert!(
+                        err.contains(&format!("plugin name `{name}`")) && err.contains(says),
+                        "{shape}: the refusal names the key and its holders: {err}"
+                    );
+                    assert!(err.contains("sbx plugins rm"), "{shape}: {err}");
+                    assert!(
+                        !layout.plugins_dir().join(name).exists(),
+                        "{shape}: the refused plugin was never placed"
+                    );
+                }
+            }
+        }
+        assert!(
+            admitted.is_empty(),
+            "installed into a name the registry disables: {admitted:?}"
+        );
     }
 
     /// One store serves both kinds. The store is not the boundary a broker is fenced by —
