@@ -535,6 +535,82 @@ fn arm_names(line: &str) -> Vec<&str> {
     names
 }
 
+/// Each match arm of `text` as one line, with the line number it starts on: the line holding its
+/// `=>`, joined to the lines of the same pattern above it.
+///
+/// rustfmt breaks a pattern that outgrows the line into one alternative per line, the `=>` on the
+/// last only: `Some("list")` over `| Some("ls") =>`, or `Some(` over `"rm"` over `| "remove",` over
+/// `) =>`. Read line by line, such an arm offered one spelling and no alias, so a spelling added to
+/// a long arm passed unchecked. A line belongs to the pattern below it unless it is where something
+/// else ends or opens: a block (`{`, `}`), an arm, an argument list or a struct (a line ending in
+/// `,` that is not a `|` alternative), a comment, or a blank line. rustfmt ends every arm that is
+/// not a block with a `,`, so an arm above is told by that.
+fn logical_arms(text: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let continues = |line: &str| {
+        let t = line.trim();
+        !t.is_empty()
+            && !t.starts_with("//")
+            && !t.ends_with('{')
+            && t != "}"
+            && (!t.ends_with(',') || t.starts_with('|'))
+    };
+    let mut arms = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !line.contains("=>") {
+            continue;
+        }
+        let mut start = i;
+        while start > 0 && continues(lines[start - 1]) {
+            start -= 1;
+        }
+        arms.push((start, lines[start..=i].join(" ")));
+    }
+    arms
+}
+
+/// A pattern rustfmt broke across lines is read whole, in each of the shapes it breaks one into;
+/// a comment, an argument list or a neighbouring arm above it is not part of it.
+#[test]
+fn an_arm_broken_across_lines_is_read_whole() {
+    let text = "\
+    match args.first().map(String::as_str) {
+        Some(\"list\")
+        | Some(\"ls\")
+        | Some(\"enumerate\") => list(&args[1..]),
+        // The removal verbs: \"rm\" and \"remove\".
+        Some(
+            \"remove\"
+            | \"rm\",
+        ) => rm(&args[1..]),
+        Some(\"show\") => show(
+            \"one\",
+            \"two\",
+        ),
+        Some(\"edit\") => {
+            edit(\"three\")
+        }
+        Some(\"new\") | Some(\"add\") => add(),
+
+        \"session\"
+        | \"sessions\" => session(rest),
+    }";
+    let arms = logical_arms(text);
+    let read: Vec<(usize, Vec<&str>)> =
+        arms.iter().map(|(at, arm)| (*at, arm_names(arm))).collect();
+    assert_eq!(
+        read,
+        [
+            (1, vec!["list", "ls", "enumerate"]),
+            (5, vec!["remove", "rm"]),
+            (9, vec!["show"]),
+            (13, vec!["edit"]),
+            (16, vec!["new", "add"]),
+            (18, vec!["session", "sessions"]),
+        ]
+    );
+}
+
 /// Where every dispatcher lives and what it dispatches below: the source path relative to
 /// `src/cli`, the function, and the command path its match arms are subcommands of. One file may
 /// hold two (`plugins`, and the `store` namespace under it). A dispatcher missing from this list
@@ -618,7 +694,8 @@ fn dispatched_alias_pairs() -> Vec<(&'static [&'static str], String, String, Str
             }
         }
 
-        for (i, line) in text.lines().enumerate() {
+        for (i, line) in logical_arms(&text) {
+            let line = line.as_str();
             let within = dispatchers.iter().find(|(_, body)| body.contains(&i));
             // Outside a known dispatcher only the `Some(...)` shape is read, so an arm that
             // maps an option value to a variant is not mistaken for a subcommand alias.
