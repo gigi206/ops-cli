@@ -235,7 +235,12 @@ fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
 
     // A second upgrade moments later resolves the same HEAD — an idempotent no-op.
     let again = run();
-    assert!(again.status.success());
+    assert!(
+        again.status.success(),
+        "a repeat flake upgrade failed:\n{}{}",
+        String::from_utf8_lossy(&again.stderr),
+        String::from_utf8_lossy(&again.stdout)
+    );
     assert!(
         String::from_utf8_lossy(&again.stdout).contains("unchanged"),
         "a repeat flake upgrade should be unchanged:\n{}",
@@ -292,7 +297,12 @@ fn upgrade_resolves_and_locks_the_default_channel() {
 
     // a second upgrade moments later finds the same channel HEAD — an explicit no-op
     let again = run();
-    assert!(again.status.success());
+    assert!(
+        again.status.success(),
+        "a repeat upgrade failed:\n{}{}",
+        String::from_utf8_lossy(&again.stderr),
+        String::from_utf8_lossy(&again.stdout)
+    );
     assert!(
         String::from_utf8_lossy(&again.stdout).contains("already at the latest"),
         "a repeat upgrade should be a no-op:\n{}",
@@ -373,7 +383,7 @@ fn a_narrowed_roll_reaches_the_app_s_backends_and_no_project_wide_work() {
     }
 }
 
-/// The two refusals a name can earn, each with its own answer and its own exit code./// The two refusals a name can earn, each with its own answer and its own exit code.
+/// The two refusals a name can earn, each with its own answer and its own exit code.
 #[test]
 fn app_upgrade_refuses_a_name_that_is_not_a_launchable_app() {
     let (config, data, proj) = (TmpDir::new("upg"), TmpDir::new("upg"), TmpDir::new("upg"));
