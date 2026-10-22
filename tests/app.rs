@@ -1190,6 +1190,61 @@ fn prune_stale_leaves_a_pool_alone_when_a_file_that_says_what_to_keep_is_refused
     );
 }
 
+/// mise names a tool's directory by its own rule, which a token with capitals does not survive as
+/// written: `github:vinhnx/VTCode` is installed as `github-vinhnx-vt-code`. With no recorded token
+/// beside it, the declared tool is still recognised, and kept.
+#[test]
+fn prune_keeps_a_declared_tool_whose_directory_mise_named_from_capitals() {
+    let fx = Project::new("app");
+    fx.write_profile(
+        "demo-app",
+        "cmd = \"demo\"\n\n[packages]\nvt = \"mise:github:vinhnx/VTCode\"\n",
+    );
+    fx.install_mise_tool("demo-app", "github-vinhnx-vt-code", "1.0.0");
+    fx.write_home_mise_config(
+        "demo-app",
+        "[tools]\n\"github:vinhnx/VTCode\" = \"latest\"\n",
+    );
+
+    let out = fx.run(&["app", "prune", "demo-app", "--yes"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        fx.installs_dir("demo-app")
+            .join("github-vinhnx-vt-code")
+            .is_dir(),
+        "a declared tool was pruned: {}",
+        text(&out)
+    );
+}
+
+/// The same tool's specs are found for its pool's versions: one no activation asks for goes.
+#[test]
+fn prune_stale_reads_the_specs_of_a_tool_whose_directory_mise_named_from_capitals() {
+    let fx = Project::new("app");
+    fx.write_profile(
+        "demo-app",
+        "cmd = \"demo\"\n\n[packages]\nvt = \"mise:github:vinhnx/VTCode\"\n",
+    );
+    fx.write_home_mise_config(
+        "demo-app",
+        "[tools]\n\"github:vinhnx/VTCode\" = \"2.0.0\"\n",
+    );
+    fx.install_pool_tool("demo-app", "testproj", "github-vinhnx-vt-code", "1.0.0");
+    let marker = fx.data_home.path().join("sbx/projects/testproj/project");
+    std::fs::write(&marker, fx.proj.path().as_os_str().as_bytes()).unwrap();
+
+    let out = fx.run(&["app", "prune", "demo-app", "--stale", "--yes"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        !fx.data_home
+            .path()
+            .join("sbx/projects/testproj/apps/demo-app/mise/installs/github-vinhnx-vt-code/1.0.0")
+            .exists(),
+        "a version no activation asks for was left: {}",
+        text(&out)
+    );
+}
+
 /// A pool the sweep keeps for a neighbour: `apps_share_install_pools` lets another app of the
 /// project resolve a tool out of this pool, and the app that depends on that most is one that never
 /// installed anything itself, whose own pool holds no `installs` at all — most pools a launch

@@ -285,9 +285,9 @@ fn one_spec_per_tool(tokens: &[String]) -> (Vec<String>, Vec<(String, String)>) 
 /// A mismatch costs one install-cage run that finds everything downloaded already and just rewrites
 /// the config, so failing *toward* re-running is cheap — and being wrong the other way is not.
 ///
-/// Matching prefers the backend token mise recorded for each install over the munged directory name
-/// (see [`InstalledTool::is`]) — the munge is best-effort observed naming, the recorded token is
-/// what mise itself says the install is.
+/// Matching prefers the backend token mise recorded for each install over the directory name (see
+/// [`InstalledTool::is`]): the recorded token is what mise itself says the install is, and the name
+/// is compared by a key two tools whose names differ only by separators and case would share.
 pub(crate) fn bins_for(pool: &Path, tokens: &[String]) -> PoolBins {
     let installed = inspect::mise_installed_in(&installs_dir(pool));
     let recorded = recorded_specs(pool);
@@ -793,8 +793,8 @@ mod tests {
         );
     }
 
-    // The pool is matched by the token mise *recorded*, not by the munged directory name — the munge
-    // is best-effort, the record is what mise says the install is.
+    // The pool is matched by the token mise *recorded* before the directory name: the record is
+    // what mise says the install is.
     #[test]
     fn a_declared_token_resolves_to_its_recorded_install() {
         let base = TmpDir::new();

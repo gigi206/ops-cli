@@ -1345,10 +1345,11 @@ pub(crate) fn prune_app_tools(home: &Path, declared: &[&str], apply: bool) -> Ve
     pruned
 }
 
-/// The version specs a mise config's `[tools]` table carries, keyed by the tool's **munged**
-/// directory name so a caller can look one up from what is on disk.
+/// The version specs a mise config's `[tools]` table carries, keyed by the tool's
+/// [`mise_key`](super::inspect::mise_key) so a caller can look one up from the directory name on
+/// disk, which reduces to the same key.
 ///
-/// `"aqua:anthropics/claude-code" = "2.1.266"` yields `aqua-anthropics-claude-code -> ["2.1.266"]`.
+/// `"aqua:anthropics/claude-code" = "2.1.266"` yields `aquaanthropicsclaudecode -> ["2.1.266"]`.
 /// A spec may name a version, or an alias (`latest`, `2`) the pool resolves; both are kept verbatim,
 /// since resolving one needs the pool this is matched against. A table entry whose value is not a
 /// string (mise accepts an inline table for options) contributes its `version` field when it has
@@ -1407,7 +1408,7 @@ fn tool_specs_of(
                 .split_whitespace();
             if let Some(tool) = words.next() {
                 specs
-                    .entry(super::inspect::mise_munge(tool))
+                    .entry(super::inspect::mise_key(tool))
                     .or_default()
                     .extend(words.map(str::to_string));
             }
@@ -1419,7 +1420,7 @@ fn tool_specs_of(
         return Ok(specs);
     };
     for (key, value) in tools {
-        let entry = specs.entry(super::inspect::mise_munge(key)).or_default();
+        let entry = specs.entry(super::inspect::mise_key(key)).or_default();
         match value {
             toml::Value::String(v) => entry.push(v.clone()),
             toml::Value::Array(vs) => {
@@ -1450,11 +1451,11 @@ pub(crate) struct PrunedVersion {
 /// Remove, from a mise `installs/` directory, the versions no activation asks for — `sbx app prune
 /// --stale`.
 ///
-/// `wanted` maps a tool's munged directory name to the version specs the activations that govern
-/// this pool carry for it. A spec is resolved *against the pool*: mise writes `latest`, `2` and
-/// `2.1` as symlinks beside the version directory they name, so a spec is matched by following the
-/// entry it names rather than by comparing strings, and a pool whose `latest` points elsewhere does
-/// not keep a version alive under that name.
+/// `wanted` maps a tool's [`mise_key`](super::inspect::mise_key) to the version specs the
+/// activations that govern this pool carry for it. A spec is resolved *against the pool*: mise
+/// writes `latest`, `2` and `2.1` as symlinks beside the version directory they name, so a spec is
+/// matched by following the entry it names rather than by comparing strings, and a pool whose
+/// `latest` points elsewhere does not keep a version alive under that name.
 ///
 /// A tool with **no** spec is left entirely alone. Having no spec does not mean nothing wants it: it
 /// equally means the activation that does was not among the files read, and deleting on that
@@ -1484,7 +1485,7 @@ pub(crate) fn prune_stale_versions(
     };
     let listing = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
     for tool in super::inspect::mise_installed_in(&listing) {
-        let Some(specs) = wanted.get(&super::inspect::mise_munge(&tool.name)) else {
+        let Some(specs) = wanted.get(&super::inspect::mise_key(&tool.name)) else {
             continue;
         };
         let Ok(name) = std::ffi::CString::new(tool.dir_name.as_bytes()) else {
@@ -2909,7 +2910,7 @@ mod tests {
         let installs = tmp.path().join("installs");
         pool_with(&installs, "demo-tool", &["1.0.0", "2.0.0"], &[]);
         let wanted = std::collections::BTreeMap::from([(
-            "demo-tool".to_string(),
+            crate::sandbox::inspect::mise_key("demo-tool"),
             vec!["2.0.0".to_string()],
         )]);
 
@@ -2938,7 +2939,7 @@ mod tests {
         let raw = "1.0\rfake";
         pool_with(&installs, "demo-tool", &[raw, "2.0.0"], &[]);
         let wanted = std::collections::BTreeMap::from([(
-            "demo-tool".to_string(),
+            crate::sandbox::inspect::mise_key("demo-tool"),
             vec!["2.0.0".to_string()],
         )]);
 
@@ -2968,7 +2969,7 @@ mod tests {
         let raw = "1.0\rfake";
         pool_with(&installs, "demo-tool", &[raw], &[("latest", raw)]);
         let wanted = std::collections::BTreeMap::from([(
-            "demo-tool".to_string(),
+            crate::sandbox::inspect::mise_key("demo-tool"),
             vec!["latest".to_string()],
         )]);
 
@@ -2991,7 +2992,7 @@ mod tests {
         let installs = tmp.path().join("installs");
         pool_with(&installs, "demo-tool", &["3.1.4"], &[("latest", "3.1.4")]);
         let wanted = std::collections::BTreeMap::from([(
-            "demo-tool".to_string(),
+            crate::sandbox::inspect::mise_key("demo-tool"),
             vec!["latest".to_string()],
         )]);
 
@@ -3040,7 +3041,7 @@ mod tests {
             &[("latest", "1.0.0"), ("2", "2.0.0")],
         );
         let wanted = std::collections::BTreeMap::from([(
-            "demo-tool".to_string(),
+            crate::sandbox::inspect::mise_key("demo-tool"),
             vec!["2.0.0".to_string()],
         )]);
 
@@ -3135,21 +3136,27 @@ mod tests {
         .unwrap();
         for read in [mise_tool_specs, project_mise_tool_specs] {
             assert_eq!(
-                read(&at("config.toml")).unwrap().get("aqua-demo-keep"),
+                read(&at("config.toml"))
+                    .unwrap()
+                    .get(&crate::sandbox::inspect::mise_key("aqua-demo-keep")),
                 Some(&vec!["1.0.0".to_string()])
             );
         }
         // The one mise file of a project that is not TOML is read in its own format.
         std::fs::write(
             at(".tool-versions"),
-            "# pinned\nnode 20.1.0 18.0.0 # two\n\n",
+            "# pinned\nnode 20.1.0 18.0.0 # two\ngithub:vinhnx/VTCode 1.0.0\n\n",
         )
         .unwrap();
+        let specs = project_mise_tool_specs(&at(".tool-versions")).unwrap();
         assert_eq!(
-            project_mise_tool_specs(&at(".tool-versions"))
-                .unwrap()
-                .get("node"),
+            specs.get(&crate::sandbox::inspect::mise_key("node")),
             Some(&vec!["20.1.0".to_string(), "18.0.0".to_string()])
+        );
+        // Found under the directory mise installs it in, as the sweep looks it up.
+        assert_eq!(
+            specs.get(&crate::sandbox::inspect::mise_key("github-vinhnx-vt-code")),
+            Some(&vec!["1.0.0".to_string()])
         );
 
         std::fs::write(at("broken.toml"), "[tools\n").unwrap();

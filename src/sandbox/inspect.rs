@@ -12,12 +12,12 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// A mise tool present under a home's `installs/` dir, by its on-disk (munged) directory name and
-/// the version directories realized for it.
+/// A mise tool present under a home's `installs/` dir, by its on-disk directory name and the
+/// version directories realized for it.
 pub(crate) struct InstalledTool {
-    /// The directory name mise gives the tool under `installs/` — the *munged* form of its declared
-    /// token (see [`mise_munge`]), e.g. `aqua-example-demo-tool`. Sanitised on the way in, because
-    /// the cage writes this directory itself (see [`mise_installed_in`]).
+    /// The directory name mise gives the tool under `installs/`, derived from its declared token by
+    /// mise's own rule (see [`mise_key`]), e.g. `aqua-example-demo-tool`. Sanitised on the way in,
+    /// because the cage writes this directory itself (see [`mise_installed_in`]).
     ///
     /// For display and for matching only. Sanitising is not reversible — a name carrying a byte the
     /// filter drops or replaces no longer names the directory it came from — so anything that has
@@ -31,7 +31,7 @@ pub(crate) struct InstalledTool {
     pub(crate) dir_name: std::ffi::OsString,
     /// The real backend token mise recorded for this tool (`pipx:demo-agent`, `aqua:example/demo-tool`,
     /// …), read from its `.mise.backend.toml`. `None` when that metadata is absent. Preferred over
-    /// the munged directory name for display *and* for an exact match against a declared token, and
+    /// the directory name for display *and* for an exact match against a declared token, and
     /// sanitised for the same reason the name is.
     pub(crate) token: Option<String>,
     /// The version subdirectories realized for the tool, sanitised like the name. Includes mise's
@@ -41,30 +41,45 @@ pub(crate) struct InstalledTool {
 }
 
 impl InstalledTool {
-    /// The tool's real backend token when known, else its munged directory name — for display.
+    /// The tool's real backend token when known, else its directory name — for display.
     pub(crate) fn label(&self) -> &str {
         self.token.as_deref().unwrap_or(&self.name)
     }
 
     /// Whether this installed tool is the one a declared mise `locator` refers to. Prefers an exact
-    /// match on the recorded backend token; falls back to comparing the munged directory name when
-    /// the token metadata is absent.
+    /// match on the recorded backend token, and otherwise compares the directory name with the
+    /// locator by [`mise_key`].
     pub(crate) fn is(&self, locator: &str) -> bool {
-        self.token.as_deref() == Some(locator) || self.name == mise_munge(locator)
+        self.token.as_deref() == Some(locator) || mise_key(&self.name) == mise_key(locator)
     }
 }
 
 /// Map a declared mise locator to the directory name mise gives it under `installs/`: `:` and `/`
 /// become `-` and `@` is dropped, so `aqua:example/demo-tool` → `aqua-example-demo-tool`,
 /// `npm:@example/other-tool` → `npm-example-other-tool`, and a bare registry token like `bare-tool`
-/// is unchanged. Best-effort — it mirrors mise's observed naming so a declared package can be paired
-/// with its realized install; a miss only drops the pairing, never asserts a wrong state, because
-/// the installed list is read straight from disk regardless of this mapping.
+/// is unchanged. Best-effort: it follows mise's naming for a token without capitals only, since
+/// mise also splits and lowercases a word written in capitals (`github:vinhnx/VTCode` is installed
+/// as `github-vinhnx-vt-code`). An installed tool is therefore paired with a declaration by
+/// [`mise_key`], which both names reduce to, and never by this.
 pub(crate) fn mise_munge(locator: &str) -> String {
     locator
         .chars()
         .filter(|c| *c != '@')
         .map(|c| if c == ':' || c == '/' { '-' } else { c })
+        .collect()
+}
+
+/// The form a mise tool's directory name and a declared locator are compared in when no recorded
+/// token settles it: their letters and digits, lowercased. mise names a tool's directory from its
+/// token by a rule of its own, which [`mise_munge`] follows only for a token without capitals —
+/// `github:vinhnx/VTCode` is installed as `github-vinhnx-vt-code` — and the token and that
+/// directory name reduce to the same key either way. Two tools whose names differ only by
+/// separators and case share one, so a comparison on it can keep a tool it should not, never take
+/// for undeclared one that is declared.
+pub(crate) fn mise_key(name: &str) -> String {
+    name.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
         .collect()
 }
 
@@ -142,8 +157,8 @@ pub(crate) fn mise_installed_in(installs: &Path) -> Vec<InstalledTool> {
 /// The real backend token mise recorded for the tool installed at `tool_dir` — the `short` (or
 /// `full`) key of its `.mise.backend.toml` (`short = "pipx:demo-agent"`). This recovers the
 /// provider the munged directory name hides. Parsed as the TOML mise writes it in, so a literal
-/// string, an escape or a trailing comment reads as mise meant it: a token missed here is matched
-/// by its munged directory name alone, which is not always the name mise gave the directory. `None`
+/// string, an escape or a trailing comment reads as mise meant it: a token missed here leaves the
+/// directory name, compared by [`mise_key`], as all there is to match a declaration with. `None`
 /// when the metadata is absent or does not parse.
 fn backend_token(tool_dir: &Path) -> Option<String> {
     let body = read_cage_metadata(&tool_dir.join(".mise.backend.toml"))?;
@@ -1196,6 +1211,26 @@ mod tests {
             Some("aqua:BurntSushi/ripgrep"),
             "an empty `short` key"
         );
+    }
+
+    /// Each token and the directory mise installed it under, as found on disk, reduce to one key,
+    /// the tokens with capitals included.
+    #[test]
+    fn a_token_and_the_directory_mise_named_from_it_share_a_key() {
+        for (token, dir) in [
+            ("github:vinhnx/VTCode", "github-vinhnx-vt-code"),
+            (
+                "github:CortexLM/cortex-code",
+                "github-cortex-lm-cortex-code",
+            ),
+            ("github:Kilo-Org/kilocode", "github-kilo-org-kilocode"),
+            ("aqua:BurntSushi/ripgrep", "aqua-burnt-sushi-ripgrep"),
+            ("npm:@example/other-tool", "npm-example-other-tool"),
+            ("bare-tool", "bare-tool"),
+        ] {
+            assert_eq!(mise_key(token), mise_key(dir), "{token} / {dir}");
+        }
+        assert_ne!(mise_key("npm:other-tool"), mise_key("npm:other-tools"));
     }
 
     #[test]
