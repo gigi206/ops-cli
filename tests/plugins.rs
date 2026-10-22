@@ -878,6 +878,31 @@ fn a_plugin_edited_after_install_is_reported_by_every_inspection_path() {
     assert!(err.contains("no installed plugin named"), "{err}");
 }
 
+/// A plugins directory `verify` cannot read is said, rather than answered as nothing installed:
+/// the index every plugin verb builds on left an unreadable directory out without a word, and the
+/// report then covered nothing while reading as complete.
+#[test]
+fn verify_says_when_the_plugins_directory_cannot_be_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = TmpDir::new("plugins");
+    let plugins = home.path().join("sbx/plugins");
+    local_plugin(&plugins, "handmade", "hm");
+    std::fs::set_permissions(&plugins, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // The failure provoked is a directory this process may not read, which a process allowed past
+    // the mode never meets. The mode is restored before anything is asserted.
+    if std::fs::read_dir(&plugins).is_ok() {
+        std::fs::set_permissions(&plugins, std::fs::Permissions::from_mode(0o700)).unwrap();
+        skip_incapable!("skipping: this process reads a directory without a read bit");
+        return;
+    }
+    let (_code, out, err) = run_both(&["plugins", "verify"], home.path());
+    std::fs::set_permissions(&plugins, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        err.contains("cannot read") && err.contains("what is installed cannot be told"),
+        "the unreadable directory is said:\nstdout:\n{out}stderr:\n{err}"
+    );
+}
+
 #[test]
 fn a_scheme_claimed_twice_disables_every_claimant_until_one_remains() {
     let home = TmpDir::new("plugins");

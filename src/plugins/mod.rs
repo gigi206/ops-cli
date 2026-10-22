@@ -721,18 +721,48 @@ impl PluginRegistry {
         // can write its target. An install never places a link (it refuses one anywhere in the
         // tree), so a link to a directory here was placed by hand, and it is named rather than
         // followed. A link to anything else was never a plugin and is passed over as a file is.
-        let mut dirs: Vec<(PathBuf, bool)> = match std::fs::read_dir(plugins_dir) {
-            Ok(entries) => entries
-                .filter_map(Result::ok)
-                .filter_map(|e| {
-                    let ft = e.file_type().ok()?;
-                    let link = ft.is_symlink() && e.path().is_dir();
-                    (ft.is_dir() || link).then(|| (e.path(), link))
-                })
-                .collect(),
+        //
+        // What cannot be read is said rather than passed over: an unreadable directory or entry
+        // holds plugins this load does not see, and a silent inventory reads as none being there.
+        let entries = match std::fs::read_dir(plugins_dir) {
+            Ok(entries) => entries,
             // No plugins directory means no plugins — the common case, not an error.
-            Err(_) => return Self::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                warnings.push(format!(
+                    "plugins: cannot read {} ({e}) — no plugin is loaded from it",
+                    plugins_dir.display()
+                ));
+                return Self::default();
+            }
         };
+        let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    warnings.push(format!(
+                        "plugins: cannot read an entry of {} ({e}) — it is not loaded",
+                        plugins_dir.display()
+                    ));
+                    continue;
+                }
+            };
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(e) => {
+                    warnings.push(format!(
+                        "plugins: ignoring `{}` — its type cannot be read ({e})",
+                        entry.file_name().to_string_lossy()
+                    ));
+                    continue;
+                }
+            };
+            let link = ft.is_symlink() && entry.path().is_dir();
+            if ft.is_dir() || link {
+                dirs.push((entry.path(), link));
+            }
+        }
         // A stable order makes a collision's "both dropped" outcome deterministic and the
         // warnings reproducible.
         dirs.sort();
@@ -3273,6 +3303,41 @@ mod tests {
             warnings[0].contains("`linked`") && warnings[0].contains("symbolic link"),
             "the link is named, and why it is skipped: {warnings:?}"
         );
+    }
+
+    /// A plugins directory that cannot be read is said, not taken for an empty one: an absent
+    /// directory is the common case and stays quiet, while one this process may not list holds
+    /// plugins the load does not see, and a silent inventory reads as none being installed.
+    #[test]
+    fn an_unreadable_plugins_dir_warns_instead_of_reading_as_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::testutil::TmpDir::new();
+        let plugins = root.path().join("plugins");
+        write_plugin(
+            &plugins,
+            "kept",
+            "name=\"kept\"\ntype=\"resolver\"\nscheme=\"kept\"\nexec=\"run\"\n",
+        );
+        fs::set_permissions(&plugins, fs::Permissions::from_mode(0o000)).unwrap();
+        // The failure provoked is a directory this process may not read, which a process allowed
+        // past the mode never meets; the mode is restored before anything is asserted.
+        if fs::read_dir(&plugins).is_ok() {
+            fs::set_permissions(&plugins, fs::Permissions::from_mode(0o700)).unwrap();
+            skip_incapable!("skipping: this process reads a directory without a read bit");
+            return;
+        }
+        let (reg, warnings) = load(&plugins);
+        fs::set_permissions(&plugins, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(reg.resolver("kept").is_none());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("cannot read") && warnings[0].contains("no plugin is loaded"),
+            "the unreadable directory is said: {warnings:?}"
+        );
+
+        // The witness: an absent directory is the common case, and stays quiet.
+        let (_, quiet) = load(&root.path().join("absent"));
+        assert!(quiet.is_empty(), "{quiet:?}");
     }
 
     #[test]

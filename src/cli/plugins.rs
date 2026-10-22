@@ -203,7 +203,7 @@ impl Contested {
 
 impl InstalledIndex {
     /// Scan the plugins directory: the directory names (with their recorded origins), the schemes
-    /// the registry resolved, and the manifest names the scheme-less kinds claim.
+    /// the registry resolved, and the manifest names every kind claims.
     fn scan(layout: &store::Layout) -> Self {
         let mut warnings = Vec::new();
         let plugins_dir = layout.plugins_dir();
@@ -262,10 +262,41 @@ impl InstalledIndex {
 
         let mut by_name = std::collections::BTreeMap::new();
         let mut strays = std::collections::BTreeMap::new();
-        if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
-            for e in entries.flatten() {
-                let Ok(ft) = e.file_type() else {
-                    continue;
+        // What cannot be read is said rather than passed over: every answer built on this index —
+        // what a listing offers, what `upgrade` and `verify` go through — would otherwise leave an
+        // unreadable plugin out without a word, and `verify` would report on the rest alone.
+        let entries = match std::fs::read_dir(&plugins_dir) {
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                diag::warn(&format!(
+                    "plugins: cannot read {} ({e}) — what is installed cannot be told",
+                    plugins_dir.display()
+                ));
+                None
+            }
+        };
+        if let Some(entries) = entries {
+            for entry in entries {
+                let e = match entry {
+                    Ok(e) => e,
+                    Err(why) => {
+                        diag::warn(&format!(
+                            "plugins: cannot read an entry of {} ({why}) — it is left out",
+                            plugins_dir.display()
+                        ));
+                        continue;
+                    }
+                };
+                let ft = match e.file_type() {
+                    Ok(ft) => ft,
+                    Err(why) => {
+                        diag::warn(&format!(
+                            "plugins: `{}` is left out — its type cannot be read ({why})",
+                            e.file_name().to_string_lossy()
+                        ));
+                        continue;
+                    }
                 };
                 let Ok(name) = e.file_name().into_string() else {
                     continue;
