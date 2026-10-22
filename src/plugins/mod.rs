@@ -3479,6 +3479,15 @@ mod tests {
             }
         }
         assert!(admitted.is_empty(), "a `$` past the head: {admitted:#?}");
+        // The answer is the manifest's alone: with no `$HOME` to expand, the entry is still refused
+        // rather than dropped as an unset variable's would be.
+        let unset = expand_allow_path("allow_paths", "~/$X", &Expansion::default());
+        assert!(
+            unset
+                .as_ref()
+                .is_err_and(|why| why.contains("unsupported variable")),
+            "refused whatever the host sets: {unset:?}"
+        );
         // The witness: an expanded head with a plain tail still expands.
         assert_eq!(
             expand_allow_path("allow_paths", "~/.password-store", &exp),
