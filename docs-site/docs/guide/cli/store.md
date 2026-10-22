@@ -16,7 +16,10 @@ per-project runtime trees. This covers *everything*: including the **shared nix 
 the largest tree, which [`sbx gc`](gc) describes only in terms of what is *reclaimable*, never
 what is actually there.
 
-Read-only: a filesystem walk. No nix, no network, no sandbox, and nothing is reclaimed.
+All but read-only: a filesystem walk. No nix, no network, no sandbox, and nothing is reclaimed.
+The one write is a pair of small probe files, created in the data directory and removed again,
+which decides whether the sizes are exact or an upper bound
+([below](#how-the-sizes-are-counted)).
 
 See also: [`sbx gc`](gc) · [`sbx projects`](projects) · [`sbx app`](app) · [Directory layout](../concepts/directory-layout).
 
