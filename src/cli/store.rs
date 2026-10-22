@@ -143,7 +143,7 @@ pub(crate) fn store_cmd(args: &[OsString]) -> ExitCode {
         Ok(l) => l,
         Err(code) => return code,
     };
-    let mut view = match build(layout.data_dir(), &layout.store_dir()) {
+    let mut view = match build(layout.data_dir(), &layout.store_dir(), !shared) {
         Ok(v) => v,
         Err(e) => {
             diag::error(&format!(
@@ -188,19 +188,28 @@ pub(crate) fn store_cmd(args: &[OsString]) -> ExitCode {
 ///
 /// A data directory that does not exist yet is nothing provisioned. Any other failure to list it
 /// is returned: an empty report would say the same of a directory that may hold everything.
-fn build(data_dir: &Path, store_dir: &Path) -> std::io::Result<StoreView> {
+///
+/// With `sized` false the entries are listed, not walked, and every size is left at zero: `--shared`
+/// restates each of them from its extent walk ([`apply_extents`]), and a block walk before it would
+/// be thrown away.
+fn build(data_dir: &Path, store_dir: &Path, sized: bool) -> std::io::Result<StoreView> {
     let mut subtrees: Vec<SubtreeView> = match std::fs::read_dir(data_dir) {
         Ok(rd) => rd
             .flatten()
             .map(|e| {
                 let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 let name = e.file_name().to_string_lossy().into_owned();
-                let usage = sandbox::tree_usage(&e.path());
+                let (bytes, inodes) = if sized {
+                    let usage = sandbox::tree_usage(&e.path());
+                    (usage.bytes, usage.inodes)
+                } else {
+                    (0, 0)
+                };
                 SubtreeView {
                     label: if is_dir { format!("{name}/") } else { name },
-                    bytes: usage.bytes,
-                    size: sandbox::human_bytes(usage.bytes),
-                    inodes: usage.inodes,
+                    bytes,
+                    size: sandbox::human_bytes(bytes),
+                    inodes,
                     purpose: paths::data_entry_purpose(&e.file_name().to_string_lossy()),
                     exclusive_bytes: None,
                     path: e.path(),
@@ -565,7 +574,7 @@ mod tests {
         std::fs::create_dir_all(data.join("apps")).unwrap();
         std::fs::write(data.join("apps/blob"), vec![b'x'; 200_000]).unwrap();
 
-        let v = build(&data, &data.join("store")).unwrap();
+        let v = build(&data, &data.join("store"), true).unwrap();
 
         assert_eq!(v.subtrees.first().map(|t| t.label.as_str()), Some("apps/"));
         assert!(v.subtrees.iter().any(|t| t.label == "store/"));
@@ -704,6 +713,27 @@ mod tests {
         }
     }
 
+    /// Unsized, the report lists every entry without walking it: `--shared` restates each size from
+    /// its own extent walk, which a block walk beforehand would only duplicate.
+    #[test]
+    fn an_unsized_build_lists_every_entry_without_walking_it() {
+        let tmp = TmpDir::new();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("apps")).unwrap();
+        std::fs::write(data.join("apps/blob"), vec![b'x'; 200_000]).unwrap();
+        std::fs::write(data.join("nixpkgs.lock"), b"x").unwrap();
+
+        let v = build(&data, &data.join("store"), false).unwrap();
+
+        let rows: Vec<(&str, u64, u64)> = v
+            .subtrees
+            .iter()
+            .map(|t| (t.label.as_str(), t.bytes, t.inodes))
+            .collect();
+        assert_eq!(rows, vec![("apps/", 0, 0), ("nixpkgs.lock", 0, 0)]);
+        assert_eq!((v.bytes, v.inodes), (0, 0));
+    }
+
     /// `--shared` restates every size from the extent walk, so the header, the rows and the
     /// breakdown share one base, and ranks again by those sizes. The rows are matched to the walk's
     /// owners by position, which is the order the walk was handed them in.
@@ -814,7 +844,7 @@ mod tests {
         let data = tmp.path().join("empty");
         std::fs::create_dir_all(&data).unwrap();
 
-        let v = build(&data, &data.join("store")).unwrap();
+        let v = build(&data, &data.join("store"), true).unwrap();
 
         assert!(v.subtrees.is_empty());
         assert_eq!(v.bytes, 0);
@@ -831,7 +861,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TmpDir::new();
         let absent = tmp.path().join("absent");
-        let v = build(&absent, &absent.join("store")).expect("an absent directory is empty");
+        let v = build(&absent, &absent.join("store"), true).expect("an absent directory is empty");
         assert!(v.subtrees.is_empty());
 
         let data = tmp.path().join("data");
@@ -843,7 +873,7 @@ mod tests {
             skip_incapable!("running as root, which reads a directory its mode refuses");
             return;
         }
-        let built = build(&data, &data.join("store"));
+        let built = build(&data, &data.join("store"), true);
         mode(0o700).unwrap();
         let err = built
             .err()
