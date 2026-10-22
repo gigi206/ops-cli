@@ -450,6 +450,35 @@ fn a_path_rule_may_not_carry_an_encoded_fragment_or_parameter_delimiter() {
     assert!(classify("api.test/a%253Bb").is_ok());
 }
 
+/// A segment that decodes to `.` or `..` is resolved like the dots it spells, so a rule carrying
+/// one written encoded matches another path than the one it reads as: `host/a/%2e%2e/b` opened
+/// `/b` and printed back as a segment of its own. Refused, naming the path really opened. Dots
+/// written plainly say what they do and stay admitted, as does an encoded dot inside a longer
+/// segment, which resolves nothing.
+#[test]
+fn a_path_rule_may_not_carry_an_encoded_dot_segment() {
+    for (entry, opened) in [
+        ("api.test/a/%2e%2e/b", "`/b`"),
+        ("api.test/a/%2E%2E/b", "`/b`"),
+        ("api.test/a/.%2e/b", "`/b`"),
+        ("api.test/a/%2e/b", "`/a/b`"),
+    ] {
+        let e = classify(entry).unwrap_err();
+        assert!(
+            e.contains("encoded `.` or `..`") && e.contains(opened),
+            "the refusal names the encoding and the path really opened: {e}"
+        );
+    }
+    for admitted in [
+        "api.test/a/../b",
+        "api.test/a/./b",
+        "api.test/a%2eb",
+        "api.test/%2e%2ex",
+    ] {
+        assert!(classify(admitted).is_ok(), "{admitted}");
+    }
+}
+
 /// `canonical_segments` strips a `#fragment` and a segment's `;parameters` from a request's path,
 /// and from the rule's path with it, so a rule written with either matches the bare path while
 /// displaying a form that names something narrower — the operator reads a rule for one resource

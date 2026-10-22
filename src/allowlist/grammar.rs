@@ -774,6 +774,21 @@ fn parse_path_rule(
             ));
         }
     }
+    // A segment that decodes to `.` or `..` is resolved like the dots it spells, so
+    // `host/a/%2e%2e/b` matches `/b` while `sbx test net` prints it back as a segment of its own.
+    // Written plainly, the dots say what they do; encoded, they hide it, which is the widening the
+    // refusals above exist to prevent.
+    if path.split('/').any(|seg| {
+        let decoded = percent_decode(seg);
+        (decoded == "." || decoded == "..") && decoded != seg
+    }) {
+        let opened = opened_path(path);
+        return Err(format!(
+            "entry `{s}` writes an encoded `.` or `..` segment in a path rule — the path is \
+             decoded before it is resolved, so this matches `{opened}` while reading as a segment \
+             of its own. Write the path it opens"
+        ));
+    }
     let subtree = path.ends_with("/*");
     // A `*` anywhere but the trailing `/*` is a literal segment, and silently so: `deny =
     // ["api.test/*/secrets"]`, written to close that page for every organisation, matched only the
