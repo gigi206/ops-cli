@@ -222,21 +222,21 @@ fn build(data_dir: &Path, store_dir: &Path, sized: bool) -> std::io::Result<Stor
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
+    let walked = if sized {
+        usages(&entries.iter().map(|e| e.path()).collect::<Vec<_>>())
+    } else {
+        vec![sandbox::TreeUsage::default(); entries.len()]
+    };
     let mut subtrees = Vec::with_capacity(entries.len());
-    for e in &entries {
+    for (e, usage) in entries.iter().zip(walked) {
         let name = e.file_name();
         let name = name.to_string_lossy();
         let kind = e.file_type().ok();
         let is_dir = kind.is_some_and(|t| t.is_dir());
         let is_link = kind.is_some_and(|t| t.is_symlink());
         let purpose = paths::data_entry_purpose(&name);
-        let (bytes, inodes) = if sized {
-            let usage = sandbox::tree_usage(&e.path());
-            unreadable += usage.unreadable;
-            (usage.bytes, usage.inodes)
-        } else {
-            (0, 0)
-        };
+        let (bytes, inodes) = (usage.bytes, usage.inodes);
+        unreadable += usage.unreadable;
         subtrees.push(SubtreeView {
             label: match (is_dir, is_link) {
                 (true, _) => format!("{name}/"),
@@ -278,6 +278,54 @@ fn build(data_dir: &Path, store_dir: &Path, sized: bool) -> std::io::Result<Stor
         volume: None,
         extents: None,
     })
+}
+
+/// How many subtree walks run at once. Three subtrees carry nearly all the cost — the shared store,
+/// the app homes and the project trees — so more walks than that would contend for the disk while
+/// adding little.
+const WALKS: usize = 4;
+
+/// The usage of each of `paths`, in order, with up to [`WALKS`] walks running side by side.
+///
+/// The walks share nothing, each counting its own hardlinks as a call of [`sandbox::tree_usage`]
+/// does, so the largest subtrees walked together cost about the largest of them rather than their
+/// sum. This thread walks too, and takes whatever is left, all of it when no other thread could be
+/// started.
+fn usages(paths: &[PathBuf]) -> Vec<sandbox::TreeUsage> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let walk = || {
+        let mut done = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(path) = paths.get(i) else {
+                return done;
+            };
+            done.push((i, sandbox::tree_usage(path)));
+        }
+    };
+    let others = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(WALKS)
+        .saturating_sub(1);
+    let mut out = vec![sandbox::TreeUsage::default(); paths.len()];
+    std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..others)
+            .filter_map(|_| std::thread::Builder::new().spawn_scoped(scope, walk).ok())
+            .collect();
+        let mut done = walk();
+        for thread in threads {
+            done.extend(
+                thread
+                    .join()
+                    .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+            );
+        }
+        for (i, usage) in done {
+            out[i] = usage;
+        }
+    });
+    out
 }
 
 /// Restate the report from an extent walk whose owners are `view`'s subtrees, in order.
@@ -801,6 +849,28 @@ mod tests {
             inline_files: 1,
             inline_bytes: 56,
         }
+    }
+
+    /// The subtrees are walked side by side, and each row keeps its own subtree's figures: a walk
+    /// handed back under another index would put one subtree's size on another's row.
+    #[test]
+    fn subtrees_walked_side_by_side_keep_their_own_figures() {
+        let tmp = TmpDir::new();
+        let paths: Vec<PathBuf> = (0..7)
+            .map(|i| {
+                let dir = tmp.path().join(format!("t{i}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                for j in 0..=i {
+                    std::fs::write(dir.join(format!("f{j}")), vec![b'x'; 5_000 * (i + 1)]).unwrap();
+                }
+                dir
+            })
+            .collect();
+
+        let walked = usages(&paths);
+
+        let alone: Vec<_> = paths.iter().map(|p| sandbox::tree_usage(p)).collect();
+        assert_eq!(walked, alone);
     }
 
     /// Unsized, the report lists every entry without walking it: `--shared` restates each size from

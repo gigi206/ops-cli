@@ -168,10 +168,10 @@ pub(crate) use flake::{
     withheld as withheld_flake_packages,
 };
 pub(crate) use gc::{
-    InstalledApp, PrunedVersion, SIZE_CAVEAT, app_trees, classify_tree, drop_home_entries,
-    human_bytes, installed_app_homes, lock_app_projects, mise_tool_specs, project_mise_tool_specs,
-    prune_app_tools, prune_stale_versions, purge_app_homes, read_marker, reset_home, tree_size,
-    tree_usage, tree_usage_parts,
+    InstalledApp, PrunedVersion, SIZE_CAVEAT, TreeUsage, app_trees, classify_tree,
+    drop_home_entries, human_bytes, installed_app_homes, lock_app_projects, mise_tool_specs,
+    project_mise_tool_specs, prune_app_tools, prune_stale_versions, purge_app_homes, read_marker,
+    reset_home, tree_size, tree_usage, tree_usage_parts,
 };
 pub(crate) use launch::{
     Learned, RollMode, SessionHeader, app, attach, detach_log_path, distro_lock_path,
