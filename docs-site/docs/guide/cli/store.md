@@ -37,6 +37,10 @@ The trailing line describes the shared store in its own terms: how many store pa
 and how many files nix has deduplicated into its `.links` pool (identical content sharing a single
 inode).
 
+Before anything is provisioned the data directory may not exist yet, and the report says
+`(nothing provisioned yet)`. A data directory that exists but cannot be listed is an error
+(exit `1`), never an empty report.
+
 When sbx's data lives in a [storage volume](storage), a line under the header reports what the
 volume's **image really costs the host**: its actual on-disk size, after btrfs compression and
 block sharing:

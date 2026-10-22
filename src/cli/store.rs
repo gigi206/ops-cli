@@ -143,7 +143,16 @@ pub(crate) fn store_cmd(args: &[OsString]) -> ExitCode {
         Ok(l) => l,
         Err(code) => return code,
     };
-    let mut view = build(layout.data_dir(), &layout.store_dir());
+    let mut view = match build(layout.data_dir(), &layout.store_dir()) {
+        Ok(v) => v,
+        Err(e) => {
+            diag::error(&format!(
+                "sbx: store: cannot read {} ({e}), so what it holds cannot be measured.",
+                layout.data_dir().display()
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
     view.volume = volume_view();
     if shared {
         let owners: Vec<Vec<PathBuf>> =
@@ -176,7 +185,10 @@ pub(crate) fn store_cmd(args: &[OsString]) -> ExitCode {
 }
 
 /// Measure the data directory: every top-level entry, largest first.
-fn build(data_dir: &Path, store_dir: &Path) -> StoreView {
+///
+/// A data directory that does not exist yet is nothing provisioned. Any other failure to list it
+/// is returned: an empty report would say the same of a directory that may hold everything.
+fn build(data_dir: &Path, store_dir: &Path) -> std::io::Result<StoreView> {
     let mut subtrees: Vec<SubtreeView> = match std::fs::read_dir(data_dir) {
         Ok(rd) => rd
             .flatten()
@@ -195,13 +207,14 @@ fn build(data_dir: &Path, store_dir: &Path) -> StoreView {
                 }
             })
             .collect(),
-        Err(_) => Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
     };
     // Largest first: the point of the report is to show where the space went.
     subtrees.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.label.cmp(&b.label)));
 
     let bytes = subtrees.iter().map(|s| s.bytes).sum();
-    StoreView {
+    Ok(StoreView {
         data_dir: data_dir.display().to_string(),
         bytes,
         size: sandbox::human_bytes(bytes),
@@ -217,7 +230,7 @@ fn build(data_dir: &Path, store_dir: &Path) -> StoreView {
         // Filled in by the caller, which has the environment `build` deliberately does not touch.
         volume: None,
         extents: None,
-    }
+    })
 }
 
 /// Restate the report from an extent walk whose owners are `view`'s subtrees, in order.
@@ -552,7 +565,7 @@ mod tests {
         std::fs::create_dir_all(data.join("apps")).unwrap();
         std::fs::write(data.join("apps/blob"), vec![b'x'; 200_000]).unwrap();
 
-        let v = build(&data, &data.join("store"));
+        let v = build(&data, &data.join("store")).unwrap();
 
         assert_eq!(v.subtrees.first().map(|t| t.label.as_str()), Some("apps/"));
         assert!(v.subtrees.iter().any(|t| t.label == "store/"));
@@ -801,12 +814,40 @@ mod tests {
         let data = tmp.path().join("empty");
         std::fs::create_dir_all(&data).unwrap();
 
-        let v = build(&data, &data.join("store"));
+        let v = build(&data, &data.join("store")).unwrap();
 
         assert!(v.subtrees.is_empty());
         assert_eq!(v.bytes, 0);
         assert!(v.shared_store.is_none());
         let out = render(&v, &style::Palette::plain());
         assert!(out.contains("nothing provisioned yet"), "{out}");
+    }
+
+    /// A data directory that does not exist yet is nothing provisioned, and one that cannot be
+    /// listed is an error: an empty report would print "nothing provisioned yet" over a directory
+    /// that may hold everything.
+    #[test]
+    fn a_data_directory_that_cannot_be_listed_is_not_reported_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new();
+        let absent = tmp.path().join("absent");
+        let v = build(&absent, &absent.join("store")).expect("an absent directory is empty");
+        assert!(v.subtrees.is_empty());
+
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("apps")).unwrap();
+        let mode = |m| std::fs::set_permissions(&data, std::fs::Permissions::from_mode(m));
+        mode(0o000).unwrap();
+        if std::fs::read_dir(&data).is_ok() {
+            mode(0o700).unwrap();
+            skip_incapable!("running as root, which reads a directory its mode refuses");
+            return;
+        }
+        let built = build(&data, &data.join("store"));
+        mode(0o700).unwrap();
+        let err = built
+            .err()
+            .expect("an unlistable data directory is an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }
