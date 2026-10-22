@@ -2,8 +2,9 @@ use super::*;
 use crate::config::{Encoding, OutputDisposition, ParamBound, TaskParam, TaskSecret};
 use crate::testutil::{EnvVar, TmpDir, env_lock};
 
-/// The engine, wired to a real provisioned userland — or `None` to skip. `pool`, when given,
-/// points the engine at a task tool pool already realized on disk.
+/// The engine, wired to a real provisioned userland — or `None`, the skip recorded, as
+/// [`engine_on`] says. `pool`, when given, points the engine at a task tool pool already realized on
+/// disk.
 fn engine_with(
     project: &Path,
     pool: Option<&Path>,
@@ -20,7 +21,8 @@ fn engine_with(
     })
 }
 
-/// The engine, wired to a real provisioned userland — or `None` to skip.
+/// The engine, wired to a real provisioned userland — or `None`, the skip recorded, as
+/// [`engine_on`] says.
 ///
 /// `slug` has to be this test's alone. It names the cage, and from there the systemd scope
 /// (`sbx-<slug>-task<n>-<seq>-<pid>.scope`), the cage hostname, and the tool pool. A distinct
@@ -44,32 +46,57 @@ fn engine_for(
 /// [`engine_for`] against a declared distribution, so what the engine derives from is an agent cage
 /// whose root is an image rather than bubblewrap's own tmpfs. `distro` is the image locator; `None`
 /// is the hermetic userland.
+///
+/// `None` once the skip is recorded under `slug`, with the error it stopped on, and each reason
+/// keeps its own class. A host without bwrap, a capability-bearing user namespace or nix, and a
+/// base channel or userland that did not provision, are what `skip_incapable!` covers, so a host
+/// armed to be capable fails on them. A declared image that did not provision is skipped as
+/// unreachable, never enforced: what failed may be the registry. The cage's own assembly is sbx's
+/// code and nothing else, so its failure fails the test.
 fn engine_on(
     project: &Path,
     slug: &str,
     distro: Option<&str>,
     tasks: impl FnOnce(&str) -> Vec<TaskSpec>,
 ) -> Option<(TaskEngine, TmpDir)> {
-    let bwrap = crate::pathfind::find_on_path("bwrap")?;
-    if !matches!(crate::probe_userns(), crate::Userns::Ok) {
+    let (Some(bwrap), crate::Userns::Ok, Some(nix)) = (
+        crate::pathfind::find_on_path("bwrap"),
+        crate::probe_userns(),
+        crate::store::resolve_nix(None),
+    ) else {
+        skip_incapable!(
+            "skipping {slug}: need bwrap, a capability-bearing user namespace, and nix"
+        );
         return None;
-    }
-    let nix = crate::store::resolve_nix(None)?;
+    };
     let data = TmpDir::new();
     let layout = crate::store::Layout::under(data.path());
-    let nixpkgs = crate::store::LockTarget::global(&layout, None)
-        .resolve(&nix, &layout)
-        .ok()?;
-    let mut userland =
-        super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs).ok()?;
+    let nixpkgs = match crate::store::LockTarget::global(&layout, None).resolve(&nix, &layout) {
+        Ok(nixpkgs) => nixpkgs,
+        Err(e) => {
+            skip_incapable!("skipping {slug}: the base channel did not resolve: {e}");
+            return None;
+        }
+    };
+    let mut userland = match super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
+    {
+        Ok(userland) => userland,
+        Err(e) => {
+            skip_incapable!("skipping {slug}: the userland did not provision: {e}");
+            return None;
+        }
+    };
     if let Some(locator) = distro {
         let lock = data.path().join("distro.lock");
-        userland.distro = Some(
-            crate::sandbox::distro::store::provision(
-                &layout, &bwrap, locator, &lock, "smoke000", None, None,
-            )
-            .ok()?,
-        );
+        match crate::sandbox::distro::store::provision(
+            &layout, &bwrap, locator, &lock, "smoke000", None, None,
+        ) {
+            Ok(image) => userland.distro = Some(image),
+            Err(e) => {
+                skip_unreachable!("skipping {slug}: {locator} did not provision: {e}");
+                return None;
+            }
+        }
     }
     let tasks = tasks(userland.shell_bin.to_str().expect("a store path is ASCII"));
 
@@ -107,7 +134,7 @@ fn engine_on(
         false,
         vec![OsString::from("/bin/true")],
     )
-    .ok()?;
+    .unwrap_or_else(|e| panic!("the agent cage of {slug} assembles: {e}"));
     let engine = TaskEngine::from_cage(
         &bwrap,
         &cage,
@@ -193,7 +220,6 @@ fn a_declared_task_runs_in_a_sibling_cage_and_comes_back_substituted() {
     let Some((engine, _data)) = engine_for(project.path(), "smoke-declared", |shell| {
         vec![echo_task(shell)]
     }) else {
-        skip_incapable!("skipping task smoke: need bwrap, userns, nix, and a provisioned userland");
         return;
     };
 
@@ -272,9 +298,6 @@ fn a_withheld_streams_substitution_count_stays_host_side() {
         task.stderr = OutputDisposition::Show;
         vec![task]
     }) else {
-        skip_incapable!(
-            "skipping count smoke: need bwrap, userns, nix, and a provisioned userland"
-        );
         return;
     };
 
@@ -331,9 +354,6 @@ fn a_credential_in_a_refused_exec_path_is_substituted_by_the_real_supervisor() {
         task.spawn = Some(vec![]);
         vec![task]
     }) else {
-        skip_incapable!(
-            "skipping refusal smoke: need bwrap, userns, nix, and a provisioned userland"
-        );
         return;
     };
 
@@ -432,7 +452,6 @@ fn a_pool_tool_runs_by_name_and_its_pool_is_read_only() {
     let Some((engine, _data)) =
         engine_with(project.path(), Some(&pool), "smoke-pool", |_| vec![spec])
     else {
-        skip_incapable!("skipping task pool smoke: need bwrap, userns, and nix");
         return;
     };
     let outcome = engine
@@ -482,9 +501,6 @@ fn the_timeout_kills_a_hanging_task_and_the_cap_truncates_a_loud_one() {
         loud.max_output = 256;
         vec![hang, loud]
     }) else {
-        skip_incapable!(
-            "skipping task ceiling smoke: need bwrap, userns, nix, and a provisioned userland"
-        );
         return;
     };
 
@@ -537,8 +553,8 @@ fn the_timeout_kills_a_hanging_task_and_the_cap_truncates_a_loud_one() {
 /// only in the image, so a cage that kept the destinations and lost the root cannot run it at all,
 /// while one that quietly fell back to the hermetic base would answer with a different program.
 ///
-/// Skipped rather than failed where the registry does not answer: what the arm proves needs a real
-/// image, and an unreachable registry is not a verdict about the derivation.
+/// Skipped rather than failed where the image does not provision, as [`engine_on`] says: what the
+/// arm proves needs a real image, and an unreachable registry is not a verdict about the derivation.
 #[test]
 fn a_declared_task_runs_on_the_distribution_the_session_declared() {
     let project = TmpDir::new();
@@ -556,23 +572,12 @@ fn a_declared_task_runs_on_the_distribution_the_session_declared() {
     task.params = Vec::new();
     task.secrets = Vec::new();
 
-    // The two reasons this cannot run are not the same reason. A host with no cage is one this
-    // test was meant to run on and could not, which the capable-host run turns into a failure; a
-    // registry that did not answer is not a verdict about the derivation either way.
-    if crate::pathfind::find_on_path("bwrap").is_none()
-        || !matches!(crate::probe_userns(), crate::Userns::Ok)
-        || crate::store::resolve_nix(None).is_none()
-    {
-        skip_incapable!("skipping the distribution task smoke: need bwrap, userns, and nix");
-        return;
-    }
     let Some((engine, _data)) = engine_on(
         project.path(),
         "smoke-distro",
         Some("oci:docker.io/library/debian:10-slim"),
         |_| vec![task],
     ) else {
-        skip_unreachable!("skipping the distribution task smoke: the registry did not answer");
         return;
     };
 
@@ -615,9 +620,6 @@ fn an_output_task_writes_its_artifact_through_the_cage() {
         dump.output = true;
         vec![dump]
     }) else {
-        skip_incapable!(
-            "skipping task output smoke: need bwrap, userns, nix, and a provisioned userland"
-        );
         return;
     };
     let dump = engine.tasks()[0].clone();
@@ -667,9 +669,6 @@ fn a_networked_task_resolves_its_own_destination_and_leaves_no_file_behind() {
         lookup.network = vec![crate::allowlist::classify("tcp://db.smoke.test:15432").unwrap()];
         vec![lookup]
     }) else {
-        skip_incapable!(
-            "skipping networked task smoke: need bwrap, userns, nix, and a provisioned userland"
-        );
         return;
     };
 
