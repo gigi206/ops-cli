@@ -1647,6 +1647,37 @@ enum Placement {
     Replace,
 }
 
+/// Refuse a staged copy that does not declare what its source declared when it was checked: the
+/// name the install keys on (and places under), the type, and the scheme. Every refusal before the
+/// copy, a collision above all, was answered for the source's manifest, and a local source may be a
+/// project a cage writes while the copy runs, so a manifest rewritten in between would place a
+/// plugin none of them looked at. A store install is held to its digest on the copy as well; this
+/// is the check a local install has.
+fn same_identity(source: &Plugin, staged: &Plugin) -> Result<(), String> {
+    if source.name() == staged.name()
+        && source.type_token() == staged.type_token()
+        && source.scheme() == staged.scheme()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "the plugin's source changed during the install: it was checked as the {} `{}`{}, and its \
+         copy declares the {} `{}`{} — run it again",
+        source.type_token(),
+        source.name(),
+        source
+            .scheme()
+            .map(|s| format!(" (`{s}://`)"))
+            .unwrap_or_default(),
+        staged.type_token(),
+        staged.name(),
+        staged
+            .scheme()
+            .map(|s| format!(" (`{s}://`)"))
+            .unwrap_or_default(),
+    ))
+}
+
 /// The shared body of [`install`] and [`install_from_store`]. `expect` is `Some((name, scheme))`
 /// only for a store install, where the catalogue's advertised identity is reconciled against the
 /// manifest before anything is placed; a local-directory or built-in install passes `None`.
@@ -1839,11 +1870,14 @@ fn install_inner(
     // Created fresh rather than cleared first: the name is predictable, so whatever already sits
     // there is not this install's, and neither deleting it nor copying through it is. A refusal
     // here has created nothing, so it leaves nothing to clean up.
-    let stage = create_fresh_sibling(layout.data_dir(), || {
+    let staging = create_fresh_sibling(layout.data_dir(), || {
         format!(".plugin-stage-{}-{}", std::process::id(), unique())
     })?;
-    if let Err(e) = copy_into(source, &stage) {
-        let _ = std::fs::remove_dir_all(&stage);
+    // The copy lands under the name it is placed as, so it is read below exactly as the placed
+    // plugin will be: a manifest that declares no `name` is named after its directory.
+    let stage = staging.join(&name);
+    if let Err(e) = create_fresh_dir(&stage).and_then(|()| copy_into(source, &stage)) {
+        let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
     // A source tree carries whatever modes produced it — a `git clone` or a checkout under the
@@ -1852,19 +1886,21 @@ fn install_inner(
     // `0755`, everything else `0644`), whatever the source looked like. The distinction that
     // matters is preserved, and the strict check below runs on the result.
     if let Err(e) = canonicalize_modes(&stage) {
-        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
-    // The staged copy is the real artifact: validate it, not just the source.
+    // The staged copy is the real artifact: validate it, not just the source, and hold it to the
+    // identity every check above was run against.
     let staged_ok = load_one(&stage, &exp)
         .map_err(|e| format!("the staged plugin failed validation: {e}"))
         .and_then(|opt| opt.ok_or_else(|| "the staged plugin lost its manifest".to_string()))
         .and_then(|p| {
+            same_identity(&probe, &p)?;
             p.check_exec()
                 .map_err(|why| format!("the staged executable is {why}"))
         });
     if let Err(e) = staged_ok {
-        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
     // A store install is held to the catalogue's digest once more, on the staged copy, the bytes
@@ -1883,7 +1919,7 @@ fn install_inner(
             Err(e) => Some(format!("the staged plugin cannot be hashed: {e}")),
         };
         if let Some(refusal) = refusal {
-            let _ = std::fs::remove_dir_all(&stage);
+            let _ = std::fs::remove_dir_all(&staging);
             return Err(refusal);
         }
     }
@@ -1898,7 +1934,7 @@ fn install_inner(
                 .data_dir()
                 .join(format!(".plugin-old-{}-{}", std::process::id(), unique()));
         if let Err(e) = std::fs::rename(&dest, &aside) {
-            let _ = std::fs::remove_dir_all(&stage);
+            let _ = std::fs::remove_dir_all(&staging);
             return Err(format!("could not set the installed plugin aside: {e}"));
         }
         Some(aside)
@@ -1908,6 +1944,8 @@ fn install_inner(
 
     match std::fs::rename(&stage, &dest) {
         Ok(()) => {
+            // The staged tree has moved out, leaving its now empty parent.
+            let _ = std::fs::remove_dir(&staging);
             if let Some(aside) = &displaced {
                 let _ = std::fs::remove_dir_all(aside);
             }
@@ -1933,7 +1971,7 @@ fn install_inner(
             })
         }
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&stage);
+            let _ = std::fs::remove_dir_all(&staging);
             // Put the displaced plugin back before reporting: the caller asked for a newer tree,
             // not for the loss of the one they had.
             if let Some(aside) = &displaced {
@@ -4287,6 +4325,63 @@ mod tests {
             bottom.push("a");
         }
         assert_eq!(fs::read(bottom.join("bottom")).unwrap(), b"x");
+    }
+
+    /// The staged copy must declare the identity its source declared when every check ran: the
+    /// name, the type and the scheme. A local source may be written while it is copied, and a copy
+    /// that declares something else was never held to the collision checks. Each field is its own
+    /// shape, and the identical copy, the witness, passes.
+    #[test]
+    fn a_copy_declaring_another_identity_than_its_source_is_refused() {
+        let root = crate::testutil::TmpDir::new();
+        let exp = Expansion::default();
+        let loaded = |dir: &str, manifest: &str| {
+            write_plugin(root.path(), dir, manifest);
+            load_one(&root.path().join(dir), &exp)
+                .expect("a valid manifest")
+                .expect("a plugin")
+        };
+        let resolver = |name: &str, scheme: &str| {
+            format!("name=\"{name}\"\ntype=\"resolver\"\nscheme=\"{scheme}\"\nexec=\"run\"\n")
+        };
+        let source = loaded("source", &resolver("kp", "kp"));
+        assert_eq!(
+            same_identity(&source, &loaded("same", &resolver("kp", "kp"))),
+            Ok(())
+        );
+        let mut admitted = Vec::new();
+        for (shape, staged) in [
+            ("another name", loaded("renamed", &resolver("other", "kp"))),
+            (
+                "another scheme",
+                loaded("rescheme", &resolver("kp", "vault")),
+            ),
+            (
+                "another type",
+                loaded(
+                    "retyped",
+                    "name=\"kp\"\ntype=\"signer\"\nexec=\"run\"\n\
+                     [signer]\nsets_headers=[\"Authorization\"]\n",
+                ),
+            ),
+        ] {
+            match same_identity(&source, &staged) {
+                Err(why) if why.contains("changed during the install") => {}
+                other => admitted.push(format!("{shape}: {other:?}")),
+            }
+        }
+        // The type alone: a broker and a signer both claim no scheme, so only the type tells
+        // their copies apart.
+        let broker = loaded("broker", &broker_manifest("").replace("gpg-agent", "kp"));
+        let signer = loaded(
+            "signer",
+            "name=\"kp\"\ntype=\"signer\"\nexec=\"run\"\n[signer]\nsets_headers=[\"Authorization\"]\n",
+        );
+        match same_identity(&broker, &signer) {
+            Err(why) if why.contains("changed during the install") => {}
+            other => admitted.push(format!("another type alone: {other:?}")),
+        }
+        assert!(admitted.is_empty(), "a changed identity: {admitted:#?}");
     }
 
     /// A source root that is a link is refused rather than followed: the copy would otherwise take
