@@ -1836,14 +1836,12 @@ fn install_inner(
 
     // Stage into a temp sibling *outside* the plugins directory (so a concurrent `list` never scans
     // a half-built tree), re-validate what landed, then atomically place it.
-    let stage =
-        layout
-            .data_dir()
-            .join(format!(".plugin-stage-{}-{}", std::process::id(), unique()));
     // Created fresh rather than cleared first: the name is predictable, so whatever already sits
     // there is not this install's, and neither deleting it nor copying through it is. A refusal
     // here has created nothing, so it leaves nothing to clean up.
-    create_fresh_dir(&stage)?;
+    let stage = create_fresh_sibling(layout.data_dir(), || {
+        format!(".plugin-stage-{}-{}", std::process::id(), unique())
+    })?;
     if let Err(e) = copy_into(source, &stage) {
         let _ = std::fs::remove_dir_all(&stage);
         return Err(e);
@@ -2158,11 +2156,38 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
 /// is about to be made would carry the copy into its target; `mkdir` refuses any existing entry,
 /// a link among them, without following it.
 fn create_fresh_dir(dir: &Path) -> Result<(), String> {
+    make_fresh_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))
+}
+
+/// The `mkdir` behind [`create_fresh_dir`], with the error kept whole for a caller that tells a
+/// name already taken apart from a failure.
+fn make_fresh_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))
+    std::fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
+/// A fresh directory under `parent`, named by `name`: a name already taken is passed over for the
+/// next one, a bounded number of times, as `mkdtemp` does. An operation that was interrupted leaves
+/// its tree behind under its pid, nothing sweeps it, and a later process may be given that pid and
+/// reach the same counter, so the first name alone would turn a leftover into a refusal with no way
+/// out. Whatever sits under a taken name is left as it is.
+fn create_fresh_sibling(
+    parent: &Path,
+    mut name: impl FnMut() -> String,
+) -> Result<PathBuf, String> {
+    const TRIES: usize = 16;
+    for _ in 0..TRIES {
+        let dir = parent.join(name());
+        match make_fresh_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("cannot create {}: {e}", dir.display())),
+        }
+    }
+    Err(format!(
+        "cannot create a staging directory under {}: the {TRIES} names tried are all taken",
+        parent.display()
+    ))
 }
 
 /// Recursively copy a plugin source tree into the directory `dst`, which [`create_fresh_dir`] has
@@ -4080,6 +4105,31 @@ mod tests {
         let fresh = data.path().join("fresh-stage");
         copy_tree(&source, &fresh).expect("a fresh destination receives the tree");
         assert!(fresh.join("plugin.toml").is_file() && fresh.join("resolve").is_file());
+    }
+
+    /// A staging name already taken is passed over for the next, so a tree an interrupted install
+    /// left behind, under a pid a later process is given, does not turn into a refusal with no way
+    /// out; what sits under the taken name, a link here, is left as it was. When every name tried
+    /// is taken, the refusal says so.
+    #[test]
+    fn a_taken_staging_name_is_passed_over_for_the_next() {
+        let data = crate::testutil::TmpDir::new();
+        let elsewhere = crate::testutil::TmpDir::new();
+        std::os::unix::fs::symlink(elsewhere.path(), data.path().join("taken")).unwrap();
+        let mut names = ["taken", "taken", "free"].into_iter();
+        let dir = create_fresh_sibling(data.path(), || names.next().unwrap().to_string())
+            .expect("a free name is found");
+        assert_eq!(dir, data.path().join("free"));
+        assert!(dir.is_dir() && !dir.is_symlink());
+        assert!(
+            fs::symlink_metadata(data.path().join("taken")).is_ok_and(|m| m.is_symlink()),
+            "the taken name is left as it was"
+        );
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+
+        let why = create_fresh_sibling(data.path(), || "taken".to_string())
+            .expect_err("every name taken");
+        assert!(why.contains("all taken"), "{why}");
     }
 
     #[test]
