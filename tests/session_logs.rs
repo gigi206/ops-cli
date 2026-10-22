@@ -124,7 +124,15 @@ fn each_reading_prints_exactly_what_it_names() {
     // does not hold is a name that names nothing.
     let o = sbx_in(data.0.path(), &["session", "logs", "9999"]);
     assert_eq!(o.status.code(), Some(2), "{}", err(&o));
-    assert!(err(&o).contains("no log for session 9999"), "{}", err(&o));
+    assert_eq!(
+        err(&o),
+        format!(
+            "sbx: no log for session 9999 ({}).\n       `sbx session ls` lists the live sessions and \
+             whether each one is detached.\n",
+            data.log(9999).display()
+        ),
+        "the refusal names the log it looked for and where the live sessions are listed"
+    );
     assert!(out(&o).is_empty());
 }
 
