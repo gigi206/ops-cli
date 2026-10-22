@@ -1128,6 +1128,76 @@ fn prune_stale_leaves_a_pool_alone_when_a_file_that_says_what_to_keep_is_refused
     );
 }
 
+/// A pool the sweep keeps for a neighbour: `apps_share_install_pools` lets another app of the
+/// project resolve a tool out of this pool, and the app that depends on that most is one that never
+/// installed anything itself, whose own pool holds no `installs` at all — most pools a launch
+/// leaves hold only mise's `plugins`. What that neighbour's activation asks for is kept.
+#[test]
+fn prune_stale_keeps_what_a_neighbour_with_nothing_installed_asks_for() {
+    let fx = fixture_with_a_leftover();
+    fx.write_home_mise_config("demo-app", "[tools]\n\"aqua:demo/keep\" = \"2.0.0\"\n");
+    fx.install_pool_tool("demo-app", "testproj", "aqua-demo-keep", "1.0.0");
+    let marker = fx.data_home.path().join("sbx/projects/testproj/project");
+    std::fs::write(&marker, fx.proj.path().as_os_str().as_bytes()).unwrap();
+    // The neighbour ran in the project and installed nothing of its own there.
+    std::fs::create_dir_all(
+        fx.data_home
+            .path()
+            .join("sbx/projects/testproj/apps/other-app/mise/plugins"),
+    )
+    .unwrap();
+    fx.write_home_mise_config("other-app", "[tools]\n\"aqua:demo/keep\" = \"1.0.0\"\n");
+
+    let out = fx.run(&["app", "prune", "demo-app", "--stale", "--yes"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        fx.data_home
+            .path()
+            .join("sbx/projects/testproj/apps/demo-app/mise/installs/aqua-demo-keep/1.0.0")
+            .exists(),
+        "the version the neighbour asks for was deleted: {}",
+        text(&out)
+    );
+}
+
+/// The project's apps are listed to find those neighbours. A listing that cannot be read leaves the
+/// pool alone and says so: read as no neighbours, it would delete what one of them asks to keep.
+#[test]
+fn prune_stale_leaves_a_pool_alone_when_the_projects_apps_cannot_be_listed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fx = fixture_with_a_leftover();
+    fx.write_home_mise_config("demo-app", "[tools]\n\"aqua:demo/keep\" = \"2.0.0\"\n");
+    fx.install_pool_tool("demo-app", "testproj", "aqua-demo-keep", "1.0.0");
+    fx.install_pool_tool("other-app", "testproj", "aqua-demo-keep", "1.0.0");
+    let marker = fx.data_home.path().join("sbx/projects/testproj/project");
+    std::fs::write(&marker, fx.proj.path().as_os_str().as_bytes()).unwrap();
+    fx.write_home_mise_config("other-app", "[tools]\n\"aqua:demo/keep\" = \"1.0.0\"\n");
+    // Searchable, so each app's pool is still reached by its name, but not readable.
+    let apps = fx.data_home.path().join("sbx/projects/testproj/apps");
+    let mode = |m| std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(m));
+    mode(0o300).unwrap();
+    if std::fs::read_dir(&apps).is_ok() {
+        mode(0o700).unwrap();
+        skip_incapable!("running as root, which reads a directory its mode refuses");
+        return;
+    }
+    let out = fx.run(&["app", "prune", "demo-app", "--stale", "--yes"]);
+    mode(0o700).unwrap();
+
+    assert!(
+        apps.join("demo-app/mise/installs/aqua-demo-keep/1.0.0")
+            .exists(),
+        "the version a neighbour asks for was deleted: {}",
+        text(&out)
+    );
+    assert!(!out.status.success(), "a sweep left undone is a failure");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("cannot read") && err.contains("left alone"),
+        "the note must name the listing and what was not done: {err}"
+    );
+}
+
 /// The home's activation is the cage's to replace, with a FIFO among other things. `--stale` and
 /// the tool sweep both read it; neither waits on it, and the pool is left alone.
 #[test]

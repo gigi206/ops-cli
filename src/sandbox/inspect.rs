@@ -377,7 +377,9 @@ pub(crate) fn project_mise_pools(
     except: &str,
 ) -> Vec<(String, PathBuf)> {
     let apps = data_dir.join("projects").join(project_id).join("apps");
-    project_mise_neighbours(data_dir, project_id, except)
+    // A listing that cannot be read shares nothing, and the asking app installs its own copy.
+    project_apps(data_dir, project_id, except)
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|name| {
             let pool = Path::new(&name).join("mise");
@@ -387,36 +389,43 @@ pub(crate) fn project_mise_pools(
         .collect()
 }
 
-/// The other apps of `project_id` whose mise pool holds an `installs` entry, of whatever kind,
-/// sorted by name: the apps [`project_mise_pools`] considers before it checks what each entry is.
+/// The other apps of `project_id`, one per directory under the project's `apps`, sorted by name:
+/// every app that has run in the project, whatever its pool holds. [`project_mise_pools`] keeps
+/// those whose pool it can share.
 ///
-/// `sbx app prune` asks this rather than the checked list, because it reads a neighbour's
-/// activations and never its pool: a neighbour whose pool is refused as a bind source still
-/// resolves out of the pool being swept, so what it asks for is still kept.
-pub(crate) fn project_mise_neighbours(
+/// `sbx app prune --stale` reads each one's activations to keep what it asks for, since
+/// `apps_share_install_pools` lets one app resolve a tool out of another's pool. The app that relies
+/// on that most is one that never installed anything itself, and whose pool therefore holds no
+/// `installs`, so none is left out for what its pool holds. A listing that cannot be read whole is an
+/// error naming the directory rather than a shorter list: a neighbour missing from it is a version
+/// the sweep would delete from under it. No `apps` directory is no apps.
+///
+/// The names here were written by launches, which validate them, so the name check is for the
+/// directory nobody's launch created: [`project_mise_pools`]'s list is joined with `:`, and a name
+/// carrying one would cut a path in half rather than be rejected.
+pub(crate) fn project_apps(
     data_dir: &Path,
     project_id: &str,
     except: &str,
-) -> Vec<String> {
-    let mut names = Vec::new();
+) -> io::Result<Vec<String>> {
     let apps = data_dir.join("projects").join(project_id).join("apps");
-    let Ok(entries) = std::fs::read_dir(&apps) else {
-        return names;
+    let unread =
+        |e: io::Error| io::Error::new(e.kind(), format!("cannot read {}: {e}", apps.display()));
+    let entries = match std::fs::read_dir(&apps) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(unread(e)),
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // The names here were written by launches, which validate them, so this filter is for the
-        // directory nobody's launch created: the list these become is joined with `:`, and a name
-        // carrying one would cut a path in half rather than be rejected.
-        if name == except || !crate::config::is_valid_app_name(&name) {
-            continue;
-        }
-        if std::fs::symlink_metadata(entry.path().join("mise").join("installs")).is_ok() {
-            names.push(name);
+    let mut names = Vec::new();
+    for entry in entries {
+        let name = entry.map_err(unread)?.file_name();
+        let name = name.to_string_lossy();
+        if name != except && crate::config::is_valid_app_name(&name) {
+            names.push(name.into_owned());
         }
     }
     names.sort();
-    names
+    Ok(names)
 }
 
 /// Which project trees pin `locator` in `lockfile` — the realized-where signal for a `deb:`,
@@ -1219,8 +1228,26 @@ mod tests {
         // while the sweep, which reads each neighbour's activations and never its pool, still
         // counts every one of them: a pool refused here is not a neighbour that stopped resolving
         assert_eq!(
-            project_mise_neighbours(data, "p1", "asker"),
+            project_apps(data, "p1", "asker").unwrap(),
             ["linked", "real", "relinked"]
+        );
+    }
+
+    /// A directory no launch could have named is not an app of the project: its name carries the
+    /// `:` that separates the pools a cage is given, and would cut that list in two.
+    #[test]
+    fn a_directory_no_launch_named_is_not_an_app() {
+        let scratch = crate::testutil::TmpDir::new();
+        let data = scratch.path();
+        let apps = data.join("projects/p1/apps");
+        for name in ["real", "cut:in-two"] {
+            std::fs::create_dir_all(apps.join(name).join("mise/installs/nix-jq/1.8.1")).unwrap();
+        }
+        assert_eq!(project_apps(data, "p1", "asker").unwrap(), ["real"]);
+        let pools = project_mise_pools(data, "p1", "asker");
+        assert_eq!(
+            pools.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["real"]
         );
     }
 

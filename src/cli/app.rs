@@ -2780,11 +2780,9 @@ fn app_prune(args: &[OsString]) -> ExitCode {
                 // resolves from this pool, so the widening only ever keeps a version, and keeping
                 // one is this sweep's stated bias (see `prune_stale_versions`, which leaves a tool
                 // with no spec entirely alone).
-                for neighbour in sandbox::inspect::project_mise_neighbours(
-                    layout.data_dir(),
-                    &pool.project_id,
-                    app_name,
-                ) {
+                for neighbour in
+                    sandbox::inspect::project_apps(layout.data_dir(), &pool.project_id, app_name)?
+                {
                     for (tool, versions) in sandbox::mise_tool_specs(&activation_of(&neighbour))? {
                         specs.entry(tool).or_default().extend(versions);
                     }
