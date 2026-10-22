@@ -327,9 +327,9 @@ fn view_with_roots(
     state_root: Option<PathBuf>,
 ) -> PathView {
     // The live project ids — the set a running session holds — for the data base's per-project
-    // liveness annotation. Computed once from the session registry at the data root (the same
-    // self-healing housekeep `sbx session ls` runs); empty when there is no data root or no sessions. Only
-    // the data base's `projects/` entry consumes it; config and state ignore it.
+    // liveness annotation. Computed once from the session registry at the data root, asked without
+    // reclaiming anything; empty when there is no data root or no sessions. Only the data base's
+    // `projects/` entry consumes it; config and state ignore it.
     let live_ids: Option<BTreeSet<String>> = data_root.as_ref().and_then(|d| live_project_ids(d));
     // The project id of the current working directory, so the matching tree (if any) is marked
     // `current` in the render — the answer to "which of these am I in right now?". `None` when the
@@ -374,17 +374,17 @@ fn view_with_roots(
     }
 }
 
-/// The set of project ids a running session holds, for the per-project `live` annotation. Reads
-/// the session registry and prunes dead records (the same self-healing `sbx session ls` performs — a
-/// benign side effect, not a violation of `sbx path`'s read-only stance, which is about no
-/// sandbox launch / no trust gate / no network, not no filesystem housekeeping). Each live
+/// The set of project ids a running session holds, for the per-project `live` annotation. Asks
+/// the session registry without touching it ([`session::Registry::live`]): reclaiming a dead
+/// session's record belongs to the verbs that mean it (`sbx session ls`, `stop`, `gc`), and the
+/// count `sbx gc` reports is only true of gc when no reader has done its work first. Each live
 /// session's recorded canonical path is hashed the way [`sandbox::project_id`] hashes a launch's
 /// cwd, so the id matches the runtime tree's directory name.
 ///
 /// `None` when the registry could not be read at all, which is not the same answer as an empty set:
 /// a tree whose liveness nothing established is reported `unknown`, never `idle`.
 fn live_project_ids(data_dir: &Path) -> Option<BTreeSet<String>> {
-    let (live, _) = session::Registry::at(data_dir).housekeep().ok()?;
+    let live = session::Registry::at(data_dir).live().ok()?;
     Some(
         live.iter()
             .map(|s| sandbox::project_id(&s.project))
@@ -893,6 +893,32 @@ mod tests {
         assert!(s.contains("    p2"), "p2 indented: {s}");
         // Sorted: p1 before p2.
         assert!(s.find("    p1") < s.find("    p2"), "sorted: {s}");
+    }
+
+    /// `sbx path` asks the session registry which projects a live session holds, and leaves it as
+    /// it found it: reclaiming a dead session's record belongs to the verbs that mean it (`sbx
+    /// session ls`, `stop`, `gc`), and the count `sbx gc` reports is only true of gc if no reader
+    /// did it first.
+    #[test]
+    fn the_overview_asks_the_registry_and_reclaims_nothing() {
+        let dir = TmpDir::new();
+        let dead = session::Session {
+            project: PathBuf::from("/work/gone"),
+            // Above the kernel's pid ceiling: no process can hold it.
+            pid: 1 << 30,
+            start_ticks: 1,
+            kind: session::Kind::Run,
+            runtime: session::SessionRuntime::Project,
+            detached: false,
+        };
+        let record = session::Registry::at(dir.path())
+            .register(&dead)
+            .expect("register a dead session");
+        assert_eq!(live_project_ids(dir.path()), Some(BTreeSet::new()));
+        assert!(
+            record.exists(),
+            "the dead record is left for a verb that reclaims"
+        );
     }
 
     /// A profile child is shown by app name (`.toml` stripped), not by filename.
