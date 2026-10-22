@@ -198,9 +198,11 @@ pub(super) fn auto_equip_tokens(cfg: &crate::config::Resolved) -> Vec<String> {
 /// a roll with no newer upstream release does nothing, and the app no longer starts. So each
 /// installed version whose `bin/python` link dangles is reinstalled with `mise install --force` at
 /// the same version, in the same data dir the equip uses, with a notice naming the tool. Only the
-/// tokens handed in here are repaired, never a directory the cage created on its own; the version
-/// alias links mise keeps beside the real directories are skipped; and the check is bash tests and
-/// globs only, so a launch where nothing is broken runs no extra process.
+/// tokens handed in here are repaired: an install directory is examined when its name reduces to a
+/// handed token's [`mise_key`](crate::sandbox::inspect::mise_key), since mise splits and lowercases
+/// a word in capitals and the name cannot be spelled from the token. The version alias links mise
+/// keeps beside the real directories are skipped, and the check is bash tests and globs only, so a
+/// launch where nothing is broken runs no extra process.
 ///
 /// The version is the one value the cage chooses: it is the name of a directory in the cage's
 /// writable pool, and it reaches both mise's version spec and the launching terminal, where mise
@@ -221,8 +223,9 @@ pub(super) fn wrap_mise_equip(
         None => String::new(),
     };
     let mise = shell_quote(&mise.to_string_lossy());
-    // `(locator, install directory, display name)` per `pipx:` token. The directory name is
-    // derived from the token here, never read back from the cage, and all three ride `"$@"`.
+    // `(locator, key, display name)` per `pipx:` token, all three riding `"$@"`. The key is the
+    // token's `mise_key`, which the directory mise installs it under reduces to as well: mise splits
+    // and lowercases a word in capitals, so that directory's name cannot be derived from the token.
     let repairs: Vec<[String; 3]> = tokens
         .iter()
         .filter_map(|token| {
@@ -230,7 +233,7 @@ pub(super) fn wrap_mise_equip(
             locator.starts_with("pipx:").then(|| {
                 [
                     locator.to_string(),
-                    crate::sandbox::inspect::mise_munge(locator),
+                    crate::sandbox::inspect::mise_key(locator),
                     crate::sandbox::sanitize(locator),
                 ]
             })
@@ -248,8 +251,10 @@ pub(super) fn wrap_mise_equip(
             "d={data_dir}\n\
              a=$(({n} + 1)); k={m}\n\
              while [ \"$k\" -gt 0 ]; do\n\
-             loc=\"${{!a}}\"; b=$((a + 1)); dir=\"${{!b}}\"; c=$((a + 2)); shown=\"${{!c}}\"\n\
-             for v in \"$d/installs/$dir\"/*; do\n\
+             loc=\"${{!a}}\"; b=$((a + 1)); key=\"${{!b}}\"; c=$((a + 2)); shown=\"${{!c}}\"\n\
+             for t in \"$d\"/installs/*; do\n\
+             n=\"${{t##*/}}\"; n=\"${{n//[!0-9A-Za-z]/}}\"; [ \"${{n,,}}\" = \"$key\" ] || continue\n\
+             for v in \"$t\"/*; do\n\
              [ -d \"$v\" ] && [ ! -L \"$v\" ] || continue\n\
              case \"${{v##*/}}\" in ''|*[!0-9A-Za-z._+-]*) continue;; esac\n\
              for py in \"$v\"/*/bin/python; do\n\
@@ -258,6 +263,7 @@ pub(super) fn wrap_mise_equip(
              {data_dir_prefix}{mise} install --force \"$loc@${{v##*/}}\" 1>&2\n\
              break\n\
              fi\n\
+             done\n\
              done\n\
              done\n\
              a=$((a + 3)); k=$((k - 1))\n\
@@ -272,7 +278,7 @@ pub(super) fn wrap_mise_equip(
         bash.as_os_str().to_os_string(),
         OsString::from("-c"),
         OsString::from(script),
-        // `$0` — a label; the tokens are `$1..$n`, then one `(locator, directory, display name)`
+        // `$0` — a label; the tokens are `$1..$n`, then one `(locator, key, display name)`
         // triple per repaired `pipx:` token; the command is what remains after `shift`.
         OsString::from("sbx-mise-equip"),
     ];

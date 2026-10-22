@@ -406,6 +406,58 @@ fn running_the_equip_script_reinstalls_a_pipx_tool_whose_python_is_gone() {
     }
 }
 
+/// mise names a tool's directory by its own rule, which splits and lowercases a token's capitals:
+/// a `pipx:` token written with them is installed under a name the token does not spell. Its broken
+/// install is found and repaired all the same.
+#[test]
+fn running_the_equip_script_repairs_a_pipx_tool_whose_directory_mise_named_from_capitals() {
+    let bash = std::path::PathBuf::from("/bin/bash");
+    if !bash.is_file() {
+        skip_incapable!("skipping equip-script run: no /bin/bash on this host");
+        return;
+    }
+    let dir = crate::testutil::TmpDir::new();
+    argv_recording_stub(&dir.path().join("mise"));
+    let pool = dir.path().join("pool");
+    // The second keeps its capitals, as a directory named before mise lowercased them would.
+    for install in ["pipx-broken-caps/2.0", "pipx-Kept-Caps/1.0"] {
+        let bin = pool.join("installs").join(install).join("env/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(
+            "/nix/store/00000000000000000000000000000000-python3/bin/python",
+            bin.join("python"),
+        )
+        .unwrap();
+    }
+    let record = dir.path().join("record");
+    let argv = wrap_mise_equip(
+        Path::new("./mise"),
+        &bash,
+        "use -g --pin",
+        &["pipx:Broken-Caps".to_string(), "pipx:Kept-Caps".to_string()],
+        None,
+        vec![OsString::from("true")],
+    );
+    let out = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(dir.path())
+        .env("SBX_TEST_RECORD", &record)
+        .env("MISE_DATA_DIR", &pool)
+        .output()
+        .expect("run the generated equip script");
+    assert!(
+        out.status.success(),
+        "the equip script failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&record).expect("the stub recorded its calls"),
+        "mise install --force pipx:Broken-Caps@2.0\n\
+         mise install --force pipx:Kept-Caps@1.0\n\
+         mise use -g --pin pipx:Broken-Caps pipx:Kept-Caps\n"
+    );
+}
+
 #[test]
 fn mise_upgrade_cmd_pins_the_app_global_pool_only_for_a_global_app() {
     // `sbx upgrade mise` rolls `[packages] mise:` tools, which for a global app live in the
