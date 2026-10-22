@@ -60,6 +60,9 @@ const HEAD_OLD: &str = "=== sbx session 4242 started=1699999000 ===\n";
 const HEAD_NEW: &str = "=== sbx session 4242 started=1700000100 ===\n";
 const OLD_BODY: &str = "old-1\nold-2\n";
 const NEW_BODY: &str = "new-1\nnew-2\nnew-3\n";
+/// The note a reading of that log prints: the state, and the day `HEAD_NEW` names. The date is
+/// rendered in UTC, so it does not move with the zone the test runs in.
+const NOTE: &str = "sbx: note: session 4242 — exited, started 2023-11-14";
 
 fn two_sessions(data: &Data) -> String {
     let whole = format!("{HEAD_OLD}{OLD_BODY}{HEAD_NEW}{NEW_BODY}");
@@ -77,15 +80,16 @@ fn each_reading_prints_exactly_what_it_names() {
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(out(&o), NEW_BODY, "the default reading is the last session");
     assert!(
-        err(&o).contains("exited") && !err(&o).contains("started ?"),
-        "the note must name the state and the date: {}",
+        err(&o).lines().any(|l| l == NOTE),
+        "the note must name the state and the last session's date: {}",
         err(&o)
     );
 
-    // A line limit counts inside that session.
+    // A line limit counts inside that session, under the same note.
     let o = sbx_in(data.0.path(), &["session", "logs", "4242", "-n", "2"]);
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(out(&o), "new-2\nnew-3\n");
+    assert!(err(&o).lines().any(|l| l == NOTE), "{}", err(&o));
 
     // `--all` is every byte in the file, headers included.
     let o = sbx_in(data.0.path(), &["session", "logs", "4242", "--all"]);
