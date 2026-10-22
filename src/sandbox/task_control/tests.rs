@@ -1101,9 +1101,10 @@ fn eventually<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
 /// The double has no pid namespace and no `--die-with-parent`: the stop kills bash, and the command
 /// bash started runs on, holding the capture pipes, until it ends. When that outlasts the plane's
 /// grace, the plane answers `Stopping`, its honest answer for an invocation that has not ended yet,
-/// and the invocation leaves once the command does. A real cage carries `--die-with-parent`, so the
-/// kill takes the whole cage down there. Either answer is a stop that landed once the invocation is
-/// gone; anything else fails with `why`.
+/// and the invocation leaves once the command does. A real cage runs in a pid namespace of its own,
+/// whose init `--die-with-parent` takes down with bwrap, and the kernel then ends every process in
+/// it. Either answer is a stop that landed once the invocation is gone; anything else fails with
+/// `why`.
 #[track_caller]
 fn stop_and_wait_out(host: &Path, id: u64, why: &str) {
     match stop_invocation(host, id).expect("stop") {
