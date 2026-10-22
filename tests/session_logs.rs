@@ -204,6 +204,15 @@ fn a_session_past_the_window_reads_the_same_and_still_names_its_date() {
     for i in 0..20_000 {
         whole.push_str(&format!("chatty line {i}\n"));
     }
+    // Past one read chunk and inside the window: the first window, sized by the line limit, then
+    // holds the two lines and not the header, which is the shape under test. A smaller fixture
+    // reaches the header in that window and passes without testing anything. The two sizes are
+    // `LOG_CHUNK` and `TAIL_WINDOW_MAX` in `src/cli/session.rs`, out of an integration test's reach.
+    assert!(
+        whole.len() > 64 * 1024 && whole.len() < 8 * 1024 * 1024,
+        "the fixture must sit past one 64 KiB read chunk and inside the 8 MiB window: {} bytes",
+        whole.len()
+    );
     std::fs::write(data.log(4242), &whole).expect("write the log");
 
     let o = sbx_in(data.0.path(), &["session", "logs", "4242", "-n", "2"]);
