@@ -41,6 +41,10 @@ Before anything is provisioned the data directory may not exist yet, and the rep
 `(nothing provisioned yet)`. A data directory that exists but cannot be listed is an error
 (exit `1`), never an empty report.
 
+An entry that is a symbolic link, such as a store moved to another disk and linked back, is shown
+with a trailing `@` and what it points at. It is sized as the link: its target is not followed, so
+nothing under it is counted. `--json` carries the target as `link_target`.
+
 When sbx's data lives in a [storage volume](storage), a line under the header reports what the
 volume's **image really costs the host**: its actual on-disk size, after btrfs compression and
 block sharing:

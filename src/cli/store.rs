@@ -21,7 +21,8 @@ use crate::{diag, help, layout_or_fail, paths, print_json, sandbox, storage, sto
 /// One top-level subtree of the data directory.
 #[derive(serde::Serialize)]
 struct SubtreeView {
-    /// The entry's name as it appears in the data directory, directories with a trailing slash.
+    /// The entry's name as it appears in the data directory, directories with a trailing slash and
+    /// symbolic links with a trailing `@`.
     label: String,
     bytes: u64,
     /// Rendered size, so a consumer of `--json` need not reimplement the units.
@@ -30,6 +31,13 @@ struct SubtreeView {
     /// What the subtree is for, when it is one of the directories sbx documents.
     #[serde(skip_serializing_if = "Option::is_none")]
     purpose: Option<&'static str>,
+    /// What the entry points at, when it is a symbolic link whose target could be read. A link is
+    /// sized as itself: its target is not followed, so nothing under it is counted here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link_target: Option<String>,
+    /// Whether the entry is a symbolic link, which the row then says in place of its purpose.
+    #[serde(skip)]
+    is_link: bool,
     /// With `--shared`: the bytes of file data no other subtree references, before compression —
     /// what removing this subtree alone frees inside the filesystem.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -215,8 +223,12 @@ fn build(data_dir: &Path, store_dir: &Path, sized: bool) -> std::io::Result<Stor
     }
     let mut subtrees = Vec::with_capacity(entries.len());
     for e in &entries {
-        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let name = e.file_name().to_string_lossy().into_owned();
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let kind = e.file_type().ok();
+        let is_dir = kind.is_some_and(|t| t.is_dir());
+        let is_link = kind.is_some_and(|t| t.is_symlink());
+        let purpose = paths::data_entry_purpose(&name);
         let (bytes, inodes) = if sized {
             let usage = sandbox::tree_usage(&e.path());
             unreadable += usage.unreadable;
@@ -225,11 +237,20 @@ fn build(data_dir: &Path, store_dir: &Path, sized: bool) -> std::io::Result<Stor
             (0, 0)
         };
         subtrees.push(SubtreeView {
-            label: if is_dir { format!("{name}/") } else { name },
+            label: match (is_dir, is_link) {
+                (true, _) => format!("{name}/"),
+                (_, true) => format!("{name}@"),
+                _ => name.into_owned(),
+            },
             bytes,
             size: sandbox::human_bytes(bytes),
             inodes,
-            purpose: paths::data_entry_purpose(&e.file_name().to_string_lossy()),
+            purpose,
+            link_target: is_link
+                .then(|| std::fs::read_link(e.path()).ok())
+                .flatten()
+                .map(|t| t.to_string_lossy().into_owned()),
+            is_link,
             exclusive_bytes: None,
             path: e.path(),
         });
@@ -472,7 +493,16 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
         .max()
         .unwrap_or(0);
     for ((t, label), excl) in v.subtrees.iter().zip(&labels).zip(&exclusive) {
-        let purpose = t.purpose.unwrap_or("");
+        // A link is sized as itself, so the purpose of the directory its name stands for would
+        // describe what the row does not count.
+        let purpose = match (&t.link_target, t.is_link) {
+            (Some(target), _) => format!(
+                "symbolic link to {}; what it points at is not counted",
+                diag::visible(target)
+            ),
+            (None, true) => "symbolic link; what it points at is not counted".to_string(),
+            (None, false) => t.purpose.unwrap_or("").to_string(),
+        };
         let unit = if t.inodes == 1 { "inode " } else { "inodes" };
         let excl = match excl {
             Some(e) => format!("{e:>excl_w$}  "),
@@ -623,6 +653,8 @@ mod tests {
             size: "4.0 KiB".into(),
             inodes: 1,
             purpose: None,
+            link_target: None,
+            is_link: false,
             exclusive_bytes: None,
             path: PathBuf::new(),
         };
@@ -683,6 +715,8 @@ mod tests {
             size: "4.0 KiB".into(),
             inodes: 1,
             purpose: None,
+            link_target: None,
+            is_link: false,
             exclusive_bytes: None,
             path: PathBuf::new(),
         };
@@ -726,6 +760,8 @@ mod tests {
             size: sandbox::human_bytes(bytes),
             inodes: 1,
             purpose: None,
+            link_target: None,
+            is_link: false,
             exclusive_bytes: None,
             path: PathBuf::from(format!("/d/{label}")),
         }
@@ -959,6 +995,38 @@ mod tests {
         let out = render(&v, &style::Palette::plain());
         assert!(!out.contains("nothing provisioned"), "{out}");
         assert!(out.contains("1 entry could not be read"), "{out}");
+    }
+
+    /// A symbolic link in the data directory is shown as one, with what it points at, and sized as
+    /// the link: a store moved elsewhere and linked back is not counted here, and the row says so
+    /// rather than wearing the store's purpose over the size of a link.
+    #[test]
+    fn a_symbolic_link_is_shown_as_one_and_its_target_not_counted() {
+        let tmp = TmpDir::new();
+        let data = tmp.path().join("data");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("nix/store/aaaa-x")).unwrap();
+        std::fs::write(elsewhere.join("blob"), vec![b'x'; 200_000]).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, data.join("store")).unwrap();
+        let target = elsewhere.to_string_lossy().into_owned();
+
+        let v = build(&data, &data.join("store"), true).unwrap();
+        let link = &v.subtrees[0];
+        assert_eq!(link.label, "store@");
+        assert_eq!(link.inodes, 1, "the link, not the tree it names");
+        assert_eq!(link.link_target.as_deref(), Some(target.as_str()));
+
+        let out = render(&v, &style::Palette::plain());
+        let row = out.lines().find(|l| l.contains("store@")).unwrap();
+        assert!(
+            row.contains(&format!(
+                "symbolic link to {}; what it points at is not counted",
+                diag::visible(&target)
+            )),
+            "{out}"
+        );
+        assert!(!row.contains("nix store"), "{out}");
     }
 
     /// A data directory that does not exist yet is nothing provisioned, and one that cannot be
