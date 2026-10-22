@@ -14,6 +14,56 @@ fn sbx() -> Command {
     common::isolated_sbx("doctor-")
 }
 
+/// One check of the human report: its tag (`ok`, `warn` or `FAIL`), the text after the tag, which is
+/// the name and then the detail, and the `·` notes printed under it.
+struct Reported<'a> {
+    tag: &'a str,
+    text: &'a str,
+    notes: Vec<&'a str>,
+}
+
+/// The checks of a human report, in the order it printed them.
+///
+/// A report names the same words in more than one place: a note under one check can quote what
+/// another check was about, and a path can hold a check's name. An assertion that searches the whole
+/// report for a word is satisfied by whichever line holds it, so each check is read here with only
+/// what was printed under it.
+fn reported(report: &str) -> Vec<Reported<'_>> {
+    let mut checks: Vec<Reported<'_>> = Vec::new();
+    for line in report.lines() {
+        if let Some((tag, text)) = line.strip_prefix("  [").and_then(|l| l.split_once("] ")) {
+            checks.push(Reported {
+                tag: tag.trim(),
+                text,
+                notes: Vec::new(),
+            });
+        } else if let (Some(note), Some(check)) =
+            (line.trim_start().strip_prefix("· "), checks.last_mut())
+        {
+            check.notes.push(note);
+        }
+    }
+    checks
+}
+
+/// The detail of a check's `text` when the check is `name`, whatever the padding between the two.
+fn detail<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let after = text.strip_prefix(name)?;
+    (after.is_empty() || after.starts_with(' ')).then(|| after.trim_start())
+}
+
+/// The one check of `report` named `name`, failing the test when there is none or more than one.
+#[track_caller]
+fn the_check<'a>(report: &'a str, name: &str) -> Reported<'a> {
+    let mut found = reported(report)
+        .into_iter()
+        .filter(|c| detail(c.text, name).is_some());
+    match (found.next(), found.next()) {
+        (Some(check), None) => check,
+        _ => panic!("the report has not exactly one `{name}` check:\n{report}"),
+    }
+}
+
 #[test]
 fn doctor_prints_the_preflight_structure() {
     // Redirect sbx's data dir to a throwaway location so the asserted store path
@@ -142,6 +192,9 @@ fn doctor_reports_a_refused_engine_override_as_refused_not_missing() {
 /// A host that restricts unprivileged user namespaces (Ubuntu's AppArmor restriction) answers no
 /// even where a launch works: the launch goes through a `bwrap` its profile names, and the question
 /// is asked of a binary none does.
+///
+/// A fork or a wait that fails is no answer, so it fails the test: read as a refused namespace, it
+/// would send the test after a `[FAIL] user namespaces` the report never had reason to print.
 fn unprivileged_namespace_bears_capabilities() -> bool {
     // SAFETY: the child calls only `unshare` and `_exit`, both async-signal-safe, so forking from
     // the multithreaded test harness is sound; the parent only reaps it.
@@ -152,12 +205,23 @@ fn unprivileged_namespace_bears_capabilities() -> bool {
                     && libc::unshare(libc::CLONE_NEWNS) == 0;
                 libc::_exit(if ok { 0 } else { 1 })
             }
-            -1 => false,
+            -1 => panic!(
+                "fork the namespace probe: {}",
+                std::io::Error::last_os_error()
+            ),
             pid => {
                 let mut status = 0;
-                libc::waitpid(pid, &mut status, 0) == pid
-                    && libc::WIFEXITED(status)
-                    && libc::WEXITSTATUS(status) == 0
+                // A signal caught while the child is being reaped interrupts the wait without
+                // ending it, so it is asked again, as `doctor`'s own probe does.
+                while libc::waitpid(pid, &mut status, 0) != pid {
+                    let e = std::io::Error::last_os_error();
+                    assert_eq!(
+                        e.raw_os_error(),
+                        Some(libc::EINTR),
+                        "reap the namespace probe: {e}"
+                    );
+                }
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
             }
         }
     }
@@ -196,11 +260,16 @@ fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
         perm.set_mode(0o755);
         std::fs::set_permissions(&stub, perm).unwrap();
     }
-    let path = format!(
-        "{}:{}",
-        stub_dir.path().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    // Joined as the OS strings the entries are: `display()` would replace a byte of the fixture
+    // root that is not UTF-8, and `PATH` would then name a directory that does not exist, so the
+    // host's `bwrap` would run in the stub's place. An absent or empty `PATH` adds no entry after
+    // the stub's.
+    let inherited = std::env::var_os("PATH").filter(|p| !p.is_empty());
+    let path = std::env::join_paths(
+        std::iter::once(stub_dir.path().to_path_buf())
+            .chain(inherited.iter().flat_map(std::env::split_paths)),
+    )
+    .expect("a PATH entry holds a `:`");
 
     let out = sbx()
         .arg("doctor")
@@ -235,13 +304,23 @@ fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
         }
         return;
     }
+    // Read under the failed launch alone: the capture check probes through the same stub, and its
+    // own note quotes the stub's stderr too.
+    let sandbox = the_check(&stdout, "sandbox");
+    assert_eq!(
+        sandbox.tag, "FAIL",
+        "a launch that failed is a failed check; stdout was:\n{stdout}"
+    );
     assert!(
-        stdout.contains("the failure is in bubblewrap"),
+        sandbox
+            .notes
+            .iter()
+            .any(|n| n.contains("the failure is in bubblewrap")),
         "the fault must be attributed to the engine, not the namespace; stdout was:\n{stdout}"
     );
     assert!(
-        stdout.contains("boom"),
-        "bwrap's own stderr should be surfaced; stdout was:\n{stdout}"
+        sandbox.notes.contains(&"boom"),
+        "bwrap's own stderr should be surfaced under the failed launch; stdout was:\n{stdout}"
     );
 }
 
