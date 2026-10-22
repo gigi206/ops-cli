@@ -34,12 +34,17 @@ impl Data {
     }
 }
 
+/// `sbx <args>` over `data`, read within a bound: a reading that never ends — a follow that did not
+/// see its session had exited — fails the test naming its arguments rather than holding the suite
+/// until the job times out.
 fn sbx_in(data: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_sbx"))
-        .args(args)
-        .env("SBX_DATA_DIR", data)
-        .output()
-        .expect("spawn sbx")
+    common::procs::output_within(
+        Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(args)
+            .env("SBX_DATA_DIR", data),
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap_or_else(|| panic!("`sbx {}` did not end within 60 s", args.join(" ")))
 }
 
 fn out(o: &Output) -> String {
