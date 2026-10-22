@@ -898,8 +898,8 @@ fn resolve_env_paths(keys: &[String]) -> Vec<(String, String)> {
 
 /// Why a path-valued variable's value cannot be bound, or `None` when it can: one answer for a
 /// value read from sbx's environment and one configured in a `[plugin.<name>]` table, so the two
-/// doors into the mount list drop the same values.
-fn unbindable(value: &str) -> Option<&'static str> {
+/// doors into the mount list drop the same values, and `sbx plugins info` says what they do.
+pub(crate) fn unbindable(value: &str) -> Option<&'static str> {
     let path = Path::new(value);
     if !path.is_absolute() {
         Some("is not an absolute path")

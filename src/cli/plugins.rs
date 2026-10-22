@@ -2964,7 +2964,7 @@ fn print_grant_brokers(names: &[String]) {
 /// the first secret rather than during it.
 ///
 /// An unset variable is not a fault — the manifest's own `allow_paths` then apply — so it is said
-/// plainly. A relative value is called out, since a launch drops it.
+/// plainly. A value a launch drops is called out, with the reason the launch gives.
 fn print_grant_env_paths(keys: &[String], err: &str, r: &str) {
     if keys.is_empty() {
         outln!("    allow_env_paths: (none)");
@@ -2972,13 +2972,22 @@ fn print_grant_env_paths(keys: &[String], err: &str, r: &str) {
     }
     let shown: Vec<String> = keys
         .iter()
-        .map(|k| match std::env::var(k) {
-            Ok(v) if std::path::Path::new(&v).is_absolute() => format!("{k} -> {v}"),
-            Ok(v) => format!("{k} -> {err}{v} (not absolute, would be dropped){r}"),
-            Err(_) => format!("{k} -> unset (the manifest's own paths apply)"),
-        })
+        .map(|k| env_path_shown(k, std::env::var(k).ok(), err, r))
         .collect();
     outln!("    allow_env_paths: {}", shown.join(", "));
+}
+
+/// One `allow_env_paths` variable as [`print_grant_env_paths`] shows it: the path it names, or why
+/// a launch drops it. The verdict is the launch's own ([`crate::sandbox::resolver::unbindable`]),
+/// so the listing cannot show as bound a value the launch drops.
+fn env_path_shown(key: &str, value: Option<String>, err: &str, r: &str) -> String {
+    match value {
+        None => format!("{key} -> unset (the manifest's own paths apply)"),
+        Some(v) => match crate::sandbox::resolver::unbindable(&v) {
+            None => format!("{key} -> {v}"),
+            Some(why) => format!("{key} -> {err}{v} (it {why}, so a launch drops it){r}"),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -3418,6 +3427,24 @@ mod tests {
             idx.marker("vault-broker", None, None, None, "mine", &plain()),
             "  [name in conflict between `vault-dev`, `vault-fork`]"
         );
+    }
+
+    /// `plugins info` shows each path-valued variable as a launch resolves it: a value the launch
+    /// drops, relative or climbing with `..`, is called out as dropped, never shown as a path the
+    /// cage will have. The verdict is the launch's own, so the two cannot disagree.
+    #[test]
+    fn a_path_valued_variable_is_shown_as_the_launch_resolves_it() {
+        let shown = |value: Option<&str>| env_path_shown("S", value.map(str::to_string), "", "");
+        assert_eq!(shown(Some("/srv/store")), "S -> /srv/store");
+        assert_eq!(
+            shown(Some("/srv/nope/../store")),
+            "S -> /srv/nope/../store (it climbs with `..`, so a launch drops it)"
+        );
+        assert_eq!(
+            shown(Some("rel/store")),
+            "S -> rel/store (it is not an absolute path, so a launch drops it)"
+        );
+        assert_eq!(shown(None), "S -> unset (the manifest's own paths apply)");
     }
 
     /// A resolver claims its manifest name besides its scheme, and an install refuses it on either,
