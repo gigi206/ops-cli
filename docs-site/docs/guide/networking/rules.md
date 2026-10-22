@@ -241,9 +241,13 @@ Three `re:` caveats:
 A `re:` rule is never scheme-split (its pattern may itself contain `://`) and is
 always inspected L7. A leading `{` in a `re:` body is part of the regex (a `{n,m}`
 quantifier), not a method prefix: the method prefix, if any, sits *before* `re:`.
-A pattern anchored on a scheme other than `https://` (`^http://`, `^tcp://`,
-`^ws://`, `^wss://`, `^ftp://`) is refused: the tested URL is always rebuilt as
-`https://…`, so such a pattern could never match.
+A pattern anchored on a text the tested URL cannot begin with is refused: the URL is
+always rebuilt as `https://…`, so `^http://`, `^tcp://`, `^ws://`, their spellings
+with a flag, a group or another case (`(?i)^http://`, `^(http://)`, `^HTTP://`), and a
+pattern anchored on the host (`^api\.example\.com`) could never match. Anchor on
+`^https://`, or leave the pattern unanchored. Only a head that can be read for certain
+is judged: a pattern with an alternation, or one that may skip the group its head sits
+in, is taken as written.
 
 ---
 

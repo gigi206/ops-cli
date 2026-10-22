@@ -1194,7 +1194,7 @@ mod tests {
     /// render and the terminal filters it.
     #[test]
     fn a_loaded_rule_cannot_reorder_the_line_that_reports_it() {
-        let rule = "re:^a\u{202e}b";
+        let rule = "re:^https://a\u{202e}b";
         assert!(
             crate::allowlist::classify_in(rule, crate::allowlist::Slot::Allow).is_ok(),
             "the premise: the grammar admits the character"
@@ -1202,7 +1202,7 @@ mod tests {
         let out = render_inject("allow", rule, &[7], &[], &style::Palette::plain());
         assert!(!out.contains('\u{202e}'), "{out:?}");
         assert!(
-            out.starts_with("loaded allow rule `re:^a b` into 1 live session(s):"),
+            out.starts_with("loaded allow rule `re:^https://a b` into 1 live session(s):"),
             "{out:?}"
         );
     }

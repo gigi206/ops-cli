@@ -82,6 +82,90 @@ fn reject_control_bytes(entry: &str, slot: Slot) -> Result<(), String> {
     Ok(())
 }
 
+/// How every URL a `re:` rule is tested against begins: [`Request::new`] rebuilds it so whatever
+/// transport the request used.
+const URL_START: &str = "https://";
+
+/// The text every match of the valid regex `pattern` must begin with, and whether it is matched
+/// without regard to case, when the pattern is anchored at its start and its head can be read for
+/// certain without a regex parser.
+///
+/// `None` means "cannot tell", never "may match": no anchor; an alternation anywhere, since a branch
+/// may begin otherwise; verbose mode, where whitespace is not literal; a group opened before the
+/// head that a quantifier may skip; a non-ASCII head matched without regard to case, which Unicode
+/// case folding may bring onto an ASCII letter (`ſ` matches `s`). The head stops at the first
+/// construct this reading does not follow, and a literal the next token makes optional is left out.
+fn anchored_head(pattern: &str) -> Option<(String, bool)> {
+    if pattern.contains('|') {
+        return None;
+    }
+    let mut rest = pattern;
+    let mut anchored = false;
+    let mut insensitive = false;
+    let mut grouped = false;
+    // Anchors, flag groups and group openers, in any order, before the first literal.
+    loop {
+        if let Some(r) = rest.strip_prefix('^').or_else(|| rest.strip_prefix("\\A")) {
+            anchored = true;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("(?") {
+            if let Some(r) = r.strip_prefix("P<").or_else(|| r.strip_prefix('<')) {
+                rest = &r[r.find('>')? + 1..];
+                grouped = true;
+                continue;
+            }
+            let end = r.find([')', ':'])?;
+            let mut on = true;
+            for flag in r[..end].chars() {
+                match flag {
+                    '-' => on = false,
+                    'i' => insensitive = on,
+                    'm' | 's' | 'U' | 'u' | 'R' => {}
+                    _ => return None,
+                }
+            }
+            grouped |= r[end..].starts_with(':');
+            rest = &r[end + 1..];
+        } else if let Some(r) = rest.strip_prefix('(') {
+            grouped = true;
+            rest = r;
+        } else {
+            break;
+        }
+    }
+    if !anchored {
+        return None;
+    }
+    // A group around the head that the pattern may skip, however deeply nested, begins nothing for
+    // certain: `^((http://))?https://x` matches `https://x`.
+    if grouped && [")?", ")*", "){"].iter().any(|skip| pattern.contains(skip)) {
+        return None;
+    }
+    let mut head = String::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        let literal = match c {
+            '\\' => match chars.next() {
+                Some(escaped) if escaped.is_ascii_punctuation() => escaped,
+                _ => break,
+            },
+            '.' | '[' | ']' | '(' | ')' | '{' | '}' | '$' | '^' | '*' | '+' | '?' => break,
+            c => c,
+        };
+        if matches!(chars.peek(), Some('?' | '*' | '{')) {
+            break;
+        }
+        head.push(literal);
+        if chars.peek() == Some(&'+') {
+            break;
+        }
+    }
+    if insensitive && !head.is_ascii() {
+        return None;
+    }
+    Some((head, insensitive))
+}
+
 /// Classify one declared entry (in `slot`'s list) by its syntax, or report why it is malformed. The
 /// optional pieces are peeled in order: a leading `{VERB,...}` method prefix, then — for a non-`re:`
 /// entry — a `tcp://`/`http://`/`https://` scheme that selects the enforcement [`Layer`]. A `re:`
@@ -96,25 +180,29 @@ pub(crate) fn classify_in(entry: &str, slot: Slot) -> Result<Rule, String> {
     let rest = rest.trim();
     // `re:` patterns may contain `://`, so they are never scheme-split — always inspected over TLS.
     if let Some(pattern) = rest.strip_prefix("re:") {
-        // A pattern anchored on a scheme other than `https` can never fire, so it is refused at
-        // parse time rather than accepted and silently inert. `Request::new` reconstructs the URL
-        // it matches against as `https://<authority><path>` for *every* request, the cleartext
-        // plane included — so `re:^http://internal\.corp`, the natural spelling for narrowing a
-        // cleartext host one has just opened, matched nothing and said nothing. A deny that cannot
-        // deny is the worst shape a rule can take: it reads as protection.
-        for scheme in ["http://", "tcp://", "ws://", "wss://", "ftp://"] {
-            if let Some(anchored) = pattern.strip_prefix('^')
-                && anchored.starts_with(scheme)
-            {
+        let re = Regex::new(pattern).map_err(|e| format!("invalid regex `{pattern}`: {e}"))?;
+        // A pattern anchored on a text the tested URL cannot begin with can never fire, so it is
+        // refused at parse time rather than accepted and silently inert. `Request::new` rebuilds
+        // the URL it matches against as `https://<authority><path>` for *every* request, the
+        // cleartext plane included — so `re:^http://internal\.corp`, the natural spelling for
+        // narrowing a cleartext host one has just opened, matched nothing and said nothing, and so
+        // did `re:^internal\.corp`. A deny that cannot deny is the worst shape a rule can take: it
+        // reads as protection.
+        if let Some((head, insensitive)) = anchored_head(pattern) {
+            let head = if insensitive {
+                head.to_ascii_lowercase()
+            } else {
+                head
+            };
+            if !(URL_START.starts_with(&head) || head.starts_with(URL_START)) {
                 return Err(format!(
-                    "entry `{entry}` anchors a `re:` pattern on `{scheme}`, which can never match \
+                    "entry `{entry}` anchors a `re:` pattern on `{head}`, which can never match \
                      — the URL a `re:` rule is tested against is always rebuilt as `https://…`, \
-                     whatever transport the request used. Drop the scheme from the pattern (the \
-                     layer is chosen by the rule's own scheme, not by its regex)"
+                     whatever transport the request used. Anchor it on `^https://`, or drop the \
+                     anchor (the layer is chosen by the rule's own scheme, not by its regex)"
                 ));
             }
         }
-        let re = Regex::new(pattern).map_err(|e| format!("invalid regex `{pattern}`: {e}"))?;
         return Ok(Rule {
             kind: RuleKind::Regex {
                 pattern: pattern.to_string(),

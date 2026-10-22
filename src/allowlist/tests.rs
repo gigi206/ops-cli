@@ -2165,7 +2165,10 @@ fn a_method_prefix_round_trips_through_display() {
         "{GET,HEAD} https://github.com"
     );
     // a regex shows its method prefix but no scheme (the pattern carries its own)
-    assert_eq!(rule("{POST} re:^x$").to_string(), "{POST} re:^x$");
+    assert_eq!(
+        rule("{POST} re:^https://x/$").to_string(),
+        "{POST} re:^https://x/$"
+    );
     assert_eq!(
         rule("{HEAD,GET} example.com/p").to_string(),
         "{GET,HEAD} https://example.com/p",
@@ -2926,31 +2929,74 @@ fn a_query_string_in_a_path_rule_is_refused_rather_than_silently_widening_it() {
     assert!(classify("re:^https://files\\.test/exec\\?cmd=ls$").is_ok());
 }
 
-/// A `re:` pattern anchored on a scheme other than `https` is refused, because it can never match.
+/// A `re:` pattern anchored on a text no tested URL begins with is refused, because it can never
+/// match.
 ///
 /// `Request::new` rebuilds the URL a `re:` rule is tested against as `https://<authority><path>`
 /// for every request, the cleartext plane included. So `re:^http://internal\.corp` — the natural
-/// spelling for narrowing a cleartext host one has just opened — matched nothing and said nothing.
-/// A deny that cannot deny is the worst shape a rule can take: it reads as protection.
+/// spelling for narrowing a cleartext host one has just opened — matched nothing and said nothing,
+/// and so did its spellings with a flag, a group or another case, and a pattern anchored on the
+/// host. A deny that cannot deny is the worst shape a rule can take: it reads as protection.
+///
+/// Each refused pattern is shown to match none of the sample URLs, and each admitted one to match a
+/// real one, so the test pins the boundary rather than asserting it: a head the reading cannot
+/// follow for certain is never refused.
 #[test]
-fn a_regex_rule_anchored_on_a_non_https_scheme_is_refused() {
+fn a_regex_rule_anchored_on_a_text_no_url_begins_with_is_refused() {
+    let urls = [
+        "https://internal.corp/",
+        "https://files.test/x",
+        "https://x/",
+    ];
     for pattern in [
-        "re:^http://internal\\.corp",
-        "re:^tcp://internal\\.corp",
-        "re:^ws://internal\\.corp",
+        "^http://internal\\.corp",
+        "^tcp://internal\\.corp",
+        "^ws://internal\\.corp",
+        "(?i)^http://files\\.test/",
+        "^HTTP://files\\.test/",
+        "^(http://)files\\.test/",
+        "^(?:http://)files\\.test/",
+        "^(?i)HTTP://x",
+        "\\Ahttp://x",
+        "^internal\\.corp",
+        "^HTTPS://x",
+        "^http\\:\\/\\/x",
     ] {
-        let err = classify(pattern).unwrap_err();
+        let re = regex::Regex::new(pattern).unwrap();
         assert!(
-            err.contains("can never match") && err.contains("https"),
+            urls.iter().all(|u| !re.is_match(u)),
+            "the premise: {pattern} matches none of the sample URLs"
+        );
+        let err = classify(&format!("re:{pattern}")).unwrap_err();
+        assert!(
+            err.contains("can never match") && err.contains("^https://"),
             "{pattern}: {err}"
         );
     }
-    // Anchored on the form that is actually built, and unanchored, both still parse — the refusal
-    // is about a scheme that cannot appear, not about anchoring.
-    assert!(classify("re:^https://internal\\.corp").is_ok());
-    assert!(classify("re:internal\\.corp").is_ok());
-    // A pattern merely *containing* a scheme is not anchored on one and is left alone.
-    assert!(classify("re:redirect=http://internal").is_ok());
+    for (pattern, url) in [
+        ("^https://internal\\.corp", "https://internal.corp/"),
+        ("internal\\.corp", "https://internal.corp/"),
+        (
+            "redirect=http://internal",
+            "https://x/?redirect=http://internal",
+        ),
+        ("^https?://files\\.test/", "https://files.test/x"),
+        ("(?i)^HTTPS://X/", "https://x/"),
+        ("^httpx?s://x/", "https://x/"),
+        ("^https\\:\\/\\/x/", "https://x/"),
+        ("^((http://))?https://x/", "https://x/"),
+        ("^(http://(y))?https://x/", "https://x/"),
+        ("^http://a|^https://x/", "https://x/"),
+        ("(?x)^ https://x/", "https://x/"),
+        ("(?i)^httpſ://x/", "https://x/"),
+        ("^\\w+://x/", "https://x/"),
+    ] {
+        assert!(
+            regex::Regex::new(pattern).unwrap().is_match(url),
+            "the premise: {pattern} matches {url}"
+        );
+        assert!(classify(&format!("re:{pattern}")).is_ok(), "{pattern}");
+    }
 }
 
 /// Every producer that composes a `host:port` owes the same answer, so the answer is pinned here.
