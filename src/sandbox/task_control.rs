@@ -1593,13 +1593,20 @@ fn serve_host(
         return writeln!(writer, "ok");
     }
 
-    let after = match command.strip_prefix("LOG") {
-        None => return writeln!(writer, "err unknown command"),
-        Some(rest) => rest
-            .trim()
-            .strip_prefix("after=")
-            .and_then(|n| n.trim().parse::<u64>().ok())
-            .unwrap_or(0),
+    // `LOG` alone, or with the one cursor its client sends. A verb that merely begins `LOG` is not
+    // this one, and a cursor that does not read is refused rather than taken for none at all, which
+    // answered a follow read with the whole log — the egress plane refuses the same.
+    let mut words = command.split_whitespace();
+    if words.next() != Some("LOG") {
+        return writeln!(writer, "err unknown command");
+    }
+    let after = match words.collect::<Vec<_>>().as_slice() {
+        [] => 0,
+        [cursor] => match cursor.strip_prefix("after=").map(str::parse::<u64>) {
+            Some(Ok(after)) => after,
+            _ => return writeln!(writer, "err a log read takes one `after=<seq>` cursor"),
+        },
+        _ => return writeln!(writer, "err a log read takes one `after=<seq>` cursor"),
     };
     let (entries, dropped, head) = log.since(after);
     if dropped > 0 {

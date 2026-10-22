@@ -478,6 +478,36 @@ fn host_conn(budget: Duration) -> (UnixStream, std::sync::mpsc::Receiver<io::Res
     (client, rx)
 }
 
+/// A `LOG` is the verb alone, or with the one `after=<seq>` cursor its client sends.
+///
+/// Anything else is refused. A verb that merely began `LOG` was read as one, and a cursor that did
+/// not read as none at all, which answered a follow read with the whole log: the egress plane
+/// refuses the same cursors for that reason.
+#[test]
+fn a_log_request_that_is_not_one_is_refused() {
+    let ask = |request: &str| {
+        let (mut conn, _served) = host_conn(Duration::from_secs(5));
+        writeln!(conn, "{request}").expect("send the request");
+        let mut reply = String::new();
+        std::io::Read::read_to_string(&mut conn, &mut reply).expect("read the reply");
+        reply
+    };
+    for bad in [
+        "LOGxyz",
+        "LOG after=x",
+        "LOG after=",
+        "LOG after=1 after=2",
+        "LOG before=1",
+    ] {
+        let reply = ask(bad);
+        assert!(reply.starts_with("err "), "`{bad}` was answered: {reply}");
+    }
+    for good in ["LOG", "LOG after=0", "LOG after=7"] {
+        let reply = ask(good);
+        assert!(reply.starts_with("head="), "`{good}` was refused: {reply}");
+    }
+}
+
 /// The host-only socket gives up on a silent connection rather than holding its thread and slot.
 ///
 /// It has its own [`MAX_CONCURRENT_CONNS`] ceiling and its own thread per connection, so the
