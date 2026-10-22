@@ -7,8 +7,8 @@ use common::fixture::TmpDir;
 use std::path::Path;
 use std::process::Command;
 
-/// The built binary, with the global config and the trust store isolated the way every other suite
-/// isolates them, by [`common::isolated_sbx`].
+/// The built binary, with the global config and the trust store isolated by the shared
+/// [`common::isolated_sbx`].
 ///
 /// Without it, `sbx upgrade` reads the developer's own `~/.config/sbx` and rolls every app declared
 /// there: each launches a cage in the fixture project, provisions that project's packages, and the

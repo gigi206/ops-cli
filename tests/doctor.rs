@@ -6,10 +6,9 @@ use common::fixture::TmpDir;
 
 use std::process::{Command, Output};
 
-/// The built binary, with the global config and the trust store isolated the way every other suite
-/// isolates them, by [`common::isolated_sbx`], so a report never depends on the developer's own
-/// `~/.config/sbx`. No test here writes either, so the suite's fixed empty directories are shared
-/// without a race.
+/// The built binary, with the global config and the trust store isolated by the shared
+/// [`common::isolated_sbx`], so a report never depends on the developer's own `~/.config/sbx`. No
+/// test here writes either, so the suite's fixed empty directories are shared without a race.
 fn sbx() -> Command {
     common::isolated_sbx("doctor-")
 }
