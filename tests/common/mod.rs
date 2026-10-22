@@ -264,6 +264,10 @@ fn cache_given_up(stderr: &str, errors: &[&str]) -> Option<String> {
 const METADATA_RUN: &str = "`nix flake metadata ";
 const METADATA_FAILED: &str = "` failed: ";
 
+/// What `sbx upgrade` writes instead when it killed a `nix flake metadata` at its deadline:
+/// `` `nix flake metadata <ref>` did not answer within <n> seconds and was killed ``.
+const METADATA_STALLED: &str = "` did not answer within ";
+
 /// nix's error in a failed `sbx upgrade`, when every `nix flake metadata` it ran that failed did so
 /// on a download, or `None` when one failed for another reason, or none ran.
 ///
@@ -280,15 +284,23 @@ const METADATA_FAILED: &str = "` failed: ";
 /// opens on `warning:` alone, in older releases on `warning: error:`, and one may carry a `(curl
 /// error: …)` inside, so an `error:` after `warning:` or `curl` opens nothing.
 ///
+/// A resolution sbx killed at its deadline is the network's as well, and it is quoted whole, since
+/// nix gave no error. nix gives up on its own, well within the deadline, a fetch it cannot start,
+/// so one still running then is a download too slow to finish.
+///
 /// Every failed resolution has to read as a download. `sbx upgrade` rolls several at once, and a
 /// `flake:` reference answered with a 404 is a regression even when the channel's fetch failed
 /// beside it.
 ///
-/// Measured with nix 2.34.5 behind a proxy that refuses every connection: four `warning: unable to
-/// download '…': Could not connect to server (7) …; retrying`, then `error: … while fetching the
-/// input '…' error: unable to download '…': Could not connect to server`. Neither a host that cannot
-/// resolve a name nor a GitHub API quota that ran out has been measured. If the second answers 403,
-/// the veto reads it as the host's, as every failure here was read before.
+/// Measured with nix 2.34.5, each shape ending on `error: … while fetching the input '…' error:
+/// unable to download '…':` and its reason: behind a proxy that refuses every connection, four
+/// `warning: unable to download '…': Could not connect to server (7) …; retrying` then `Could not
+/// connect to server`; behind a proxy whose name does not resolve, `Could not resolve hostname (6)
+/// Could not resolve proxy: …`; behind one that accepts and never answers, `Timeout was reached
+/// (28) Connection timed out after 15001 milliseconds`, 79 seconds in. The deadline's sentence was
+/// measured with the deadline brought down to two seconds. A GitHub API quota that ran out has not
+/// been measured: if it answers 403, the veto reads it as the host's, as every failure here was
+/// read before.
 pub fn metadata_fetch_fault(log: &[u8]) -> Option<String> {
     let log = String::from_utf8_lossy(log);
     let mut faults = Vec::new();
@@ -297,6 +309,9 @@ pub fn metadata_fetch_fault(log: &[u8]) -> Option<String> {
             continue;
         };
         let Some(failed) = line[run..].find(METADATA_FAILED) else {
+            if line[run..].contains(METADATA_STALLED) {
+                faults.push(line[run..].trim_end());
+            }
             continue;
         };
         match nix_error(&line[run + failed + METADATA_FAILED.len()..]) {
@@ -450,6 +465,64 @@ pub fn isolated_sbx(prefix: &str) -> Command {
     }
     cmd.env("LC_ALL", "C.UTF-8").env_remove("LANG");
     cmd
+}
+
+/// Whether GitHub's API will still answer, which for a `mise:aqua:` tool or a `github:` flake
+/// reference is not the same question as whether it is reachable.
+///
+/// The unauthenticated quota is sixty requests an hour **per address**, and it is shared with
+/// everything else on the host: another suite, a `nix flake metadata`, a person probing by hand. A
+/// tool declared `mise:aqua:` resolves its release through that API, and nix resolves a `github:`
+/// reference through it too, the default nixpkgs channel among them, so a spent quota fails the
+/// install or the roll while `cache.nixos.org` stays perfectly reachable. That is a red no code
+/// change can clear, and it belongs to the same family as an unreachable cache.
+///
+/// Read from `rate_limit`, whose own request costs nothing and whose `remaining` is a documented
+/// field, rather than from an upstream error message that is part of no contract. Best effort in
+/// one direction only: no `curl`, no answer, or an answer that will not parse all say the quota is
+/// fine, so this can only ever turn a failure into a counted skip, never the reverse.
+///
+/// The margin is the point, and a bare "any budget left" was not one. Resolving a `mise:aqua:`
+/// release is several requests, not one, so a test admitted on the strength of a single remaining
+/// call spends the budget partway through and fails on the half it could not finish — after the
+/// gate has already answered that the quota was fine. That is the shape this whole function exists
+/// to prevent, arriving through the gate itself, and it reads as an unstable test rather than as
+/// the exhausted shared resource it is: a different suite each time, always one of the `aqua:`
+/// family, never reproducible alone. Requiring room for a whole resolution makes the skip land
+/// before the work instead of during it.
+pub fn github_api_has_quota() -> bool {
+    let Ok(out) = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "10",
+            "https://api.github.com/rate_limit",
+        ])
+        .output()
+    else {
+        return true;
+    };
+    quota_remaining(&String::from_utf8_lossy(&out.stdout))
+        .is_none_or(|remaining| remaining >= AQUA_RESOLVE_BUDGET)
+}
+
+/// The room one `mise:aqua:` test needs left in the hourly budget before it is worth starting.
+///
+/// Not one: a release resolution is several requests. Not the whole suite's need either, which
+/// would skip a run that could have finished — each test asks this for itself, immediately before
+/// its own work, so what has to fit is one resolution and not five.
+const AQUA_RESOLVE_BUDGET: u32 = 5;
+
+/// The `core` budget left, read out of a `rate_limit` body. `None` when the body says nothing this
+/// can be read from, which the caller treats as "fine" rather than as an accusation.
+///
+/// Its own function so the rule is held by a test rather than by the endpoint: a probe that has to
+/// spend the very budget it reports, to prove it reads it correctly, is not a test.
+pub fn quota_remaining(body: &str) -> Option<u32> {
+    // Parsed and read by key, `resources.core.remaining`: every resource carries a `remaining` of
+    // its own, and the one that governs a release download is `core`'s.
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    u32::try_from(body["resources"]["core"]["remaining"].as_u64()?).ok()
 }
 
 /// The first `nft` on `PATH`, where a launch looks for the one that installs its capture redirect,

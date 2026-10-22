@@ -77,6 +77,35 @@ fn upgrade_self_refuses_a_build_from_source_and_a_selector() {
     assert!(!data.exists(), "the refusals created the data directory");
 }
 
+/// Whether `log` carries one of the two refusals `sbx upgrade` gives before it rolls anything: no
+/// usable nix, or a data directory sbx refused. Both are the host's failures rather than the roll's.
+///
+/// Each is read off its own sentence, not off "cannot upgrade" alone: a roll that ran and failed
+/// says "cannot upgrade the nixpkgs channel: …" or "cannot upgrade the mise engine: …", and taking
+/// either for a host that cannot roll skips the very failure the test is there to catch.
+fn refused_before_any_roll(log: &str) -> bool {
+    log.contains("— cannot upgrade. See `sbx doctor`.")
+        || log.contains("sbx: cannot resolve the data directory")
+}
+
+/// Leave a resolution test whose `sbx upgrade` failed, and not on a download: skipped when the host
+/// refused to roll at all, or when GitHub's API quota is spent, since every reference these tests
+/// resolve goes through it; failed otherwise. A host that can roll and has quota, and still cannot
+/// resolve what it declares, has found a regression, which is what [`common::metadata_fetch_fault`] calls a
+/// `flake:` reference answered with a 404.
+fn leave_a_failed_resolution(what: &str, log: &str) {
+    if refused_before_any_roll(log) {
+        skip_incapable!("skipping {what}: {log}");
+    } else if !common::github_api_has_quota() {
+        skip_unreachable!(
+            "skipping {what}: github's api quota is spent, and the references resolve through it \
+             ({log})"
+        );
+    } else {
+        panic!("{what} failed, and not on a download:\n{log}");
+    }
+}
+
 /// The revision the per-project flake lock records for `reference`, if any. The lock lives under
 /// the single project's directory; each line is `<reference>\t<rev>\t<locked-ref>`.
 fn flake_lock_rev(data: &Path, reference: &str) -> Option<String> {
@@ -156,15 +185,17 @@ fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
             return;
         }
         common::Probe::Incapable(log) => {
-            skip_incapable!("skipping flake upgrade resolution: {log}");
+            leave_a_failed_resolution("flake upgrade resolution", &log);
             return;
         }
     };
     let log = String::from_utf8_lossy(&first.stderr).into_owned();
-    if log.contains("re-resolve failed") {
-        skip_incapable!("skipping flake upgrade resolution: {log}");
-        return;
-    }
+    // A roll that exits 0 has resolved every reference it declares. One reported as failed under a
+    // clean exit is a failure that a script reading the status never sees.
+    assert!(
+        !log.contains("re-resolve failed"),
+        "a roll that exits 0 must report no failed resolution:\n{log}"
+    );
     assert!(
         String::from_utf8_lossy(&first.stdout).contains("newly pinned"),
         "a first resolution must pin the flake package:\n{log}"
@@ -243,7 +274,7 @@ fn upgrade_resolves_and_locks_the_default_channel() {
             return;
         }
         common::Probe::Incapable(stderr) => {
-            skip_incapable!("skipping upgrade resolution: {stderr}");
+            leave_a_failed_resolution("upgrade resolution", &stderr);
             return;
         }
     };
@@ -317,15 +348,21 @@ fn a_narrowed_roll_reaches_the_app_s_backends_and_no_project_wide_work() {
     );
     // The host may have no usable nix, in which case the roll cannot start at all; that is a
     // capability, not a defect, and it is reported rather than asserted away.
-    if log.contains("cannot upgrade") {
+    if refused_before_any_roll(&log) {
         skip_incapable!("skipping the narrowed roll: {log}");
         return;
     }
-    // The `deb:` roll ran: the invalid URL cannot resolve, and saying so IS the proof that the
-    // backend was attempted rather than named. A routing answer would have printed neither.
+    // The `deb:` roll ran: the invalid URL cannot resolve, and the line that says so IS the proof
+    // that the backend was attempted rather than named. A routing answer, or a roll that left the
+    // app's package out, prints the group's heading and no such line.
     assert!(
-        log.contains("deb"),
+        log.contains("deb:https://example.invalid/reader.deb: re-resolve failed"),
         "the app's own backend must be rolled, not named:\n{log}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a resolution that failed fails the roll:\n{log}"
     );
     // And nothing project-wide announced itself.
     for widened in ["mise engine", "task pool", "distribution image"] {
@@ -484,9 +521,9 @@ fn a_mise_roll_whose_preparation_fails_is_a_failure_not_a_missing_sandbox() {
     break_app_lock(data.path(), "reader");
 
     let (out, log) = narrowed_roll(config.path(), data.path(), proj.path(), "mise", "reader");
-    // A host with no nix stops before any roll ("cannot upgrade"), one with no sandbox before any
-    // preparation ("the sandbox cannot run"): neither is the case under test.
-    if log.contains("cannot upgrade") || log.contains("the sandbox cannot run") {
+    // A host with no nix or no usable data directory stops before any roll, one with no sandbox
+    // before any preparation ("the sandbox cannot run"): neither is the case under test.
+    if refused_before_any_roll(&log) || log.contains("the sandbox cannot run") {
         skip_incapable!("skipping the failed-preparation roll: {log}");
         return;
     }
@@ -527,9 +564,9 @@ fn an_install_roll_whose_preparation_fails_is_a_failure_not_a_missing_sandbox() 
         "provision",
         "installer",
     );
-    // A host with no nix stops before any roll ("cannot upgrade"), one with no sandbox before any
-    // preparation ("the sandbox cannot run"): neither is the case under test.
-    if log.contains("cannot upgrade") || log.contains("the sandbox cannot run") {
+    // A host with no nix or no usable data directory stops before any roll, one with no sandbox
+    // before any preparation ("the sandbox cannot run"): neither is the case under test.
+    if refused_before_any_roll(&log) || log.contains("the sandbox cannot run") {
         skip_incapable!("skipping the failed-preparation install roll: {log}");
         return;
     }

@@ -1770,63 +1770,6 @@ fn cache_reachable() -> bool {
     })
 }
 
-/// Whether GitHub's API will still answer, which for a `mise:aqua:` tool is not the same question
-/// as whether it is reachable.
-///
-/// The unauthenticated quota is sixty requests an hour **per address**, and it is shared with
-/// everything else on the host: another suite, a `nix flake metadata`, a person probing by hand. A
-/// tool declared `mise:aqua:` resolves its release through that API, so a spent quota fails the
-/// install while `cache.nixos.org` stays perfectly reachable. That is a red no code change can
-/// clear, and it belongs to the same family as an unreachable cache.
-///
-/// Read from `rate_limit`, whose own request costs nothing and whose `remaining` is a documented
-/// field, rather than from an upstream error message that is part of no contract. Best effort in
-/// one direction only: no `curl`, no answer, or an answer that will not parse all say the quota is
-/// fine, so this can only ever turn a failure into a counted skip, never the reverse.
-///
-/// The margin is the point, and a bare "any budget left" was not one. Resolving a `mise:aqua:`
-/// release is several requests, not one, so a test admitted on the strength of a single remaining
-/// call spends the budget partway through and fails on the half it could not finish — after the
-/// gate has already answered that the quota was fine. That is the shape this whole function exists
-/// to prevent, arriving through the gate itself, and it reads as an unstable test rather than as
-/// the exhausted shared resource it is: a different suite each time, always one of the `aqua:`
-/// family, never reproducible alone. Requiring room for a whole resolution makes the skip land
-/// before the work instead of during it.
-fn github_api_has_quota() -> bool {
-    let Ok(out) = std::process::Command::new("curl")
-        .args([
-            "-s",
-            "--max-time",
-            "10",
-            "https://api.github.com/rate_limit",
-        ])
-        .output()
-    else {
-        return true;
-    };
-    quota_remaining(&String::from_utf8_lossy(&out.stdout))
-        .is_none_or(|remaining| remaining >= AQUA_RESOLVE_BUDGET)
-}
-
-/// The room one `mise:aqua:` test needs left in the hourly budget before it is worth starting.
-///
-/// Not one: a release resolution is several requests. Not the whole suite's need either, which
-/// would skip a run that could have finished — each test asks this for itself, immediately before
-/// its own work, so what has to fit is one resolution and not five.
-const AQUA_RESOLVE_BUDGET: u32 = 5;
-
-/// The `core` budget left, read out of a `rate_limit` body. `None` when the body says nothing this
-/// can be read from, which the caller treats as "fine" rather than as an accusation.
-///
-/// Its own function so the rule is held by a test rather than by the endpoint: a probe that has to
-/// spend the very budget it reports, to prove it reads it correctly, is not a test.
-fn quota_remaining(body: &str) -> Option<u32> {
-    // Parsed and read by key, `resources.core.remaining`: every resource carries a `remaining` of
-    // its own, and the one that governs a release download is `core`'s.
-    let body: serde_json::Value = serde_json::from_str(body).ok()?;
-    u32::try_from(body["resources"]["core"]["remaining"].as_u64()?).ok()
-}
-
 #[test]
 fn the_quota_probe_reads_the_budget_that_governs_a_tool_install() {
     // A body in the shape the endpoint returns, with `code_search` ahead of `core` as the
@@ -1835,21 +1778,24 @@ fn the_quota_probe_reads_the_budget_that_governs_a_tool_install() {
     let body = r#"{"resources":{"code_search":{"limit":30,"remaining":29,"reset":1,"used":1},
         "core":{"limit":60,"remaining":0,"reset":2,"used":60},
         "graphql":{"limit":0,"remaining":17,"reset":3,"used":0}},"rate":{"remaining":41}}"#;
-    assert_eq!(quota_remaining(body), Some(0));
+    assert_eq!(common::quota_remaining(body), Some(0));
     assert_eq!(
-        quota_remaining(r#"{"resources":{"core":{"remaining":44}}}"#),
+        common::quota_remaining(r#"{"resources":{"core":{"remaining":44}}}"#),
         Some(44)
     );
     // A `core` without a `remaining` of its own is not read off the resource after it.
     assert_eq!(
-        quota_remaining(
+        common::quota_remaining(
             r#"{"resources":{"core":{"limit":60},"graphql":{"limit":0,"remaining":17}}}"#
         ),
         None
     );
     // Nothing to read is not evidence of an empty budget, and must never skip a test on its own.
-    assert_eq!(quota_remaining("not json at all"), None);
-    assert_eq!(quota_remaining(r#"{"message":"Bad credentials"}"#), None);
+    assert_eq!(common::quota_remaining("not json at all"), None);
+    assert_eq!(
+        common::quota_remaining(r#"{"message":"Bad credentials"}"#),
+        None
+    );
 }
 
 /// Whether the public `grpcb.in` gRPC test server is reachable — the HTTP/2 secret e2e depends on it
@@ -6664,7 +6610,7 @@ fn the_cage_auto_equips_a_non_nix_mise_tool_at_launch() {
         "skipping auto-equip e2e: the network is unreachable"
     );
     need_reachable!(
-        github_api_has_quota(),
+        common::github_api_has_quota(),
         "skipping auto-equip e2e: github's api quota is spent, and the `aqua:` tool resolves its \
          release through it"
     );
@@ -6721,7 +6667,7 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
         "skipping auto-equip allowlist e2e: the network is unreachable"
     );
     need_reachable!(
-        github_api_has_quota(),
+        common::github_api_has_quota(),
         "skipping auto-equip allowlist e2e: github's api quota is spent, and the `aqua:` tool \
          resolves its release through it"
     );
@@ -6805,7 +6751,7 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
         "skipping fresh `mise:` package app e2e: the network is unreachable"
     );
     need_reachable!(
-        github_api_has_quota(),
+        common::github_api_has_quota(),
         "skipping fresh `mise:` package app e2e: github's api quota is spent, and the `mise:aqua:` tool \
          resolves its release through it"
     );
@@ -6946,7 +6892,7 @@ fn a_global_app_splits_mise_pools_across_two_projects() {
         "skipping mise-split two-project e2e: the network is unreachable"
     );
     need_reachable!(
-        github_api_has_quota(),
+        common::github_api_has_quota(),
         "skipping mise-split two-project e2e: github's api quota is spent, and the `mise:aqua:` tool \
          resolves its release through it"
     );
@@ -7058,7 +7004,7 @@ fn a_global_apps_project_mise_tool_lands_in_the_per_project_pool() {
         "skipping Lane-2 pool e2e: the network is unreachable"
     );
     need_reachable!(
-        github_api_has_quota(),
+        common::github_api_has_quota(),
         "skipping Lane-2 pool e2e: github's api quota is spent, and the `mise:aqua:` tool \
          resolves its release through it"
     );
@@ -7146,7 +7092,7 @@ fn a_shared_pool_lets_the_second_app_reuse_what_the_first_installed() {
         "skipping shared-pool e2e: the network is unreachable"
     );
     need_reachable!(
-        github_api_has_quota(),
+        common::github_api_has_quota(),
         "skipping shared-pool e2e: github's api quota is spent, and the `mise:aqua:` tool resolves \
          its release through it"
     );
@@ -7259,7 +7205,7 @@ fn sbx_upgrade_mise_rolls_a_mise_package_in_cage() {
         "skipping mise: package upgrade e2e: the network is unreachable"
     );
     need_reachable!(
-        github_api_has_quota(),
+        common::github_api_has_quota(),
         "skipping mise: package upgrade e2e: github's api quota is spent, and the `mise:aqua:` tool \
          resolves its release through it"
     );
@@ -7350,7 +7296,7 @@ fn sbx_upgrade_mise_rolls_a_global_apps_app_global_tool() {
         "skipping global-app mise upgrade e2e: the network is unreachable"
     );
     need_reachable!(
-        github_api_has_quota(),
+        common::github_api_has_quota(),
         "skipping global-app mise upgrade e2e: github's api quota is spent, and the `mise:aqua:` tool \
          resolves its release through it"
     );
@@ -10728,7 +10674,8 @@ error: builder for '/nix/store/aaaa-sbx-gui-data.drv' failed with exit code 1
 /// `sbx upgrade` folds nix's stderr into a sentence of its own, so its failures are read after that
 /// sentence, from nix's error on: a download that failed there is the network's, tried once more as
 /// a launch is. A retry warning, whatever it carries, is not nix's error, and a resolution that
-/// failed for good is the host's even beside one that failed on a download.
+/// failed for good is the host's even beside one that failed on a download. One sbx killed at its
+/// deadline is the network's, quoted whole.
 #[test]
 fn an_upgrade_that_failed_on_a_download_is_read_from_nixs_error_and_not_its_warnings() {
     use common::{Probe, metadata_fetch_fault, probe_with};
@@ -10798,6 +10745,11 @@ metadata github:numtide/flake-utils` failed: error: … while fetching the input
 'github:numtide/flake-utils' error: unable to download \
 'https://api.github.com/repos/numtide/flake-utils/commits/HEAD': HTTP error 404
 ";
+    // Measured with the deadline brought down to two seconds: nix gave no error, so sbx's own
+    // sentence is what is quoted.
+    const STALLED: &str = "sbx: cannot upgrade the nixpkgs channel: `nix flake metadata \
+github:NixOS/nixpkgs/nixos-unstable` did not answer within 2 seconds and was killed
+";
     // No resolution ran: the engine itself is missing.
     const NO_NIX: &str = "sbx: nix is not installed — cannot upgrade. See `sbx doctor`.\n";
     // nix's own line from a launch, which carries no sentence of sbx's: not this reader's to read.
@@ -10824,6 +10776,18 @@ metadata github:numtide/flake-utils` failed: error: … while fetching the input
             matches!(verdict, Probe::Ran(_)) && calls == 2,
             "one that failed on a download once is tried again: {verdict:?} after {calls}"
         );
+    }
+
+    match drive(&[output(1, STALLED)]) {
+        (Probe::Unreachable(why), 2) => assert_eq!(
+            why,
+            "`nix flake metadata github:NixOS/nixpkgs/nixos-unstable` did not answer within 2 \
+             seconds and was killed"
+        ),
+        (other, calls) => panic!(
+            "a resolution killed at its deadline is the network's, after two tries: {other:?} \
+             after {calls}"
+        ),
     }
 
     for shape in [
