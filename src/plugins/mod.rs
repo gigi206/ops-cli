@@ -661,11 +661,20 @@ impl PluginRegistry {
     /// Core of [`load`](Self::load) with the environment expansion injected, so the path
     /// expansion is testable without touching the process environment.
     fn load_with(plugins_dir: &Path, exp: &Expansion, warnings: &mut Vec<String>) -> Self {
-        let mut dirs: Vec<PathBuf> = match std::fs::read_dir(plugins_dir) {
+        // Each entry is judged by its own type, never by what a link points at: a plugin is
+        // trusted because its tree sits under this owner-only directory, and a link resolves
+        // elsewhere, so following one would run, as code in the trusted computing base, whatever
+        // can write its target. An install never places a link (it refuses one anywhere in the
+        // tree), so a link to a directory here was placed by hand, and it is named rather than
+        // followed. A link to anything else was never a plugin and is passed over as a file is.
+        let mut dirs: Vec<(PathBuf, bool)> = match std::fs::read_dir(plugins_dir) {
             Ok(entries) => entries
                 .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
+                .filter_map(|e| {
+                    let ft = e.file_type().ok()?;
+                    let link = ft.is_symlink() && e.path().is_dir();
+                    (ft.is_dir() || link).then(|| (e.path(), link))
+                })
                 .collect(),
             // No plugins directory means no plugins — the common case, not an error.
             Err(_) => return Self::default(),
@@ -679,7 +688,16 @@ impl PluginRegistry {
         let mut signers: BTreeMap<String, signer::SignerPlugin> = BTreeMap::new();
         let mut conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut name_conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for dir in dirs {
+        for (dir, link) in dirs {
+            if link {
+                let name = dir.file_name().and_then(OsStr::to_str).unwrap_or("?");
+                warnings.push(format!(
+                    "plugins: ignoring `{name}` — it is a symbolic link, and a plugin is trusted \
+                     by where its tree sits: remove the link and install the tree it points at \
+                     with `sbx plugins install <dir>`"
+                ));
+                continue;
+            }
             let plugin = match load_one(&dir, exp) {
                 Ok(Some(plugin)) => plugin,
                 // Not a plugin directory (no manifest) — skip quietly.
@@ -2973,6 +2991,40 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "a bare directory must not warn: {warnings:?}"
+        );
+    }
+
+    /// A plugin is trusted because its tree sits under the owner-only plugins directory, so a link
+    /// placed there, which resolves to a tree elsewhere, is named and skipped rather than followed:
+    /// the resolver cage would run whatever can write the target. A link to a file was never a
+    /// plugin and stays quiet, and a real directory beside them, the witness, still loads.
+    #[test]
+    fn a_symbolic_link_in_the_plugins_directory_is_named_and_not_followed() {
+        let root = crate::testutil::TmpDir::new();
+        let outside = crate::testutil::TmpDir::new();
+        let plugins = root.path().join("plugins");
+        let manifest = |name: &str| {
+            format!("name=\"{name}\"\ntype=\"resolver\"\nscheme=\"{name}\"\nexec=\"run\"\n")
+        };
+        write_plugin(&plugins, "real", &manifest("real"));
+        write_plugin(outside.path(), "tree", &manifest("linked"));
+        std::os::unix::fs::symlink(outside.path().join("tree"), plugins.join("linked")).unwrap();
+        fs::write(outside.path().join("notes"), "").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("notes"), plugins.join("notes")).unwrap();
+
+        let (reg, warnings) = load(&plugins);
+        assert!(
+            reg.resolver("real").is_some(),
+            "the witness loads: {warnings:?}"
+        );
+        assert!(
+            reg.resolver("linked").is_none(),
+            "a link is never followed into a plugin"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("`linked`") && warnings[0].contains("symbolic link"),
+            "the link is named, and why it is skipped: {warnings:?}"
         );
     }
 

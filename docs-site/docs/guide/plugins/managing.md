@@ -51,7 +51,9 @@ in.
 
 Plugins live under the owner-only (`0700`) data directory, which a project (which
 writes only the project directory) cannot plant into: so the registry is
-**trusted by location**. Loading a plugin *neither runs nor provisions* anything;
+**trusted by location**. A link does not count: a symbolic link placed under
+`<data>/plugins/` reaches a tree outside that directory, so it is skipped with a
+warning rather than followed. Loading a plugin *neither runs nor provisions* anything;
 before it execs a resolver, the runner re-checks the executable is a regular file
 owned by you and not writable by group or other (stricter than the config-file
 safety gate, because this is code about to run in the TCB).
