@@ -1563,7 +1563,6 @@ const UNDOCUMENTED_MODULE_ITEMS: &[(&str, &str)] = &[
     ("sandbox/control/mod.rs", "Inner"),
     ("sandbox/control/mod.rs", "LogInner"),
     ("sandbox/control/mod.rs", "ManualInner"),
-    ("sandbox/gc.rs", "accumulate_usage"),
     ("sandbox/launch/mod.rs", "prepare_config"),
     ("sandbox/lens.rs", "Inner"),
     ("sandbox/netns.rs", "to_cstring"),

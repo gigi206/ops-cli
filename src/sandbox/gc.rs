@@ -2130,6 +2130,13 @@ fn unread(e: &io::Error) -> u64 {
     u64::from(e.kind() != io::ErrorKind::NotFound)
 }
 
+/// Add up everything under the directory `path` into `usage`, `skip` aside.
+///
+/// The directories still to list are held on the heap rather than in a native frame each: the walk
+/// descends into trees a cage writes, whose depth it does not choose, and one frame per level
+/// overran the stack of a thread that is not the main one (2 MiB by default) on a chain of two
+/// thousand directories. Each directory is listed to its end before the next is opened, so the
+/// walk holds one descriptor whatever the depth.
 fn accumulate_usage(
     path: &Path,
     skip: &[PathBuf],
@@ -2137,42 +2144,45 @@ fn accumulate_usage(
     usage: &mut TreeUsage,
 ) {
     use std::os::unix::fs::MetadataExt;
-    let entries = match std::fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(e) => {
-            usage.unreadable += unread(&e);
-            return;
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
             Err(e) => {
                 usage.unreadable += unread(&e);
                 continue;
             }
         };
-        let child = entry.path();
-        if skip.contains(&child) {
-            continue;
-        }
-        // A directory whose own entry cannot be examined cannot be listed either, so it is counted
-        // once here rather than descended into.
-        let m = match child.symlink_metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                usage.unreadable += unread(&e);
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    usage.unreadable += unread(&e);
+                    continue;
+                }
+            };
+            let child = entry.path();
+            if skip.contains(&child) {
                 continue;
             }
-        };
-        // Only a multiply-linked file can be reached twice, so only those need remembering.
-        if !m.is_dir() && m.nlink() > 1 && !seen.insert((m.dev(), m.ino())) {
-            continue;
-        }
-        usage.bytes += m.blocks() * 512;
-        usage.inodes += 1;
-        if m.is_dir() {
-            accumulate_usage(&child, skip, seen, usage);
+            // A directory whose own entry cannot be examined cannot be listed either, so it is
+            // counted once here rather than descended into.
+            let m = match child.symlink_metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    usage.unreadable += unread(&e);
+                    continue;
+                }
+            };
+            // Only a multiply-linked file can be reached twice, so only those need remembering.
+            if !m.is_dir() && m.nlink() > 1 && !seen.insert((m.dev(), m.ino())) {
+                continue;
+            }
+            usage.bytes += m.blocks() * 512;
+            usage.inodes += 1;
+            if m.is_dir() {
+                pending.push(child);
+            }
         }
     }
 }
@@ -3706,6 +3716,37 @@ mod tests {
 
         // A root that is not there is nothing unread.
         assert_eq!(tree_usage(&tmp.path().join("absent")), TreeUsage::default());
+    }
+
+    /// A cage can make a tree as deep as it likes in a directory it writes, and `sbx store` sizes
+    /// its subtrees on threads of their own: a walk taking one native frame per level would abort
+    /// the process there. The walk runs on a small stack, which a few thousand levels overflow; the
+    /// tree stays shallow enough for every path in it to resolve, for the reason
+    /// `a_tree_deeper_than_its_stack_is_removed` gives.
+    #[test]
+    fn a_tree_deeper_than_its_stack_is_sized() {
+        let tmp = TmpDir::new();
+        let root = tmp.path().join("deep");
+        let mut dir = root.clone();
+        for _ in 0..1_800 {
+            dir.push("a");
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bottom"), b"x").unwrap();
+
+        let sizing = root.clone();
+        let usage = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || tree_usage(&sizing))
+            .unwrap()
+            .join()
+            .unwrap();
+        force_remove_dir_all(&root).expect("the deep tree is removed");
+        assert_eq!(
+            (usage.inodes, usage.unreadable),
+            (1 + 1_800 + 1, 0),
+            "every level and the file at the bottom: {usage:?}"
+        );
     }
 
     /// A symlink is sized as the link, never as the tree it points at — the root of the walk as
