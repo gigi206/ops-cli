@@ -70,13 +70,40 @@ pub(crate) fn stage(data_dir: &Path, content: &str) -> io::Result<(PathBuf, Stri
 fn content_hash(content: &str) -> String {
     let mut h = Sha256::new();
     h.update(content.as_bytes());
-    crate::plugins::catalogue::to_hex(&h.finalize()[..8])
+    crate::plugins::catalogue::to_hex(&h.finalize()[..CONTENT_HASH_BYTES])
+}
+
+/// How many bytes of the source's SHA-256 [`content_hash`] keeps.
+const CONTENT_HASH_BYTES: usize = 8;
+
+/// Whether `s` has the shape of a [`content_hash`]: the lowercase hex of its bytes. What follows
+/// `<name>-` in a build out-link is one, which is how a reader tells that out-link from the one of
+/// a flake whose own name begins with `<name>-`.
+pub(crate) fn is_content_hash(s: &str) -> bool {
+    s.len() == 2 * CONTENT_HASH_BYTES && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    /// A content hash reads back as one, and a name that merely follows a dash does not.
+    #[test]
+    fn a_content_hash_is_told_from_a_name() {
+        assert!(is_content_hash(&content_hash(
+            "{ outputs = { self }: {}; }\n"
+        )));
+        for not_one in [
+            "bar",
+            "deadbeef",
+            "0123456789ABCDEF",
+            "0123456789abcdef0",
+            "bar-0123456789ab",
+        ] {
+            assert!(!is_content_hash(not_one), "{not_one}");
+        }
+    }
 
     #[test]
     fn stage_writes_flake_nix_content_keyed_and_idempotent() {

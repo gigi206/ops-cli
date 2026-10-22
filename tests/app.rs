@@ -289,11 +289,12 @@ fn show_detects_an_inline_flake_built_into_the_home() {
         "demo-app",
         "cmd = \"demo\"\n\n[flakes.agent]\nattr = \"default\"\nflake = \"{ outputs = { self }: {}; }\"\n",
     );
-    // The launch names an inline flake's out-link `<name>-<hash>`; `flake_built` matches it by the
-    // declared name's prefix, so a hash-suffixed link stands in for a real build.
+    // The launch names an inline flake's out-link `<name>-<hash>`, the hash sixteen lowercase hex
+    // digits; `flake_built` matches it by the declared name and that shape, so a hash-suffixed link
+    // stands in for a real build.
     fx.build_flake(
         "demo-app",
-        "agent-0f1e2d3c",
+        "agent-0f1e2d3c4b5a6978",
         "abcd1234abcd1234abcd1234abcd1234abcd1234-agent-2.0",
     );
 

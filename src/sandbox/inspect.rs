@@ -550,6 +550,11 @@ pub(crate) fn flake_built(home: &Path, name: &str) -> Option<String> {
 /// when `dir` has no matching out-link. Factored out so [`flake_built`] can try the current and legacy
 /// directories in turn.
 ///
+/// The stable out-link `<name>` is read first, since it is the one `PATH` resolves through; a build
+/// out-link `<name>-<hash>` answers only without it, the first by name where there are several. The
+/// hash is matched by its shape ([`super::flake_inline::is_content_hash`]), so the out-link of
+/// another flake whose name begins with `<name>-` is not taken for this one.
+///
 /// The label is run through [`crate::sandbox::sanitize`] for the same reason every name in
 /// [`mise_installed_in`] is: the out-link directory sits in the cage's own writable home and the
 /// link is written by the in-cage `nix build`, so its target — and therefore this label — is text
@@ -557,22 +562,33 @@ pub(crate) fn flake_built(home: &Path, name: &str) -> Option<String> {
 /// escape sequences that let one line of `sbx app show` erase the lines above it and assert a
 /// package is built, trusted, or at a version it is not.
 fn flake_built_in(dir: &Path, name: &str) -> Option<String> {
-    let prefix = format!("{name}-");
+    let mut stable = None;
+    let mut builds = Vec::new();
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let fname = entry.file_name().to_string_lossy().into_owned();
-        if fname != name && !fname.starts_with(&prefix) {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
             continue;
+        };
+        if file_name == name {
+            stable = Some(entry.path());
+        } else if file_name
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(super::flake_inline::is_content_hash)
+        {
+            builds.push(entry.path());
         }
-        // The out-link target's basename, minus the store hash, is a friendly `<pname>-<version>`.
-        let detail = std::fs::read_link(entry.path())
-            .ok()
-            .and_then(|t| t.file_name().map(|f| f.to_string_lossy().into_owned()))
-            .and_then(|base| base.split_once('-').map(|(_, rest)| rest.to_string()))
-            .map(|detail| crate::sandbox::sanitize(&detail))
-            .unwrap_or_else(|| "built".to_string());
-        return Some(detail);
     }
-    None
+    builds.sort();
+    let link = stable.or_else(|| builds.into_iter().next())?;
+    // The out-link target's basename, minus the store hash, is a friendly `<pname>-<version>`.
+    let detail = std::fs::read_link(link)
+        .ok()
+        .and_then(|t| t.file_name().map(|f| f.to_string_lossy().into_owned()))
+        .and_then(|base| base.split_once('-').map(|(_, rest)| rest.to_string()))
+        .map(|detail| crate::sandbox::sanitize(&detail))
+        .unwrap_or_else(|| "built".to_string());
+    Some(detail)
 }
 
 /// The store path names the shared store holds, for [`store_built_here_against`]. Read once by a
@@ -1430,7 +1446,7 @@ mod tests {
         assert!(flake_built(home, "other").is_none());
         std::os::unix::fs::symlink(
             "/nix/store/abcd1234abcd1234abcd1234abcd1234abcd1234-other-1.0",
-            flake.join("other-deadbeef"),
+            flake.join("other-0123456789abcdef"),
         )
         .unwrap();
         assert!(flake_built(home, "other").is_some());
@@ -1463,6 +1479,57 @@ mod tests {
         );
         // Filtered, not dropped: the honest part of the label still reads back.
         assert!(label.starts_with("x-1.0 "), "unexpected label: {label:?}");
+    }
+
+    /// The out-link directory of a home, with `links` as `(out-link name, store path)`.
+    fn flake_home(links: &[(&str, &str)]) -> crate::testutil::TmpDir {
+        let scratch = crate::testutil::TmpDir::new();
+        let flake = scratch.path().join(crate::sandbox::binds::FLAKE_ROOTS_REL);
+        std::fs::create_dir_all(&flake).unwrap();
+        for (link, target) in links {
+            std::os::unix::fs::symlink(target, flake.join(link)).unwrap();
+        }
+        scratch
+    }
+
+    /// Another flake whose name begins with `<name>-` is not this one: its stable out-link does not
+    /// say `<name>` is built.
+    #[test]
+    fn a_sibling_flakes_stable_out_link_is_not_taken_for_this_one() {
+        let home = flake_home(&[(
+            "demo-tool",
+            "/nix/store/9d2v9068xl6f926gl4hbkyfixh8ar0yw-demo-tool-1.0",
+        )]);
+        assert_eq!(flake_built(home.path(), "demo"), None);
+    }
+
+    /// Nor does its build out-link, whose hash follows its own name rather than `<name>-`.
+    #[test]
+    fn a_sibling_flakes_build_out_link_is_not_taken_for_this_one() {
+        let home = flake_home(&[(
+            "demo-tool-0123456789abcdef",
+            "/nix/store/9d2v9068xl6f926gl4hbkyfixh8ar0yw-demo-tool-1.0",
+        )]);
+        assert_eq!(flake_built(home.path(), "demo"), None);
+    }
+
+    /// Beside a build out-link, the stable one is what is reported: it is the build `PATH` uses.
+    #[test]
+    fn the_stable_out_link_is_reported_before_a_build_one() {
+        let home = flake_home(&[
+            (
+                "demo-0123456789abcdef",
+                "/nix/store/9d2v9068xl6f926gl4hbkyfixh8ar0yw-demo-1.0",
+            ),
+            (
+                "demo",
+                "/nix/store/9d2v9068xl6f926gl4hbkyfixh8ar0yw-demo-2.0",
+            ),
+        ]);
+        assert_eq!(
+            flake_built(home.path(), "demo").as_deref(),
+            Some("demo-2.0")
+        );
     }
 
     #[test]
