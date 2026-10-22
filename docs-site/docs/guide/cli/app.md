@@ -588,14 +588,16 @@ version, rather than compared as text: a pool whose `latest` points at the versi
 names is asking for it.
 
 A third source joins them for a per-project pool: the activation record of every other app that
-has a pool in the same project. Where the project sets
+has run in the same project, whether or not it installed anything there. Where the project sets
 [`apps_share_install_pools`](../configuration/packages#apps_share_install_pools-when-two-apps-in-one-project-equip-the-same-tool),
 a version this app equipped and no longer asks for may be the one a neighbour found here and
 therefore never installed itself, and a sweep reading this app's records alone would take it out
 from under a neighbour. Those records are read whether or not the project shares its pools: with
 sharing off they name versions no launch resolves from this pool, so reading them can only keep a
 version, never remove one. A project that does not share therefore sees `--stale` free the same
-disk or a little less, never more.
+disk or a little less, never more. The neighbour most likely to rely on this pool is one that
+found everything here, so it is counted even when its own pool holds nothing; and a project whose
+list of apps cannot be read leaves the pool alone, as an unreadable file below does.
 
 What it deliberately leaves alone: a tool no activation mentions at all (that may mean the file
 asking for it was not among those read, and a tool the app does not declare is what plain
