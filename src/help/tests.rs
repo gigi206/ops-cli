@@ -312,6 +312,32 @@ fn unwrapped_source(text: &str) -> String {
     out
 }
 
+/// The inline-code spans of a source that quote an `sbx` command: each opens with a backtick and
+/// `sbx`, and runs to the next backtick.
+///
+/// Found by their opening rather than by pairing backticks from the top of the file, because a
+/// source is not one text the way a page's prose is: a lone backtick in a char literal or a message
+/// flips every pairing after it, and a split on the backtick then reads each command quoted beyond
+/// it as prose and each stretch of prose as a span, so the rest of that file goes unchecked without
+/// a word.
+fn sbx_spans(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices("`sbx").filter_map(|(at, _)| {
+        let span = &text[at + 1..];
+        span.find('`').map(|end| &span[..end])
+    })
+}
+
+/// A command quoted after a lone backtick is still read, where pairing backticks from the top of
+/// the file takes it for prose.
+#[test]
+fn a_command_quoted_after_a_lone_backtick_is_still_read() {
+    let text = "let tick = '`'; // run `sbx session stop`, then `sbx gc`";
+    assert_eq!(
+        sbx_spans(text).collect::<Vec<_>>(),
+        ["sbx session stop", "sbx gc"]
+    );
+}
+
 /// No source sends a reader to a command the binary does not have, either.
 ///
 /// [`no_page_names_a_command_the_binary_does_not_have`] guards the help table, which is where a
@@ -338,7 +364,7 @@ fn no_source_names_a_command_the_binary_does_not_have() {
     for path in crate::testutil::crate_sources() {
         let text = unwrapped_source(&std::fs::read_to_string(&path).expect("a crate source"));
         let shown = path.display().to_string();
-        for span in text.split('`').skip(1).step_by(2) {
+        for span in sbx_spans(&text) {
             let mut words = span.split_whitespace();
             if words.next() != Some("sbx") {
                 continue;
