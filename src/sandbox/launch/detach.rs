@@ -14,9 +14,15 @@ use super::build::build;
 use super::cage::{exec, register, run_status};
 use super::*;
 
-/// The byte the detached child writes to the readiness pipe once the cage is built, registered,
-/// and its log is open — the parent treats any other outcome (a closed pipe, no byte) as failure.
+/// The byte the detached child writes to the readiness pipe once the cage is built and recorded and
+/// its log is open — the parent treats any outcome but this byte or [`DETACH_READY_UNRECORDED`] (a
+/// closed pipe, no byte) as failure.
 const DETACH_READY: u8 = 1;
+
+/// The readiness byte of a daemon whose session could not be recorded: it runs, but `sbx session`
+/// can neither list, attach to nor stop it, so the parent's announcement does not offer those
+/// verbs.
+const DETACH_READY_UNRECORDED: u8 = 2;
 
 /// Launch the cage as a background daemon and return to the caller's shell once it is ready.
 ///
@@ -121,14 +127,15 @@ fn detached_child(
         // so the parent reports failure.
         Err(_) => fail_detached(write_fd, None),
     };
-    register(
+    let recorded = register(
         prep.layout.data_dir(),
         &spec,
         kind,
         runtime,
         true,
         store_lock,
-    );
+    )
+    .is_some();
 
     // Open the session log before signalling ready: a daemon whose output we cannot capture is
     // not ready. Its name is keyed by this process's pid — the session id the parent reports.
@@ -164,7 +171,7 @@ fn detached_child(
         fail_detached(write_fd, guard);
     }
     // Ready: tell the parent, and drop the pipe.
-    signal_detach_ready(write_fd);
+    signal_detach_ready(write_fd, recorded);
     // SAFETY: the readiness byte has been written and this daemon has been the write end's only
     // owner since the fork, so this is its single close.
     unsafe { libc::close(write_fd) };
@@ -238,21 +245,14 @@ fn detach_parent(
     let mut pipe = unsafe { File::from_raw_fd(read_fd) };
     let mut byte = [0u8; 1];
     use std::io::Read;
-    if matches!(pipe.read(&mut byte), Ok(1) if byte[0] == DETACH_READY) {
+    let read = pipe.read(&mut byte);
+    if let Some(recorded) = readiness(matches!(read, Ok(1)).then_some(byte[0])) {
         let log = detach_log_path(data_dir, child as u32);
         crate::diag::error(&format!(
             "sbx: started `{label}` as detached session {child} (logs: {})",
             log.display()
         ));
-        // `sbx session logs` takes the id explicitly and the registry drops a session's record the
-        // moment it dies, so this line is the one place the id and the way to read its output
-        // appear together — name the log verb here or a session that fails overnight leaves the
-        // user with a path they must reconstruct by hand.
-        crate::diag::hint(&format!(
-            "sbx: `sbx session logs {child}` shows its output (`-f` to follow), \
-             `sbx session attach {child}` opens a shell inside its live cage, \
-             `sbx session stop {child}` ends it; `sbx session ls` lists it."
-        ));
+        crate::diag::hint(&started_hint(child, recorded));
         ExitCode::SUCCESS
     } else {
         // The daemon closed the pipe without signalling success: it failed before launch. Reap it,
@@ -274,6 +274,48 @@ fn detach_parent(
         };
         crate::diag::error(&failed_start(reaped.then_some(status)));
         ExitCode::FAILURE
+    }
+}
+
+/// Whether the daemon is ready, from the byte it wrote to the readiness pipe (`None` when it wrote
+/// none): `Some` of whether its session was recorded, `None` for a daemon that is not ready.
+fn readiness(byte: Option<u8>) -> Option<bool> {
+    match byte {
+        Some(DETACH_READY) => Some(true),
+        Some(DETACH_READY_UNRECORDED) => Some(false),
+        _ => None,
+    }
+}
+
+/// The readiness byte for a daemon whose session was `recorded`, or not.
+fn ready_byte(recorded: bool) -> u8 {
+    if recorded {
+        DETACH_READY
+    } else {
+        DETACH_READY_UNRECORDED
+    }
+}
+
+/// The verbs the parent names after announcing detached session `child`.
+///
+/// `sbx session logs` takes the id explicitly and the registry drops a session's record the moment
+/// it dies, so this line is the one place the id and the way to read its output appear together —
+/// name the log verb here or a session that fails overnight leaves the user with a path they must
+/// reconstruct by hand. A session that could not be `recorded` is one `sbx session` does not know:
+/// its log is still read by id, but the other verbs would not find it and a follow would stop at
+/// once, so the line says so rather than offer them.
+fn started_hint(child: libc::pid_t, recorded: bool) -> String {
+    if recorded {
+        format!(
+            "sbx: `sbx session logs {child}` shows its output (`-f` to follow), \
+             `sbx session attach {child}` opens a shell inside its live cage, \
+             `sbx session stop {child}` ends it; `sbx session ls` lists it."
+        )
+    } else {
+        format!(
+            "sbx: `sbx session logs {child}` shows its output so far; the session could not be \
+             recorded, so `sbx session` will not list, attach to or stop it, nor follow its log."
+        )
     }
 }
 
@@ -535,13 +577,14 @@ fn fail_detached(write_fd: libc::c_int, guard: Option<LaunchGuard>) -> ! {
     std::process::exit(1);
 }
 
-/// Write the readiness byte to the pipe. A failed write does not stop this daemon, so the session
-/// runs whatever the parent concludes. One byte into a fresh pipe nothing else writes fails only
-/// when the reading end is gone (`EPIPE`), that is when the parent is no longer there to conclude
-/// anything; a parent that were still reading would take the closed pipe for a failure to start,
-/// say so, and wait for this daemon, which is to say for the session to end.
-fn signal_detach_ready(write_fd: libc::c_int) {
-    let byte = [DETACH_READY];
+/// Write the readiness byte to the pipe ([`ready_byte`], which tells the parent whether the session
+/// was `recorded`). A failed write does not stop this daemon, so the session runs whatever the
+/// parent concludes. One byte into a fresh pipe nothing else writes fails only when the reading end
+/// is gone (`EPIPE`), that is when the parent is no longer there to conclude anything; a parent
+/// that were still reading would take the closed pipe for a failure to start, say so, and wait for
+/// this daemon, which is to say for the session to end.
+fn signal_detach_ready(write_fd: libc::c_int, recorded: bool) {
+    let byte = [ready_byte(recorded)];
     // SAFETY: writing one byte to a pipe end we own.
     unsafe {
         libc::write(write_fd, byte.as_ptr() as *const libc::c_void, 1);

@@ -33,6 +33,14 @@ derives its runtime id from: so the registry and the runtime never disagree.
 | [`sbx run`](../cli/run) | while the shell runs (unlinked on exit) |
 | interactive [`sbx app`](../cli/app) | while the app runs |
 
+A launch whose record cannot be written still runs, and says so on its terminal: sbx then takes
+the session for one that is not running. `sbx session` does not list, attach to or stop it, and a
+detached one's log is still read by id with `sbx session logs <id>`, but not followed. The verbs
+that refuse to act under a running sandbox do not refuse for it: [`sbx gc`](../cli/gc),
+[`sbx projects rm`](../cli/projects), [`sbx app rm --purge` and `sbx app prune`](../cli/app),
+[`sbx storage use` and `sbx storage migrate`](../cli/storage). A detached launch's announcement then
+names its log alone, not the session verbs.
+
 ## Listing, attaching, stopping
 
 ```sh

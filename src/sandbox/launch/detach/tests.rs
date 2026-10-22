@@ -377,3 +377,65 @@ fn a_daemon_a_signal_ended_is_reported_by_its_signal() {
     let unreaped = super::failed_start(None);
     assert!(unreaped.contains("see the error above"), "{unreaped}");
 }
+
+/// The readiness byte says whether the daemon's session was recorded, and the parent reads back what
+/// the daemon wrote: a recorded session and an unrecorded one are both ready, and any other byte, or
+/// none, is a daemon that is not.
+#[test]
+fn the_readiness_byte_carries_whether_the_session_was_recorded() {
+    assert_eq!(readiness(Some(ready_byte(true))), Some(true));
+    assert_eq!(readiness(Some(ready_byte(false))), Some(false));
+    assert_eq!(readiness(None), None);
+    assert_eq!(readiness(Some(0)), None);
+    assert_eq!(readiness(Some(3)), None);
+}
+
+/// The announcement of a session `sbx session` knows names its verbs. That of a session that could
+/// not be recorded names its log alone and says why.
+#[test]
+fn a_session_that_could_not_be_recorded_is_not_offered_the_session_verbs() {
+    let recorded = started_hint(4242, true);
+    for verb in [
+        "sbx session logs 4242",
+        "sbx session attach 4242",
+        "sbx session stop 4242",
+        "sbx session ls",
+    ] {
+        assert!(recorded.contains(verb), "{verb} is not named: {recorded}");
+    }
+    let unrecorded = started_hint(4242, false);
+    for said in ["sbx session logs 4242", "could not be recorded"] {
+        assert!(
+            unrecorded.contains(said),
+            "{said} is not said: {unrecorded}"
+        );
+    }
+    for verb in [
+        "sbx session attach",
+        "sbx session stop",
+        "sbx session ls",
+        "-f",
+    ] {
+        assert!(
+            !unrecorded.contains(verb),
+            "{verb} is offered: {unrecorded}"
+        );
+    }
+}
+
+/// What the daemon writes to the readiness pipe is what its parent decodes: a recorded session reads
+/// back as recorded, an unrecorded one as ready but unrecorded.
+#[test]
+fn the_daemon_writes_the_readiness_its_parent_reads() {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    for recorded in [true, false] {
+        let (mut read, write) = std::io::pipe().unwrap();
+        signal_detach_ready(write.as_raw_fd(), recorded);
+        drop(write);
+        let mut written = Vec::new();
+        read.read_to_end(&mut written).unwrap();
+        assert_eq!(written.len(), 1, "one byte, for recorded = {recorded}");
+        assert_eq!(readiness(written.first().copied()), Some(recorded));
+    }
+}
