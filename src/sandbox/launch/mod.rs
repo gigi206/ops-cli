@@ -192,8 +192,7 @@ pub(crate) fn run(
         return code;
     }
 
-    // SAFETY: `isatty` only inspects fd 0.
-    let interactive = !detach && unsafe { libc::isatty(0) } == 1;
+    let interactive = !detach && io::stdin().is_terminal();
 
     // Observation runs on any path where a parent sbx survives the cage. Its inline stderr feed rides
     // only the non-tty foreground path under a non-enforcing `[proc]` mode; the launches that take it
@@ -656,8 +655,7 @@ pub(crate) fn app(
         return AppOutcome::plain(code);
     }
 
-    // SAFETY: `isatty` only inspects fd 0.
-    let interactive = !detach && unsafe { libc::isatty(0) } == 1;
+    let interactive = !detach && io::stdin().is_terminal();
     warn_observe_feed_absent(
         observe,
         interactive,
