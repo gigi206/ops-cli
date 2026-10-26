@@ -52,6 +52,11 @@ export OPENCODE_API_KEY=oc_…
   permit scopes agree.
 - **The key never enters the cage**, as with GitHub: the agent issues a plain
   request, the proxy adds the header on the wire.
+- **Not under a splice.** The shipped `opencode`, `opencode-v2` and
+  `opencode-web` profiles carry a commented `tcp://opencode.ai:443` line, the
+  raw splice the free models need. Leave it commented with this recipe: under a
+  splice the proxy never reads these requests, so the key is not injected and
+  nothing warns.
 
 ## Verifying
 

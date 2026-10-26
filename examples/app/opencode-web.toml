@@ -84,6 +84,15 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle opencode`, and what the
 # launch ends up with via `sbx config show --app opencode-web`.
 allow = [
+    # Free models without a key: uncomment the raw L4 splice below. The gateway serves a free-model
+    # request only over the client's own TLS connection, so through the inspecting proxy it answers
+    # `429 FreeUsageLimitError`; its own free-usage limit applies either way. The splice costs
+    # inspection on this host: no path or method matching, no capture, and a raw stream carries any
+    # payload, a WebSocket included. Keep it commented when you use an OpenCode key: the refusal
+    # concerns the free models, and a `[secret]` aimed at `opencode.ai` (see
+    # `examples/secrets/opencode`) is inert under the splice. A bare `--net` posture drops the line
+    # for that launch; restate it in a `--config` `[network]` table.
+    #"tcp://opencode.ai:443",
     # /share syncs a session to opencode's servers on demand (HTTPS POST, not a WebSocket).
     #"{*} https://opncd.ai",
     # A WebSocket is opened only by the OpenAI "Responses" transport, targeting the OpenAI
