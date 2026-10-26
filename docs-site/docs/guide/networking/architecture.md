@@ -699,10 +699,12 @@ under this reason. Neither is a certificate problem, and reading one as
 
 `upstream-cert-rejected` itself names the usual cause rather than the whole class it
 covers: every failure of the upstream TLS handshake arrives under it, so a reached host
-that speaks no TLS on the allowed port, or that answers the ClientHello too slowly,
-lands here beside a genuinely untrusted certificate. All of them are refusals and none
-is a downgrade, which is why they share one reason; when the certificate checks out by
-hand, look at what the port actually speaks.
+that speaks no TLS on the allowed port, that answers the ClientHello too slowly, or that
+speaks only HTTP/2 and refuses the proxy's ALPN `http/1.1` offer, lands here
+beside a genuinely untrusted certificate. All of them are refusals and none is a
+downgrade, which is why they share one reason; when the certificate checks out by hand,
+look at what the port actually speaks, and list an HTTP/2-only host in
+[`http2`](../configuration/network#http2-and-grpc).
 
 A transport failure is also *recorded*, not only answered, and where it fell is what a
 reader sees. A host that was never reached leaves one `error` line carrying the reason

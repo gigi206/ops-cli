@@ -217,11 +217,16 @@ impl ResolvesServerCert for CertResolver {
 /// interception never weakens the transport — a forged or self-signed upstream is rejected
 /// exactly as it would be without the proxy.
 ///
+/// It advertises ALPN `http/1.1`, the protocol every connection opened with it speaks, as an
+/// HTTP/1.1 client over TLS does: a ClientHello naming no protocol at all is a shape few clients
+/// send. A server that does not speak HTTP/1.1 either refuses the offer during the handshake or
+/// ignores it and fails on the first request.
+///
 /// Built once per process and shared: the root store is the same bundled set every time, and a
 /// shared config is what lets rustls resume sessions across connections.
 pub(crate) fn upstream_config() -> Arc<ClientConfig> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
-    Arc::clone(CONFIG.get_or_init(|| Arc::new(upstream_client(Vec::new()))))
+    Arc::clone(CONFIG.get_or_init(|| Arc::new(upstream_client(vec![b"http/1.1".to_vec()]))))
 }
 
 /// A client config anchored on the bundled roots, advertising `alpn`.
@@ -269,7 +274,7 @@ mod tests {
     fn the_upstream_configs_are_built_once_and_shared() {
         assert!(Arc::ptr_eq(&upstream_config(), &upstream_config()));
         assert!(Arc::ptr_eq(&upstream_config_h2(), &upstream_config_h2()));
-        assert!(upstream_config().alpn_protocols.is_empty());
+        assert_eq!(upstream_config().alpn_protocols, vec![b"http/1.1".to_vec()]);
         assert_eq!(upstream_config_h2().alpn_protocols, vec![b"h2".to_vec()]);
     }
 
