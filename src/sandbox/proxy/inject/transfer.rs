@@ -184,6 +184,7 @@ struct InjectionWire {
     rule: Rule,
     form: FormWire,
     by: Vec<String>,
+    by_other: crate::config::ByOther,
 }
 
 /// [`Form`] as it crosses: a signer is carried by its position in [`SetWire::signers`].
@@ -315,7 +316,12 @@ fn asking(set: &CredentialSet, id: u64) -> Option<Signer> {
 
 impl InjectionWire {
     fn from_injection(injection: &HeaderInjection, signers: &mut Handed) -> io::Result<Self> {
-        let HeaderInjection { rule, form, by } = injection;
+        let HeaderInjection {
+            rule,
+            form,
+            by,
+            by_other,
+        } = injection;
         let form = match form {
             Form::Fixed { header, value } => FormWire::Fixed {
                 header: header.clone(),
@@ -352,11 +358,17 @@ impl InjectionWire {
             rule: rule.clone(),
             form,
             by: by.clone(),
+            by_other: *by_other,
         })
     }
 
     fn into_injection(self, signers: &[Signer]) -> io::Result<HeaderInjection> {
-        let InjectionWire { rule, form, by } = self;
+        let InjectionWire {
+            rule,
+            form,
+            by,
+            by_other,
+        } = self;
         let form = match form {
             FormWire::Fixed { header, value } => Form::Fixed { header, value },
             FormWire::Signed {
@@ -399,7 +411,12 @@ impl InjectionWire {
                 })
             }
         };
-        Ok(HeaderInjection { rule, form, by })
+        Ok(HeaderInjection {
+            rule,
+            form,
+            by,
+            by_other,
+        })
     }
 }
 
@@ -473,6 +490,7 @@ mod tests {
         marker: Option<SecretMarker>,
     ) -> HeaderInjection {
         HeaderInjection {
+            by_other: crate::config::ByOther::Bare,
             by: Vec::new(),
             rule: crate::allowlist::classify(host).unwrap(),
             form: Form::Signed(Signed {
@@ -501,6 +519,7 @@ mod tests {
         CredentialSet {
             injections: vec![
                 HeaderInjection {
+                    by_other: crate::config::ByOther::Bare,
                     by: Vec::new(),
                     rule,
                     form: Form::Fixed {
@@ -543,8 +562,14 @@ mod tests {
     }
 
     fn same_injection(a: &HeaderInjection, b: &HeaderInjection) {
-        let HeaderInjection { rule, form, by } = a;
+        let HeaderInjection {
+            rule,
+            form,
+            by,
+            by_other,
+        } = a;
         assert_eq!(by, &b.by);
+        assert_eq!(by_other, &b.by_other);
         assert_eq!(rule, &b.rule);
         assert_eq!(rule.group, b.rule.group, "`==` ignores the group");
         assert_eq!(rule.builtin, b.rule.builtin, "`==` ignores `builtin`");

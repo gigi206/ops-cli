@@ -1547,6 +1547,7 @@ mod tests {
                 description: None,
             }],
             injections: vec![HeaderSecret {
+                by_other: crate::config::ByOther::Bare,
                 by: Vec::new(),
                 name: "upstream".into(),
                 description: None,

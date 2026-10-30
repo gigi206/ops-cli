@@ -1171,6 +1171,7 @@ fn raw_with_app(name: &str, app: RawApp) -> RawConfig {
 /// dependence on the default resolver order).
 fn a_header_secret() -> HeaderSecret {
     let raw = RawHostSecret {
+        by_other: None,
         by: None,
         name: None,
         description: None,
@@ -9242,6 +9243,7 @@ fn raw_secret(
     (
         to.into(),
         RawHostSecret {
+            by_other: None,
             by: None,
             name: None,
             description: None,
@@ -9317,6 +9319,7 @@ fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConf
 /// A `RawHostSecret` whose `from` is the given resolver-ref list, for the validation tests.
 fn raw_secret_from(from: Vec<&str>) -> RawHostSecret {
     RawHostSecret {
+        by_other: None,
         by: None,
         name: None,
         description: None,
@@ -9337,6 +9340,31 @@ fn raw_secret_from(from: Vec<&str>) -> RawHostSecret {
 /// fixed concrete target so the tests focus on the source form.
 fn validate(secret: RawHostSecret) -> Result<HeaderSecret, String> {
     vhs("api.github.com", secret, &SecretDefaults::default())
+}
+
+/// `by_other` reads `bare` or `deny`, defaults to `bare`, and is refused without a `by`, where it
+/// would say nothing.
+#[test]
+fn a_secrets_by_other_is_bare_or_deny_and_needs_a_by() {
+    let with = |by: Option<&[&str]>, by_other: Option<&str>| {
+        let mut secret = raw_secret_from(vec!["env://GH_TOKEN"]);
+        secret.by = by.map(|by| by.iter().map(|s| s.to_string()).collect());
+        secret.by_other = by_other.map(str::to_string);
+        validate(secret)
+    };
+    assert_eq!(with(Some(&["gh"]), None).unwrap().by_other, ByOther::Bare);
+    assert_eq!(
+        with(Some(&["gh"]), Some("bare")).unwrap().by_other,
+        ByOther::Bare
+    );
+    assert_eq!(
+        with(Some(&["gh"]), Some("deny")).unwrap().by_other,
+        ByOther::Deny
+    );
+    let e = with(Some(&["gh"]), Some("refuse")).unwrap_err();
+    assert!(e.contains("unknown `by_other`"), "{e}");
+    let e = with(None, Some("deny")).unwrap_err();
+    assert!(e.contains("`by_other` without `by`"), "{e}");
 }
 
 /// `by` names programs in three forms, each checked as it is written; one that matches no form is
@@ -10703,6 +10731,7 @@ fn an_apps_network_stats_toggle_is_warned_and_ignored() {
 /// A terse `RawHostSecret` — `key` only, no explicit `from` — for the expansion tests.
 fn terse(key: &str) -> RawHostSecret {
     RawHostSecret {
+        by_other: None,
         by: None,
         name: None,
         description: None,
@@ -10721,6 +10750,7 @@ fn terse(key: &str) -> RawHostSecret {
 /// `[secret.defaults]` — for the default-header/type tests.
 fn terse_bare(key: &str) -> RawHostSecret {
     RawHostSecret {
+        by_other: None,
         by: None,
         name: None,
         description: None,
@@ -11188,6 +11218,7 @@ fn signer_reading(name: &str, env: &[&str]) -> crate::plugins::signer::SignerPlu
 /// A credential formed by a signer, for the host-config tests.
 fn secret_signed_by(name: &str) -> RawHostSecret {
     RawHostSecret {
+        by_other: None,
         by: None,
         name: None,
         description: None,
@@ -12115,6 +12146,7 @@ fn an_untrusted_project_secret_section_steers_nothing() {
         hosts.insert(
             "api.github.com".to_string(),
             RawHostSecrets::One(RawHostSecret {
+                by_other: None,
                 by: None,
                 name: None,
                 description: None,

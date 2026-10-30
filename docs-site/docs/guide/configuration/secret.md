@@ -87,6 +87,7 @@ host ``) and in the `sbx config show --json` view, so the two spellings meet the
 | `sign` | a [signer plugin](../plugins/signer) that forms the credential **per request** |
 | `optional` | whether a launch may proceed when this credential does not resolve, its destination denied for the run; default `false`, which refuses the launch |
 | `by` | the programs the credential is injected for (a name, an absolute in-cage path, or `sha256:<hex>`); absent, every program of the cage; see [Held for named programs](#held-for-named-programs-by) |
+| `by_other` | what a request from any other program gets: `"bare"` (default) forwards it without the header, `"deny"` refuses it with a `403` (`by-mismatch`); only beside `by` |
 
 A secret must have **exactly one** of `key` or `from`. It must have a `header` and a
 `type`, either on itself or from `[secret.defaults]`: a secret that names neither is
@@ -292,7 +293,10 @@ Without `by`, every program in the cage that reaches `api.github.com` receives t
 agent's `curl` as much as `gh`. With it, the proxy asks which program holds the connection a request
 arrived on, and injects the credential only when it is one of those named. A request from any other
 program is forwarded **without** the header, so it reaches the host unauthenticated rather than being
-refused, and the tools that do not need the credential keep working.
+refused, and the tools that do not need the credential keep working. With `by_other = "deny"` it is
+refused instead, with a `403` whose `X-Sbx-Egress-Reason` is `by-mismatch`, so a program that was not
+meant to reach the host with the credential does not reach it at all; `sbx net logs` shows the
+refusal under that reason.
 
 Each entry names a program one of three ways:
 

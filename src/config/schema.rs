@@ -1583,6 +1583,10 @@ pub(crate) struct RawHostSecret {
     /// the credential; it is not a boundary: a program the cage can run can be made to act for
     /// another, and a bare name is the cage's to give to any file.
     pub(crate) by: Option<Vec<String>>,
+    /// What a request from a program `by` does not name gets: `"bare"` (the default) forwards it
+    /// without the header, `"deny"` refuses it with a `403` whose reason is `by-mismatch`. Only
+    /// meaningful beside `by`, and refused without it.
+    pub(crate) by_other: Option<String>,
 }
 
 /// The defaults declared once under `[secret.defaults]`: the resolver order and per-resolver

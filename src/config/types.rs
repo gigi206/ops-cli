@@ -352,6 +352,20 @@ pub(crate) struct HeaderSecret {
     /// The programs the credential is injected for, each a bare name, an absolute in-cage path, or
     /// `sha256:<hex>` (see [`crate::config::schema::RawHostSecret::by`]). Empty: every program.
     pub(crate) by: Vec<String>,
+    /// What a request from a program [`Self::by`] does not name gets.
+    pub(crate) by_other: ByOther,
+}
+
+/// What a request gets when its connection is held by a program a credential's `by` does not name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ByOther {
+    /// Forwarded without the credential: the host is reached unauthenticated, and the tools that do
+    /// not need the credential keep working.
+    #[default]
+    Bare,
+    /// Refused with a `403` (`by-mismatch`), so a program that was not meant to reach the host with
+    /// a credential does not reach it at all.
+    Deny,
 }
 
 impl HeaderSecret {

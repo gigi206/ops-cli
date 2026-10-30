@@ -2776,6 +2776,7 @@ mod tests {
     /// A minimal HTTP-header credential, for the secret-posture agreement below.
     fn a_header_secret() -> crate::config::HeaderSecret {
         crate::config::HeaderSecret {
+            by_other: crate::config::ByOther::Bare,
             by: Vec::new(),
             name: "api.example.com".into(),
             description: None,

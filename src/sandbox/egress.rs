@@ -1621,7 +1621,7 @@ fn resolve_one(
                 secret.header.clone(),
                 secret.shape.format(trimmed),
             )
-            .for_programs(&secret.by),
+            .for_programs(&secret.by, secret.by_other),
             needles,
         ));
     };
@@ -1669,6 +1669,7 @@ fn resolve_one(
                 body_digest: plugin.signer.body_digest,
             }),
             by: secret.by.clone(),
+            by_other: secret.by_other,
         },
         needles,
     ))
@@ -3517,6 +3518,7 @@ mod tests {
         shape: crate::config::HeaderShape,
     ) -> HeaderSecret {
         HeaderSecret {
+            by_other: crate::config::ByOther::Bare,
             by: Vec::new(),
             name: to.to_string(),
             description: None,
@@ -3542,6 +3544,7 @@ mod tests {
     /// running signer belongs to is the question being asked.
     fn standing_signer_for(host: &str, plugin: &str, key: &str) -> HeaderInjection {
         HeaderInjection {
+            by_other: crate::config::ByOther::Bare,
             by: Vec::new(),
             rule: crate::allowlist::classify(host).unwrap(),
             form: crate::sandbox::proxy::Form::Signed(crate::sandbox::proxy::Signed {

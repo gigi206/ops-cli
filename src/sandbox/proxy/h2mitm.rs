@@ -31,10 +31,10 @@ use super::inject::{CredentialSet, HeaderLookup, RequestFacts, pairs_for as inje
 use super::link::{Asked, Checked};
 use super::ssrf::{ConnectRefusal, ip_refusal};
 use super::{
-    AskPosture, ProxyCtx, SIGNER_REFUSED, SecretNeedle, StatKind, authority_bound_to,
-    carries_secret, decide_https, header_name_eq, is_connection_bound_challenge,
-    matching_injection_ids, note_final_status, redact_in_place, signer_refusal_message,
-    sni_bound_to, upstream_server_name,
+    AskPosture, BY_MISMATCH, BY_MISMATCH_MESSAGE, ProxyCtx, SIGNER_REFUSED, SecretNeedle, StatKind,
+    authority_bound_to, carries_secret, decide_https, header_name_eq,
+    is_connection_bound_challenge, matching_injection_ids, note_final_status, redact_in_place,
+    signer_refusal_message, sni_bound_to, upstream_server_name, withheld_by_deny,
 };
 use crate::allowlist::Rule;
 use crate::sandbox::control::{HttpVer, LogVerdict, Proto, RpcKind};
@@ -520,6 +520,26 @@ async fn relay(
     // allow — a refused stream would have been counted twice, once allowed and once blocked, which
     // is the same asymmetry between the plans that once made an h2 refusal invisible, inverted.
     let injected_ids = matching_injection_ids(creds, host, port, path, who, ctx);
+    // As on the HTTP/1.1 planes: a credential held for other programs under `by_other = "deny"`
+    // refuses the stream rather than letting it leave without the credential.
+    if withheld_by_deny(creds, host, port, path, who, ctx) {
+        ctx.outcome(
+            Proto::Https,
+            host,
+            port,
+            Some(method),
+            Some(path),
+            StatKind::Blocked,
+            BY_MISMATCH,
+        );
+        let _ = refuse_with_detail(
+            respond,
+            StatusCode::FORBIDDEN,
+            BY_MISMATCH,
+            BY_MISMATCH_MESSAGE,
+        );
+        return;
+    }
     // What a signer asking for a body digest is told here. A stream that ended with its headers has
     // no body, and the digest of nothing is exact and free. Anything else is **stated as unheld**:
     // this plan relays DATA frames as they arrive, and an h2 request half may legitimately never end

@@ -1912,6 +1912,7 @@ fn the_inventory_writes_what_a_declaration_chose_as_text_that_drives_nothing() {
     let mut task = probe_task();
     task.packages = vec!["T01\u{202e}X".into()];
     task.injections = vec![crate::config::HeaderSecret {
+        by_other: crate::config::ByOther::Bare,
         by: Vec::new(),
         name: "api.test".into(),
         description: None,

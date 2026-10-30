@@ -1109,6 +1109,7 @@ mod wiring_tests {
         let (process, _plugin) =
             crate::sandbox::signer::SignerProcess::stand_in(&["Authorization"]);
         let signed = HeaderInjection {
+            by_other: crate::config::ByOther::Bare,
             by: Vec::new(),
             rule: rule("signed.test"),
             form: Form::Signed(Signed {

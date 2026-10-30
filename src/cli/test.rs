@@ -1330,6 +1330,7 @@ mod tests {
             &p,
         );
         let secret = config::HeaderSecret {
+            by_other: crate::config::ByOther::Bare,
             by: Vec::new(),
             name: "api.test".into(),
             description: None,

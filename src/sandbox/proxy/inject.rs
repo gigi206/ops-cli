@@ -35,8 +35,11 @@ pub(crate) struct HeaderInjection {
     pub(crate) form: Form,
     /// The programs this credential is injected for (`[secret] by`), each a bare name, an absolute
     /// in-cage path or `sha256:<hex>`; empty for every program. A request whose connection is held
-    /// by none of them is forwarded without it ([`Self::injects_for`]).
+    /// by none of them is forwarded without it ([`Self::injects_for`]), or refused when
+    /// [`Self::by_other`] says so.
     pub(crate) by: Vec<String>,
+    /// What a request from a program [`Self::by`] does not name gets.
+    pub(crate) by_other: crate::config::ByOther,
 }
 
 /// The two ways a credential becomes headers on a request.
@@ -124,12 +127,15 @@ impl HeaderInjection {
                 value: value.into(),
             },
             by: Vec::new(),
+            by_other: crate::config::ByOther::Bare,
         }
     }
 
-    /// This injection, held for the programs `by` names.
-    pub(crate) fn for_programs(mut self, by: &[String]) -> Self {
+    /// This injection, held for the programs `by` names, a request from any other getting what
+    /// `by_other` says.
+    pub(crate) fn for_programs(mut self, by: &[String], by_other: crate::config::ByOther) -> Self {
         self.by = by.to_vec();
+        self.by_other = by_other;
         self
     }
 
@@ -210,7 +216,9 @@ impl HeaderInjection {
 impl fmt::Debug for HeaderInjection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("HeaderInjection");
-        s.field("rule", &self.rule).field("by", &self.by);
+        s.field("rule", &self.rule)
+            .field("by", &self.by)
+            .field("by_other", &self.by_other);
         match &self.form {
             Form::Fixed { header, .. } => s.field("header", header).field("value", &"<redacted>"),
             Form::Signed(signed) => s
@@ -2257,7 +2265,10 @@ mod tests {
                 "Authorization",
                 "Bearer t",
             )
-            .for_programs(&by.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .for_programs(
+                &by.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                crate::config::ByOther::Bare,
+            )
         };
         assert!(held(&["gh"]).injects_for(|| Some(&named)));
         assert!(held(&["/nix/store/abc-gh/bin/gh"]).injects_for(|| Some(&named)));
@@ -2433,6 +2444,7 @@ mod tests {
             Err(why) => Err(why.to_string()),
         };
         HeaderInjection {
+            by_other: crate::config::ByOther::Bare,
             by: Vec::new(),
             rule: crate::allowlist::classify("api.example.com").unwrap(),
             form: Form::Signed(Signed {
@@ -2579,6 +2591,7 @@ mod tests {
         seen: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
     ) -> HeaderInjection {
         HeaderInjection {
+            by_other: crate::config::ByOther::Bare,
             by: Vec::new(),
             rule: crate::allowlist::classify("api.example.com").unwrap(),
             form: Form::Signed(Signed {
@@ -2813,6 +2826,7 @@ mod tests {
         key: &str,
     ) -> HeaderInjection {
         HeaderInjection {
+            by_other: crate::config::ByOther::Bare,
             by: Vec::new(),
             rule: crate::allowlist::classify("signed.test").unwrap(),
             form: Form::Signed(Signed {

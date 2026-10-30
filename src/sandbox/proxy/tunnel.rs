@@ -333,6 +333,20 @@ pub(super) fn serve_tunneled_request(
     //    cannot ride along to an unintended host. It is settled before any connection is taken,
     //    because which credentials a request carries is half of what partitions the pool below.
     let injected_ids = matching_injection_ids(&creds, connect_host, port, &itarget, who, ctx);
+    // 7''. A credential held for other programs, under `by_other = "deny"`, refuses the request
+    //      outright rather than letting it leave without the credential.
+    if withheld_by_deny(&creds, connect_host, port, &itarget, who, ctx) {
+        ctx.outcome(
+            crate::sandbox::control::Proto::Https,
+            connect_host,
+            port,
+            Some(&imethod),
+            Some(&itarget),
+            StatKind::Blocked,
+            BY_MISMATCH,
+        );
+        return respond_refusal_tls(&mut br, "403 Forbidden", BY_MISMATCH, BY_MISMATCH_MESSAGE);
+    }
     // 7'. A signer whose manifest asks for a digest over the body is told one, which means the body
     //     has to exist before the question is put: hold it here rather than stream it at step 9. The
     //     `100-continue` a client may be waiting on is answered first — it withholds the body until

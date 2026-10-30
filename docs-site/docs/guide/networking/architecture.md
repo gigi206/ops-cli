@@ -649,7 +649,9 @@ copy of the policy refused a connection the proxy had admitted, described under
 [the SSRF guard](#the-ssrf-guard)), `host-mismatch`, `ip-literal`,
 `method-not-allowed` (a request naming no destination the proxy can route),
 `bad-request` (including `bad-request:head`, a head that never arrived whole),
-`outbound-secret`, `signer-refused`, `signer-body-too-large`, `body-buffer-cap`,
+`outbound-secret`, `signer-refused`, `by-mismatch` (a credential
+[held for other programs](../configuration/secret#held-for-named-programs-by) under
+`by_other = "deny"`), `signer-body-too-large`, `body-buffer-cap`,
 `connection-cap`, `supervisor-busy` (the supervisor was already opening as many
 connections as it opens at once, twice `[network] max_connections`), `splice-cap` (the
 concurrent raw `tcp://` tunnel ceiling),
@@ -665,7 +667,7 @@ no status, because that connection is closed before the proxy is dialed.
 
 The statuses behind them: policy and guard refusals are `403` (`denied-*`,
 `outbound-secret`, `ssrf-blocked`, `supervisor-denied`, `ip-literal`,
-`ws-injection-refused`, `signer-refused`), a too-large signer body is `413`, the shared
+`ws-injection-refused`, `signer-refused`, `by-mismatch`), a too-large signer body is `413`, the shared
 ceilings are `503` (`splice-cap`, `connection-cap`, `supervisor-busy`,
 `body-buffer-cap`), a fronting mismatch is `421`,
 a malformed request is `400`, a destination-less one `405`, and transport failures are

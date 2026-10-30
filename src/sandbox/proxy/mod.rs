@@ -101,6 +101,7 @@
 //! | `403` | `denied-default`         | no allow rule matched the host / port / path |
 //! | `403` | `denied-by-rule`         | a deny rule matched (the rule text is not disclosed) |
 //! | `403` | `denied-method`          | an allow rule matched the host but not the request's HTTP method (a `{VERB}`-scoped rule) |
+//! | `403` | `by-mismatch`            | a `[secret]` held for named programs (`by`) matched the destination, and the program holding the connection is none of them, under `by_other = "deny"` (see [`withheld_by_deny`]) |
 //! | `403` | `ws-injection-refused`   | a WebSocket upgrade named a host a `[secret]` is injected into. The credential rides the handshake and the frames past the `101` are opaque, so nothing can redact a reflection of it — the upgrade is refused rather than opened |
 //! | `403` | `asked-denied`           | the `ask` posture parked the request and it was not allowed — deliberately conflating an explicit `sbx net pending deny`, the ask timeout, and the pending-queue cap (all three mean "no egress" in Mode B) |
 //! | `403` | `http2-ask-unsupported`  | an `ask`-undecided host designated `[network] http2`. Every stream of one HTTP/2 connection is multiplexed onto a single runtime, so parking one to wait for `sbx net pending` would stall its siblings; the stream fails closed under its own reason instead of being parked (see [`AskPosture`]) |
@@ -1516,6 +1517,33 @@ fn refuse_ws_into_injected_host<W: Write>(
         "a WebSocket to a credential-injected host is refused: its frames cannot be redacted",
     )?;
     Ok(true)
+}
+
+/// The reason token a request carries when it is refused because a credential held for other
+/// programs matched its destination ([`withheld_by_deny`]).
+const BY_MISMATCH: &str = "by-mismatch";
+
+/// What such a refusal tells the cage, naming the configuration that made it so.
+const BY_MISMATCH_MESSAGE: &str = "a credential for this destination is held for other programs \
+     (`[secret] by`), and a request from any other is refused (`by_other = \"deny\"`)";
+
+/// Whether a credential held for named programs under `by_other = "deny"` matches this request's
+/// destination while the program holding the connection is none of those it names: the request is
+/// then refused instead of being forwarded without it. Asks who holds the connection only when such
+/// a credential matches the destination.
+fn withheld_by_deny(
+    creds: &CredentialSet,
+    host: &str,
+    port: u16,
+    target: &str,
+    who: &Who,
+    ctx: &ProxyCtx,
+) -> bool {
+    creds.injections.iter().any(|inj| {
+        inj.by_other == crate::config::ByOther::Deny
+            && allowlist::rule_matches(&inj.rule, host, port, target)
+            && !inj.injects_for(|| who.named(ctx))
+    })
 }
 
 /// The reason token a request refused for want of a signature carries: the `x-sbx-egress-reason`

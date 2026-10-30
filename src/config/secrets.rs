@@ -244,7 +244,31 @@ pub(super) fn validate_host_secret(
         // credential its configuration said it needs.
         optional: raw.optional.unwrap_or(false),
         by: validate_by(raw.by.as_deref().unwrap_or_default())?,
+        by_other: validate_by_other(raw)?,
     })
+}
+
+/// A credential's `by_other`: what a program its `by` does not name gets. Refused without a `by`,
+/// where no program is unnamed and the field would say nothing.
+fn validate_by_other(raw: &RawHostSecret) -> Result<ByOther, String> {
+    let Some(value) = raw.by_other.as_deref() else {
+        return Ok(ByOther::Bare);
+    };
+    if raw.by.as_deref().unwrap_or_default().is_empty() {
+        return Err(
+            "`by_other` without `by`: it says what an unnamed program gets, and with no \
+                    `by` no program is unnamed"
+                .to_string(),
+        );
+    }
+    match value {
+        "bare" => Ok(ByOther::Bare),
+        "deny" => Ok(ByOther::Deny),
+        other => Err(format!(
+            "unknown `by_other` `{}` (expected \"bare\" or \"deny\")",
+            crate::diag::visible(other)
+        )),
+    }
 }
 
 /// The `by` entries of a credential, each checked for the form it is written in: `sha256:` and

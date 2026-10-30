@@ -173,6 +173,25 @@ pub(super) fn handle_https_forward(
     //    it encrypted, never in the clear. Settled before a connection is taken, because which
     //    credentials a request carries is half of what partitions the pool.
     let injected_ids = matching_injection_ids(&creds, &host, port, &path, who, ctx);
+    // 7''. As on the tunneled path: a credential held for other programs under `by_other = "deny"`
+    //      refuses the request rather than letting it leave without the credential.
+    if withheld_by_deny(&creds, &host, port, &path, who, ctx) {
+        ctx.outcome(
+            crate::sandbox::control::Proto::Https,
+            &host,
+            port,
+            Some(verb),
+            Some(&path),
+            StatKind::Blocked,
+            BY_MISMATCH,
+        );
+        return write_refusal(
+            &mut client,
+            "403 Forbidden",
+            BY_MISMATCH,
+            BY_MISMATCH_MESSAGE,
+        );
+    }
     // 7'. As on the tunneled path: a signer that asks for a digest over the body needs the body held
     //     before the question is put, so it is read here rather than streamed at step 9.
     let digest_wanted = creds.wants_body_digest(&injected_ids);

@@ -7096,6 +7096,7 @@ fn digesting_injection() -> HeaderInjection {
 
 fn digesting_injection_for(to: &str) -> HeaderInjection {
     HeaderInjection {
+        by_other: crate::config::ByOther::Bare,
         by: Vec::new(),
         rule: classify(to).unwrap(),
         form: super::Form::Signed(super::Signed {
@@ -9283,6 +9284,47 @@ fn a_url_in_the_query_is_not_absolute_form() {
 /// A header injection scoped to `to` (in allowlist-entry syntax), setting `header` to `value`.
 fn injection(to: &str, header: &str, value: &str) -> HeaderInjection {
     HeaderInjection::fixed(classify(to).unwrap(), header.to_string(), value.to_string())
+}
+
+/// A credential held for named programs is withheld from a connection whose program cannot be
+/// named, as a test's is (no supervisor answers): under `bare` the request reaches the upstream
+/// without it, under `deny` it is refused with `by-mismatch` and reaches nothing.
+#[test]
+fn a_credential_held_for_other_programs_is_withheld_or_refuses() {
+    let held = |by_other| {
+        injection("host.test:*", "Authorization", "Bearer sbx-secret")
+            .for_programs(&["gh".to_string()], by_other)
+    };
+    let request = b"GET / HTTP/1.1\r\nHost: host.test\r\n\r\n";
+    let (resp, head) = run_with_injections(
+        &["host.test:*"],
+        vec![held(crate::config::ByOther::Bare)],
+        "host.test",
+        request,
+    );
+    assert!(
+        resp.contains("200"),
+        "bare: the request was proxied: {resp:?}"
+    );
+    assert!(
+        !head.to_ascii_lowercase().contains("authorization"),
+        "bare: the credential stayed behind: {head:?}"
+    );
+
+    // Refused before any upstream is asked for, so none is stood up: the port names nothing.
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+    let ctx = Arc::new(
+        ProxyCtx::new(proxy_ca, policy(&["host.test:*"]))
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+            .with_injections(vec![held(crate::config::ByOther::Deny)]),
+    );
+    let resp = through_proxy(ctx, proxy_ca_der, "host.test", "host.test", 9, request).unwrap();
+    assert!(
+        resp.contains("403") && resp.contains("by-mismatch"),
+        "deny: refused under its own reason: {resp:?}"
+    );
 }
 
 /// Drive one request through a proxy that allows `allow` and carries `injections`, to a
