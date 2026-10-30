@@ -2063,7 +2063,9 @@ fn absorb_bundle(acc: &mut RawBundle, higher: RawBundle, notes: &mut Vec<String>
     acc.deny.extend(higher.deny);
     acc.mute.extend(higher.mute);
     acc.shared_credential.extend(higher.shared_credential);
-    acc.reserve.extend(higher.reserve);
+    for (entry, reserved) in higher.reserve {
+        put_reservation(&mut acc.reserve, entry, reserved, Precedence::Incoming);
+    }
     acc.open.extend(higher.open);
     acc.service.extend(higher.service);
     acc.flakes.extend(higher.flakes);
@@ -2206,7 +2208,7 @@ fn fold_bundle_into_app(
             extend_deduped(&mut table.shared_credential, acc.shared_credential);
             // Keyed by destination, so the app's own reservation of one stands over the bundle's.
             for (entry, reserved) in acc.reserve {
-                table.reserve.entry(entry).or_insert(reserved);
+                put_reservation(&mut table.reserve, entry, reserved, Precedence::Standing);
             }
             None
         }
@@ -2223,6 +2225,58 @@ const NO_TABLE_NOTE: &str = "uses a bundle with egress rules or a shared-credent
     declares no `[network]` table, so they are left out: add one to apply them, with the `mode` \
     the app runs under and the rules it relies on, since a table replaces the policy it inherits. \
     Synthesizing one here could change the app's posture, which a bundle must never do";
+
+/// Which of two reservations of one destination stands when they meet.
+#[derive(Clone, Copy)]
+enum Precedence {
+    /// The one already in the table: an app's own over its bundles'.
+    Standing,
+    /// The one arriving: a later bundle in `use` over an earlier one.
+    Incoming,
+}
+
+/// Add the reservation `entry` to `into`, where a reservation of the same destination may already
+/// stand under another spelling, as `codeload.example.com` and `https://codeload.example.com` do,
+/// so the two are compared by destination rather than by key: two keys for one destination would
+/// both be kept and both asked, and a program would then need naming by each, the intersection of
+/// their `by` lists rather than the one precedence promises.
+fn put_reservation(
+    into: &mut BTreeMap<String, super::schema::RawReserve>,
+    entry: String,
+    reserved: super::schema::RawReserve,
+    precedence: Precedence,
+) {
+    let standing = into
+        .keys()
+        .find(|key| same_destination(key, &entry))
+        .cloned();
+    match (standing, precedence) {
+        (Some(_), Precedence::Standing) => {}
+        (Some(key), Precedence::Incoming) => {
+            into.remove(&key);
+            into.insert(entry, reserved);
+        }
+        (None, _) => {
+            into.insert(entry, reserved);
+        }
+    }
+}
+
+/// Whether two `[network.reserve]` keys name one destination: the hosts and ports their rules
+/// classify to are equal, whatever the scheme, since a reservation covers its destination on every
+/// plane. A key that does not classify (an `@group`, or one the resolver will refuse) is compared
+/// as written.
+fn same_destination(a: &str, b: &str) -> bool {
+    let destination = |key: &str| {
+        crate::allowlist::classify_in(key, crate::allowlist::Slot::Reserve)
+            .ok()
+            .map(|rule| rule.kind)
+    };
+    match (destination(a), destination(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a.trim() == b.trim(),
+    }
+}
 
 /// Append the entries of `add` that `into` does not already carry, preserving order.
 fn extend_deduped<T: PartialEq>(into: &mut Vec<T>, add: Vec<T>) {
@@ -3824,7 +3878,8 @@ mod tests {
             )]
         );
         let app = settle_under(
-            "[network]\nmode = \"deny\"\n[network.reserve.\"codeload.example.com\"]\nby = [\"gh\"]\n",
+            // The same destination as the bundle's, spelled another way.
+            "[network]\nmode = \"deny\"\n[network.reserve.\"https://codeload.example.com\"]\nby = [\"gh\"]\n",
             &reserving_bundle("git"),
             None,
         );
@@ -3835,6 +3890,54 @@ mod tests {
                 vec!["gh".to_string()]
             )]
         );
+    }
+
+    /// Two spellings of one destination meet as one reservation, the standing one or the incoming
+    /// one kept as precedence says; two destinations stay two.
+    #[test]
+    fn reservations_meet_by_destination_rather_than_by_spelling() {
+        let by = |program: &str| schema::RawReserve {
+            by: Some(vec![program.to_string()]),
+            rest: Default::default(),
+        };
+        let mut table = BTreeMap::from([("codeload.example.com".to_string(), by("gh"))]);
+        put_reservation(
+            &mut table,
+            "https://codeload.example.com:443".to_string(),
+            by("git"),
+            Precedence::Standing,
+        );
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table["codeload.example.com"].by,
+            Some(vec!["gh".to_string()])
+        );
+        put_reservation(
+            &mut table,
+            "https://codeload.example.com".to_string(),
+            by("git"),
+            Precedence::Incoming,
+        );
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table["https://codeload.example.com"].by,
+            Some(vec!["git".to_string()])
+        );
+        // A reservation covers its destination on every plane, so a raw splice to it is the same.
+        put_reservation(
+            &mut table,
+            "tcp://codeload.example.com:443".to_string(),
+            by("ssh"),
+            Precedence::Standing,
+        );
+        assert_eq!(table.len(), 1);
+        put_reservation(
+            &mut table,
+            "tcp://codeload.example.com:22".to_string(),
+            by("ssh"),
+            Precedence::Standing,
+        );
+        assert_eq!(table.len(), 2, "another port is another destination");
     }
 
     /// A reservation a string posture leaves out stops the launch wherever the posture filters, as a

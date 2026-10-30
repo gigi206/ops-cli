@@ -849,6 +849,13 @@ pub(super) fn wrap_background(
 /// and their stat files must not be the same file — see where it is read for what that cost.
 static PROXY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether a launch holds anything for named programs, which is what needs the supervisor to name
+/// the program behind a connection: a credential declared with `by`, or a destination reserved
+/// under `[network.reserve]`.
+fn names_callers(secrets: &[crate::config::HeaderSecret], policy: &EgressPolicy) -> bool {
+    secrets.iter().any(|s| !s.by.is_empty()) || !policy.reserved().is_empty()
+}
+
 /// Start the host proxy for `policy` on a fresh per-launch Unix socket, write its CA, and
 /// return the cage wiring plus a guard owning the on-disk artifacts. The proxy is serving
 /// before this returns (the listener is bound and a thread is accepting), so the cage's
@@ -1165,18 +1172,20 @@ pub(crate) fn start(
     // The proxy's copy of the policy and of the credentials cross in the form they are encoded to,
     // so a field that form drops is dropped on every launch. See [`EgressPolicy::encode`] and
     // [`super::proxy::Credentials::encode`].
-    // How the supervisor names the program behind a connection, stood up only when a credential is
-    // held for named programs. One that cannot be stood up names nothing, so such a credential is
-    // withheld from every request rather than handed to every program.
+    // How the supervisor names the program behind a connection, stood up only when something is
+    // held for named programs ([`names_callers`]). One that cannot be stood up names nothing, so
+    // such a credential is withheld from every request and such a destination refused to every
+    // program, rather than either being handed to every program.
     let identify = match relay {
-        Some(relay) if secrets.iter().any(|s| !s.by.is_empty()) => {
+        Some(relay) if names_callers(secrets, &policy) => {
             match super::caller::Identify::new(relay, Path::new("/proc/self/exe"), CAGE_PROXY_PORT)
             {
                 Ok(identify) => Some(Arc::new(identify)),
                 Err(e) => {
                     crate::diag::warn(&format!(
                         "cannot name the programs behind egress connections ({e}): a credential \
-                         declared with `by` is injected for none of them"
+                         declared with `by` is injected for none of them, and a destination under \
+                         `[network.reserve]` is refused to all of them"
                     ));
                     None
                 }
@@ -2842,6 +2851,19 @@ mod tests {
                 "`{entry}` with ca_roots={ca_roots}: base roots appended should be {roots_expected}"
             );
         }
+    }
+
+    /// A reservation needs the program behind a connection named as much as a `by` credential does:
+    /// without it every program, the named ones included, is refused the destination.
+    #[test]
+    fn a_reservation_alone_has_the_callers_named() {
+        use crate::allowlist::{EgressPolicy, Reservation, classify};
+        let open = EgressPolicy::new(vec![classify("example.com").unwrap()], vec![]);
+        assert!(!names_callers(&[], &open));
+        let reserved = open.with_reserved(vec![
+            Reservation::new(classify("example.com").unwrap(), vec!["git".into()]).unwrap(),
+        ]);
+        assert!(names_callers(&[], &reserved));
     }
 
     fn tcp_policy(entries: &[&str]) -> crate::allowlist::EgressPolicy {

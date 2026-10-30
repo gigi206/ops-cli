@@ -291,9 +291,12 @@ enum ToSupervisor {
         from: usize,
     },
     /// Name the program holding the connection handed over with this message, whose request said
-    /// its client connected from `stated` (a port only the capture tap is believed about). Answered
-    /// under the same `id`.
-    Identify { id: u64, stated: Option<u16> },
+    /// what `stated` says about its client's connection (believed from the capture tap alone), and
+    /// answer under the same `id`.
+    Identify {
+        id: u64,
+        stated: Option<crate::sandbox::caller::Stated>,
+    },
 }
 
 /// An answer the proxy waits for, handed to the request that asked.
@@ -487,6 +490,17 @@ impl Link {
         message: impl FnOnce(u64) -> ToSupervisor,
         fd: Option<&OwnedFd>,
     ) -> Option<Reply> {
+        self.ask_within(message, fd, None)
+    }
+
+    /// [`Self::ask_handing`], giving up after `wait` when one is given: the question is then
+    /// forgotten, and an answer arriving later finds nobody waiting for it.
+    fn ask_within(
+        &self,
+        message: impl FnOnce(u64) -> ToSupervisor,
+        fd: Option<&OwnedFd>,
+        wait: Option<std::time::Duration>,
+    ) -> Option<Reply> {
         let (id, reply) = {
             let mut waiting = locked(&self.side.waiting);
             waiting.next += 1;
@@ -500,15 +514,33 @@ impl Link {
             locked(&self.side.waiting).replies.remove(&id);
             return None;
         }
-        reply.recv().ok()
+        match wait {
+            None => reply.recv().ok(),
+            Some(wait) => {
+                let answer = reply.recv_timeout(wait).ok();
+                if answer.is_none() {
+                    locked(&self.side.waiting).replies.remove(&id);
+                }
+                answer
+            }
+        }
     }
 
     /// Ask the supervisor which program holds the other end of `client`, the connection this proxy
-    /// accepted, whose request said its client connected from `stated`; and wait for the answer.
-    /// `None` when it cannot be named, or no answer can come.
-    pub(crate) fn identify(&self, client: &UnixStream, stated: Option<u16>) -> Option<Named> {
+    /// accepted, whose request said what `stated` says about its client's connection; and wait for
+    /// the answer, [`IDENTIFY_WAIT`] at most. `None` when it cannot be named, or no answer came.
+    pub(crate) fn identify(
+        &self,
+        client: &UnixStream,
+        stated: Option<crate::sandbox::caller::Stated>,
+    ) -> Option<Named> {
         let handed = OwnedFd::from(client.try_clone().ok()?);
-        match self.ask_handing(|id| ToSupervisor::Identify { id, stated }, Some(&handed)) {
+        let asked = self.ask_within(
+            |id| ToSupervisor::Identify { id, stated },
+            Some(&handed),
+            Some(IDENTIFY_WAIT),
+        );
+        match asked {
             Some(Reply::Identified(caller)) => caller,
             _ => None,
         }
@@ -542,6 +574,11 @@ fn shown(text: &str) -> &str {
         .map_or(text, |(at, _)| &text[..at])
 }
 
+/// How long the proxy waits for a program to be named. A walk reads the cage's `/proc` and may hash
+/// an executable, which is milliseconds on a cache miss; one that has not answered by this is
+/// treated as having named nobody, so a connection never waits on it for good.
+const IDENTIFY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The supervisor's end: how it reaches the proxy it serves.
 #[derive(Clone)]
 pub(crate) struct Supervisor {
@@ -563,8 +600,10 @@ struct SupervisorSide {
     /// How the proxy's checks and connections are answered.
     judge: Arc<Judge>,
     /// How the programs behind the proxy's connections are named, or `None` when the launch holds
-    /// no credential for named programs: each question is then answered with no name.
+    /// nothing for named programs: each question is then answered with no name.
     identify: Option<Arc<Identify>>,
+    /// How many questions to name a program are being walked at once, held to [`NAMING_MAX`].
+    naming: Arc<std::sync::atomic::AtomicUsize>,
     /// How a thread of this end is started: [`named_thread`], or in a test one the host refuses.
     threads: fn(&str) -> std::thread::Builder,
     /// The way to the one thread that runs the admitted refreshes, while it runs.
@@ -817,6 +856,7 @@ fn supervise(
         refresh,
         judge,
         identify,
+        naming: Arc::default(),
         threads,
         refreshes: Mutex::new(None),
         answers: Mutex::new(None),
@@ -1001,21 +1041,42 @@ fn read_proxy(side: &Arc<SupervisorSide>, socket: &wire::Socket) -> io::Result<(
 /// cage's `/proc` and may hash an executable, and answer under `id`. Answered with no name at once
 /// when the launch names no program, or no thread can be started: the proxy waits for an answer
 /// either way, and nothing else will send it.
-fn serve_identify(side: &Arc<SupervisorSide>, id: u64, stated: Option<u16>, fd: OwnedFd) {
-    let Some(identify) = side.identify.clone() else {
+fn serve_identify(
+    side: &Arc<SupervisorSide>,
+    id: u64,
+    stated: Option<crate::sandbox::caller::Stated>,
+    fd: OwnedFd,
+) {
+    use std::sync::atomic::Ordering;
+    let unnamed = || {
         let _ = send(side, ToProxy::Identified { id, caller: None });
-        return;
     };
+    let Some(identify) = side.identify.clone() else {
+        return unnamed();
+    };
+    // Held to a ceiling, as every other piece of supervisor work a cage can start is: past it a
+    // question is answered with no name at once, which no rule names.
+    if side.naming.fetch_add(1, Ordering::SeqCst) >= NAMING_MAX {
+        side.naming.fetch_sub(1, Ordering::SeqCst);
+        return unnamed();
+    }
     let naming = Arc::clone(side);
     let started = (side.threads)("sbx-identify").spawn(move || {
         let client = UnixStream::from(fd);
         let caller = identify.caller(&client, stated).map(Named::from);
+        naming.naming.fetch_sub(1, Ordering::SeqCst);
         let _ = send(&naming, ToProxy::Identified { id, caller });
     });
     if started.is_err() {
-        let _ = send(side, ToProxy::Identified { id, caller: None });
+        side.naming.fetch_sub(1, Ordering::SeqCst);
+        unnamed();
     }
 }
+
+/// How many questions to name a program the supervisor walks at once. Each reads the cage's
+/// `/proc` and may hash an executable, so a cage opening connections faster than they are answered
+/// is answered with no name past this rather than with a thread each.
+const NAMING_MAX: usize = 16;
 
 /// Let a request the proxy parked into the queue and wait for its answer on a thread of its own, or
 /// deny it at once: nobody serves parks, the queue is full, or the host is one the judge refuses
@@ -2310,6 +2371,7 @@ mod tests {
             refresh: None,
             judge: Arc::clone(&judge),
             identify: None,
+            naming: Arc::default(),
             threads: named_thread,
             refreshes: Mutex::new(None),
             answers: Mutex::new(None),

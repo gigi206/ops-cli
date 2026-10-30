@@ -2252,11 +2252,6 @@ mod tests {
         );
     }
 
-    /// The interaction that matters most, because it breaks the very setup observing exists to
-    /// protect. When sbx injects a header, the client's own value is stripped and never reaches the
-    /// wire — and in the intended arrangement that value is a *placeholder* the application carries
-    /// on every request. Remembering it would make the next request an outbound leak of a worthless
-    /// string, refusing traffic sbx itself arranged. Found by running a real agent, not by reading.
     /// A credential held for named programs goes to a request only when its connection is held by
     /// one of them: by file name, by exact path or by content; and to none when nothing was named.
     /// One held for no program in particular never asks who holds the connection.
@@ -2294,6 +2289,11 @@ mod tests {
         );
     }
 
+    /// The interaction that matters most, because it breaks the very setup observing exists to
+    /// protect. When sbx injects a header, the client's own value is stripped and never reaches the
+    /// wire — and in the intended arrangement that value is a *placeholder* the application carries
+    /// on every request. Remembering it would make the next request an outbound leak of a worthless
+    /// string, refusing traffic sbx itself arranged.
     #[test]
     fn a_header_that_will_be_injected_is_never_observed() {
         let creds = default_creds(Vec::new(), Vec::new());

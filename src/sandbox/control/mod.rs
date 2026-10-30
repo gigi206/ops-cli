@@ -989,8 +989,8 @@ pub(crate) struct LogEvent {
     /// [`SIGHTINGS_MAX`] of them.
     pub(crate) secrets_seen: Vec<SecretSighting>,
     /// The program the supervisor named as holding this exchange's connection, by its executable
-    /// inside the cage. Named only where a credential held for named programs (`[secret] by`) asked
-    /// who it was; `None` everywhere else.
+    /// inside the cage. Named only in a launch holding something for named programs (`[secret] by`
+    /// or `[network.reserve]`), which asks who holds every connection; `None` everywhere else.
     pub(crate) caller: Option<String>,
 }
 

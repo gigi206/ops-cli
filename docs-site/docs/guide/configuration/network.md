@@ -824,11 +824,13 @@ Left out, it would leave its destination open to every program a wider `allow` a
 A project `[app.<name>.network]` with no `mode` adds its reservations to the app profile's, as it
 adds its rules. A table that replaces the layer below keeps only its own. A [bundle](bundles) carries the
 same field, folded under the app's own reservations: an app reserving the same destination keeps
-its own `by`.
+its own `by`, however either spells it (`codeload.github.com`, `https://codeload.github.com:443` and
+`tcp://codeload.github.com:443` are one destination).
 
 **A guardrail, not a boundary**, for the reason `[secret] by` is one: the program is named from the
-binary its process runs, and the cage runs as your uid. What it stops is the ordinary case, a
-prompt that asks `curl` to fetch what only `git` was meant to. Removing a reservation, or adding a
+binary its process runs when the proxy asks, once per connection as its first head is read, and the
+cage runs as your uid ([how the program is found](secret#held-for-named-programs-by)). What it stops
+is the ordinary case, a prompt that asks `curl` to fetch what only `git` was meant to. Removing a reservation, or adding a
 program to its `by`, is shown as a grant by [`sbx trust`](../cli/trust#reading-the-grants).
 
 ## `default_methods` (apps)

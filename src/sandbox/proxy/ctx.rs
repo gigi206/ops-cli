@@ -688,6 +688,19 @@ impl ProxyCtx {
         }
     }
 
+    /// Whether this proxy holds anything for named programs: a destination reserved under
+    /// `[network.reserve]`, or a credential declared with `by`. Only then is the program behind a
+    /// connection asked about ([`super::Who`]).
+    pub(super) fn names_callers(&self) -> bool {
+        !self.policy.reserved().is_empty()
+            || self
+                .credentials
+                .snapshot()
+                .injections
+                .iter()
+                .any(|injection| !injection.by.is_empty())
+    }
+
     /// Hand the proxy its credential state. The launch passes the copy it decoded from the form the
     /// proxy is handed; a test may keep a clone, to read what the proxy holds after a refresh.
     pub(crate) fn with_shared_credentials(mut self, credentials: Arc<Credentials>) -> Self {

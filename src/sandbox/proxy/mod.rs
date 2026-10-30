@@ -383,10 +383,17 @@ const CONTROL_BYTE_DETAIL: &str = "a request line or header carries a control by
      character); another parser could read it as a line break, so it is refused rather than \
      forwarded";
 
-/// The program behind one client connection: asked of the supervisor the first time a credential
-/// held for named programs could ride a request on it ([`HeaderInjection::injects_for`]), and never
-/// again for that connection. A connection whose requests match no such credential is never asked
-/// about, so naming costs nothing where nobody wrote `by`.
+/// The program behind one client connection: asked of the supervisor once, as soon as the
+/// connection's head is read, when the launch holds anything for named programs
+/// ([`ProxyCtx::names_callers`]), and never again for that connection. A launch where nobody wrote
+/// `by` or `[network.reserve]` never asks, so naming costs nothing there.
+///
+/// Asked at the head rather than at the first request a rule covers, for two reasons. The program
+/// is read from what the connection's holder runs at the moment of asking, so the earlier the
+/// question, the less room a process has to write its requests and only then become a program a
+/// rule names. And an HTTP/2 connection serves its streams on one current-thread runtime, where a
+/// blocking question would stall every sibling stream: asked before that runtime starts, the
+/// answer is already there when a stream reads it.
 ///
 /// Held per connection because the answer is: every request of a tunnel, and every stream of an
 /// HTTP/2 connection, travels on the one socket, held by the one program.
@@ -397,16 +404,16 @@ pub(super) struct Who {
     /// end of its response would wait for good. `None` where there is none to hand (a test that
     /// serves a plane directly).
     client: Option<std::os::fd::RawFd>,
-    /// The port the request said its client connected from ([`TAP_SOURCE_HEADER`]), which the
+    /// What the request said about its client's connection ([`TAP_SOURCE_HEADER`]), which the
     /// supervisor believes only from the capture tap.
-    stated: Option<u16>,
+    stated: Option<crate::sandbox::caller::Stated>,
     named: std::sync::OnceLock<Option<link::Named>>,
 }
 
 impl Who {
     /// The program behind `client`, whose CONNECT head stated `stated`. Asked only while a plane
     /// serves `client`, which is what keeps the descriptor open for [`Self::named`] to copy.
-    fn of(client: &UnixStream, stated: Option<u16>) -> Self {
+    fn of(client: &UnixStream, stated: Option<crate::sandbox::caller::Stated>) -> Self {
         Who {
             client: Some(client.as_raw_fd()),
             stated,
@@ -422,6 +429,14 @@ impl Who {
             stated: None,
             named: std::sync::OnceLock::new(),
         }
+    }
+
+    /// A connection held by the program `named`, as the supervisor would have named it.
+    #[cfg(test)]
+    pub(super) fn named_as(named: link::Named) -> Self {
+        let who = Self::nobody();
+        let _ = who.named.set(Some(named));
+        who
     }
 
     /// The program the supervisor already named for this connection, without asking: `None` when it
@@ -447,12 +462,12 @@ impl Who {
     }
 }
 
-/// The port a CONNECT head states its client connected from, under [`TAP_SOURCE_HEADER`].
-fn stated_source(head: &Head) -> Option<u16> {
+/// What a CONNECT head states about its client's connection, under [`TAP_SOURCE_HEADER`].
+fn stated_source(head: &Head) -> Option<crate::sandbox::caller::Stated> {
     head.headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(TAP_SOURCE_HEADER))
-        .and_then(|(_, value)| value.trim().parse().ok())
+        .and_then(|(_, value)| crate::sandbox::caller::Stated::parse(value))
 }
 
 /// Handle one client connection: parse the CONNECT, man-in-the-middle the tunnel, and serve the
@@ -474,6 +489,9 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         Err(e) => return refuse_unreadable_head(&mut client, ctx, &head, &e),
     };
     let who = Who::of(&client, stated_source(&parsed));
+    if ctx.names_callers() {
+        who.named(ctx);
+    }
     let Some((method, target)) = request_line_parts(&parsed.request_line) else {
         // A malformed request line carries no destination to attribute — log the attempt so it is
         // not dark, but with no host/method/path (the raw line may hold whitespace the wire format

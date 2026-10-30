@@ -249,7 +249,8 @@ Egress entries **union** rather than override: a duplicate is not repeated. So a
 profile can adopt a bundle wholesale and still pin one of its packages. A `reserve`
 entry is keyed by its destination, like a package by its name: a later bundle's
 reservation of the same destination overrides an earlier one's, and the app's own
-`[network.reserve]` entry overrides both.
+`[network.reserve]` entry overrides both. The destination is compared by host and port, so two
+spellings of one (`codeload.github.com` and `https://codeload.github.com`) are one entry.
 
 ```toml
 # bundles/git-tools.toml

@@ -109,6 +109,11 @@ fn runtime() -> io::Result<tokio::runtime::Runtime> {
 /// connection of this proxy is allowed ([`super::link::Judge`]). A runtime that is dropped waits for
 /// its blocking threads, so a tunnel that ends with a question in flight holds its connection until
 /// the answer comes.
+///
+/// Which program holds the connection is a question to the supervisor too, read by every stream a
+/// `by` or a `[network.reserve]` concerns. It never waits here: it is put once, when the CONNECT
+/// head is read and before this runtime starts ([`super::Who`]), so a stream reads an answer that
+/// is already there.
 async fn serve(
     client: std::os::unix::net::UnixStream,
     connect_host: &str,

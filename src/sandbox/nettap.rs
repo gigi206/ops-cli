@@ -732,16 +732,23 @@ pub(crate) fn answer_query(
 
 /// The `CONNECT` a captured connection is introduced with — byte for byte what a proxy-aware
 /// client would have sent, so the proxy's tunnelled plane serves it with no special case.
-pub(crate) fn synthesize_connect(host: &str, port: u16, source: Option<u16>) -> String {
-    let source = source.map_or_else(String::new, |p| format!("{TAP_SOURCE_HEADER}: {p}\r\n"));
+pub(crate) fn synthesize_connect(
+    host: &str,
+    port: u16,
+    source: Option<super::caller::Stated>,
+) -> String {
+    let source = source.map_or_else(String::new, |stated| {
+        format!("{TAP_SOURCE_HEADER}: {}\r\n", stated.header_value())
+    });
     format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n{source}\r\n")
 }
 
-/// The header naming the port a captured client connected from, as `accept(2)` reported it. The
-/// supervisor believes it only from a peer that is the tap itself, since any client of the proxy's
-/// socket could write it ([`crate::sandbox::caller`]): it is what lets the program behind a captured
-/// connection be named, which the tap cannot otherwise show, carrying every connection it captures
-/// from one process.
+/// The header naming both ends of a captured client's connection: where it connected from, as
+/// `accept(2)` reported it, and the destination it dialled, as the capture recorded it
+/// ([`super::caller::Stated`]). The supervisor believes it only from a peer that is the tap itself,
+/// since any client of the proxy's socket could write it ([`crate::sandbox::caller`]): it is what
+/// lets the program behind a captured connection be named, which the tap cannot otherwise show,
+/// carrying every connection it captures from one process.
 pub(crate) const TAP_SOURCE_HEADER: &str = "Sbx-Tap-Source";
 
 /// Whether a response head is a success. The proxy answers `200 Connection established`; anything
@@ -889,7 +896,7 @@ impl Capture {
 pub(crate) fn serve_capture(
     client: TcpStream,
     dest: SocketAddrV4,
-    source: Option<u16>,
+    source: Option<std::net::SocketAddr>,
     table: &Mutex<FakeIps>,
     uds: &Path,
 ) -> Capture {
@@ -918,7 +925,11 @@ pub(crate) fn serve_capture(
     let _ = proxy.set_read_timeout(Some(CONNECT_TIMEOUT));
     let _ = proxy.set_write_timeout(Some(CONNECT_TIMEOUT));
 
-    let intro = synthesize_connect(&host, port, source);
+    let stated = source.map(|from| super::caller::Stated {
+        from,
+        to: std::net::SocketAddr::V4(dest),
+    });
+    let intro = synthesize_connect(&host, port, stated);
     let established = proxy
         .write_all(intro.as_bytes())
         .and_then(|()| proxy.flush())
@@ -1153,10 +1164,10 @@ fn serve_captured(
 ) {
     let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
     loop {
-        // The port the client connected from, which the tap states to the proxy so the program
+        // The address the client connected from, which the tap states to the proxy so the program
         // behind the connection can be named ([`TAP_SOURCE_HEADER`]).
         let (stream, source) = match listener.accept() {
-            Ok((stream, from)) => (stream, Some(from.port())),
+            Ok((stream, from)) => (stream, Some(from)),
             Err(e) => {
                 super::conncap::accept_backoff("net-tap", &e);
                 continue;

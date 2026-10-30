@@ -465,12 +465,21 @@ fn delta(before: &Resolved, after: &Resolved, app: Option<&String>, out: &mut Ve
                 Risk::High,
                 "a credential is injected here",
             ),
-            Some(was) if was != secret => push(
-                "secret",
-                format!("{} ({})", secret.to, secret.header),
-                Risk::High,
-                "credential source or shape changed",
-            ),
+            Some(was) if was != secret => match by_change(was, secret) {
+                Some(ByChange::Narrowed) => {}
+                Some(ByChange::Widened(what, risk, why)) => push(
+                    "secret",
+                    format!("{} ({}) {what}", secret.to, secret.header),
+                    risk,
+                    why,
+                ),
+                None => push(
+                    "secret",
+                    format!("{} ({})", secret.to, secret.header),
+                    Risk::High,
+                    "credential source or shape changed",
+                ),
+            },
             Some(_) => {}
         }
     }
@@ -649,14 +658,65 @@ fn policy_grants(
     }
 }
 
-/// The reservation of `policy` whose destination is `rule`'s, compared by kind and layer: an app's
-/// `default_methods` rewrites the method set of the `allow` rule a reservation added, never the
-/// destination.
+/// How a credential changed when only the programs it is held for did.
+enum ByChange {
+    /// Held for fewer programs, or refusing the others where it let them through: nothing opens.
+    Narrowed,
+    /// Held for more programs, or letting the others through: what changed, and how far.
+    Widened(String, Risk, &'static str),
+}
+
+/// The change from `was` to `now` when nothing but `by` and `by_other` differ, or `None` when
+/// anything else did.
+fn by_change(was: &super::HeaderSecret, now: &super::HeaderSecret) -> Option<ByChange> {
+    let only_by = super::HeaderSecret {
+        by: was.by.clone(),
+        by_other: was.by_other,
+        ..now.clone()
+    } == *was;
+    if !only_by {
+        return None;
+    }
+    let added: Vec<&str> = now
+        .by
+        .iter()
+        .filter(|p| !was.by.contains(p))
+        .map(String::as_str)
+        .collect();
+    Some(if !was.by.is_empty() && now.by.is_empty() {
+        ByChange::Widened(
+            "by removed".to_string(),
+            Risk::High,
+            "the credential goes to every program",
+        )
+    } else if !was.by.is_empty() && !added.is_empty() {
+        ByChange::Widened(
+            format!("by {}", added.join(", ")),
+            Risk::High,
+            "the credential goes to more programs",
+        )
+    } else if was.by_other == crate::config::ByOther::Deny
+        && now.by_other == crate::config::ByOther::Bare
+        && !now.by.is_empty()
+    {
+        ByChange::Widened(
+            "by_other = bare".to_string(),
+            Risk::Notable,
+            "other programs reach the host without the credential instead of being refused",
+        )
+    } else {
+        ByChange::Narrowed
+    })
+}
+
+/// The reservation of `policy` whose destination is `rule`'s, compared by host and port alone: an
+/// app's `default_methods` rewrites the method set of the `allow` rule a reservation added, never
+/// the destination, and a reservation covers its destination on every plane.
 fn reservation_of<'a>(policy: &'a EgressPolicy, rule: &Rule) -> Option<&'a Reservation> {
     policy
         .reserved()
         .iter()
-        .find(|r| r.rule().kind == rule.kind && r.rule().layer == rule.layer)
+        .find(|r| r.rule().kind == rule.kind)
 }
 
 /// The risk of one newly allowed egress rule and every trait that earns it, most serious first: a
@@ -933,6 +993,54 @@ mod tests {
                 "deny https://telemetry.example.com",
                 Risk::Notable
             )]
+        );
+    }
+
+    /// A change to the programs a credential is held for is named as such: removing `by` or adding
+    /// a program is High, letting the others through is Notable, and narrowing grants nothing.
+    #[test]
+    fn a_credential_held_for_more_programs_is_named_and_a_narrowed_one_is_not() {
+        let secret = |by: &str| {
+            format!(
+                "[network]\nmode = \"deny\"\nallow = [\"api.github.com\"]\n\n\
+                 [secret.\"api.github.com\"]\nfrom = \"env://GH\"\nheader = \"Authorization\"\n\
+                 type = \"bearer\"\n{by}"
+            )
+        };
+        let gh = secret("by = [\"gh\"]\nby_other = \"deny\"\n");
+        let seen_one = |after: &str| {
+            let got = over(&gh, after);
+            assert_eq!(got.len(), 1, "{got:?}");
+            (got[0].what.clone(), got[0].risk)
+        };
+        assert_eq!(
+            seen_one(&secret("")),
+            (
+                "https://api.github.com (Authorization) by removed".to_string(),
+                Risk::High
+            )
+        );
+        assert_eq!(
+            seen_one(&secret("by = [\"gh\", \"curl\"]\nby_other = \"deny\"\n")),
+            (
+                "https://api.github.com (Authorization) by curl".to_string(),
+                Risk::High
+            )
+        );
+        assert_eq!(
+            seen_one(&secret("by = [\"gh\"]\n")),
+            (
+                "https://api.github.com (Authorization) by_other = bare".to_string(),
+                Risk::Notable
+            )
+        );
+        assert_eq!(over(&secret("by = [\"gh\"]\n"), &gh), vec![]);
+        assert_eq!(
+            over(
+                &secret("by = [\"gh\", \"git\"]\nby_other = \"deny\"\n"),
+                &gh
+            ),
+            vec![]
         );
     }
 

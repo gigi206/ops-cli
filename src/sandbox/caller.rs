@@ -7,25 +7,34 @@
 //! side, where the cage's `/proc` is readable:
 //!
 //! 1. the peer of the proxy's socket is named by its pidfd ([`super::peer::peer_pid`]);
-//! 2. a peer whose executable is the forwarder's is a **relay**: its own TCP socket, accepted on the
-//!    proxy port, gives the client's source port, read from its network namespace's TCP table. A
-//!    peer that is the capture tap is one too, but it carries every connection it captured from one
-//!    process, so it cannot be read the same way: it states the client's source port in the request
-//!    it forwards, and that statement is believed only because the peer is the tap, which runs sbx's
-//!    own executable and takes the port from `accept(2)`, never from the cage;
-//! 3. the socket bound to that port is found among the descriptors of the processes sharing that
+//! 2. a peer whose executable is the forwarder's is a **relay**: its one live TCP socket accepted
+//!    on the proxy port gives both ends of the client's connection, read from its network
+//!    namespace's TCP table. A peer that is the capture tap is one too, but it carries every
+//!    connection it captured from one process, so it cannot be read the same way: it states both
+//!    ends of its client's connection in the request it forwards ([`Stated`]), and that statement
+//!    is believed only because the peer is the tap, which runs sbx's own executable and takes the
+//!    addresses from `accept(2)` and the capture, never from the cage, and only while the tap still
+//!    holds its own end of that connection;
+//! 3. the socket with those two ends is found among the descriptors of the processes sharing that
 //!    namespace, and every process holding it is a holder;
 //! 4. a holder that is the forwarder's executable again is a relay in front of the first: the
 //!    in-cage listener of a `tcp://` rule, or the `socat` of the `ProxyCommand` ssh is given. It is
-//!    walked through the same way, from its one other established socket, a few relays deep at
-//!    most. A relay with no other socket carries its bytes on its standard streams, and the
-//!    program that launched it is the one driving them, so its parent is the holder;
+//!    walked through the same way, from its one other live socket, a few relays deep at most. A
+//!    relay with no other socket carries its bytes on its standard streams, and is followed to the
+//!    processes holding the other ends of those pipes, of which its parent must be one;
 //! 5. the caller is the holders' executable, named by its SHA-256, and only when every holder runs
-//!    the same one: a socket shared by two programs is held by neither alone.
+//!    the same one: a socket or a pipe shared by two programs is held by neither alone.
 //!
 //! A peer that is not a relay is the caller itself: a client that talks to the proxy's socket
 //! directly holds the connection, so it is the one named. What cannot be named is `None`, and a
-//! caller of `None` is never the program a rule names.
+//! caller of `None` is never the program a rule names. Every ambiguity on the way, two candidate
+//! sockets or a relay holding something it is not known to use, ends in `None`.
+//!
+//! The tap is told apart by its content, so the statement rests on the cage not being able to run a
+//! byte-identical sbx: a cage is given the store paths its own closure needs, which do not hold
+//! sbx, and a launch that installs sbx into the cage as one of its packages gives the cage a tap of
+//! its own to state connections with. Even then the statement names only a program whose
+//! connection that process accepted, since the tap must hold the far end of what it states.
 //!
 //! The identity is the executable's content, not its path or name: in a cage the agent writes most
 //! of what is on its `PATH`, and a copy of one program under another's name is still the first. It
@@ -35,11 +44,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// The program holding an egress connection.
@@ -53,20 +64,56 @@ pub(crate) struct Caller {
     pub(crate) sha256: [u8; 32],
 }
 
-/// The `st` value `/proc/net/tcp` gives an established connection.
-const ESTABLISHED: u8 = 0x01;
+/// Both ends of a captured client's connection, as the capture tap states them: `from`, where the
+/// client connected from, as `accept(2)` reported it, and `to`, the destination it dialled, as the
+/// capture recorded it. Carried in the `CONNECT` the tap synthesizes
+/// ([`super::nettap::TAP_SOURCE_HEADER`]) as `<from> <to>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Stated {
+    pub(crate) from: SocketAddr,
+    pub(crate) to: SocketAddr,
+}
+
+impl Stated {
+    /// The statement as the header carries it.
+    pub(crate) fn header_value(&self) -> String {
+        format!("{} {}", self.from, self.to)
+    }
+
+    /// The statement a header value carries, or `None` when it is not two socket addresses.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let (from, to) = value.trim().split_once(' ')?;
+        Some(Self {
+            from: from.trim().parse().ok()?,
+            to: to.trim().parse().ok()?,
+        })
+    }
+}
+
+/// The `st` value `/proc/net/tcp` gives a listening socket.
+const LISTEN: u8 = 0x0A;
+/// The `st` values of a connection that is over: `TIME_WAIT` and `CLOSE`.
+const OVER: [u8; 2] = [0x06, 0x07];
 
 /// How many relays in front of the first are walked through. The deepest sbx builds is two (a
 /// `tcp://` listener, or the `ProxyCommand` relay, in front of the forwarder); a chain longer than
 /// this is named after the relay it stops at, which no rule names.
 const MAX_RELAYS: usize = 4;
 
+/// The largest executable hashed, in bytes. The cage writes the file, and a sparse one of any size
+/// costs it nothing; one past this is not named rather than read by the supervisor to its end.
+const HASH_MAX: u64 = 1 << 30;
+
+/// How many executables' hashes are kept. Past it the cache starts over, so a cage running many
+/// distinct files costs the supervisor rehashing rather than memory.
+const HASHES_KEPT: usize = 1024;
+
 /// Where a relay leads, from the socket the walk reached it by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Onward {
-    /// Its one other established socket, accepted from a client on `port` connected `toward` this
-    /// relay's port.
-    Client { port: u16, toward: u16 },
+    /// Its one other live socket, accepted from the next hop: that hop is the socket with this
+    /// one's ends reversed.
+    Client(TcpRow),
     /// No other socket: it carries its bytes on its standard streams.
     Stdio,
 }
@@ -74,11 +121,23 @@ enum Onward {
 /// One row of a `/proc/<pid>/net/tcp` or `tcp6` table: the parts the walk reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcpRow {
-    local_port: u16,
-    remote_port: u16,
+    local: SocketAddr,
+    remote: SocketAddr,
     state: u8,
     inode: u64,
 }
+
+impl TcpRow {
+    /// Whether the row is a connection still carrying, or able to carry, bytes: not a listener and
+    /// not one that is over. A half-closed connection still counts, so that a client which closed
+    /// its sending side is still a candidate, and two candidates are an ambiguity rather than one.
+    fn live(&self) -> bool {
+        self.state != LISTEN && !OVER.contains(&self.state) && self.inode != 0
+    }
+}
+
+/// A hash taken once per file however many connections ask for it at the same moment.
+type HashCell = Arc<OnceLock<Option<[u8; 32]>>>;
 
 /// Names the callers of egress connections, holding the hashes it has already taken.
 pub(crate) struct Identify {
@@ -86,14 +145,14 @@ pub(crate) struct Identify {
     /// named.
     relay: [u8; 32],
     /// The SHA-256 of the capture tap's executable, sbx's own: a peer running it is believed about
-    /// the port it says its client connected from.
+    /// the connection it says it carries.
     tap: [u8; 32],
     /// The cage port the forwarder accepts on.
     proxy_port: u16,
     /// Executable hashes by the identity of the file hashed: device, inode, size and change time.
     /// A file the cage rewrites in place changes its change time, which the cage cannot set, so a
     /// stale entry is never read for a new content.
-    hashes: Mutex<HashMap<FileKey, [u8; 32]>>,
+    hashes: Mutex<HashMap<FileKey, HashCell>>,
 }
 
 impl Identify {
@@ -111,9 +170,9 @@ impl Identify {
     }
 
     /// The program holding the connection whose proxy-side end is `stream`, or `None` when it
-    /// cannot be named. `stated` is the source port the request on `stream` says its client
-    /// connected from, which only a tap peer is believed about.
-    pub(crate) fn caller(&self, stream: &UnixStream, stated: Option<u16>) -> Option<Caller> {
+    /// cannot be named. `stated` is what the request on `stream` says about its client's
+    /// connection, which only a tap peer is believed about.
+    pub(crate) fn caller(&self, stream: &UnixStream, stated: Option<Stated>) -> Option<Caller> {
         let peer = super::peer::peer_pid(stream)?;
         let peer_hash = self.exe_hash(peer)?;
         let relayed = peer_hash == self.relay;
@@ -123,18 +182,16 @@ impl Identify {
         let net = net_ns(peer)?;
         let rows = tcp_rows(peer);
         let held = socket_inodes(peer);
-        // A tap's client connected to the destination it named, which the capture rewrote, so
-        // only a relay's client is held to the port it reached.
-        let (port, toward) = if relayed {
-            (
-                relayed_port(&rows, &held, self.proxy_port)?,
-                Some(self.proxy_port),
-            )
+        let (local, remote) = if relayed {
+            let accepted = accepted_on(&rows, &held, self.proxy_port)?;
+            (accepted.remote, accepted.local)
         } else {
-            (stated?, None)
+            let stated = stated?;
+            tap_carries(&rows, &held, stated.from)?;
+            (stated.from, stated.to)
         };
-        let mut inode = client_inode(&rows, port, toward, &held)?;
-        let mut holders = holders_of(inode, &net);
+        let mut inode = client_inode(&rows, local, remote, &held)?;
+        let mut holders = holders_of(Held::Socket(inode), &net);
         for _ in 0..MAX_RELAYS {
             let &[relay] = holders.as_slice() else {
                 break;
@@ -144,12 +201,12 @@ impl Identify {
             }
             let held = socket_inodes(relay);
             match onward(&rows, &held, inode)? {
-                Onward::Client { port, toward } => {
-                    inode = client_inode(&rows, port, Some(toward), &held)?;
-                    holders = holders_of(inode, &net);
+                Onward::Client(accepted) => {
+                    inode = client_inode(&rows, accepted.remote, accepted.local, &held)?;
+                    holders = holders_of(Held::Socket(inode), &net);
                 }
                 Onward::Stdio => {
-                    holders = vec![parent_pid(relay)?];
+                    holders = stdio_drivers(relay, inode, &net)?;
                     break;
                 }
             }
@@ -169,7 +226,11 @@ impl Identify {
     ) -> Self {
         let hashes = known
             .iter()
-            .map(|(path, hash)| (file_key(&std::fs::metadata(path).unwrap()), *hash))
+            .map(|(path, hash)| {
+                let cell = Arc::new(OnceLock::new());
+                let _ = cell.set(Some(*hash));
+                (file_key(&std::fs::metadata(path).unwrap()), cell)
+            })
             .collect();
         Self {
             relay,
@@ -200,16 +261,23 @@ impl Identify {
         named
     }
 
-    /// The SHA-256 of the executable `pid` runs, from the cache when that file was hashed before.
+    /// The SHA-256 of the executable `pid` runs: from the cache when that file was hashed before,
+    /// taken once when several connections ask at the same moment, and `None` for a file past
+    /// [`HASH_MAX`].
     fn exe_hash(&self, pid: u32) -> Option<[u8; 32]> {
         let file = std::fs::File::open(format!("/proc/{pid}/exe")).ok()?;
-        let key = file_key(&file.metadata().ok()?);
-        if let Some(hash) = crate::sandbox::locks::locked(&self.hashes).get(&key) {
-            return Some(*hash);
+        let meta = file.metadata().ok()?;
+        if meta.len() > HASH_MAX {
+            return None;
         }
-        let hash = sha256_read(file).ok()?;
-        crate::sandbox::locks::locked(&self.hashes).insert(key, hash);
-        Some(hash)
+        let cell = {
+            let mut hashes = crate::sandbox::locks::locked(&self.hashes);
+            if hashes.len() >= HASHES_KEPT && !hashes.contains_key(&file_key(&meta)) {
+                hashes.clear();
+            }
+            Arc::clone(hashes.entry(file_key(&meta)).or_default())
+        };
+        *cell.get_or_init(|| sha256_read(file).ok())
     }
 }
 
@@ -253,23 +321,57 @@ fn net_ns(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/ns/net")).ok()
 }
 
-/// The inodes of the sockets `pid` holds.
-fn socket_inodes(pid: u32) -> BTreeSet<u64> {
-    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-        return BTreeSet::new();
-    };
-    fds.filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
-        .filter_map(|target| socket_inode(&target.to_string_lossy()))
-        .collect()
+/// A kernel object a descriptor can name, by inode: what the walk looks for among the processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Socket(u64),
+    Pipe(u64),
 }
 
-/// The inode a descriptor link such as `socket:[1234]` names, if it names a socket.
-fn socket_inode(target: &str) -> Option<u64> {
-    target
-        .strip_prefix("socket:[")?
-        .strip_suffix(']')?
-        .parse()
-        .ok()
+impl Held {
+    /// The object a descriptor link such as `socket:[1234]` or `pipe:[1234]` names, if it names
+    /// one of the two.
+    fn of_link(target: &str) -> Option<Self> {
+        let inode = |kind: &str| -> Option<u64> {
+            target
+                .strip_prefix(kind)?
+                .strip_prefix(":[")?
+                .strip_suffix(']')?
+                .parse()
+                .ok()
+        };
+        inode("socket")
+            .map(Held::Socket)
+            .or_else(|| inode("pipe").map(Held::Pipe))
+    }
+}
+
+/// The objects `pid`'s descriptors name, by descriptor number.
+fn descriptors(pid: u32) -> Vec<(u32, Option<Held>, String)> {
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    fds.filter_map(|fd| {
+        let fd = fd.ok()?;
+        let number = fd.file_name().to_str()?.parse().ok()?;
+        let target = std::fs::read_link(fd.path())
+            .ok()?
+            .to_string_lossy()
+            .into_owned();
+        Some((number, Held::of_link(&target), target))
+    })
+    .collect()
+}
+
+/// The inodes of the sockets `pid` holds.
+fn socket_inodes(pid: u32) -> BTreeSet<u64> {
+    descriptors(pid)
+        .into_iter()
+        .filter_map(|(_, held, _)| match held {
+            Some(Held::Socket(inode)) => Some(inode),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The TCP rows of the network namespace `pid` runs in, IPv4 and IPv6 alike.
@@ -281,16 +383,36 @@ fn tcp_rows(pid: u32) -> Vec<TcpRow> {
         .collect()
 }
 
+/// An address as a `/proc/net/tcp` table writes it: the IP in hexadecimal, as 32-bit words in host
+/// byte order, a colon, and the port. An IPv4 address mapped into IPv6 reads as the IPv4 one, so a
+/// socket is compared in one spelling whichever table it is in.
+fn parse_addr(text: &str) -> Option<SocketAddr> {
+    let (ip, port) = text.rsplit_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let word = |hex: &str| u32::from_str_radix(hex, 16).ok().map(u32::to_ne_bytes);
+    let ip = match ip.len() {
+        8 => IpAddr::V4(Ipv4Addr::from(word(ip)?)),
+        32 => {
+            let mut bytes = [0u8; 16];
+            for (i, chunk) in bytes.chunks_mut(4).enumerate() {
+                chunk.copy_from_slice(&word(ip.get(i * 8..i * 8 + 8)?)?);
+            }
+            Ipv6Addr::from(bytes).to_canonical()
+        }
+        _ => return None,
+    };
+    Some(SocketAddr::new(ip, port))
+}
+
 /// The rows of a `/proc/net/tcp` or `tcp6` table. A line that does not read is skipped: the header,
 /// or a format a later kernel adds, says nothing about the connections this walk follows.
 fn parse_tcp_table(text: &str) -> Vec<TcpRow> {
-    let port = |addr: &str| u16::from_str_radix(addr.rsplit_once(':')?.1, 16).ok();
     text.lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
             Some(TcpRow {
-                local_port: port(fields.get(1)?)?,
-                remote_port: port(fields.get(2)?)?,
+                local: parse_addr(fields.get(1)?)?,
+                remote: parse_addr(fields.get(2)?)?,
                 state: u8::from_str_radix(fields.get(3)?, 16).ok()?,
                 inode: fields.get(9)?.parse().ok()?,
             })
@@ -298,55 +420,58 @@ fn parse_tcp_table(text: &str) -> Vec<TcpRow> {
         .collect()
 }
 
-/// The source port of the client a relay carries: the remote port of its one established socket
-/// accepted on `proxy_port`. `None` unless there is exactly one, since a relay carrying two
-/// connections cannot say which one this is.
-fn relayed_port(rows: &[TcpRow], held: &BTreeSet<u64>, proxy_port: u16) -> Option<u16> {
-    let ports: BTreeSet<u16> = rows
+/// The one live socket a relay holds that was accepted on `proxy_port`, or `None` unless there is
+/// exactly one, since a relay carrying two connections cannot say which one this is.
+fn accepted_on(rows: &[TcpRow], held: &BTreeSet<u64>, proxy_port: u16) -> Option<TcpRow> {
+    let accepted: Vec<&TcpRow> = rows
         .iter()
-        .filter(|r| held.contains(&r.inode) && r.state == ESTABLISHED && r.local_port == proxy_port)
-        .map(|r| r.remote_port)
+        .filter(|r| r.live() && held.contains(&r.inode) && r.local.port() == proxy_port)
         .collect();
-    match ports.len() {
-        1 => ports.into_iter().next(),
+    match accepted.as_slice() {
+        [one] => Some(**one),
         _ => None,
     }
 }
 
+/// Whether the tap holds its own end of the connection it states a client made from `from`: one
+/// live socket whose far end is that address. A statement about a connection the tap is not
+/// carrying is not believed.
+fn tap_carries(rows: &[TcpRow], held: &BTreeSet<u64>, from: SocketAddr) -> Option<()> {
+    let carrying = rows
+        .iter()
+        .filter(|r| r.live() && held.contains(&r.inode) && r.remote == from)
+        .count();
+    (carrying == 1).then_some(())
+}
+
 /// Where the relay holding `relay_holds` leads from the socket `came_in` the walk reached it by:
-/// its one other established socket, or its standard streams when it has none. `None` when it
+/// its one other live socket, or its standard streams when it holds no other socket. `None` when it
 /// has more than one, since a relay carrying two connections cannot say which one this is.
 fn onward(rows: &[TcpRow], relay_holds: &BTreeSet<u64>, came_in: u64) -> Option<Onward> {
     let others: Vec<&TcpRow> = rows
         .iter()
-        .filter(|r| r.state == ESTABLISHED && r.inode != came_in && relay_holds.contains(&r.inode))
+        .filter(|r| r.live() && r.inode != came_in && relay_holds.contains(&r.inode))
         .collect();
     match others.as_slice() {
         [] => Some(Onward::Stdio),
-        [accepted] => Some(Onward::Client {
-            port: accepted.remote_port,
-            toward: accepted.local_port,
-        }),
+        [accepted] => Some(Onward::Client(**accepted)),
         _ => None,
     }
 }
 
-/// The inode of the client's end of a relayed connection: the one established socket bound to
-/// `port`, connected to `toward` when that is known, that the relay does not hold itself. `None`
-/// when there is none, or more than one, which no single connection could be.
+/// The inode of the client's end of a connection: the one live socket from `local` to `remote` that
+/// the relay does not hold itself. `None` when there is none, or more than one, which no single
+/// connection could be.
 fn client_inode(
     rows: &[TcpRow],
-    port: u16,
-    toward: Option<u16>,
+    local: SocketAddr,
+    remote: SocketAddr,
     relay_holds: &BTreeSet<u64>,
 ) -> Option<u64> {
     let found: BTreeSet<u64> = rows
         .iter()
         .filter(|r| {
-            r.state == ESTABLISHED
-                && r.local_port == port
-                && toward.is_none_or(|t| r.remote_port == t)
-                && !relay_holds.contains(&r.inode)
+            r.live() && r.local == local && r.remote == remote && !relay_holds.contains(&r.inode)
         })
         .map(|r| r.inode)
         .collect();
@@ -354,6 +479,40 @@ fn client_inode(
         1 => found.into_iter().next(),
         _ => None,
     }
+}
+
+/// The processes driving a relay that carries its bytes on its standard streams: those holding the
+/// other ends of the pipes its stdin and stdout are, of which its parent must be one.
+///
+/// Every condition is what makes "the parent drives it" true rather than assumed. Its stdin and
+/// stdout are each a pipe or `/dev/null`, with at least one pipe, so its bytes have nowhere else to
+/// come from; it holds no descriptor past its standard streams but the socket `came_in`, so none
+/// other carries them; and the parent holds one of those pipes, so the program that launched it is
+/// on the other end rather than a stranger it was handed to. Anything else is `None`.
+fn stdio_drivers(relay: u32, came_in: u64, net: &Path) -> Option<Vec<u32>> {
+    let mut pipes = Vec::new();
+    for (fd, held, target) in descriptors(relay) {
+        match (fd, held) {
+            (0 | 1, Some(Held::Pipe(inode))) => pipes.push(inode),
+            (0 | 1, _) if target == "/dev/null" => {}
+            (0 | 1, _) => return None,
+            (2, _) => {}
+            (_, Some(Held::Socket(inode))) if inode == came_in => {}
+            _ => return None,
+        }
+    }
+    if pipes.is_empty() {
+        return None;
+    }
+    let mut drivers: Vec<u32> = pipes
+        .iter()
+        .flat_map(|&inode| holders_of(Held::Pipe(inode), net))
+        .filter(|&pid| pid != relay)
+        .collect();
+    drivers.sort_unstable();
+    drivers.dedup();
+    let parent = parent_pid(relay)?;
+    drivers.contains(&parent).then_some(drivers)
 }
 
 /// The parent of `pid`, from the `PPid:` line of its status.
@@ -368,15 +527,19 @@ fn parent_pid(pid: u32) -> Option<u32> {
         .filter(|&ppid| ppid != 0)
 }
 
-/// The processes running in the network namespace `net` that hold the socket `inode`.
-fn holders_of(inode: u64, net: &Path) -> Vec<u32> {
+/// The processes running in the network namespace `net` that hold `object`.
+fn holders_of(object: Held, net: &Path) -> Vec<u32> {
     let Ok(procs) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
     procs
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
         .filter(|&pid| net_ns(pid).as_deref() == Some(net))
-        .filter(|&pid| socket_inodes(pid).contains(&inode))
+        .filter(|&pid| {
+            descriptors(pid)
+                .iter()
+                .any(|(_, held, _)| *held == Some(object))
+        })
         .collect()
 }
 
@@ -394,100 +557,157 @@ mod tests {
    2: 0100007F:A8CA 0100007F:467B 01 00000000:00000000 00:00000000 00000000  1000        0 333 1 0000000000000000 20 4 30 10 -1
 ";
 
+    /// An address on the cage's loopback.
+    fn lo(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// An established row from `local` to `remote`.
+    fn row(local: SocketAddr, remote: SocketAddr, inode: u64) -> TcpRow {
+        TcpRow {
+            local,
+            remote,
+            state: 0x01,
+            inode,
+        }
+    }
+
     #[test]
-    fn a_tcp_table_reads_as_ports_states_and_inodes() {
+    fn a_tcp_table_reads_as_addresses_states_and_inodes() {
+        let any = SocketAddr::from(([0, 0, 0, 0], 0));
         assert_eq!(
             parse_tcp_table(TABLE),
             vec![
                 TcpRow {
-                    local_port: 18043,
-                    remote_port: 0,
-                    state: 0x0A,
+                    local: lo(18043),
+                    remote: any,
+                    state: LISTEN,
                     inode: 111
                 },
-                TcpRow {
-                    local_port: 18043,
-                    remote_port: 43210,
-                    state: ESTABLISHED,
-                    inode: 222
-                },
-                TcpRow {
-                    local_port: 43210,
-                    remote_port: 18043,
-                    state: ESTABLISHED,
-                    inode: 333
-                },
+                row(lo(18043), lo(43210), 222),
+                row(lo(43210), lo(18043), 333),
             ]
         );
+        // `::1`, and `127.0.0.1` mapped into IPv6, the second read as the IPv4 address it maps.
         let v6 = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
-   0: 00000000000000000000000001000000:467B 00000000000000000000000001000000:A8CA 01 00000000:00000000 00:00000000 00000000  1000        0 444 1 0000000000000000 20 4 30 10 -1
+   0: 00000000000000000000000001000000:467B 0000000000000000FFFF00000100007F:A8CA 01 00000000:00000000 00:00000000 00000000  1000        0 444 1 0000000000000000 20 4 30 10 -1
 ";
         assert_eq!(
             parse_tcp_table(v6),
-            vec![TcpRow {
-                local_port: 18043,
-                remote_port: 43210,
-                state: ESTABLISHED,
-                inode: 444
-            }]
+            vec![row(
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 18043)),
+                lo(43210),
+                444
+            )]
         );
+    }
+
+    #[test]
+    fn a_tap_statement_reads_back_as_written() {
+        let stated = Stated {
+            from: lo(43210),
+            to: SocketAddr::from(([93, 184, 216, 34], 443)),
+        };
+        assert_eq!(stated.header_value(), "127.0.0.1:43210 93.184.216.34:443");
+        assert_eq!(Stated::parse(&stated.header_value()), Some(stated));
+        assert_eq!(Stated::parse("43210"), None);
+        assert_eq!(Stated::parse("127.0.0.1:1 nowhere"), None);
     }
 
     #[test]
     fn a_relay_leads_to_the_one_client_it_carries_and_to_its_socket() {
         let rows = parse_tcp_table(TABLE);
         let relay: BTreeSet<u64> = [111, 222].into();
-        assert_eq!(relayed_port(&rows, &relay, 18043), Some(43210));
-        assert_eq!(client_inode(&rows, 43210, Some(18043), &relay), Some(333));
-        assert_eq!(client_inode(&rows, 43210, None, &relay), Some(333));
-        // A socket on that port connected elsewhere is not the relay's client.
-        assert_eq!(client_inode(&rows, 43210, Some(443), &relay), None);
+        let accepted = accepted_on(&rows, &relay, 18043).expect("one accepted connection");
+        assert_eq!(accepted.inode, 222);
+        assert_eq!(
+            client_inode(&rows, accepted.remote, accepted.local, &relay),
+            Some(333)
+        );
+        // A socket from that port to anywhere else is not the relay's client.
+        assert_eq!(client_inode(&rows, lo(43210), lo(443), &relay), None);
         // The relay's own end is never the client's.
-        assert_eq!(client_inode(&rows, 18043, None, &relay), None);
+        assert_eq!(client_inode(&rows, lo(18043), lo(43210), &relay), None);
         // The listener is held too, but it carries nothing.
-        assert_eq!(relayed_port(&rows, &[111].into(), 18043), None);
+        assert_eq!(accepted_on(&rows, &[111].into(), 18043), None);
         // A relay that holds two accepted connections cannot say which one this is.
         let mut two = rows.clone();
-        two.push(TcpRow {
-            local_port: 18043,
-            remote_port: 40000,
-            state: ESTABLISHED,
-            inode: 555,
+        two.push(row(lo(18043), lo(40000), 555));
+        assert_eq!(accepted_on(&two, &[222, 555].into(), 18043), None);
+    }
+
+    /// A client that closed its sending side is still the client, and a second socket with the same
+    /// ends on another state is an ambiguity, not a choice between them.
+    #[test]
+    fn a_half_closed_client_is_still_a_candidate_and_two_are_none() {
+        let mut rows = parse_tcp_table(TABLE);
+        let relay: BTreeSet<u64> = [222].into();
+        rows.iter_mut().find(|r| r.inode == 333).unwrap().state = 0x05; // FIN_WAIT2
+        rows.iter_mut().find(|r| r.inode == 222).unwrap().state = 0x08; // CLOSE_WAIT
+        let accepted = accepted_on(&rows, &relay, 18043).expect("still carrying");
+        assert_eq!(
+            client_inode(&rows, accepted.remote, accepted.local, &relay),
+            Some(333)
+        );
+        rows.push(TcpRow {
+            state: 0x01,
+            ..row(lo(43210), lo(18043), 999)
         });
-        assert_eq!(relayed_port(&two, &[222, 555].into(), 18043), None);
+        assert_eq!(
+            client_inode(&rows, accepted.remote, accepted.local, &relay),
+            None
+        );
+        // A connection that is over is no candidate.
+        rows.last_mut().unwrap().state = 0x06; // TIME_WAIT
+        assert_eq!(
+            client_inode(&rows, accepted.remote, accepted.local, &relay),
+            Some(333)
+        );
+    }
+
+    /// The tap is believed only about a connection it holds the far end of, and the client is the
+    /// socket with exactly the two ends it states: one from the same port on another address is
+    /// someone else's.
+    #[test]
+    fn a_tap_statement_is_held_to_both_ends_and_to_the_tap_own_socket() {
+        let to = SocketAddr::from(([93, 184, 216, 34], 443));
+        let other = SocketAddr::from(([127, 0, 0, 2], 43210));
+        let rows = vec![
+            row(lo(15001), lo(43210), 10),
+            row(lo(43210), to, 11),
+            row(other, to, 12),
+        ];
+        let tap: BTreeSet<u64> = [10].into();
+        assert_eq!(tap_carries(&rows, &tap, lo(43210)), Some(()));
+        assert_eq!(client_inode(&rows, lo(43210), to, &tap), Some(11));
+        assert_eq!(client_inode(&rows, other, to, &tap), Some(12));
+        assert_eq!(tap_carries(&rows, &tap, other), None);
     }
 
     /// A relay in front of the forwarder: reached by its socket toward the forwarder, it leads to
-    /// the one connection it accepted, or to its standard streams when it has none.
+    /// the one connection it accepted, or to its standard streams when it holds no other socket.
     #[test]
     fn a_relay_in_front_leads_to_its_accepted_client_or_to_its_standard_streams() {
         // The `tcp://` listener's child holds 444, from port 50000 to the forwarder on 18043, and
         // 555, accepted on 4022 from the client on 51000, which holds 666.
         let mut rows = parse_tcp_table(TABLE);
-        let row = |local_port, remote_port, inode| TcpRow {
-            local_port,
-            remote_port,
-            state: ESTABLISHED,
-            inode,
-        };
         rows.extend([
-            row(50000, 18043, 444),
-            row(4022, 51000, 555),
-            row(51000, 4022, 666),
+            row(lo(50000), lo(18043), 444),
+            row(lo(4022), lo(51000), 555),
+            row(lo(51000), lo(4022), 666),
         ]);
         let listener: BTreeSet<u64> = [444, 555].into();
+        let Some(Onward::Client(accepted)) = onward(&rows, &listener, 444) else {
+            panic!("the listener leads to its client");
+        };
         assert_eq!(
-            onward(&rows, &listener, 444),
-            Some(Onward::Client {
-                port: 51000,
-                toward: 4022
-            })
+            client_inode(&rows, accepted.remote, accepted.local, &listener),
+            Some(666)
         );
-        assert_eq!(client_inode(&rows, 51000, Some(4022), &listener), Some(666));
         // The `ProxyCommand` relay holds only its socket toward the forwarder.
         assert_eq!(onward(&rows, &[444].into(), 444), Some(Onward::Stdio));
         // One carrying two connections names none.
-        rows.push(row(4022, 52000, 777));
+        rows.push(row(lo(4022), lo(52000), 777));
         assert_eq!(onward(&rows, &[444, 555, 777].into(), 444), None);
     }
 
@@ -501,11 +721,87 @@ mod tests {
     }
 
     #[test]
-    fn a_descriptor_link_names_a_socket_or_nothing() {
-        assert_eq!(socket_inode("socket:[1234]"), Some(1234));
-        assert_eq!(socket_inode("pipe:[1234]"), None);
-        assert_eq!(socket_inode("/dev/null"), None);
-        assert_eq!(socket_inode("socket:[x]"), None);
+    fn a_descriptor_link_names_a_socket_a_pipe_or_nothing() {
+        assert_eq!(Held::of_link("socket:[1234]"), Some(Held::Socket(1234)));
+        assert_eq!(Held::of_link("pipe:[1234]"), Some(Held::Pipe(1234)));
+        assert_eq!(Held::of_link("/dev/null"), None);
+        assert_eq!(Held::of_link("socket:[x]"), None);
+    }
+
+    /// A relay on its standard streams is followed to whoever holds the other ends of its pipes,
+    /// and only when its parent is one of them: here `sleep`, holding a TCP socket and pipes to this
+    /// process, which launched it. With those ends let go, or a stream that is not a pipe, nothing.
+    #[test]
+    fn a_relay_on_its_standard_streams_is_driven_by_its_parent_or_by_nobody() {
+        use std::process::{Command, Stdio};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let spawn = |stdout: Stdio| {
+            Command::new("bash")
+                .arg("-c")
+                .arg(format!("exec 3<>/dev/tcp/127.0.0.1/{port}; exec sleep 30"))
+                .stdin(Stdio::piped())
+                .stdout(stdout)
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn the relay")
+        };
+        // The relay's socket, once `exec sleep` has run: by then its descriptors are final.
+        let settled = |pid: u32| -> u64 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+                let socket = descriptors(pid)
+                    .into_iter()
+                    .find_map(|(fd, held, _)| match held {
+                        Some(Held::Socket(inode)) if fd == 3 => Some(inode),
+                        _ => None,
+                    });
+                if let (Some(exe), Some(socket)) = (exe, socket)
+                    && exe.ends_with("sleep")
+                {
+                    return socket;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the relay never settled"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let net = net_ns(std::process::id()).unwrap();
+
+        let mut piped = spawn(Stdio::piped());
+        let _accepted = listener.accept().unwrap();
+        let socket = settled(piped.id());
+        assert_eq!(
+            stdio_drivers(piped.id(), socket, &net),
+            Some(vec![std::process::id()])
+        );
+        // Another socket than the one the walk came by is a way in the walk cannot see.
+        assert_eq!(stdio_drivers(piped.id(), socket + 1, &net), None);
+        // Its pipes let go of: nobody drives it, the parent included.
+        drop(piped.stdin.take());
+        drop(piped.stdout.take());
+        assert_eq!(stdio_drivers(piped.id(), socket, &net), None);
+        let _ = piped.kill();
+        let _ = piped.wait();
+
+        let file = tempfile_stdout();
+        let mut filed = spawn(Stdio::from(file));
+        let _accepted = listener.accept().unwrap();
+        let socket = settled(filed.id());
+        assert_eq!(stdio_drivers(filed.id(), socket, &net), None);
+        let _ = filed.kill();
+        let _ = filed.wait();
+    }
+
+    /// A file to point a child's stdout at, unlinked so it leaves nothing behind.
+    fn tempfile_stdout() -> std::fs::File {
+        let path = std::env::temp_dir().join(format!("sbx-caller-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        file
     }
 
     /// The walk end to end, with this test process as the relay and a `sleep` as the client: the
@@ -555,15 +851,21 @@ mod tests {
         let this = Path::new("/proc/self/exe");
         let walker = Identify::seeded([1; 32], [2; 32], 18043, &[(this, [9; 32])]);
         let caller = walker
-            .caller(&ours, Some(1))
+            .caller(
+                &ours,
+                Some(Stated {
+                    from: lo(1),
+                    to: lo(2),
+                }),
+            )
             .expect("this process is named");
         assert_eq!(caller.pid, std::process::id());
         assert_eq!(caller.sha256, [9; 32]);
     }
 
     /// The tap's case: this process plays the tap, holding an accepted connection, and is believed
-    /// about the port its client connected from; without that statement nothing is named, since a
-    /// tap carries many connections.
+    /// about the two ends of its client's connection; without that statement nothing is named,
+    /// since a tap carries many connections.
     #[test]
     fn a_tap_peer_is_followed_to_the_port_it_states_and_no_further_without_one() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -585,7 +887,11 @@ mod tests {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let caller = loop {
-            let caller = walker.caller(&ours, Some(from.port()));
+            let stated = Stated {
+                from,
+                to: listener.local_addr().unwrap(),
+            };
+            let caller = walker.caller(&ours, Some(stated));
             if caller.as_ref().is_some_and(|c| c.exe.ends_with("sleep"))
                 || std::time::Instant::now() > deadline
             {

@@ -309,21 +309,28 @@ Each entry names a program one of three ways:
 How the program is found: the supervisor, which can read the cage's processes, names whatever holds
 the other end of the connection. When that is the cage's own forwarder (the `socat` behind
 `HTTP_PROXY`), it follows the forwarder back to the client it carries; when it is the [capture
-tap](network#clients-that-ignore-the-proxy-variables), it follows the source port the tap reports.
-A forwarder in front of that one is followed the same way: the in-cage listener of a `tcp://` rule,
-and the `socat` that ssh's generated `ProxyCommand` runs. That last one carries its bytes on its
-standard streams rather than a socket, so the program named is the one that launched it: ssh.
-A connection whose program cannot be named, or is held by two different programs at once, receives
-no credential held this way. The lookup happens only for a request a `by` credential could ride,
-once per connection.
+tap](network#clients-that-ignore-the-proxy-variables), it follows the two ends of the connection the
+tap reports, and only while the tap still holds its own end of it. A forwarder in front of that one
+is followed the same way: the in-cage listener of a `tcp://` rule, and the `socat` that ssh's
+generated `ProxyCommand` runs. That last one carries its bytes on its standard streams rather than a
+socket, so the program named is the one on the other end of those pipes, and only when that is the
+program that launched it: ssh. A connection whose program cannot be named, is held by two different
+programs at once, or reaches the forwarder through anything the walk cannot account for, receives
+no credential held this way.
+
+The question is put once per connection, as soon as the proxy reads its first head, and only in a
+launch that declares a `by` or a [`[network.reserve]`](network#destinations-reserved-for-named-programs-reserve)
+entry. The program is read from what the connection's holder runs at that moment.
 
 **This narrows who is handed the credential; it is not a boundary.** The cage runs as your uid, so a
 program it can run can be made to act for another: a bare name is the agent's to give any file it
-writes, a library loaded into `gh` runs as `gh`, and `git` runs whatever its configuration tells it
-to. What `by` stops is the ordinary case: a credential sent by `curl` because a prompt asked for it.
-An absolute path or a `sha256:` entry is harder to stand in for than a name, at the price of being
-written again when the tool is updated. Removing or widening a `by` is shown as a grant by
-[`sbx trust`](../cli/trust#reading-the-grants), like any change to a credential.
+writes, a library loaded into `gh` runs as `gh`, `git` runs whatever its configuration tells it to,
+and a process that opens a connection and then replaces itself with `gh` (an `exec` that keeps the
+descriptor) is named `gh` if it does so before the proxy asks. What `by` stops is the ordinary case:
+a credential sent by `curl` because a prompt asked for it. An absolute path or a `sha256:` entry is
+harder to stand in for than a name, at the price of being written again when the tool is updated.
+Removing `by`, adding a program to it, or turning `by_other = "deny"` into `"bare"` is shown as a
+grant by [`sbx trust`](../cli/trust#reading-the-grants); narrowing it is not.
 
 `by` restricts the credential, not the destination: under `by_other = "bare"` every program still
 reaches `api.github.com`. To reserve the destination itself for named programs, credential or not,

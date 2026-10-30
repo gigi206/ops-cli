@@ -294,10 +294,15 @@ fn the_synthesized_request_is_the_one_an_obedient_client_sends() {
         synthesize_connect("github.com", 443, None),
         "CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n"
     );
-    // The port a captured client connected from rides along, for the supervisor to name it by.
+    // Both ends of a captured client's connection ride along, for the supervisor to name it by.
+    let stated = crate::sandbox::caller::Stated {
+        from: "127.0.0.1:43210".parse().unwrap(),
+        to: "140.82.112.3:443".parse().unwrap(),
+    };
     assert_eq!(
-        synthesize_connect("github.com", 443, Some(43210)),
-        "CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\nSbx-Tap-Source: 43210\r\n\r\n"
+        synthesize_connect("github.com", 443, Some(stated)),
+        "CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\
+         Sbx-Tap-Source: 127.0.0.1:43210 140.82.112.3:443\r\n\r\n"
     );
 }
 

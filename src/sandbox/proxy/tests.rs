@@ -13564,3 +13564,86 @@ fn a_reserved_splice_is_refused_before_the_tunnel() {
     );
     assert_eq!(ctx.splices.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
+
+/// The program the supervisor would name from `exe`.
+fn named(exe: &str) -> super::link::Named {
+    super::link::Named {
+        exe: exe.to_string(),
+        sha256: "ab".repeat(32),
+    }
+}
+
+/// A program a reservation names may have its destination; one it does not is refused, and so is
+/// one that only some of several reservations covering the destination name.
+#[test]
+fn a_reservation_admits_the_programs_it_names_and_each_must_name_them() {
+    use crate::sandbox::control::Proto;
+    let (ctx, _) = reserving_ctx(&["*.host.test:*"], &["locked.host.test:*"]);
+    let refused = |who: &Who| {
+        refused_by_reservation(&ctx, who, Proto::Https, "locked.host.test", 443, None, None)
+    };
+    assert!(!refused(&Who::named_as(named("/usr/bin/gh"))));
+    assert!(refused(&Who::named_as(named("/usr/bin/curl"))));
+
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let reserve = |entry: &str, by: &str| {
+        crate::allowlist::Reservation::new(classify(entry).unwrap(), vec![by.to_string()]).unwrap()
+    };
+    let both = ProxyCtx::new(
+        ca,
+        policy(&["*.host.test:*"]).with_reserved(vec![
+            reserve("locked.host.test:*", "gh"),
+            reserve("*.host.test:443", "git"),
+        ]),
+    )
+    .unwrap();
+    assert!(refused_by_reservation(
+        &both,
+        &Who::named_as(named("/usr/bin/gh")),
+        Proto::Https,
+        "locked.host.test",
+        443,
+        None,
+        None
+    ));
+}
+
+/// A credential held for named programs is matched for a connection the supervisor named as one of
+/// them, and not for one it named as another.
+#[test]
+fn a_credential_held_for_a_named_program_is_matched_for_that_program_alone() {
+    let held = injection("host.test:*", "Authorization", "Bearer sbx-secret")
+        .for_programs(&["gh".to_string()], crate::config::ByOther::Bare);
+    let ctx = loopback_ctx(&["host.test:*"]);
+    let ctx = Arc::try_unwrap(ctx)
+        .ok()
+        .expect("one owner")
+        .with_injections(vec![held]);
+    let creds = ctx.credentials.snapshot();
+    let ids = |who: &Who| matching_injection_ids(&creds, "host.test", 443, "/", who, &ctx);
+    assert_eq!(ids(&Who::named_as(named("/usr/bin/gh"))), vec![0]);
+    assert_eq!(
+        ids(&Who::named_as(named("/usr/bin/curl"))),
+        Vec::<usize>::new()
+    );
+    assert!(
+        ctx.names_callers(),
+        "a `by` credential has the callers named"
+    );
+}
+
+/// The absolute-form `https://` plane refuses a reserved destination as the tunnel does.
+#[test]
+fn a_reserved_destination_is_refused_on_the_absolute_form_plane() {
+    let (ctx, _) = reserving_ctx(&["*.host.test:*"], &["locked.host.test:*"]);
+    assert!(ctx.names_callers(), "a reservation has the callers named");
+    let resp = through_cleartext(
+        ctx,
+        b"GET https://locked.host.test/x HTTP/1.1\r\nHost: locked.host.test\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    assert!(
+        resp.contains(" 403 ") && resp.contains("by-mismatch"),
+        "{resp:?}"
+    );
+}

@@ -3967,7 +3967,8 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
 }
 
 /// The script the cage runs for the `by` test: each request on its path, one line per case, from
-/// bash alone (`/dev/tcp`), so no package is fetched. `$1`..`$4` are the ports A, B, U and V.
+/// bash alone (`/dev/tcp`, `coproc`), so no package is fetched. `$1`..`$4` are the ports A, B, U and
+/// V; `$5` is the phase, `reserve` or `secret`, which picks the cases.
 const BY_CASES: &str = r#"
 A=$1 B=$2 U=$3 V=$4
 req() {
@@ -3991,25 +3992,32 @@ listener() {
   fi
   echo "$label: ${line%$'\r'}"
 }
+# The pinned socat on its standard streams, driven by this shell through a coprocess: the way ssh
+# drives its `ProxyCommand`, holding both pipes and being the relay's parent.
 stdio() {
-  local line
-  line=$("$socat" -t 5 - "PROXY:127.0.0.1:127.0.0.1:$2,proxyport=18043" </dev/null \
-    | { IFS= read -r -t 15 l; echo "$l"; })
+  local line=
+  coproc RELAY { exec "$socat" -t 5 - "PROXY:127.0.0.1:127.0.0.1:$2,proxyport=18043"; }
+  IFS= read -r -t 15 line <&"${RELAY[0]}"
+  kill "$RELAY_PID" 2>/dev/null
+  wait "$RELAY_PID" 2>/dev/null
   echo "$1: ${line%$'\r'}"
 }
-req http-a "http://127.0.0.1:$A/" "127.0.0.1:$A"
-req http-b "http://127.0.0.1:$B/" "127.0.0.1:$B"
-listener listener-a "$A"
-listener listener-b "$B"
-socat=
-while read -r key value _; do
-  [[ $key == ProxyCommand ]] && socat=$value
-done < /etc/ssh/ssh_config
-echo "socat: ${socat:-none}"
-stdio stdio-a "$A"
-stdio stdio-b "$B"
-req secret-git "https://127.0.0.1:$U/" "127.0.0.1:$U"
-req secret-bash "https://127.0.0.1:$V/" "127.0.0.1:$V"
+if [[ $5 == reserve ]]; then
+  req http-a "http://127.0.0.1:$A/" "127.0.0.1:$A"
+  req http-b "http://127.0.0.1:$B/" "127.0.0.1:$B"
+  listener listener-a "$A"
+  listener listener-b "$B"
+  socat=
+  while read -r key value _; do
+    [[ $key == ProxyCommand ]] && socat=$value
+  done < /etc/ssh/ssh_config
+  echo "socat: ${socat:-none}"
+  stdio stdio-a "$A"
+  stdio stdio-b "$B"
+else
+  req secret-git "https://127.0.0.1:$U/" "127.0.0.1:$U"
+  req secret-bash "https://127.0.0.1:$V/" "127.0.0.1:$V"
+fi
 "#;
 
 #[test]
@@ -4021,9 +4029,11 @@ fn a_destination_or_credential_held_for_named_programs_follows_the_real_caller()
     //
     // - an absolute-form `http://` request through the forwarder (one relay);
     // - the in-cage listener of a `tcp://` rule, which is a relay in front of the forwarder;
-    // - the pinned socat run on its standard streams, as ssh's `ProxyCommand` runs it, whose
-    //   parent is the program;
+    // - the pinned socat on its standard streams, driven by bash as ssh drives its `ProxyCommand`;
     // - an absolute-form `https://` request to a credential held under `by_other = "deny"`.
+    //
+    // Two launches, because each kind of declaration has to stand up the naming on its own: the
+    // first declares reservations and no credential, the second credentials and no reservation.
     //
     // Offline: the upstream is a listener on the host's loopback, which an exact-address rule may
     // reach, and the credential's destination is a port nothing listens on, since a refusal for
@@ -4057,79 +4067,101 @@ fn a_destination_or_credential_held_for_named_programs_follows_the_real_caller()
     };
     serve(a);
     serve(b);
-
-    std::fs::write(
-        project.path().join(".sbx.toml"),
-        format!(
-            "[network]\nmode = \"deny\"\n\
-             allow = [\"127.0.0.1:{pu}\", \"127.0.0.1:{pv}\", \"tcp://127.0.0.1:22\"]\n\
-             [network.reserve.\"tcp://127.0.0.1:{pa}\"]\nby = [\"bash\"]\n\
-             [network.reserve.\"http://127.0.0.1:{pa}\"]\nby = [\"bash\"]\n\
-             [network.reserve.\"tcp://127.0.0.1:{pb}\"]\nby = [\"git\"]\n\
-             [network.reserve.\"http://127.0.0.1:{pb}\"]\nby = [\"git\"]\n\
-             [secret.\"127.0.0.1:{pu}\"]\nfrom = \"env://SBX_TEST_BY_TOKEN\"\n\
-             header = \"Authorization\"\ntype = \"bearer\"\nby = [\"git\"]\nby_other = \"deny\"\n\
-             [secret.\"127.0.0.1:{pv}\"]\nfrom = \"env://SBX_TEST_BY_TOKEN\"\n\
-             header = \"Authorization\"\ntype = \"bearer\"\nby = [\"bash\"]\nby_other = \"deny\"\n"
-        ),
-    )
-    .unwrap();
-    let trusted = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &["trust", "--yes", ".sbx.toml"],
-    );
-    assert!(
-        trusted.status.success(),
-        "sbx trust failed: {}",
-        String::from_utf8_lossy(&trusted.stderr)
-    );
-
     let ports = [pa, pb, pu, pv].map(|p| p.to_string());
-    let mut args = vec!["run", "--", "bash", "-c", BY_CASES, "by-cases"];
-    args.extend(ports.iter().map(String::as_str));
-    let Some(out) = trusted_launch("by e2e", || {
-        sbx_session_in(project.path(), data.path(), state.path())
-            .env("SBX_TEST_BY_TOKEN", "sbx-by-test-token")
-            .args(&args)
-            .output()
-            .expect("spawn sbx run")
-    }) else {
-        return;
+
+    // Write `config`, trust it, and run the cases of `phase` under it: their output lines.
+    let run_phase = |phase: &str, config: String| -> Option<(String, String)> {
+        std::fs::write(project.path().join(".sbx.toml"), config).unwrap();
+        let trusted = sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["trust", "--yes", ".sbx.toml"],
+        );
+        assert!(
+            trusted.status.success(),
+            "sbx trust failed: {}",
+            String::from_utf8_lossy(&trusted.stderr)
+        );
+        let mut args = vec!["run", "--", "bash", "-c", BY_CASES, "by-cases"];
+        args.extend(ports.iter().map(String::as_str));
+        args.push(phase);
+        let out = trusted_launch("by e2e", || {
+            sbx_session_in(project.path(), data.path(), state.path())
+                .env("SBX_TEST_BY_TOKEN", "sbx-by-test-token")
+                .args(&args)
+                .output()
+                .expect("spawn sbx run")
+        })?;
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let context = format!(
+            "{stdout}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !stdout.contains("no-dev-tcp"),
+            "the cage's bash cannot open /dev/tcp, so no case ran:\n{context}"
+        );
+        Some((stdout, context))
     };
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let context = format!(
-        "{stdout}\n--- stderr ---\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let case = |label: &str| -> String {
+    let case = |(stdout, context): &(String, String), label: &str| -> String {
         stdout
             .lines()
             .find_map(|l| l.strip_prefix(&format!("{label}: ")))
             .unwrap_or_else(|| panic!("no `{label}` line:\n{context}"))
             .to_string()
     };
-    assert!(
-        !stdout.contains("no-dev-tcp"),
-        "the cage's bash cannot open /dev/tcp, so no case ran:\n{context}"
-    );
-    assert_eq!(case("http-a"), "HTTP/1.1 200 OK reason=none", "{context}");
+
+    // Reservations alone: nothing else asks for the programs to be named.
+    let Some(reserve) = run_phase(
+        "reserve",
+        format!(
+            "[network]\nmode = \"deny\"\nallow = [\"tcp://127.0.0.1:22\"]\n\
+             [network.reserve.\"tcp://127.0.0.1:{pa}\"]\nby = [\"bash\"]\n\
+             [network.reserve.\"http://127.0.0.1:{pa}\"]\nby = [\"bash\"]\n\
+             [network.reserve.\"tcp://127.0.0.1:{pb}\"]\nby = [\"git\"]\n\
+             [network.reserve.\"http://127.0.0.1:{pb}\"]\nby = [\"git\"]\n"
+        ),
+    ) else {
+        return;
+    };
+    let context = &reserve.1;
     assert_eq!(
-        case("http-b"),
+        case(&reserve, "http-a"),
+        "HTTP/1.1 200 OK reason=none",
+        "{context}"
+    );
+    assert_eq!(
+        case(&reserve, "http-b"),
         "HTTP/1.1 403 Forbidden reason=by-mismatch",
         "{context}"
     );
-    assert_eq!(case("listener-a"), "HTTP/1.1 200 OK", "{context}");
-    assert_eq!(case("listener-b"), "", "{context}");
-    assert_ne!(case("socat"), "none", "{context}");
-    assert_eq!(case("stdio-a"), "HTTP/1.1 200 OK", "{context}");
-    assert_eq!(case("stdio-b"), "", "{context}");
+    assert_eq!(case(&reserve, "listener-a"), "HTTP/1.1 200 OK", "{context}");
+    assert_eq!(case(&reserve, "listener-b"), "", "{context}");
+    assert_ne!(case(&reserve, "socat"), "none", "{context}");
+    assert_eq!(case(&reserve, "stdio-a"), "HTTP/1.1 200 OK", "{context}");
+    assert_eq!(case(&reserve, "stdio-b"), "", "{context}");
+
+    // Credentials alone.
+    let Some(secret) = run_phase(
+        "secret",
+        format!(
+            "[network]\nmode = \"deny\"\nallow = [\"127.0.0.1:{pu}\", \"127.0.0.1:{pv}\"]\n\
+             [secret.\"127.0.0.1:{pu}\"]\nfrom = \"env://SBX_TEST_BY_TOKEN\"\n\
+             header = \"Authorization\"\ntype = \"bearer\"\nby = [\"git\"]\nby_other = \"deny\"\n\
+             [secret.\"127.0.0.1:{pv}\"]\nfrom = \"env://SBX_TEST_BY_TOKEN\"\n\
+             header = \"Authorization\"\ntype = \"bearer\"\nby = [\"bash\"]\nby_other = \"deny\"\n"
+        ),
+    ) else {
+        return;
+    };
+    let context = &secret.1;
+    let git = case(&secret, "secret-git");
     assert!(
-        case("secret-git").ends_with("reason=by-mismatch") && case("secret-git").contains(" 403 "),
+        git.ends_with("reason=by-mismatch") && git.contains(" 403 "),
         "{context}"
     );
-    let bash = case("secret-bash");
+    let bash = case(&secret, "secret-bash");
     assert!(
         !bash.ends_with("reason=by-mismatch") && bash.contains(" 502 "),
         "the credential's own program passes the `by` gate and fails only at the upstream:\n{context}"

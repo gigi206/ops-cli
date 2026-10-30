@@ -1026,7 +1026,7 @@ fn log_event_json(
             "way": s.way.as_str(),
         })).collect::<Vec<_>>(),
         // The executable inside the cage the supervisor named as holding the connection, or null
-        // where nothing asked (only a `[secret] by` credential does).
+        // where nothing asked (only a launch with a `[secret] by` or a `[network.reserve]` does).
         "caller": e.caller,
     });
     if view.with_status {
