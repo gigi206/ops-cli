@@ -67,8 +67,9 @@ pub(super) fn handle(
     connect_host: &str,
     port: u16,
     ctx: &ProxyCtx,
+    who: &super::Who,
 ) -> io::Result<()> {
-    runtime()?.block_on(serve(client, connect_host, port, ctx))
+    runtime()?.block_on(serve(client, connect_host, port, ctx, who))
 }
 
 /// The runtime one tunnel runs on. Dropped when the tunnel ends, which waits for the questions its
@@ -112,6 +113,7 @@ async fn serve(
     connect_host: &str,
     port: u16,
     ctx: &ProxyCtx,
+    who: &super::Who,
 ) -> io::Result<()> {
     client.set_nonblocking(true)?;
     let mut client = tokio::net::UnixStream::from_std(client)?;
@@ -186,7 +188,7 @@ async fn serve(
 
     // One pool per tunnel, living exactly as long as the runtime that drives its connections.
     let pool = UpstreamPool::default();
-    accept_streams(&mut conn, connect_host, port, ctx, &pool).await;
+    accept_streams(&mut conn, connect_host, port, ctx, who, &pool).await;
     Ok(())
 }
 
@@ -215,6 +217,7 @@ async fn accept_streams<T>(
     connect_host: &str,
     port: u16,
     ctx: &ProxyCtx,
+    who: &super::Who,
     pool: &UpstreamPool,
 ) where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -258,7 +261,7 @@ async fn accept_streams<T>(
                         let _ = refuse(respond, StatusCode::TOO_MANY_REQUESTS, "http2-stream-cap");
                         continue;
                     }
-                    inflight.push(stream(req, respond, connect_host, port, ctx, pool));
+                    inflight.push(stream(req, respond, connect_host, port, ctx, who, pool));
                 }
                 // Accept error, or the client sent GOAWAY / closed the connection: stop taking
                 // new streams, then drain the ones already in flight below.
@@ -291,6 +294,7 @@ async fn stream(
     connect_host: &str,
     port: u16,
     ctx: &ProxyCtx,
+    who: &super::Who,
     pool: &UpstreamPool,
 ) {
     let method = req.method().clone();
@@ -419,6 +423,7 @@ async fn stream(
         &creds,
         generation,
         ctx,
+        who,
         pool,
     )
     .await;
@@ -468,6 +473,7 @@ async fn relay(
     creds: &Arc<CredentialSet>,
     generation: u64,
     ctx: &ProxyCtx,
+    who: &super::Who,
     pool: &UpstreamPool,
 ) {
     // The URI the upstream request is rebuilt from, settled before anything is spent on the stream:
@@ -513,7 +519,7 @@ async fn relay(
     // where the HTTP/1.1 paths settle it too. Left where the injection used to sit — after the
     // allow — a refused stream would have been counted twice, once allowed and once blocked, which
     // is the same asymmetry between the plans that once made an h2 refusal invisible, inverted.
-    let injected_ids = matching_injection_ids(creds, host, port, path);
+    let injected_ids = matching_injection_ids(creds, host, port, path, who, ctx);
     // What a signer asking for a body digest is told here. A stream that ended with its headers has
     // no body, and the digest of nothing is exact and free. Anything else is **stated as unheld**:
     // this plan relays DATA frames as they arrive, and an h2 request half may legitimately never end
@@ -1857,7 +1863,9 @@ mod tests {
                 .unwrap();
             let served = {
                 let c = ctx.clone();
-                std::thread::spawn(move || handle(cage_end, "grpc.test", 443, &c))
+                std::thread::spawn(move || {
+                    handle(cage_end, "grpc.test", 443, &c, &super::super::Who::nobody())
+                })
             };
             let established = b"HTTP/1.1 200 Connection established\r\n\r\n";
             let mut reply = vec![0u8; established.len()];
@@ -2356,6 +2364,7 @@ mod tests {
                         "grpc.test",
                         443,
                         &ctx,
+                        &super::super::Who::nobody(),
                         &UpstreamPool::default(),
                     )
                     .await;
@@ -2463,6 +2472,7 @@ mod tests {
                     "grpc.test",
                     443,
                     &ctx,
+                    &super::super::Who::nobody(),
                     &UpstreamPool::default(),
                 )
                 .await;
@@ -2573,7 +2583,7 @@ mod tests {
                 let proxy = async {
                     let mut conn = h2::server::handshake(server_io).await.unwrap();
                     let (req, respond) = conn.accept().await.unwrap().unwrap();
-                    stream(req, respond, "grpc.test", 443, &ctx, &UpstreamPool::default()).await;
+                    stream(req, respond, "grpc.test", 443, &ctx, &super::super::Who::nobody(), &UpstreamPool::default()).await;
                     while conn.accept().await.is_some() {}
                 };
                 // The bound is also the assertion for the `ask` case: a verdict that parked would
@@ -3403,7 +3413,7 @@ mod tests {
                         accepted = conn.accept() => match accepted {
                             Some(Ok((req, respond))) => inflight.push(async {
                                 trace.entered.fetch_add(1, Ordering::Relaxed);
-                                stream(req, respond, connect_host, port, ctx, &pool).await;
+                                stream(req, respond, connect_host, port, ctx, &super::super::Who::nobody(), &pool).await;
                                 trace.returned.fetch_add(1, Ordering::Relaxed);
                             }),
                             _ => break,
@@ -4669,8 +4679,15 @@ mod tests {
                 };
                 let proxy = async {
                     let mut conn = h2::server::handshake(server_io).await.unwrap();
-                    accept_streams(&mut conn, "grpc.test", 443, &ctx, &UpstreamPool::default())
-                        .await;
+                    accept_streams(
+                        &mut conn,
+                        "grpc.test",
+                        443,
+                        &ctx,
+                        &super::super::Who::nobody(),
+                        &UpstreamPool::default(),
+                    )
+                    .await;
                 };
                 tokio::time::timeout(Duration::from_secs(10), async {
                     tokio::join!(proxy, client)
@@ -4748,7 +4765,7 @@ mod tests {
                     let proxy = async {
                         let mut conn = h2::server::handshake(server_io).await.unwrap();
                         let (req, respond) = conn.accept().await.unwrap().unwrap();
-                        stream(req, respond, "grpc.test", 443, &ctx, &UpstreamPool::default())
+                        stream(req, respond, "grpc.test", 443, &ctx, &super::super::Who::nobody(), &UpstreamPool::default())
                             .await;
                         while conn.accept().await.is_some() {}
                     };
@@ -4819,7 +4836,15 @@ mod tests {
             let (client, proxied) = std::os::unix::net::UnixStream::pair().unwrap();
             let tunnel = {
                 let ctx = Arc::clone(&ctx);
-                std::thread::spawn(move || handle(proxied, "grpc.test", 443, &ctx))
+                std::thread::spawn(move || {
+                    handle(
+                        proxied,
+                        "grpc.test",
+                        443,
+                        &ctx,
+                        &super::super::Who::nobody(),
+                    )
+                })
             };
             let mut roots = rustls::RootCertStore::empty();
             roots.add(ca.ca_cert_der()).unwrap();
@@ -5023,12 +5048,13 @@ mod tests {
             let proxy = async {
                 let mut conn = h2::server::handshake(server_io).await.unwrap();
                 let pool = UpstreamPool::default();
+                let who = super::super::Who::nobody();
                 let mut inflight = FuturesUnordered::new();
                 loop {
                     tokio::select! {
                         accepted = conn.accept() => match accepted {
                             Some(Ok((req, respond))) => inflight.push(
-                                stream(req, respond, connect_host, port, ctx, &pool),
+                                stream(req, respond, connect_host, port, ctx, &who, &pool),
                             ),
                             _ => break,
                         },

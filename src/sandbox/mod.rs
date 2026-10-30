@@ -32,6 +32,7 @@ pub(crate) mod memfd;
 pub(crate) mod naming;
 mod openuri;
 // Whether a control socket's peer runs in the supervisor's own PID namespace, which no cage does.
+mod caller;
 mod peer;
 mod pty;
 // When a host-side reader takes a control socket's answer to a read as whole: once its `ok` came.

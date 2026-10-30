@@ -183,6 +183,7 @@ struct SignerWire {
 struct InjectionWire {
     rule: Rule,
     form: FormWire,
+    by: Vec<String>,
 }
 
 /// [`Form`] as it crosses: a signer is carried by its position in [`SetWire::signers`].
@@ -314,7 +315,7 @@ fn asking(set: &CredentialSet, id: u64) -> Option<Signer> {
 
 impl InjectionWire {
     fn from_injection(injection: &HeaderInjection, signers: &mut Handed) -> io::Result<Self> {
-        let HeaderInjection { rule, form } = injection;
+        let HeaderInjection { rule, form, by } = injection;
         let form = match form {
             Form::Fixed { header, value } => FormWire::Fixed {
                 header: header.clone(),
@@ -350,11 +351,12 @@ impl InjectionWire {
         Ok(InjectionWire {
             rule: rule.clone(),
             form,
+            by: by.clone(),
         })
     }
 
     fn into_injection(self, signers: &[Signer]) -> io::Result<HeaderInjection> {
-        let InjectionWire { rule, form } = self;
+        let InjectionWire { rule, form, by } = self;
         let form = match form {
             FormWire::Fixed { header, value } => Form::Fixed { header, value },
             FormWire::Signed {
@@ -397,7 +399,7 @@ impl InjectionWire {
                 })
             }
         };
-        Ok(HeaderInjection { rule, form })
+        Ok(HeaderInjection { rule, form, by })
     }
 }
 
@@ -471,6 +473,7 @@ mod tests {
         marker: Option<SecretMarker>,
     ) -> HeaderInjection {
         HeaderInjection {
+            by: Vec::new(),
             rule: crate::allowlist::classify(host).unwrap(),
             form: Form::Signed(Signed {
                 name: "demo-sigv4".to_string(),
@@ -498,6 +501,7 @@ mod tests {
         CredentialSet {
             injections: vec![
                 HeaderInjection {
+                    by: Vec::new(),
                     rule,
                     form: Form::Fixed {
                         header: "X-Api-Key".to_string(),
@@ -539,7 +543,8 @@ mod tests {
     }
 
     fn same_injection(a: &HeaderInjection, b: &HeaderInjection) {
-        let HeaderInjection { rule, form } = a;
+        let HeaderInjection { rule, form, by } = a;
+        assert_eq!(by, &b.by);
         assert_eq!(rule, &b.rule);
         assert_eq!(rule.group, b.rule.group, "`==` ignores the group");
         assert_eq!(rule.builtin, b.rule.builtin, "`==` ignores `builtin`");

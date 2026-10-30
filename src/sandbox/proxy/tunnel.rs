@@ -53,6 +53,7 @@ type ClientTls = BufReader<StreamOwned<ServerConnection, UnixStream>>;
 pub(super) fn serve_tunneled_request(
     mut br: Box<ClientTls>,
     ctx: &ProxyCtx,
+    who: &super::Who,
     connect_host: &str,
     port: u16,
 ) -> io::Result<Turn> {
@@ -292,7 +293,7 @@ pub(super) fn serve_tunneled_request(
         && refuse_ws_into_injected_host(
             br.get_mut(),
             ctx,
-            &creds,
+            !matching_injection_ids(&creds, connect_host, port, &itarget, who, ctx).is_empty(),
             connect_host,
             port,
             &imethod,
@@ -331,7 +332,7 @@ pub(super) fn serve_tunneled_request(
     //    to. A redirect to another host opens a new tunnel and re-runs this match, so the secret
     //    cannot ride along to an unintended host. It is settled before any connection is taken,
     //    because which credentials a request carries is half of what partitions the pool below.
-    let injected_ids = matching_injection_ids(&creds, connect_host, port, &itarget);
+    let injected_ids = matching_injection_ids(&creds, connect_host, port, &itarget, who, ctx);
     // 7'. A signer whose manifest asks for a digest over the body is told one, which means the body
     //     has to exist before the question is put: hold it here rather than stream it at step 9. The
     //     `100-continue` a client may be waiting on is answered first — it withholds the body until

@@ -1573,6 +1573,16 @@ pub(crate) struct RawHostSecret {
     /// re-issues the token lives inside the app, and a launch refused for the expired token is a
     /// launch that cannot reach the login either.
     pub(crate) optional: Option<bool>,
+    /// The programs this credential is injected for, when only some may carry it. Each entry names
+    /// the program holding the connection: a bare name (`gh`) matches the file name of the
+    /// executable it runs, an entry with a `/` matches that path inside the cage exactly, and
+    /// `sha256:<hex>` matches the executable's content. Absent or empty, every program of the cage
+    /// receives the credential, as before this field existed.
+    ///
+    /// A request from any other program is forwarded without the header. This narrows who is handed
+    /// the credential; it is not a boundary: a program the cage can run can be made to act for
+    /// another, and a bare name is the cage's to give to any file.
+    pub(crate) by: Option<Vec<String>>,
 }
 
 /// The defaults declared once under `[secret.defaults]`: the resolver order and per-resolver

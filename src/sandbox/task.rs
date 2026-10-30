@@ -904,6 +904,7 @@ impl TaskEngine {
                 // A task's proxy shares the session's ring, which already carries the record; see
                 // `egress::start`.
                 None,
+                Some(self.forwarder.socat.as_path()),
             )
             .map_err(TaskError::Io)?;
             proxy_binds = wiring.binds;

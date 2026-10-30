@@ -349,6 +349,9 @@ pub(crate) struct HeaderSecret {
     /// destination is never reached without the header it was declared to carry: the two answers
     /// differ in blast radius, never in what may leave.
     pub(crate) optional: bool,
+    /// The programs the credential is injected for, each a bare name, an absolute in-cage path, or
+    /// `sha256:<hex>` (see [`crate::config::schema::RawHostSecret::by`]). Empty: every program.
+    pub(crate) by: Vec<String>,
 }
 
 impl HeaderSecret {

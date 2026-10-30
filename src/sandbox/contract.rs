@@ -1547,6 +1547,7 @@ mod tests {
                 description: None,
             }],
             injections: vec![HeaderSecret {
+                by: Vec::new(),
                 name: "upstream".into(),
                 description: None,
                 sources: vec![SecretSource::Env("UPSTREAM_TOKEN".into())],

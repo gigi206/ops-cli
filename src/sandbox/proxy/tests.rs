@@ -5749,7 +5749,16 @@ fn a_re_resolution_during_a_forwarded_requests_check_does_not_share_its_connecti
         let head = parse_head(&bytes).unwrap();
         let (method, target) = request_line_parts(&head.request_line).unwrap();
         let (client, mut peer) = UnixStream::pair().unwrap();
-        handle_https_forward(client, &head, &bytes, &method, &target, &ctx).unwrap();
+        handle_https_forward(
+            client,
+            &head,
+            &bytes,
+            &method,
+            &target,
+            &ctx,
+            &Who::nobody(),
+        )
+        .unwrap();
         let mut got = String::new();
         peer.read_to_string(&mut got).unwrap();
         assert!(
@@ -7087,6 +7096,7 @@ fn digesting_injection() -> HeaderInjection {
 
 fn digesting_injection_for(to: &str) -> HeaderInjection {
     HeaderInjection {
+        by: Vec::new(),
         rule: classify(to).unwrap(),
         form: super::Form::Signed(super::Signed {
             name: "digest-echo".to_string(),

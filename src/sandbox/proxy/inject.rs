@@ -10,6 +10,20 @@ mod transfer;
 
 pub(crate) use transfer::Transfer;
 
+/// Whether the `by` entry `entry` names the program `named`: by its content for `sha256:<hex>`, by
+/// its exact path for an entry with a `/`, and by its file name otherwise.
+fn program_is(entry: &str, named: &super::link::Named) -> bool {
+    if let Some(hex) = entry.strip_prefix("sha256:") {
+        return named.sha256 == hex;
+    }
+    if entry.contains('/') {
+        return named.exe == entry;
+    }
+    std::path::Path::new(&named.exe)
+        .file_name()
+        .is_some_and(|name| name == entry)
+}
+
 /// A resolved credential the proxy injects into requests matching its host/path rule. Injection
 /// happens only after a request is ALLOWED, and only when `rule` matches the verified CONNECT host
 /// and the decrypted path, so the credential reaches exactly one known destination.
@@ -19,6 +33,10 @@ pub(crate) struct HeaderInjection {
     pub(crate) rule: Rule,
     /// How the headers it puts on a request come to be.
     pub(crate) form: Form,
+    /// The programs this credential is injected for (`[secret] by`), each a bare name, an absolute
+    /// in-cage path or `sha256:<hex>`; empty for every program. A request whose connection is held
+    /// by none of them is forwarded without it ([`Self::injects_for`]).
+    pub(crate) by: Vec<String>,
 }
 
 /// The two ways a credential becomes headers on a request.
@@ -105,7 +123,28 @@ impl HeaderInjection {
                 header: header.into(),
                 value: value.into(),
             },
+            by: Vec::new(),
         }
+    }
+
+    /// This injection, held for the programs `by` names.
+    pub(crate) fn for_programs(mut self, by: &[String]) -> Self {
+        self.by = by.to_vec();
+        self
+    }
+
+    /// Whether this credential goes to a request whose connection `caller` holds: always when it is
+    /// held for no program in particular; otherwise only when `caller` was named and is one of
+    /// them. `caller` is asked only in that second case, since naming a program costs the
+    /// supervisor a walk of the cage's `/proc`.
+    pub(crate) fn injects_for<'a>(
+        &self,
+        caller: impl FnOnce() -> Option<&'a super::link::Named>,
+    ) -> bool {
+        if self.by.is_empty() {
+            return true;
+        }
+        caller().is_some_and(|named| self.by.iter().any(|entry| program_is(entry, named)))
     }
 
     /// The formed value of a fixed injection, for the tests that assert what reaches the wire.
@@ -171,7 +210,7 @@ impl HeaderInjection {
 impl fmt::Debug for HeaderInjection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("HeaderInjection");
-        s.field("rule", &self.rule);
+        s.field("rule", &self.rule).field("by", &self.by);
         match &self.form {
             Form::Fixed { header, .. } => s.field("header", header).field("value", &"<redacted>"),
             Form::Signed(signed) => s
@@ -2203,6 +2242,40 @@ mod tests {
     /// wire — and in the intended arrangement that value is a *placeholder* the application carries
     /// on every request. Remembering it would make the next request an outbound leak of a worthless
     /// string, refusing traffic sbx itself arranged. Found by running a real agent, not by reading.
+    /// A credential held for named programs goes to a request only when its connection is held by
+    /// one of them: by file name, by exact path or by content; and to none when nothing was named.
+    /// One held for no program in particular never asks who holds the connection.
+    #[test]
+    fn a_credential_held_for_named_programs_goes_only_to_them() {
+        let named = super::super::link::Named {
+            exe: "/nix/store/abc-gh/bin/gh".to_string(),
+            sha256: "cd".repeat(32),
+        };
+        let held = |by: &[&str]| {
+            HeaderInjection::fixed(
+                crate::allowlist::classify("api.github.com").unwrap(),
+                "Authorization",
+                "Bearer t",
+            )
+            .for_programs(&by.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert!(held(&["gh"]).injects_for(|| Some(&named)));
+        assert!(held(&["/nix/store/abc-gh/bin/gh"]).injects_for(|| Some(&named)));
+        assert!(held(&[&format!("sha256:{}", "cd".repeat(32))]).injects_for(|| Some(&named)));
+        assert!(held(&["git", "gh"]).injects_for(|| Some(&named)));
+        assert!(!held(&["git"]).injects_for(|| Some(&named)));
+        assert!(!held(&["/usr/bin/gh"]).injects_for(|| Some(&named)));
+        assert!(!held(&[&format!("sha256:{}", "00".repeat(32))]).injects_for(|| Some(&named)));
+        assert!(
+            !held(&["gh"]).injects_for(|| None),
+            "nothing named, nothing injected"
+        );
+        assert!(
+            held(&[]).injects_for(|| panic!("a credential for every program asks nobody")),
+            "held for no program in particular, it goes to every request"
+        );
+    }
+
     #[test]
     fn a_header_that_will_be_injected_is_never_observed() {
         let creds = default_creds(Vec::new(), Vec::new());
@@ -2360,6 +2433,7 @@ mod tests {
             Err(why) => Err(why.to_string()),
         };
         HeaderInjection {
+            by: Vec::new(),
             rule: crate::allowlist::classify("api.example.com").unwrap(),
             form: Form::Signed(Signed {
                 name: "demo-signer".to_string(),
@@ -2505,6 +2579,7 @@ mod tests {
         seen: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
     ) -> HeaderInjection {
         HeaderInjection {
+            by: Vec::new(),
             rule: crate::allowlist::classify("api.example.com").unwrap(),
             form: Form::Signed(Signed {
                 name: "demo-signer".to_string(),
@@ -2738,6 +2813,7 @@ mod tests {
         key: &str,
     ) -> HeaderInjection {
         HeaderInjection {
+            by: Vec::new(),
             rule: crate::allowlist::classify("signed.test").unwrap(),
             form: Form::Signed(Signed {
                 name: "demo-sig".to_string(),

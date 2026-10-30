@@ -1764,6 +1764,7 @@ mod tests {
         raw.inject = [(
             "api.example.com".to_string(),
             RawHostSecrets::One(RawHostSecret {
+                by: None,
                 name: None,
                 description: None,
                 kind: None,
@@ -1833,6 +1834,7 @@ mod tests {
     #[test]
     fn two_injections_of_one_header_to_one_host_are_refused() {
         let secret = |name: &str, header: &str| RawHostSecret {
+            by: None,
             name: Some(name.to_string()),
             description: None,
             kind: None,
@@ -1923,6 +1925,7 @@ mod tests {
             host: Default::default(),
         };
         let signed = |name: &str| RawHostSecret {
+            by: None,
             name: Some(name.to_string()),
             description: None,
             kind: None,

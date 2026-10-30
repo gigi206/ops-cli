@@ -99,20 +99,25 @@ pub(crate) struct Launched {
     pub(crate) ca: String,
 }
 
-/// Start a proxy as `start` says, and serve its link with `judge`, `parks` and `refresh`: returned
-/// once the proxy serves.
+/// Start a proxy as `start` says, and serve its link with `judge`, `parks`, `refresh` and
+/// `identify`: returned once the proxy serves.
 pub(crate) fn launch(
     start: Start<'_>,
     judge: Arc<Judge>,
     parks: Parks,
     refresh: Option<Arc<CredentialRefresh>>,
+    identify: Option<Arc<crate::sandbox::caller::Identify>>,
 ) -> io::Result<Launched> {
     let not_started =
         |e: io::Error| io::Error::new(e.kind(), format!("the egress proxy did not start: {e}"));
     let (down, up) = wire::Socket::pair()?;
     let proxy = Proxy::start(start.bwrap, up).map_err(not_started)?;
-    let served = hand_over(&down, start, START_WAIT)
-        .and_then(|ca| Ok((ca, super::link::supervising(down, judge, parks, refresh)?)));
+    let served = hand_over(&down, start, START_WAIT).and_then(|ca| {
+        Ok((
+            ca,
+            super::link::supervising(down, judge, parks, refresh, identify)?,
+        ))
+    });
     match served {
         Ok((ca, supervisor)) => Ok(Launched {
             proxy,
@@ -156,12 +161,15 @@ fn hand_over(down: &wire::Socket, start: Start<'_>, wait: Duration) -> io::Resul
         ));
     }
     let mut buf = vec![0u8; wire::MAX_UP];
-    let n = down.recv_up_into(&mut buf)?.ok_or_else(|| {
+    let (n, handed) = down.recv_up_into(&mut buf)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "it ended before it served (its own error, if any, is above)",
         )
     })?;
+    if handed.is_some() {
+        return Err(wire::invalid("a message handing over a descriptor"));
+    }
     let ready: Ready = serde_json::from_slice(&buf[..n])
         .map_err(|_| wire::invalid("an answer that does not parse"))?;
     certificate(&ready.ca)?;
@@ -562,6 +570,7 @@ mod tests {
             },
             judge,
             parks,
+            None,
             None,
         )
         .unwrap();

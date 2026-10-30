@@ -198,6 +198,7 @@ use rustls::{ClientConnection, ServerConnection, StreamOwned};
 use crate::allowlist::{self, Decision, L4Decision, Rule};
 
 use super::egress_stats::StatKind;
+use super::nettap::TAP_SOURCE_HEADER;
 
 #[cfg(test)]
 mod bench;
@@ -381,6 +382,72 @@ const CONTROL_BYTE_DETAIL: &str = "a request line or header carries a control by
      character); another parser could read it as a line break, so it is refused rather than \
      forwarded";
 
+/// The program behind one client connection: asked of the supervisor the first time a credential
+/// held for named programs could ride a request on it ([`HeaderInjection::injects_for`]), and never
+/// again for that connection. A connection whose requests match no such credential is never asked
+/// about, so naming costs nothing where nobody wrote `by`.
+///
+/// Held per connection because the answer is: every request of a tunnel, and every stream of an
+/// HTTP/2 connection, travels on the one socket, held by the one program.
+pub(super) struct Who {
+    /// The descriptor of the connection the proxy accepted, copied only when the supervisor is
+    /// asked and the copy closed once it is handed over. Holding a copy for the life of the
+    /// connection would keep it open past the plane that closes it, and a client waiting for the
+    /// end of its response would wait for good. `None` where there is none to hand (a test that
+    /// serves a plane directly).
+    client: Option<std::os::fd::RawFd>,
+    /// The port the request said its client connected from ([`TAP_SOURCE_HEADER`]), which the
+    /// supervisor believes only from the capture tap.
+    stated: Option<u16>,
+    named: std::sync::OnceLock<Option<link::Named>>,
+}
+
+impl Who {
+    /// The program behind `client`, whose CONNECT head stated `stated`. Asked only while a plane
+    /// serves `client`, which is what keeps the descriptor open for [`Self::named`] to copy.
+    fn of(client: &UnixStream, stated: Option<u16>) -> Self {
+        Who {
+            client: Some(client.as_raw_fd()),
+            stated,
+            named: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// A connection with nothing to name: a credential held for named programs never rides it.
+    #[cfg(test)]
+    pub(super) fn nobody() -> Self {
+        Who {
+            client: None,
+            stated: None,
+            named: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The program the supervisor names, asked once.
+    pub(super) fn named(&self, ctx: &ProxyCtx) -> Option<&link::Named> {
+        self.named
+            .get_or_init(|| {
+                let fd = self.client?;
+                // SAFETY: a `Who` is asked only by the plane serving the connection it was made
+                // for, which owns that connection and keeps its descriptor open while it serves;
+                // the borrow ends with the copy taken here.
+                let copy = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
+                    .try_clone_to_owned()
+                    .ok()?;
+                ctx.link.identify(&UnixStream::from(copy), self.stated)
+            })
+            .as_ref()
+    }
+}
+
+/// The port a CONNECT head states its client connected from, under [`TAP_SOURCE_HEADER`].
+fn stated_source(head: &Head) -> Option<u16> {
+    head.headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(TAP_SOURCE_HEADER))
+        .and_then(|(_, value)| value.trim().parse().ok())
+}
+
 /// Handle one client connection: parse the CONNECT, man-in-the-middle the tunnel, and serve the
 /// requests the client sends through it — each one a full turn through [`serve_tunneled_request`],
 /// which is where the policy decision and every check around it live. A connection that is not a
@@ -399,6 +466,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         Ok(parsed) => parsed,
         Err(e) => return refuse_unreadable_head(&mut client, ctx, &head, &e),
     };
+    let who = Who::of(&client, stated_source(&parsed));
     let Some((method, target)) = request_line_parts(&parsed.request_line) else {
         // A malformed request line carries no destination to attribute — log the attempt so it is
         // not dark, but with no host/method/path (the raw line may hold whitespace the wire format
@@ -432,7 +500,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             return handle_cleartext(client, &parsed, &head, &method, &target, ctx);
         }
         if target.starts_with("https://") {
-            return handle_https_forward(client, &parsed, &head, &method, &target, ctx);
+            return handle_https_forward(client, &parsed, &head, &method, &target, ctx, &who);
         }
         ctx.push_log(
             super::control::Proto::Other,
@@ -519,7 +587,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // confined to [`h2mitm`]; the synchronous HTTP/1.1 path below is untouched. Read from the config
     // policy — h2 selection is launch-static, not `--session`-overlaid.
     if ctx.policy.speaks_http2(&connect_host, port) {
-        return h2mitm::handle(client, &connect_host, port, ctx);
+        return h2mitm::handle(client, &connect_host, port, ctx, &who);
     }
 
     // 3. Accept the tunnel, then terminate TLS with a leaf minted for the SNI host.
@@ -555,7 +623,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             // thread and a descriptor per idle connection, bounded by `max_connections`.
             let _ = br.get_ref().sock.set_read_timeout(Some(ctx.idle));
         }
-        match serve_tunneled_request(br, ctx, &connect_host, port)? {
+        match serve_tunneled_request(br, ctx, &who, &connect_host, port)? {
             Turn::Continue(tunnel) => {
                 br = tunnel;
                 reused = true;
@@ -1333,17 +1401,26 @@ fn hold_request_body<R: BufRead>(
 /// partitioned by which credentials a request received, and its key has to name them without holding
 /// them. Ascending by construction, so two requests matching the same rules produce the same list.
 /// The two functions share this one matcher so the partition can never drift from the injection.
+///
+/// A credential held for named programs is matched only for a connection `who` the supervisor names
+/// as one of them; for any other it is as if no rule matched, so the request is forwarded without
+/// it and lands in the pool partition of the credentials it did receive.
 fn matching_injection_ids(
     creds: &CredentialSet,
     host: &str,
     port: u16,
     target: &str,
+    who: &Who,
+    ctx: &ProxyCtx,
 ) -> Vec<usize> {
     creds
         .injections
         .iter()
         .enumerate()
-        .filter(|(_, inj)| allowlist::rule_matches(&inj.rule, host, port, target))
+        .filter(|(_, inj)| {
+            allowlist::rule_matches(&inj.rule, host, port, target)
+                && inj.injects_for(|| who.named(ctx))
+        })
         .map(|(i, _)| i)
         .collect()
 }
@@ -1397,7 +1474,9 @@ fn note_final_status(
     }
 }
 
-/// Refuse a WebSocket upgrade into a credential-injected host, and say whether it did.
+/// Refuse a WebSocket upgrade into a credential-injected host, and say whether it did. `injected`
+/// is whether this request would carry a credential, as [`matching_injection_ids`] answers it for
+/// the connection it arrived on.
 ///
 /// A credential-injected host cannot also host a WebSocket: the injected secret rides the handshake,
 /// but once the upgrade completes the frames are opaque and cannot be redacted, so a value the host
@@ -1412,13 +1491,13 @@ fn note_final_status(
 fn refuse_ws_into_injected_host<W: Write>(
     w: &mut W,
     ctx: &ProxyCtx,
-    creds: &CredentialSet,
+    injected: bool,
     host: &str,
     port: u16,
     method: &str,
     target: &str,
 ) -> io::Result<bool> {
-    if matching_injection_ids(creds, host, port, target).is_empty() {
+    if !injected {
         return Ok(false);
     }
     ctx.outcome(

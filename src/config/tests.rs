@@ -1171,6 +1171,7 @@ fn raw_with_app(name: &str, app: RawApp) -> RawConfig {
 /// dependence on the default resolver order).
 fn a_header_secret() -> HeaderSecret {
     let raw = RawHostSecret {
+        by: None,
         name: None,
         description: None,
         kind: None,
@@ -9241,6 +9242,7 @@ fn raw_secret(
     (
         to.into(),
         RawHostSecret {
+            by: None,
             name: None,
             description: None,
             kind: Some("http-header".into()),
@@ -9315,6 +9317,7 @@ fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConf
 /// A `RawHostSecret` whose `from` is the given resolver-ref list, for the validation tests.
 fn raw_secret_from(from: Vec<&str>) -> RawHostSecret {
     RawHostSecret {
+        by: None,
         name: None,
         description: None,
         kind: Some("http-header".into()),
@@ -9334,6 +9337,38 @@ fn raw_secret_from(from: Vec<&str>) -> RawHostSecret {
 /// fixed concrete target so the tests focus on the source form.
 fn validate(secret: RawHostSecret) -> Result<HeaderSecret, String> {
     vhs("api.github.com", secret, &SecretDefaults::default())
+}
+
+/// `by` names programs in three forms, each checked as it is written; one that matches no form is
+/// refused rather than kept as a program no executable could be.
+#[test]
+fn a_secrets_by_entries_are_a_name_an_absolute_path_or_a_sha256() {
+    let with = |by: &[&str]| {
+        let mut secret = raw_secret_from(vec!["env://GH_TOKEN"]);
+        secret.by = Some(by.iter().map(|s| s.to_string()).collect());
+        validate(secret)
+    };
+    let digest = format!("sha256:{}", "ab".repeat(32));
+    assert_eq!(
+        with(&["gh", "/usr/bin/git", &digest]).unwrap().by,
+        vec!["gh".to_string(), "/usr/bin/git".to_string(), digest.clone()]
+    );
+    assert_eq!(
+        validate(raw_secret_from(vec!["env://GH_TOKEN"]))
+            .unwrap()
+            .by,
+        Vec::<String>::new()
+    );
+    for bad in [
+        "",
+        "bin/gh",
+        "sha256:abc",
+        &format!("sha256:{}", "AB".repeat(32)),
+        "g\nh",
+    ] {
+        let e = with(&[bad]).unwrap_err();
+        assert!(e.contains("`by` entry"), "{bad:?}: {e}");
+    }
 }
 
 // A credential with no `name` is still named — after its destination host, the section key — so
@@ -10668,6 +10703,7 @@ fn an_apps_network_stats_toggle_is_warned_and_ignored() {
 /// A terse `RawHostSecret` — `key` only, no explicit `from` — for the expansion tests.
 fn terse(key: &str) -> RawHostSecret {
     RawHostSecret {
+        by: None,
         name: None,
         description: None,
         kind: None,
@@ -10685,6 +10721,7 @@ fn terse(key: &str) -> RawHostSecret {
 /// `[secret.defaults]` — for the default-header/type tests.
 fn terse_bare(key: &str) -> RawHostSecret {
     RawHostSecret {
+        by: None,
         name: None,
         description: None,
         kind: None,
@@ -11151,6 +11188,7 @@ fn signer_reading(name: &str, env: &[&str]) -> crate::plugins::signer::SignerPlu
 /// A credential formed by a signer, for the host-config tests.
 fn secret_signed_by(name: &str) -> RawHostSecret {
     RawHostSecret {
+        by: None,
         name: None,
         description: None,
         kind: Some("http-header".into()),
@@ -12077,6 +12115,7 @@ fn an_untrusted_project_secret_section_steers_nothing() {
         hosts.insert(
             "api.github.com".to_string(),
             RawHostSecrets::One(RawHostSecret {
+                by: None,
                 name: None,
                 description: None,
                 kind: None,

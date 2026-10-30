@@ -902,6 +902,10 @@ pub(crate) fn start(
     // the event ring: a proxy handed one already has a record attached to it, and opening a second
     // at the same path would truncate the first.
     record: Option<&super::lens::RecordWiring>,
+    // The forwarder's executable on the host (the `socat` the cage bridges its proxy port with),
+    // which naming the program behind a connection walks through ([`super::caller`]). Read only when
+    // a credential is held for named programs (`[secret] by`); `None` where no cage forwards.
+    relay: Option<&Path>,
 ) -> io::Result<(Egress, Wiring)> {
     // Tighten the data directory to owner-only before anything reads from it. A resolver plugin
     // is trusted by location — it is run only because it sits under `<data>/plugins`, a tree a
@@ -1161,6 +1165,25 @@ pub(crate) fn start(
     // The proxy's copy of the policy and of the credentials cross in the form they are encoded to,
     // so a field that form drops is dropped on every launch. See [`EgressPolicy::encode`] and
     // [`super::proxy::Credentials::encode`].
+    // How the supervisor names the program behind a connection, stood up only when a credential is
+    // held for named programs. One that cannot be stood up names nothing, so such a credential is
+    // withheld from every request rather than handed to every program.
+    let identify = match relay {
+        Some(relay) if secrets.iter().any(|s| !s.by.is_empty()) => {
+            match super::caller::Identify::new(relay, Path::new("/proc/self/exe"), CAGE_PROXY_PORT)
+            {
+                Ok(identify) => Some(Arc::new(identify)),
+                Err(e) => {
+                    crate::diag::warn(&format!(
+                        "cannot name the programs behind egress connections ({e}): a credential \
+                         declared with `by` is injected for none of them"
+                    ));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     let launched = super::proxy::child::launch(
         super::proxy::child::Start {
             bwrap,
@@ -1174,6 +1197,7 @@ pub(crate) fn start(
         judge,
         parks,
         refresh,
+        identify,
     )
     .map_err(&unlink_socket)?;
     manual
@@ -1596,7 +1620,8 @@ fn resolve_one(
                 secret.to.clone(),
                 secret.header.clone(),
                 secret.shape.format(trimmed),
-            ),
+            )
+            .for_programs(&secret.by),
             needles,
         ));
     };
@@ -1643,6 +1668,7 @@ fn resolve_one(
                 signer,
                 body_digest: plugin.signer.body_digest,
             }),
+            by: secret.by.clone(),
         },
         needles,
     ))
@@ -2293,6 +2319,7 @@ mod tests {
             None,
             Unresolved::Abort,
             None,
+            None,
         )
         .expect("start the egress proxy");
 
@@ -2450,6 +2477,7 @@ mod tests {
             None,
             Unresolved::Abort,
             None,
+            None,
         )
         .expect("start the egress proxy");
         let begun = std::time::Instant::now();
@@ -2486,6 +2514,7 @@ mod tests {
             Plane::Agent,
             None,
             Unresolved::Abort,
+            None,
             None,
         )
         .expect("start the egress proxy");
@@ -2554,6 +2583,7 @@ mod tests {
             Plane::Task,
             None,
             Unresolved::Abort,
+            None,
             None,
         )
         .expect("start with the session's ring");
@@ -2709,6 +2739,7 @@ mod tests {
             None,
             Unresolved::Abort,
             None,
+            None,
         )
         .expect("start the ask egress proxy");
         let control = guard.control_uds.clone().expect("a control socket");
@@ -2789,6 +2820,7 @@ mod tests {
                 Plane::Agent,
                 None,
                 Unresolved::Abort,
+                None,
                 None,
             )
             .expect("start the egress proxy");
@@ -3351,6 +3383,7 @@ mod tests {
             None,
             Unresolved::Abort,
             None,
+            None,
         )
         .expect("start the ask egress proxy");
 
@@ -3426,6 +3459,7 @@ mod tests {
             None,
             Unresolved::Abort,
             None,
+            None,
         )
         .expect("start with stats off");
         drop(guard);
@@ -3456,6 +3490,7 @@ mod tests {
             None,
             Unresolved::Abort,
             None,
+            None,
         )
         .expect("start with stats on");
         drop(guard);
@@ -3482,6 +3517,7 @@ mod tests {
         shape: crate::config::HeaderShape,
     ) -> HeaderSecret {
         HeaderSecret {
+            by: Vec::new(),
             name: to.to_string(),
             description: None,
             sources,
@@ -3506,6 +3542,7 @@ mod tests {
     /// running signer belongs to is the question being asked.
     fn standing_signer_for(host: &str, plugin: &str, key: &str) -> HeaderInjection {
         HeaderInjection {
+            by: Vec::new(),
             rule: crate::allowlist::classify(host).unwrap(),
             form: crate::sandbox::proxy::Form::Signed(crate::sandbox::proxy::Signed {
                 name: plugin.to_string(),
@@ -4399,6 +4436,7 @@ mod tests {
             None,
             Unresolved::DenyDestination,
             None,
+            None,
         )
         .expect("start the egress proxy");
         let judge = guard.supervisor.judge();
@@ -5054,6 +5092,7 @@ mod tests {
             None,
             Unresolved::Abort,
             None,
+            None,
         )
         .expect("start with a shared ring");
         shared.push(
@@ -5099,6 +5138,7 @@ mod tests {
             Plane::Agent,
             None,
             Unresolved::Abort,
+            None,
             None,
         )
         .expect("start with a ring of its own");

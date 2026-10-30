@@ -63,6 +63,7 @@ pub(super) fn handle_https_forward(
     method: &str,
     target: &str,
     ctx: &ProxyCtx,
+    who: &super::Who,
 ) -> io::Result<()> {
     // One credential state for the whole exchange: taken once here so the value injected and
     // the needle scanned for can never come from two different resolutions, even if a refresh
@@ -137,7 +138,15 @@ pub(super) fn handle_https_forward(
     //     egress so no `allow` is recorded. Reached only when a `{WS}` rule already permitted the
     //     upgrade — an upgrade to a non-`{WS}` host was denied by method above.
     if ws_upgrade
-        && refuse_ws_into_injected_host(&mut client, ctx, &creds, &host, port, verb, &path)?
+        && refuse_ws_into_injected_host(
+            &mut client,
+            ctx,
+            !matching_injection_ids(&creds, &host, port, &path, who, ctx).is_empty(),
+            &host,
+            port,
+            verb,
+            &path,
+        )?
     {
         return Ok(());
     }
@@ -163,7 +172,7 @@ pub(super) fn handle_https_forward(
     //    scoped destination. Unlike the `http://` path, the upstream is TLS, so a header secret rides
     //    it encrypted, never in the clear. Settled before a connection is taken, because which
     //    credentials a request carries is half of what partitions the pool.
-    let injected_ids = matching_injection_ids(&creds, &host, port, &path);
+    let injected_ids = matching_injection_ids(&creds, &host, port, &path, who, ctx);
     // 7'. As on the tunneled path: a signer that asks for a digest over the body needs the body held
     //     before the question is put, so it is read here rather than streamed at step 9.
     let digest_wanted = creds.wants_body_digest(&injected_ids);
@@ -676,7 +685,16 @@ mod tests {
         let bytes = request.as_bytes().to_vec();
         let head = parse_head(&bytes).unwrap();
         let (method, target) = request_line_parts(&head.request_line).unwrap();
-        handle_https_forward(client, &head, &bytes, &method, &target, &ctx).unwrap();
+        handle_https_forward(
+            client,
+            &head,
+            &bytes,
+            &method,
+            &target,
+            &ctx,
+            &super::Who::nobody(),
+        )
+        .unwrap();
         let mut transcript = String::new();
         peer.read_to_string(&mut transcript).unwrap();
         transcript
@@ -841,7 +859,16 @@ mod tests {
         let head = parse_head(&bytes).unwrap();
         let (method, target) = request_line_parts(&head.request_line).unwrap();
         let (client, mut peer) = UnixStream::pair().unwrap();
-        handle_https_forward(client, &head, &bytes, &method, &target, &ctx).unwrap();
+        handle_https_forward(
+            client,
+            &head,
+            &bytes,
+            &method,
+            &target,
+            &ctx,
+            &super::Who::nobody(),
+        )
+        .unwrap();
         let mut transcript = String::new();
         peer.read_to_string(&mut transcript).unwrap();
         assert!(
@@ -901,7 +928,16 @@ mod tests {
         let head = parse_head(&bytes).unwrap();
         let (method, target) = request_line_parts(&head.request_line).unwrap();
         let (client, mut peer) = UnixStream::pair().unwrap();
-        handle_https_forward(client, &head, &bytes, &method, &target, &ctx).unwrap();
+        handle_https_forward(
+            client,
+            &head,
+            &bytes,
+            &method,
+            &target,
+            &ctx,
+            &super::Who::nobody(),
+        )
+        .unwrap();
         let mut transcript = String::new();
         peer.read_to_string(&mut transcript).unwrap();
         assert!(

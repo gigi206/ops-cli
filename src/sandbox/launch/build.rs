@@ -2700,6 +2700,7 @@ pub(super) fn build(
             signer_ring.clone(),
             prep.unresolved_secret,
             record.as_ref(),
+            Some(prep.userland.socat_bin.as_path()),
         )
         .map_err(|e| {
             // Through `diag::error` despite carrying no backtick of its own: the error it

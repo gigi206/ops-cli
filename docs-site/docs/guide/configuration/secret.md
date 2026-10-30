@@ -86,6 +86,7 @@ host ``) and in the `sbx config show --json` view, so the two spellings meet the
 | `prefix` | override the type's default prefix (`Bearer ` / `Basic ` / empty) |
 | `sign` | a [signer plugin](../plugins/signer) that forms the credential **per request** |
 | `optional` | whether a launch may proceed when this credential does not resolve, its destination denied for the run; default `false`, which refuses the launch |
+| `by` | the programs the credential is injected for (a name, an absolute in-cage path, or `sha256:<hex>`); absent, every program of the cage; see [Held for named programs](#held-for-named-programs-by) |
 
 A secret must have **exactly one** of `key` or `from`. It must have a `header` and a
 `type`, either on itself or from `[secret.defaults]`: a secret that names neither is
@@ -276,6 +277,46 @@ reaches `api.github.com`.
 has its requests authenticated *as you*. It still never sees the token, but it acts with
 your identity on that API within whatever its allowlist permits. Put the block in a single
 app profile (below) to narrow that to one tool.
+
+## Held for named programs (`by`)
+
+```toml
+[secret."api.github.com"]
+from   = "env://GH_TOKEN"
+header = "Authorization"
+type   = "bearer"
+by     = ["gh", "git"]
+```
+
+Without `by`, every program in the cage that reaches `api.github.com` receives the header: the
+agent's `curl` as much as `gh`. With it, the proxy asks which program holds the connection a request
+arrived on, and injects the credential only when it is one of those named. A request from any other
+program is forwarded **without** the header, so it reaches the host unauthenticated rather than being
+refused, and the tools that do not need the credential keep working.
+
+Each entry names a program one of three ways:
+
+| Entry | Matches |
+|---|---|
+| `"gh"` | an executable whose file name is `gh` |
+| `"/nix/store/…-gh-2.62.0/bin/gh"` | that exact executable path inside the cage |
+| `"sha256:<64 lowercase hex>"` | an executable with exactly that content |
+
+How the program is found: the supervisor, which can read the cage's processes, names whatever holds
+the other end of the connection. When that is the cage's own forwarder (the `socat` behind
+`HTTP_PROXY`), it follows the forwarder back to the client it carries; when it is the [capture
+tap](network#clients-that-ignore-the-proxy-variables), it follows the source port the tap reports.
+A connection whose program cannot be named, or is held by two different programs at once, receives
+no credential held this way. The lookup happens only for a request a `by` credential could ride,
+once per connection.
+
+**This narrows who is handed the credential; it is not a boundary.** The cage runs as your uid, so a
+program it can run can be made to act for another: a bare name is the agent's to give any file it
+writes, a library loaded into `gh` runs as `gh`, and `git` runs whatever its configuration tells it
+to. What `by` stops is the ordinary case: a credential sent by `curl` because a prompt asked for it.
+An absolute path or a `sha256:` entry is harder to stand in for than a name, at the price of being
+written again when the tool is updated. Removing or widening a `by` is shown as a grant by
+[`sbx trust`](../cli/trust#reading-the-grants), like any change to a credential.
 
 ## Per-app secrets
 

@@ -564,6 +564,7 @@ impl crate::sandbox::signer::Signing for NullSigner {
 
 fn signing_injection(digest: bool) -> HeaderInjection {
     HeaderInjection {
+        by: Vec::new(),
         rule: classify("upstream.test:*").unwrap(),
         form: Form::Signed(Signed {
             name: "bench".to_string(),

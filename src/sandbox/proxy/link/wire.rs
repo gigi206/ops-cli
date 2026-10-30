@@ -230,40 +230,67 @@ impl Socket {
         self.send(&[doc], &[])
     }
 
-    /// The next message from the proxy, or `None` where the link ends.
+    /// Send `doc` to the supervisor handing over `fd` with it: the one message up that hands over
+    /// anything is the connection the proxy asks the supervisor to name, and it hands over exactly
+    /// that connection.
+    pub(super) fn send_up_handing(&self, doc: &[u8], fd: &OwnedFd) -> io::Result<()> {
+        if doc.len() > MAX_UP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "link: a message larger than the link carries",
+            ));
+        }
+        self.send(&[doc], &[fd.as_raw_fd()])
+    }
+
+    /// The next message from the proxy, or `None` where the link ends. One that hands over a
+    /// descriptor is refused: the messages a test reads this way hand over none.
     #[cfg(test)]
     pub(super) fn recv_up(&self) -> io::Result<Option<Vec<u8>>> {
         let mut buf = vec![0u8; MAX_UP];
-        Ok(self.recv_up_into(&mut buf)?.map(|n| {
-            buf.truncate(n);
-            buf
-        }))
+        match self.recv_up_into(&mut buf)? {
+            None => Ok(None),
+            Some((_, Some(_))) => Err(invalid("a message handing over a descriptor")),
+            Some((n, None)) => {
+                buf.truncate(n);
+                Ok(Some(buf))
+            }
+        }
     }
 
-    /// Read the next message from the proxy into `buf`, which holds [`MAX_UP`] bytes: its length,
-    /// or `None` where the link ends.
+    /// Read the next message from the proxy into `buf`, which holds [`MAX_UP`] bytes: its length
+    /// and the one descriptor it handed over, if any, or `None` where the link ends.
+    ///
+    /// There is room for one descriptor and no more. A message that hands over more is refused, and
+    /// what it handed over is closed as the refusal returns, so nothing the proxy sends stays open
+    /// on this side beyond the message that carried it. Which message may carry one is the
+    /// reader's to decide ([`super::read_proxy`]).
     pub(in crate::sandbox::proxy) fn recv_up_into(
         &self,
         buf: &mut [u8],
-    ) -> io::Result<Option<usize>> {
+    ) -> io::Result<Option<(usize, Option<OwnedFd>)>> {
         let mut iov = libc::iovec {
             iov_base: buf.as_mut_ptr().cast(),
             iov_len: buf.len(),
         };
-        // SAFETY: as in `recv_down`; the control field stays null and empty, which is the point:
-        // with no room for one, a descriptor the proxy sends is discarded by the kernel instead of
-        // being installed here.
+        let (mut control, space) = control_room(1);
+        // SAFETY: as in `recv_down`; the iov and control fields are pointed at live buffers below
+        // before `recvmsg` reads them.
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
-        let received_len = receive(&self.0, &mut msg, 0)?;
-        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
-            return Err(invalid("a message handing over a descriptor"));
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = space as _;
+        let received_len = receive(&self.0, &mut msg, libc::MSG_CMSG_CLOEXEC)?;
+        // Owned before anything is checked, so a refusal below closes what it refuses.
+        let mut fds = received(&msg);
+        if msg.msg_flags & libc::MSG_CTRUNC != 0 || fds.len() > 1 {
+            return Err(invalid("a message handing over more than one descriptor"));
         }
         if msg.msg_flags & libc::MSG_TRUNC != 0 {
             return Err(invalid("a message larger than the link carries"));
         }
-        Ok(received_len)
+        Ok(received_len.map(|n| (n, fds.pop())))
     }
 
     /// Stop sending: the other end reads the end of the link once it has read what came before.
@@ -548,11 +575,11 @@ mod tests {
         assert!(fds.is_empty());
     }
 
-    /// A descriptor the proxy hands over never enters the supervisor, and the message that carried it
-    /// is refused: the write end of a pipe sent up reads as closed once the sender's copy is, so no
-    /// copy of it was installed on this side.
+    /// A descriptor the proxy hands over with a message that may not carry one is refused with the
+    /// message, and closed as the refusal returns: the write end of a pipe sent up reads as closed
+    /// once the sender's copy is, so no copy of it stays open on this side.
     #[test]
-    fn a_descriptor_sent_up_is_refused_and_never_installed() {
+    fn a_descriptor_sent_up_is_refused_and_closed_at_once() {
         let (supervisor, proxy) = Socket::pair().unwrap();
         let (read, write) = pipe();
         raw(

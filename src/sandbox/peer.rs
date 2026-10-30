@@ -250,6 +250,23 @@ fn pin_peer(stream: &UnixStream, peer_pidfd: bool) -> Result<OwnedFd, Verdict> {
     }
 }
 
+/// The number, in the PID namespace `/proc` belongs to, of the process at the other end of `stream`:
+/// the process [`pin_peer`] names, read off its pidfd's `Pid:` line. `None` when it has exited, runs
+/// outside that namespace, or cannot be named.
+///
+/// The number is read through the pidfd rather than taken from `SO_PEERCRED` alone, so on a kernel
+/// with `SO_PEERPIDFD` it names the process that connected even if that one has since exited and
+/// its number gone to another: such a peer reads as `-1`, which is `None` here.
+pub(super) fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    let pidfd = pin_peer(stream, true).ok()?;
+    fdinfo(&pidfd)
+        .lines()
+        .find_map(|l| l.strip_prefix("Pid:"))
+        .and_then(|pid| pid.trim().parse::<i64>().ok())
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|&pid| pid > 0)
+}
+
 /// The fdinfo text of a pidfd, empty when it cannot be read (which [`depth`] reads as unnamed).
 fn fdinfo(pidfd: &OwnedFd) -> String {
     std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd())).unwrap_or_default()

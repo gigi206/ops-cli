@@ -291,8 +291,13 @@ fn a_table_full_of_connected_names_answers_servfail() {
 #[test]
 fn the_synthesized_request_is_the_one_an_obedient_client_sends() {
     assert_eq!(
-        synthesize_connect("github.com", 443),
+        synthesize_connect("github.com", 443, None),
         "CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n"
+    );
+    // The port a captured client connected from rides along, for the supervisor to name it by.
+    assert_eq!(
+        synthesize_connect("github.com", 443, Some(43210)),
+        "CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\nSbx-Tap-Source: 43210\r\n\r\n"
     );
 }
 
@@ -376,7 +381,13 @@ fn capture_through(
         back
     });
     let (server_side, _) = listener.accept().expect("accept");
-    let outcome = serve_capture(server_side, SocketAddrV4::new(dest_ip, 443), table, uds);
+    let outcome = serve_capture(
+        server_side,
+        SocketAddrV4::new(dest_ip, 443),
+        None,
+        table,
+        uds,
+    );
     let echoed = client.join().expect("client thread");
     (outcome, echoed)
 }
@@ -404,7 +415,7 @@ fn a_named_address_reaches_the_proxy_as_a_connect_and_then_pumps() {
         }
     );
     let head = heads.recv_timeout(Duration::from_secs(5)).expect("head");
-    assert_eq!(head, synthesize_connect("github.com", 443));
+    assert_eq!(head, synthesize_connect("github.com", 443, None));
     assert_eq!(
         echoed, b"hello",
         "bytes must flow both ways once the tunnel is open"
@@ -1038,7 +1049,7 @@ fn the_taps_work_under_its_filter(dir: &Path) {
         let reply = answer_query(&query("github.com", QTYPE_A), &table, &reporter).expect("answer");
         let at = reply.len() - 4;
         let ip = Ipv4Addr::new(reply[at], reply[at + 1], reply[at + 2], reply[at + 3]);
-        let outcome = serve_capture(stream, SocketAddrV4::new(ip, 443), &table, &uds);
+        let outcome = serve_capture(stream, SocketAddrV4::new(ip, 443), None, &table, &uds);
         (unredirected, outcome)
     })
     .join()
@@ -1061,7 +1072,7 @@ fn the_taps_work_under_its_filter(dir: &Path) {
     );
     assert_eq!(
         heads.recv_timeout(Duration::from_secs(5)).expect("head"),
-        synthesize_connect("github.com", 443)
+        synthesize_connect("github.com", 443, None)
     );
     assert_eq!(client.join().expect("client thread"), b"hello");
     assert_eq!(

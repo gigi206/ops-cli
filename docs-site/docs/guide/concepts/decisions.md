@@ -36,7 +36,10 @@ promoted:
   control: what enforces egress is the allowlist behind it;
 - a task's [output redaction](../tasks/output) and [parameter
   handling](../tasks/parameters) are accident containment, catching a credential echoed by
-  mistake rather than one a program set out to exfiltrate.
+  mistake rather than one a program set out to exfiltrate;
+- a credential held for [named programs](../configuration/secret#held-for-named-programs-by)
+  goes only to them, but a program the cage runs as your uid can be made to act for another,
+  so it narrows who is handed the credential rather than keeping it from a determined agent.
 
 Reading any of those as the boundary is the one misreading that changes a decision, which
 is why each page states it in its own words.

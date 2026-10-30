@@ -21,7 +21,15 @@
 //! compromised one is the supervisor's own check of every connection it makes on the proxy's behalf.
 //! A confirmation is therefore never believed beyond the last version sent, and a message the
 //! supervisor cannot read (one that does not parse, is longer than it reads, or hands it a
-//! descriptor) ends the link: past it, the supervisor no longer knows what the proxy meant.
+//! descriptor it did not ask for) ends the link: past it, the supervisor no longer knows what the
+//! proxy meant.
+//!
+//! **The program behind a connection is the supervisor's to name.** The proxy cannot see the cage's
+//! processes; the supervisor can. Where a credential is held for named programs, the proxy hands the
+//! supervisor the connection it accepted ([`Link::identify`]), the one message up that hands over a
+//! descriptor, and the supervisor answers with what holds the other end ([`crate::sandbox::caller`]).
+//! A proxy that lies is answered about whatever it handed over, which grants it nothing it did not
+//! already hold: it holds the credentials.
 //!
 //! **A parked request waits on the supervisor.** The proxy says what it would park
 //! ([`Link::park`]) and blocks until the answer comes back. The supervisor lets it into the queue
@@ -53,6 +61,7 @@ use super::events::Emitter;
 use super::inject::{CredentialRefresh, Started, Transfer};
 use super::ssrf::ConnectRefusal;
 use crate::allowlist::{EgressPolicy, Rule};
+use crate::sandbox::caller::Identify;
 use crate::sandbox::control::{PendingState, Verdict};
 use crate::sandbox::locks::{locked, read_locked, write_locked};
 use serde::{Deserialize, Serialize};
@@ -61,6 +70,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::TcpStream;
 use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
@@ -151,6 +161,25 @@ enum ToProxy<S = Transfer, C = OwnedFd> {
     },
     /// The check or the connection asked for as `id` is refused, and why.
     Refused { id: u64, refusal: ConnectRefusal },
+    /// The program holding the connection handed over as `id`, or `None` when it cannot be named.
+    Identified { id: u64, caller: Option<Named> },
+}
+
+/// A program as the supervisor names it to the proxy: its executable inside the cage, and the
+/// SHA-256 of that executable's content, in lowercase hex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Named {
+    pub(crate) exe: String,
+    pub(crate) sha256: String,
+}
+
+impl From<crate::sandbox::caller::Caller> for Named {
+    fn from(caller: crate::sandbox::caller::Caller) -> Self {
+        Named {
+            exe: caller.exe.to_string_lossy().into_owned(),
+            sha256: caller.sha256.iter().map(|b| format!("{b:02x}")).collect(),
+        }
+    }
 }
 
 impl<S, C> ToProxy<S, C> {
@@ -182,6 +211,7 @@ impl<S, C> ToProxy<S, C> {
                 stream: stream(s)?,
             },
             ToProxy::Refused { id, refusal } => ToProxy::Refused { id, refusal },
+            ToProxy::Identified { id, caller } => ToProxy::Identified { id, caller },
         })
     }
 }
@@ -260,6 +290,10 @@ enum ToSupervisor {
         check: Option<u64>,
         from: usize,
     },
+    /// Name the program holding the connection handed over with this message, whose request said
+    /// its client connected from `stated` (a port only the capture tap is believed about). Answered
+    /// under the same `id`.
+    Identify { id: u64, stated: Option<u16> },
 }
 
 /// An answer the proxy waits for, handed to the request that asked.
@@ -269,6 +303,7 @@ enum Reply {
     Checked,
     Connected(TcpStream, usize, usize),
     Refused(ConnectRefusal),
+    Identified(Option<Named>),
 }
 
 /// A request the supervisor cleared to connect: what was asked, and the check that cleared it, for
@@ -318,15 +353,19 @@ impl ProxySide {
         }
     }
 
-    /// Send `message` to the supervisor. An error when this end reaches none, or the link has ended.
-    fn say(&self, message: &ToSupervisor) -> io::Result<()> {
+    /// Send `message` to the supervisor, handing over `fd` with it when there is one. An error when
+    /// this end reaches none, or the link has ended.
+    fn say(&self, message: &ToSupervisor, fd: Option<&OwnedFd>) -> io::Result<()> {
         let socket = self
             .socket
             .as_ref()
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
         let doc = serde_json::to_vec(message)
             .map_err(|_| wire::invalid("a message that does not encode"))?;
-        socket.send_up(&doc)
+        match fd {
+            Some(fd) => socket.send_up_handing(&doc, fd),
+            None => socket.send_up(&doc),
+        }
     }
 }
 
@@ -439,6 +478,15 @@ impl Link {
     /// Send the question `message` builds under a fresh id, and wait for its answer. `None` when the
     /// answer cannot come: an end no supervisor reaches, or a link that closed meanwhile.
     fn ask(&self, message: impl FnOnce(u64) -> ToSupervisor) -> Option<Reply> {
+        self.ask_handing(message, None)
+    }
+
+    /// [`Self::ask`], handing over `fd` with the question.
+    fn ask_handing(
+        &self,
+        message: impl FnOnce(u64) -> ToSupervisor,
+        fd: Option<&OwnedFd>,
+    ) -> Option<Reply> {
         let (id, reply) = {
             let mut waiting = locked(&self.side.waiting);
             waiting.next += 1;
@@ -448,11 +496,22 @@ impl Link {
             (id, rx)
         };
         // Registered before it is sent, so an answer arriving at once finds where to go.
-        if self.side.say(&message(id)).is_err() {
+        if self.side.say(&message(id), fd).is_err() {
             locked(&self.side.waiting).replies.remove(&id);
             return None;
         }
         reply.recv().ok()
+    }
+
+    /// Ask the supervisor which program holds the other end of `client`, the connection this proxy
+    /// accepted, whose request said its client connected from `stated`; and wait for the answer.
+    /// `None` when it cannot be named, or no answer can come.
+    pub(crate) fn identify(&self, client: &UnixStream, stated: Option<u16>) -> Option<Named> {
+        let handed = OwnedFd::from(client.try_clone().ok()?);
+        match self.ask_handing(|id| ToSupervisor::Identify { id, stated }, Some(&handed)) {
+            Some(Reply::Identified(caller)) => caller,
+            _ => None,
+        }
     }
 
     /// Keep the reader from installing what it is sent, and so from confirming it, until the guard
@@ -503,6 +562,9 @@ struct SupervisorSide {
     refresh: Option<Arc<CredentialRefresh>>,
     /// How the proxy's checks and connections are answered.
     judge: Arc<Judge>,
+    /// How the programs behind the proxy's connections are named, or `None` when the launch holds
+    /// no credential for named programs: each question is then answered with no name.
+    identify: Option<Arc<Identify>>,
     /// How a thread of this end is started: [`named_thread`], or in a test one the host refuses.
     threads: fn(&str) -> std::thread::Builder,
     /// The way to the one thread that runs the admitted refreshes, while it runs.
@@ -631,8 +693,9 @@ pub(super) fn supervising(
     judge: Arc<Judge>,
     parks: Parks,
     refresh: Option<Arc<CredentialRefresh>>,
+    identify: Option<Arc<Identify>>,
 ) -> io::Result<Supervisor> {
-    Ok(supervise(socket, judge, Some(parks), refresh, named_thread)?.0)
+    Ok(supervise(socket, judge, Some(parks), refresh, identify, named_thread)?.0)
 }
 
 /// A judge over the default policy: all a test that makes no connection needs.
@@ -694,7 +757,7 @@ fn start(
     let (down, up) = wire::Socket::pair()?;
     #[cfg(test)]
     let held = Arc::clone(&judge);
-    let (supervisor, supervisor_reader) = supervise(down, judge, parks, refresh, threads)?;
+    let (supervisor, supervisor_reader) = supervise(down, judge, parks, refresh, None, threads)?;
     let (link, proxy_reader) = attend(up, events)?;
     #[cfg(test)]
     let link = {
@@ -741,6 +804,7 @@ fn supervise(
     judge: Arc<Judge>,
     parks: Option<Parks>,
     refresh: Option<Arc<CredentialRefresh>>,
+    identify: Option<Arc<Identify>>,
     threads: fn(&str) -> std::thread::Builder,
 ) -> io::Result<(Supervisor, JoinHandle<io::Result<()>>)> {
     socket.send_wait(SEND_WAIT)?;
@@ -752,6 +816,7 @@ fn supervise(
         parks,
         refresh,
         judge,
+        identify,
         threads,
         refreshes: Mutex::new(None),
         answers: Mutex::new(None),
@@ -815,7 +880,7 @@ fn read_supervisor(side: &ProxySide, flushes: &Sender<u64>) {
                 };
                 // Confirmed only once installed: the supervisor answers the operator on this, and
                 // the next request must be decided with what it confirmed.
-                let _ = side.say(&ToSupervisor::Installed { version: installed });
+                let _ = side.say(&ToSupervisor::Installed { version: installed }, None);
             }
             ToProxy::Answer { id, verdict } => hand_over(side, id, Reply::Verdict(verdict)),
             ToProxy::Refreshed { id, set } => hand_over(side, id, Reply::Refreshed(set)),
@@ -824,6 +889,7 @@ fn read_supervisor(side: &ProxySide, flushes: &Sender<u64>) {
                 hand_over(side, id, Reply::Connected(TcpStream::from(stream), at, of));
             }
             ToProxy::Refused { id, refusal } => hand_over(side, id, Reply::Refused(refusal)),
+            ToProxy::Identified { id, caller } => hand_over(side, id, Reply::Identified(caller)),
             // Not flushed here: the reader would stop reading for as long as the flush takes.
             ToProxy::Flush { id } => {
                 let _ = flushes.send(id);
@@ -851,7 +917,7 @@ fn run_flushes(side: &ProxySide, events: Option<&Emitter>, asked: &Receiver<u64>
         if let Some(events) = events {
             events.flush();
         }
-        let _ = side.say(&ToSupervisor::Flushed { id });
+        let _ = side.say(&ToSupervisor::Flushed { id }, None);
     }
 }
 
@@ -864,13 +930,24 @@ fn read_proxy(side: &Arc<SupervisorSide>, socket: &wire::Socket) -> io::Result<(
     // large allocated per message is a mapping made and unmade per request.
     let mut buf = vec![0u8; wire::MAX_UP];
     let ended = loop {
-        let doc = match socket.recv_up_into(&mut buf) {
-            Ok(Some(n)) => &buf[..n],
+        let (doc, handed) = match socket.recv_up_into(&mut buf) {
+            Ok(Some((n, handed))) => (&buf[..n], handed),
             Ok(None) => break Ok(()),
             Err(e) => break Err(e),
         };
-        let Ok(message) = serde_json::from_slice(doc) else {
+        let Ok(message) = serde_json::from_slice::<ToSupervisor>(doc) else {
             break Err(wire::invalid("a message that does not parse"));
+        };
+        // The one message that hands over a descriptor is the connection to name, and it hands
+        // over exactly that one: anything else that carries one, or that one without it, is a
+        // message this reader cannot read.
+        let handed = match (&message, handed) {
+            (ToSupervisor::Identify { .. }, Some(fd)) => Some(fd),
+            (ToSupervisor::Identify { .. }, None) => {
+                break Err(wire::invalid("a connection to name handed over without it"));
+            }
+            (_, Some(_)) => break Err(wire::invalid("a message handing over a descriptor")),
+            (_, None) => None,
         };
         match message {
             ToSupervisor::Installed { version } => {
@@ -897,6 +974,11 @@ fn read_proxy(side: &Arc<SupervisorSide>, socket: &wire::Socket) -> io::Result<(
                 check,
                 from,
             } => serve_question(side, id, Question::Connect { asked, check, from }),
+            ToSupervisor::Identify { id, stated } => {
+                if let Some(fd) = handed {
+                    serve_identify(side, id, stated, fd);
+                }
+            }
         }
     };
     locked(&side.down).take();
@@ -913,6 +995,26 @@ fn read_proxy(side: &Arc<SupervisorSide>, socket: &wire::Socket) -> io::Result<(
         parks.pending.answer_all(Verdict::Deny);
     }
     ended
+}
+
+/// Name the program holding the connection `fd`, on a thread of its own since naming it reads the
+/// cage's `/proc` and may hash an executable, and answer under `id`. Answered with no name at once
+/// when the launch names no program, or no thread can be started: the proxy waits for an answer
+/// either way, and nothing else will send it.
+fn serve_identify(side: &Arc<SupervisorSide>, id: u64, stated: Option<u16>, fd: OwnedFd) {
+    let Some(identify) = side.identify.clone() else {
+        let _ = send(side, ToProxy::Identified { id, caller: None });
+        return;
+    };
+    let naming = Arc::clone(side);
+    let started = (side.threads)("sbx-identify").spawn(move || {
+        let client = UnixStream::from(fd);
+        let caller = identify.caller(&client, stated).map(Named::from);
+        let _ = send(&naming, ToProxy::Identified { id, caller });
+    });
+    if started.is_err() {
+        let _ = send(side, ToProxy::Identified { id, caller: None });
+    }
 }
 
 /// Let a request the proxy parked into the queue and wait for its answer on a thread of its own, or
@@ -1197,7 +1299,7 @@ mod tests {
     fn a_confirmation_beyond_what_was_sent_is_not_believed() {
         let (link, supervisor) = pair();
         link.side
-            .say(&ToSupervisor::Installed { version: u64::MAX })
+            .say(&ToSupervisor::Installed { version: u64::MAX }, None)
             .unwrap();
         supervisor.push(1, overlay("api.test")).unwrap();
         assert_eq!(supervisor.installed(), 1);
@@ -1355,12 +1457,15 @@ mod tests {
         // Sent as the proxy sends it, straight on the socket: a request parked with `park` would
         // hold the end this test lets go of.
         link.side
-            .say(&ToSupervisor::Park {
-                id: 1,
-                host: "api.test".to_string(),
-                port: 443,
-                path: "/".to_string(),
-            })
+            .say(
+                &ToSupervisor::Park {
+                    id: 1,
+                    host: "api.test".to_string(),
+                    port: 443,
+                    path: "/".to_string(),
+                },
+                None,
+            )
             .unwrap();
         assert_eq!(listed(&pending, 1).len(), 1);
         drop(link);
@@ -1702,7 +1807,7 @@ mod tests {
     fn supervised() -> (Supervisor, JoinHandle<io::Result<()>>, Arc<wire::Socket>) {
         let (down, up) = wire::Socket::pair().unwrap();
         let (supervisor, reader) =
-            supervise(down, default_judge(), None, None, named_thread).unwrap();
+            supervise(down, default_judge(), None, None, None, named_thread).unwrap();
         (supervisor, reader, Arc::new(up))
     }
 
@@ -2052,6 +2157,55 @@ mod tests {
         );
     }
 
+    /// The connection the proxy asks to have named crosses as its descriptor, and the supervisor
+    /// names what holds its other end: here this very process, whose executable the walker was
+    /// told the hash of. A supervisor that names no program answers with no name.
+    #[test]
+    fn a_connection_to_name_crosses_and_is_named_after_what_holds_it() {
+        let this = std::path::Path::new("/proc/self/exe");
+        let identify = Arc::new(Identify::seeded(
+            [1; 32],
+            [2; 32],
+            18043,
+            &[(this, [9; 32])],
+        ));
+        let (down, up) = wire::Socket::pair().unwrap();
+        let (_supervisor, _reader) = supervise(
+            down,
+            default_judge(),
+            None,
+            None,
+            Some(identify),
+            named_thread,
+        )
+        .unwrap();
+        let (link, _proxy_reader) = attend(up, None).unwrap();
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let named = link.identify(&ours, None).expect("this process is named");
+        assert_eq!(named.sha256, "09".repeat(32));
+        assert_eq!(
+            named.exe,
+            std::fs::read_link(this).unwrap().to_string_lossy()
+        );
+
+        let (link, _supervisor) = joined(default_judge(), None, None);
+        assert_eq!(link.identify(&ours, None), None);
+    }
+
+    /// The one message up that hands over a descriptor must hand it over: without it the reader
+    /// cannot read the question, and the link ends.
+    #[test]
+    fn a_connection_to_name_handed_over_without_it_ends_the_link() {
+        let (_supervisor, reader, proxy) = supervised();
+        proxy
+            .send_raw(br#"{"Identify":{"id":1,"stated":null}}"#, &[])
+            .unwrap();
+        assert_eq!(
+            ended(reader).unwrap_err().to_string(),
+            "link: a connection to name handed over without it"
+        );
+    }
+
     /// A connection handed over without its descriptor is a message the proxy cannot read: the link
     /// ends, and the request that asked for it is told there is none.
     #[test]
@@ -2155,6 +2309,7 @@ mod tests {
             parks: None,
             refresh: None,
             judge: Arc::clone(&judge),
+            identify: None,
             threads: named_thread,
             refreshes: Mutex::new(None),
             answers: Mutex::new(None),
@@ -2393,6 +2548,7 @@ mod tests {
                 down,
                 Arc::new(judge),
                 Some(parks(&pending, 2, wait)),
+                None,
                 None,
                 named_thread,
             )

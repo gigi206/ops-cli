@@ -243,7 +243,38 @@ pub(super) fn validate_host_secret(
         // before this field expects: refuse the launch rather than stand a cage up without a
         // credential its configuration said it needs.
         optional: raw.optional.unwrap_or(false),
+        by: validate_by(raw.by.as_deref().unwrap_or_default())?,
     })
+}
+
+/// The `by` entries of a credential, each checked for the form it is written in: `sha256:` and
+/// 64 lowercase hex digits, an absolute path, or a bare file name. Anything else is refused, named,
+/// rather than read as a program no executable could ever be.
+fn validate_by(entries: &[String]) -> Result<Vec<String>, String> {
+    entries
+        .iter()
+        .map(|entry| {
+            let shown = crate::diag::visible(entry);
+            if entry.is_empty() || entry.chars().any(char::is_control) {
+                return Err(format!(
+                    "`by` entry `{shown}` is empty or holds a control character"
+                ));
+            }
+            if let Some(hex) = entry.strip_prefix("sha256:") {
+                if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                    return Err(format!(
+                        "`by` entry `{shown}` is not `sha256:` and 64 lowercase hex digits"
+                    ));
+                }
+            } else if entry.contains('/') && !entry.starts_with('/') {
+                return Err(format!(
+                    "`by` entry `{shown}` is a relative path; name the program, or give its \
+                     absolute path inside the cage"
+                ));
+            }
+            Ok(entry.clone())
+        })
+        .collect()
 }
 
 /// The longest description kept, in characters — a label for one terminal line, not a document.
