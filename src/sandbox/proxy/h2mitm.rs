@@ -523,7 +523,7 @@ async fn relay(
     // As on the HTTP/1.1 planes: a credential held for other programs under `by_other = "deny"`
     // refuses the stream rather than letting it leave without the credential.
     if withheld_by_deny(creds, host, port, path, who, ctx) {
-        ctx.outcome(
+        let seq = ctx.outcome(
             Proto::Https,
             host,
             port,
@@ -532,6 +532,7 @@ async fn relay(
             StatKind::Blocked,
             BY_MISMATCH,
         );
+        ctx.set_caller(seq, who);
         let _ = refuse_with_detail(
             respond,
             StatusCode::FORBIDDEN,
@@ -645,6 +646,7 @@ async fn relay(
         StatKind::Allow,
         "allowed",
     );
+    ctx.set_caller(seq, who);
 
     // Register this stream in the live flow registry for as long as it is relayed, exactly where the
     // other three planes register theirs (tunnel.rs, forward.rs, cleartext.rs all take the guard

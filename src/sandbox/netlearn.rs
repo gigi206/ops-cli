@@ -488,6 +488,7 @@ mod tests {
         plane: Plane,
     ) -> LogEvent {
         LogEvent {
+            caller: None,
             seq: 0,
             at_epoch_ms: 0,
             host: host.to_string(),
@@ -1343,6 +1344,7 @@ mod tests {
     #[test]
     fn nothing_the_capture_tap_reports_is_learned_into_the_allowlist() {
         let tap_event = |host: &str, port: u16, verdict, reason: &str, proto| LogEvent {
+            caller: None,
             seq: 1,
             at_epoch_ms: 0,
             host: host.to_string(),

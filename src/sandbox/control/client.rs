@@ -331,6 +331,11 @@ pub(crate) fn read_log(
             incarnation = v.parse().ok();
         } else if let Some(ev) = parse_event_line(&line) {
             events.push(ev);
+        } else if let Some((seq, exe)) = parse_caller_line(&line) {
+            // Like a sighting: it follows its own event, and one whose event is gone is dropped.
+            if let Some(ev) = events.iter_mut().find(|e| e.seq == seq) {
+                ev.caller = Some(exe);
+            }
         } else if let Some((seq, sighting)) = parse_sighting_line(&line) {
             // A sighting follows its own event on the wire, so the event it belongs to is already in
             // hand. One that arrives without it (an evicted event) is dropped rather than invented
@@ -520,6 +525,10 @@ pub(crate) fn read_record(path: &Path) -> io::Result<crate::sandbox::lens::Recor
             seq: u64,
             seen: SecretSighting,
         },
+        Caller {
+            seq: u64,
+            exe: String,
+        },
     }
 
     let parsed = crate::sandbox::lens::read_record_with(path, |line| {
@@ -539,6 +548,9 @@ pub(crate) fn read_record(path: &Path) -> io::Result<crate::sandbox::lens::Recor
         }
         if let Some((seq, seen)) = parse_sighting_line(line) {
             return Some(Line::Seen { seq, seen });
+        }
+        if let Some((seq, exe)) = parse_caller_line(line) {
+            return Some(Line::Caller { seq, exe });
         }
         parse_event_line(line).map(|ev| Line::Event(Box::new(ev)))
     })?;
@@ -562,9 +574,22 @@ pub(crate) fn read_record(path: &Path) -> io::Result<crate::sandbox::lens::Recor
                     ev.secrets_seen.push(seen);
                 }
             }
+            Line::Caller { seq, exe } => {
+                if let Some(ev) = out.events.iter_mut().rev().find(|e| e.seq == seq) {
+                    ev.caller = Some(exe);
+                }
+            }
         }
     }
     Ok(out)
+}
+
+/// Parse one `by seq=… exe=…` line into the event sequence it belongs to and the program named for
+/// it, or `None` if it is malformed. `exe` is read as the rest of the line, as it is written.
+fn parse_caller_line(line: &str) -> Option<(u64, String)> {
+    let rest = line.strip_prefix("by seq=")?;
+    let (seq, exe) = rest.split_once(" exe=")?;
+    Some((seq.parse().ok()?, exe.to_string()))
 }
 
 /// Parse one `seen seq=… way=… name=…` line into the event sequence it belongs to and the sighting,
@@ -656,6 +681,7 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
         amend_seq: None,
         awaiting_capture: false,
         secrets_seen: Vec::new(),
+        caller: None,
     })
 }
 
@@ -1171,6 +1197,7 @@ mod tests {
     fn event_line_round_trips_through_the_wire() {
         // A full L7 event whose path carries a query string's `=` (the field that must stay last).
         let ev = LogEvent {
+            caller: None,
             seq: 7,
             at_epoch_ms: 1_700_000_000_123,
             host: "api.test".into(),
@@ -1200,6 +1227,7 @@ mod tests {
 
         // An early-CONNECT / L4 event has no method/path — those tokens are omitted and parse None.
         let bare = LogEvent {
+            caller: None,
             seq: 8,
             at_epoch_ms: 1_700_000_000_456,
             host: "raw.test".into(),
@@ -1236,6 +1264,7 @@ mod tests {
             LogVerdict::Error,
         ] {
             let ev = LogEvent {
+                caller: None,
                 seq: 9,
                 at_epoch_ms: 1_700_000_000_789,
                 host: "h.test".into(),
@@ -1281,6 +1310,19 @@ mod tests {
         assert_eq!(parsed.proto, Proto::Https);
     }
 
+    /// The program named for an event round-trips over the control wire, a path with a space in it
+    /// included, since it is written last and read as the rest of the line.
+    #[test]
+    fn a_caller_line_round_trips_with_a_spaced_path() {
+        let line = format_caller_line(12, "/opt/my tools/bin/gh");
+        assert_eq!(
+            parse_caller_line(line.trim_end()),
+            Some((12, "/opt/my tools/bin/gh".to_string()))
+        );
+        assert_eq!(parse_caller_line("by seq=x exe=/bin/gh"), None);
+        assert_eq!(parse_caller_line("seen seq=1 way=out name=t"), None);
+    }
+
     /// A sighting round-trips over the control wire, INCLUDING a credential name carrying a space.
     /// The name comes from a configuration key, so unlike a host or a request target it is not
     /// whitespace-free — which is why it is written last and read as the rest of the line. A
@@ -1288,6 +1330,7 @@ mod tests {
     #[test]
     fn a_sighting_round_trips_with_a_spaced_credential_name() {
         let mut ev = LogEvent {
+            caller: None,
             seq: 9,
             at_epoch_ms: 1_000_000,
             host: "chat.example.com".into(),
@@ -1330,6 +1373,7 @@ mod tests {
     #[test]
     fn an_event_with_no_sighting_writes_no_line() {
         let ev = LogEvent {
+            caller: None,
             seq: 1,
             at_epoch_ms: 0,
             host: "api.example.com".into(),

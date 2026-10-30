@@ -354,6 +354,19 @@ impl ProxyCtx {
         });
     }
 
+    /// Note on the decision logged as `id` the program the supervisor named as holding its
+    /// connection. Only a name already asked for is noted: logging a decision never sends the
+    /// supervisor to name a program.
+    pub(super) fn set_caller(&self, id: Option<u64>, who: &super::Who) {
+        let (Some(events), Some(id), Some(named)) = (self.logged(), id, who.known()) else {
+            return;
+        };
+        events.send(super::events::ProxyEvent::Caller {
+            id,
+            exe: named.exe.clone(),
+        });
+    }
+
     /// Where a decision is logged, when the launch keeps a log.
     fn logged(&self) -> Option<&super::events::Emitter> {
         self.events.as_ref().filter(|e| e.keeps().log)

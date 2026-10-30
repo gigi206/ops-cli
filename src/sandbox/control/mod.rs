@@ -988,6 +988,10 @@ pub(crate) struct LogEvent {
     /// crossing says nothing new after the first time — and the event keeps at most
     /// [`SIGHTINGS_MAX`] of them.
     pub(crate) secrets_seen: Vec<SecretSighting>,
+    /// The program the supervisor named as holding this exchange's connection, by its executable
+    /// inside the cage. Named only where a credential held for named programs (`[secret] by`) asked
+    /// who it was; `None` everywhere else.
+    pub(crate) caller: Option<String>,
 }
 
 /// Which way a configured secret was seen crossing an open WebSocket.
@@ -1223,6 +1227,7 @@ impl LogRing {
             amend_seq: None,
             awaiting_capture: false,
             secrets_seen: Vec::new(),
+            caller: None,
         };
         // A muted refusal goes to its own ring so it can never evict a real event from `events`;
         // both rings share `self.cap` and the monotonic `seq`.
@@ -1354,6 +1359,29 @@ impl LogRing {
             ev.amend_seq = Some(g.next_amend);
             g.next_amend += 1;
         }
+    }
+
+    /// Note the program the supervisor named as holding the connection of event `seq`, and amend the
+    /// event so a `--follow` reader shows it. Set once: a connection is named once, so a second
+    /// report for the same event says nothing new and is dropped, as is one for an evicted event.
+    pub(crate) fn set_caller(&self, seq: u64, exe: &str) {
+        // The proxy reports the path, and is held to what it reports like every logged field.
+        let exe = super::sanitize(exe);
+        let recorded = {
+            let mut guard = locked(&self.inner);
+            let g = &mut *guard;
+            let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) else {
+                return;
+            };
+            if ev.caller.is_some() {
+                return;
+            }
+            ev.caller = Some(exe.clone());
+            ev.amend_seq = Some(g.next_amend);
+            g.next_amend += 1;
+            self.record.as_ref().map(|_| format_caller_line(seq, &exe))
+        };
+        self.write_record(recorded);
     }
 
     /// Note that a configured secret was seen crossing the tunnel of event `seq`, and amend the
@@ -2114,6 +2142,9 @@ fn dispatch(
                 // capture is a debugging convenience the reader opts into, while a secret crossing a
                 // tunnel is a fact about the session that has to reach a plain `sbx net logs`.
                 out.push_str(&format_sighting_lines(ev));
+                if let Some(exe) = &ev.caller {
+                    out.push_str(&format_caller_line(ev.seq, exe));
+                }
                 if let Some(cap) = captures.iter().find(|c| c.seq == ev.seq) {
                     out.push_str(&format_capture_lines(cap));
                 }
@@ -2256,6 +2287,12 @@ fn format_capture_lines(cap: &Capture) -> String {
         ));
     }
     out
+}
+
+/// The `by` line naming the program behind event `seq`, for the wire and the session record alike.
+/// `exe` is emitted last and read as the rest of the line, since a path may hold a space.
+pub(super) fn format_caller_line(seq: u64, exe: &str) -> String {
+    format!("by seq={seq} exe={exe}\n")
 }
 
 /// Format an event's secret sightings, one `seen` line each, or nothing when it has none.
@@ -4658,6 +4695,39 @@ mod tests {
         assert!(caught_up.events.is_empty());
         assert_eq!(caught_up.dropped, 0);
         assert_eq!(caught_up.head, 4);
+    }
+
+    #[test]
+    fn the_program_named_for_an_event_is_set_once_and_amends_it() {
+        let ring = LogRing::new(4);
+        let seq = ring.push(
+            false,
+            "api.test",
+            443,
+            Some("GET"),
+            Some("/"),
+            LogVerdict::Allow,
+            "allowed",
+            Proto::Https,
+            HttpVer::H1,
+            RpcKind::None,
+            Plane::Agent,
+        );
+        ring.set_caller(seq, "/nix/store/abc-gh/bin/gh");
+        ring.set_caller(seq, "/usr/bin/curl");
+        let snap = ring.snapshot(None, None, false);
+        assert_eq!(
+            snap.events[0].caller.as_deref(),
+            Some("/nix/store/abc-gh/bin/gh"),
+            "named once, by the first report"
+        );
+        assert!(
+            snap.events[0].amend_seq.is_some(),
+            "a follow reader is told"
+        );
+        // An event that is not in the ring is not invented.
+        ring.set_caller(seq + 100, "/bin/sh");
+        assert_eq!(ring.snapshot(None, None, false).events.len(), 1);
     }
 
     #[test]

@@ -9,6 +9,7 @@ fn log_event(
     reason: &str,
 ) -> sandbox::control::LogEvent {
     sandbox::control::LogEvent {
+        caller: None,
         seq,
         at_epoch_ms: 1_000_000,
         host: host.into(),
@@ -589,6 +590,27 @@ fn status_shows_only_under_with_status_in_both_render_and_json() {
         serde_json::Value::Null,
         "null when none captured"
     );
+}
+
+/// The program a `[secret] by` credential had named for a request is shown on its line and in its
+/// JSON, and a request nothing asked about shows none.
+#[test]
+fn the_program_named_for_a_request_shows_in_render_and_json() {
+    use sandbox::control::LogVerdict::*;
+    let p = style::Palette::plain();
+    let view = LogView::default();
+    let mut named = log_event(1, "api.test", Some("GET"), Some("/p"), Allow, "allowed");
+    named.caller = Some("/nix/store/abc-gh/bin/gh".into());
+    let unnamed = log_event(2, "api.test", Some("GET"), Some("/p"), Allow, "allowed");
+
+    let line = render_log_line(&named, 4242, &view, &p);
+    assert!(line.ends_with("by /nix/store/abc-gh/bin/gh"), "{line}");
+    assert!(!render_log_line(&unnamed, 4242, &view, &p).contains(" by "));
+
+    let j = log_event_json(&named, 7, None, None, &view, None);
+    assert_eq!(j["caller"], serde_json::json!("/nix/store/abc-gh/bin/gh"));
+    let j = log_event_json(&unnamed, 7, None, None, &view, None);
+    assert_eq!(j["caller"], serde_json::Value::Null);
 }
 
 #[test]

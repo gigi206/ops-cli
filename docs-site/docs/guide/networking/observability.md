@@ -486,6 +486,21 @@ closes the tunnel instead: see below.)
 Under `--json` the same fact rides on every event as `secrets_seen`, a possibly-empty list of
 `{"name": …, "way": "out"|"back"}`.
 
+#### Which program made the request
+
+Where a [`[secret]` held for named programs](../configuration/secret#held-for-named-programs-by)
+matched a request, the supervisor named the program holding its connection, and the line ends with
+it:
+
+```
+  3786263  07:56:46  https/h1  api.github.com:443  GET /user  allow  by /nix/store/…-gh-2.62.0/bin/gh
+  3786263  07:56:51  https/h1  api.github.com:443  GET /user  blocked (by-mismatch)  by /nix/store/…-curl-8.11.0/bin/curl
+```
+
+Nothing else asks who holds a connection, so a request no such credential matched shows no
+program: naming one costs a walk of the cage's processes, and a log line never pays it. Under
+`--json` the same name is `caller`, or `null`.
+
 #### What a capture does not cover
 
 - A raw **`tcp://` splice**: there is no HTTP head to read, so a method and a body are

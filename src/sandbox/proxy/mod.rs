@@ -424,6 +424,12 @@ impl Who {
         }
     }
 
+    /// The program the supervisor already named for this connection, without asking: `None` when it
+    /// was never asked, or named nothing.
+    pub(super) fn known(&self) -> Option<&link::Named> {
+        self.named.get().and_then(Option::as_ref)
+    }
+
     /// The program the supervisor names, asked once.
     pub(super) fn named(&self, ctx: &ProxyCtx) -> Option<&link::Named> {
         self.named

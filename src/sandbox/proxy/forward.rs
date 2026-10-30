@@ -176,7 +176,7 @@ pub(super) fn handle_https_forward(
     // 7''. As on the tunneled path: a credential held for other programs under `by_other = "deny"`
     //      refuses the request rather than letting it leave without the credential.
     if withheld_by_deny(&creds, &host, port, &path, who, ctx) {
-        ctx.outcome(
+        let seq = ctx.outcome(
             crate::sandbox::control::Proto::Https,
             &host,
             port,
@@ -185,6 +185,7 @@ pub(super) fn handle_https_forward(
             StatKind::Blocked,
             BY_MISMATCH,
         );
+        ctx.set_caller(seq, who);
         return write_refusal(
             &mut client,
             "403 Forbidden",
@@ -383,6 +384,7 @@ pub(super) fn handle_https_forward(
         StatKind::Allow,
         "allowed",
     );
+    ctx.set_caller(allow_seq, who);
     let flow = ctx.register_flow(&host, port, crate::sandbox::control::Proto::Https);
 
     // 8a. Open the traffic capture, recording the client's own head (before the reserialization

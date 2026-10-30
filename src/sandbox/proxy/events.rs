@@ -123,6 +123,9 @@ pub(crate) enum ProxyEvent<C = Masked> {
         name: String,
         way: SecretWay,
     },
+    /// The program the supervisor named as holding the connection of the exchange logged as `id`,
+    /// by its executable inside the cage.
+    Caller { id: u64, exe: String },
     /// A permitted tunnel opened, numbered `id` by the proxy for its later reports
     /// ([`super::flows`]).
     FlowOpened {
@@ -151,6 +154,7 @@ impl ProxyEvent {
                 capture.weight()
             }
             ProxyEvent::SecretSeen { name, .. } => name.len(),
+            ProxyEvent::Caller { exe, .. } => exe.len(),
             ProxyEvent::FlowOpened { host, .. } => host.len(),
             ProxyEvent::FlowCounts(moved) => std::mem::size_of_val(moved.as_slice()),
             ProxyEvent::FlowClosed { .. } => 0,
@@ -191,6 +195,7 @@ impl<C> ProxyEvent<C> {
                 capture: convert(capture)?,
             },
             ProxyEvent::SecretSeen { id, name, way } => ProxyEvent::SecretSeen { id, name, way },
+            ProxyEvent::Caller { id, exe } => ProxyEvent::Caller { id, exe },
             ProxyEvent::FlowOpened {
                 id,
                 host,
@@ -748,6 +753,13 @@ impl Applier {
                     && name.len() <= MAX_FIELD
                 {
                     log.secret_seen(seq, &name, way);
+                }
+            }
+            ProxyEvent::Caller { id, exe } => {
+                if let (Some(log), Some(seq)) = (&sinks.log, self.seq(id))
+                    && exe.len() <= MAX_FIELD
+                {
+                    log.set_caller(seq, &exe);
                 }
             }
             // One registry serves one proxy, so the proxy's own numbers key it: a proxy can open,
@@ -1653,6 +1665,10 @@ mod tests {
                 name: "GITHUB_TOKEN".into(),
                 way: SecretWay::Back,
             },
+            ProxyEvent::Caller {
+                id: 7,
+                exe: "/nix/store/abc-gh/bin/gh".into(),
+            },
             ProxyEvent::FlowOpened {
                 id: 3,
                 host: "db.internal".into(),
@@ -1677,6 +1693,7 @@ mod tests {
             ProxyEvent::CaptureFiled { .. } => "capture-filed",
             ProxyEvent::CaptureGrew { .. } => "capture-grew",
             ProxyEvent::SecretSeen { .. } => "secret-seen",
+            ProxyEvent::Caller { .. } => "caller",
             ProxyEvent::FlowOpened { .. } => "flow-opened",
             ProxyEvent::FlowCounts(_) => "flow-counts",
             ProxyEvent::FlowClosed { .. } => "flow-closed",
@@ -1689,7 +1706,7 @@ mod tests {
     fn every_kind_of_event_crosses_the_channel_unchanged() {
         let sent = one_of_each();
         let kinds: std::collections::BTreeSet<_> = sent.iter().map(kind).collect();
-        assert_eq!(kinds.len(), 12, "one event of each kind: {kinds:?}");
+        assert_eq!(kinds.len(), 13, "one event of each kind: {kinds:?}");
 
         let mut stream = Vec::new();
         for event in one_of_each() {
@@ -1994,6 +2011,7 @@ mod tests {
                 select(vec![SecretWay::Out, SecretWay::Back])
             )
                 .prop_map(|(id, name, way)| ProxyEvent::SecretSeen { id, name, way }),
+            (numbers(), text()).prop_map(|(id, exe)| ProxyEvent::Caller { id, exe }),
             (numbers(), text(), any::<u16>(), protos()).prop_map(|(id, host, port, proto)| {
                 ProxyEvent::FlowOpened {
                     id,

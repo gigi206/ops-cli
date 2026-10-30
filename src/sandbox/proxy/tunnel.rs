@@ -336,7 +336,7 @@ pub(super) fn serve_tunneled_request(
     // 7''. A credential held for other programs, under `by_other = "deny"`, refuses the request
     //      outright rather than letting it leave without the credential.
     if withheld_by_deny(&creds, connect_host, port, &itarget, who, ctx) {
-        ctx.outcome(
+        let seq = ctx.outcome(
             crate::sandbox::control::Proto::Https,
             connect_host,
             port,
@@ -345,6 +345,7 @@ pub(super) fn serve_tunneled_request(
             StatKind::Blocked,
             BY_MISMATCH,
         );
+        ctx.set_caller(seq, who);
         return respond_refusal_tls(&mut br, "403 Forbidden", BY_MISMATCH, BY_MISMATCH_MESSAGE);
     }
     // 7'. A signer whose manifest asks for a digest over the body is told one, which means the body
@@ -582,6 +583,7 @@ pub(super) fn serve_tunneled_request(
         StatKind::Allow,
         "allowed",
     );
+    ctx.set_caller(allow_seq, who);
 
     // The tunnel is now carrying traffic — register it for `sbx net live` until this turn returns.
     // One guard covers both the request/response below and a WebSocket upgrade: a WS over TLS is

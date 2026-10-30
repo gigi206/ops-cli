@@ -839,8 +839,14 @@ fn render_log_line(
     } else {
         String::new()
     };
+    // The program the supervisor named as holding the connection, where a credential held for
+    // named programs asked: whose request this was, which is the question `by` is about.
+    let caller = match &e.caller {
+        Some(exe) => format!("  {dim}by{r} {}", crate::diag::visible(exe)),
+        None => String::new(),
+    };
     format!(
-        "    {dim}{pid}{r}  {dim}{time}{r}  {dim}{proto}{r}  {n}{hostport}{r}  {method}{path}{rpc}  {vc}{}{r}{reason}{ws}{muted}{status}",
+        "    {dim}{pid}{r}  {dim}{time}{r}  {dim}{proto}{r}  {n}{hostport}{r}  {method}{path}{rpc}  {vc}{}{r}{reason}{ws}{muted}{status}{caller}",
         e.verdict.as_str()
     )
 }
@@ -1019,6 +1025,9 @@ fn log_event_json(
             "name": s.name,
             "way": s.way.as_str(),
         })).collect::<Vec<_>>(),
+        // The executable inside the cage the supervisor named as holding the connection, or null
+        // where nothing asked (only a `[secret] by` credential does).
+        "caller": e.caller,
     });
     if view.with_status {
         obj["status"] = e
