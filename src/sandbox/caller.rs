@@ -15,7 +15,12 @@
 //!    own executable and takes the port from `accept(2)`, never from the cage;
 //! 3. the socket bound to that port is found among the descriptors of the processes sharing that
 //!    namespace, and every process holding it is a holder;
-//! 4. the caller is the holders' executable, named by its SHA-256, and only when every holder runs
+//! 4. a holder that is the forwarder's executable again is a relay in front of the first: the
+//!    in-cage listener of a `tcp://` rule, or the `socat` of the `ProxyCommand` ssh is given. It is
+//!    walked through the same way, from its one other established socket, a few relays deep at
+//!    most. A relay with no other socket carries its bytes on its standard streams, and the
+//!    program that launched it is the one driving them, so its parent is the holder;
+//! 5. the caller is the holders' executable, named by its SHA-256, and only when every holder runs
 //!    the same one: a socket shared by two programs is held by neither alone.
 //!
 //! A peer that is not a relay is the caller itself: a client that talks to the proxy's socket
@@ -50,6 +55,21 @@ pub(crate) struct Caller {
 
 /// The `st` value `/proc/net/tcp` gives an established connection.
 const ESTABLISHED: u8 = 0x01;
+
+/// How many relays in front of the first are walked through. The deepest sbx builds is two (a
+/// `tcp://` listener, or the `ProxyCommand` relay, in front of the forwarder); a chain longer than
+/// this is named after the relay it stops at, which no rule names.
+const MAX_RELAYS: usize = 4;
+
+/// Where a relay leads, from the socket the walk reached it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Onward {
+    /// Its one other established socket, accepted from a client on `port` connected `toward` this
+    /// relay's port.
+    Client { port: u16, toward: u16 },
+    /// No other socket: it carries its bytes on its standard streams.
+    Stdio,
+}
 
 /// One row of a `/proc/<pid>/net/tcp` or `tcp6` table: the parts the walk reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,13 +123,38 @@ impl Identify {
         let net = net_ns(peer)?;
         let rows = tcp_rows(peer);
         let held = socket_inodes(peer);
-        let port = if relayed {
-            relayed_port(&rows, &held, self.proxy_port)?
+        // A tap's client connected to the destination it named, which the capture rewrote, so
+        // only a relay's client is held to the port it reached.
+        let (port, toward) = if relayed {
+            (
+                relayed_port(&rows, &held, self.proxy_port)?,
+                Some(self.proxy_port),
+            )
         } else {
-            stated?
+            (stated?, None)
         };
-        let inode = client_inode(&rows, port, &held)?;
-        self.named(&holders_of(inode, &net))
+        let mut inode = client_inode(&rows, port, toward, &held)?;
+        let mut holders = holders_of(inode, &net);
+        for _ in 0..MAX_RELAYS {
+            let &[relay] = holders.as_slice() else {
+                break;
+            };
+            if self.exe_hash(relay)? != self.relay {
+                break;
+            }
+            let held = socket_inodes(relay);
+            match onward(&rows, &held, inode)? {
+                Onward::Client { port, toward } => {
+                    inode = client_inode(&rows, port, Some(toward), &held)?;
+                    holders = holders_of(inode, &net);
+                }
+                Onward::Stdio => {
+                    holders = vec![parent_pid(relay)?];
+                    break;
+                }
+            }
+        }
+        self.named(&holders)
     }
 
     /// A walker that recognises the relay and the tap by the hashes given, with the hash of each
@@ -268,14 +313,40 @@ fn relayed_port(rows: &[TcpRow], held: &BTreeSet<u64>, proxy_port: u16) -> Optio
     }
 }
 
+/// Where the relay holding `relay_holds` leads from the socket `came_in` the walk reached it by:
+/// its one other established socket, or its standard streams when it has none. `None` when it
+/// has more than one, since a relay carrying two connections cannot say which one this is.
+fn onward(rows: &[TcpRow], relay_holds: &BTreeSet<u64>, came_in: u64) -> Option<Onward> {
+    let others: Vec<&TcpRow> = rows
+        .iter()
+        .filter(|r| r.state == ESTABLISHED && r.inode != came_in && relay_holds.contains(&r.inode))
+        .collect();
+    match others.as_slice() {
+        [] => Some(Onward::Stdio),
+        [accepted] => Some(Onward::Client {
+            port: accepted.remote_port,
+            toward: accepted.local_port,
+        }),
+        _ => None,
+    }
+}
+
 /// The inode of the client's end of a relayed connection: the one established socket bound to
-/// `port` that the relay does not hold itself. `None` when there is none, or more than one, which
-/// no single connection could be.
-fn client_inode(rows: &[TcpRow], port: u16, relay_holds: &BTreeSet<u64>) -> Option<u64> {
+/// `port`, connected to `toward` when that is known, that the relay does not hold itself. `None`
+/// when there is none, or more than one, which no single connection could be.
+fn client_inode(
+    rows: &[TcpRow],
+    port: u16,
+    toward: Option<u16>,
+    relay_holds: &BTreeSet<u64>,
+) -> Option<u64> {
     let found: BTreeSet<u64> = rows
         .iter()
         .filter(|r| {
-            r.state == ESTABLISHED && r.local_port == port && !relay_holds.contains(&r.inode)
+            r.state == ESTABLISHED
+                && r.local_port == port
+                && toward.is_none_or(|t| r.remote_port == t)
+                && !relay_holds.contains(&r.inode)
         })
         .map(|r| r.inode)
         .collect();
@@ -283,6 +354,18 @@ fn client_inode(rows: &[TcpRow], port: u16, relay_holds: &BTreeSet<u64>) -> Opti
         1 => found.into_iter().next(),
         _ => None,
     }
+}
+
+/// The parent of `pid`, from the `PPid:` line of its status.
+fn parent_pid(pid: u32) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&ppid| ppid != 0)
 }
 
 /// The processes running in the network namespace `net` that hold the socket `inode`.
@@ -355,9 +438,12 @@ mod tests {
         let rows = parse_tcp_table(TABLE);
         let relay: BTreeSet<u64> = [111, 222].into();
         assert_eq!(relayed_port(&rows, &relay, 18043), Some(43210));
-        assert_eq!(client_inode(&rows, 43210, &relay), Some(333));
+        assert_eq!(client_inode(&rows, 43210, Some(18043), &relay), Some(333));
+        assert_eq!(client_inode(&rows, 43210, None, &relay), Some(333));
+        // A socket on that port connected elsewhere is not the relay's client.
+        assert_eq!(client_inode(&rows, 43210, Some(443), &relay), None);
         // The relay's own end is never the client's.
-        assert_eq!(client_inode(&rows, 18043, &relay), None);
+        assert_eq!(client_inode(&rows, 18043, None, &relay), None);
         // The listener is held too, but it carries nothing.
         assert_eq!(relayed_port(&rows, &[111].into(), 18043), None);
         // A relay that holds two accepted connections cannot say which one this is.
@@ -369,6 +455,49 @@ mod tests {
             inode: 555,
         });
         assert_eq!(relayed_port(&two, &[222, 555].into(), 18043), None);
+    }
+
+    /// A relay in front of the forwarder: reached by its socket toward the forwarder, it leads to
+    /// the one connection it accepted, or to its standard streams when it has none.
+    #[test]
+    fn a_relay_in_front_leads_to_its_accepted_client_or_to_its_standard_streams() {
+        // The `tcp://` listener's child holds 444, from port 50000 to the forwarder on 18043, and
+        // 555, accepted on 4022 from the client on 51000, which holds 666.
+        let mut rows = parse_tcp_table(TABLE);
+        let row = |local_port, remote_port, inode| TcpRow {
+            local_port,
+            remote_port,
+            state: ESTABLISHED,
+            inode,
+        };
+        rows.extend([
+            row(50000, 18043, 444),
+            row(4022, 51000, 555),
+            row(51000, 4022, 666),
+        ]);
+        let listener: BTreeSet<u64> = [444, 555].into();
+        assert_eq!(
+            onward(&rows, &listener, 444),
+            Some(Onward::Client {
+                port: 51000,
+                toward: 4022
+            })
+        );
+        assert_eq!(client_inode(&rows, 51000, Some(4022), &listener), Some(666));
+        // The `ProxyCommand` relay holds only its socket toward the forwarder.
+        assert_eq!(onward(&rows, &[444].into(), 444), Some(Onward::Stdio));
+        // One carrying two connections names none.
+        rows.push(row(4022, 52000, 777));
+        assert_eq!(onward(&rows, &[444, 555, 777].into(), 444), None);
+    }
+
+    #[test]
+    fn a_process_parent_is_read_from_its_status() {
+        assert_eq!(
+            parent_pid(std::process::id()),
+            Some(std::os::unix::process::parent_id())
+        );
+        assert_eq!(parent_pid(u32::MAX), None);
     }
 
     #[test]

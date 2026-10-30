@@ -3966,6 +3966,176 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
     );
 }
 
+/// The script the cage runs for the `by` test: each request on its path, one line per case, from
+/// bash alone (`/dev/tcp`), so no package is fetched. `$1`..`$4` are the ports A, B, U and V.
+const BY_CASES: &str = r#"
+A=$1 B=$2 U=$3 V=$4
+req() {
+  local label=$1 status= reason=none line
+  if ! exec 3<>/dev/tcp/127.0.0.1/18043; then echo "$label: no-dev-tcp"; return; fi
+  printf 'GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$2" "$3" >&3
+  IFS= read -r -t 15 status <&3
+  while IFS= read -r -t 15 line <&3; do
+    line=${line%$'\r'}
+    [[ -z $line ]] && break
+    [[ ${line,,} == x-sbx-egress-reason:* ]] && reason=${line#*: }
+  done
+  exec 3<&- 3>&-
+  echo "$label: ${status%$'\r'} reason=$reason"
+}
+listener() {
+  local label=$1 line=
+  if exec 3<>"/dev/tcp/127.0.0.1/$2"; then
+    IFS= read -r -t 15 line <&3
+    exec 3<&- 3>&-
+  fi
+  echo "$label: ${line%$'\r'}"
+}
+stdio() {
+  local line
+  line=$("$socat" -t 5 - "PROXY:127.0.0.1:127.0.0.1:$2,proxyport=18043" </dev/null \
+    | { IFS= read -r -t 15 l; echo "$l"; })
+  echo "$1: ${line%$'\r'}"
+}
+req http-a "http://127.0.0.1:$A/" "127.0.0.1:$A"
+req http-b "http://127.0.0.1:$B/" "127.0.0.1:$B"
+listener listener-a "$A"
+listener listener-b "$B"
+socat=
+while read -r key value _; do
+  [[ $key == ProxyCommand ]] && socat=$value
+done < /etc/ssh/ssh_config
+echo "socat: ${socat:-none}"
+stdio stdio-a "$A"
+stdio stdio-b "$B"
+req secret-git "https://127.0.0.1:$U/" "127.0.0.1:$U"
+req secret-bash "https://127.0.0.1:$V/" "127.0.0.1:$V"
+"#;
+
+#[test]
+fn a_destination_or_credential_held_for_named_programs_follows_the_real_caller() {
+    // `[network.reserve]` and `[secret] by` through the real cage: the proxy hands the connection
+    // to the supervisor, which walks the cage's `/proc` from the forwarder back to the program and
+    // hashes it. The client is the cage's bash on every path, so `by = ["bash"]` names it and
+    // `by = ["git"]` does not, and each pair of cases differs in that alone:
+    //
+    // - an absolute-form `http://` request through the forwarder (one relay);
+    // - the in-cage listener of a `tcp://` rule, which is a relay in front of the forwarder;
+    // - the pinned socat run on its standard streams, as ssh's `ProxyCommand` runs it, whose
+    //   parent is the program;
+    // - an absolute-form `https://` request to a credential held under `by_other = "deny"`.
+    //
+    // Offline: the upstream is a listener on the host's loopback, which an exact-address rule may
+    // reach, and the credential's destination is a port nothing listens on, since a refusal for
+    // the credential comes before the upstream is dialled. Skips when the host cannot sandbox.
+    use std::io::{Read, Write};
+    let project = TmpDir::prefixed("r", "by-proj");
+    let data = TmpDir::prefixed("r", "by-data");
+    let state = TmpDir::prefixed("r", "by-state");
+    probe_or_skip!("by e2e", run_in(project.path(), data.path(), &["true"]));
+
+    // A and B answer every connection with a response before reading it, so a refused case would
+    // show it had leaked through; U and V are free, nothing listens on them.
+    let serve = |listener: std::net::TcpListener| {
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nsbx-upstream",
+                );
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let _ = stream.read_to_end(&mut Vec::new());
+            }
+        })
+    };
+    let bind = || std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = |l: &std::net::TcpListener| l.local_addr().unwrap().port();
+    let (a, b) = (bind(), bind());
+    let (pa, pb) = (port(&a), port(&b));
+    let (pu, pv) = {
+        let (u, v) = (bind(), bind());
+        (port(&u), port(&v))
+    };
+    serve(a);
+    serve(b);
+
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        format!(
+            "[network]\nmode = \"deny\"\n\
+             allow = [\"127.0.0.1:{pu}\", \"127.0.0.1:{pv}\", \"tcp://127.0.0.1:22\"]\n\
+             [network.reserve.\"tcp://127.0.0.1:{pa}\"]\nby = [\"bash\"]\n\
+             [network.reserve.\"http://127.0.0.1:{pa}\"]\nby = [\"bash\"]\n\
+             [network.reserve.\"tcp://127.0.0.1:{pb}\"]\nby = [\"git\"]\n\
+             [network.reserve.\"http://127.0.0.1:{pb}\"]\nby = [\"git\"]\n\
+             [secret.\"127.0.0.1:{pu}\"]\nfrom = \"env://SBX_TEST_BY_TOKEN\"\n\
+             header = \"Authorization\"\ntype = \"bearer\"\nby = [\"git\"]\nby_other = \"deny\"\n\
+             [secret.\"127.0.0.1:{pv}\"]\nfrom = \"env://SBX_TEST_BY_TOKEN\"\n\
+             header = \"Authorization\"\ntype = \"bearer\"\nby = [\"bash\"]\nby_other = \"deny\"\n"
+        ),
+    )
+    .unwrap();
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", "--yes", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let ports = [pa, pb, pu, pv].map(|p| p.to_string());
+    let mut args = vec!["run", "--", "bash", "-c", BY_CASES, "by-cases"];
+    args.extend(ports.iter().map(String::as_str));
+    let Some(out) = trusted_launch("by e2e", || {
+        sbx_session_in(project.path(), data.path(), state.path())
+            .env("SBX_TEST_BY_TOKEN", "sbx-by-test-token")
+            .args(&args)
+            .output()
+            .expect("spawn sbx run")
+    }) else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let context = format!(
+        "{stdout}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let case = |label: &str| -> String {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{label}: ")))
+            .unwrap_or_else(|| panic!("no `{label}` line:\n{context}"))
+            .to_string()
+    };
+    assert!(
+        !stdout.contains("no-dev-tcp"),
+        "the cage's bash cannot open /dev/tcp, so no case ran:\n{context}"
+    );
+    assert_eq!(case("http-a"), "HTTP/1.1 200 OK reason=none", "{context}");
+    assert_eq!(
+        case("http-b"),
+        "HTTP/1.1 403 Forbidden reason=by-mismatch",
+        "{context}"
+    );
+    assert_eq!(case("listener-a"), "HTTP/1.1 200 OK", "{context}");
+    assert_eq!(case("listener-b"), "", "{context}");
+    assert_ne!(case("socat"), "none", "{context}");
+    assert_eq!(case("stdio-a"), "HTTP/1.1 200 OK", "{context}");
+    assert_eq!(case("stdio-b"), "", "{context}");
+    assert!(
+        case("secret-git").ends_with("reason=by-mismatch") && case("secret-git").contains(" 403 "),
+        "{context}"
+    );
+    let bash = case("secret-bash");
+    assert!(
+        !bash.ends_with("reason=by-mismatch") && bash.contains(" 502 "),
+        "the credential's own program passes the `by` gate and fails only at the upstream:\n{context}"
+    );
+}
+
 /// A client that ignores the proxy variables is still judged by the proxy. The capture tap answers
 /// its name, bends its connection, and hands it to the proxy as a `CONNECT`; the proxy, in a process
 /// of its own, decides it like any other: an allowed host answers, a denied one is refused with the

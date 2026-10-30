@@ -310,6 +310,9 @@ How the program is found: the supervisor, which can read the cage's processes, n
 the other end of the connection. When that is the cage's own forwarder (the `socat` behind
 `HTTP_PROXY`), it follows the forwarder back to the client it carries; when it is the [capture
 tap](network#clients-that-ignore-the-proxy-variables), it follows the source port the tap reports.
+A forwarder in front of that one is followed the same way: the in-cage listener of a `tcp://` rule,
+and the `socat` that ssh's generated `ProxyCommand` runs. That last one carries its bytes on its
+standard streams rather than a socket, so the program named is the one that launched it: ssh.
 A connection whose program cannot be named, or is held by two different programs at once, receives
 no credential held this way. The lookup happens only for a request a `by` credential could ride,
 once per connection.

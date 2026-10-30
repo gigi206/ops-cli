@@ -792,7 +792,9 @@ by = ["ssh", "git"]
 ```
 
 Here `git` may download from `codeload.github.com`, and `ssh` or `git` may open the raw SSH
-tunnel to `github.com:22`. Any other program reaching either is refused with a `403` whose
+tunnel to `github.com:22`. ssh reaches a privileged port through the `ProxyCommand` sbx writes for
+it, and the program behind that relay is the ssh that launched it, so `by = ["ssh"]` names the
+client you ran. Any other program reaching either is refused with a `403` whose
 `X-Sbx-Egress-Reason` is `by-mismatch`, and [`sbx net logs`](../networking/observability#which-program-made-the-request)
 shows the refusal with the program that made it. The rest of `*.github.com` stays open to every
 program: the wider `allow` does not reopen a reserved destination.
