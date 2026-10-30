@@ -820,7 +820,9 @@ that does not classify, names a path or a pattern, or whose `by` is missing, emp
 Left out, it would leave its destination open to every program a wider `allow` admits.
 
 A project `[app.<name>.network]` with no `mode` adds its reservations to the app profile's, as it
-adds its rules. A table that replaces the layer below keeps only its own.
+adds its rules. A table that replaces the layer below keeps only its own. A [bundle](bundles) carries the
+same field, folded under the app's own reservations: an app reserving the same destination keeps
+its own `by`.
 
 **A guardrail, not a boundary**, for the reason `[secret] by` is one: the program is named from the
 binary its process runs, and the cage runs as your uid. What it stops is the ordinary case, a

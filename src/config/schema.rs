@@ -468,6 +468,11 @@ pub(crate) struct RawBundle {
     /// statement that some of them share a credential belongs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) shared_credential: Vec<Vec<String>>,
+    /// Destinations of this tool reserved for the programs that need them — same shape and meaning
+    /// as [`NetworkTable::reserve`], folded under the app's own reservations (the app's entry wins
+    /// on a key). The bundle knows which of a tool's hosts only its own binary talks to.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) reserve: BTreeMap<String, RawReserve>,
     /// Credentials the egress proxy injects for this tool, host-side. Same shape and effect as an
     /// app's `[secret]` section — effective only under a network allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]

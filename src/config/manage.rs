@@ -3554,6 +3554,26 @@ mod tests {
         }
     }
 
+    /// A reservation the load would refuse is refused before it is written, and one it keeps is
+    /// written: the next launch would otherwise stop on a value the writer was told had been set.
+    #[test]
+    fn a_reservation_is_admitted_as_the_load_reads_it() {
+        let tmp = crate::testutil::TmpDir::new();
+        let net = "[network]\nmode = \"deny\"\n";
+        for (reserve, kept) in [
+            ("[network.reserve.\"a.com\"]\nby = [\"git\"]\n", true),
+            // Undefined here, so the launch would stop on it, as on a `deny` naming it.
+            ("[network.reserve.\"@hosts\"]\nby = [\"git\"]\n", false),
+            ("[network.reserve.\"a.com\"]\nby = []\n", false),
+            ("[network.reserve.\"a.com/x\"]\nby = [\"git\"]\n", false),
+            ("[network.reserve.\"*\"]\nby = [\"git\"]\n", false),
+        ] {
+            let p = doc_at(tmp.path(), &format!("{net}{reserve}"));
+            let got = add(&p, "fs.deny", ".env");
+            assert_eq!(got.is_ok(), kept, "{reserve}: {got:?}");
+        }
+    }
+
     /// Every list the write checks, each holding a value the cage could have written into a
     /// project's `.sbx.toml`, and each refused. The refusal is printed as it is, so it carries no
     /// control character and no character that reorders a line: the ones a value held are written
@@ -3569,6 +3589,8 @@ mod tests {
             "[network]\nhttp2 = [\"h\\u202Eost\\u001B[2J\"]\n",
             "[ssh_agent]\nallow = [\"key\\u202E\\u001B[2J\"]\n",
             "[network]\nshared_credential = [[\"a\\u202E.com\"]]\n",
+            "[network]\nmode = \"deny\"\n[network.reserve.\"a\\u202E.com\"]\nby = [\"git\"]\n",
+            "[network]\nmode = \"deny\"\n[network.reserve.\"a.com\"]\nby = [\"g\\u001B[2Jit\"]\n",
             "[proc]\nmode = \"enforce\"\ndeny = [\"cu\\u202Erl\\u001B[2J\"]\n",
             "[proc]\nmode = \"enforce\"\ndeny = [\"curl\\nsbx: warning: none\"]\n",
             "[seccomp]\nallow = [\"user\\u202Efaultfd\"]\n",

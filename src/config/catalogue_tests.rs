@@ -1143,7 +1143,14 @@ fn every_shipped_bundle_row_names_the_groups_it_references() {
     for path in shipped_files("examples/bundle") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let bundle = shipped_bundle(&path);
-        let groups = super::group_refs(bundle.allow.iter().chain(&bundle.mute).chain(&bundle.deny));
+        let groups = super::group_refs(
+            bundle
+                .allow
+                .iter()
+                .chain(&bundle.mute)
+                .chain(&bundle.deny)
+                .chain(bundle.reserve.keys()),
+        );
         let want = if groups.is_empty() {
             "none".to_string()
         } else {
@@ -1694,7 +1701,11 @@ fn every_shipped_profile_header_names_the_egress_groups_it_needs() {
         let mut required: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         if let Some(schema::NetworkField::Table(t)) = &profile.network {
             required.extend(super::group_refs(
-                t.allow.iter().chain(&t.deny).chain(&t.mute),
+                t.allow
+                    .iter()
+                    .chain(&t.deny)
+                    .chain(&t.mute)
+                    .chain(t.reserve.keys()),
             ));
         }
         for used in &profile.uses {
@@ -1705,7 +1716,12 @@ fn every_shipped_profile_header_names_the_egress_groups_it_needs() {
             );
             let bundle = shipped_bundle(&bundle_path);
             required.extend(super::group_refs(
-                bundle.allow.iter().chain(&bundle.deny).chain(&bundle.mute),
+                bundle
+                    .allow
+                    .iter()
+                    .chain(&bundle.deny)
+                    .chain(&bundle.mute)
+                    .chain(bundle.reserve.keys()),
             ));
         }
 
@@ -1748,8 +1764,14 @@ fn every_shipped_bundle_header_names_the_egress_groups_it_references() {
     for path in shipped_files("examples/bundle") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let bundle = shipped_bundle(&path);
-        let required =
-            super::group_refs(bundle.allow.iter().chain(&bundle.mute).chain(&bundle.deny));
+        let required = super::group_refs(
+            bundle
+                .allow
+                .iter()
+                .chain(&bundle.mute)
+                .chain(&bundle.deny)
+                .chain(bundle.reserve.keys()),
+        );
         if required.is_empty() {
             continue;
         }

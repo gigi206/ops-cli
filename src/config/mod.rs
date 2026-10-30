@@ -4304,12 +4304,8 @@ fn parse_reservations(
                 crate::diag::visible(key)
             ));
         }
-        let by = match table.by.as_deref() {
-            None | Some([]) => Err("its `by` names no program".to_string()),
-            Some(by) => validate_by(by),
-        };
         let mut reasons = Vec::new();
-        match by {
+        match reservation_by(&table) {
             Err(reason) => reasons.push(reason),
             Ok(by) => {
                 // Classified on its own so that each rule an `@group` expands to carries this `by`.
@@ -4340,6 +4336,14 @@ fn parse_reservations(
         }
     }
     reserved
+}
+
+/// The programs a `[network.reserve]` table names, or why it names none a reservation can hold.
+fn reservation_by(table: &schema::RawReserve) -> Result<Vec<String>, String> {
+    match table.by.as_deref() {
+        None | Some([]) => Err("its `by` names no program".to_string()),
+        Some(by) => validate_by(by),
+    }
 }
 
 /// The hosts of a `shared_credential` group as written, for a warning that has to name which group

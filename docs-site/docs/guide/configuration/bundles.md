@@ -59,6 +59,7 @@ the map-side companion, and it carries the egress along.
 | `allow`, `deny`, `mute` | `network` mode, `gui`, `gpu`, `audio`, `dbus`, `proc`, `home_scope` |
 | `secret` | another bundle (`use`) |
 | `shared_credential` (the hosts of this tool that are one service) | |
+| `reserve` (destinations of this tool held for the programs that need them, [`[network.reserve]`](network#destinations-reserved-for-named-programs-reserve)) | |
 | `task` (declared operations, `[task.<task>]`) | |
 | `service` (an auxiliary process run beside the app, `[service.<svc>]`) | |
 | `flakes`, `tarball`, `deb`, `appimage`, `binary` (the resolver tables that pair with a package) | |
@@ -245,7 +246,18 @@ shared-lib = "nix:ripgrep"   # and this overrides whatever either bundle said
 ```
 
 Egress entries **union** rather than override: a duplicate is not repeated. So a
-profile can adopt a bundle wholesale and still pin one of its packages.
+profile can adopt a bundle wholesale and still pin one of its packages. A `reserve`
+entry is keyed by its destination, like a package by its name: a later bundle's
+reservation of the same destination overrides an earlier one's, and the app's own
+`[network.reserve]` entry overrides both.
+
+```toml
+# bundles/git-tools.toml
+allow = ["*.github.com"]
+
+[reserve."codeload.github.com"]
+by = ["git"]
+```
 
 ## Global-only, and `use` is a security field
 
@@ -279,8 +291,10 @@ What that costs depends on the entry. An `allow` or `mute` entry left out only n
 the app or logs more, and a `shared_credential` group left out refuses a credential it
 would have let travel: the app still launches, and is told so. A `deny` entry left out
 would open the host its bundle closed wherever the app's posture filters: under `allow`,
-and under `deny` or `ask` too, where it carved an exception out of an `allow` rule. There
-it **stops the app's launch**, naming the entry. Either way, sbx names what to write
+and under `deny` or `ask` too, where it carved an exception out of an `allow` rule. A
+`reserve` entry left out would leave its destination open to every program a wider rule
+admits. Under a filtering posture either one **stops the app's launch**, naming the
+entry. Either way, sbx names what to write
 instead:
 
 - for a string posture, the table of the same mode, which changes nothing else:
@@ -298,7 +312,7 @@ one with no `mode` inherits only a `deny` or `ask` parent: under an `allow` one 
 back to `deny`. Writing one would move the app's posture behind your back, and a bundle
 must never move a posture in either direction.
 
-Under an app that runs `shared` or `none`, a `deny` entry changes nothing: that posture
+Under an app that runs `shared` or `none`, a `deny` or `reserve` entry changes nothing: that posture
 is already wider, or admits nothing at all. An app that writes either as a string is told
 nothing, since no entry of a bundle changes what it reaches.
 

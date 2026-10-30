@@ -202,6 +202,10 @@ fn bundle_json(name: &str, b: &config::RawBundle) -> serde_json::Value {
         // The groups whole, not counted: which hosts one covers IS the widening, and an
         // audit that reads this instead of the listing has no second place to find it.
         "shared_credential": b.shared_credential,
+        // Each destination with the programs it is held for: which programs IS the reservation.
+        "reserve": b.reserve.iter()
+            .map(|(entry, r)| (entry, r.by.clone().unwrap_or_default()))
+            .collect::<std::collections::BTreeMap<_, _>>(),
         "secrets": b.secret.as_ref().map(|s| s.hosts.len()).unwrap_or(0),
         // Everything below is what a consuming app also folds in. Left out, a `--json`
         // audit of an imported fragment reported a bundle as harmless while it carried
@@ -351,6 +355,15 @@ fn render_bundles(
                 ),
             );
         }
+        for (entry, reserved) in &b.reserve {
+            push_line(
+                &mut out,
+                &format!(
+                    "  reserve  {entry} (only for {})",
+                    reserved.by.as_deref().unwrap_or_default().join(", ")
+                ),
+            );
+        }
         if let Some(secret) = &b.secret {
             for host in secret.hosts.keys() {
                 push_line(&mut out, &format!("  secret   {host} (injected host-side)"));
@@ -470,6 +483,7 @@ const DESCRIBED_BUNDLE_SECTIONS: &[&str] = &[
     "deny",
     "mute",
     "shared_credential",
+    "reserve",
     "secret",
     "provision",
     "task",
@@ -559,6 +573,13 @@ fn grants_of(b: &config::RawBundle) -> Vec<String> {
         parts.push(format!(
             "{} shared-credential group(s)",
             b.shared_credential.len()
+        ));
+    }
+    // Named apart too: a reservation opens its destination, but to the programs it names only.
+    if !b.reserve.is_empty() {
+        parts.push(format!(
+            "{} destination(s) reserved for named programs",
+            b.reserve.len()
         ));
     }
     if b.provision.is_some() {
@@ -870,11 +891,13 @@ pub(crate) fn undefined_groups(
     src: &Path,
     declared: &std::collections::BTreeMap<String, Vec<String>>,
 ) -> Vec<crate::cli::MissingRef> {
-    let referenced = config::group_refs(
-        bundles
-            .values()
-            .flat_map(|b| b.allow.iter().chain(b.deny.iter()).chain(b.mute.iter())),
-    );
+    let referenced = config::group_refs(bundles.values().flat_map(|b| {
+        b.allow
+            .iter()
+            .chain(b.deny.iter())
+            .chain(b.mute.iter())
+            .chain(b.reserve.keys())
+    }));
     if referenced.is_empty() {
         return Vec::new();
     }
@@ -1234,6 +1257,7 @@ mod tests {
             deny: _,
             mute: _,
             shared_credential: _,
+            reserve: _,
             secret: _,
             provision: _,
             task: _,
@@ -1256,6 +1280,7 @@ mod tests {
             "deny = [\"https://blocked.example.com\"]\n",
             "mute = [\"https://noisy.example.com\"]\n",
             "shared_credential = [[\"api.example.com\", \"app.example.com\"]]\n",
+            "reserve.\"codeload.example.com\" = { by = [\"git\"] }\n",
             "provision = [\"/bin/true\"]\n",
             "secret.\"api.example.com\" = { from = \"env:API_KEY\" }\n",
             "task.deploy = { cmd = [\"deploy\"] }\n",
@@ -1295,6 +1320,14 @@ mod tests {
         assert!(
             as_json.contains("\"shared_credential\":[[\"api.example.com\",\"app.example.com\"]]"),
             "{as_json}"
+        );
+        assert!(
+            as_json.contains("\"reserve\":{\"codeload.example.com\":[\"git\"]}"),
+            "{as_json}"
+        );
+        assert!(
+            listed.contains("reserve  codeload.example.com (only for git)"),
+            "{listed}"
         );
         assert!(!as_json.contains("\"undescribed\":[\""), "{as_json}");
     }

@@ -1127,9 +1127,10 @@ pub(crate) fn validate_profile(bytes: &[u8]) -> Result<ProfilePreview, String> {
     })
 }
 
-/// The egress groups a raw `network` field references, across all three lists. The bare-string
-/// posture form has no lists at all, so it references nothing. What counts as a reference is
-/// [`super::group_ref`]'s single definition, shared with the fold that resolves it.
+/// The egress groups a raw `network` field references, across its three lists and its `reserve`
+/// keys. The bare-string posture form has no lists at all, so it references nothing. What counts
+/// as a reference is [`super::group_ref`]'s single definition, shared with the fold that resolves
+/// it.
 fn referenced_groups(network: Option<&NetworkField>) -> Vec<String> {
     let Some(NetworkField::Table(table)) = network else {
         return Vec::new();
@@ -1139,7 +1140,8 @@ fn referenced_groups(network: Option<&NetworkField>) -> Vec<String> {
             .allow
             .iter()
             .chain(table.deny.iter())
-            .chain(table.mute.iter()),
+            .chain(table.mute.iter())
+            .chain(table.reserve.keys()),
     )
 }
 
@@ -1251,6 +1253,10 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
             }
             if !t.deny.is_empty() {
                 s.push_str(&format!(" — deny {}", t.deny.join(", ")));
+            }
+            for (entry, reserved) in &t.reserve {
+                let by = reserved.by.as_deref().unwrap_or_default().join(", ");
+                s.push_str(&format!(" — reserve {entry} for {by}"));
             }
             lines.push(s);
         }
@@ -1734,8 +1740,9 @@ fn merge_config_dirs(
 /// them. Synthesizing one looks tempting, but a table replaces the policy the app runs under and a
 /// mode-less one falls back to `deny` under an `allow` parent (`mode_from_parent`), and a bundle
 /// must never move a posture in either direction. So the entries are left out. A `deny` entry left
-/// out would open the host its bundle closed wherever the app's posture filters, while an `allow`,
-/// `mute` or `shared_credential` entry only narrows or logs more. Both are kept in `fold`: a layer
+/// out would open the host its bundle closed wherever the app's posture filters, and a `reserve`
+/// entry the destination it held for named programs, while an `allow`, `mute` or
+/// `shared_credential` entry only narrows or logs more. Both are kept in `fold`: a layer
 /// above may replace the app's network and take the loss out of the profile's hands
 /// ([`set_aside_replaced`]), and what stands is weighed by [`settle_bundles`] once the resolution
 /// says what the posture is.
@@ -1897,8 +1904,11 @@ fn set_aside_replaced(fold: &mut BundleFold, project_apps: &BTreeMap<String, Raw
 
 /// A bundle's egress entries an app could not take in, and the shape of what it wrote instead.
 struct LostEgress {
-    /// The `deny` entries among them, which are what can open a host.
+    /// The `deny` entries among them, which can open a host.
     deny: Vec<String>,
+    /// The `reserve` keys among them, which can open a destination to every program a wider
+    /// `allow` admits.
+    reserve: Vec<String>,
     /// The posture the app wrote as a string in place of a table, or `None` when it wrote neither.
     posture: Option<String>,
     layer: FoldLayer,
@@ -1908,7 +1918,8 @@ struct LostEgress {
 /// on each set of lost egress entries.
 ///
 /// A `deny` entry left out opens the host its bundle closed under every posture that filters, a
-/// default-`deny` or `ask` one included, where it carved an exception out of an `allow` rule. So
+/// default-`deny` or `ask` one included, where it carved an exception out of an `allow` rule; a
+/// `reserve` entry left out opens its destination to every program a wider `allow` admits. So
 /// under a filtering posture it stops the app's launch, naming what to write instead, which keeps
 /// the posture: a string posture written as the table of the same mode, or a table of the app's
 /// own that carries the rules it relies on, since a table replaces the policy it inherits. Under
@@ -1962,7 +1973,8 @@ fn settle_bundles(resolved: &mut Resolved, fold: BundleFold) {
             NetworkPolicy::Shared | NetworkPolicy::Isolated => None,
         };
         for lost in lost {
-            if lost.posture.is_none() && (lost.deny.is_empty() || mode.is_none()) {
+            let restricting = !lost.deny.is_empty() || !lost.reserve.is_empty();
+            if lost.posture.is_none() && (!restricting || mode.is_none()) {
                 app.warnings.push(NO_TABLE_NOTE.to_string());
                 continue;
             }
@@ -1989,23 +2001,32 @@ fn settle_bundles(resolved: &mut Resolved, fold: BundleFold) {
                     ),
                 ),
             };
-            if lost.deny.is_empty() {
+            if !restricting {
                 app.warnings.push(format!(
                     "uses a bundle with egress rules or a shared-credential group, but {shape}, so \
                      they are left out. To apply them, {fix}"
                 ));
                 continue;
             }
-            let entries: Vec<String> = lost
-                .deny
-                .iter()
-                .map(|e| format!("`{}`", crate::diag::visible(e)))
-                .collect();
+            let quoted = |entries: &[String]| -> String {
+                entries
+                    .iter()
+                    .map(|e| format!("`{}`", crate::diag::visible(e)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let mut carried = Vec::new();
+            if !lost.deny.is_empty() {
+                carried.push(format!("`deny` entries ({})", quoted(&lost.deny)));
+            }
+            if !lost.reserve.is_empty() {
+                carried.push(format!("`reserve` entries ({})", quoted(&lost.reserve)));
+            }
             let said = format!(
-                "uses a bundle whose `deny` entries ({}) have no table to land in: {shape}, so \
-                 they are left out, and a launch of this app stops rather than run under `{mode}` \
-                 without them. To apply them, {fix}; or remove the bundle from `use`",
-                entries.join(", ")
+                "uses a bundle whose {} have no table to land in: {shape}, so they are left out, \
+                 and a launch of this app stops rather than run under `{mode}` without them. To \
+                 apply them, {fix}; or remove the bundle from `use`",
+                carried.join(" and ")
             );
             app.warnings.push(said.clone());
             app.refusals.push(said);
@@ -2042,6 +2063,7 @@ fn absorb_bundle(acc: &mut RawBundle, higher: RawBundle, notes: &mut Vec<String>
     acc.deny.extend(higher.deny);
     acc.mute.extend(higher.mute);
     acc.shared_credential.extend(higher.shared_credential);
+    acc.reserve.extend(higher.reserve);
     acc.open.extend(higher.open);
     acc.service.extend(higher.service);
     acc.flakes.extend(higher.flakes);
@@ -2163,12 +2185,14 @@ fn fold_bundle_into_app(
     let egress = !acc.allow.is_empty()
         || !acc.deny.is_empty()
         || !acc.mute.is_empty()
-        || !acc.shared_credential.is_empty();
+        || !acc.shared_credential.is_empty()
+        || !acc.reserve.is_empty();
     if !egress {
         return None;
     }
     let lost = |posture: Option<String>| LostEgress {
         deny: acc.deny.clone(),
+        reserve: acc.reserve.keys().cloned().collect(),
         posture,
         layer,
     };
@@ -2180,6 +2204,10 @@ fn fold_bundle_into_app(
             extend_deduped(&mut table.deny, acc.deny);
             extend_deduped(&mut table.mute, acc.mute);
             extend_deduped(&mut table.shared_credential, acc.shared_credential);
+            // Keyed by destination, so the app's own reservation of one stands over the bundle's.
+            for (entry, reserved) in acc.reserve {
+                table.reserve.entry(entry).or_insert(reserved);
+            }
             None
         }
         // A string posture has no rules to add to, and neither has an app with no table. What the
@@ -3759,5 +3787,74 @@ mod tests {
             "{pins:?}"
         );
         assert_ancestors_first(&pins);
+    }
+
+    /// A bundle reserving `codeload.example.com` for `git`.
+    fn reserving_bundle(by: &str) -> RawBundle {
+        toml::from_str(&format!(
+            "allow = [\"*.example.com\"]\n[reserve.\"codeload.example.com\"]\nby = [\"{by}\"]\n"
+        ))
+        .expect("the bundle parses")
+    }
+
+    /// A bundle's reservation reaches the policy of an app with a table to take it, and the app's
+    /// own reservation of the same destination stands over the bundle's.
+    #[test]
+    fn a_bundle_reservation_folds_under_the_apps_own() {
+        let reserved = |app: &ResolvedApp| -> Vec<(String, Vec<String>)> {
+            let Some(NetworkPolicy::Allowlist(p)) = &app.network else {
+                panic!("expected an allowlist: {:?}", app.network);
+            };
+            p.reserved()
+                .iter()
+                .map(|r| (r.rule().to_string(), r.by().to_vec()))
+                .collect()
+        };
+        let app = settle_under(
+            "[network]\nmode = \"deny\"\n",
+            &reserving_bundle("git"),
+            None,
+        );
+        assert!(app.refusals.is_empty(), "{:?}", app.refusals);
+        assert_eq!(
+            reserved(&app),
+            vec![(
+                "https://codeload.example.com".to_string(),
+                vec!["git".to_string()]
+            )]
+        );
+        let app = settle_under(
+            "[network]\nmode = \"deny\"\n[network.reserve.\"codeload.example.com\"]\nby = [\"gh\"]\n",
+            &reserving_bundle("git"),
+            None,
+        );
+        assert_eq!(
+            reserved(&app),
+            vec![(
+                "https://codeload.example.com".to_string(),
+                vec!["gh".to_string()]
+            )]
+        );
+    }
+
+    /// A reservation a string posture leaves out stops the launch wherever the posture filters, as a
+    /// `deny` entry does, and changes nothing under `shared`.
+    #[test]
+    fn a_bundle_reservation_with_no_table_stops_a_filtering_launch() {
+        for posture in ["deny", "ask", "allow"] {
+            let app = settle_under(
+                &format!("network = \"{posture}\"\n"),
+                &reserving_bundle("git"),
+                None,
+            );
+            assert_eq!(app.refusals.len(), 1, "{posture}: {:?}", app.refusals);
+            assert!(
+                app.refusals[0].contains("`reserve` entries (`codeload.example.com`)"),
+                "{posture}: {:?}",
+                app.refusals
+            );
+        }
+        let app = settle_under("network = \"shared\"\n", &reserving_bundle("git"), None);
+        assert!(app.refusals.is_empty(), "{:?}", app.refusals);
     }
 }
