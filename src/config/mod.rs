@@ -17,6 +17,7 @@
 mod apps;
 pub(crate) mod fspolicy;
 mod gate;
+mod grants;
 mod load;
 pub(crate) mod manage;
 pub(crate) mod overrides;
@@ -35,9 +36,10 @@ pub(crate) use apps::{
     AppContract, AppHomeScope, ResolvedApp, ends_with_shell_payload, is_valid_app_name,
 };
 pub(crate) use gate::{is_trust_drop, untrusted_reason};
+pub(crate) use grants::{Grant, Risk, grants};
 pub(crate) use load::{
     Source, apps_using_bundle, bundles, bundles_dir, control_plane_pins, control_plane_root_of,
-    export_profile, is_profile_file, is_valid_bundle_name, load, load_scoped, net_groups,
+    export_profile, is_profile_file, is_valid_bundle_name, load, load_as, load_scoped, net_groups,
     net_groups_dir, nothing_to_export, profile_path, profiles_dir, read_bundle_fragment,
     read_net_groups_fragment, sbx_control_plane_roots, undeclarable_app, undeclarable_apps,
     validate_bundle, validate_group_file, validate_profile,

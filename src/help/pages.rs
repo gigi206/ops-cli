@@ -1488,9 +1488,11 @@ pub(super) const PAGES: &[Page] = &[
             The trust also covers the mise files beside the config and every sops file it names\n\
             in the project: a `sops://` source there is decrypted only as the bytes approved here.\n\
             \n\
-            Before recording, it prints what the trust grants: the lines of the config, of its\n\
-            mise files and of its sops files that changed since they were last approved, or every\n\
-            line when nothing was approved before. It then asks a terminal to confirm; without\n\
+            Before recording, it prints what the trust grants: first each host, credential,\n\
+            bind, port or relaxation the approval opens, resolved as a launch would and marked\n\
+            !! (hard to take back) or ! (a named hole); then the lines of the config, of its mise\n\
+            files and of its sops files that changed since they were last approved, or every line\n\
+            when nothing was approved before. It then asks a terminal to confirm; without\n\
             one it refuses unless --yes is given. A config that already matches its approval is\n\
             recorded without a question, since it grants nothing new.",
     },

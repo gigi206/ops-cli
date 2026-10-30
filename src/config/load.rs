@@ -51,6 +51,34 @@ pub(crate) fn load(cwd: &Path) -> Resolved {
 /// canonicalization, and warning assembly), so a single-source view stays a faithful slice of
 /// the same resolution rather than a parallel code path.
 pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
+    load_layers(cwd, source, None)
+}
+
+/// Resolve the configuration for the project at `cwd` as if its `.sbx.toml` held `bytes` under the
+/// verdict `state`, every other layer read as a launch reads it.
+///
+/// This is how `sbx trust` asks what an approval would grant: the same project resolved under two
+/// verdicts, or two contents resolved under the same one, through the engine a launch uses, so the
+/// answer cannot describe a policy the launch would not apply. Nothing about the project is read
+/// from disk but its sibling files; the covered mise files are not folded in, since only the
+/// `.sbx.toml` is compared. A content that does not parse is an error, named.
+pub(crate) fn load_as(cwd: &Path, bytes: &[u8], state: TrustState) -> Result<Resolved, String> {
+    let mut dropped = Vec::new();
+    let raw = schema::parse_layer(bytes, &mut dropped)?;
+    Ok(load_layers(
+        cwd,
+        Source::All,
+        Some((raw, state, trust::MiseInputs::default())),
+    ))
+}
+
+/// [`load_scoped`], with the project layer taken from `given` instead of read from `cwd` when one is
+/// supplied ([`load_as`]).
+fn load_layers(
+    cwd: &Path,
+    source: Source,
+    given: Option<(RawConfig, TrustState, trust::MiseInputs)>,
+) -> Resolved {
     let mut warnings = Vec::new();
     // Imported app profiles live beside the global config and are trusted by location, so they
     // join the global app layer before resolution — `resolve_app`/`resolve_apps` then gate and
@@ -86,7 +114,9 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         }
         libraries
     };
-    let mut project = if source.includes_project() {
+    let mut project = if given.is_some() {
+        given
+    } else if source.includes_project() {
         read_project(cwd, &mut warnings).unwrap_or_else(|why| {
             warnings.push(format!("ignoring {why}"));
             // Folded onto one line: the reason quotes what the file wrote (the path of the value

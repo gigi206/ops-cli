@@ -122,6 +122,57 @@ fn re_trusting_a_changed_config_shows_the_added_line_only() {
     );
 }
 
+/// The review leads with what the change grants, in the policy's own terms: a wildcard and a
+/// credential are flagged with why, and a reworded comment grants nothing.
+#[test]
+fn re_trusting_names_each_grant_and_flags_the_risky_ones() {
+    let state = TmpDir::new("trust");
+    let proj = TmpDir::new("trust");
+    let cfg = proj.path().join(".sbx.toml");
+    let base = "[network]\nmode = \"deny\"\nallow = [\"example.com\"]\n";
+    std::fs::write(&cfg, base).unwrap();
+    let trust = || {
+        sbx()
+            .args(["trust", "--yes"])
+            .arg(&cfg)
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .expect("spawn sbx trust")
+    };
+    assert!(trust().status.success());
+
+    std::fs::write(&cfg, format!("# reworded\n{base}")).unwrap();
+    let again = trust();
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(again.status.success(), "{stderr}");
+    assert!(stderr.contains("no security field changes"), "{stderr}");
+
+    std::fs::write(
+        &cfg,
+        "[network]\nmode = \"deny\"\nallow = [\"example.com\", \"*.amazonaws.com\"]\n\n\
+         [secret.\"api.example.com\"]\nfrom = \"env://TOKEN\"\nheader = \"Authorization\"\n\
+         type = \"bearer\"\n",
+    )
+    .unwrap();
+    let again = trust();
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(again.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "!! secret: https://api.example.com (Authorization) — a credential is injected here"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("!  network: allow https://*.amazonaws.com — every subdomain"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("allow https://example.com"),
+        "a rule already approved is not a grant:\n{stderr}"
+    );
+}
+
 #[test]
 fn trust_then_untrust_records_and_revokes_a_marker() {
     let state = TmpDir::new("trust");

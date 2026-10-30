@@ -34,9 +34,13 @@ bytes it parses:
   (distinct from untrusted).
 - **Untrusted**: no record; security fields are dropped.
 
-Before recording, `sbx trust` prints what the trust grants: the lines of the config,
-of its mise files and of its sops files (shown as `sops:<path>`) that changed since they were last approved, as a diff, or every line
-when nothing was approved before. It then asks for confirmation on a terminal. Without a
+Before recording, `sbx trust` prints what the trust grants, twice over. First in the
+policy's own terms: each host, credential, bind, port, device or relaxation the approval
+opens, one per line, read off the configuration as a launch would resolve it, over the
+approved contents or, on a first approval, over what the project gets untrusted. Then the
+lines of the config, of its mise files and of its sops files (shown as `sops:<path>`) that
+changed since they were last approved, as a diff, or every line when nothing was approved
+before. It then asks for confirmation on a terminal. Without a
 terminal it refuses unless `--yes` is given, so a script that trusts a config has to say
 so. A config that already matches its approval is recorded without a question, since it
 grants nothing new. The bytes recorded are the ones shown: a change written to the file
@@ -46,6 +50,32 @@ The review matters because the project tree is writable from inside the cage. A
 re-approval prompted by a change you did not make is exactly the moment to read the
 diff: a launch names each bind it drops from a changed file, and `sbx trust` shows the
 line that added it.
+
+### Reading the grants
+
+```text
+sbx: .sbx.toml changed since it was trusted; trusting it grants:
+  !! secret: https://api.github.com (Authorization) — a credential is injected here
+  !! binds: /home/u/.aws (rw) — writable from the cage
+  !  network: allow https://*.amazonaws.com — every subdomain
+  !  app claude, forward: 1455 — host loopback port, reachable by every local user
+     network: allow https://registry.npmjs.org
+--- .sbx.toml
+…
+```
+
+A grant marked `!!` hands the cage something hard to take back: a credential sent to a new
+destination or able to do more where it already goes, a writable host path, the unfiltered
+host network, a syscall back, an ssh key. One marked `!` opens a named hole whose cost is
+written beside it: a wildcard, a raw `tcp://` splice, cleartext `http://`, a private
+address, a port a database or cache listens on, a lifted `deny`, a display, a device. An
+unmarked line is a grant with no shape that calls for more. A grant that only one app
+receives is named under that app. The marks are heuristics over what is granted, not a
+verdict: none of them refuses anything.
+
+A change that touches no security field (a comment, `[env]`, `timezone`) says so: `no
+security field changes`. When the contents do not resolve at all, the review says the
+grants could not be computed and shows the diff alone.
 
 For the same reason, the review never lets a line act on your terminal. A control
 character (an escape sequence, a carriage return) is printed as an escape such as `\x1b`

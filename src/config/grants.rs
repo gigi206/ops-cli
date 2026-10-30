@@ -1,0 +1,853 @@
+//! What approving a project config grants, read off the resolved configuration rather than the
+//! text: the same project resolved twice — before and after the approval — and compared on every
+//! field the trust gate holds back.
+//!
+//! The text diff `sbx trust` prints says which lines changed. It does not say what they open: a
+//! `*.amazonaws.com` reads like any other line, and a `[secret]` aimed at a new host reads like a
+//! comment. This module answers in the policy's own terms, through the resolution engine a launch
+//! uses, so the answer cannot describe a policy the launch would not apply.
+//!
+//! Every [`Grant`] carries a [`Risk`]. The risks are heuristics over the shape of what is granted,
+//! never a verdict: nothing here refuses anything, and the decision stays with whoever approves.
+
+use std::collections::BTreeSet;
+
+use super::{GuiPolicy, NetworkPolicy, Resolved};
+use crate::allowlist::{DefaultAction, EgressPolicy, Layer, Ports, Rule, RuleKind};
+use crate::proc_policy::{ProcMode, ProcPolicy};
+use crate::sandbox::{AddrRefusal, ip_refusal};
+
+/// How much attention one grant deserves, most first. Ordered so a sorted list leads with the
+/// grants a reviewer must not miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Risk {
+    /// Hands the cage something that is hard to take back: a credential's new destination, a
+    /// writable host path, an unfiltered network, a syscall back.
+    High,
+    /// Opens a named hole whose cost is written beside it.
+    Notable,
+    /// A grant worth seeing, with no shape that calls for more.
+    Info,
+}
+
+/// One thing the approval grants that the configuration before it did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Grant {
+    /// The app overlay the grant belongs to, or `None` for the baseline every launch gets.
+    pub(crate) app: Option<String>,
+    /// The configuration field, as the config spells it: `network`, `secret`, `binds`, …
+    pub(crate) field: &'static str,
+    /// What is granted, as the policy displays it: a rule, a path, a port, a key.
+    pub(crate) what: String,
+    pub(crate) risk: Risk,
+    /// Why it carries that risk, in a few words. Empty when the grant is plain.
+    pub(crate) why: &'static str,
+}
+
+/// Ports a database, cache or search engine listens on by default. A heuristic: a rule naming one
+/// probably reaches a service that was not meant to face the cage.
+const SERVICE_PORTS: [u16; 6] = [3306, 5432, 6379, 9200, 11211, 27017];
+
+/// The first port of the ephemeral range, past which a port rarely carries a public service.
+const EPHEMERAL_FROM: u16 = 49152;
+
+/// What `after` grants that `before` did not, for the baseline and for every app overlay `after`
+/// declares, ordered by risk.
+///
+/// An app's grants are computed on the app as it launches — the baseline with the overlay folded on
+/// — and those the baseline already lists are left out, so a grant is named once, where it lands.
+pub(crate) fn grants(before: &Resolved, after: &Resolved) -> Vec<Grant> {
+    let mut out = Vec::new();
+    delta(before, after, None, &mut out);
+    let baseline: BTreeSet<(&'static str, String)> =
+        out.iter().map(|g| (g.field, g.what.clone())).collect();
+    for (name, app) in &after.apps {
+        let mut was = before.clone();
+        if let Some(old) = before.apps.get(name) {
+            was.merge_app(old.clone());
+        }
+        let mut now = after.clone();
+        now.merge_app(app.clone());
+        let mut own = Vec::new();
+        delta(&was, &now, Some(name), &mut own);
+        if before.apps.get(name).is_none_or(|old| old.cmd != app.cmd) && !app.cmd.is_empty() {
+            own.push(grant(
+                Some(name),
+                "cmd",
+                app.cmd.join(" "),
+                Risk::Info,
+                "the command the app runs",
+            ));
+        }
+        out.extend(
+            own.into_iter()
+                .filter(|g| !baseline.contains(&(g.field, g.what.clone()))),
+        );
+    }
+    out.sort_by(|a, b| (a.risk, &a.app, a.field, &a.what).cmp(&(b.risk, &b.app, b.field, &b.what)));
+    out.dedup();
+    out
+}
+
+/// A [`Grant`] built from its parts, the app borrowed as [`delta`] holds it.
+fn grant(
+    app: Option<&String>,
+    field: &'static str,
+    what: String,
+    risk: Risk,
+    why: &'static str,
+) -> Grant {
+    Grant {
+        app: app.cloned(),
+        field,
+        what,
+        risk,
+        why,
+    }
+}
+
+/// The grants of one resolution over another, field by field.
+///
+/// The destructuring is exhaustive on purpose: a field added to [`Resolved`] fails to compile here
+/// until it is classified, so a new security field cannot reach a launch without the review naming
+/// it. A field named `_` was weighed and grants nothing: it is free, a display affordance, the
+/// global layer's alone, or I/O the pure resolution leaves empty.
+fn delta(before: &Resolved, after: &Resolved, app: Option<&String>, out: &mut Vec<Grant>) {
+    let Resolved {
+        env: _,
+        env_layer: _,
+        binds,
+        bind_layer: _,
+        packages,
+        accepts_fresh_releases,
+        apps_share_install_pools,
+        apps_share_install_pools_origin: _,
+        plugin,
+        open,
+        service,
+        provisions: _,
+        nixpkgs_global: _,
+        mise_engine: _,
+        nixpkgs_project,
+        mise: _,
+        mise_ignored: _,
+        network,
+        network_origin: _,
+        net_groups: _,
+        egress_stats,
+        egress_stats_origin: _,
+        proc,
+        proc_origin: _,
+        notify,
+        notify_origin: _,
+        gui,
+        gui_origin: _,
+        distro,
+        distro_run,
+        distro_auth,
+        distro_origin: _,
+        timezone: _,
+        timezone_origin: _,
+        gpu,
+        gpu_origin: _,
+        allow_insecure_http,
+        allow_insecure_http_origin: _,
+        audio,
+        audio_origin: _,
+        dbus,
+        dbus_origin: _,
+        forward,
+        forward_origin: _,
+        limits,
+        limits_origin: _,
+        seccomp,
+        seccomp_origin: _,
+        devices,
+        devices_origin: _,
+        fs,
+        fs_origin: _,
+        ssh_agent,
+        ssh_agent_origin: _,
+        brokers,
+        ssh_agent_confirm,
+        ssh_agent_confirm_origin: _,
+        redact_min_len,
+        redact_min_len_origin: _,
+        observe_record,
+        observe_record_origin: _,
+        secrets,
+        declared_secrets: _,
+        tasks,
+        apps: _,
+        warnings: _,
+        refusals: _,
+    } = after;
+    let mut push = |field, what: String, risk, why| out.push(grant(app, field, what, risk, why));
+
+    for bind in binds {
+        let was = before.binds.iter().find(|b| b.path == bind.path);
+        let path = bind.path.display();
+        match (was, bind.writable) {
+            (None, true) => push(
+                "binds",
+                format!("{path} (rw)"),
+                Risk::High,
+                "writable from the cage",
+            ),
+            (None, false) => push(
+                "binds",
+                format!("{path} (ro)"),
+                Risk::Notable,
+                "readable from the cage",
+            ),
+            (Some(b), true) if !b.writable => push(
+                "binds",
+                format!("{path} (rw)"),
+                Risk::High,
+                "now writable from the cage",
+            ),
+            _ => {}
+        }
+    }
+
+    // A package from an untrusted layer is carried with its verdict and never provisioned, so only
+    // a trusted one is something the approval grants.
+    let provisioned = |p: &&super::Package| p.state == crate::trust::TrustState::Trusted;
+    for package in packages.iter().filter(provisioned) {
+        let had = before
+            .packages
+            .iter()
+            .filter(provisioned)
+            .any(|p| p.name == package.name && p.backend == package.backend);
+        if !had {
+            push(
+                "packages",
+                package.name.clone(),
+                Risk::Info,
+                "built or fetched for the cage",
+            );
+        }
+    }
+    for name in accepts_fresh_releases {
+        if !before.accepts_fresh_releases.contains(name) {
+            push(
+                "accepts_fresh_releases",
+                name.clone(),
+                Risk::Notable,
+                "installs a release with no cooling-off delay",
+            );
+        }
+    }
+    if *apps_share_install_pools && !before.apps_share_install_pools {
+        push(
+            "apps_share_install_pools",
+            "true".into(),
+            Risk::Notable,
+            "one app can place a program another runs",
+        );
+    }
+    for (name, settings) in plugin {
+        if before.plugin.get(name) != Some(settings) {
+            push(
+                "plugin",
+                name.clone(),
+                Risk::Info,
+                "resolver plugin settings",
+            );
+        }
+    }
+    for (scheme, handler) in open {
+        if before.open.get(scheme) != Some(handler) {
+            push(
+                "open",
+                scheme.clone(),
+                Risk::Notable,
+                "decides what runs when a link is opened",
+            );
+        }
+    }
+    for (name, spec) in service {
+        if before.service.get(name) != Some(spec) {
+            push(
+                "service",
+                name.clone(),
+                Risk::Notable,
+                "runs at every launch",
+            );
+        }
+    }
+    if nixpkgs_project.is_some() && *nixpkgs_project != before.nixpkgs_project {
+        let source = nixpkgs_project.clone().unwrap_or_default();
+        push(
+            "nixpkgs",
+            source,
+            Risk::Info,
+            "the source the project's tools are built from",
+        );
+    }
+
+    network_grants(&before.network, network, secrets, &mut push);
+
+    if !*egress_stats && before.egress_stats {
+        push(
+            "network",
+            "stats = false".into(),
+            Risk::Notable,
+            "egress counters off",
+        );
+    }
+    proc_grants(&before.proc, proc, &mut push);
+    if *notify != before.notify {
+        push(
+            "notify",
+            "changed".into(),
+            Risk::Info,
+            "which refusals are announced",
+        );
+    }
+    if gui_rank(*gui) > gui_rank(before.gui) {
+        let what = match gui {
+            GuiPolicy::Wayland => "wayland",
+            GuiPolicy::Offscreen => "offscreen",
+            GuiPolicy::None => "none",
+        };
+        push("gui", what.into(), Risk::Notable, "display access");
+    }
+    if (distro, distro_run, distro_auth)
+        != (&before.distro, &before.distro_run, &before.distro_auth)
+        && let Some(locator) = distro
+    {
+        push(
+            "distro",
+            locator.clone(),
+            Risk::Info,
+            "the userland every program comes from",
+        );
+    }
+    for (on, was, field, why) in [
+        (
+            *gpu,
+            before.gpu,
+            "gpu",
+            "render node and the /sys device tree",
+        ),
+        (
+            *audio,
+            before.audio,
+            "audio",
+            "microphone and every playback stream",
+        ),
+        (*dbus, before.dbus, "dbus", "an in-cage desktop portal"),
+        (
+            *allow_insecure_http,
+            before.allow_insecure_http,
+            "allow_insecure_http",
+            "packages may arrive over plaintext http",
+        ),
+    ] {
+        if on && !was {
+            push(field, "true".into(), Risk::Notable, why);
+        }
+    }
+    for port in forward {
+        if !before.forward.contains(port) {
+            push(
+                "forward",
+                port.to_string(),
+                Risk::Notable,
+                "host loopback port, reachable by every local user",
+            );
+        }
+    }
+    for (name, now, was) in [
+        (
+            "memory_high",
+            &limits.memory_high,
+            &before.limits.memory_high,
+        ),
+        ("memory_max", &limits.memory_max, &before.limits.memory_max),
+        ("tasks_max", &limits.tasks_max, &before.limits.tasks_max),
+    ] {
+        if now != was
+            && let Some(value) = now
+        {
+            push(
+                "limits",
+                format!("{name} = {value}"),
+                Risk::Notable,
+                "resource limit changed",
+            );
+        }
+    }
+    let lifted = before.seccomp.tokens();
+    for token in seccomp.tokens() {
+        if !lifted.contains(&token) {
+            push("seccomp", token, Risk::High, "syscall re-permitted");
+        }
+    }
+    for device in devices {
+        if !before.devices.contains(device) {
+            push(
+                "devices",
+                device.display().to_string(),
+                Risk::Notable,
+                "host device",
+            );
+        }
+    }
+    for (was, now, list) in [
+        (&before.fs.deny, &fs.deny, "deny"),
+        (&before.fs.readonly, &fs.readonly, "readonly"),
+        (&before.fs.scan, &fs.scan, "scan"),
+    ] {
+        for entry in was.iter().filter(|e| !now.contains(e)) {
+            push(
+                "fs",
+                format!("{list} {entry}"),
+                Risk::Notable,
+                "a closed path reopens",
+            );
+        }
+    }
+    if fs.git_writable == Some(true) && before.fs.git_writable != Some(true) {
+        push(
+            "fs",
+            "git_writable = true".into(),
+            Risk::Notable,
+            "git hooks writable",
+        );
+    }
+    for key in ssh_agent {
+        if !before.ssh_agent.contains(key) {
+            push(
+                "ssh_agent",
+                key.clone(),
+                Risk::High,
+                "a key the cage can sign with",
+            );
+        }
+    }
+    if !*ssh_agent_confirm && before.ssh_agent_confirm {
+        push(
+            "ssh_agent",
+            "confirm = false".into(),
+            Risk::Notable,
+            "signatures no longer confirmed",
+        );
+    }
+    for broker in brokers {
+        if !before.brokers.contains(broker) {
+            push(
+                "broker",
+                broker.name.clone(),
+                Risk::Notable,
+                "a plugin holds a host connection",
+            );
+        }
+    }
+    if redact_min_len > &before.redact_min_len {
+        push(
+            "redact",
+            format!("min_len = {redact_min_len}"),
+            Risk::Notable,
+            "shorter credentials leave the redaction",
+        );
+    }
+    if *observe_record != before.observe_record {
+        push(
+            "observe",
+            format!("record = {observe_record}"),
+            Risk::Info,
+            "session record",
+        );
+    }
+    for secret in secrets {
+        match before.secrets.iter().find(|s| s.to == secret.to) {
+            None => push(
+                "secret",
+                format!("{} ({})", secret.to, secret.header),
+                Risk::High,
+                "a credential is injected here",
+            ),
+            Some(was) if was != secret => push(
+                "secret",
+                format!("{} ({})", secret.to, secret.header),
+                Risk::High,
+                "credential source or shape changed",
+            ),
+            Some(_) => {}
+        }
+    }
+    for task in tasks {
+        if !before.tasks.contains(task) {
+            push(
+                "task",
+                task.name.clone(),
+                Risk::Notable,
+                "a declared operation",
+            );
+        }
+    }
+}
+
+/// The grants of one network posture over another. Only a widening is a grant: moving to
+/// `isolated`, or off `shared`, takes reach away.
+fn network_grants(
+    before: &NetworkPolicy,
+    after: &NetworkPolicy,
+    secrets: &[super::HeaderSecret],
+    push: &mut impl FnMut(&'static str, String, Risk, &'static str),
+) {
+    match (before, after) {
+        (NetworkPolicy::Shared, _) | (_, NetworkPolicy::Isolated) => {}
+        (_, NetworkPolicy::Shared) => push(
+            "network",
+            "shared".into(),
+            Risk::High,
+            "the host network, unfiltered",
+        ),
+        (NetworkPolicy::Isolated, NetworkPolicy::Allowlist(now)) => {
+            policy_grants(None, now, secrets, push)
+        }
+        (NetworkPolicy::Allowlist(was), NetworkPolicy::Allowlist(now)) => {
+            policy_grants(Some(was), now, secrets, push)
+        }
+    }
+}
+
+/// The grants of one egress policy over another (`None`: over no egress at all). The built-in
+/// self-equip set is every policy's, so it is never something an approval grants.
+fn policy_grants(
+    before: Option<&EgressPolicy>,
+    after: &EgressPolicy,
+    secrets: &[super::HeaderSecret],
+    push: &mut impl FnMut(&'static str, String, Risk, &'static str),
+) {
+    let was_open = before.is_some_and(|b| b.default_action() == DefaultAction::Allow);
+    if after.default_action() == DefaultAction::Allow && !was_open {
+        push(
+            "network",
+            "mode = allow".into(),
+            Risk::High,
+            "everything not denied is reachable",
+        );
+    }
+    for rule in after.allow_rules() {
+        if rule.builtin || before.is_some_and(|b| b.allow_rules().contains(rule)) {
+            continue;
+        }
+        let (risk, why) = rule_risk(rule, secrets);
+        push("network", format!("allow {rule}"), risk, why);
+    }
+    if let Some(before) = before {
+        for rule in before.deny_rules() {
+            if !after.deny_rules().contains(rule) {
+                push(
+                    "network",
+                    format!("deny {rule}"),
+                    Risk::Notable,
+                    "a refusal is lifted",
+                );
+            }
+        }
+    }
+}
+
+/// The risk of one newly allowed egress rule: the first of its traits, most serious first.
+fn rule_risk(rule: &Rule, secrets: &[super::HeaderSecret]) -> (Risk, &'static str) {
+    if rule.opens_every_host() {
+        return (Risk::High, "matches every host");
+    }
+    if secrets
+        .iter()
+        .filter_map(|s| s.to.concrete_host())
+        .any(|host| reaches(rule, host))
+    {
+        return (Risk::High, "widens what an injected credential can do");
+    }
+    match rule.layer {
+        Layer::L4 => return (Risk::Notable, "raw TCP, not inspected"),
+        Layer::L7Clear => return (Risk::Notable, "cleartext HTTP"),
+        Layer::L7 => {}
+    }
+    let ports = match &rule.kind {
+        RuleKind::Regex { .. } => return (Risk::Notable, "a regex over the whole URL"),
+        RuleKind::Subdomain(_, _) => return (Risk::Notable, "every subdomain"),
+        RuleKind::Ip(ip, ports) => {
+            if matches!(
+                ip_refusal(*ip, "", None),
+                Some(AddrRefusal::PrivateWithoutExactHost)
+            ) {
+                return (Risk::Notable, "a private address");
+            }
+            ports
+        }
+        RuleKind::Host(_, ports) | RuleKind::Url { ports, .. } => ports,
+    };
+    if reaches_service_port(ports) {
+        return (Risk::Notable, "a port an internal service listens on");
+    }
+    (Risk::Info, "")
+}
+
+/// Whether `rule` reaches `host` by name: names it, or is a `*.domain` it falls under.
+fn reaches(rule: &Rule, host: &str) -> bool {
+    match &rule.kind {
+        RuleKind::Host(h, _) | RuleKind::Url { host: h, .. } => h == host,
+        RuleKind::Subdomain(domain, _) => host == domain || host.ends_with(&format!(".{domain}")),
+        RuleKind::Ip(..) | RuleKind::Regex { .. } => false,
+    }
+}
+
+/// Whether a port set admits any port past [`EPHEMERAL_FROM`] or any of [`SERVICE_PORTS`].
+fn reaches_service_port(ports: &Ports) -> bool {
+    match ports {
+        Ports::Any => true,
+        Ports::Ranges(ranges) => ranges.iter().any(|&(lo, hi)| {
+            hi >= EPHEMERAL_FROM || SERVICE_PORTS.iter().any(|p| (lo..=hi).contains(p))
+        }),
+    }
+}
+
+/// The grants of one process posture over another: a mode that enforces less, a program no longer
+/// refused, or one that now runs without being asked about.
+fn proc_grants(
+    before: &ProcPolicy,
+    after: &ProcPolicy,
+    push: &mut impl FnMut(&'static str, String, Risk, &'static str),
+) {
+    if proc_rank(after.mode) < proc_rank(before.mode) {
+        push(
+            "proc",
+            format!("mode = {}", after.mode.as_str()),
+            Risk::Notable,
+            "process enforcement loosened",
+        );
+    }
+    for rule in &before.deny {
+        if !after.deny.contains(rule) {
+            push(
+                "proc",
+                format!("deny {}", rule.as_str()),
+                Risk::Notable,
+                "may now run",
+            );
+        }
+    }
+    if matches!(after.mode, ProcMode::Ask | ProcMode::Confine) {
+        for rule in &after.allow {
+            if !before.allow.contains(rule) {
+                push(
+                    "proc",
+                    format!("allow {}", rule.as_str()),
+                    Risk::Info,
+                    "runs without asking",
+                );
+            }
+        }
+    }
+}
+
+/// How much a process mode enforces, least first.
+fn proc_rank(mode: ProcMode) -> u8 {
+    match mode {
+        ProcMode::Off => 0,
+        ProcMode::Observe => 1,
+        ProcMode::Enforce => 2,
+        ProcMode::Ask => 3,
+        ProcMode::Confine => 4,
+    }
+}
+
+/// How much of the host display a GUI posture exposes, least first.
+fn gui_rank(gui: GuiPolicy) -> u8 {
+    match gui {
+        GuiPolicy::None => 0,
+        GuiPolicy::Offscreen => 1,
+        GuiPolicy::Wayland => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::schema::{self, RawConfig};
+    use crate::plugins::PluginRegistry;
+    use crate::trust::TrustState;
+
+    /// One project layer over an empty global config, under `state`.
+    fn resolved(toml: &str, state: TrustState) -> Resolved {
+        let raw = schema::parse_layer(toml.as_bytes(), &mut Vec::new()).expect("a valid layer");
+        super::super::resolve(
+            RawConfig::default(),
+            Some((raw, state)),
+            &PluginRegistry::default(),
+        )
+    }
+
+    /// What approving `after` grants over an approved `before`.
+    fn over(before: &str, after: &str) -> Vec<Grant> {
+        grants(
+            &resolved(before, TrustState::Trusted),
+            &resolved(after, TrustState::Trusted),
+        )
+    }
+
+    /// The grants as `(field, what, risk)`, the shape the assertions read.
+    fn seen(grants: &[Grant]) -> Vec<(&'static str, &str, Risk)> {
+        grants
+            .iter()
+            .map(|g| (g.field, g.what.as_str(), g.risk))
+            .collect()
+    }
+
+    #[test]
+    fn a_change_to_a_free_field_or_a_comment_grants_nothing() {
+        let before = "[network]\nmode = \"deny\"\nallow = [\"example.com\"]\n";
+        let after = "# reworded\n[env]\nA = \"1\"\n\n[network]\nmode = \"deny\"\nallow = [\"example.com\"]\n";
+        assert_eq!(over(before, after), vec![]);
+    }
+
+    #[test]
+    fn a_bind_is_high_when_writable_and_notable_when_read_only() {
+        let got = over(
+            "binds = [\"/srv/a\"]\n",
+            "binds = [{ path = \"/srv/a\", mode = \"rw\" }, \"/srv/b\"]\n",
+        );
+        assert_eq!(
+            seen(&got),
+            vec![
+                ("binds", "/srv/a (rw)", Risk::High),
+                ("binds", "/srv/b (ro)", Risk::Notable),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_new_egress_rule_carries_the_risk_of_its_shape() {
+        let got = over(
+            "[network]\nmode = \"deny\"\n",
+            "[network]\nmode = \"deny\"\nallow = [\"example.com\", \"*.amazonaws.com\", \
+             \"tcp://db.internal:5432\", \"10.0.0.5\", \"example.org:6379\", \"re:.*\"]\n",
+        );
+        let risk = |what: &str| {
+            got.iter()
+                .find(|g| g.what.contains(what))
+                .map(|g| (g.risk, g.why))
+                .unwrap_or_else(|| panic!("no grant for {what}: {got:?}"))
+        };
+        assert_eq!(risk("re:.*"), (Risk::High, "matches every host"));
+        assert_eq!(risk("amazonaws"), (Risk::Notable, "every subdomain"));
+        assert_eq!(
+            risk("db.internal"),
+            (Risk::Notable, "raw TCP, not inspected")
+        );
+        assert_eq!(risk("10.0.0.5"), (Risk::Notable, "a private address"));
+        assert_eq!(
+            risk("example.org"),
+            (Risk::Notable, "a port an internal service listens on")
+        );
+        assert_eq!(risk("example.com"), (Risk::Info, ""));
+    }
+
+    #[test]
+    fn a_credential_and_any_new_reach_to_its_host_are_high() {
+        let secret = "[secret.\"api.github.com\"]\nfrom = \"env://GH\"\nheader = \"Authorization\"\n\
+                      type = \"bearer\"\n";
+        let before =
+            format!("[network]\nmode = \"deny\"\nallow = [\"{{GET}} api.github.com\"]\n\n{secret}");
+        let after = format!(
+            "[network]\nmode = \"deny\"\nallow = [\"{{GET}} api.github.com\", \"{{POST}} api.github.com\"]\n\n{secret}"
+        );
+        let got = over(&before, &after);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].risk, Risk::High);
+        assert_eq!(got[0].why, "widens what an injected credential can do");
+
+        let none = "[network]\nmode = \"deny\"\nallow = [\"{GET} api.github.com\"]\n";
+        let got = over(none, &before);
+        assert_eq!(
+            seen(&got),
+            vec![(
+                "secret",
+                "https://api.github.com (Authorization)",
+                Risk::High
+            )]
+        );
+    }
+
+    #[test]
+    fn opening_the_network_is_high_and_closing_it_grants_nothing() {
+        let filtered = "[network]\nmode = \"deny\"\nallow = [\"example.com\"]\n";
+        assert_eq!(
+            seen(&over(filtered, "network = \"shared\"\n")),
+            vec![("network", "shared", Risk::High)]
+        );
+        assert_eq!(
+            seen(&over(
+                filtered,
+                "[network]\nmode = \"allow\"\nallow = [\"example.com\"]\n"
+            )),
+            vec![("network", "mode = allow", Risk::High)]
+        );
+        assert_eq!(over("network = \"shared\"\n", filtered), vec![]);
+        assert_eq!(over(filtered, "network = \"isolated\"\n"), vec![]);
+    }
+
+    #[test]
+    fn a_lifted_deny_is_a_grant() {
+        let got = over(
+            "[network]\nmode = \"allow\"\ndeny = [\"telemetry.example.com\"]\n",
+            "[network]\nmode = \"allow\"\n",
+        );
+        assert_eq!(
+            seen(&got),
+            vec![(
+                "network",
+                "deny https://telemetry.example.com",
+                Risk::Notable
+            )]
+        );
+    }
+
+    #[test]
+    fn the_built_in_self_equip_set_is_never_listed() {
+        assert_eq!(
+            over("network = \"isolated\"\n", "network = \"deny\"\n"),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn a_first_approval_lists_what_the_untrusted_resolution_held_back() {
+        let toml = "forward = [1455]\n\n[ssh_agent]\nallow = [\"deploy\"]\n\n[seccomp]\nallow = [\"ptrace\"]\n";
+        let got = grants(
+            &resolved(toml, TrustState::Untrusted),
+            &resolved(toml, TrustState::Trusted),
+        );
+        assert_eq!(
+            seen(&got),
+            vec![
+                ("seccomp", "ptrace", Risk::High),
+                ("ssh_agent", "deploy", Risk::High),
+                ("forward", "1455", Risk::Notable),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_app_grant_is_named_under_the_app_and_a_baseline_one_once() {
+        let before = "[app.demo]\ncmd = [\"bash\"]\n";
+        let after = "binds = [\"/srv/a\"]\n\n[app.demo]\ncmd = [\"bash\"]\n\n[app.demo.network]\nmode = \"shared\"\n";
+        let got = over(before, after);
+        assert_eq!(
+            got.iter()
+                .map(|g| (g.app.as_deref(), g.field, g.what.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("demo"), "network", "shared"),
+                (None, "binds", "/srv/a (ro)"),
+            ]
+        );
+    }
+}

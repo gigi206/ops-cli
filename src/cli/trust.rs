@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::diag::visible;
-use crate::{diag, help, style, trust};
+use crate::{config, diag, help, style, trust};
 
 /// The config path an `sbx trust`/`untrust` invocation targets: the given path,
 /// or the project `.sbx.toml` in the current directory by default.
@@ -189,7 +189,15 @@ pub(crate) fn review_and_trust(store_dir: &Path, path: &Path, yes: bool) -> Trus
         let was = before
             .as_ref()
             .map(|(sbx, mise)| contents_of(path, sbx, mise));
-        err!("{}", render_trust_review(path, was.as_deref(), &now, &epal));
+        let grants = grants_of(
+            path,
+            before.as_ref().map(|(sbx, _)| sbx.as_slice()),
+            &sbx_bytes,
+        );
+        err!(
+            "{}",
+            render_trust_review(path, was.as_deref(), &now, grants.as_ref(), &epal)
+        );
         if !yes && !crate::cli::confirm::ask("trust these contents?", "these contents are intended")
         {
             return TrustOutcome::Declined;
@@ -199,6 +207,38 @@ pub(crate) fn review_and_trust(store_dir: &Path, path: &Path, yes: bool) -> Trus
         Ok(()) => TrustOutcome::Recorded,
         Err(e) => TrustOutcome::Failed(e),
     }
+}
+
+/// What approving `now` grants, read off the resolved configuration: over the approved contents
+/// when a copy is on record and still resolves, else over the same contents left untrusted — which
+/// is what the project gets without the approval.
+///
+/// `None` when `path` is not a file the loader reads as a project config, since resolving it would
+/// describe a configuration no launch applies. An error when `now` itself does not resolve: the
+/// text diff is then all the review can show.
+fn grants_of(
+    path: &Path,
+    approved: Option<&[u8]>,
+    now: &[u8],
+) -> Option<Result<Vec<config::Grant>, String>> {
+    if path.file_name() != Some(std::ffi::OsStr::new(config::PROJECT_CONFIG)) {
+        return None;
+    }
+    let cwd = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let after = match config::load_as(cwd, now, trust::TrustState::Trusted) {
+        Ok(resolved) => resolved,
+        Err(e) => return Some(Err(e)),
+    };
+    let before = approved
+        .and_then(|old| config::load_as(cwd, old, trust::TrustState::Trusted).ok())
+        .map_or_else(
+            || config::load_as(cwd, now, trust::TrustState::Untrusted),
+            Ok,
+        );
+    Some(before.map(|before| config::grants(&before, &after)))
 }
 
 /// One file of what a trust covers: the name it is shown under, and its text.
@@ -220,14 +260,16 @@ fn contents_of(path: &Path, sbx: &[u8], mise: &trust::TrustInputs) -> Vec<Shown>
     out
 }
 
-/// The review printed before a trust is recorded: per file, what changed since the approved
-/// contents — or, when none are recorded, every line, since all of it is being granted. A file
-/// that appeared shows as all added, one that went away as all removed, and an unchanged file is
-/// not shown. A pure presenter (its layout is asserted in a test).
+/// The review printed before a trust is recorded: what the approval grants, field by field
+/// ([`render_grants`]), then per file what changed since the approved contents — or, when none are
+/// recorded, every line, since all of it is being granted. A file that appeared shows as all added,
+/// one that went away as all removed, and an unchanged file is not shown. A pure presenter (its
+/// layout is asserted in a test).
 fn render_trust_review(
     path: &Path,
     approved: Option<&[Shown]>,
     now: &[Shown],
+    grants: Option<&Result<Vec<config::Grant>, String>>,
     pal: &style::Palette,
 ) -> String {
     let (n, dim, r) = (pal.name, pal.dim, pal.reset);
@@ -240,6 +282,9 @@ fn render_trust_review(
             "sbx: {n}{shown_path}{r} {dim}(no approved contents on record){r}; trusting it grants:\n"
         ),
     };
+    if let Some(grants) = grants {
+        out.push_str(&render_grants(grants, pal));
+    }
     let find = |set: &[Shown], name: &str| {
         set.iter()
             .find(|(k, _)| k == name)
@@ -259,6 +304,51 @@ fn render_trust_review(
         }
         out.push_str(&format!("{n}--- {}{r}\n", visible(name)));
         out.push_str(&render_line_diff(&old, &new, pal));
+    }
+    out
+}
+
+/// The grants of an approval, one per line, most serious first: `!!` in the error hue for a
+/// [`config::Risk::High`] grant, `!` in the caution hue for a [`config::Risk::Notable`] one (two
+/// marks rather than two hues alone, so the difference survives a pipe), then the
+/// app it belongs to, the field, what is granted and why it is flagged. Every value a config wrote
+/// goes through [`visible`], since the config is the project's. A pure presenter.
+fn render_grants(grants: &Result<Vec<config::Grant>, String>, pal: &style::Palette) -> String {
+    let (dim, r) = (pal.dim, pal.reset);
+    let grants = match grants {
+        Ok(grants) => grants,
+        Err(e) => {
+            return format!(
+                "  {dim}grants could not be computed: {}{r}\n",
+                visible(&diag::one_line(e))
+            );
+        }
+    };
+    if grants.is_empty() {
+        return format!("  {dim}no security field changes{r}\n");
+    }
+    let mut out = String::new();
+    for g in grants {
+        let mark = match g.risk {
+            config::Risk::High => format!("{}!!{r}", pal.err),
+            config::Risk::Notable => format!("{}! {r}", pal.warn),
+            config::Risk::Info => "  ".to_string(),
+        };
+        let scope = g
+            .app
+            .as_ref()
+            .map(|app| format!("app {}, ", visible(app)))
+            .unwrap_or_default();
+        let why = if g.why.is_empty() {
+            String::new()
+        } else {
+            format!(" {dim}— {}{r}", g.why)
+        };
+        out.push_str(&format!(
+            "  {mark} {scope}{}: {}{why}\n",
+            g.field,
+            visible(&g.what)
+        ));
     }
     out
 }
@@ -544,7 +634,7 @@ mod tests {
             ("mise.toml", "[tools]\nnode = \"22\"\n"),
         ]);
         assert_eq!(
-            render_trust_review(Path::new(".sbx.toml"), Some(&was), &now, &p),
+            render_trust_review(Path::new(".sbx.toml"), Some(&was), &now, None, &p),
             "sbx: .sbx.toml changed since it was trusted; trusting it grants:\n\
              --- .sbx.toml\n\
              @@ -2 +2 @@\n\
@@ -553,11 +643,68 @@ mod tests {
     }
 
     #[test]
+    fn the_grants_lead_the_review_most_serious_first_and_say_why() {
+        let p = style::Palette::plain();
+        let grant = |app: Option<&str>, field, what: &str, risk, why| config::Grant {
+            app: app.map(str::to_string),
+            field,
+            what: what.to_string(),
+            risk,
+            why,
+        };
+        let grants = Ok(vec![
+            grant(
+                None,
+                "secret",
+                "https://api.example.com (Authorization)",
+                config::Risk::High,
+                "a credential is injected here",
+            ),
+            grant(
+                Some("demo"),
+                "forward",
+                "1455",
+                config::Risk::Notable,
+                "host loopback port",
+            ),
+            grant(
+                None,
+                "network",
+                "allow https://example.com",
+                config::Risk::Info,
+                "",
+            ),
+        ]);
+        let now = shown(&[(".sbx.toml", "x = 1\n")]);
+        assert_eq!(
+            render_trust_review(Path::new(".sbx.toml"), None, &now, Some(&grants), &p),
+            "sbx: .sbx.toml (no approved contents on record); trusting it grants:\n  \
+             !! secret: https://api.example.com (Authorization) — a credential is injected here\n  \
+             !  app demo, forward: 1455 — host loopback port\n     \
+             network: allow https://example.com\n\
+             --- .sbx.toml\n\
+             @@ -1 +1 @@\n\
+             +x = 1\n"
+        );
+        assert_eq!(
+            render_grants(&Ok(vec![]), &p),
+            "  no security field changes\n"
+        );
+        assert_eq!(
+            render_grants(&Err("bad \x1b[31mtoml\nline".to_string()), &p),
+            format!(
+                "  grants could not be computed: {}\n",
+                visible(&diag::one_line("bad \x1b[31mtoml\nline"))
+            )
+        );
+    }
+
+    #[test]
     fn the_review_shows_every_line_when_nothing_was_approved_and_a_file_that_appeared() {
         let p = style::Palette::plain();
         let now = shown(&[(".sbx.toml", "binds = [\"/a\"]\n")]);
         assert_eq!(
-            render_trust_review(Path::new(".sbx.toml"), None, &now, &p),
+            render_trust_review(Path::new(".sbx.toml"), None, &now, None, &p),
             "sbx: .sbx.toml (no approved contents on record); trusting it grants:\n\
              --- .sbx.toml\n\
              @@ -1 +1 @@\n\
@@ -566,7 +713,7 @@ mod tests {
         // A mise file created since the approval shows whole; one removed shows as removed.
         let was = shown(&[(".sbx.toml", "x = 1\n"), (".tool-versions", "node 20\n")]);
         let now = shown(&[(".sbx.toml", "x = 1\n"), ("mise.toml", "[tools]\n")]);
-        let out = render_trust_review(Path::new(".sbx.toml"), Some(&was), &now, &p);
+        let out = render_trust_review(Path::new(".sbx.toml"), Some(&was), &now, None, &p);
         assert!(
             out.contains("--- mise.toml\n@@ -1 +1 @@\n+[tools]\n"),
             "{out}"
@@ -639,7 +786,7 @@ mod tests {
             ),
             ("mise\x07.toml", "[tools]\n"),
         ]);
-        let out = render_trust_review(Path::new("p\x1b/.sbx.toml"), None, &now, &p);
+        let out = render_trust_review(Path::new("p\x1b/.sbx.toml"), None, &now, None, &p);
         assert!(
             !out.contains(['\x1b', '\r', '\x07', '\u{202e}']),
             "a raw control character reached the review: {out:?}"
