@@ -31,10 +31,11 @@ use super::inject::{CredentialSet, HeaderLookup, RequestFacts, pairs_for as inje
 use super::link::{Asked, Checked};
 use super::ssrf::{ConnectRefusal, ip_refusal};
 use super::{
-    AskPosture, BY_MISMATCH, BY_MISMATCH_MESSAGE, ProxyCtx, SIGNER_REFUSED, SecretNeedle, StatKind,
-    authority_bound_to, carries_secret, decide_https, header_name_eq,
+    AskPosture, BY_MISMATCH, BY_MISMATCH_MESSAGE, ProxyCtx, RESERVED_MESSAGE, SIGNER_REFUSED,
+    SecretNeedle, StatKind, authority_bound_to, carries_secret, decide_https, header_name_eq,
     is_connection_bound_challenge, matching_injection_ids, note_final_status, redact_in_place,
-    signer_refusal_message, sni_bound_to, upstream_server_name, withheld_by_deny,
+    refused_by_reservation, signer_refusal_message, sni_bound_to, upstream_server_name,
+    withheld_by_deny,
 };
 use crate::allowlist::Rule;
 use crate::sandbox::control::{HttpVer, LogVerdict, Proto, RpcKind};
@@ -393,6 +394,24 @@ async fn stream(
             return;
         }
     };
+    // As on the HTTP/1.1 planes: a destination reserved for named programs is refused to any other.
+    if refused_by_reservation(
+        ctx,
+        who,
+        Proto::Https,
+        connect_host,
+        port,
+        Some(method.as_str()),
+        Some(&path),
+    ) {
+        let _ = refuse_with_detail(
+            respond,
+            StatusCode::FORBIDDEN,
+            BY_MISMATCH,
+            RESERVED_MESSAGE,
+        );
+        return;
+    }
     // The allow is recorded only after the upstream connects (in `relay`), matching the
     // HTTP/1.1 path: a request that passes the verdict but then fails SSRF/DNS/upstream is
     // logged (an `Error`/`Blocked` line) but never counted as an allow in `sbx net stats`.

@@ -322,6 +322,10 @@ An absolute path or a `sha256:` entry is harder to stand in for than a name, at 
 written again when the tool is updated. Removing or widening a `by` is shown as a grant by
 [`sbx trust`](../cli/trust#reading-the-grants), like any change to a credential.
 
+`by` restricts the credential, not the destination: under `by_other = "bare"` every program still
+reaches `api.github.com`. To reserve the destination itself for named programs, credential or not,
+write a [`[network.reserve]`](network#destinations-reserved-for-named-programs-reserve) entry.
+
 ## Per-app secrets
 
 An `[app.<name>.secret]` section declares credentials for that app, gated and

@@ -154,6 +154,7 @@ fn declare_groups(raw: &mut RawConfig, defs: &[(&str, &[&str])]) {
 /// it. That guard belongs on the resolver, not on a test spelling out sixteen `None`s to reach one.
 fn net_table_defaults() -> NetworkTable {
     NetworkTable {
+        reserve: Default::default(),
         shared_credential: vec![],
         mode: None,
         allow: vec![],
@@ -553,6 +554,7 @@ fn a_mute_list_classifies_and_expands_groups_like_allow_deny() {
     let (g, _) = make_groups(&[("telemetry", &["play.googleapis.com", "*.datadoghq.com"])]);
     let mut w = Vec::new();
     let field = NetworkField::Table(NetworkTable {
+        reserve: Default::default(),
         shared_credential: vec![],
         mode: Some("deny".into()),
         allow: vec![],
@@ -986,6 +988,7 @@ fn raw_network(value: &str) -> RawConfig {
 fn raw_network_table(allow: &[&str], deny: &[&str]) -> RawConfig {
     RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -1357,6 +1360,7 @@ fn an_untrusted_project_app_cannot_widen_its_default_methods() {
     // the app falls to the built-in `{GET,HEAD}`, never all-verbs. (Read-by-default only ever
     // tightens; the only direction an untrusted layer could abuse is widening, which it cannot.)
     let net = NetworkField::Table(NetworkTable {
+        reserve: Default::default(),
         shared_credential: vec![],
         mute: vec![],
         http2: vec![],
@@ -1570,6 +1574,7 @@ fn network_modes_set_the_egress_default_action() {
     let mut w = Vec::new();
     let tbl = |mode: &str, allow: &[&str], deny: &[&str]| {
         NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -1679,6 +1684,7 @@ fn a_mode_less_table_inherits_a_filtering_parent_and_keeps_its_own_rules() {
     // A `[network]` table that lists a rule but omits `mode`.
     let no_mode = || {
         NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -1759,6 +1765,7 @@ fn a_table_names_the_settings_of_the_layer_below_it_gives_up() {
     // The table `sbx net allow --local` writes: a mode and one rule, no settings of its own.
     let one_rule = || {
         NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -1859,6 +1866,7 @@ fn a_mode_less_project_network_table_inherits_the_global_mode() {
     let global = raw_network("ask");
     let project = RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -1906,6 +1914,7 @@ fn a_mode_less_app_network_table_inherits_the_baseline_mode() {
         RawApp {
             cmd: Some(schema::RawCmd::Line("demo".to_string())),
             network: Some(NetworkField::Table(NetworkTable {
+                reserve: Default::default(),
                 shared_credential: vec![],
                 mute: vec![],
                 http2: vec![],
@@ -1952,6 +1961,7 @@ fn a_mode_less_app_network_table_inherits_the_baseline_mode() {
 fn the_pool_toggle_defaults_on_and_is_gated_trusted_only() {
     let pool_table = |pool: Option<bool>| {
         NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -2023,6 +2033,7 @@ fn the_pool_toggle_defaults_on_and_is_gated_trusted_only() {
 fn ca_roots_defaults_on_and_a_splice_overrides_a_request_to_drop_them() {
     let ca_table = |ca_roots: Option<bool>, entry: &str| {
         NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -2113,6 +2124,7 @@ fn ca_roots_defaults_on_and_a_splice_overrides_a_request_to_drop_them() {
 fn dns_cache_ttl_flows_from_the_table_to_the_policy() {
     let dns_table = |ttl: Option<u64>| {
         NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -2156,6 +2168,7 @@ fn dns_cache_ttl_flows_from_the_table_to_the_policy() {
 fn the_connection_settings_flow_from_the_table_and_fail_closed_on_a_value_that_would_bite() {
     let conn_table = |idle: Option<&str>, max: Option<usize>, body_mb: Option<u64>| {
         NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -2265,6 +2278,7 @@ fn the_websocket_secret_posture_flows_from_the_table_and_fails_closed_on_a_typo(
     use crate::allowlist::WebsocketSecret;
     let table = |raw: Option<&str>| {
         NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -2323,6 +2337,7 @@ fn the_capture_level_flows_from_the_table_to_the_policy_and_fails_closed_on_a_ty
     use crate::sandbox::control::CaptureLevel;
     let capture_table = |level: Option<&str>, kb: Option<u64>| {
         NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -2433,6 +2448,7 @@ fn an_untrusted_project_cannot_turn_the_capture_on() {
     use crate::sandbox::control::CaptureLevel;
     let project = || RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -2466,6 +2482,7 @@ fn an_untrusted_project_cannot_turn_the_capture_on() {
     // back to a comparable posture rather than to "no network policy at all".
     let global = || RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -2540,6 +2557,7 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
     use crate::allowlist::DefaultAction;
     let ask_table = |timeout: Option<&str>| {
         NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -2590,6 +2608,7 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
 
     // An `ask_timeout` under a non-ask mode is moot — warned and ignored.
     let moot = NetworkField::Table(NetworkTable {
+        reserve: Default::default(),
         shared_credential: vec![],
         mute: vec![],
         http2: vec![],
@@ -2624,6 +2643,7 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
     use crate::allowlist::DefaultAction;
     let ask = |notice: Option<bool>| {
         NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -2666,6 +2686,7 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
 
     // An `ask_notice` under a non-ask mode is moot — warned and ignored.
     let moot = NetworkField::Table(NetworkTable {
+        reserve: Default::default(),
         shared_credential: vec![],
         mute: vec![],
         http2: vec![],
@@ -4627,6 +4648,7 @@ fn a_baseline_default_methods_is_ignored_with_a_warning() {
     // ignored (Mode-A `sbx run` stays all-verbs), with a warning so it is not silent.
     let global = RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -8853,6 +8875,7 @@ fn network_posture_validator() {
 #[test]
 fn a_non_filtering_mode_names_the_fields_it_leaves_inert() {
     let table = |mode: &str, allow: &[&str], ask_timeout: Option<&str>| NetworkTable {
+        reserve: Default::default(),
         shared_credential: vec![],
         mute: vec![],
         http2: vec![],
@@ -9127,6 +9150,7 @@ fn an_unknown_network_mode_is_dropped_with_a_warning() {
     let r = resolve_no_plugins(
         RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
+                reserve: Default::default(),
                 shared_credential: vec![],
                 mute: vec![],
                 http2: vec![],
@@ -9289,6 +9313,7 @@ fn raw_secret_section(secrets: Vec<(String, RawHostSecret)>) -> RawSecretSection
 fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConfig {
     RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -10011,6 +10036,7 @@ fn an_override_reference_to_an_undefined_group_is_dropped_with_a_warning() {
 fn a_one_shot_override_says_what_its_network_table_gives_up() {
     let table = |capture: Option<&str>, allow: &[&str]| {
         NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mode: Some("deny".to_string()),
             allow: allow.iter().map(|h| h.to_string()).collect(),
@@ -10530,6 +10556,7 @@ fn the_egress_stats_toggle_defaults_on_and_is_gated_trusted_only() {
     // A `[network]` table carrying an explicit `stats` value.
     let net = |stats: Option<bool>| RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -10688,6 +10715,7 @@ fn an_apps_network_stats_toggle_is_warned_and_ignored() {
         &[],
         &[],
         Some(NetworkField::Table(NetworkTable {
+            reserve: Default::default(),
             shared_credential: vec![],
             mute: vec![],
             http2: vec![],
@@ -10805,6 +10833,7 @@ fn raw_plugin_defaults(order: &[&str], scheme: &str, locator: Option<&str>) -> R
 /// A trusted-shaped network allowlist for the given hosts.
 fn allowlist_net(allow: &[&str]) -> Option<NetworkField> {
     Some(NetworkField::Table(NetworkTable {
+        reserve: Default::default(),
         shared_credential: vec![],
         mute: vec![],
         http2: vec![],
@@ -14530,4 +14559,148 @@ fn the_resolved_dump_is_created_owner_only() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o600, "the resolved dump is owner-only");
+}
+
+/// `[network.reserve]` through the network validator, from the TOML of a `[network]` table: the
+/// policy, the warnings and the refusals.
+fn reserve_policy(
+    toml: &str,
+    groups: &NetGroups,
+) -> (crate::allowlist::EgressPolicy, Vec<String>, Vec<String>) {
+    let table: NetworkTable = toml::from_str(toml).expect("a valid `[network]` table");
+    let (mut w, mut r) = (Vec::new(), Vec::new());
+    let policy = super::validate_network(
+        &mut w,
+        &mut r,
+        GLOBAL_CONFIG,
+        NetworkField::Table(table),
+        groups,
+        &NetworkPolicy::default(),
+    );
+    let Some(NetworkPolicy::Allowlist(p)) = policy else {
+        panic!("expected an allowlist policy: {policy:?}");
+    };
+    (*p, w, r)
+}
+
+/// A reservation reaches the policy with its programs, and its destination joins `allow`: the
+/// reservation is what opens it to those programs.
+#[test]
+fn a_reservation_reaches_the_policy_and_opens_its_destination() {
+    let (p, w, r) = reserve_policy(
+        "mode = \"deny\"\nallow = [\"*.github.com\"]\n\
+         [reserve.\"codeload.github.com\"]\nby = [\"git\"]\n\
+         [reserve.\"tcp://github.com:22\"]\nby = [\"ssh\", \"/usr/bin/git\"]\n",
+        &NetGroups::new(),
+    );
+    assert!(w.is_empty() && r.is_empty(), "{w:?} {r:?}");
+    let reserved: Vec<(String, Vec<String>)> = p
+        .reserved()
+        .iter()
+        .map(|r| (r.rule().to_string(), r.by().to_vec()))
+        .collect();
+    assert_eq!(
+        reserved,
+        vec![
+            (
+                "https://codeload.github.com".to_string(),
+                vec!["git".to_string()]
+            ),
+            (
+                "tcp://github.com:22".to_string(),
+                vec!["ssh".to_string(), "/usr/bin/git".to_string()]
+            ),
+        ]
+    );
+    for r in p.reserved() {
+        assert!(
+            p.allow_rules().contains(r.rule()),
+            "`{}` is allowed for the programs it names",
+            r.rule()
+        );
+    }
+    assert_eq!(p.reserved_for("codeload.github.com", 443).count(), 1);
+    assert_eq!(p.reserved_for("api.github.com", 443).count(), 0);
+}
+
+/// Every reservation that cannot be kept stops a launch: left out, its destination would be open
+/// to every program a wider `allow` admits.
+#[test]
+fn a_reservation_that_cannot_be_kept_is_refused() {
+    for (entry, by, says) in [
+        ("codeload.github.com", None, "names no program"),
+        ("codeload.github.com", Some("[]"), "names no program"),
+        (
+            "codeload.github.com",
+            Some("[\"bin/git\"]"),
+            "relative path",
+        ),
+        (
+            "codeload.github.com",
+            Some("[\"sha256:abc\"]"),
+            "64 lowercase hex",
+        ),
+        (
+            "github.com/repos/*",
+            Some("[\"git\"]"),
+            "names a path or a pattern",
+        ),
+        (
+            "re:^https://github",
+            Some("[\"git\"]"),
+            "names a path or a pattern",
+        ),
+        ("*", Some("[\"git\"]"), "as a reserve entry"),
+        ("@missing", Some("[\"git\"]"), "undefined group"),
+    ] {
+        let by = by.map(|b| format!("by = {b}\n")).unwrap_or_default();
+        let (p, w, r) = reserve_policy(
+            &format!("mode = \"deny\"\nallow = [\"*.github.com\"]\n[reserve.{entry:?}]\n{by}"),
+            &NetGroups::new(),
+        );
+        assert!(p.reserved().is_empty(), "{entry}: nothing is reserved");
+        assert_eq!(r.len(), 1, "{entry}: one refusal stops the launch: {r:?}");
+        assert!(r[0].contains(says), "{entry}: {r:?}");
+        assert!(w.contains(&r[0]), "{entry}: and it is reported");
+    }
+}
+
+/// An `@group` key reserves each rule the group expands to for the same programs.
+#[test]
+fn a_reserved_group_reserves_each_of_its_rules() {
+    let (groups, w) =
+        make_groups(&[("git-hosts", &["codeload.github.com", "tcp://github.com:22"])]);
+    assert!(w.is_empty(), "{w:?}");
+    let (p, w, r) = reserve_policy(
+        "mode = \"deny\"\n[reserve.\"@git-hosts\"]\nby = [\"git\"]\n",
+        &groups,
+    );
+    assert!(w.is_empty() && r.is_empty(), "{w:?} {r:?}");
+    assert_eq!(p.reserved().len(), 2);
+    assert!(p.reserved().iter().all(|r| r.by() == ["git".to_string()]));
+    assert_eq!(p.allow_rules().len(), 2);
+}
+
+/// A mode-less overlay adds its reservations to the layer below's, as it adds its rules.
+#[test]
+fn an_amending_overlay_adds_its_reservations_to_the_layer_below() {
+    let (below, _, _) = reserve_policy(
+        "mode = \"deny\"\n[reserve.\"codeload.github.com\"]\nby = [\"git\"]\n",
+        &NetGroups::new(),
+    );
+    let table: NetworkTable =
+        toml::from_str("[reserve.\"tcp://github.com:22\"]\nby = [\"ssh\"]\n").unwrap();
+    let policy = super::validate_network_amending(
+        &mut Vec::new(),
+        &mut Vec::new(),
+        "app `demo`",
+        NetworkField::Table(table),
+        &NetGroups::new(),
+        &NetworkPolicy::Allowlist(Box::new(below)),
+    )
+    .expect("the overlay validates");
+    let NetworkPolicy::Allowlist(p) = policy else {
+        panic!("an amending overlay stays a filtering policy");
+    };
+    assert_eq!(p.reserved().len(), 2);
 }

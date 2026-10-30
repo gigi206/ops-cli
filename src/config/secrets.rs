@@ -271,10 +271,11 @@ fn validate_by_other(raw: &RawHostSecret) -> Result<ByOther, String> {
     }
 }
 
-/// The `by` entries of a credential, each checked for the form it is written in: `sha256:` and
-/// 64 lowercase hex digits, an absolute path, or a bare file name. Anything else is refused, named,
-/// rather than read as a program no executable could ever be.
-fn validate_by(entries: &[String]) -> Result<Vec<String>, String> {
+/// The `by` entries of a credential or of a `[network.reserve]` destination, each checked for the
+/// form it is written in: `sha256:` and 64 lowercase hex digits, an absolute path, or a bare file
+/// name. Anything else is refused, named, rather than read as a program no executable could ever
+/// be.
+pub(super) fn validate_by(entries: &[String]) -> Result<Vec<String>, String> {
     entries
         .iter()
         .map(|entry| {

@@ -112,6 +112,7 @@ fn app_detail_network(
         mute,
         http2,
         shared_credential,
+        reserve,
         builtin,
         ..
     } = &view.network
@@ -126,6 +127,7 @@ fn app_detail_network(
         for rule in deny {
             let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
         }
+        super::render::write_reserve(o, reserve, "    ", pal);
         // The host groups a credential the cage signed in for may travel across. Ahead of
         // `--details`, unlike `mute` and `http2`: those decide nothing about what leaves the cage,
         // while a group widens the outbound tripwire — and an app takes it from a bundle rather
@@ -742,6 +744,7 @@ pub(super) fn sample_app_detail_view() -> config::view::AppDetailView {
             deny: vec![],
             mute: vec![],
             shared_credential: vec![],
+            reserve: vec![],
             http2: vec![],
             capture: "off".to_string(),
             capture_max_kb: None,
@@ -933,6 +936,7 @@ fn filled_app_detail_view() -> config::view::AppDetailView {
             deny: vec!["telemetry.example.net".into()],
             mute: vec!["logs.example.com".into(), "beacon.example.com".into()],
             shared_credential: vec![vec!["example.com".into(), "api.example.com".into()]],
+            reserve: vec![],
             http2: vec!["grpc.example.com".into()],
             capture: "bodies".to_string(),
             capture_max_kb: Some(64),

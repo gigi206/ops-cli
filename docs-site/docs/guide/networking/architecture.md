@@ -651,7 +651,9 @@ copy of the policy refused a connection the proxy had admitted, described under
 `bad-request` (including `bad-request:head`, a head that never arrived whole),
 `outbound-secret`, `signer-refused`, `by-mismatch` (a credential
 [held for other programs](../configuration/secret#held-for-named-programs-by) under
-`by_other = "deny"`), `signer-body-too-large`, `body-buffer-cap`,
+`by_other = "deny"`, or a destination
+[reserved for other programs](../configuration/network#destinations-reserved-for-named-programs-reserve)),
+`signer-body-too-large`, `body-buffer-cap`,
 `connection-cap`, `supervisor-busy` (the supervisor was already opening as many
 connections as it opens at once, twice `[network] max_connections`), `splice-cap` (the
 concurrent raw `tcp://` tunnel ceiling),

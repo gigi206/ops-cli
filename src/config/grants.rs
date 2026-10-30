@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 
 use super::{GuiPolicy, NetworkPolicy, Resolved};
-use crate::allowlist::{DefaultAction, EgressPolicy, Layer, Ports, Rule, RuleKind};
+use crate::allowlist::{DefaultAction, EgressPolicy, Layer, Ports, Reservation, Rule, RuleKind};
 use crate::proc_policy::{ProcMode, ProcPolicy};
 use crate::sandbox::{AddrRefusal, ip_refusal};
 
@@ -598,7 +598,11 @@ fn policy_grants(
         if rule.builtin || before.is_some_and(|b| b.allow_rules().contains(rule)) {
             continue;
         }
-        let (risk, why) = rule_risk(rule, secrets);
+        let (risk, mut why) = rule_risk(rule, secrets);
+        // A reserved destination opens to its named programs only, which the reviewer is told
+        // rather than left to find under `[network.reserve]`.
+        let only = reservation_of(after, rule).map(|r| format!("only for {}", r.by().join(", ")));
+        why.extend(only.as_deref());
         push("network", format!("allow {rule}"), risk, &why.join(", "));
     }
     if let Some(before) = before {
@@ -612,7 +616,47 @@ fn policy_grants(
                 );
             }
         }
+        for was in before.reserved() {
+            let rule = was.rule();
+            match reservation_of(after, rule) {
+                // Lifted while an `allow` rule still opens the destination: it opens to everyone.
+                // Lifted with its destination closed, it grants nothing.
+                None if after.allow_rules().iter().any(|r| r.covers(rule)) => push(
+                    "network",
+                    format!("reserve {rule}"),
+                    Risk::High,
+                    "a destination reserved for named programs opens to every program",
+                ),
+                None => {}
+                Some(now) => {
+                    let added: Vec<&str> = now
+                        .by()
+                        .iter()
+                        .filter(|p| !was.by().contains(p))
+                        .map(String::as_str)
+                        .collect();
+                    if !added.is_empty() {
+                        push(
+                            "network",
+                            format!("reserve {rule} by {}", added.join(", ")),
+                            Risk::Notable,
+                            "more programs may reach a reserved destination",
+                        );
+                    }
+                }
+            }
+        }
     }
+}
+
+/// The reservation of `policy` whose destination is `rule`'s, compared by kind and layer: an app's
+/// `default_methods` rewrites the method set of the `allow` rule a reservation added, never the
+/// destination.
+fn reservation_of<'a>(policy: &'a EgressPolicy, rule: &Rule) -> Option<&'a Reservation> {
+    policy
+        .reserved()
+        .iter()
+        .find(|r| r.rule().kind == rule.kind && r.rule().layer == rule.layer)
 }
 
 /// The risk of one newly allowed egress rule and every trait that earns it, most serious first: a
@@ -887,6 +931,41 @@ mod tests {
             vec![(
                 "network",
                 "deny https://telemetry.example.com",
+                Risk::Notable
+            )]
+        );
+    }
+
+    #[test]
+    fn a_lifted_or_widened_reservation_is_a_grant() {
+        let reserved = "[network]\nmode = \"deny\"\nallow = [\"*.github.com\"]\n\n\
+                        [network.reserve.\"codeload.github.com\"]\nby = [\"git\"]\n";
+        let got = over(
+            "[network]\nmode = \"deny\"\nallow = [\"*.github.com\"]\n",
+            reserved,
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].what, "allow https://codeload.github.com");
+        assert_eq!(got[0].why, "only for git");
+
+        let got = over(
+            reserved,
+            "[network]\nmode = \"deny\"\nallow = [\"*.github.com\"]\n",
+        );
+        assert_eq!(
+            seen(&got),
+            vec![("network", "reserve https://codeload.github.com", Risk::High)]
+        );
+
+        let got = over(
+            reserved,
+            &reserved.replace("[\"git\"]", "[\"git\", \"curl\"]"),
+        );
+        assert_eq!(
+            seen(&got),
+            vec![(
+                "network",
+                "reserve https://codeload.github.com by curl",
                 Risk::Notable
             )]
         );

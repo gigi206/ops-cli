@@ -3060,6 +3060,7 @@ fn every_field_of_a_policy_survives_the_transfer() {
     let mut builtin = rule("*.nixos.org");
     builtin.builtin = true;
     let policy = EgressPolicy {
+        reserved: None,
         allow: vec![
             grouped,
             builtin,
@@ -3482,4 +3483,30 @@ fn a_rule_covers_another_only_where_the_two_show_it() {
             "{wide} does not cover {narrow}"
         );
     }
+}
+
+/// A reservation names a destination: it covers its host and ports on every plane, and a path or a
+/// pattern, which a raw splice has none of to read, cannot be one.
+#[test]
+fn a_reservation_covers_hosts_and_ports_and_refuses_paths_and_patterns() {
+    let by = || vec!["git".to_string()];
+    let host = Reservation::new(classify("codeload.github.com").unwrap(), by()).unwrap();
+    assert!(host.covers("codeload.github.com", 443));
+    assert!(!host.covers("codeload.github.com", 22));
+    assert!(!host.covers("api.github.com", 443));
+    let wild = Reservation::new(classify("tcp://*.github.com:22").unwrap(), by()).unwrap();
+    assert!(wild.covers("github.com", 22) && wild.covers("ssh.github.com", 22));
+    for entry in ["github.com/repos/*", "re:^https://github\\.com/"] {
+        let err = Reservation::new(classify(entry).unwrap(), by()).unwrap_err();
+        assert!(err.contains("names a path or a pattern"), "{entry}: {err}");
+    }
+    let policy = EgressPolicy::new(vec![], vec![])
+        .with_reserved(vec![host])
+        .with_reserved(vec![wild]);
+    assert_eq!(
+        policy.reserved().len(),
+        2,
+        "a second call adds to the first"
+    );
+    assert_eq!(policy.reserved_for("github.com", 22).count(), 1);
 }

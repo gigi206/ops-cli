@@ -439,6 +439,13 @@ impl From<crate::allowlist::DefaultAction> for NetDefaultView {
     }
 }
 
+/// One destination reserved for named programs: the rule, and the programs its `by` names.
+#[derive(Serialize)]
+pub(crate) struct ReserveView {
+    pub(crate) rule: String,
+    pub(crate) by: Vec<String>,
+}
+
 /// The resolved network posture.
 //
 // The `Allowlist` variant runs to a few hundred bytes against two unit variants, which the size
@@ -478,6 +485,10 @@ pub(crate) enum NetworkView {
         /// shown nowhere is a grant the reader cannot audit, and an app usually inherits it from a
         /// bundle rather than writing it itself.
         shared_credential: Vec<Vec<String>>,
+        /// The destinations reserved for named programs (`reserve`). Surfaced beside the rules
+        /// because each one is also among `allow`, where it would otherwise read as open to every
+        /// program.
+        reserve: Vec<ReserveView>,
         /// The traffic-capture level (`off`/`headers`/`bodies`) and, when bodies are captured, the
         /// per-body cap in KiB. Surfaced so a launch that retains the plaintext of its exchanges
         /// says so in `sbx config` — a capture is never silent.
@@ -544,6 +555,7 @@ impl NetworkView {
             mute: Vec::new(),
             http2: Vec::new(),
             shared_credential: Vec::new(),
+            reserve: Vec::new(),
             capture: "off".to_string(),
             capture_max_kb: None,
             websocket_secret: "warn".to_string(),
@@ -1518,6 +1530,14 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
                 .iter()
                 .map(|group| group.to_vec())
                 .collect(),
+            reserve: a
+                .reserved()
+                .iter()
+                .map(|r| ReserveView {
+                    rule: r.rule().to_string(),
+                    by: r.by().to_vec(),
+                })
+                .collect(),
             websocket_secret: match a.websocket_secret() {
                 crate::allowlist::WebsocketSecret::Warn => "warn".to_string(),
                 crate::allowlist::WebsocketSecret::Block => "block".to_string(),
@@ -2476,6 +2496,7 @@ mod tests {
                 deny: vec![],
                 mute: vec![],
                 shared_credential: vec![],
+                reserve: vec![],
                 http2: vec![],
                 capture: "off".to_string(),
                 capture_max_kb: None,

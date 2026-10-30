@@ -53,7 +53,22 @@ pub(super) fn splice_l4(
     connect_host: &str,
     port: u16,
     ctx: &ProxyCtx,
+    who: &Who,
 ) -> io::Result<()> {
+    // A destination reserved for named programs (`[network.reserve]`) is refused to any other
+    // before a slot is taken, as on the inspected planes. A splice has no head, so no method or path
+    // to name.
+    if refused_by_reservation(
+        ctx,
+        who,
+        crate::sandbox::control::Proto::Tcp,
+        connect_host,
+        port,
+        None,
+        None,
+    ) {
+        return write_refusal(&mut client, "403 Forbidden", BY_MISMATCH, RESERVED_MESSAGE);
+    }
     // Reserve a splice slot up front; the guard releases it on every return below.
     let guard = SpliceGuard::new(&ctx.splices);
     if guard.count() > MAX_CONCURRENT_SPLICES {

@@ -283,6 +283,19 @@ pub(super) fn serve_tunneled_request(
             );
         }
     };
+    // 5a. A destination reserved for named programs (`[network.reserve]`) is refused to any other,
+    //     however wide the rule that allowed it.
+    if refused_by_reservation(
+        ctx,
+        who,
+        crate::sandbox::control::Proto::Https,
+        connect_host,
+        port,
+        Some(&imethod),
+        Some(&itarget),
+    ) {
+        return respond_refusal_tls(&mut br, "403 Forbidden", BY_MISMATCH, RESERVED_MESSAGE);
+    }
 
     // 5b. A credential-injected host cannot also host a WebSocket: the reason, the `Blocked` outcome
     //     and the `403` are `refuse_ws_into_injected_host`'s, shared with the forward plane, and the

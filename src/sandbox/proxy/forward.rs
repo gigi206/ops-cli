@@ -132,6 +132,19 @@ pub(super) fn handle_https_forward(
             );
         }
     };
+    // 5a. As on the tunneled plane: a destination reserved for named programs is refused to any
+    //     other.
+    if refused_by_reservation(
+        ctx,
+        who,
+        crate::sandbox::control::Proto::Https,
+        &host,
+        port,
+        Some(verb),
+        Some(&path),
+    ) {
+        return write_refusal(&mut client, "403 Forbidden", BY_MISMATCH, RESERVED_MESSAGE);
+    }
 
     // 5b. The same refusal the tunneled plane makes, from the same `refuse_ws_into_injected_host`:
     //     a credential-injected host cannot also host a WebSocket, and the refusal comes before any

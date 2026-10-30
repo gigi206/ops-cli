@@ -455,6 +455,7 @@ fn network_view(network: &NetworkView) -> NetworkView {
             mute,
             http2,
             shared_credential,
+            reserve,
             capture,
             capture_max_kb,
             websocket_secret,
@@ -474,6 +475,13 @@ fn network_view(network: &NetworkView) -> NetworkView {
             mute: texts(mute),
             http2: texts(http2),
             shared_credential: shared_credential.iter().map(|set| texts(set)).collect(),
+            reserve: reserve
+                .iter()
+                .map(|r| crate::config::view::ReserveView {
+                    rule: text(&r.rule),
+                    by: texts(&r.by),
+                })
+                .collect(),
             capture: text(capture),
             capture_max_kb: *capture_max_kb,
             websocket_secret: text(websocket_secret),

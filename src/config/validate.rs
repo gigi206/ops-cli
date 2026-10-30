@@ -914,6 +914,7 @@ fn warn_inert_under_posture(
     list("stats", table.stats.is_some());
     list("default_methods", table.default_methods.is_some());
     list("shared_credential", !table.shared_credential.is_empty());
+    list("reserve", !table.reserve.is_empty());
     if inert.is_empty() {
         return;
     }
@@ -1011,7 +1012,7 @@ pub(super) fn validate_network_table(
         },
         None => mode_from_parent(parent),
     };
-    let allow = classify_entries(
+    let mut allow = classify_entries(
         warnings,
         refusals,
         source_label,
@@ -1019,6 +1020,10 @@ pub(super) fn validate_network_table(
         table.allow,
         groups,
     );
+    // `reserve` opens each destination it names, to the programs its `by` names only: its rules
+    // join `allow`, and the reservations ride the policy for the proxy to ask after an allow.
+    let reserved = parse_reservations(warnings, refusals, source_label, table.reserve, groups);
+    allow.extend(reserved.iter().map(|r| r.rule().clone()));
     let deny = classify_entries(
         warnings,
         refusals,
@@ -1066,13 +1071,15 @@ pub(super) fn validate_network_table(
             if !shared_credential.is_empty() {
                 p = p.with_shared_credential(shared_credential);
             }
-            p
+            // Appended to the layer below's, as the rules they reserve are.
+            p.with_reserved(reserved)
         }
         _ => crate::allowlist::EgressPolicy::new(allow, deny)
             .with_default(action)
             .with_mute(mute)
             .with_http2(http2)
-            .with_shared_credential(shared_credential),
+            .with_shared_credential(shared_credential)
+            .with_reserved(reserved),
     };
     if action == DefaultAction::Ask {
         // A configured `ask_timeout` bounds the parked wait; a malformed value falls back to

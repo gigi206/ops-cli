@@ -105,6 +105,7 @@ host, unfiltered".
 | `capture_max_kb` | bytes kept per captured body, in KiB (default `8`, ceiling `1024`); inert unless `capture = "bodies"`; above the ceiling it is clamped, not refused |
 | `websocket_secret` | what a configured secret seen leaving through a WebSocket does: `"warn"` (default, record it) or `"block"` (record it and close the tunnel); an unrecognized value is refused and the strict `"block"` posture applies, with a warning naming the value, and a value of the wrong type costs the file: see below |
 | `shared_credential` | groups of hosts that are one service, so a credential the cage obtained by its own sign-in may travel among them: see below |
+| `reserve` | destinations opened only to the programs a `by` list names, `[network.reserve."<entry>"] by = [ … ]`; any other program is refused with a `403` (`by-mismatch`), even under a wider `allow`: see below |
 | `groups` | **ignored, with a warning**: an egress group lives in its own file under `net-groups/`, and a list references it as `@<name>`: see [Egress groups](../networking/groups) |
 | `default_methods` | an **app's** read-by-default verbs (see below) |
 
@@ -772,6 +773,59 @@ guard, and a message offering to lift it would be advice to allow a leak. What t
 two cases apart is [`sbx net logs`](../networking/observability): a refusal toward a host
 of the app's own service is this one, and a refusal toward anything else is the guard
 doing its work.
+
+## Destinations reserved for named programs (`reserve`)
+
+An `allow` rule opens a destination to every program in the cage. A reservation opens it to
+some of them:
+
+```toml
+[network]
+mode = "deny"
+allow = ["*.github.com"]
+
+[network.reserve."codeload.github.com"]
+by = ["git"]
+
+[network.reserve."tcp://github.com:22"]
+by = ["ssh", "git"]
+```
+
+Here `git` may download from `codeload.github.com`, and `ssh` or `git` may open the raw SSH
+tunnel to `github.com:22`. Any other program reaching either is refused with a `403` whose
+`X-Sbx-Egress-Reason` is `by-mismatch`, and [`sbx net logs`](../networking/observability#which-program-made-the-request)
+shows the refusal with the program that made it. The rest of `*.github.com` stays open to every
+program: the wider `allow` does not reopen a reserved destination.
+
+A reservation is also the rule that opens its destination to the programs it names. Its key
+joins the `allow` list, so the `tcp://` entry above needs no `allow` line of its own. A `deny`
+rule still wins over it, as over any `allow`.
+
+The key names hosts and ports, in the [rule grammar](../networking/rules): an IP, a host, a
+`*.domain`, with an optional scheme (`http://`, `tcp://`), port, or `{GET,HEAD}` verb prefix, or an
+`@group` of such entries, each rule of the group reserved for the same programs. A path or a
+`re:` pattern is refused: a reservation is decided on every plane, the raw `tcp://` splice
+included, where there is no path to read. The verb prefix narrows what the named programs may
+send through the `allow` rule; the reservation itself covers the destination whatever the verb, and
+whatever the scheme the request arrives on: `codeload.github.com` reserved over HTTPS stays
+reserved when a `tcp://codeload.github.com:443` rule splices the same host and port raw.
+
+`by` takes the entries [`[secret] by`](secret#held-for-named-programs-by) does: a bare file name,
+an absolute path inside the cage, or `sha256:` and the executable's digest. The program is named
+the same way, once per connection, and only for a destination a reservation covers. When several
+reservations cover one destination, a program has to be named by each of them.
+
+A reservation that cannot be kept stops the launch, as a malformed `deny` entry does: an entry
+that does not classify, names a path or a pattern, or whose `by` is missing, empty or malformed.
+Left out, it would leave its destination open to every program a wider `allow` admits.
+
+A project `[app.<name>.network]` with no `mode` adds its reservations to the app profile's, as it
+adds its rules. A table that replaces the layer below keeps only its own.
+
+**A guardrail, not a boundary**, for the reason `[secret] by` is one: the program is named from the
+binary its process runs, and the cage runs as your uid. What it stops is the ordinary case, a
+prompt that asks `curl` to fetch what only `git` was meant to. Removing a reservation, or adding a
+program to its `by`, is shown as a grant by [`sbx trust`](../cli/trust#reading-the-grants).
 
 ## `default_methods` (apps)
 

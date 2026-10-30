@@ -1873,6 +1873,22 @@ pub(crate) struct RawTaskExecNode {
     pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
+/// One `[network.reserve."<entry>"]` table: the programs a destination is reserved for.
+///
+/// No `deny_unknown_fields`, like every other table here: an unknown key lands in `rest` and is
+/// reported. `by` is optional at the parse layer only so that a reservation naming no program is
+/// refused with a sentence that says so rather than a parse error for the whole file.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawReserve {
+    /// The programs that may reach the destination: a bare name, an absolute in-cage path, or
+    /// `sha256:<hex>`, as `[secret] by` reads them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) by: Option<Vec<String>>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
+}
+
 /// A value kept only for its key's sake: whatever was written under an unknown key is about to be
 /// refused, so its content is never read. Accepting *any* shape is the point — a type that could
 /// fail to deserialize would report against the whole file, taking every other declaration in it
@@ -2191,6 +2207,20 @@ pub(crate) struct NetworkTable {
     /// it had before the declaration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) shared_credential: Vec<Vec<String>>,
+    /// Destinations reserved for named programs, `[network.reserve."<entry>"] by = [ … ]`. The key
+    /// is an egress entry naming hosts and ports — an IP, a host, a `*.domain`, on any scheme
+    /// (`tcp://`, `http://`), or an `@group` of such entries — and `by` the programs that may reach
+    /// it, in the grammar of `[secret] by`.
+    ///
+    /// The entry is allowed for those programs, and refused for every other one with a `403
+    /// by-mismatch`, even where a wider `allow` rule covers it: `*.github.com` stays open to every
+    /// program while `codeload.github.com` is git's alone. A guardrail, as `[secret] by` is: the
+    /// program is named from the binary the connection's holder runs, which a determined agent can
+    /// arrange.
+    ///
+    /// A sub-table, so it sits with `groups` after the scalar fields.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) reserve: BTreeMap<String, RawReserve>,
     /// Named reusable egress groups, `[network.groups]` — each `name = [ "<entry>", … ]`, where an
     /// entry is any egress rule string the `allow`/`deny` lists accept (an IP, host, `*.domain`,
     /// exact URL, `re:` regex, or `tcp://` L4 target, with an optional `{VERB,…}` method prefix).
@@ -2207,8 +2237,9 @@ pub(crate) struct NetworkTable {
     /// bare-string `network = "deny"` with a `[network.groups]` sub-table, so a config that defines
     /// groups writes its posture as `[network] mode = "…"`.
     ///
-    /// Last of the ordinary fields because it is the only sub-table: TOML emits a nested table after
-    /// the scalars of its parent, so a field declared below it would serialize into the group table.
+    /// Last of the ordinary fields, with `reserve`, because the two are the sub-tables: TOML emits a
+    /// nested table after the scalars of its parent, so a field declared below them would serialize
+    /// into the group table.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) groups: BTreeMap<String, Vec<String>>,
     /// Unknown keys in this table, kept so they can be reported. `[network]` is the largest table in
@@ -4201,6 +4232,7 @@ mod tests {
         assert_eq!(
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
+                reserve: Default::default(),
                 shared_credential: vec![],
                 mute: vec![],
                 http2: vec![],
@@ -4237,6 +4269,7 @@ mod tests {
         assert_eq!(
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
+                reserve: Default::default(),
                 shared_credential: vec![],
                 mute: vec![],
                 http2: vec![],
@@ -4270,6 +4303,7 @@ mod tests {
         assert_eq!(
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
+                reserve: Default::default(),
                 shared_credential: vec![],
                 mute: vec![],
                 http2: vec![],

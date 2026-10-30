@@ -1202,6 +1202,56 @@ pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 512;
 /// [`DEFAULT_DNS_CACHE_TTL`]: the proxy enforces it, `sbx config show --details` reports it.
 pub(crate) const DEFAULT_BODY_MAX: u64 = 64 * 1024 * 1024;
 
+/// A destination reserved for named programs (`[network.reserve]`): a request to it is refused
+/// unless the program holding the connection is one `by` names. The rule is also among the
+/// policy's `allow` rules, so the reservation opens the destination to those programs; it never
+/// opens it to anyone else, even where a wider `allow` rule covers it.
+///
+/// The rule names hosts and ports only — an IP, a host or a `*.domain`, on any layer — because a
+/// reservation is decided on every plane, a raw `tcp://` splice included, where there is no path
+/// to read. A method set is kept: it narrows what the named programs may send, through the `allow`
+/// rule, and the reservation covers the destination whatever the verb.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Reservation {
+    rule: Rule,
+    /// The programs the destination is reserved for, each a bare name, an absolute in-cage path or
+    /// `sha256:<hex>`, as a `[secret] by` entry reads.
+    by: Box<[String]>,
+}
+
+impl Reservation {
+    /// The destination `rule` names, reserved for the programs `by` names, or why `rule` cannot be
+    /// one: a path or a `re:` pattern names what a request asks for rather than where it goes.
+    pub(crate) fn new(rule: Rule, by: Vec<String>) -> Result<Self, String> {
+        match rule.kind {
+            RuleKind::Ip(..) | RuleKind::Host(..) | RuleKind::Subdomain(..) => Ok(Reservation {
+                rule,
+                by: by.into_boxed_slice(),
+            }),
+            RuleKind::Url { .. } | RuleKind::Regex { .. } => Err(format!(
+                "`{rule}` names a path or a pattern, and a reservation names a destination: an IP, \
+                 a host or a `*.domain`, with its ports, since a raw `tcp://` splice to it carries \
+                 no path to read"
+            )),
+        }
+    }
+
+    /// The reserved destination.
+    pub(crate) fn rule(&self) -> &Rule {
+        &self.rule
+    }
+
+    /// The programs it is reserved for.
+    pub(crate) fn by(&self) -> &[String] {
+        &self.by
+    }
+
+    /// Whether this reservation covers a request to `host`:`port`, whatever the plane carrying it.
+    pub(crate) fn covers(&self, host: &str, port: u16) -> bool {
+        rule_matches(&self.rule, host, port, "/")
+    }
+}
+
 /// A classified egress policy: an allow list, a deny list, and a default action for a request
 /// that matches neither. Deny always wins. Under [`DefaultAction::Deny`] an empty allow list
 /// permits nothing; under [`DefaultAction::Allow`] the allow list's only remaining effect is the
@@ -1279,6 +1329,13 @@ pub(crate) struct EgressPolicy {
     /// `NetworkPolicy::Allowlist`: an inline `Vec` grows every one of that enum's values by its
     /// three words, for a field a launch declaring no group never reads.
     shared_credential: Option<Box<[Box<[String]>]>>,
+    /// The destinations reserved for named programs (`[network.reserve]`). Each one's rule is also
+    /// an `allow` rule; this list is what the proxy asks, after an allow, whether the program holding
+    /// the connection may have it. Read via [`Self::reserved`] and [`Self::reserved_for`].
+    ///
+    /// Behind a `Box` for the reason [`Self::shared_credential`] is.
+    #[serde(default)]
+    reserved: Option<Box<[Reservation]>>,
 }
 
 impl Default for EgressPolicy {
@@ -1316,6 +1373,7 @@ impl EgressPolicy {
             max_connections: None,
             body_max: None,
             shared_credential: None,
+            reserved: None,
         }
     }
 
@@ -1385,6 +1443,9 @@ impl EgressPolicy {
             allow: _,
             deny: _,
             capture_body_kb: _,
+            // A reservation is a rule too: its destination is one of the `allow` rules a table
+            // replacing this one drops with the rest.
+            reserved: _,
             default_action,
             mute,
             http2,
@@ -1591,6 +1652,34 @@ impl EgressPolicy {
     /// The host sets that share one learned credential, as the credential store reads them.
     pub(crate) fn shared_credential(&self) -> &[Box<[String]>] {
         self.shared_credential.as_deref().unwrap_or(&[])
+    }
+
+    /// Add destinations reserved for named programs to those this policy carries (builder style).
+    /// Each one's rule is expected among the `allow` rules already: reserving is what makes it
+    /// conditional, not what opens it.
+    pub(crate) fn with_reserved(mut self, reserved: Vec<Reservation>) -> Self {
+        if reserved.is_empty() {
+            return self;
+        }
+        let mut all = self.reserved.take().map(Vec::from).unwrap_or_default();
+        all.extend(reserved);
+        self.reserved = Some(all.into_boxed_slice());
+        self
+    }
+
+    /// Every destination reserved for named programs.
+    pub(crate) fn reserved(&self) -> &[Reservation] {
+        self.reserved.as_deref().unwrap_or(&[])
+    }
+
+    /// The reservations covering a request to `host`:`port`. A program may have the destination
+    /// only when each of them names it.
+    pub(crate) fn reserved_for<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> impl Iterator<Item = &'a Reservation> + 'a {
+        self.reserved().iter().filter(move |r| r.covers(host, port))
     }
 
     /// The most of one request body the proxy holds, in bytes, from `[network] body_max_mb`.

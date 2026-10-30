@@ -571,6 +571,7 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
         mute,
         http2,
         shared_credential,
+        reserve,
         builtin,
         ..
     } = &view.network
@@ -682,6 +683,7 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
         // security guard and an app usually inherits it from a bundle rather than writing it: a
         // reader auditing what a launch granted has to be able to see it here.
         write_shared_credential(&mut o, shared_credential, "    ", pal);
+        write_reserve(&mut o, reserve, "    ", pal);
         // The egress-stats toggle is meaningful only under a filtering posture (the proxy runs
         // only then), so it rides the network section. Shown both ways — an audit knob is worth
         // surfacing — naming the reader command when on.
@@ -721,6 +723,27 @@ fn write_shared_credential(
     );
     for group in groups {
         let _ = writeln!(o, "{indent}  {n}{}{r}", group.join(", "));
+    }
+}
+
+/// The destinations reserved for named programs, indented by `indent`, or nothing when there are
+/// none. Each is among the `allow` rules listed above it, where it reads as open to every program;
+/// this says which programs it is open to.
+pub(super) fn write_reserve(
+    o: &mut String,
+    reserve: &[config::view::ReserveView],
+    indent: &str,
+    pal: &style::Palette,
+) {
+    use std::fmt::Write as _;
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    for reserved in reserve {
+        let _ = writeln!(
+            o,
+            "{indent}{dim}reserve{r} {n}{}{r} {dim}for{r} {n}{}{r}",
+            reserved.rule,
+            reserved.by.join(", ")
+        );
     }
 }
 
@@ -1439,6 +1462,19 @@ mod tests {
     use super::super::format::assert_snapshot;
     use super::*;
 
+    /// A reservation is stated with the programs it is open to, since its rule is listed among
+    /// `allow` too, where it reads as open to every program.
+    #[test]
+    fn a_reservation_names_the_programs_it_is_open_to() {
+        let mut o = String::new();
+        let reserve = [config::view::ReserveView {
+            rule: "tcp://github.com:22".into(),
+            by: vec!["ssh".into(), "git".into()],
+        }];
+        write_reserve(&mut o, &reserve, "    ", &style::Palette::plain());
+        assert_eq!(o, "    reserve tcp://github.com:22 for ssh, git\n");
+    }
+
     /// One declared app at an inert default, named `name` and running a command of the same name —
     /// the counterpart of `blank_config_view` for the nested app view, so an app a test builds
     /// carries only the fields that test is about.
@@ -1597,6 +1633,7 @@ mod tests {
                 deny: vec!["evil.com".into()],
                 mute: vec![],
                 shared_credential: vec![],
+                reserve: vec![],
                 http2: vec![],
                 capture: "off".to_string(),
                 capture_max_kb: None,

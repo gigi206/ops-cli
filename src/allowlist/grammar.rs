@@ -16,6 +16,8 @@ pub(crate) enum Slot {
     Deny,
     /// A `mute` list: a log filter that changes no verdict.
     Mute,
+    /// A `[network.reserve]` key: a destination opened only to the programs its `by` names.
+    Reserve,
     /// Not a rule at all — the concrete host or URL `sbx test net` tests a policy against.
     Target,
 }
@@ -28,6 +30,7 @@ impl Slot {
             Slot::Allow => "allow",
             Slot::Deny => "deny",
             Slot::Mute => "mute",
+            Slot::Reserve => "reserve",
             Slot::Target => "target",
         }
     }
@@ -40,6 +43,7 @@ impl Slot {
         match self {
             Slot::Deny => "denied",
             Slot::Mute => "muted",
+            Slot::Reserve => "reserved",
             Slot::Allow | Slot::Target => "allowed",
         }
     }
@@ -475,6 +479,11 @@ fn reject_catch_all(host: &str, slot: Slot) -> Result<(), String> {
              log empty of the thing it exists to show. Name the noisy hosts, or — deliberately — \
              write the catch-all regex `re:.*` (a mute changes no verdict, only what `sbx net logs` \
              shows by default; `--all` brings muted lines back either way)"
+        }
+        Slot::Reserve => {
+            "`*` matches every host: as a reserve entry it would hand the whole network to the \
+             programs its `by` names, which is a posture rather than a reservation. Name the \
+             destinations those programs need"
         }
         Slot::Target => {
             "`*` is not a host: a target names the one concrete host or URL to test the policy \

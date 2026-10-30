@@ -597,6 +597,21 @@ path (`host/@user`) or a `re:` pattern is a literal part of the rule. An **undef
 group reference is dropped from an `allow` list with a warning; in a `deny` list, where
 leaving it out would lose a carve-out, it stops the launch. See [Egress groups](groups).
 
+## Reserving a destination for named programs
+
+An `allow` entry opens a destination to every program in the cage. The same entry written as
+a [`[network.reserve]`](../configuration/network#destinations-reserved-for-named-programs-reserve) key
+opens it only to the programs its `by` list names, and refuses it to any other, even where a
+wider `allow` entry covers it:
+
+```toml
+[network.reserve."codeload.github.com"]
+by = ["git"]
+```
+
+A reserved entry names hosts and ports only (no path, no `re:`), since it is decided on every
+layer, the raw splice included.
+
 ---
 
 ## Worked examples

@@ -13485,3 +13485,82 @@ fn a_splice_whose_client_left_before_its_200_is_still_logged_as_allowed() {
         "the splice was decided and dialed, so its allow is logged"
     );
 }
+
+/// A proxy allowing `allow`, with `reserved` reserved for `gh`, whose names resolve to loopback.
+fn reserving_ctx(allow: &[&str], reserved: &[&str]) -> (Arc<ProxyCtx>, CertificateDer<'static>) {
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let ca_der = ca.ca_cert_der();
+    let reservations = reserved
+        .iter()
+        .map(|e| {
+            crate::allowlist::Reservation::new(classify(e).unwrap(), vec!["gh".to_string()])
+                .unwrap()
+        })
+        .collect();
+    let ctx = ProxyCtx::new(ca, policy(allow).with_reserved(reservations))
+        .unwrap()
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
+    (Arc::new(ctx), ca_der)
+}
+
+/// A reservation covers only its destination, and refuses a connection whose program cannot be
+/// named, as a test's is (no supervisor answers).
+#[test]
+fn a_reservation_refuses_only_the_destination_it_covers() {
+    use crate::sandbox::control::Proto;
+    let (ctx, _) = reserving_ctx(&["*.host.test:*"], &["locked.host.test:*"]);
+    let refused = |host: &str| {
+        refused_by_reservation(&ctx, &Who::nobody(), Proto::Https, host, 443, None, None)
+    };
+    assert!(refused("locked.host.test"));
+    assert!(
+        refused("LOCKED.host.test."),
+        "matched in the canonical spelling"
+    );
+    assert!(!refused("open.host.test"));
+}
+
+/// A reserved destination is refused inside the tunnel with `by-mismatch`, though a wider `allow`
+/// rule covers it, and before any upstream is asked for: the port names nothing.
+#[test]
+fn a_reserved_destination_is_refused_under_a_wider_allow() {
+    let (ctx, ca) = reserving_ctx(&["*.host.test:*"], &["locked.host.test:*"]);
+    let request = b"GET / HTTP/1.1\r\nHost: locked.host.test\r\n\r\n";
+    let resp = through_proxy(ctx, ca, "locked.host.test", "locked.host.test", 9, request).unwrap();
+    assert!(
+        resp.contains("403") && resp.contains("by-mismatch"),
+        "refused under its own reason: {resp:?}"
+    );
+    assert!(resp.contains("reserved for other programs"), "{resp:?}");
+}
+
+/// The cleartext plane refuses a reserved destination the same way.
+#[test]
+fn a_reserved_destination_is_refused_in_the_clear() {
+    let (ctx, _) = reserving_ctx(&["http://*.host.test"], &["http://locked.host.test"]);
+    let resp = through_cleartext(
+        ctx,
+        b"GET http://locked.host.test/x HTTP/1.1\r\nHost: locked.host.test\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    assert!(
+        resp.contains(" 403 ") && resp.contains("by-mismatch"),
+        "{resp:?}"
+    );
+}
+
+/// A raw splice to a reserved destination is refused before the tunnel is accepted, and before a
+/// splice slot is taken.
+#[test]
+fn a_reserved_splice_is_refused_before_the_tunnel() {
+    let (ctx, _) = reserving_ctx(
+        &["tcp://locked.host.test:22"],
+        &["tcp://locked.host.test:22"],
+    );
+    let reply = splice_connect_reply(Arc::clone(&ctx), "locked.host.test", 22);
+    assert!(
+        reply.contains("403") && reply.contains("by-mismatch"),
+        "{reply:?}"
+    );
+    assert_eq!(ctx.splices.load(std::sync::atomic::Ordering::SeqCst), 0);
+}

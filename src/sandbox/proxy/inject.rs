@@ -24,6 +24,13 @@ fn program_is(entry: &str, named: &super::link::Named) -> bool {
         .is_some_and(|name| name == entry)
 }
 
+/// Whether any entry of a `by` list names the program `named` ([`program_is`]). Shared by a
+/// credential held for named programs and by a destination reserved for them
+/// (`[network.reserve]`), so the two read one list the same way.
+pub(super) fn named_by(by: &[String], named: &super::link::Named) -> bool {
+    by.iter().any(|entry| program_is(entry, named))
+}
+
 /// A resolved credential the proxy injects into requests matching its host/path rule. Injection
 /// happens only after a request is ALLOWED, and only when `rule` matches the verified CONNECT host
 /// and the decrypted path, so the credential reaches exactly one known destination.
@@ -150,7 +157,7 @@ impl HeaderInjection {
         if self.by.is_empty() {
             return true;
         }
-        caller().is_some_and(|named| self.by.iter().any(|entry| program_is(entry, named)))
+        caller().is_some_and(|named| named_by(&self.by, named))
     }
 
     /// The formed value of a fixed injection, for the tests that assert what reaches the wire.

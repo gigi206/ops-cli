@@ -101,7 +101,7 @@
 //! | `403` | `denied-default`         | no allow rule matched the host / port / path |
 //! | `403` | `denied-by-rule`         | a deny rule matched (the rule text is not disclosed) |
 //! | `403` | `denied-method`          | an allow rule matched the host but not the request's HTTP method (a `{VERB}`-scoped rule) |
-//! | `403` | `by-mismatch`            | a `[secret]` held for named programs (`by`) matched the destination, and the program holding the connection is none of them, under `by_other = "deny"` (see [`withheld_by_deny`]) |
+//! | `403` | `by-mismatch`            | the program holding the connection is not one the destination is held for: a `[secret]` held for named programs (`by`) matched it under `by_other = "deny"` (see [`withheld_by_deny`]), or a `[network.reserve]` entry covers it (see [`refused_by_reservation`]) |
 //! | `403` | `ws-injection-refused`   | a WebSocket upgrade named a host a `[secret]` is injected into. The credential rides the handshake and the frames past the `101` are opaque, so nothing can redact a reflection of it — the upgrade is refused rather than opened |
 //! | `403` | `asked-denied`           | the `ask` posture parked the request and it was not allowed — deliberately conflating an explicit `sbx net pending deny`, the ask timeout, and the pending-queue cap (all three mean "no egress" in Mode B) |
 //! | `403` | `http2-ask-unsupported`  | an `ask`-undecided host designated `[network] http2`. Every stream of one HTTP/2 connection is multiplexed onto a single runtime, so parking one to wait for `sbx net pending` would stall its siblings; the stream fails closed under its own reason instead of being parked (see [`AskPosture`]) |
@@ -504,7 +504,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         // method) is refused fail-closed — the method + raw target are the "what is the agent trying to
         // do" signal, so log them (host blank, target as the path).
         if target.starts_with("http://") {
-            return handle_cleartext(client, &parsed, &head, &method, &target, ctx);
+            return handle_cleartext(client, &parsed, &head, &method, &target, ctx, &who);
         }
         if target.starts_with("https://") {
             return handle_https_forward(client, &parsed, &head, &method, &target, ctx, &who);
@@ -559,7 +559,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     {
         let policy = effective_policy(ctx);
         if let L4Decision::Splice(_) = policy.l4_decision(&connect_host, port) {
-            return splice_l4(client, &connect_host, port, ctx);
+            return splice_l4(client, &connect_host, port, ctx, &who);
         }
     }
 
@@ -1550,6 +1550,51 @@ fn withheld_by_deny(
             && allowlist::rule_matches(&inj.rule, host, port, target)
             && !inj.injects_for(|| who.named(ctx))
     })
+}
+
+/// What a request refused by a reservation tells the cage, naming the configuration that made it so.
+const RESERVED_MESSAGE: &str =
+    "this destination is reserved for other programs (`[network.reserve]`)";
+
+/// Whether a `[network.reserve]` entry covers this destination while the program holding the
+/// connection is not one each covering entry names. The refusal is recorded here, as a
+/// [`BY_MISMATCH`] block with the program it named, and answered by the plane in its own framing.
+///
+/// Asked after the allow, on every plane: the reservation's rule is among the `allow` rules, so
+/// reaching here says nothing about who may have it. Asks who holds the connection only when a
+/// reservation covers the destination. The policy is the launch's: a `--session` overlay adds rules
+/// and never reservations.
+fn refused_by_reservation(
+    ctx: &ProxyCtx,
+    who: &Who,
+    proto: super::control::Proto,
+    host: &str,
+    port: u16,
+    method: Option<&str>,
+    target: Option<&str>,
+) -> bool {
+    let mut covering = ctx.policy.reserved_for(host, port).peekable();
+    if covering.peek().is_none() {
+        return false;
+    }
+    let admitted = match who.named(ctx) {
+        Some(named) => covering.all(|r| inject::named_by(r.by(), named)),
+        None => false,
+    };
+    if admitted {
+        return false;
+    }
+    let seq = ctx.outcome(
+        proto,
+        host,
+        port,
+        method,
+        target,
+        StatKind::Blocked,
+        BY_MISMATCH,
+    );
+    ctx.set_caller(seq, who);
+    true
 }
 
 /// The reason token a request refused for want of a signature carries: the `x-sbx-egress-reason`

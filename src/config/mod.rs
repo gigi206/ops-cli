@@ -86,7 +86,8 @@ use tools::{
 use load::{canonicalize_binds, global_path, read_global};
 // The secret source/validation machinery the resolution engine folds into the resolved set.
 use secrets::{
-    SecretDefaults, apply_secret_section, count_host_secrets, upsert_secret, warn_resolver_bindings,
+    SecretDefaults, apply_secret_section, count_host_secrets, upsert_secret, validate_by,
+    warn_resolver_bindings,
 };
 // The two leaf checks the task engine re-runs at invocation time: a caller's value against its
 // declared bound, and the `{param}` placeholders in one argv element. They live with the validator
@@ -4276,6 +4277,71 @@ fn parse_shared_credential(
     kept
 }
 
+/// Parse the `[network.reserve]` table into the destinations it reserves for named programs. Each
+/// key classifies as an egress entry (`@group` included, one reservation per rule it expands to)
+/// and each `by` as a `[secret] by` does.
+///
+/// Every reservation that cannot be kept is refused, and a launch stops on it, as on a malformed
+/// `deny` entry: a reservation left out would leave its destination open to every program a wider
+/// `allow` rule admits, which is the direction a typo must not fail in. That covers a key that does
+/// not classify or that names a path or a pattern ([`crate::allowlist::Reservation::new`]), and a
+/// `by` that names no program or a malformed one. An unknown key in the table is only reported,
+/// as everywhere else.
+fn parse_reservations(
+    warnings: &mut Vec<String>,
+    refusals: &mut Vec<String>,
+    source_label: &str,
+    raw: BTreeMap<String, schema::RawReserve>,
+    groups: &NetGroups,
+) -> Vec<crate::allowlist::Reservation> {
+    let mut reserved = Vec::new();
+    for (entry, table) in raw {
+        let shown = crate::diag::visible(&entry);
+        for key in table.rest.keys() {
+            warnings.push(format!(
+                "{source_label}: ignoring unknown key `{}` under `[network.reserve.\"{shown}\"]` — \
+                 a reservation reads `by` only",
+                crate::diag::visible(key)
+            ));
+        }
+        let by = match table.by.as_deref() {
+            None | Some([]) => Err("its `by` names no program".to_string()),
+            Some(by) => validate_by(by),
+        };
+        let mut reasons = Vec::new();
+        match by {
+            Err(reason) => reasons.push(reason),
+            Ok(by) => {
+                // Classified on its own so that each rule an `@group` expands to carries this `by`.
+                // A key that does not classify is refused there, under the `reserve` slot.
+                let rules = classify_entries(
+                    warnings,
+                    refusals,
+                    source_label,
+                    Slot::Reserve,
+                    vec![entry.clone()],
+                    groups,
+                );
+                for rule in rules {
+                    match crate::allowlist::Reservation::new(rule, by.clone()) {
+                        Ok(reservation) => reserved.push(reservation),
+                        Err(reason) => reasons.push(reason),
+                    }
+                }
+            }
+        }
+        for reason in reasons {
+            let said = format!(
+                "{source_label}: ignoring reserve entry `{shown}` — {reason} (a launch stops rather \
+                 than leave it open to every program)"
+            );
+            refusals.push(said.clone());
+            warnings.push(said);
+        }
+    }
+    reserved
+}
+
 /// The hosts of a `shared_credential` group as written, for a warning that has to name which group
 /// it is about. Quoted individually so an empty entry is visible rather than swallowed by the
 /// separator.
@@ -4371,8 +4437,9 @@ pub(crate) fn group_refs<'a>(entries: impl Iterator<Item = &'a String>) -> Vec<S
 ///
 /// What leaving an entry out costs depends on the list. An `allow` entry left out leaves its host
 /// unreachable, a `mute` entry leaves a denial logged: the note is enough. A `deny` entry left out
-/// leaves reachable the host its author meant to block, the one case where a typo fails open, so
-/// the note goes to `refusals` too, and a launch stops on it.
+/// leaves reachable the host its author meant to block, and a `reserve` entry left out leaves its
+/// destination open to every program a wider `allow` admits — the two cases where a typo fails
+/// open, so the note goes to `refusals` too, and a launch stops on it.
 fn classify_entries(
     warnings: &mut Vec<String>,
     refusals: &mut Vec<String>,
@@ -4382,10 +4449,11 @@ fn classify_entries(
     groups: &NetGroups,
 ) -> Vec<crate::allowlist::Rule> {
     let list = slot.label();
-    let restricts = slot == Slot::Deny;
-    let cost = match restricts {
-        true => "a launch stops rather than deny nothing for it".to_string(),
-        false => format!(
+    let restricts = matches!(slot, Slot::Deny | Slot::Reserve);
+    let cost = match slot {
+        Slot::Deny => "a launch stops rather than deny nothing for it".to_string(),
+        Slot::Reserve => "a launch stops rather than leave it open to every program".to_string(),
+        _ => format!(
             "the entry is ignored, so nothing is {} for it",
             slot.consequence()
         ),

@@ -27,6 +27,7 @@ pub(super) fn handle_cleartext(
     method: &str,
     target: &str,
     ctx: &ProxyCtx,
+    who: &Who,
 ) -> io::Result<()> {
     // One credential state for the whole exchange: taken once here so the value injected and
     // the needle scanned for can never come from two different resolutions, even if a refresh
@@ -75,6 +76,21 @@ pub(super) fn handle_cleartext(
     //    its own, below.
     let policy = effective_policy(ctx);
     match policy.explain_clear(&host, port, &path, method) {
+        // A destination reserved for named programs (`[network.reserve]`) is refused to any other,
+        // as on the encrypted planes.
+        Decision::AllowedBy(_)
+            if refused_by_reservation(
+                ctx,
+                who,
+                crate::sandbox::control::Proto::Http,
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+            ) =>
+        {
+            return write_refusal(&mut client, "403 Forbidden", BY_MISMATCH, RESERVED_MESSAGE);
+        }
         Decision::AllowedBy(_) => {}
         Decision::DeniedBy(_) => {
             ctx.outcome(
