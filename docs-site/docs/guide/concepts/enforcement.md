@@ -136,8 +136,9 @@ Two filters are needed because one `seccompiler` program carries one match actio
 Syscalls that return `EPERM`: the historically abused set plus the mount and
 namespace family:
 
-- **ptrace family**, `ptrace`, `process_vm_readv`, `process_vm_writev` (no memory
-  inspection or patching of sibling processes).
+- **ptrace family**, `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd`
+  (no memory inspection or patching of sibling processes, and no taking a descriptor
+  another process opened).
 - **mount / namespace family**: `unshare`, `setns`, `mount`, `umount2`,
   `pivot_root`, `chroot`.
 - **kernel modules**: `init_module`, `finit_module`, `delete_module`.

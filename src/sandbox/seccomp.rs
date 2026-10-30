@@ -158,6 +158,9 @@ fn eperm_unconditional_named() -> Vec<(&'static str, i64)> {
         ("ptrace", libc::SYS_ptrace),
         ("process_vm_readv", libc::SYS_process_vm_readv),
         ("process_vm_writev", libc::SYS_process_vm_writev),
+        // taking a descriptor out of another process: a connection opened by one program, used by
+        // another, would wear the identity of the first
+        ("pidfd_getfd", libc::SYS_pidfd_getfd),
         // kernel module loading
         ("init_module", libc::SYS_init_module),
         ("finit_module", libc::SYS_finit_module),
@@ -342,8 +345,9 @@ pub(crate) fn refused_families(policy: &SeccompPolicy) -> Vec<&'static str> {
 /// confident wrong sentence is the one failure this document is written against.
 fn family_of(name: &str) -> Option<&'static str> {
     Some(match name {
-        "ptrace" | "process_vm_readv" | "process_vm_writev" => {
-            "reading or patching another process (a debugger, `strace`, a leak sanitizer)"
+        "ptrace" | "process_vm_readv" | "process_vm_writev" | "pidfd_getfd" => {
+            "reading or patching another process, or taking its open files (a debugger, `strace`, \
+             a leak sanitizer)"
         }
         "init_module" | "finit_module" | "delete_module" | "kexec_load" | "kexec_file_load"
         | "reboot" => "loading kernel modules, and rebooting",
@@ -898,6 +902,7 @@ mod tests {
             libc::SYS_ptrace,
             libc::SYS_process_vm_readv,
             libc::SYS_process_vm_writev,
+            libc::SYS_pidfd_getfd,
         ] {
             lifted.allow(Allow::Whole(nr));
         }
@@ -988,6 +993,9 @@ mod tests {
         let m = eperm_rules(&SeccompPolicy::default());
         for nr in [
             libc::SYS_ptrace,
+            // the identity of an egress connection is the program holding it, which a borrowed
+            // descriptor would forge
+            libc::SYS_pidfd_getfd,
             libc::SYS_bpf,
             libc::SYS_io_uring_setup,
             libc::SYS_userfaultfd,
