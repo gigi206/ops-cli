@@ -36,7 +36,7 @@ pub(crate) use apps::{
     AppContract, AppHomeScope, ResolvedApp, ends_with_shell_payload, is_valid_app_name,
 };
 pub(crate) use gate::{is_trust_drop, untrusted_reason};
-pub(crate) use grants::{Grant, Risk, grants};
+pub(crate) use grants::{Grant, Risk, grants, mise_grants, sort_grants};
 pub(crate) use load::{
     Source, apps_using_bundle, bundles, bundles_dir, control_plane_pins, control_plane_root_of,
     export_profile, is_profile_file, is_valid_bundle_name, load, load_as, load_scoped, net_groups,

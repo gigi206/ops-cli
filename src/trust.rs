@@ -142,7 +142,7 @@ pub(crate) fn mise_inputs_for(config_path: &Path) -> io::Result<MiseInputs> {
 
 /// What a sops file's part of the hash is tagged with, before the file as the config spells it. No
 /// entry of [`MISE_CONFIG_NAMES`] begins so, which keeps every tag of one hash distinct.
-const SOPS_TAG_PREFIX: &str = "sops:";
+pub(crate) const SOPS_TAG_PREFIX: &str = "sops:";
 
 /// The most the sops files a config names in the project may come to together, a file counted
 /// once for each way the config spells it, since each spelling is read on its own.

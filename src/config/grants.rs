@@ -40,8 +40,9 @@ pub(crate) struct Grant {
     /// What is granted, as the policy displays it: a rule, a path, a port, a key.
     pub(crate) what: String,
     pub(crate) risk: Risk,
-    /// Why it carries that risk, in a few words. Empty when the grant is plain.
-    pub(crate) why: &'static str,
+    /// Why it carries that risk, in a few words, each trait it shows comma-separated. Empty when the
+    /// grant is plain.
+    pub(crate) why: String,
 }
 
 /// Ports a database, cache or search engine listens on by default. A heuristic: a rule naming one
@@ -84,25 +85,18 @@ pub(crate) fn grants(before: &Resolved, after: &Resolved) -> Vec<Grant> {
                 .filter(|g| !baseline.contains(&(g.field, g.what.clone()))),
         );
     }
-    out.sort_by(|a, b| (a.risk, &a.app, a.field, &a.what).cmp(&(b.risk, &b.app, b.field, &b.what)));
-    out.dedup();
+    sort_grants(&mut out);
     out
 }
 
 /// A [`Grant`] built from its parts, the app borrowed as [`delta`] holds it.
-fn grant(
-    app: Option<&String>,
-    field: &'static str,
-    what: String,
-    risk: Risk,
-    why: &'static str,
-) -> Grant {
+fn grant(app: Option<&String>, field: &'static str, what: String, risk: Risk, why: &str) -> Grant {
     Grant {
         app: app.cloned(),
         field,
         what,
         risk,
-        why,
+        why: why.to_string(),
     }
 }
 
@@ -182,7 +176,9 @@ fn delta(before: &Resolved, after: &Resolved, app: Option<&String>, out: &mut Ve
         warnings: _,
         refusals: _,
     } = after;
-    let mut push = |field, what: String, risk, why| out.push(grant(app, field, what, risk, why));
+    let mut push = |field: &'static str, what: String, risk: Risk, why: &str| {
+        out.push(grant(app, field, what, risk, why))
+    };
 
     for bind in binds {
         let was = before.binds.iter().find(|b| b.path == bind.path);
@@ -490,13 +486,79 @@ fn delta(before: &Resolved, after: &Resolved, app: Option<&String>, out: &mut Ve
     }
 }
 
+/// The tools the project's mise files declare in `after` that `before` did not: a tool new to the
+/// files, or one whose requested version changed, each something the cage will install. `None` is
+/// the first approval, over a project whose mise files no launch honors yet.
+///
+/// Only the `[tools]` of each file are read, through the parser provisioning uses
+/// ([`parse_nix_tools`](crate::sandbox::nixhub::parse_nix_tools)); the sops files the inputs also
+/// carry are skipped. A file that does not parse is a grant of its own, since what it declares is
+/// unknown rather than nothing.
+pub(crate) fn mise_grants(
+    before: Option<&crate::trust::TrustInputs>,
+    after: &crate::trust::TrustInputs,
+) -> Vec<Grant> {
+    let tools = |inputs: &crate::trust::TrustInputs| {
+        let mise: Vec<(String, Vec<u8>)> = inputs
+            .iter()
+            .filter(|(name, _)| !name.starts_with(crate::trust::SOPS_TAG_PREFIX))
+            .cloned()
+            .collect();
+        let declared = crate::sandbox::nixhub::parse_nix_tools(&mise);
+        let named = declared
+            .nix
+            .iter()
+            .map(|t| format!("nix:{}@{}", t.pkg, t.version))
+            .chain(
+                declared
+                    .non_nix
+                    .iter()
+                    .map(|t| format!("{}@{}", t.token, t.version)),
+            );
+        (named.collect::<BTreeSet<String>>(), declared.unparsed)
+    };
+    let (had, _) = before.map(tools).unwrap_or_default();
+    let (now, unparsed) = tools(after);
+    let mut out: Vec<Grant> = now
+        .difference(&had)
+        .map(|tool| {
+            grant(
+                None,
+                "mise",
+                tool.clone(),
+                Risk::Info,
+                "installed for the cage",
+            )
+        })
+        .collect();
+    out.extend(unparsed.into_iter().map(|file| {
+        grant(
+            None,
+            "mise",
+            file,
+            Risk::Notable,
+            "what this file declares is unknown",
+        )
+    }));
+    out
+}
+
+/// Order grants most serious first, then baseline before apps, then by field and what, and drop
+/// a grant listed twice. The one order every list of grants is shown in.
+pub(crate) fn sort_grants(grants: &mut Vec<Grant>) {
+    grants.sort_by(|a, b| {
+        (a.risk, &a.app, a.field, &a.what).cmp(&(b.risk, &b.app, b.field, &b.what))
+    });
+    grants.dedup();
+}
+
 /// The grants of one network posture over another. Only a widening is a grant: moving to
 /// `isolated`, or off `shared`, takes reach away.
 fn network_grants(
     before: &NetworkPolicy,
     after: &NetworkPolicy,
     secrets: &[super::HeaderSecret],
-    push: &mut impl FnMut(&'static str, String, Risk, &'static str),
+    push: &mut impl FnMut(&'static str, String, Risk, &str),
 ) {
     match (before, after) {
         (NetworkPolicy::Shared, _) | (_, NetworkPolicy::Isolated) => {}
@@ -521,7 +583,7 @@ fn policy_grants(
     before: Option<&EgressPolicy>,
     after: &EgressPolicy,
     secrets: &[super::HeaderSecret],
-    push: &mut impl FnMut(&'static str, String, Risk, &'static str),
+    push: &mut impl FnMut(&'static str, String, Risk, &str),
 ) {
     let was_open = before.is_some_and(|b| b.default_action() == DefaultAction::Allow);
     if after.default_action() == DefaultAction::Allow && !was_open {
@@ -537,7 +599,7 @@ fn policy_grants(
             continue;
         }
         let (risk, why) = rule_risk(rule, secrets);
-        push("network", format!("allow {rule}"), risk, why);
+        push("network", format!("allow {rule}"), risk, &why.join(", "));
     }
     if let Some(before) = before {
         for rule in before.deny_rules() {
@@ -553,41 +615,58 @@ fn policy_grants(
     }
 }
 
-/// The risk of one newly allowed egress rule: the first of its traits, most serious first.
-fn rule_risk(rule: &Rule, secrets: &[super::HeaderSecret]) -> (Risk, &'static str) {
-    if rule.opens_every_host() {
-        return (Risk::High, "matches every host");
+/// The risk of one newly allowed egress rule and every trait that earns it, most serious first: a
+/// rule can be a raw splice to a private address on a database port, and a reviewer reading only
+/// the first would not know the other two.
+fn rule_risk(rule: &Rule, secrets: &[super::HeaderSecret]) -> (Risk, Vec<&'static str>) {
+    let mut traits: Vec<(Risk, &'static str)> = Vec::new();
+    let every_host = rule.opens_every_host();
+    if every_host {
+        traits.push((Risk::High, "matches every host"));
     }
     if secrets
         .iter()
         .filter_map(|s| s.to.concrete_host())
         .any(|host| reaches(rule, host))
     {
-        return (Risk::High, "widens what an injected credential can do");
+        traits.push((Risk::High, "widens what an injected credential can do"));
     }
     match rule.layer {
-        Layer::L4 => return (Risk::Notable, "raw TCP, not inspected"),
-        Layer::L7Clear => return (Risk::Notable, "cleartext HTTP"),
+        Layer::L4 => traits.push((Risk::Notable, "raw TCP, not inspected")),
+        Layer::L7Clear => traits.push((Risk::Notable, "cleartext HTTP")),
         Layer::L7 => {}
     }
     let ports = match &rule.kind {
-        RuleKind::Regex { .. } => return (Risk::Notable, "a regex over the whole URL"),
-        RuleKind::Subdomain(_, _) => return (Risk::Notable, "every subdomain"),
+        RuleKind::Regex { .. } => {
+            if !every_host {
+                traits.push((Risk::Notable, "a regex over the whole URL"));
+            }
+            None
+        }
+        RuleKind::Subdomain(_, ports) => {
+            traits.push((Risk::Notable, "every subdomain"));
+            Some(ports)
+        }
         RuleKind::Ip(ip, ports) => {
             if matches!(
                 ip_refusal(*ip, "", None),
                 Some(AddrRefusal::PrivateWithoutExactHost)
             ) {
-                return (Risk::Notable, "a private address");
+                traits.push((Risk::Notable, "a private address"));
             }
-            ports
+            Some(ports)
         }
-        RuleKind::Host(_, ports) | RuleKind::Url { ports, .. } => ports,
+        RuleKind::Host(_, ports) | RuleKind::Url { ports, .. } => Some(ports),
     };
-    if reaches_service_port(ports) {
-        return (Risk::Notable, "a port an internal service listens on");
+    if ports.is_some_and(reaches_service_port) {
+        traits.push((Risk::Notable, "a port an internal service listens on"));
     }
-    (Risk::Info, "")
+    let risk = traits
+        .iter()
+        .map(|(risk, _)| *risk)
+        .min()
+        .unwrap_or(Risk::Info);
+    (risk, traits.into_iter().map(|(_, why)| why).collect())
 }
 
 /// Whether `rule` reaches `host` by name: names it, or is a `*.domain` it falls under.
@@ -614,7 +693,7 @@ fn reaches_service_port(ports: &Ports) -> bool {
 fn proc_grants(
     before: &ProcPolicy,
     after: &ProcPolicy,
-    push: &mut impl FnMut(&'static str, String, Risk, &'static str),
+    push: &mut impl FnMut(&'static str, String, Risk, &str),
 ) {
     if proc_rank(after.mode) < proc_rank(before.mode) {
         push(
@@ -733,14 +812,17 @@ mod tests {
         let risk = |what: &str| {
             got.iter()
                 .find(|g| g.what.contains(what))
-                .map(|g| (g.risk, g.why))
+                .map(|g| (g.risk, g.why.as_str()))
                 .unwrap_or_else(|| panic!("no grant for {what}: {got:?}"))
         };
         assert_eq!(risk("re:.*"), (Risk::High, "matches every host"));
         assert_eq!(risk("amazonaws"), (Risk::Notable, "every subdomain"));
         assert_eq!(
             risk("db.internal"),
-            (Risk::Notable, "raw TCP, not inspected")
+            (
+                Risk::Notable,
+                "raw TCP, not inspected, a port an internal service listens on"
+            )
         );
         assert_eq!(risk("10.0.0.5"), (Risk::Notable, "a private address"));
         assert_eq!(
@@ -847,6 +929,64 @@ mod tests {
             vec![
                 (Some("demo"), "network", "shared"),
                 (None, "binds", "/srv/a (ro)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rule_lists_every_trait_it_shows() {
+        let got = over(
+            "[network]\nmode = \"deny\"\n",
+            "[network]\nmode = \"deny\"\nallow = [\"tcp://10.0.0.5:5432\"]\n",
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].risk, Risk::Notable);
+        assert_eq!(
+            got[0].why,
+            "raw TCP, not inspected, a private address, a port an internal service listens on"
+        );
+    }
+
+    fn inputs(files: &[(&str, &str)]) -> crate::trust::TrustInputs {
+        files
+            .iter()
+            .map(|(name, text)| (name.to_string(), text.as_bytes().to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn a_mise_tool_added_or_moved_to_another_version_is_a_grant() {
+        let was = inputs(&[("mise.toml", "[tools]\nnode = \"20\"\npython = \"3.12\"\n")]);
+        let now = inputs(&[
+            (
+                "mise.toml",
+                "[tools]\nnode = \"22\"\npython = \"3.12\"\n\"nix:jq\" = \"1.7\"\n",
+            ),
+            ("sops:secrets.enc.yaml", "[tools]\nignored = \"1\"\n"),
+            (".tool-versions", "ruby 3.3\n"),
+        ]);
+        assert_eq!(
+            seen(&mise_grants(Some(&was), &now)),
+            vec![
+                ("mise", "nix:jq@1.7", Risk::Info),
+                ("mise", "node@22", Risk::Info),
+                ("mise", "ruby@3.3", Risk::Info),
+            ]
+        );
+        assert_eq!(mise_grants(Some(&was), &was), vec![]);
+    }
+
+    #[test]
+    fn a_first_approval_grants_every_mise_tool_and_an_unreadable_file_is_flagged() {
+        let now = inputs(&[
+            ("mise.toml", "[tools]\nnode = \"22\"\n"),
+            (".mise.toml", "not toml ["),
+        ]);
+        assert_eq!(
+            seen(&mise_grants(None, &now)),
+            vec![
+                ("mise", "node@22", Risk::Info),
+                ("mise", ".mise.toml", Risk::Notable),
             ]
         );
     }

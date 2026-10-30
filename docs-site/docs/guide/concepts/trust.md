@@ -133,9 +133,9 @@ review leads with the grants themselves. Both versions are resolved by the engin
 uses, against your current global config, and compared on every field the gate holds
 back: the approved contents against the new ones, or, on a first approval, the new
 contents untrusted against the same contents trusted, which is exactly what the approval
-adds. Each grant is listed with a mark for how much attention it deserves; [`sbx
-trust`](../cli/trust#reading-the-grants) shows the form. Like the copy, the list informs
-the decision and never makes it.
+adds. The tools the mise files declare are compared the same way. Each grant is listed
+with a mark for how much attention it deserves; [`sbx trust`](../cli/trust#reading-the-grants)
+shows the form. Like the copy, the list informs the decision and never makes it.
 
 This closes the loop the project tree opens. The tree is writable from the cage. A
 `.sbx.toml` and the mise files present at launch are mounted read-only inside it, but a

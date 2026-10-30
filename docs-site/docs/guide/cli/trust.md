@@ -17,7 +17,7 @@ it is re-approved: see [the trust gate](../concepts/trust#free-fields-vs-securit
 | Option | Meaning |
 |---|---|
 | `[path]` | the config to act on (default `./.sbx.toml`) |
-| `--show` | report the trust state without changing it (accepted before or after `[path]`) |
+| `--show` | report the trust state and what approving would grant, without changing anything (accepted before or after `[path]`) |
 | `--yes` | record without asking; required when there is no terminal to confirm at |
 
 See also: [The trust gate](../concepts/trust) · [`sbx untrust`](untrust) · [Configuration overview](../configuration/).
@@ -51,6 +51,20 @@ re-approval prompted by a change you did not make is exactly the moment to read 
 diff: a launch names each bind it drops from a changed file, and `sbx trust` shows the
 line that added it.
 
+For the same reason, the review never lets a line act on your terminal. A control
+character (an escape sequence, a carriage return) is printed as an escape such as `\x1b`
+or `\x0d`, and so is a character that reorders the text around it, such as `\u{202e}`.
+You see that the character is there rather than what it would do to the lines you read.
+A tab is left as it is.
+
+The global config and app profiles are **trusted by location**: they need no `sbx
+trust`, and asking for one says so and records nothing, since no reader looks for a
+marker on either. Only a project `.sbx.toml` uses content trust. One exception: [`[fs]`](../configuration/fs)
+is the one table this does not govern, since it can only close project paths off inside
+the cage, so it applies whether or not the file is trusted. Its two keys that widen
+instead, `scan_max_kb` and `git_writable`, are gated like any security field. See
+[The trust gate](../concepts/trust).
+
 ### Reading the grants
 
 ```text
@@ -77,19 +91,16 @@ A change that touches no security field (a comment, `[env]`, `timezone`) says so
 security field changes`. When the contents do not resolve at all, the review says the
 grants could not be computed and shows the diff alone.
 
-For the same reason, the review never lets a line act on your terminal. A control
-character (an escape sequence, a carriage return) is printed as an escape such as `\x1b`
-or `\x0d`, and so is a character that reorders the text around it, such as `\u{202e}`.
-You see that the character is there rather than what it would do to the lines you read.
-A tab is left as it is.
+A bind is named as declared, even when its path does not exist yet: a launch skips a path
+it cannot find, but the first launch after it appears mounts it, so the approval is what
+grants it. The tools a mise file declares are listed too, each new tool or new version as
+`mise: <tool>@<version>`, and a mise file that does not parse is flagged, since what it
+declares is unknown. The other sections of a mise file (`[env]`, `[tasks]`, hooks) appear
+in the diff only.
 
-The global config and app profiles are **trusted by location**: they need no `sbx
-trust`, and asking for one says so and records nothing, since no reader looks for a
-marker on either. Only a project `.sbx.toml` uses content trust. One exception: [`[fs]`](../configuration/fs)
-is the one table this does not govern, since it can only close project paths off inside
-the cage, so it applies whether or not the file is trusted. Its two keys that widen
-instead, `scan_max_kb` and `git_writable`, are gated like any security field. See
-[The trust gate](../concepts/trust).
+`sbx trust --show` prints the same list under the verdict whenever the config is not
+trusted, and records nothing: it is the way to read what an approval would grant before
+deciding to make it.
 
 ## Examples
 

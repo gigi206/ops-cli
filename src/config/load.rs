@@ -61,7 +61,9 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
 /// verdicts, or two contents resolved under the same one, through the engine a launch uses, so the
 /// answer cannot describe a policy the launch would not apply. Nothing about the project is read
 /// from disk but its sibling files; the covered mise files are not folded in, since only the
-/// `.sbx.toml` is compared. A content that does not parse is an error, named.
+/// `.sbx.toml` is compared. The binds are left as declared rather than canonicalized: a path that
+/// does not exist today is dropped by a launch, but mounted by the first launch after it appears,
+/// so a review must still name it. A content that does not parse is an error, named.
 pub(crate) fn load_as(cwd: &Path, bytes: &[u8], state: TrustState) -> Result<Resolved, String> {
     let mut dropped = Vec::new();
     let raw = schema::parse_layer(bytes, &mut dropped)?;
@@ -114,6 +116,8 @@ fn load_layers(
         }
         libraries
     };
+    // A project handed in is resolved for review, not for a launch: its binds stay as declared.
+    let as_declared = given.is_some();
     let mut project = if given.is_some() {
         given
     } else if source.includes_project() {
@@ -208,50 +212,54 @@ fn load_layers(
 
     settle_bundles(&mut resolved, fold);
 
-    // Canonicalize the (already absolute) bind sources, dropping any that cannot be
-    // resolved — so `binds` is the *effective* list, identical to what the
-    // launch will bind, and `sbx config` cannot advertise a bind the launch would
-    // silently skip. Following symlinks here also *narrows* each source's swap window
-    // (see [`canonicalize_one`] for what narrows means and what it does not).
-    // The bind's read-only/read-write mode carries through unchanged; the per-layer
-    // provenance is re-keyed from the raw declared path to the canonical one as we go,
-    // so a lookup against the displayed (canonical) path resolves.
-    let sbx_roots = sbx_control_plane_roots();
-    // The canonical project root, because the bind paths are canonical: a symlinked project root
-    // would otherwise never match its own binds.
-    let project = cwd.canonicalize().ok();
-    let declared = std::mem::take(&mut resolved.binds);
-    let raw_layer = std::mem::take(&mut resolved.bind_layer);
-    let mut canon_layer = BTreeMap::new();
-    let canon_binds = canonicalize_binds(
-        declared,
-        &sbx_roots,
-        project.as_deref(),
-        resolved.distro.is_some(),
-        Some(LayerRekey {
-            declared: &raw_layer,
-            canonical: &mut canon_layer,
-        }),
-        &mut resolved.warnings,
-    );
-    resolved.binds = canon_binds;
-    resolved.bind_layer = canon_layer;
-
-    // Each app's binds go through the same fold, into that app's own warnings — so an app overlay
-    // also advertises only the binds the launch would actually make. No re-keying: the per-layer
-    // provenance map is the baseline's.
-    // An app declares no distribution of its own, so the baseline's is the one its launch runs on.
-    let distro = resolved.distro.is_some();
-    for app in resolved.apps.values_mut() {
-        let declared = std::mem::take(&mut app.binds);
-        app.binds = canonicalize_binds(
+    // A review keeps the binds as declared ([`load_as`]): canonicalizing would drop a path that
+    // does not exist yet, and a later launch, once it does, would mount it unreviewed.
+    if !as_declared {
+        // Canonicalize the (already absolute) bind sources, dropping any that cannot be
+        // resolved — so `binds` is the *effective* list, identical to what the
+        // launch will bind, and `sbx config` cannot advertise a bind the launch would
+        // silently skip. Following symlinks here also *narrows* each source's swap window
+        // (see [`canonicalize_one`] for what narrows means and what it does not).
+        // The bind's read-only/read-write mode carries through unchanged; the per-layer
+        // provenance is re-keyed from the raw declared path to the canonical one as we go,
+        // so a lookup against the displayed (canonical) path resolves.
+        let sbx_roots = sbx_control_plane_roots();
+        // The canonical project root, because the bind paths are canonical: a symlinked project root
+        // would otherwise never match its own binds.
+        let project = cwd.canonicalize().ok();
+        let declared = std::mem::take(&mut resolved.binds);
+        let raw_layer = std::mem::take(&mut resolved.bind_layer);
+        let mut canon_layer = BTreeMap::new();
+        let canon_binds = canonicalize_binds(
             declared,
             &sbx_roots,
             project.as_deref(),
-            distro,
-            None,
-            &mut app.warnings,
+            resolved.distro.is_some(),
+            Some(LayerRekey {
+                declared: &raw_layer,
+                canonical: &mut canon_layer,
+            }),
+            &mut resolved.warnings,
         );
+        resolved.binds = canon_binds;
+        resolved.bind_layer = canon_layer;
+
+        // Each app's binds go through the same fold, into that app's own warnings — so an app overlay
+        // also advertises only the binds the launch would actually make. No re-keying: the per-layer
+        // provenance map is the baseline's.
+        // An app declares no distribution of its own, so the baseline's is the one its launch runs on.
+        let distro = resolved.distro.is_some();
+        for app in resolved.apps.values_mut() {
+            let declared = std::mem::take(&mut app.binds);
+            app.binds = canonicalize_binds(
+                declared,
+                &sbx_roots,
+                project.as_deref(),
+                distro,
+                None,
+                &mut app.warnings,
+            );
+        }
     }
 
     // I/O-level notes (unsafe/unparseable files) come first, then the gating notes.

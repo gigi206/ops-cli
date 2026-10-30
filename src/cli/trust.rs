@@ -189,11 +189,7 @@ pub(crate) fn review_and_trust(store_dir: &Path, path: &Path, yes: bool) -> Trus
         let was = before
             .as_ref()
             .map(|(sbx, mise)| contents_of(path, sbx, mise));
-        let grants = grants_of(
-            path,
-            before.as_ref().map(|(sbx, _)| sbx.as_slice()),
-            &sbx_bytes,
-        );
+        let grants = grants_of(path, before.as_ref(), &sbx_bytes, &mise);
         err!(
             "{}",
             render_trust_review(path, was.as_deref(), &now, grants.as_ref(), &epal)
@@ -209,17 +205,19 @@ pub(crate) fn review_and_trust(store_dir: &Path, path: &Path, yes: bool) -> Trus
     }
 }
 
-/// What approving `now` grants, read off the resolved configuration: over the approved contents
-/// when a copy is on record and still resolves, else over the same contents left untrusted — which
-/// is what the project gets without the approval.
+/// What approving `now` and the files its trust covers grants, read off the resolved configuration:
+/// over the approved contents when a copy is on record and still resolves, else over the same
+/// contents left untrusted — which is what the project gets without the approval. The tools its mise
+/// files declare are compared beside it ([`config::mise_grants`]).
 ///
 /// `None` when `path` is not a file the loader reads as a project config, since resolving it would
 /// describe a configuration no launch applies. An error when `now` itself does not resolve: the
 /// text diff is then all the review can show.
 fn grants_of(
     path: &Path,
-    approved: Option<&[u8]>,
+    approved: Option<&(Vec<u8>, trust::TrustInputs)>,
     now: &[u8],
+    covered: &trust::TrustInputs,
 ) -> Option<Result<Vec<config::Grant>, String>> {
     if path.file_name() != Some(std::ffi::OsStr::new(config::PROJECT_CONFIG)) {
         return None;
@@ -233,12 +231,17 @@ fn grants_of(
         Err(e) => return Some(Err(e)),
     };
     let before = approved
-        .and_then(|old| config::load_as(cwd, old, trust::TrustState::Trusted).ok())
+        .and_then(|(old, _)| config::load_as(cwd, old, trust::TrustState::Trusted).ok())
         .map_or_else(
             || config::load_as(cwd, now, trust::TrustState::Untrusted),
             Ok,
         );
-    Some(before.map(|before| config::grants(&before, &after)))
+    Some(before.map(|before| {
+        let mut grants = config::grants(&before, &after);
+        grants.extend(config::mise_grants(approved.map(|(_, was)| was), covered));
+        config::sort_grants(&mut grants);
+        grants
+    }))
 }
 
 /// One file of what a trust covers: the name it is shown under, and its text.
@@ -451,8 +454,10 @@ fn render_trust_recorded(path: &Path, pal: &style::Palette) -> String {
     format!("sbx: {}trusted{} {}", pal.ok, pal.reset, path.display())
 }
 
-/// Report a config's current trust state. A query never changes anything, so it
-/// succeeds whatever the state — the verdict is the message, not the exit code.
+/// Report a config's current trust state and, when it is not trusted, what approving it would
+/// grant ([`render_grants`]). A query never changes anything, so it succeeds whatever the state —
+/// the verdict is the message, not the exit code. A config that cannot be read reports its verdict
+/// alone, since the verdict is what was asked.
 fn show_trust(path: &Path) -> ExitCode {
     let store_dir = match trust_store_dir() {
         Ok(d) => d,
@@ -461,6 +466,18 @@ fn show_trust(path: &Path) -> ExitCode {
     let state = trust::state(&store_dir, path);
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     outln!("{}", render_trust_verdict(path, state, &pal));
+    if state != trust::TrustState::Trusted
+        && let Ok(sbx) = crate::config::safety::read_safe_bytes(path)
+        && let Ok(covered) = trust::trust_inputs_for(path, &sbx)
+        && let Some(grants) = grants_of(
+            path,
+            trust::approved(&store_dir, path).as_ref(),
+            &sbx,
+            &covered,
+        )
+    {
+        out!("{}", render_grants(&grants, &pal));
+    }
     ExitCode::SUCCESS
 }
 
@@ -645,12 +662,12 @@ mod tests {
     #[test]
     fn the_grants_lead_the_review_most_serious_first_and_say_why() {
         let p = style::Palette::plain();
-        let grant = |app: Option<&str>, field, what: &str, risk, why| config::Grant {
+        let grant = |app: Option<&str>, field, what: &str, risk, why: &str| config::Grant {
             app: app.map(str::to_string),
             field,
             what: what.to_string(),
             risk,
-            why,
+            why: why.to_string(),
         };
         let grants = Ok(vec![
             grant(

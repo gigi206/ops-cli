@@ -254,7 +254,42 @@ fn show_reports_untrusted_then_trusted_then_changed() {
     assert!(show("after trust").contains("is trusted"));
 
     std::fs::write(&cfg, b"network = \"isolated\"\nbinds = [\"/etc/ssh\"]\n").unwrap();
-    assert!(show("after edit").contains("changed since it was trusted"));
+    let edited = show("after edit");
+    assert!(edited.contains("changed since it was trusted"), "{edited}");
+    assert!(
+        edited.contains("!  binds: /etc/ssh (ro) — readable from the cage"),
+        "--show names what approving the change would grant:\n{edited}"
+    );
+    assert_eq!(marker_count(state.path()), 1, "--show records nothing new");
+}
+
+/// A tool a mise file gains is named among the grants, beside the config's own.
+#[test]
+fn a_tool_a_mise_file_gains_is_named_among_the_grants() {
+    let state = TmpDir::new("trust");
+    let proj = TmpDir::new("trust");
+    let cfg = proj.path().join(".sbx.toml");
+    let mise = proj.path().join("mise.toml");
+    std::fs::write(&cfg, b"network = \"isolated\"\n").unwrap();
+    std::fs::write(&mise, b"[tools]\nnode = \"20\"\n").unwrap();
+    let trust = || {
+        sbx()
+            .args(["trust", "--yes"])
+            .arg(&cfg)
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .expect("spawn sbx trust")
+    };
+    assert!(trust().status.success());
+
+    std::fs::write(&mise, b"[tools]\nnode = \"22\"\n").unwrap();
+    let again = trust();
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(again.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("   mise: node@22 — installed for the cage"),
+        "{stderr}"
+    );
 }
 
 #[test]

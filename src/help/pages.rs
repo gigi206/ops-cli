@@ -1471,7 +1471,10 @@ pub(super) const PAGES: &[Page] = &[
         summary: "vouch for a project config's current contents",
         options: &[
             ("[path]", "the config to act on (default ./.sbx.toml)"),
-            ("--show", "report the trust state without changing it"),
+            (
+                "--show",
+                "report the trust state and what approving would grant, without changing it",
+            ),
             (
                 "--yes",
                 "record without asking (required without a terminal, e.g. in a script)",
