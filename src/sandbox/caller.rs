@@ -21,7 +21,10 @@
 //!    in-cage listener of a `tcp://` rule, or the `socat` of the `ProxyCommand` ssh is given. It is
 //!    walked through the same way, from its one other live socket, a few relays deep at most. A
 //!    relay with no other socket carries its bytes on its standard streams, and is followed to the
-//!    processes holding the other ends of those pipes, of which its parent must be one;
+//!    processes holding the other ends of those pipes, of which its parent must be one. Every relay
+//!    is held to its command line too ([`Carries`]): socat moves bytes only between the two
+//!    addresses it was given, so one whose addresses are not an accepted connection or its
+//!    standard streams on one side and the way to the proxy on the other is named after nobody;
 //! 5. the caller is the holders' executable, named by its SHA-256, and only when every holder runs
 //!    the same one: a socket or a pipe shared by two programs is held by neither alone.
 //!
@@ -29,6 +32,11 @@
 //! directly holds the connection, so it is the one named. What cannot be named is `None`, and a
 //! caller of `None` is never the program a rule names. Every ambiguity on the way, two candidate
 //! sockets or a relay holding something it is not known to use, ends in `None`.
+//!
+//! The walk reads the network namespace of the proxy socket's peer, which is the cage's. A holder in
+//! a namespace of its own is not seen, so a cage allowed to create one (`unshare` reopened in its
+//! seccomp policy, which denies it by default) can hold a connection where whoever is visible would
+//! be named.
 //!
 //! The tap is told apart by its content, so the statement rests on the cage not being able to run a
 //! byte-identical sbx: a cage is given the store paths its own closure needs, which do not hold
@@ -108,6 +116,56 @@ const HASH_MAX: u64 = 1 << 30;
 /// distinct files costs the supervisor rehashing rather than memory.
 const HASHES_KEPT: usize = 1024;
 
+/// Where a relay's bytes come from, as the two addresses on its command line say: socat moves bytes
+/// between those two and nowhere else, whatever else it holds, so this is what makes a walk through
+/// it sound. Read from `/proc/<pid>/cmdline`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Carries {
+    /// A connection it accepted (`TCP-LISTEN:`).
+    Accepted,
+    /// Its standard input and output (`-` or `STDIO`), and so not its standard error, which carries
+    /// its diagnostics alone.
+    Stdio,
+}
+
+/// What a relay with the command line `argv` carries toward the proxy: one address must lead to it
+/// (`PROXY:` or `UNIX-CONNECT:`), the other must be one [`Carries`] names, written bare. Anything
+/// else, a file, another descriptor, a second connection, is `None`.
+fn carries_from_argv(argv: &[String]) -> Option<Carries> {
+    let prefixed = |address: &str, prefix: &str| {
+        address
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    let toward = |address: &str| prefixed(address, "PROXY:") || prefixed(address, "UNIX-CONNECT:");
+    let [.., first, second] = argv.get(1..)? else {
+        return None;
+    };
+    let other = match (toward(first), toward(second)) {
+        (true, false) => second,
+        (false, true) => first,
+        _ => return None,
+    };
+    if other == "-" || other.eq_ignore_ascii_case("STDIO") {
+        Some(Carries::Stdio)
+    } else if prefixed(other, "TCP-LISTEN:") || prefixed(other, "TCP4-LISTEN:") {
+        Some(Carries::Accepted)
+    } else {
+        None
+    }
+}
+
+/// What the relay `pid` carries, from its command line ([`carries_from_argv`]).
+fn relay_carries(pid: u32) -> Option<Carries> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let argv: Vec<String> = cmdline
+        .split(|b| *b == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect();
+    carries_from_argv(&argv)
+}
+
 /// Where a relay leads, from the socket the walk reached it by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Onward {
@@ -153,6 +211,9 @@ pub(crate) struct Identify {
     /// A file the cage rewrites in place changes its change time, which the cage cannot set, so a
     /// stale entry is never read for a new content.
     hashes: Mutex<HashMap<FileKey, HashCell>>,
+    /// How what a relay carries is read: [`relay_carries`], or in a test, where this process plays
+    /// the relay with a command line of its own, an answer fixed in advance.
+    carries: fn(u32) -> Option<Carries>,
 }
 
 impl Identify {
@@ -166,6 +227,7 @@ impl Identify {
             tap: sha256_of(tap)?,
             proxy_port,
             hashes: Mutex::new(HashMap::new()),
+            carries: relay_carries,
         })
     }
 
@@ -183,6 +245,9 @@ impl Identify {
         let rows = tcp_rows(peer);
         let held = socket_inodes(peer);
         let (local, remote) = if relayed {
+            if (self.carries)(peer)? != Carries::Accepted {
+                return None;
+            }
             let accepted = accepted_on(&rows, &held, self.proxy_port)?;
             (accepted.remote, accepted.local)
         } else {
@@ -200,15 +265,16 @@ impl Identify {
                 break;
             }
             let held = socket_inodes(relay);
-            match onward(&rows, &held, inode)? {
-                Onward::Client(accepted) => {
+            match (onward(&rows, &held, inode)?, (self.carries)(relay)?) {
+                (Onward::Client(accepted), Carries::Accepted) => {
                     inode = client_inode(&rows, accepted.remote, accepted.local, &held)?;
                     holders = holders_of(Held::Socket(inode), &net);
                 }
-                Onward::Stdio => {
-                    holders = stdio_drivers(relay, inode, &net)?;
+                (Onward::Stdio, Carries::Stdio) => {
+                    holders = stdio_drivers(relay, &net)?;
                     break;
                 }
+                _ => return None,
             }
         }
         self.named(&holders)
@@ -237,6 +303,7 @@ impl Identify {
             tap,
             proxy_port,
             hashes: Mutex::new(hashes),
+            carries: |_| Some(Carries::Accepted),
         }
     }
 
@@ -277,7 +344,7 @@ impl Identify {
             }
             Arc::clone(hashes.entry(file_key(&meta)).or_default())
         };
-        *cell.get_or_init(|| sha256_read(file).ok())
+        *cell.get_or_init(|| sha256_read(file, HASH_MAX).ok().flatten())
     }
 }
 
@@ -296,20 +363,31 @@ fn file_key(meta: &std::fs::Metadata) -> FileKey {
     )
 }
 
-/// The SHA-256 of the file at `path`.
+/// The SHA-256 of the file at `path`: sbx's own executable or the forwarder's, read whole.
 fn sha256_of(path: &Path) -> io::Result<[u8; 32]> {
-    sha256_read(std::fs::File::open(path)?)
+    sha256_read(std::fs::File::open(path)?, u64::MAX)?
+        .ok_or_else(|| io::Error::other("larger than any file read"))
 }
 
-/// The SHA-256 of what `file` reads to its end.
-fn sha256_read(mut file: std::fs::File) -> io::Result<[u8; 32]> {
+/// The SHA-256 of what `file` reads to its end, or `None` once it has read more than `cap` bytes:
+/// the length checked before is the length then, and a file that grows while it is read is held to
+/// the same bound.
+fn sha256_read(file: std::fs::File, cap: u64) -> io::Result<Option<[u8; 32]>> {
     use std::io::Read;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
+    let mut read = 0u64;
+    let mut bounded = file.take(cap.saturating_add(1));
     loop {
-        match file.read(&mut buf) {
-            Ok(0) => return Ok(hasher.finalize().into()),
-            Ok(n) => hasher.update(&buf[..n]),
+        match bounded.read(&mut buf) {
+            Ok(0) => return Ok(Some(hasher.finalize().into())),
+            Ok(n) => {
+                read += n as u64;
+                if read > cap {
+                    return Ok(None);
+                }
+                hasher.update(&buf[..n]);
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
@@ -484,21 +562,20 @@ fn client_inode(
 /// The processes driving a relay that carries its bytes on its standard streams: those holding the
 /// other ends of the pipes its stdin and stdout are, of which its parent must be one.
 ///
-/// Every condition is what makes "the parent drives it" true rather than assumed. Its stdin and
-/// stdout are each a pipe or `/dev/null`, with at least one pipe, so its bytes have nowhere else to
-/// come from; it holds no descriptor past its standard streams but the socket `came_in`, so none
-/// other carries them; and the parent holds one of those pipes, so the program that launched it is
-/// on the other end rather than a stranger it was handed to. Anything else is `None`.
-fn stdio_drivers(relay: u32, came_in: u64, net: &Path) -> Option<Vec<u32>> {
+/// Every condition is what makes "the parent drives it" true rather than assumed. Its command line
+/// says its bytes go through its stdin and stdout alone ([`Carries::Stdio`], checked by the
+/// caller), so what else it holds carries none of them, its standard error included; those two are
+/// each a pipe or `/dev/null`, with at least one pipe; and the parent holds one of those pipes, so
+/// the program that launched it is on the other end rather than a stranger it was handed to, and
+/// anything else is `None`.
+fn stdio_drivers(relay: u32, net: &Path) -> Option<Vec<u32>> {
     let mut pipes = Vec::new();
     for (fd, held, target) in descriptors(relay) {
         match (fd, held) {
             (0 | 1, Some(Held::Pipe(inode))) => pipes.push(inode),
             (0 | 1, _) if target == "/dev/null" => {}
             (0 | 1, _) => return None,
-            (2, _) => {}
-            (_, Some(Held::Socket(inode))) if inode == came_in => {}
-            _ => return None,
+            _ => {}
         }
     }
     if pipes.is_empty() {
@@ -711,6 +788,71 @@ mod tests {
         assert_eq!(onward(&rows, &[444, 555, 777].into(), 444), None);
     }
 
+    /// A relay is walked through only on the addresses sbx gives its relays: an accepted
+    /// connection or its standard streams on one side, the way to the proxy on the other.
+    #[test]
+    fn a_relay_carries_what_its_two_addresses_say_and_nothing_else() {
+        let argv = |args: &[&str]| -> Vec<String> {
+            std::iter::once("/nix/store/x-socat/bin/socat")
+                .chain(args.iter().copied())
+                .map(str::to_string)
+                .collect()
+        };
+        let carries = |args: &[&str]| carries_from_argv(&argv(args));
+        assert_eq!(
+            carries(&[
+                "TCP-LISTEN:18043,bind=127.0.0.1,fork,reuseaddr,nodelay",
+                "UNIX-CONNECT:/tmp/sbx-egress.sock"
+            ]),
+            Some(Carries::Accepted)
+        );
+        assert_eq!(
+            carries(&[
+                "TCP-LISTEN:4022,bind=127.0.0.2,fork",
+                "PROXY:127.0.0.1:db.test:4022,proxyport=18043,nodelay"
+            ]),
+            Some(Carries::Accepted)
+        );
+        assert_eq!(
+            carries(&["-", "PROXY:127.0.0.1:github.com:22,proxyport=18043"]),
+            Some(Carries::Stdio)
+        );
+        assert_eq!(
+            carries(&["-t", "5", "-", "PROXY:127.0.0.1:h:1,proxyport=18043"]),
+            Some(Carries::Stdio)
+        );
+        // Its bytes from elsewhere: standard error, a descriptor, a file, a second listener.
+        for other in [
+            "FD:2",
+            "STDERR",
+            "FD:4",
+            "OPEN:/tmp/x",
+            "-,ignoreeof",
+            "TCP:h:1",
+        ] {
+            assert_eq!(
+                carries(&[other, "PROXY:127.0.0.1:h:1,proxyport=18043"]),
+                None,
+                "{other}"
+            );
+        }
+        assert_eq!(carries(&["-", "-"]), None);
+        assert_eq!(carries(&["PROXY:a:b:1", "UNIX-CONNECT:/x"]), None);
+        assert_eq!(carries(&["-"]), None);
+    }
+
+    /// The bound on what is hashed holds on the read itself, not only on the length seen before it.
+    #[test]
+    fn a_hash_stops_past_its_bound() {
+        let path = std::env::temp_dir().join(format!("sbx-caller-hash-{}", std::process::id()));
+        std::fs::write(&path, b"0123456789").unwrap();
+        let open = || std::fs::File::open(&path).unwrap();
+        let whole = sha256_read(open(), 10).unwrap();
+        assert_eq!(whole, Some(Sha256::digest(b"0123456789").into()));
+        assert_eq!(sha256_read(open(), 9).unwrap(), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_process_parent_is_read_from_its_status() {
         assert_eq!(
@@ -773,25 +915,23 @@ mod tests {
 
         let mut piped = spawn(Stdio::piped());
         let _accepted = listener.accept().unwrap();
-        let socket = settled(piped.id());
+        settled(piped.id());
         assert_eq!(
-            stdio_drivers(piped.id(), socket, &net),
+            stdio_drivers(piped.id(), &net),
             Some(vec![std::process::id()])
         );
-        // Another socket than the one the walk came by is a way in the walk cannot see.
-        assert_eq!(stdio_drivers(piped.id(), socket + 1, &net), None);
         // Its pipes let go of: nobody drives it, the parent included.
         drop(piped.stdin.take());
         drop(piped.stdout.take());
-        assert_eq!(stdio_drivers(piped.id(), socket, &net), None);
+        assert_eq!(stdio_drivers(piped.id(), &net), None);
         let _ = piped.kill();
         let _ = piped.wait();
 
         let file = tempfile_stdout();
         let mut filed = spawn(Stdio::from(file));
         let _accepted = listener.accept().unwrap();
-        let socket = settled(filed.id());
-        assert_eq!(stdio_drivers(filed.id(), socket, &net), None);
+        settled(filed.id());
+        assert_eq!(stdio_drivers(filed.id(), &net), None);
         let _ = filed.kill();
         let _ = filed.wait();
     }

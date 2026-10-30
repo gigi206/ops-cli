@@ -13627,7 +13627,7 @@ fn a_credential_held_for_a_named_program_is_matched_for_that_program_alone() {
         Vec::<usize>::new()
     );
     assert!(
-        ctx.names_callers(),
+        ctx.names_callers_for("host.test", 443) && !ctx.names_callers_for("other.test", 443),
         "a `by` credential has the callers named"
     );
 }
@@ -13636,7 +13636,11 @@ fn a_credential_held_for_a_named_program_is_matched_for_that_program_alone() {
 #[test]
 fn a_reserved_destination_is_refused_on_the_absolute_form_plane() {
     let (ctx, _) = reserving_ctx(&["*.host.test:*"], &["locked.host.test:*"]);
-    assert!(ctx.names_callers(), "a reservation has the callers named");
+    assert!(
+        ctx.names_callers_for("locked.host.test", 443)
+            && !ctx.names_callers_for("open.host.test", 443),
+        "the reserved destination alone has its callers named"
+    );
     let resp = through_cleartext(
         ctx,
         b"GET https://locked.host.test/x HTTP/1.1\r\nHost: locked.host.test\r\nConnection: close\r\n\r\n",

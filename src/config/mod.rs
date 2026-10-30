@@ -4285,8 +4285,11 @@ fn parse_shared_credential(
 /// `deny` entry: a reservation left out would leave its destination open to every program a wider
 /// `allow` rule admits, which is the direction a typo must not fail in. That covers a key that does
 /// not classify or that names a path or a pattern ([`crate::allowlist::Reservation::new`]), and a
-/// `by` that names no program or a malformed one. An unknown key in the table is only reported,
-/// as everywhere else.
+/// `by` that names no program or a malformed one, and a key naming a destination an earlier key of
+/// the same table already reserves under another spelling (`codeload.example.com` beside
+/// `https://codeload.example.com`): one destination holds one reservation, and which of the two
+/// was meant is not this table's to guess. An unknown key in the table is only reported, as
+/// everywhere else.
 fn parse_reservations(
     warnings: &mut Vec<String>,
     refusals: &mut Vec<String>,
@@ -4294,7 +4297,7 @@ fn parse_reservations(
     raw: BTreeMap<String, schema::RawReserve>,
     groups: &NetGroups,
 ) -> Vec<crate::allowlist::Reservation> {
-    let mut reserved = Vec::new();
+    let mut reserved: Vec<(String, crate::allowlist::Reservation)> = Vec::new();
     for (entry, table) in raw {
         let shown = crate::diag::visible(&entry);
         for key in table.rest.keys() {
@@ -4320,7 +4323,17 @@ fn parse_reservations(
                 );
                 for rule in rules {
                     match crate::allowlist::Reservation::new(rule, by.clone()) {
-                        Ok(reservation) => reserved.push(reservation),
+                        Ok(reservation) => match reserved
+                            .iter()
+                            .find(|(_, earlier)| earlier.rule().kind == reservation.rule().kind)
+                        {
+                            Some((earlier, _)) => reasons.push(format!(
+                                "it names the destination `{}` already reserves; write the \
+                                 destination once",
+                                crate::diag::visible(earlier)
+                            )),
+                            None => reserved.push((entry.clone(), reservation)),
+                        },
                         Err(reason) => reasons.push(reason),
                     }
                 }
@@ -4336,6 +4349,9 @@ fn parse_reservations(
         }
     }
     reserved
+        .into_iter()
+        .map(|(_, reservation)| reservation)
+        .collect()
 }
 
 /// The programs a `[network.reserve]` table names, or why it names none a reservation can hold.

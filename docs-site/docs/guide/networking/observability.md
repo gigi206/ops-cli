@@ -488,19 +488,19 @@ Under `--json` the same fact rides on every event as `secrets_seen`, a possibly-
 
 #### Which program made the request
 
-In a launch that holds something for named programs, a
+For a connection to a destination something is held for named programs at, a
 [`[secret]` with `by`](../configuration/secret#held-for-named-programs-by) or a
 [`[network.reserve]` entry](../configuration/network#destinations-reserved-for-named-programs-reserve),
-the supervisor names the program holding each connection as soon as the proxy reads its first head,
-and the line of an allowed HTTPS request, or of a `by-mismatch` refusal on any plane, ends with it:
+the supervisor names the program holding it as soon as the proxy reads its first head, and the line
+of an allowed HTTPS request, or of a `by-mismatch` refusal on any plane, ends with it:
 
 ```
   3786263  07:56:46  https/h1  api.github.com:443  GET /user  allow  by /nix/store/…-gh-2.62.0/bin/gh
   3786263  07:56:51  https/h1  api.github.com:443  GET /user  blocked (by-mismatch)  by /nix/store/…-curl-8.11.0/bin/curl
 ```
 
-A launch that declares neither never asks who holds a connection, so its lines show no program:
-naming one costs a walk of the cage's processes, and a log line never pays it on its own. Under
+A connection anywhere else is never asked about, so its lines show no program: naming one costs a
+walk of the cage's processes, and a log line never pays it on its own. Under
 `--json` the same name is `caller`, or `null`.
 
 #### What a capture does not cover

@@ -602,7 +602,8 @@ struct SupervisorSide {
     /// How the programs behind the proxy's connections are named, or `None` when the launch holds
     /// nothing for named programs: each question is then answered with no name.
     identify: Option<Arc<Identify>>,
-    /// How many questions to name a program are being walked at once, held to [`NAMING_MAX`].
+    /// How many questions to name a program are being walked at once, held to [`NAMING_MAX`] by
+    /// [`NamingSlot`].
     naming: Arc<std::sync::atomic::AtomicUsize>,
     /// How a thread of this end is started: [`named_thread`], or in a test one the host refuses.
     threads: fn(&str) -> std::thread::Builder,
@@ -1047,7 +1048,6 @@ fn serve_identify(
     stated: Option<crate::sandbox::caller::Stated>,
     fd: OwnedFd,
 ) {
-    use std::sync::atomic::Ordering;
     let unnamed = || {
         let _ = send(side, ToProxy::Identified { id, caller: None });
     };
@@ -1056,20 +1056,42 @@ fn serve_identify(
     };
     // Held to a ceiling, as every other piece of supervisor work a cage can start is: past it a
     // question is answered with no name at once, which no rule names.
-    if side.naming.fetch_add(1, Ordering::SeqCst) >= NAMING_MAX {
-        side.naming.fetch_sub(1, Ordering::SeqCst);
+    let Some(slot) = NamingSlot::take(&side.naming) else {
         return unnamed();
-    }
+    };
     let naming = Arc::clone(side);
     let started = (side.threads)("sbx-identify").spawn(move || {
+        let _slot = slot;
         let client = UnixStream::from(fd);
         let caller = identify.caller(&client, stated).map(Named::from);
-        naming.naming.fetch_sub(1, Ordering::SeqCst);
         let _ = send(&naming, ToProxy::Identified { id, caller });
     });
     if started.is_err() {
-        side.naming.fetch_sub(1, Ordering::SeqCst);
         unnamed();
+    }
+}
+
+/// One of the [`NAMING_MAX`] questions the supervisor walks at once, given back when it is dropped:
+/// at the end of the walk, on a thread that could not start, and on a walk that panics, so no path
+/// leaves a slot taken for good.
+struct NamingSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl NamingSlot {
+    /// A slot counted in `count`, or `None` when all are taken.
+    fn take(count: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let count = Arc::clone(count);
+        if count.fetch_add(1, Ordering::SeqCst) >= NAMING_MAX {
+            count.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(NamingSlot(count))
+    }
+}
+
+impl Drop for NamingSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2216,6 +2238,28 @@ mod tests {
             stream.local_addr().unwrap(),
             "the proxy holds the connection the supervisor opened"
         );
+    }
+
+    /// The slots to walk a question in are given back however a walk ends, a panic included.
+    #[test]
+    fn a_naming_slot_is_given_back_however_its_walk_ends() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut slots: Vec<NamingSlot> = (0..NAMING_MAX)
+            .map(|_| NamingSlot::take(&count).expect("a free slot"))
+            .collect();
+        assert!(NamingSlot::take(&count).is_none(), "all taken");
+        let walk = slots.pop().unwrap();
+        let panicked = std::thread::spawn(move || {
+            let _slot = walk;
+            panic!("a walk that panics");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(
+            NamingSlot::take(&count).is_some(),
+            "the panicked walk gave its slot back"
+        );
+        drop(slots);
     }
 
     /// The connection the proxy asks to have named crosses as its descriptor, and the supervisor

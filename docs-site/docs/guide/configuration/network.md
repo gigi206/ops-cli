@@ -821,11 +821,14 @@ A reservation that cannot be kept stops the launch, as a malformed `deny` entry 
 that does not classify, names a path or a pattern, or whose `by` is missing, empty or malformed.
 Left out, it would leave its destination open to every program a wider `allow` admits.
 
-A project `[app.<name>.network]` with no `mode` adds its reservations to the app profile's, as it
-adds its rules. A table that replaces the layer below keeps only its own. A [bundle](bundles) carries the
-same field, folded under the app's own reservations: an app reserving the same destination keeps
-its own `by`, however either spells it (`codeload.github.com`, `https://codeload.github.com:443` and
-`tcp://codeload.github.com:443` are one destination).
+A destination holds one reservation, compared by host and port whatever scheme names it:
+`codeload.github.com`, `https://codeload.github.com:443` and `tcp://codeload.github.com:443` are one
+destination. Two of those spellings in one table stop the launch, since which `by` was meant is not
+sbx's to guess. A project `[app.<name>.network]` with no `mode` adds its reservations to the app
+profile's, as it adds its rules, and one that reserves a destination the profile already reserves
+replaces the profile's `by` for it. A table that replaces the layer below keeps only its own. A
+[bundle](bundles) carries the same field, folded under the app's own reservations: an app reserving
+the same destination keeps its own `by`, however either spells it.
 
 **A guardrail, not a boundary**, for the reason `[secret] by` is one: the program is named from the
 binary its process runs when the proxy asks, once per connection as its first head is read, and the

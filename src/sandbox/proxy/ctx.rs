@@ -688,17 +688,22 @@ impl ProxyCtx {
         }
     }
 
-    /// Whether this proxy holds anything for named programs: a destination reserved under
-    /// `[network.reserve]`, or a credential declared with `by`. Only then is the program behind a
-    /// connection asked about ([`super::Who`]).
-    pub(super) fn names_callers(&self) -> bool {
-        !self.policy.reserved().is_empty()
+    /// Whether this proxy holds anything for named programs at `host`:`port`: a destination
+    /// reserved there under `[network.reserve]`, or a credential declared with `by` whose rule
+    /// names it, whatever path the rule scopes it to. Only then is the program behind a connection
+    /// to it asked about ([`super::Who`]), so traffic elsewhere neither pays for the question nor
+    /// competes with it.
+    pub(super) fn names_callers_for(&self, host: &str, port: u16) -> bool {
+        self.policy.reserved_for(host, port).next().is_some()
             || self
                 .credentials
                 .snapshot()
                 .injections
                 .iter()
-                .any(|injection| !injection.by.is_empty())
+                .any(|injection| {
+                    !injection.by.is_empty()
+                        && crate::allowlist::names_destination(&injection.rule, host, port)
+                })
     }
 
     /// Hand the proxy its credential state. The launch passes the copy it decoded from the form the

@@ -3510,3 +3510,38 @@ fn a_reservation_covers_hosts_and_ports_and_refuses_paths_and_patterns() {
     );
     assert_eq!(policy.reserved_for("github.com", 22).count(), 1);
 }
+
+/// One destination holds one reservation: a later one of the same host and ports replaces the
+/// first, whatever scheme either names.
+#[test]
+fn a_later_reservation_of_a_destination_replaces_the_first() {
+    let reserve = |entry: &str, by: &str| {
+        Reservation::new(classify(entry).unwrap(), vec![by.to_string()]).unwrap()
+    };
+    let policy = EgressPolicy::new(vec![], vec![])
+        .with_reserved(vec![reserve("codeload.github.com", "gh")])
+        .with_reserved(vec![reserve("tcp://codeload.github.com:443", "git")]);
+    let covering: Vec<&[String]> = policy
+        .reserved_for("codeload.github.com", 443)
+        .map(Reservation::by)
+        .collect();
+    assert_eq!(covering, vec![&["git".to_string()][..]]);
+}
+
+/// Whether a rule can match some request to a destination, its path set aside.
+#[test]
+fn a_rule_names_a_destination_whatever_path_it_is_scoped_to() {
+    let names = |entry: &str, host: &str, port: u16| {
+        names_destination(&classify(entry).unwrap(), host, port)
+    };
+    assert!(names("api.github.com/repos/*", "api.github.com", 443));
+    assert!(names("api.github.com/repos/*", "API.github.com.", 443));
+    assert!(!names("api.github.com/repos/*", "api.github.com", 8443));
+    assert!(!names("api.github.com/repos/*", "github.com", 443));
+    assert!(names("*.github.com", "api.github.com", 443));
+    assert!(!names("api.github.com", "uploads.github.com", 443));
+    assert!(
+        names("re:^https://x\\.test/", "elsewhere.test", 443),
+        "a pattern over-asks"
+    );
+}

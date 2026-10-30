@@ -318,9 +318,17 @@ program that launched it: ssh. A connection whose program cannot be named, is he
 programs at once, or reaches the forwarder through anything the walk cannot account for, receives
 no credential held this way.
 
-The question is put once per connection, as soon as the proxy reads its first head, and only in a
-launch that declares a `by` or a [`[network.reserve]`](network#destinations-reserved-for-named-programs-reserve)
-entry. The program is read from what the connection's holder runs at that moment.
+The question is put once per connection, as soon as the proxy reads its first head, and only for a
+connection to a destination a `by` credential or a
+[`[network.reserve]`](network#destinations-reserved-for-named-programs-reserve) entry names: traffic
+anywhere else is never asked about. The program is read from what the connection's holder runs at
+that moment.
+
+Two arrangements name nobody, by design. A relay on its standard streams is followed through pipes
+only, so a program that hands it a socket pair instead is not named (ssh uses pipes). And the walk
+reads the cage's own network namespace: the cage may not create another by default, and a
+configuration that lets it (`unshare` reopened in [`[seccomp]`](seccomp)) lets a process hold a
+connection from a namespace the walk does not see, where whoever is visible would be named.
 
 **This narrows who is handed the credential; it is not a boundary.** The cage runs as your uid, so a
 program it can run can be made to act for another: a bare name is the agent's to give any file it

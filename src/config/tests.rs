@@ -14704,3 +14704,38 @@ fn an_amending_overlay_adds_its_reservations_to_the_layer_below() {
     };
     assert_eq!(p.reserved().len(), 2);
 }
+
+/// One destination holds one reservation: two spellings of it in one table are refused, and a
+/// mode-less overlay reserving it again replaces the layer below's rather than adding to it.
+#[test]
+fn a_destination_is_reserved_once_per_table_and_anew_by_an_overlay() {
+    let (p, _, r) = reserve_policy(
+        "mode = \"deny\"\n[reserve.\"codeload.example.com\"]\nby = [\"gh\"]\n\
+         [reserve.\"https://codeload.example.com:443\"]\nby = [\"git\"]\n",
+        &NetGroups::new(),
+    );
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(r[0].contains("already reserves"), "{r:?}");
+    assert_eq!(p.reserved().len(), 1);
+
+    let (below, _, _) = reserve_policy(
+        "mode = \"deny\"\n[reserve.\"codeload.example.com\"]\nby = [\"gh\"]\n",
+        &NetGroups::new(),
+    );
+    let table: NetworkTable =
+        toml::from_str("[reserve.\"tcp://codeload.example.com:443\"]\nby = [\"git\"]\n").unwrap();
+    let policy = super::validate_network_amending(
+        &mut Vec::new(),
+        &mut Vec::new(),
+        "app `demo`",
+        NetworkField::Table(table),
+        &NetGroups::new(),
+        &NetworkPolicy::Allowlist(Box::new(below)),
+    )
+    .expect("the overlay validates");
+    let NetworkPolicy::Allowlist(p) = policy else {
+        panic!("an amending overlay stays a filtering policy");
+    };
+    let by: Vec<&[String]> = p.reserved().iter().map(|r| r.by()).collect();
+    assert_eq!(by, vec![&["git".to_string()][..]]);
+}

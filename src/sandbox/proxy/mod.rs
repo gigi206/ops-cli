@@ -384,9 +384,15 @@ const CONTROL_BYTE_DETAIL: &str = "a request line or header carries a control by
      forwarded";
 
 /// The program behind one client connection: asked of the supervisor once, as soon as the
-/// connection's head is read, when the launch holds anything for named programs
-/// ([`ProxyCtx::names_callers`]), and never again for that connection. A launch where nobody wrote
-/// `by` or `[network.reserve]` never asks, so naming costs nothing there.
+/// connection's head is read, when anything is held for named programs at the destination it names
+/// ([`ProxyCtx::names_callers_for`]), and never again for that connection. A connection elsewhere
+/// is never asked about, so naming costs nothing where no `by` or `[network.reserve]` reaches, and
+/// unrelated traffic does not compete with it for the supervisor's attention.
+///
+/// The set of credentials held for named programs does not change during a session: a refresh
+/// re-resolves the values of the credentials the launch declared, each keeping its `by`. So a
+/// connection not asked about at its head carries no request a `by` could later concern, and the
+/// question [`Self::named`] would put lazily is one no plane reaches.
 ///
 /// Asked at the head rather than at the first request a rule covers, for two reasons. The program
 /// is read from what the connection's holder runs at the moment of asking, so the earlier the
@@ -489,9 +495,6 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         Err(e) => return refuse_unreadable_head(&mut client, ctx, &head, &e),
     };
     let who = Who::of(&client, stated_source(&parsed));
-    if ctx.names_callers() {
-        who.named(ctx);
-    }
     let Some((method, target)) = request_line_parts(&parsed.request_line) else {
         // A malformed request line carries no destination to attribute — log the attempt so it is
         // not dark, but with no host/method/path (the raw line may hold whitespace the wire format
@@ -512,6 +515,21 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             "the CONNECT request line is malformed",
         );
     };
+    // The program behind the connection, asked now if anything is held for named programs at the
+    // destination its head names: the CONNECT authority, or an absolute-form target's host. Every
+    // plane decides on that same destination, so no later request on the connection asks again.
+    let destination = if method == "CONNECT" {
+        connect_authority(&target)
+    } else {
+        allowlist::parse_url_target(&target)
+            .ok()
+            .map(|(host, port, _)| (host, port))
+    };
+    if let Some((host, port)) = &destination
+        && ctx.names_callers_for(host, *port)
+    {
+        who.named(ctx);
+    }
     if method != "CONNECT" {
         // A client with `http_proxy` set sends an **absolute-form** request (`GET http://host/… HTTP/1.1`)
         // for an `http://` URL — no CONNECT. When an `http://` (cleartext L7) rule permits it, this is

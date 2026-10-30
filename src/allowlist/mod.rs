@@ -1657,12 +1657,20 @@ impl EgressPolicy {
     /// Add destinations reserved for named programs to those this policy carries (builder style).
     /// Each one's rule is expected among the `allow` rules already: reserving is what makes it
     /// conditional, not what opens it.
+    ///
+    /// One destination holds one reservation. An added one replaces a reservation of the same host
+    /// and ports already carried, whatever scheme either names, since a reservation covers its
+    /// destination on every plane: a layer that amends the one below reserves a destination anew
+    /// rather than leaving a program to be named by both.
     pub(crate) fn with_reserved(mut self, reserved: Vec<Reservation>) -> Self {
         if reserved.is_empty() {
             return self;
         }
         let mut all = self.reserved.take().map(Vec::from).unwrap_or_default();
-        all.extend(reserved);
+        for incoming in reserved {
+            all.retain(|standing| standing.rule.kind != incoming.rule.kind);
+            all.push(incoming);
+        }
         self.reserved = Some(all.into_boxed_slice());
         self
     }
@@ -2163,6 +2171,19 @@ pub(crate) enum Decision<'a> {
 /// identical normalized view as the verdict, and a host or path dodge cannot separate the two.
 pub(crate) fn rule_matches(rule: &Rule, host: &str, port: u16, target: &str) -> bool {
     rule.kind.matches(&Request::new(host, port, target))
+}
+
+/// Whether `rule` can match a request to `host`:`port` on some path: its host and ports, with any
+/// path it is scoped to set aside. A `re:` rule's reach is not readable off its text, so it is
+/// taken to name every destination, which over-asks rather than under-asks.
+pub(crate) fn names_destination(rule: &Rule, host: &str, port: u16) -> bool {
+    match &rule.kind {
+        RuleKind::Url {
+            host: named, ports, ..
+        } => *named == canonical_host(host) && ports.admits(port),
+        RuleKind::Regex { .. } => true,
+        _ => rule_matches(rule, host, port, "/"),
+    }
 }
 
 /// An exact-host rule scoped to a single port — what a live `ask` decision remembers: exactly the
