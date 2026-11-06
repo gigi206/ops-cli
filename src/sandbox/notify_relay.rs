@@ -109,7 +109,7 @@
 //! toasts are on their way at once, and a call past that is refused rather than queued.
 //!
 //! Lifecycle:[`NotifyRelay::start`] spawns a dedicated thread that drives the async work with
-//! `async_io::block_on` (the pure-Rust async-io backend — no tokio, and the runtime never leaves this
+//! `zbus::block_on` (zbus's own pure-Rust runtime — no tokio, and the runtime never leaves this
 //! module). The thread waits for the in-cage `dbus-daemon` to create the private-bus socket (the
 //! portal's command wrap starts it before the app runs), then attaches; the wait has no bound of its
 //! own, because the relay is started before the rest of the launch is provisioned. The guard's
@@ -126,13 +126,15 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::{FutureExt, StreamExt};
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+use zbus::OwnedVariant;
 use zbus::message::{Flags, Header, Type};
-use zbus::zvariant::{DynamicDeserialize, DynamicType, OwnedValue};
+use zbus::zvariant::{DynamicDeserialize, DynamicType};
 use zbus::{MatchRule, Message, MessageStream, connection, fdo, proxy};
 
 /// The notifications service name and object path (identical on the host and the private bus).
@@ -160,7 +162,7 @@ const CALL_MESSAGE_MAX: usize = 1 << 20;
 /// are served one at a time and an application raises a notification at human pace, so two is
 /// ample. zbus's own object server queues 64 calls and cannot be told otherwise, which is why the
 /// relay reads its calls itself.
-const CALLS_QUEUED: usize = 2;
+const CALLS_QUEUED: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
 /// The longest a call forwarded to the host daemon may wait for its answer.
 ///
@@ -183,7 +185,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EMIT_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Client proxy onto the **host** notifications daemon. Owned argument types (`Vec<String>`,
-/// `HashMap<String, OwnedValue>`) so a forwarded call needs no lifetime juggling — the `a{sv}` hints
+/// `HashMap<String, OwnedVariant>`) so a forwarded call needs no lifetime juggling — the `a{sv}` hints
 /// dictionary serialises identically whether its values are borrowed or owned.
 ///
 /// Shared with [`super::notify_sink`], which raises sbx's *own* refusal notifications on the host
@@ -205,7 +207,7 @@ pub(crate) trait HostNotifications {
         summary: &str,
         body: &str,
         actions: Vec<String>,
-        hints: HashMap<String, OwnedValue>,
+        hints: HashMap<String, OwnedVariant>,
         expire_timeout: i32,
     ) -> zbus::Result<u32>;
     fn close_notification(&self, id: u32) -> zbus::Result<()>;
@@ -228,7 +230,7 @@ struct NotifyCall {
     summary: String,
     body: String,
     actions: Vec<String>,
-    hints: HashMap<String, OwnedValue>,
+    hints: HashMap<String, OwnedVariant>,
     expire_timeout: i32,
 }
 
@@ -613,17 +615,17 @@ const URGENCY_CRITICAL: u8 = 2;
 /// as an integer below `critical`, of whatever width; anything else — `critical` or above, a double,
 /// a string — is dropped rather than rewritten, which lands the toast on the daemon's own default,
 /// the same place sbx's announcements sit.
-fn capped_urgency(mut hints: HashMap<String, OwnedValue>) -> HashMap<String, OwnedValue> {
-    use zbus::zvariant::Value;
-    let below_critical = |v: &OwnedValue| {
+fn capped_urgency(mut hints: HashMap<String, OwnedVariant>) -> HashMap<String, OwnedVariant> {
+    use zbus::Variant;
+    let below_critical = |v: &OwnedVariant| {
         let level = match &**v {
-            Value::U8(n) => i128::from(*n),
-            Value::I16(n) => i128::from(*n),
-            Value::U16(n) => i128::from(*n),
-            Value::I32(n) => i128::from(*n),
-            Value::U32(n) => i128::from(*n),
-            Value::I64(n) => i128::from(*n),
-            Value::U64(n) => i128::from(*n),
+            Variant::U8(n) => i128::from(*n),
+            Variant::I16(n) => i128::from(*n),
+            Variant::U16(n) => i128::from(*n),
+            Variant::I32(n) => i128::from(*n),
+            Variant::U32(n) => i128::from(*n),
+            Variant::I64(n) => i128::from(*n),
+            Variant::U64(n) => i128::from(*n),
             _ => return false,
         };
         level < i128::from(URGENCY_CRITICAL)
@@ -766,8 +768,11 @@ impl Served {
     /// whose structure holds an image and not words. Anything else — an array, a dictionary, a
     /// variant wrapping a string, an object path — is dropped: each is a place a credential could
     /// ride past a redaction that reads strings alone, and no hint of the specification is one.
-    fn redacted_hints(&self, hints: HashMap<String, OwnedValue>) -> HashMap<String, OwnedValue> {
-        use zbus::zvariant::Value;
+    fn redacted_hints(
+        &self,
+        hints: HashMap<String, OwnedVariant>,
+    ) -> HashMap<String, OwnedVariant> {
+        use zbus::Variant;
         hints
             .into_iter()
             .filter_map(|(name, value)| {
@@ -775,25 +780,25 @@ impl Served {
                     return Some((name, value));
                 }
                 match &*value {
-                    Value::Str(text) => {
+                    Variant::Str(text) => {
                         let clean = self.redacted(text.to_string());
                         if clean == text.as_str() {
                             return Some((name, value));
                         }
                         // A value that cannot be rebuilt is dropped rather than forwarded with
                         // the credential still in it.
-                        let owned = Value::from(clean).try_to_owned().ok()?;
+                        let owned = Variant::from(clean).try_to_owned().ok()?;
                         Some((name, owned))
                     }
-                    Value::U8(_)
-                    | Value::Bool(_)
-                    | Value::I16(_)
-                    | Value::U16(_)
-                    | Value::I32(_)
-                    | Value::U32(_)
-                    | Value::I64(_)
-                    | Value::U64(_)
-                    | Value::F64(_) => Some((name, value)),
+                    Variant::U8(_)
+                    | Variant::Bool(_)
+                    | Variant::I16(_)
+                    | Variant::U16(_)
+                    | Variant::I32(_)
+                    | Variant::U32(_)
+                    | Variant::I64(_)
+                    | Variant::U64(_)
+                    | Variant::F64(_) => Some((name, value)),
                     _ => None,
                 }
             })
@@ -809,7 +814,7 @@ impl Served {
         summary: String,
         body: String,
         actions: Vec<String>,
-        hints: HashMap<String, OwnedValue>,
+        hints: HashMap<String, OwnedVariant>,
         expire_timeout: i32,
     ) -> fdo::Result<u32> {
         // An id the relay never handed out is not the cage's to overwrite, so it is downgraded to the
@@ -900,7 +905,7 @@ type NotifyArgs = (
     String,
     String,
     Vec<String>,
-    HashMap<String, OwnedValue>,
+    HashMap<String, OwnedVariant>,
     i32,
 );
 
@@ -1018,7 +1023,7 @@ async fn respond<B>(
 where
     B: serde::Serialize + DynamicType,
 {
-    if call.primary().flags().contains(Flags::NoReplyExpected) {
+    if call.primary().flags().contains(Flags::NO_REPLY_EXPECTED) {
         return Ok(());
     }
     match outcome {
@@ -1088,7 +1093,7 @@ async fn answer(conn: &zbus::Connection, served: &Served, call: &Message) -> zbu
             "GetAll" => {
                 let outcome = arguments::<String>(call).and_then(|asked| {
                     if asked == IFACE {
-                        Ok(HashMap::<String, OwnedValue>::new())
+                        Ok(HashMap::<String, OwnedVariant>::new())
                     } else {
                         Err(fdo::Error::UnknownInterface(format!(
                             "Unknown interface '{asked}'"
@@ -1156,7 +1161,7 @@ impl NotifyRelay {
         let handle = std::thread::Builder::new()
             .name("sbx-notify-relay".to_string())
             .spawn(move || {
-                if let Err(e) = async_io::block_on(run(private_socket, host_bus, rx, needles)) {
+                if let Err(e) = zbus::block_on(run(private_socket, host_bus, rx, needles)) {
                     // A connection error to the private bus is almost always the cage tearing down
                     // (the in-cage dbus-daemon went away) — a benign teardown race on a short-lived
                     // launch, not worth alarming the user. Only a genuinely unexpected failure (e.g.
@@ -1310,8 +1315,8 @@ async fn relay(
     // The host bus (the ambient $DBUS_SESSION_BUS_ADDRESS unless told otherwise) and a proxy onto
     // its notifications daemon, every call to which gives up after `HOST_CALL_DEADLINE`.
     let host_conn = match host_bus.as_deref() {
-        Some(address) => connection::Builder::address(address)?,
-        None => connection::Builder::session()?,
+        Some(address) => connection::Builder::address(address),
+        None => connection::Builder::session(),
     }
     .method_timeout(HOST_CALL_DEADLINE)
     .build()
@@ -1326,7 +1331,7 @@ async fn relay(
     // than served by zbus's object server, whose queue is 64 calls deep and which decodes a call
     // before any method sees it. The stream listens with the rule that server uses, and is in place
     // before the name is requested, so no call addressed to the name arrives with nothing to take it.
-    let private_conn = connection::Builder::async_io_unix_stream(private_stream)
+    let private_conn = connection::Builder::unix_stream(private_stream)
         .build()
         .await?;
     let unique = private_conn
@@ -1334,8 +1339,8 @@ async fn relay(
         .ok_or("the private bus assigned the relay no unique name")?;
     let to_relay = MatchRule::builder()
         .msg_type(Type::MethodCall)
-        .destination(unique.as_str())?
-        .build();
+        .destination(unique.as_str())
+        .build()?;
     let calls = MessageStream::for_match_rule(to_relay, &private_conn, Some(CALLS_QUEUED)).await?;
     private_conn.request_name(IFACE).await?;
     let ours = Arc::new(OwnedIds::default());
@@ -1434,7 +1439,7 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = async_io::block_on(run(bus, None, shutdown, Default::default()));
+            let outcome = zbus::block_on(run(bus, None, shutdown, Default::default()));
             let _ = tx.send(outcome.map_err(|e| e.to_string()));
         });
         let err = rx
@@ -1458,7 +1463,7 @@ mod tests {
     /// busy-but-live cage is never cut.
     #[test]
     fn a_write_that_never_finishes_is_given_up_on_rather_than_parking() {
-        async_io::block_on(async {
+        zbus::block_on(async {
             let bound = Duration::from_millis(50);
 
             let started = Instant::now();
@@ -1581,7 +1586,7 @@ mod tests {
         let dir = crate::testutil::TmpDir::new();
         let served = served_by_mac(dir.path());
         let refusal = "Blocked: evil.com:443";
-        async_io::block_on(served.notify(
+        zbus::block_on(served.notify(
             "sbx".to_string(),
             0,
             String::new(),
@@ -1622,9 +1627,9 @@ mod tests {
             "a replacement is a new note"
         );
 
-        let caps = async_io::block_on(served.get_capabilities()).unwrap();
+        let caps = zbus::block_on(served.get_capabilities()).unwrap();
         assert!(!caps.iter().any(|c| c == "actions"), "{caps:?}");
-        async_io::block_on(served.close_notification(first)).unwrap();
+        zbus::block_on(served.close_notification(first)).unwrap();
     }
 
     /// The relay in front of Windows toasts raised through `toaster`.
@@ -1647,7 +1652,7 @@ mod tests {
         let refusal = "Blocked: evil.com:443";
         let host = FakeHost::default();
         let served = served(&host);
-        async_io::block_on(served.notify(
+        zbus::block_on(served.notify(
             "sbx".to_string(),
             0,
             String::new(),
@@ -1679,9 +1684,9 @@ mod tests {
         let second = notify(&served, first);
         assert!(first != 0 && second != 0 && first != second);
         assert!(ours.owns(first) && ours.owns(second));
-        let caps = async_io::block_on(served.get_capabilities()).unwrap();
+        let caps = zbus::block_on(served.get_capabilities()).unwrap();
         assert!(!caps.iter().any(|c| c == "actions"), "{caps:?}");
-        async_io::block_on(served.close_notification(first)).unwrap();
+        zbus::block_on(served.close_notification(first)).unwrap();
     }
 
     /// Each toast is a process on the Windows side, so a cage that calls `Notify` in a loop is held
@@ -1702,7 +1707,7 @@ mod tests {
         }
         let (served, _) = served_by_windows(toaster);
         let call = || {
-            async_io::block_on(served.notify(
+            zbus::block_on(served.notify(
                 "app".to_string(),
                 0,
                 String::new(),
@@ -1759,7 +1764,7 @@ mod tests {
     fn a_credential_in_a_caged_apps_notification_does_not_reach_the_host_daemon() {
         let host = FakeHost::default();
         let with_secret = served_with_needle(&host, "gh_token", "ghp-abcdefghij");
-        async_io::block_on(with_secret.notify(
+        zbus::block_on(with_secret.notify(
             "caged-app".to_string(),
             0,
             String::new(),
@@ -1797,12 +1802,11 @@ mod tests {
     fn a_credential_in_the_identity_fields_or_a_hint_does_not_reach_the_host_daemon() {
         let host = FakeHost::default();
         let with_secret = served_with_needle(&host, "gh_token", "ghp-abcdefghij");
-        let string = |s: &str| zbus::zvariant::Value::from(s).try_to_owned().unwrap();
-        let wrapped =
-            zbus::zvariant::Value::Value(Box::new(zbus::zvariant::Value::from("ghp-abcdefghij")))
-                .try_to_owned()
-                .unwrap();
-        let listed = zbus::zvariant::Value::from(vec!["ghp-abcdefghij"])
+        let string = |s: &str| zbus::Variant::from(s).try_to_owned().unwrap();
+        let wrapped = zbus::Variant::Variant(Box::new(zbus::Variant::from("ghp-abcdefghij")))
+            .try_to_owned()
+            .unwrap();
+        let listed = zbus::Variant::from(vec!["ghp-abcdefghij"])
             .try_to_owned()
             .unwrap();
         let hints = HashMap::from([
@@ -1810,7 +1814,7 @@ mod tests {
             ("x-plain".to_string(), string("nothing here")),
             ("x-wrapped".to_string(), wrapped),
             ("x-listed".to_string(), listed),
-            ("transient".to_string(), OwnedValue::from(true)),
+            ("transient".to_string(), OwnedVariant::from(true)),
         ]);
         notify_as(
             &with_secret,
@@ -1841,7 +1845,7 @@ mod tests {
     #[test]
     fn a_relayed_notification_keeps_its_one_line_fields_to_one_line() {
         let host = FakeHost::default();
-        async_io::block_on(served(&host).notify(
+        zbus::block_on(served(&host).notify(
             "app\nFAKE".to_string(),
             0,
             String::new(),
@@ -1865,29 +1869,25 @@ mod tests {
 
     #[test]
     fn a_critical_urgency_is_capped_whatever_integer_carries_it() {
-        let urgency = |v: OwnedValue| {
+        let urgency = |v: OwnedVariant| {
             capped_urgency(HashMap::from([("urgency".to_string(), v)])).contains_key("urgency")
         };
-        assert!(!urgency(OwnedValue::from(2u8)));
-        assert!(!urgency(OwnedValue::from(2i32)));
-        assert!(!urgency(OwnedValue::from(7u32)));
-        assert!(!urgency(OwnedValue::from(2i64)));
-        assert!(urgency(OwnedValue::from(1u8)), "normal crosses");
+        assert!(!urgency(OwnedVariant::from(2u8)));
+        assert!(!urgency(OwnedVariant::from(2i32)));
+        assert!(!urgency(OwnedVariant::from(7u32)));
+        assert!(!urgency(OwnedVariant::from(2i64)));
+        assert!(urgency(OwnedVariant::from(1u8)), "normal crosses");
         assert!(
-            urgency(OwnedValue::from(1i32)),
+            urgency(OwnedVariant::from(1i32)),
             "normal crosses in any width"
         );
-        assert!(urgency(OwnedValue::from(0u16)), "low crosses");
+        assert!(urgency(OwnedVariant::from(0u16)), "low crosses");
         assert!(
-            !urgency(OwnedValue::from(2.0f64)),
+            !urgency(OwnedVariant::from(2.0f64)),
             "a double is no urgency to trust"
         );
         assert!(
-            !urgency(
-                zbus::zvariant::Value::from("critical")
-                    .try_to_owned()
-                    .unwrap()
-            ),
+            !urgency(zbus::Variant::from("critical").try_to_owned().unwrap()),
             "nor is a string"
         );
     }
@@ -1981,9 +1981,9 @@ mod tests {
         app_name: &str,
         replaces_id: u32,
         app_icon: &str,
-        hints: HashMap<String, OwnedValue>,
+        hints: HashMap<String, OwnedVariant>,
     ) -> u32 {
-        async_io::block_on(served.notify(
+        zbus::block_on(served.notify(
             app_name.to_string(),
             replaces_id,
             app_icon.to_string(),
@@ -1997,8 +1997,8 @@ mod tests {
     }
 
     /// A hint value, as a caged app would send one.
-    fn hint(value: &str) -> OwnedValue {
-        zbus::zvariant::Value::from(value)
+    fn hint(value: &str) -> OwnedVariant {
+        zbus::Variant::from(value)
             .try_into()
             .expect("a string is a hint value")
     }
@@ -2014,7 +2014,7 @@ mod tests {
         let host = FakeHost::default();
         let served = served(&host);
         let long = |n: usize| "x".repeat(n);
-        async_io::block_on(
+        zbus::block_on(
             served.notify(
                 "caged-app".to_string(),
                 0,
@@ -2085,7 +2085,7 @@ mod tests {
 
         // Answered `Ok` — an app closing a notification the host already expired must not start
         // seeing failures — but nothing reaches the daemon.
-        async_io::block_on(served.close_notification(mine + 1))
+        zbus::block_on(served.close_notification(mine + 1))
             .expect("closing an id the cage does not own is a no-op, not an error");
         assert!(
             host.closed().is_empty(),
@@ -2094,7 +2094,7 @@ mod tests {
             host.closed()
         );
 
-        async_io::block_on(served.close_notification(mine))
+        zbus::block_on(served.close_notification(mine))
             .expect("closing the cage's own notification forwards cleanly");
         assert_eq!(
             host.closed(),
@@ -2306,11 +2306,11 @@ mod tests {
         let host = FakeHost::default();
         let served = served(&host);
 
-        let urgency = |level: u8| -> HashMap<String, OwnedValue> {
+        let urgency = |level: u8| -> HashMap<String, OwnedVariant> {
             let mut h = HashMap::new();
             h.insert(
                 "urgency".to_string(),
-                zbus::zvariant::Value::from(level)
+                zbus::Variant::from(level)
                     .try_into()
                     .expect("a byte is a hint value"),
             );
@@ -2395,13 +2395,13 @@ mod tests {
         &'static str,
         &'static str,
         Vec<&'static str>,
-        HashMap<&'static str, zbus::zvariant::Value<'static>>,
+        HashMap<&'static str, zbus::Variant<'static>>,
         i32,
     );
 
     fn notify_args(hint_bytes: usize) -> NotifyCallArgs {
         let mut hints = HashMap::new();
-        hints.insert("x-blob", zbus::zvariant::Value::from(vec![0u8; hint_bytes]));
+        hints.insert("x-blob", zbus::Variant::from(vec![0u8; hint_bytes]));
         ("caged-app", 0, "", "summary", "body", Vec::new(), hints, -1)
     }
 
@@ -2414,9 +2414,9 @@ mod tests {
 
     fn notify_message(hint_bytes: usize) -> Message {
         Message::method_call(OBJECT, "Notify")
-            .and_then(|m| m.destination(IFACE))
-            .and_then(|m| m.interface(IFACE))
-            .and_then(|m| m.build(&notify_args(hint_bytes)))
+            .destination(IFACE)
+            .interface(IFACE)
+            .build(&notify_args(hint_bytes))
             .expect("a well-formed call")
     }
 
@@ -2524,7 +2524,7 @@ mod tests {
             _summary: String,
             _body: String,
             _actions: Vec<String>,
-            _hints: HashMap<String, OwnedValue>,
+            _hints: HashMap<String, OwnedVariant>,
             _expire_timeout: i32,
         ) -> u32 {
             let earlier = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2556,11 +2556,10 @@ mod tests {
             seen: Arc::clone(seen),
             stalled,
         };
-        async_io::block_on(
+        zbus::block_on(
             connection::Builder::address(address)
-                .and_then(|b| b.name(IFACE))
-                .and_then(|b| b.serve_at(OBJECT, daemon))
-                .expect("a well-formed daemon")
+                .name(IFACE)
+                .serve_at(OBJECT, daemon)
                 .build(),
         )
         .expect("the fake daemon owns the name")
@@ -2571,7 +2570,6 @@ mod tests {
     async fn cage_app(sock: &std::path::Path) -> zbus::Connection {
         let started = Instant::now();
         let app = connection::Builder::address(address_of(sock).as_str())
-            .expect("a well-formed address")
             .build()
             .await
             .expect("the private bus accepts the app");
@@ -2612,7 +2610,7 @@ mod tests {
         let _daemon = fake_daemon(&host_address, &seen, true);
         let relay = NotifyRelay::start_on(sock.clone(), Some(host_address), Default::default());
 
-        async_io::block_on(async {
+        zbus::block_on(async {
             let app = cage_app(&sock).await;
             let asked = app
                 .call_method(Some(IFACE), OBJECT, Some(PEER), "GetMachineId", &())
@@ -2674,7 +2672,7 @@ mod tests {
         let _daemon = fake_daemon(&host_address, &seen, false);
         let _relay = NotifyRelay::start_on(sock.clone(), Some(host_address), Default::default());
 
-        async_io::block_on(async {
+        zbus::block_on(async {
             let app = cage_app(&sock).await;
 
             let id: u32 = call_notify(&app, 64)
@@ -2742,13 +2740,13 @@ mod tests {
         let daemon = fake_daemon(&host_address, &seen, false);
         let _relay = NotifyRelay::start_on(sock.clone(), Some(host_address), Default::default());
 
-        async_io::block_on(async {
+        zbus::block_on(async {
             let app = cage_app(&sock).await;
             let rule = MatchRule::builder()
                 .msg_type(Type::Signal)
                 .interface(IFACE)
-                .expect("a well-formed interface")
-                .build();
+                .build()
+                .expect("a well-formed rule");
             let mut signals = MessageStream::for_match_rule(rule, &app, None)
                 .await
                 .expect("the cage subscribes");
@@ -2827,7 +2825,7 @@ mod tests {
         std::thread::sleep(LATE);
         let _private_bus = test_bus(&sock).expect("the dbus-daemon that served the host side");
 
-        async_io::block_on(async {
+        zbus::block_on(async {
             let app = cage_app(&sock).await;
             let reply = call_notify(&app, 64).await.expect("the relay answers");
             let id: u32 = reply.body().deserialize().expect("an id");

@@ -562,7 +562,7 @@ impl Sink for MacNoteSink {
 /// The desktop sink: `org.freedesktop.Notifications.Notify` on the host session bus.
 ///
 /// Holds the connection for the session's lifetime — one connection, one thread, and the async work
-/// driven by `async_io::block_on` so nothing async escapes this module (the same arrangement the
+/// driven by `zbus::block_on` so nothing async escapes this module (the same arrangement the
 /// in-cage relays use; sbx's own world is std threads).
 struct DesktopSink {
     proxy: crate::sandbox::notify_relay::HostNotificationsProxy<'static>,
@@ -596,7 +596,7 @@ fn bounded_notify_within(
     call: impl std::future::Future<Output = Result<u32, ()>>,
     deadline: Duration,
 ) -> Result<u32, ()> {
-    async_io::block_on(async {
+    zbus::block_on(async {
         futures_util::select! {
             sent = call.fuse() => sent,
             _ = futures_util::FutureExt::fuse(async_io::Timer::after(deadline)) => Err(()),
@@ -616,10 +616,10 @@ async fn notify_over(
 ) -> Result<u32, ()> {
     let icon = icon_for(settings).await;
     let mut hints = std::collections::HashMap::new();
-    if let Ok(v) = zbus::zvariant::Value::from(URGENCY_NORMAL).try_into() {
+    if let Ok(v) = zbus::Variant::from(URGENCY_NORMAL).try_into() {
         hints.insert("urgency".to_string(), v);
     }
-    if let Ok(v) = zbus::zvariant::Value::from("security").try_into() {
+    if let Ok(v) = zbus::Variant::from("security").try_into() {
         hints.insert("category".to_string(), v);
     }
     // The same icon under the 1.2 hint as well as the `app_icon` argument, because daemons differ
@@ -627,7 +627,7 @@ async fn notify_over(
     // is for, and a daemon that failed to resolve it under `image-path` could render nothing at
     // all rather than falling back.
     if icon != FALLBACK_ICON
-        && let Ok(v) = zbus::zvariant::Value::from(icon).try_into()
+        && let Ok(v) = zbus::Variant::from(icon).try_into()
     {
         hints.insert("image-path".to_string(), v);
     }
@@ -767,7 +767,7 @@ impl DesktopSink {
         app_name: String,
         deadline: Duration,
     ) -> Option<DesktopSink> {
-        async_io::block_on(async {
+        zbus::block_on(async {
             futures_util::select! {
                 sink = Self::bind(address, app_name).fuse() => sink,
                 _ = FutureExt::fuse(async_io::Timer::after(deadline)) => None,
@@ -780,7 +780,6 @@ impl DesktopSink {
     async fn bind(address: Option<&str>, app_name: String) -> Option<DesktopSink> {
         let conn = match address {
             Some(addr) => zbus::connection::Builder::address(addr)
-                .ok()?
                 .build()
                 .await
                 .ok()?,
@@ -1975,7 +1974,7 @@ mod tests {
             _summary: String,
             _body: String,
             _actions: Vec<String>,
-            hints: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+            hints: std::collections::HashMap<String, zbus::OwnedVariant>,
             _expire_timeout: i32,
         ) -> u32 {
             self.calls.fetch_add(1, Ordering::Relaxed);
@@ -2168,9 +2167,9 @@ mod tests {
             &self,
             _namespace: String,
             _key: String,
-        ) -> zbus::fdo::Result<zbus::zvariant::OwnedValue> {
+        ) -> zbus::fdo::Result<zbus::OwnedVariant> {
             let n = self.scheme.load(Ordering::Relaxed) as u32;
-            zbus::zvariant::Value::from(n)
+            zbus::Variant::from(n)
                 .try_into()
                 .map_err(|_| zbus::fdo::Error::Failed("cannot build the reply".into()))
         }
@@ -2224,18 +2223,15 @@ mod tests {
         // `prefer-light` (2) to begin with. Owning the portal name here also keeps the bus from
         // activating the real one behind our back.
         let scheme = Arc::new(AtomicU64::new(2));
-        let _portal = async_io::block_on(async {
+        let _portal = zbus::block_on(async {
             zbus::connection::Builder::address(address.as_str())
-                .unwrap()
                 .name("org.freedesktop.portal.Desktop")
-                .unwrap()
                 .serve_at(
                     "/org/freedesktop/portal/desktop",
                     FakePortal {
                         scheme: Arc::clone(&scheme),
                     },
                 )
-                .unwrap()
                 .build()
                 .await
                 .expect("the fake portal owns the name")
@@ -2267,9 +2263,8 @@ mod tests {
 
     /// Block until nobody owns the notifications name on `address`, or a bounded wait elapses.
     fn wait_until_unowned(address: &str) {
-        async_io::block_on(async {
+        zbus::block_on(async {
             let conn = zbus::connection::Builder::address(address)
-                .unwrap()
                 .build()
                 .await
                 .expect("the bus is up");
@@ -2297,13 +2292,10 @@ mod tests {
         calls: Arc<AtomicU64>,
         seen: Arc<RwLock<Vec<Served>>>,
     ) -> zbus::Connection {
-        async_io::block_on(async {
+        zbus::block_on(async {
             zbus::connection::Builder::address(address)
-                .unwrap()
                 .name("org.freedesktop.Notifications")
-                .unwrap()
                 .serve_at("/org/freedesktop/Notifications", FakeDaemon { calls, seen })
-                .unwrap()
                 .build()
                 .await
                 .expect("the fake daemon owns the name")

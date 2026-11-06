@@ -26,7 +26,7 @@
 //! when it answers, Windows when it does not and the kernel is a WSL one.
 //!
 //! Lifecycle mirrors [`super::notify_relay`]: [`ThemeRelay::start`] spawns a dedicated thread driving
-//! the async work with `async_io::block_on` (no tokio); the guard's `Drop` closes a shutdown channel
+//! the async work with `zbus::block_on` (no tokio); the guard's `Drop` closes a shutdown channel
 //! and joins the thread. The WSL body waits on a pipe instead of that channel, so `Drop` also ends
 //! the watcher process, which is what closes the pipe. That watcher is started only after
 //! [`WATCH_START_DELAY`], because starting it competes with the launch it runs alongside, and a
@@ -37,8 +37,8 @@ use crate::diag;
 use futures_util::{FutureExt, StreamExt};
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
+use zbus::Variant;
 use zbus::proxy;
-use zbus::zvariant::Value;
 
 /// Client proxy onto the **host** desktop portal's Settings interface, for the appearance
 /// `color-scheme` `SettingChanged` signal.
@@ -50,14 +50,14 @@ use zbus::zvariant::Value;
 pub(crate) trait HostSettings {
     /// The current value of one setting. Used for the at-launch read; the signal below carries
     /// every later change.
-    fn read(&self, namespace: &str, key: &str) -> zbus::Result<zbus::zvariant::OwnedValue>;
+    fn read(&self, namespace: &str, key: &str) -> zbus::Result<zbus::OwnedVariant>;
 
     #[zbus(signal)]
     fn setting_changed(
         &self,
         namespace: String,
         key: String,
-        value: zbus::zvariant::OwnedValue,
+        value: zbus::OwnedVariant,
     ) -> zbus::Result<()>;
 }
 
@@ -144,7 +144,7 @@ fn mac_fallback(mounted: bool, read: impl FnOnce() -> Option<String>) -> Option<
 /// does not, and following the other source would correct the cage to a value read a second way.
 /// Sharing the read is what keeps the seed and the relay on one interpretation.
 fn portal_color_scheme() -> Option<String> {
-    async_io::block_on(async {
+    zbus::block_on(async {
         futures_util::select! {
             scheme = current_color_scheme().fuse() => scheme,
             // `Timer` is both a `Future` and a `Stream`, so name the trait rather than let
@@ -352,7 +352,7 @@ const MAC_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 fn run_mac_watch(home: &Path, shutdown: &async_channel::Receiver<()>) {
     let mut last = super::lima_mac::read_color_scheme();
     loop {
-        let ended = async_io::block_on(async {
+        let ended = zbus::block_on(async {
             futures_util::select! {
                 _ = shutdown.recv().fuse() => true,
                 _ = FutureExt::fuse(async_io::Timer::after(MAC_POLL)) => false,
@@ -454,7 +454,7 @@ fn run_relay(
         return;
     }
     if !relay_follows_windows(portal_answered, is_wsl) {
-        if let Err(e) = async_io::block_on(run_portal(home, shutdown))
+        if let Err(e) = zbus::block_on(run_portal(home, shutdown))
             && !bus_error_is_a_teardown_race(&e.to_string())
         {
             diag::warn(&format!(
@@ -469,7 +469,7 @@ fn run_relay(
     // waiting, and a sleep would wake to start a watcher for a cage that no longer exists. Waiting
     // on the channel makes an early end of the launch the other way out of the delay. A closed
     // channel returns immediately, which is that same case seen one moment later.
-    let ended = async_io::block_on(async {
+    let ended = zbus::block_on(async {
         futures_util::select! {
             _ = shutdown.recv().fuse() => true,
             _ = FutureExt::fuse(async_io::Timer::after(WATCH_START_DELAY)) => false,
@@ -615,10 +615,10 @@ async fn run_portal(
 }
 
 /// Unwrap the `color-scheme` value to its `uint32`, tolerating a nested variant (`v(v(u))`). Pure.
-fn extract_u32(value: &Value) -> Option<u32> {
+fn extract_u32(value: &Variant) -> Option<u32> {
     match value {
-        Value::U32(n) => Some(*n),
-        Value::Value(inner) => extract_u32(inner),
+        Variant::U32(n) => Some(*n),
+        Variant::Variant(inner) => extract_u32(inner),
         _ => None,
     }
 }
@@ -711,7 +711,7 @@ mod tests {
     /// must produce a scheme — the two cases cannot be confused, which is the whole point (a read
     /// that silently answers `None` everywhere would otherwise look like "no portal here").
     fn host_portal_present() -> bool {
-        async_io::block_on(async {
+        zbus::block_on(async {
             let Ok(conn) = zbus::Connection::session().await else {
                 return false;
             };
@@ -749,12 +749,12 @@ mod tests {
 
     #[test]
     fn extract_u32_reads_a_bare_or_nested_variant() {
-        assert_eq!(extract_u32(&Value::U32(1)), Some(1));
+        assert_eq!(extract_u32(&Variant::U32(1)), Some(1));
         // The appearance value can arrive wrapped in an extra variant (`v(v(u))`).
-        let nested = Value::Value(Box::new(Value::U32(2)));
+        let nested = Variant::Variant(Box::new(Variant::U32(2)));
         assert_eq!(extract_u32(&nested), Some(2));
         // A non-uint value yields nothing rather than a bogus scheme.
-        assert_eq!(extract_u32(&Value::Bool(true)), None);
+        assert_eq!(extract_u32(&Variant::Bool(true)), None);
     }
 
     #[test]

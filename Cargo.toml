@@ -29,9 +29,10 @@ bundled-bwrap = []
 
 [dependencies]
 # The in-cage desktop notifications relay (`dbus = true`): bridges the cage's private D-Bus bus
-# to the host `org.freedesktop.Notifications`. The async runtime is the pure-Rust `async-io` backend
-# (NOT tokio), driven by `async_io::block_on` on a single dedicated thread inside `notify_relay`, so
-# nothing async leaks into sbx's std-thread world (the egress proxy stays sync std threads).
+# to the host `org.freedesktop.Notifications`. The async runtime is zbus's own pure-Rust one (NOT
+# tokio), driven by `zbus::block_on` on a single dedicated thread inside `notify_relay`, so nothing
+# async leaks into sbx's std-thread world (the egress proxy stays sync std threads). `async-io`
+# supplies the timers.
 async-channel = "2"
 async-io = "2"
 # The egress proxy's HTTP/2 (gRPC) man-in-the-middle path. `h2` is tokio-based, so a designated
@@ -60,7 +61,7 @@ toml_edit = "0.25"
 tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "time", "macros"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
-zbus = { version = "5", default-features = false, features = ["async-io"] }
+zbus = { version = "6", default-features = false, features = ["default-rt", "proxy", "service"] }
 # Raw DEFLATE, for reading a `permessage-deflate` WebSocket in the traffic capture: those
 # payloads are compressed on the wire, so without this the transcript of the very protocols
 # the capture exists for reads as binary. Pure Rust with no C, so the static musl build is
