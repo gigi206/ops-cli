@@ -9313,7 +9313,8 @@ fn a_nested_namespace_cannot_unmount_what_the_cage_mounted() {
             && echo OWN-UNMOUNTED
         umount -l "$PWD/k.key"; echo "unmount=$?"
         echo "read=$(cat k.key)"'"#;
-    let Some(out) = trusted_launch("nested unmount e2e", || {
+    let out = probe_or_skip!(
+        "nested unmount e2e",
         sbx_session_in(project.path(), data.path(), state.path())
             .env("SBX_BWRAP_BIN", &stand_in)
             .args([
@@ -9331,9 +9332,7 @@ fn a_nested_namespace_cannot_unmount_what_the_cage_mounted() {
             ])
             .output()
             .expect("spawn sbx")
-    }) else {
-        return;
-    };
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !stdout.contains("uid=0") {
         skip_incapable!("skipping nested unmount e2e: the host refused the nested namespace");

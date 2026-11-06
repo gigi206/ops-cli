@@ -2754,6 +2754,12 @@ mod tests {
                     );
                     continue;
                 }
+                // A removal offers the rules the working directory's config holds, which are
+                // that file's and not the grammar's. `insertable` is what stands between them
+                // and a shell.
+                if removal_list(path).is_some() {
+                    continue;
+                }
                 // A value candidate is a single word the shell can insert as typed: a
                 // registry name, a pid, a `<pid>.<seq>` id, a cell of the grammar. Never
                 // a metavariable, an alternation, or a fragment of prose.
