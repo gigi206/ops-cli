@@ -104,10 +104,10 @@ opened:
   comes with it.)
 - **`ioctl`, `ioctl:tiocsti`, `ioctl:tioclinux`** → reopens **terminal input injection**
   (writing into the controlling terminal's input queue).
-- **`umount2`** → reopens **tearing down a mount**. This is the one entry with a
-  launch-side interdependency: if you also bind `sbx`'s control plane read-write, in-cage
-  code could unmount a pin and defeat a control-plane protection. Lift it only when you
-  understand that interaction.
+- **`umount2`** → reopens **tearing down a mount**, and only one made in a nested
+  namespace. The cage's own mounts stay out of reach, control-plane pins and `[fs]` masks
+  among them: the cage holds no capability, and a nested namespace receives them locked,
+  so the kernel refuses with `EINVAL`.
 
 Cautions are informational: the token is still applied.
 

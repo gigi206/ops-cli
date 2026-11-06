@@ -54,7 +54,7 @@
 //! rest denied. An empty or absent `allow` list reproduces the mandatory baseline exactly.
 //! Loosening is trusted-only (an untrusted project's `[seccomp]` is dropped), and each token
 //! that reopens a real escape surface (`clone`→userns, `ioctl`→terminal injection,
-//! `umount2`→a mount teardown that can defeat a control-plane pin) is surfaced with a
+//! `umount2`→tearing down a mount a nested namespace made) is surfaced with a
 //! [`Caution`] the resolver turns into a warning.
 //!
 //! ## The helpers' own filters
@@ -654,8 +654,9 @@ pub(crate) enum Caution {
     /// Reopens injecting input into the controlling terminal (bare `ioctl`, `ioctl:tiocsti`,
     /// `ioctl:tioclinux`).
     TerminalInjection,
-    /// Reopens tearing down a mount, which can defeat a control-plane pin sbx relies on (`umount2`).
-    ControlPlane,
+    /// Reopens tearing down a mount (`umount2`). The cage's own mounts are out of its reach: the
+    /// cage holds no capability, and a nested namespace receives them locked.
+    Unmount,
 }
 
 impl Caution {
@@ -664,9 +665,9 @@ impl Caution {
         match self {
             Caution::Userns => "unprivileged user-namespace creation",
             Caution::TerminalInjection => "terminal input injection",
-            Caution::ControlPlane => {
-                "tearing down a mount (can defeat a control-plane pin when sbx's control plane is \
-                 bound read-write, and every `[fs]` mask, which is a mount over a project path)"
+            Caution::Unmount => {
+                "tearing down a mount (only one made in a nested namespace: the cage's own, \
+                 control-plane pins and `[fs]` masks among them, stay locked)"
             }
         }
     }
@@ -715,7 +716,7 @@ pub(crate) fn resolve_allow(token: &str) -> Result<(Allow, Option<Caution>), Str
         name => match denied_number(name) {
             Some(nr) => {
                 let caution = match name {
-                    "umount2" => Some(Caution::ControlPlane),
+                    "umount2" => Some(Caution::Unmount),
                     // clone3 cannot be argument-filtered (its flags live behind a struct pointer a
                     // cBPF cannot read), so lifting it reopens unfiltered namespace creation.
                     "clone3" => Some(Caution::Userns),
@@ -1004,9 +1005,9 @@ mod tests {
             // mount/ns family
             libc::SYS_unshare,
             libc::SYS_mount,
-            // `umount2` is load-bearing beyond LPE surface reduction: the control-plane pins rely
-            // on in-cage code being unable to tear a pinned mountpoint down (a launch-side
-            // interdependency), so its removal here must fail a test.
+            // `umount2` stays denied by default as surface reduction. What keeps a pinned mountpoint
+            // up is the kernel, not this entry: the cage holds no capability, and a nested
+            // namespace receives the cage's mounts locked.
             libc::SYS_umount2,
             libc::SYS_pivot_root,
             libc::SYS_setns,
@@ -1140,7 +1141,7 @@ mod tests {
         // The two syscalls with a specific, non-default caution.
         assert!(matches!(
             resolve_allow("umount2"),
-            Ok((Allow::Whole(_), Some(Caution::ControlPlane)))
+            Ok((Allow::Whole(_), Some(Caution::Unmount)))
         ));
         assert!(matches!(
             resolve_allow("clone3"),

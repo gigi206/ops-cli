@@ -954,11 +954,11 @@ fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     //          rest of the home is writable, and `/nix` itself is still writable (per-mount, not
     //          per-inode: the read-only pin on the data-dir path does not freeze the store the rw
     //          `/nix` mount is backed by).
-    // Interdependency: the pin's protection also assumes in-cage code cannot `umount` it — which
-    // holds by cap-drop (no CAP_SYS_ADMIN) and the seccomp `umount2` denial (covered by the seccomp
-    // membership + enforcement tests); the base cage carries no `umount` binary, so this e2e
-    // exercises the reachable filesystem attack (rename/remove), not a raw syscall. Skips (never
-    // fails) where the host cannot sandbox.
+    // The pin's protection also assumes in-cage code cannot `umount` it, which holds by cap-drop (no
+    // CAP_SYS_ADMIN) and by the kernel locking a cage's mounts against a nested namespace
+    // (`a_nested_namespace_cannot_unmount_what_the_cage_mounted`). The base cage carries no `umount`
+    // binary, so this e2e exercises the reachable filesystem attack (rename/remove), not a raw
+    // syscall. Skips (never fails) where the host cannot sandbox.
     let (_home, h) = control_plane_home("cp");
     let data = h.join(DATA_REL);
     let state = h.join(STATE_REL);
@@ -9280,6 +9280,77 @@ fi"#;
         } else {
             "n/a"
         },
+    );
+}
+
+/// Lifting the mount family reopens a nested namespace, and that namespace still cannot take the
+/// cage apart: its capabilities stop at itself and it receives the cage's mounts locked, so a `[fs]`
+/// mask stays up. The boundary this states is the kernel's, which is why it is run rather than read.
+///
+/// `OWN-UNMOUNTED` is the control: the same `umount` tearing down a mount the namespace made
+/// itself, so a refusal below cannot come from a tool that fails on everything. `uid=0` proves the
+/// namespace mapped root.
+///
+/// The launch goes through a copy of the host's bwrap, because `/usr/bin/bwrap` attaches to the
+/// AppArmor profile on Ubuntu, whose denial follows the cage and would refuse the `uid_map` write
+/// before anything here was tried. Skips where the host refuses that namespace anyway.
+#[test]
+fn a_nested_namespace_cannot_unmount_what_the_cage_mounted() {
+    let Some(bwrap) = common::bwrap_on_path() else {
+        skip_incapable!("skipping nested unmount e2e: no bwrap on PATH");
+        return;
+    };
+    let project = TmpDir::prefixed("r", "nest-proj");
+    let data = TmpDir::prefixed("r", "nest-data");
+    let state = TmpDir::prefixed("r", "nest-state");
+    let engine = TmpDir::prefixed("r", "nest-bwrap");
+    let stand_in = engine.path().join("bwrap");
+    std::fs::copy(&bwrap, &stand_in).expect("copy bwrap");
+    std::fs::write(project.path().join("k.key"), "TOPSECRET\n").expect("write the masked file");
+
+    let script = r#"unshare -Urm sh -c '
+        echo "uid=$(id -u)"
+        mkdir -p "$HOME/own" && mount -t tmpfs t "$HOME/own" && umount "$HOME/own" \
+            && echo OWN-UNMOUNTED
+        umount -l "$PWD/k.key"; echo "unmount=$?"
+        echo "read=$(cat k.key)"'"#;
+    let Some(out) = trusted_launch("nested unmount e2e", || {
+        sbx_session_in(project.path(), data.path(), state.path())
+            .env("SBX_BWRAP_BIN", &stand_in)
+            .args([
+                "run",
+                "--package",
+                "ul=nix:util-linux",
+                "--seccomp",
+                "unshare,mount,umount2,clone:newns,clone:newuser",
+                "--fs",
+                "deny=k.key",
+                "--",
+                "sh",
+                "-c",
+                script,
+            ])
+            .output()
+            .expect("spawn sbx")
+    }) else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !stdout.contains("uid=0") {
+        skip_incapable!("skipping nested unmount e2e: the host refused the nested namespace");
+        return;
+    }
+    assert!(
+        stdout.contains("OWN-UNMOUNTED"),
+        "control failed:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("unmount=0"),
+        "the mask came down:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("TOPSECRET"),
+        "the file was read:\n{stdout}"
     );
 }
 

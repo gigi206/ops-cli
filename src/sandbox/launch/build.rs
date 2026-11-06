@@ -2878,9 +2878,10 @@ pub(super) fn build(
     // a held directory already provides; the rest stay beneath what the masks lay. A mask inside a
     // root bound from the decoy is dropped by `binds::lay_pins`: the decoy closes it.
     //
-    // Interdependency: the protection assumes in-cage code cannot `umount` a pin. That holds because
-    // bwrap drops all capabilities (no `CAP_SYS_ADMIN` in the cage's user namespace) and the seccomp
-    // filter denies `umount2`/`unshare`/`mount` — a change loosening either would silently break it.
+    // The protection assumes in-cage code cannot `umount` a pin. That holds because bwrap drops all
+    // capabilities (no `CAP_SYS_ADMIN` in the cage's user namespace), and a nested namespace, which
+    // `[seccomp] allow` can reopen, receives the pins locked. Keeping the capabilities is what would
+    // break it.
     // The project counts as one of those read-write binds, and used not to. It is bound read-write
     // at its own path by `binds::build_spec` structurally rather than as a config bind, so it never
     // reached this computation — and a session launched from a directory that *contains* a
