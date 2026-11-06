@@ -68,6 +68,11 @@
       "addLabels": ["security"]
     },
     {
+      "description": "dtolnay/rust-toolchain names its versions by branch, not by tag, so a digest lookup fails. Its pins move with rust-toolchain.toml, which Renovate does read.",
+      "matchPackageNames": ["dtolnay/rust-toolchain"],
+      "enabled": false
+    },
+    {
       "description": "The nixpkgs revision the bundled engines are built from. Detection only: build.rs verifies a sha256 of the resulting binaries, so a revision bump has to carry a recomputed hash and cannot be merged on its own.",
       "matchDepNames": ["NixOS/nixpkgs"],
       "dependencyDashboardApproval": true,
