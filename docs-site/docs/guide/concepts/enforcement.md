@@ -173,9 +173,9 @@ A second filter returns `ENOSYS` (rather than `EPERM`) for:
 Blocking the mount and namespace family makes the
 `user-namespace → mount → overlayfs / pivot_root` code paths **unreachable** in the
 cage. That is a real reduction of the most common Linux local-privilege-escalation
-class. (Dropping all capabilities already neuters a *nested* user namespace on its
-own, the single-uid map cannot map root, so this block is attack-surface
-reduction, not the sole escape stop.)
+class. (A *nested* user namespace holds capabilities over itself alone, with the cage's
+mounts locked against it, so this block is attack-surface reduction, not the sole
+escape stop.)
 
 ### Reconciled with in-cage nix
 

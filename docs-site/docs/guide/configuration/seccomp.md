@@ -34,11 +34,28 @@ re-permit the syscall they need:
 | `perf` | `perf_event_open` | `"perf_event_open"` |
 | CRIU, some runtimes/JITs | `userfaultfd` | `"userfaultfd"` |
 | an `io_uring` app | `io_uring_*` | `"io_uring_setup"`, `"io_uring_enter"`, `"io_uring_register"` |
+| `bwrap`-in-`bwrap` | `unshare`, `clone(NEWUSER)`, `clone(NEWNS)`, `mount`, `umount2`, `pivot_root` | `"unshare"`, `"clone:newuser"`, `"clone:newns"`, `"mount"`, `"umount2"`, `"pivot_root"` |
+| `sbx` in `sbx` | the `bwrap` row, then `setns`, `sethostname`, `setdomainname`, `chroot` | the `bwrap` row, then `"setns"`, `"sethostname"`, `"setdomainname"`, `"chroot"` |
 
 Re-permitting `io_uring` also takes something away: a file opened through the ring is opened
 without an open system call, so the [content scan](fs#scan-closing-a-file-by-what-it-holds) never
 sees it.
-| nested containers / `bwrap`-in-`bwrap` | `unshare`, `mount`, `clone(NEWNS)` | `"unshare"`, `"mount"`, `"clone:newns"` |
+
+### A nested sandbox on an AppArmor host
+
+The tokens are necessary, and on Ubuntu not sufficient. `/usr/bin/bwrap` attaches to the AppArmor
+profile `bwrap`, and everything it starts runs under `unpriv_bwrap`, which denies every capability.
+The denial follows the cage into a nested user namespace, so the `uid_map` write fails and `bwrap`
+reports that it cannot create a namespace, whatever `allow` says. No config field reaches this: the
+host has to launch the outer cage with a `bwrap` at another path, which `SBX_BWRAP_BIN` selects (see
+[`sbx doctor`](../cli/doctor)). That drops the profile from the whole cage, so set it for this one
+launch rather than for every cage, and only where
+`kernel.apparmor_restrict_unprivileged_userns` is `0`.
+
+A nested `sbx` differs from one on a host in three ways: its test binary has to be static, since the
+inner cage holds no loader for a dynamic one; there is no `systemd-run`, so the inner cage carries no
+resource limits of its own; and `sbx doctor` reports the launch probe as failed, because the
+`/bin/sh` it runs is a link into a store the probe does not bind.
 
 ## The grammar
 
@@ -118,10 +135,13 @@ and carries on.
 
 Blocking the mount/namespace family removes the
 `userns → mount → overlayfs/pivot_root` kernel-LPE paths from the cage. Re-permitting
-them reduces that *defense-in-depth*, but the boundary does not rest on it: `sbx` also
-drops all capabilities and runs a single-uid user namespace, so a nested user namespace
-is already neutered (`unshare(CLONE_NEWUSER)` succeeds but the `uid_map` write is
-refused). Lifting a syscall is your informed, trusted-only choice.
+them reduces that *defense-in-depth*, but the boundary does not rest on it. Once the family
+is lifted, a nested user namespace can be created and can map its uid to root, and the
+capabilities that gives it hold over that namespace alone: the cage's own mounts stay locked
+against it, so it can neither unmount an `[fs]` mask, nor bind the directory under one
+without the mask, nor remount a read-only path writable. What it does reach is the kernel
+code behind those calls, which is the surface the denylist exists to remove. Lifting a
+syscall is your informed, trusted-only choice.
 
 Re-permitting the mount/namespace family does **not** re-enable nix's own build sandbox, `sbx` still runs in-cage `nix build` with `sandbox = false` (see
 [Enforcement stack](../concepts/enforcement)).
