@@ -1,0 +1,44 @@
+# Work on sbx from inside an sbx cage: build it, and launch real nested cages from its tests.
+#
+# Inert until `sbx trust`: `[packages]` and `[seccomp]` are both withheld from an untrusted project.
+#
+# This file is not enough on an Ubuntu host. `/usr/bin/bwrap` attaches to the AppArmor profile
+# `bwrap`, whose children run under `unpriv_bwrap`, which denies every capability, including inside
+# a nested user namespace, and no setting here reaches that. The launching host has to use a bwrap
+# outside that path: set `SBX_BWRAP_BIN` to a copy, for this launch and not for every cage.
+#
+# A cage test needs a static binary, since the nested cage holds no loader for a dynamic one:
+# `cargo-zigbuild test --target x86_64-unknown-linux-musl --test <suite>`.
+
+# Read-only: what the tools of `mise.toml` and cargo fetch, on top of the nix and GitHub hosts the
+# self-equip lane already opens.
+[network]
+mode = "deny"
+allow = [
+  "{GET,HEAD} https://static.rust-lang.org",
+  "{GET,HEAD} https://index.crates.io",
+  "{GET,HEAD} https://static.crates.io",
+  "{GET,HEAD} https://nodejs.org",
+  "{GET,HEAD} https://ziglang.org",
+  "{GET,HEAD} https://registry.npmjs.org",
+]
+
+# The `rustup` package below owns the compiler and reads `rust-toolchain.toml`. A mise that records
+# no rust install answers `cargo` by installing rust again from `sh.rustup.rs`, which the list above
+# refuses, so mise is kept off it.
+[env]
+MISE_DISABLE_TOOLS = "rust"
+
+[packages]
+bwrap = "nix:bubblewrap"
+rustup = "nix:rustup"
+gcc = "nix:gcc"
+nft = "nix:nftables"
+ul = "nix:util-linux"
+
+# The first six carry bwrap, `sethostname` and `setns` the nested cage and its netns, and
+# `setdomainname` and `chroot` the build sandbox of the nix that the nested sbx runs.
+[seccomp]
+allow = ["unshare", "setns", "mount", "umount2", "pivot_root",
+         "clone:newns", "clone:newuser",
+         "sethostname", "setdomainname", "chroot"]
