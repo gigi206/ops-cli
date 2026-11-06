@@ -4116,11 +4116,10 @@ fn a_destination_or_credential_held_for_named_programs_follows_the_real_caller()
     let Some(reserve) = run_phase(
         "reserve",
         format!(
-            "[network]\nmode = \"deny\"\nallow = [\"tcp://127.0.0.1:22\"]\n\
+            "[network]\nmode = \"deny\"\n\
+             allow = [\"tcp://127.0.0.1:22\", \"http://127.0.0.1:{pa}\", \"http://127.0.0.1:{pb}\"]\n\
              [network.reserve.\"tcp://127.0.0.1:{pa}\"]\nby = [\"bash\"]\n\
-             [network.reserve.\"http://127.0.0.1:{pa}\"]\nby = [\"bash\"]\n\
-             [network.reserve.\"tcp://127.0.0.1:{pb}\"]\nby = [\"git\"]\n\
-             [network.reserve.\"http://127.0.0.1:{pb}\"]\nby = [\"git\"]\n"
+             [network.reserve.\"tcp://127.0.0.1:{pb}\"]\nby = [\"git\"]\n"
         ),
     ) else {
         return;

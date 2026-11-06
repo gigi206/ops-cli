@@ -849,6 +849,15 @@ pub(super) fn wrap_background(
 /// and their stat files must not be the same file — see where it is read for what that cost.
 static PROXY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Where the host finds `relay`, a path the cage sees through the store bound at `/nix`. The two
+/// differ whenever sbx's store is not the host's own `/nix`, which is the usual case: read at the
+/// cage's path, the forwarder is missing and no program can be named.
+fn relay_on_host(layout: &Layout, relay: &Path) -> PathBuf {
+    layout
+        .store_dir()
+        .join(relay.strip_prefix("/").unwrap_or(relay))
+}
+
 /// Whether a launch holds anything for named programs, which is what needs the supervisor to name
 /// the program behind a connection: a credential declared with `by`, or a destination reserved
 /// under `[network.reserve]`.
@@ -909,9 +918,10 @@ pub(crate) fn start(
     // the event ring: a proxy handed one already has a record attached to it, and opening a second
     // at the same path would truncate the first.
     record: Option<&super::lens::RecordWiring>,
-    // The forwarder's executable on the host (the `socat` the cage bridges its proxy port with),
-    // which naming the program behind a connection walks through ([`super::caller`]). Read only when
-    // a credential is held for named programs (`[secret] by`); `None` where no cage forwards.
+    // The forwarder's executable as the cage sees it (the `socat` the cage bridges its proxy port
+    // with), which naming the program behind a connection walks through ([`super::caller`]). Read
+    // only when something is held for named programs, from the store on the host
+    // ([`relay_on_host`]); `None` where no cage forwards.
     relay: Option<&Path>,
 ) -> io::Result<(Egress, Wiring)> {
     // Tighten the data directory to owner-only before anything reads from it. A resolver plugin
@@ -1178,7 +1188,8 @@ pub(crate) fn start(
     // program, rather than either being handed to every program.
     let identify = match relay {
         Some(relay) if names_callers(secrets, &policy) => {
-            match super::caller::Identify::new(relay, Path::new("/proc/self/exe"), CAGE_PROXY_PORT)
+            let relay = relay_on_host(layout, relay);
+            match super::caller::Identify::new(&relay, Path::new("/proc/self/exe"), CAGE_PROXY_PORT)
             {
                 Ok(identify) => Some(Arc::new(identify)),
                 Err(e) => {
