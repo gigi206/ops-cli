@@ -16,7 +16,7 @@
 # Bump this together with `rust` in `mise.toml` and the `dtolnay/rust-toolchain@<version>` refs in
 # `.github/workflows/`.
 [toolchain]
-channel = "1.97.1"
+channel = "1.99.1"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
 targets = ["x86_64-unknown-linux-musl"]

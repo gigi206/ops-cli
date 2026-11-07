@@ -781,7 +781,7 @@ fn tally(entries: &[u8]) -> io::Result<Space> {
         reason = "`chunks_exact(ENTRY)` yields chunks of exactly `ENTRY` bytes, and `ENTRY` is \
                   three `u64`s, so each eight-byte slice converts"
     )]
-    for e in entries.chunks_exact(ENTRY) {
+    for e in entries.as_chunks::<ENTRY>().0 {
         let flags = u64::from_ne_bytes(e[0..8].try_into().unwrap());
         if flags & GLOBAL_RSV != 0 {
             continue;

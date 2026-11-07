@@ -963,8 +963,8 @@ fn trust_inner(
             .recursive(true)
             .mode(0o700)
             .create(store_dir)
-            .map_err(&store_err)?;
-        std::fs::set_permissions(store_dir, Permissions::from_mode(0o700)).map_err(&store_err)?;
+            .map_err(store_err)?;
+        std::fs::set_permissions(store_dir, Permissions::from_mode(0o700)).map_err(store_err)?;
     }
     // A path sbx cannot name is refused rather than recorded under a name it shares with another
     // path — see `marker_path`. This is the only branch that reports it, because it is the only one
@@ -991,7 +991,7 @@ fn trust_inner(
     // share, and a shared temp is the one thing the rename cannot make atomic — the second writer
     // truncates the inode the first is still filling. That the marker's torn form reads `Changed`
     // makes the outcome safe, not correct.
-    crate::sandbox::atomicfile::write_atomic(&marker, body.as_bytes()).map_err(&store_err)?;
+    crate::sandbox::atomicfile::write_atomic(&marker, body.as_bytes()).map_err(store_err)?;
     // The record of what was approved, after the marker. The other order has a failure that lies:
     // a record written and a marker that is not leaves the previous approval in force beside a
     // record of the new contents, and the next `sbx trust` shows no change where there is one.

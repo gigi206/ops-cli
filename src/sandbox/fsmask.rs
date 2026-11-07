@@ -4216,7 +4216,9 @@ fn ewah_words(data: &[u8]) -> Option<(Vec<u64>, usize)> {
     let end = count.checked_mul(8)?.checked_add(12)?;
     let words = data
         .get(8..end - 4)?
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|word| {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(word);

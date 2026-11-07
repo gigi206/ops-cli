@@ -488,7 +488,7 @@ pub(crate) fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     };
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         out.push(val(pair[0])? << 4 | val(pair[1])?);
     }
     Ok(out)

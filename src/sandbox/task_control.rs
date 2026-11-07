@@ -1137,7 +1137,7 @@ fn admit_quota(
     quota: &AtomicU64,
 ) -> io::Result<Option<u64>> {
     if quota
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
             (left > 0).then(|| left - 1)
         })
         .is_err()

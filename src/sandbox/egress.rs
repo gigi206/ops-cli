@@ -1219,13 +1219,13 @@ pub(crate) fn start(
         refresh,
         identify,
     )
-    .map_err(&unlink_socket)?;
+    .map_err(unlink_socket)?;
     manual
         .attach(launched.supervisor.clone())
-        .map_err(&unlink_socket)?;
+        .map_err(unlink_socket)?;
     // Bind+listen here, before the serving thread, so the control plane is reachable the moment the
     // launch is up: never a race with the first `sbx net pending`/`sbx net logs`.
-    let control_listener = UnixListener::bind(&control_uds).map_err(&unlink_socket)?;
+    let control_listener = UnixListener::bind(&control_uds).map_err(unlink_socket)?;
     // The tap's own channel, made beside the control socket and before either thread starts, so a
     // failure here has only the two paths to take back. The tap reports down it, never on the
     // owner's socket above, and it has no path: the wiring carries the tap's end to the launcher,
@@ -1314,7 +1314,7 @@ pub(crate) fn start(
         launched.ca.as_bytes(),
         ca_bundle.filter(|_| roots_needed),
     )
-    .map_err(&unwind_control)?;
+    .map_err(unwind_control)?;
 
     let proxy_url = format!("http://127.0.0.1:{CAGE_PROXY_PORT}");
     // Exempt loopback from the proxy: an agent's own in-cage service (a dev server, a test

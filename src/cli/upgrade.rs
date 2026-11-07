@@ -1795,9 +1795,9 @@ mod tests {
         sandbox::distro::store::Rolled {
             locator: locator.to_string(),
             key: full(digest),
-            previous: previous.map(&full),
+            previous: previous.map(full),
             base: full(digest),
-            previous_base: previous.map(&full),
+            previous_base: previous.map(full),
         }
     }
 

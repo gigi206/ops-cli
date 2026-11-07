@@ -26,7 +26,7 @@ min_version = "2024.12.0"
 # point, including a bare `cargo` that never goes through mise. This line exists so `mise install`
 # provisions that exact toolchain on a fresh clone rather than a floating one, and it must name the
 # same version as the `channel` there.
-rust                            = "1.97.1"
+rust                            = "1.99.1"
 # The Rust language server (LSP). Floats: it is provisioned so every `git clone` + `mise install`
 # contributor gets a working LSP out of the box (rustup does not ship it by default), and it reads
 # the crate rather than building it — no version of it can change what CI accepts.
