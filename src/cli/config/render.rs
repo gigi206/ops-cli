@@ -354,6 +354,14 @@ fn desktop_sections(view: &config::view::ConfigView, pal: &style::Palette) -> Op
             provenance_tag(view.apps_share_install_pools_origin, pal)
         );
     }
+    if view.apps_read_project_pool {
+        let _ = writeln!(
+            o,
+            "  {h}apps_read_project_pool:{r} enabled {dim}(each app may run a tool this project's \
+             `sbx run` installed){r}{}",
+            provenance_tag(view.apps_read_project_pool_origin, pal)
+        );
+    }
     if view.audio {
         let _ = writeln!(
             o,
@@ -1535,6 +1543,8 @@ mod tests {
             ssh_agent_confirm_origin: Default::default(),
             apps_share_install_pools: false,
             apps_share_install_pools_origin: Default::default(),
+            apps_read_project_pool: false,
+            apps_read_project_pool_origin: Default::default(),
             cwd: "/proj".into(),
             env: vec![],
             binds: vec![],
@@ -2041,6 +2051,29 @@ mod tests {
             .unwrap_or_else(|| panic!("the grant must be rendered:\n{out}"));
         assert!(
             line.contains("enabled") && line.contains("another app") && line.contains("(project)"),
+            "the grant must say what it opens and which layer opened it: {line}"
+        );
+    }
+
+    #[test]
+    fn config_render_names_the_project_pool_grant_only_when_a_project_made_it() {
+        // The same audit for the grant that lets an app run what the project's shell installed.
+        let out = render_config(&sample_config_view(), &style::Palette::plain(), false);
+        assert!(
+            !out.contains("apps_read_project_pool"),
+            "an ungranted config must not mention the grant:\n{out}"
+        );
+
+        let mut view = sample_config_view();
+        view.apps_read_project_pool = true;
+        view.apps_read_project_pool_origin = config::view::ProvenanceView::Project;
+        let out = render_config(&view, &style::Palette::plain(), false);
+        let line = out
+            .lines()
+            .find(|l| l.contains("apps_read_project_pool"))
+            .unwrap_or_else(|| panic!("the grant must be rendered:\n{out}"));
+        assert!(
+            line.contains("enabled") && line.contains("`sbx run`") && line.contains("(project)"),
             "the grant must say what it opens and which layer opened it: {line}"
         );
     }

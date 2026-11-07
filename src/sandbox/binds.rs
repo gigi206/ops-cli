@@ -750,10 +750,11 @@ pub(crate) struct Overlay<'a> {
     /// (`apps_share_install_pools`, a trusted project's grant). Only a global app has such a pool,
     /// so it changes nothing for the other runtimes.
     pub(crate) share_install_pools: bool,
-    /// Whether that grant also reaches the pool `sbx run` fills ([`PROJECT_POOL`]). It takes a
-    /// bubblewrap that mounts a source from its descriptor, since that pool, unlike an app's, lies
-    /// inside a home its cage can write: by path, a parent swapped for a link between the plan and
-    /// the mount would choose what the reading cage sees.
+    /// Whether a global app may read the pool `sbx run` fills ([`PROJECT_POOL`];
+    /// `apps_read_project_pool`, a trusted project's grant). It takes a bubblewrap that mounts a
+    /// source from its descriptor, since that pool, unlike an app's, lies inside a home its cage can
+    /// write: by path, a parent swapped for a link between the plan and the mount would choose what
+    /// the reading cage sees.
     pub(crate) share_project_pool: bool,
     /// Whether the cage cannot write the configuration the project's git reads, `.git/config` or
     /// the one a `.git` file leads to (sbx's own read-only default, or a declared mask). Then git

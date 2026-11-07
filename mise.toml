@@ -64,7 +64,7 @@ node                            = "26"
 # with the resolved typescript version when it bumps.
 #
 # These two and `cargo-callgraph` below are exact versions rather than a range or `latest`: an app
-# launched from this project reads the tools `sbx run` installed (`apps_share_install_pools` in
+# launched from this project reads the tools `sbx run` installed (`apps_read_project_pool` in
 # `.sbx.toml`), and only an exact version resolves there without asking a registry the app's egress
 # refuses.
 "npm:typescript"                = "5.9.3"

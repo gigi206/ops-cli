@@ -91,6 +91,7 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `accepts_fresh_releases` | security | [packages](packages#accepts_fresh_releases-when-the-vendor-publishes-faster-than-the-delay) |
 | `allow_insecure_http` | security | [packages](packages#plaintext-sources-and-the-one-switch-that-admits-them) |
 | `apps_share_install_pools` | security, project only | [packages](packages#apps_share_install_pools-when-two-apps-in-one-project-equip-the-same-tool) |
+| `apps_read_project_pool` | security, project only | [packages](packages#apps_read_project_pool-when-an-app-needs-the-tools-the-projects-shell-installed) |
 | `nixpkgs` | security | [nixpkgs](nixpkgs) |
 | `distro` | security | [distro](distro) |
 | `[mise]` (`engine`) | security, global only | [nixpkgs](nixpkgs#mise-engine-the-engines-own-source) |

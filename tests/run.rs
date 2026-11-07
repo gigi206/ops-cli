@@ -7278,19 +7278,16 @@ fn a_shared_pool_lets_the_second_app_reuse_what_the_first_installed() {
          [app.two]\ncmd = [\"sh\", \"-c\", \"rg --version\"]\n",
     )
     .unwrap();
-
-    probe_or_skip!(
-        "shared-pool e2e",
-        run_in(project.path(), data.path(), &["true"])
-    );
-    // Declared only after the probe: the probe is an `sbx run`, which would equip the tool into the
-    // project's own pool, and the grant reaches that pool too, so the first app would find it there
-    // and install nothing of its own.
     std::fs::write(
         project.path().join("mise.toml"),
         "[tools]\n\"aqua:BurntSushi/ripgrep\" = \"latest\"\n",
     )
     .unwrap();
+
+    probe_or_skip!(
+        "shared-pool e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
     need_reachable!(
         cache_reachable(),
         "skipping shared-pool e2e: the network is unreachable"
@@ -7640,7 +7637,7 @@ fn a_global_apps_npm_tool_rolls_whatever_node_the_projects_mise_file_names() {
 fn an_app_finds_the_project_tools_sbx_run_installed_without_fetching_them() {
     // An app's `[network]` replaces the project's, so a tool the project's mise file declares from a
     // host only the project allows failed to install at every app launch, and the app never had it.
-    // Under `apps_share_install_pools` the app reads the pool `sbx run` filled. Teeth: `sbx run`
+    // Under `apps_read_project_pool` the app reads the pool `sbx run` filled. Teeth: `sbx run`
     // installs an exact-version `npm:` tool under the project's egress, and the app, whose egress
     // refuses the registry, then runs it with no failed install and no request to the registry.
     // Skips (never fails) without a sandbox or the network.
@@ -7672,7 +7669,7 @@ fn an_app_finds_the_project_tools_sbx_run_installed_without_fetching_them() {
     .unwrap();
     std::fs::write(
         project.path().join(".sbx.toml"),
-        "apps_share_install_pools = true\n\
+        "apps_read_project_pool = true\n\
          [network]\nmode = \"deny\"\nallow = [\"{GET,HEAD} https://registry.npmjs.org\"]\n\
          [packages]\nnode = \"nix:nodejs\"\n\
          [app.pp]\ncmd = [\"sh\", \"-c\", \"command -v cowsay\"]\n\

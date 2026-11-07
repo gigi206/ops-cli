@@ -529,7 +529,8 @@ A cage writes the project, its store, its home and its pools, and a later comman
 | `src/sandbox/gc.rs`, `src/sandbox/launch/reclaim.rs` | the project's store, the app homes and pools, a task's output | `sbx gc`, `sbx app prune`, `sbx app rm --purge` |
 | `src/sandbox/taskpool.rs` | the pool the tasks' tools are installed into | a launch that declares tasks, and each invocation |
 | `src/sandbox/miseplugin.rs`, `src/sandbox/cagedir.rs`, `src/sandbox/binds.rs` | the directories of a home, a pool or a declared userland that a launch places a mount in | every launch |
-| `src/sandbox/inspect.rs`, `src/sandbox/binds.rs` | the other apps' pools in the project, mounted read-only in this cage only while each is a real directory, and resolved below the pool inside the cage; and the pool `sbx run` fills, held open with every link refused and mounted from that descriptor | a global app's launch in a project that sets `apps_share_install_pools` |
+| `src/sandbox/inspect.rs`, `src/sandbox/binds.rs` | the other apps' pools in the project, mounted read-only in this cage only while each is a real directory, and resolved below the pool inside the cage | a global app's launch in a project that sets `apps_share_install_pools` |
+| `src/sandbox/binds.rs`, `src/sandbox/cagedir.rs` | the pool `sbx run` fills, held open with every link refused and mounted from that descriptor, the cage checking what it sees there | a global app's launch in a project that sets `apps_read_project_pool` |
 | `src/sandbox/distro/build.rs`, `src/sandbox/distro/store.rs` | the root filesystem a `distro` `run` list wrote | the build, and each launch on it |
 | `src/sandbox/portal.rs` | the directory the cage's bus wrote in, as it is removed | the end of a `dbus = true` session |
 | `src/sandbox/egress_stats.rs`, `src/sandbox/lens.rs`, `src/cli/logs.rs` | hosts, commands and paths the cage chose, as the supervisor recorded them | `sbx net stats`, `sbx logs`, the lens logs |

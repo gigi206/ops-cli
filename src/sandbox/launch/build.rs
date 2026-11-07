@@ -2982,7 +2982,7 @@ pub(super) fn build(
         fresh_release_tokens: &fresh_release_tokens,
         ignored_mise_paths: &prep.cfg.mise_ignored,
         share_install_pools: prep.cfg.apps_share_install_pools,
-        share_project_pool: prep.cfg.apps_share_install_pools
+        share_project_pool: prep.cfg.apps_read_project_pool
             && super::cage::bwrap_binds_descriptors(&prep.bwrap),
         // Read off the masks this launch lays down, not re-derived: the cage's git is told what
         // the mounts do, whichever entry (sbx's default or a declared one) closed the file, the

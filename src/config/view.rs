@@ -116,11 +116,16 @@ pub(crate) struct ConfigView {
     pub(crate) allow_insecure_http: bool,
     /// Which layer opened plaintext fetching (`Default` when none did).
     pub(crate) allow_insecure_http_origin: ProvenanceView,
-    /// Whether this project's apps may read each other's mise install pools, and the one `sbx run`
-    /// fills (`apps_share_install_pools = true`).
+    /// Whether this project's apps may read each other's mise install pools
+    /// (`apps_share_install_pools = true`).
     pub(crate) apps_share_install_pools: bool,
     /// Which layer granted it (`Default` when none did; only a project can).
     pub(crate) apps_share_install_pools_origin: ProvenanceView,
+    /// Whether this project's apps may read the mise pool `sbx run` fills
+    /// (`apps_read_project_pool = true`).
+    pub(crate) apps_read_project_pool: bool,
+    /// Which layer granted it (`Default` when none did; only a project can).
+    pub(crate) apps_read_project_pool_origin: ProvenanceView,
     /// Whether audio (microphone + playback) is open (`audio = true`).
     pub(crate) audio: bool,
     /// Which layer supplied the audio posture (`Default` when neither config set it).
@@ -1340,6 +1345,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         ssh_agent_confirm_origin: resolved.ssh_agent_confirm_origin.into(),
         apps_share_install_pools: resolved.apps_share_install_pools,
         apps_share_install_pools_origin: resolved.apps_share_install_pools_origin.into(),
+        apps_read_project_pool: resolved.apps_read_project_pool,
+        apps_read_project_pool_origin: resolved.apps_read_project_pool_origin.into(),
         limits,
         secrets,
         apps,
@@ -2437,6 +2444,8 @@ mod tests {
             timezone_origin: Default::default(),
             apps_share_install_pools: false,
             apps_share_install_pools_origin: Default::default(),
+            apps_read_project_pool: false,
+            apps_read_project_pool_origin: Default::default(),
             open: vec![],
             service: vec![],
             plugins: vec![],
@@ -3055,6 +3064,8 @@ mod tests {
         let baseline = Resolved {
             apps_share_install_pools: false,
             apps_share_install_pools_origin: Default::default(),
+            apps_read_project_pool: false,
+            apps_read_project_pool_origin: Default::default(),
             distro_run: Vec::new(),
             accepts_fresh_releases: Default::default(),
             timezone: None,

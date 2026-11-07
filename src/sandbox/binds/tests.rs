@@ -2624,10 +2624,10 @@ fn the_grant_puts_the_other_apps_pools_behind_the_apps_own_and_read_only() {
     );
 }
 
-/// The pool `sbx run` fills lies inside a home its cage writes, so the grant reaches it only when the
-/// launch can hold it: bound read-only behind every app pool, mounted from a descriptor opened with
-/// every link refused, and left out when the launch cannot do that or the pool is not what a launch
-/// left.
+/// The pool `sbx run` fills lies inside a home its cage writes, so `apps_read_project_pool` reaches
+/// it only when the launch can hold it: bound read-only behind every app pool, mounted from a
+/// descriptor opened with every link refused, and left out when the launch cannot do that or the
+/// pool is not what a launch left. It is its own grant: the apps' pools are shared only under theirs.
 #[test]
 fn the_grant_reaches_the_pool_sbx_run_fills_only_from_a_held_descriptor() {
     let data = TmpDir::new();
@@ -2640,7 +2640,7 @@ fn the_grant_reaches_the_pool_sbx_run_fills_only_from_a_held_descriptor() {
     std::fs::create_dir_all(pool.join("installs/node/26.13.0")).unwrap();
     let dest = Path::new(MISE_SHARED_INCAGE).join(PROJECT_POOL);
 
-    let spec_for = |project_pool: bool| {
+    let spec_with = |apps: bool, project_pool: bool| {
         let overlay = Overlay {
             env: &[],
             binds: &[],
@@ -2648,7 +2648,7 @@ fn the_grant_reaches_the_pool_sbx_run_fills_only_from_a_held_descriptor() {
             timezone: DEFAULT_ZONE,
             fresh_release_tokens: &[],
             ignored_mise_paths: &[],
-            share_install_pools: true,
+            share_install_pools: apps,
             share_project_pool: project_pool,
             git_config_read_only: false,
         };
@@ -2678,6 +2678,7 @@ fn the_grant_reaches_the_pool_sbx_run_fills_only_from_a_held_descriptor() {
             .map(|(_, v)| v.clone())
     };
 
+    let spec_for = |project_pool: bool| spec_with(true, project_pool);
     let granted = spec_for(true);
     assert!(
         granted.mounts.iter().any(|m| matches!(
@@ -2711,7 +2712,15 @@ fn the_grant_reaches_the_pool_sbx_run_fills_only_from_a_held_descriptor() {
         "the cage sees the held pool at its shared destination"
     );
 
-    // Without a bubblewrap that takes a descriptor, the pool is not shared at all.
+    // On its own, the grant shares the project's pool and none of the apps'.
+    assert_eq!(
+        dirs(&spec_with(false, true)),
+        Some(format!(
+            "{SANDBOX_HOME}/{MISE_DATA_REL}/installs:{MISE_SHARED_INCAGE}/{PROJECT_POOL}/installs"
+        )),
+    );
+
+    // Without the grant, or a bubblewrap that takes a descriptor, the pool is not shared at all.
     let by_path = spec_for(false);
     assert!(!by_path.mounts.iter().any(|m| m.dest() == dest));
     assert!(

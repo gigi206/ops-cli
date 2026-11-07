@@ -521,6 +521,12 @@ const DROPPED_TABLES: &[(&str, fn(&RawConfig) -> bool, &str)] = &[
          decision",
     ),
     (
+        "apps_read_project_pool",
+        |r| r.apps_read_project_pool,
+        "the grant that lets a project's apps run the tools its shell installed is a property of \
+         the project, written in its config where it is reviewed, not a one-launch decision",
+    ),
+    (
         "distro",
         |r| r.distro.is_some(),
         "the substrate a cage is built on is not a one-launch decision",
@@ -626,6 +632,9 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         // launch without a line anywhere saying so. `push_ignored_field_notices` says it is
         // dropped rather than letting it govern nothing in silence.
         apps_share_install_pools: _,
+        // Dropped for the same reason: which of the project's own tools its apps may run is
+        // recorded in the project's config, not decided for one launch.
+        apps_read_project_pool: _,
         binds,
         packages,
         nixpkgs,
@@ -746,6 +755,9 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         // launch without a line anywhere saying so. `push_ignored_field_notices` says it is
         // dropped rather than letting it govern nothing in silence.
         apps_share_install_pools: _,
+        // Dropped for the same reason: which of the project's own tools its apps may run is
+        // recorded in the project's config, not decided for one launch.
+        apps_read_project_pool: _,
         env,
         binds,
         packages,

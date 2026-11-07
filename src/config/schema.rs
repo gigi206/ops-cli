@@ -68,12 +68,22 @@ pub(crate) struct RawConfig {
     /// — the grant is about *these* apps in *this* project, and a machine-wide default would open
     /// it for projects that never asked. What it gives up is that a tool one app installed becomes
     /// a tool another app can run: an app that equips the version a second app is about to ask for
-    /// gets its copy run instead. The pool `sbx run` fills is read the same way, last, so what the
-    /// project's own shell installed is also a tool an app can run. The project's `/nix` store is
-    /// already shared this way (see the security model); this extends the same shape to the
-    /// backends that never touch the store.
+    /// gets its copy run instead. The project's `/nix` store is already shared this way (see the
+    /// security model); this extends the same shape to the backends that never touch the store.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) apps_share_install_pools: bool,
+    /// Lets the project's global apps read, read-only and last, the mise pool `sbx run` fills: the
+    /// project's own tools, fetched under the project's `[network]`, which an app's posture
+    /// replaces. An app whose egress refuses those tools' hosts finds them there instead of failing
+    /// to fetch them at every launch.
+    ///
+    /// **A security field**, honored only from a trusted project and never from the global config,
+    /// for the reason [`Self::apps_share_install_pools`] gives. What it gives up is that a tool the
+    /// project's shell installed becomes a tool an app can run. The pool lies inside a home that
+    /// shell's cage writes, so it is mounted only from a descriptor the launch held with every link
+    /// refused, and not at all on a bubblewrap without `--bind-fd`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) apps_read_project_pool: bool,
     /// Inline nix flakes, declared as `[flakes.<name>]` tables. Each carries a full `flake.nix`
     /// written directly in the config (the `flake` field, a multiline string) plus an optional
     /// output `attr` (default `"default"`); sbx stages it, binds it read-only into the cage, and

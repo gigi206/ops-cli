@@ -518,6 +518,12 @@ pub(crate) struct Resolved {
     /// form). Carried rather than inferred at the render, so a global form added later cannot make
     /// a hardcoded tag say `project` about a value the machine set.
     pub(crate) apps_share_install_pools_origin: Provenance,
+    /// Whether the global apps of this project may read the mise pool `sbx run` fills. Set only by
+    /// a trusted project; see [`schema::RawConfig::apps_read_project_pool`].
+    pub(crate) apps_read_project_pool: bool,
+    /// Which layer granted it (`Default` when none did, and never `Global`: there is no global
+    /// form).
+    pub(crate) apps_read_project_pool_origin: Provenance,
     /// Per-plugin settings for the installed resolver plugins, keyed by plugin name: where to get
     /// a program the manifest declares when `PATH` does not have it, and values for the variables
     /// it reads. Layered global-under-project and gated by trust, like `[packages]`.
@@ -1093,6 +1099,7 @@ impl Resolved {
             // Dropped by `overlay_into` before it reaches here, and named for the same reason: the
             // grant belongs to the project's config, not to one launch.
             apps_share_install_pools: _,
+            apps_read_project_pool: _,
             env,
             binds,
             packages,
@@ -2145,6 +2152,25 @@ fn resolve(
             );
         }
     }
+    // Whether this project's apps may read the pool `sbx run` fills: project-only and trusted-only,
+    // for the reasons the grant above is.
+    let mut apps_read_project_pool = false;
+    let mut apps_read_project_pool_origin = Provenance::Default;
+    if let Some((proj, state)) = project.as_ref()
+        && proj.apps_read_project_pool
+    {
+        if *state == TrustState::Trusted {
+            apps_read_project_pool = true;
+            apps_read_project_pool_origin = Provenance::Project;
+        } else {
+            refuse_untrusted(
+                &mut warnings,
+                PROJECT_CONFIG,
+                "`apps_read_project_pool`",
+                *state,
+            );
+        }
+    }
     apply_tools(
         &mut packages,
         &mut warnings,
@@ -3097,6 +3123,8 @@ fn resolve(
     let resolved = Resolved {
         apps_share_install_pools,
         apps_share_install_pools_origin,
+        apps_read_project_pool,
+        apps_read_project_pool_origin,
         allow_insecure_http,
         allow_insecure_http_origin,
         env,

@@ -232,17 +232,6 @@ An app's own tools win. Its pool and its home are searched before any neighbour'
 holds itself is always the one it resolves, and a neighbour supplies only a version it has nowhere
 else.
 
-The grant also reaches the pool `sbx run` fills, last of all. That is where the project's own
-tools land when they are fetched under the project's own `[network]`, which an app's posture
-replaces rather than extends: an app whose egress refuses `nodejs.org` finds the `node` the project
-declares there instead of failing to fetch it at every launch. A tool the project's mise file asks
-for by an exact version resolves from it with no network at all; one asked for by a range or
-`latest` still asks its registry which release that names. Unlike an app's pool, this one sits
-inside a home its cage can write, so it is shared only where bubblewrap mounts a source from a
-descriptor (`--bind-fd`): the launch holds the pool open with every link on its path refused, and
-the cage checks what it sees there against what was held before anything runs. On a bubblewrap
-without it, the pool is not shared.
-
 Only a global app has a pool of its own to share. An app declared
 [`home_scope = "project"`](apps) roots its home under the project already, so its mise data has
 no second pool: it neither offers a pool nor reads one.
@@ -266,9 +255,39 @@ What it gives up is that a tool one app installed becomes a tool another app can
 equips the version a second app is about to ask for gets its copy run instead, and the version a
 project declares is written in a file every app in it can read. The project's `/nix` store is
 [already shared this way](../concepts/security-model#the-store-an-agent-writes-into-is-shared-by-the-projects-apps);
-this extends the same shape to the backends that never touch the store. The same holds for the
-project's own shell: what `sbx run` installed in its pool, an app may run. Leave it off unless the
-apps in the project, and what runs in its shell, are ones you would let each other's tools run.
+this extends the same shape to the backends that never touch the store. Leave it off unless the
+apps in the project are ones you would let each other's tools run.
+
+#### `apps_read_project_pool`: when an app needs the tools the project's shell installed
+
+The project's own mise file is equipped in every cage launched from the project, `sbx run` and each
+app alike, and each fetches under its own `[network]`. An app's posture replaces the project's
+rather than extending it, so a tool fetched from a host only the project allows installs in
+`sbx run` and fails in every app, at every launch: an app whose egress refuses `nodejs.org` never
+gets the `node` the project declares.
+
+Set this in the project's config and each global app also reads, read-only and last, the pool
+`sbx run` fills:
+
+```toml
+apps_read_project_pool = true
+```
+
+A tool the project's mise file asks for by an exact version then resolves from that pool with no
+network at all. One asked for by a range or `latest` still asks its registry which release that
+names, and fails there under an egress that refuses it: pin the project's tools to exact versions
+for the apps to need nothing. A tool `sbx run` has not installed yet is fetched by the app as before.
+
+Unlike an app's pool, this one sits inside a home its cage can write. It is therefore never mounted
+by its path: the launch holds it open with every link on its path refused, bubblewrap mounts the
+object held (`--ro-bind-fd`), and the cage checks what it sees there against what was held before
+anything runs. On a bubblewrap without `--bind-fd` the pool is not shared at all.
+
+This is a security field, [trusted-only](#why-the-tool-sources-are-trusted-only), and project-only
+like `apps_share_install_pools`. What it gives up is that a tool the project's shell installed
+becomes a tool its apps can run, so anything that runs in `sbx run` can place a program an app with
+credentials will run. Leave it off unless what runs in the project's shell is something you would
+let the apps' tools come from.
 
 ### `flake:`: a nix flake output
 

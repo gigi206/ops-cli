@@ -11,9 +11,8 @@
 # `cargo-zigbuild test --target x86_64-unknown-linux-musl --test <suite>`.
 
 # An app launched from here reads the project's tools from the pool `sbx run` filled, read-only,
-# instead of fetching them under its own egress, which refuses the hosts below. Each app's own pool
-# is shared with the others the same way.
-apps_share_install_pools = true
+# instead of fetching them under its own egress, which refuses the hosts below.
+apps_read_project_pool = true
 
 # Read-only: what the tools of `mise.toml` and cargo fetch, on top of the nix and GitHub hosts the
 # self-equip lane already opens.

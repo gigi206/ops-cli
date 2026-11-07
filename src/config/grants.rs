@@ -116,6 +116,8 @@ fn delta(before: &Resolved, after: &Resolved, app: Option<&String>, out: &mut Ve
         accepts_fresh_releases,
         apps_share_install_pools,
         apps_share_install_pools_origin: _,
+        apps_read_project_pool,
+        apps_read_project_pool_origin: _,
         plugin,
         open,
         service,
@@ -239,7 +241,15 @@ fn delta(before: &Resolved, after: &Resolved, app: Option<&String>, out: &mut Ve
             "apps_share_install_pools",
             "true".into(),
             Risk::Notable,
-            "one app, or the project's `sbx run` shell, can place a program another app runs",
+            "one app can place a program another runs",
+        );
+    }
+    if *apps_read_project_pool && !before.apps_read_project_pool {
+        push(
+            "apps_read_project_pool",
+            "true".into(),
+            Risk::Notable,
+            "the project's `sbx run` shell can place a program its apps run",
         );
     }
     for (name, settings) in plugin {
