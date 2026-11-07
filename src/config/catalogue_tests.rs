@@ -2329,3 +2329,33 @@ fn the_claude_desktop_bundle_carries_the_library_its_native_module_links() {
         "the claude-desktop `.deb` needs `pipewire` among its `libs`: {libs:?}"
     );
 }
+
+/// Claude Desktop's login page runs an hCaptcha bot check before any sign-in, and refused, the
+/// check never completes and the sign-in buttons do nothing at all, Google's included. The app's
+/// resolved policy must let the check post and load its widget.
+#[test]
+fn the_claude_desktop_policy_lets_the_login_pages_captcha_complete() {
+    let policies = shipped_egress_policies();
+    let (_, policy) = policies
+        .iter()
+        .find(|(name, _)| name == "claude-desktop")
+        .expect("claude-desktop is a shipped app");
+    let allowed = |host: &str, method: &str| {
+        matches!(
+            policy.explain(host, 443, "/", method),
+            crate::allowlist::Decision::AllowedBy(_)
+        )
+    };
+    for host in ["hcaptcha.com", "api.hcaptcha.com", "api2.hcaptcha.com"] {
+        assert!(
+            allowed(host, "POST"),
+            "the captcha posts its check to {host}"
+        );
+    }
+    for host in ["newassets.hcaptcha.com", "c0ffee.w.hcaptcha.com"] {
+        assert!(
+            allowed(host, "GET"),
+            "the captcha loads its widget from {host}"
+        );
+    }
+}

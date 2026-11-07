@@ -77,6 +77,14 @@ allow = [
     # OAuth result returns as a `claude://login/google-auth` deep-link. The shared lane — the ccTLD
     # sign-in pages, the token endpoint and the consent assets. An EMAIL login needs none of it.
     "@google-signin-incage",
+    # hCaptcha, the bot check the login page now runs before any sign-in, email or Google: it POSTs
+    # its site config and its challenge to these three hosts and reads its widget from the other
+    # two. Refused, the check never completes and the sign-in buttons do nothing at all.
+    "{GET,POST} https://hcaptcha.com",
+    "{GET,POST} https://api.hcaptcha.com",
+    "{GET,POST} https://api2.hcaptcha.com",
+    "{GET} https://newassets.hcaptcha.com",
+    "{GET} https://*.w.hcaptcha.com",
 ]
 # Deliberately-DENIED telemetry, kept out of the default `sbx net logs`. A `mute` never opens egress
 # and never hides a count (`sbx net stats` still tallies them; see them with `--all`).
