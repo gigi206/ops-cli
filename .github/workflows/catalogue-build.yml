@@ -79,6 +79,13 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
+      # A build from source embeds no store engine and looks for one on PATH; without it every launch
+      # stops before provisioning, which reads as no package failing.
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
       - name: Build sbx
         run: cargo build
 
@@ -113,8 +120,10 @@ jobs:
             out="$(timeout 1800 "$sbx" app run "$app" --gui none -- --version 2>&1)" || true
             echo "$out" | grep -vE '^copying path|^  /nix/store/' | tail -n 40
             echo "::endgroup::"
-            if grep -q 'cannot provision' <<<"$out"; then
-              failed+=("$app: $(grep 'cannot provision' <<<"$out" | head -n 1)")
+            # A launch that never reached provisioning judges nothing, and is a failure of its own
+            # rather than a package that built.
+            if grep -qE 'cannot provision|the sandbox cannot run' <<<"$out"; then
+              failed+=("$app: $(grep -E 'cannot provision|the sandbox cannot run' <<<"$out" | head -n 1)")
             fi
             "$sbx" app rm "$app" --purge >/dev/null 2>&1 || true
             "$sbx" gc --all --prune >/dev/null 2>&1 || true
