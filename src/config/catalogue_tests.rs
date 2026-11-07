@@ -1497,6 +1497,73 @@ fn the_trae_install_step_reinstalls_a_tool_whose_interpreter_is_gone() {
     assert!(installs(true), "the roll left the install as it found it");
 }
 
+#[test]
+fn the_reasonix_desktop_command_names_the_service_its_package_ships() {
+    // Runs the SHIPPED command against a stand-in package: a `reasonix-desktop` launcher in
+    // `<pkg>/bin` that prints the service it was told to start. The real shell looks for its service
+    // beside its install only under the literal `/usr/lib/reasonix`, so under the nix store it starts
+    // none unless `REASONIX_DESKTOP_SERVICE` names `<pkg>/usr/bin/reasonix-desktop`.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/app/reasonix-desktop.toml");
+    let raw = schema::parse_app(&std::fs::read(&path).expect("read the profile")).unwrap();
+    let argv = raw.cmd.expect("the profile declares a command").into_argv();
+    let script = shell_command_string(&argv).expect("the command is a shell script");
+
+    let tmp = TmpDir::new();
+    let pkg = tmp.path().join("pkg");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(pkg.join("bin")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let launcher = pkg.join("bin/reasonix-desktop");
+    std::fs::write(
+        &launcher,
+        format!(
+            "#!{}\nprintf '%s' \"$REASONIX_DESKTOP_SERVICE\"\n",
+            program_on_path("bash").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &launcher,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let out = crate::testutil::run_within(
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .arg("reasonix-desktop")
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    pkg.join("bin").display(),
+                    std::env::var("PATH").expect("the test runner has a PATH")
+                ),
+            )
+            .env_remove("REASONIX_DESKTOP_SERVICE")
+            .stdin(std::process::Stdio::null()),
+        "the shipped command",
+    );
+    assert!(
+        out.status.success(),
+        "the command failed ({}): {}{}",
+        out.status,
+        out.stdout,
+        out.stderr
+    );
+    let canonical = pkg.canonicalize().unwrap();
+    assert_eq!(
+        out.stdout,
+        canonical
+            .join("usr/bin/reasonix-desktop")
+            .display()
+            .to_string(),
+        "the command does not name the service its package ships, so the shell starts none"
+    );
+}
+
 /// `name`, as an absolute path, found the way a launch finds a program: by walking `PATH`.
 ///
 /// The step below is run with a `PATH` of this fixture's own making, and a program named without a
