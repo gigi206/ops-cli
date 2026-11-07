@@ -773,3 +773,20 @@ fn a_dry_run_skips_a_group_whose_cage_would_first_pin_a_lock() {
     crate::store::write_lock(&lock, locator, &format!("sha256:{}", "2".repeat(64))).unwrap();
     assert_eq!(first(&cfg), None);
 }
+
+#[test]
+fn a_dry_run_counts_a_project_with_no_store_as_one_a_cage_would_seed() {
+    let data = crate::testutil::TmpDir::new();
+    let project = crate::testutil::TmpDir::new();
+    let layout = crate::store::Layout::under(data.path());
+    assert!(
+        crate::sandbox::launch::would_seed_project_store(&layout, project.path()),
+        "a project never launched has no store, and a cage would fill one"
+    );
+    let id = crate::sandbox::binds::project_runtime_id(project.path()).unwrap();
+    std::fs::create_dir_all(crate::sandbox::projectstore::store_dir_for(&layout, &id)).unwrap();
+    assert!(!crate::sandbox::launch::would_seed_project_store(
+        &layout,
+        project.path()
+    ));
+}

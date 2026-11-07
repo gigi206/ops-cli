@@ -591,6 +591,16 @@ fn check_mise_packages(
             ));
             continue;
         }
+        if layout
+            .as_ref()
+            .is_some_and(|layout| super::would_seed_project_store(layout, cwd))
+        {
+            say(format!(
+                "{dim}not checked — this project has no store yet, and a launch here would \
+                 seed one{r}"
+            ));
+            continue;
+        }
         if let Some(what) = layout
             .as_ref()
             .and_then(|layout| first_pin_of_a_launch(layout, cwd, &cfg, home.app()))

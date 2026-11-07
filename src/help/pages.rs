@@ -2016,7 +2016,8 @@ pub(super) const PAGES: &[Page] = &[
             \n\
             A group, or a resolve command, whose cage would first pin a lock (a channel never\n\
             resolved here, an image never unpacked) is named as not checked, since a dry run\n\
-            writes no lock.\n\
+            writes no lock. So is one in a project never launched, whose cage would first create\n\
+            and fill the project's store.\n\
             \n\
             What a dry run cannot report it names. An install step records no version (it may\n\
             install the agent, rebuild part of a package or write a setting), so the apps that\n\

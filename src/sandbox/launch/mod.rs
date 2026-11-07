@@ -1447,6 +1447,18 @@ pub(crate) fn first_channel_pin(
         .then_some("the mise engine")
 }
 
+/// Whether a cage built for the project at `cwd` would first seed that project's own store.
+///
+/// A project never launched has none, and building a cage there creates the project's runtime tree
+/// and fills its store with the base userland, which is a launch's work, not a question's. So
+/// `sbx upgrade --dry-run` asks this beside [`first_channel_pin`] and says the reason instead of
+/// building one. A project whose identity cannot be read counts as one with no store. Pure file
+/// reads.
+pub(crate) fn would_seed_project_store(layout: &Layout, cwd: &Path) -> bool {
+    binds::project_runtime_id(cwd)
+        .map_or(true, |id| !super::projectstore::store_exists(layout, &id))
+}
+
 /// Seed (or top up) the project's own writable store with the closure of everything
 /// the cage reads through `/nix`: the base userland, the native `[packages]`, and the
 /// `nix:` tools. The roots are collected from the provisioners and handed as the single

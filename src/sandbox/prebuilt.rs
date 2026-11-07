@@ -1549,19 +1549,26 @@ pub(crate) fn upgrade_project(
     only: Option<&str>,
     mode: super::RollMode,
 ) -> io::Result<Vec<Upgrade>> {
-    // A dry run writes no lock, and resolving the project's channels for the cage would pin one
-    // where none is yet; the resolver references are then reported with that reason.
-    let first_pin = (!mode.applies())
-        .then(|| super::launch::first_channel_pin(layout, project, cfg, None))
+    // A dry run writes no lock and seeds no store, and building the cage would do either where
+    // none is yet: resolving the project's channels pins one, and a project never launched gets its
+    // store filled. The resolver references are then reported with that reason.
+    let unchecked = (!mode.applies())
+        .then(|| {
+            if super::launch::would_seed_project_store(layout, project) {
+                return Some(
+                    "its resolve command's cage would first seed this project's store".to_string(),
+                );
+            }
+            super::launch::first_channel_pin(layout, project, cfg, None)
+                .map(|channel| format!("its resolve command's cage would first pin {channel} here"))
+        })
         .flatten();
-    let held = match first_pin {
+    let held = match unchecked {
         None if has_resolve_ref(kind, cfg, only) => {
             super::resolve::UpgradeCage::build(nix, layout, project, cfg, mode)
         }
         _ => None,
     };
-    let unchecked = first_pin
-        .map(|channel| format!("its resolve command's cage would first pin {channel} here"));
     let cage = held.as_ref().map(super::resolve::UpgradeCage::as_cage);
     upgrade(
         kind,

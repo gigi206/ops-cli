@@ -120,7 +120,8 @@ app's `mise:` packages, so asking it builds and downloads none of the others.
 
 A group, or a resolve command, whose cage would first pin a lock (a channel never resolved
 in this project, an image never unpacked) is named as not checked, since a dry run writes
-no lock.
+no lock. So is one in a project never launched: building its cage would first create the
+project's store and fill it with the base userland, which is a launch's work.
 
 **What a dry run cannot report, it names.** An install step records no version (it may
 install the agent, rebuild part of a package or write a setting), so the apps that carry
