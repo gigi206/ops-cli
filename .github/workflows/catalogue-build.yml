@@ -108,7 +108,9 @@ jobs:
             fi
             checked=$((checked + 1))
             echo "::group::$app"
-            out="$(timeout 1800 "$sbx" app run "$app" --gui none -- --version 2>&1)"
+            # The app's own exit status says nothing here (headless, it may well fail to start),
+            # and the step's shell runs with `-e`: only provisioning's line is judged.
+            out="$(timeout 1800 "$sbx" app run "$app" --gui none -- --version 2>&1)" || true
             echo "$out" | grep -vE '^copying path|^  /nix/store/' | tail -n 40
             echo "::endgroup::"
             if grep -q 'cannot provision' <<<"$out"; then
