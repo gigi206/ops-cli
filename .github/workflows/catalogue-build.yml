@@ -12,16 +12,22 @@
 # HOW. A release-free build of sbx imports the shipped groups, bundles and apps into throwaway
 # homes, then launches each app whose resolved packages include a prebuilt one, without a display
 # (`--gui none`). Provisioning runs before the cage and prints `cannot provision` when a build
-# fails, which is the one line this job judges by: what the app's own command does next, headless
-# on a runner, is no part of the question. Each app's tree is purged and the store collected before
-# the next, so the run fits the runner's disk.
+# fails, which is the first thing this job judges by. The second is a built program that cannot
+# start: an app with no display posture of its own is a command-line agent, and its `--version`
+# ending on a signal means the binary the build produced is broken — the shape a faulty patchelf
+# leaves, which builds cleanly and then dies of SIGSEGV before the program's first line. Beyond
+# those two, what the app's own command does headless on a runner is no part of the question: a
+# desktop app without its display, or an agent asking for a sign-in, says nothing about the build.
+# Each app's tree is purged and the store collected before the next, so the run fits the runner's
+# disk.
 #
 # THE NIXPKGS IS THE ONE A FIRST LAUNCH RESOLVES. The homes start empty, so sbx pins the default
 # channel's current revision, which is what an installed sbx builds these packages against. The
 # engines' pinned revision would test a toolchain no app launch uses.
 #
-# WHAT A RED MEANS. A package that no longer builds, named with the cause sbx printed, or a vendor
-# briefly unreachable while its package was fetched. Read it as "go look at the named app".
+# WHAT A RED MEANS. A package that no longer builds, named with the cause sbx printed, a command-line
+# agent whose built binary dies on a signal, or a vendor briefly unreachable while its package was
+# fetched. Read it as "go look at the named app".
 #
 # WHEN IT RUNS. Weekly, on demand, and whenever a shipped profile, bundle or group changes. A
 # `schedule` runs from the default branch alone, which is `ops-v2`.
@@ -40,6 +46,12 @@ on:
       - examples/app/**
       - examples/bundle/**
       - examples/net-groups/**
+      # The generated derivations every prebuilt package is built from.
+      - src/sandbox/prebuilt.rs
+      - src/sandbox/deb.rs
+      - src/sandbox/appimage.rs
+      - src/sandbox/tarball.rs
+      - src/sandbox/binary.rs
 
 permissions:
   contents: read
@@ -115,15 +127,20 @@ jobs:
             fi
             checked=$((checked + 1))
             echo "::group::$app"
-            # The app's own exit status says nothing here (headless, it may well fail to start),
-            # and the step's shell runs with `-e`: only provisioning's line is judged.
-            out="$(timeout 1800 "$sbx" app run "$app" --gui none -- --version 2>&1)" || true
+            # The step's shell runs with `-e`, so the status is captured rather than left to end the
+            # step: it is judged below, and only for a command-line agent.
+            rc=0
+            out="$(timeout 1800 "$sbx" app run "$app" --gui none -- --version 2>&1)" || rc=$?
             echo "$out" | grep -vE '^copying path|^  /nix/store/' | tail -n 40
             echo "::endgroup::"
             # A launch that never reached provisioning judges nothing, and is a failure of its own
             # rather than a package that built.
             if grep -qE 'cannot provision|the sandbox cannot run' <<<"$out"; then
               failed+=("$app: $(grep -E 'cannot provision|the sandbox cannot run' <<<"$out" | head -n 1)")
+            # A command-line agent (no `gui:` in its resolved posture) whose `--version` died on a
+            # signal ran a broken binary. `timeout` reports its own expiry as 124, below this range.
+            elif [ "$rc" -ge 128 ] && ! "$sbx" config show --app "$app" 2>/dev/null | grep -qE '^ *gui:'; then
+              failed+=("$app: \`--version\` died on signal $((rc - 128)) (exit $rc) — the built binary does not start")
             fi
             "$sbx" app rm "$app" --purge >/dev/null 2>&1 || true
             "$sbx" gc --all --prune >/dev/null 2>&1 || true
