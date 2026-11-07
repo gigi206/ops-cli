@@ -462,11 +462,11 @@ fn own_seccomp_filters() -> u32 {
 /// line it prints first says it ran — and no route on a kernel that has the driver.
 #[test]
 fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
-    let python = std::path::Path::new("/usr/bin/python3");
-    if !python.exists() {
-        skip_incapable!("skipping tap DNS e2e: no /usr/bin/python3 to ask the query");
+    // Any python on `PATH` will do: the cage binds the whole root read-only.
+    let Some(python) = common::python3_on_path() else {
+        skip_incapable!("skipping tap DNS e2e: no python3 on PATH to ask the query");
         return;
-    }
+    };
     let Some(nft) = common::nft_on_path() else {
         skip_incapable!("skipping tap DNS e2e: no nft on PATH to install the redirect");
         return;
@@ -576,7 +576,7 @@ print("report fd", "held" if held else "closed")
         .args(holder_argv(
             &bwrap,
             &[
-                python.into(),
+                python.as_os_str().into(),
                 "-c".into(),
                 query.into(),
                 reported.clone().into(),

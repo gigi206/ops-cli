@@ -536,6 +536,11 @@ pub fn bwrap_on_path() -> Option<std::path::PathBuf> {
     on_path("bwrap")
 }
 
+/// The first `python3` on `PATH`, or `None` on a host without one.
+pub fn python3_on_path() -> Option<std::path::PathBuf> {
+    on_path("python3")
+}
+
 /// The first program called `name` in a directory of `PATH`, as [`program_in`] finds it.
 fn on_path(name: &str) -> Option<std::path::PathBuf> {
     program_in(name, &std::env::var_os("PATH")?)
