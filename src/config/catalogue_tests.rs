@@ -2466,6 +2466,22 @@ fn the_codex_desktop_bundle_carries_the_library_its_native_module_links() {
     );
 }
 
+/// dsh's boot reaches Node's internal module loader through `node-addon-require-builtin`, which
+/// recognizes the machine code of the official Node.js builds only: on nixpkgs' node it answers
+/// `Unsupported/no-getter` and dsh exits before serving, with no other route to the loader. The
+/// bundle names the official build, which mise installs; this holds it there.
+#[test]
+fn the_deepseek_harness_bundle_runs_on_the_official_node_build() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/bundle/deepseek-harness.toml");
+    let bundle = shipped_bundle(&path);
+    let node = bundle.packages.get("nodejs");
+    assert!(
+        node.is_some_and(|locator| locator.starts_with("mise:node@")),
+        "the deepseek-harness bundle needs the official node build (`mise:node@…`), not {node:?}"
+    );
+}
+
 /// MiMo Code's npm package is a Node launcher that downloads the native binary on the first run and
 /// unpacks it by spawning `tar -xzf`. The cage's base toolset carries neither `tar` nor `gzip`, so
 /// without them the download succeeds and the launch ends on `spawn tar ENOENT`, with nothing to run.

@@ -138,7 +138,7 @@ port to your host loopback, and you open it in your own browser.
 
 | Profile | Tool (fresh, upstream) | Provider / egress |
 |---|---|---|
-| `deepseek-harness` | `mise:npm:@deepseek-ai/dsh` (+ `nix:nodejs`, `nix:python3`, `nix:gnumake`, `nix:gcc`) | `api.deepseek.com` (`DEEPSEEK_API_KEY`) |
+| `deepseek-harness` | `mise:npm:@deepseek-ai/dsh` (+ `mise:node@lts`, the official Node.js build) | `api.deepseek.com` (`DEEPSEEK_API_KEY`) |
 | `hermes-web` | `flake:github:NousResearch/hermes-agent#default` (+ `nix:nodejs`, `nix:chromium`, …) | `openrouter.ai` (BYOK) |
 | `hermes-webui` | `flake:github:nesquena/hermes-webui#default` (+ `flake:github:NousResearch/hermes-agent#default`, `nix:nodejs`, …) | `openrouter.ai` (BYOK) |
 | `odysseus` | `nix:git` (+ `nix:python312`, `nix:uv`, …) | multi-provider (BYOK), self-hosted workspace |

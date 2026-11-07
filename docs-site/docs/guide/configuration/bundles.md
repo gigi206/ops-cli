@@ -369,7 +369,7 @@ The 69 shipped bundles, and what each carries:
 | `cursor` | 2 (`deb:`, `nix:`) | 32 egress entries, 1 env var, a `deb:` resolver | `chromium-background`, `chromium-spellcheck`, `google-signin-incage` |
 | `cursor-agent` | 1 (`tarball:`) | 4 egress entries, 1 env var, a `tarball:` resolver | none |
 | `deepagents-code` | 4 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
-| `deepseek-harness` | 5 (`mise:`, `nix:`) | 4 egress entries, 1 env var, an install step, a freshness exemption | `npm-audit`, `npm-jsr`, `npm-registry` |
+| `deepseek-harness` | 2 (`mise:`) | 5 egress entries, 1 env var, a freshness exemption | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `devin` | 1 (`tarball:`) | 4 egress entries, a `tarball:` resolver | none |
 | `dirac` | 3 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `droid` | 2 (`mise:`, `nix:`) | 10 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
@@ -429,8 +429,8 @@ name `opencode`; `hermes-web` and `hermes-webui` name `hermes`. No shipped profi
 one-step import: importing one alone leaves its bundle (and any group that bundle
 REQUIRES) undeclared, and the launch warns.
 
-Nine bundles carry an **install step** (`provision`), because their agent is finished by a command
-rather than by unpacking: `deepseek-harness`, `junie`, `odysseus`, `openfox` and `trae` build or
+Eight bundles carry an **install step** (`provision`), because their agent is finished by a command
+rather than by unpacking: `junie`, `odysseus`, `openfox` and `trae` build or
 extend what a backend delivered; `muse` and `prime-agent` are vendor bootstraps
 whose installer script is the only way the agent arrives at all, which is why `muse` is the one
 bundle that names no package; and `kiro` and `hermes-desktop` state in the app's home a preference

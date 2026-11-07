@@ -36,39 +36,22 @@
 # `@deepseek-ai/node-addon-landlock-run`, `node-addon-require-builtin`, and `@vscode/ripgrep` 1.18
 # (the file-search tool's own ripgrep, resolved lazily at the first search rather than at load).
 #
-# The fourth is `node-pty` 1.1.0, the terminal's pseudo-terminal binding, and it is carried by the
-# BUNDLE rather than by this command. Its tarball ships prebuilds for macOS and
-# Windows only; on Linux its `install` script falls through to `node-gyp rebuild`, so an install
-# that skips scripts leaves `build/Release/pty.node` absent — and the web profile loads node-pty at
-# BOOT, so `dsh web` dies in its loader before serving anything. The bundle's `provision` heals
-# that, and sbx runs it before this command, in this cage: on first launch, and again after
-# `sbx upgrade mise` rolls dsh into a fresh install directory. Two details keep that honest — the
-# step's guard skips the build once the binary exists, and
-# `--nodedir` points node-gyp at the node package's own headers instead of letting it download a
-# header tarball. That is why `nodejs.org` is in no allowlist here; it was measured on a nixpkgs
-# node package, not on the exact node this channel resolves, so if a future one ever ships without
-# its `include/node` tree the build reaches for that host and the proxy names it in `sbx net logs`
-# — a named refusal, not a silent break. The toolchain the compile needs (python3, make, a C++
-# compiler) rides the bundle, alongside the harness itself. Upstream requires Node
-# `^22.19.0 || >=24.0.0`; the unversioned `nix:nodejs` satisfies it.
+# The fourth is `node-pty`, the terminal's pseudo-terminal binding, which the web profile loads at
+# BOOT. It ships Linux prebuilds beside the macOS and Windows ones, and its `install` script builds
+# nothing on Linux, so the script-free install is complete and nothing is compiled in the cage.
 #
-# WHY `cmd` IS STILL A WRAPPER: `--expose-internals`, and it is about THIS cage's node build. After boot, the
-# launcher mounts a reload plugin whenever no `hmr` service is present — which is exactly this
-# profile's case, since the web layer disables the bundle's own `hmr` row — and that plugin needs
-# Node's internal module loader. The loader reaches it two ways: directly when `--expose-internals`
-# is on the command line, otherwise through the native addon `node-addon-require-builtin`. That
-# addon locates the internals by recognizing the machine code of a compiled getter, and it does not
-# recognize the node this cage runs: probed in-cage on nixpkgs node 24.18 it answers
-# `node-addon-require-builtin unsupported: Unsupported/no-getter (x64 sysv getter is not a
-# recognized this->field accessor)`, the reload plugin then throws `--expose-internals is required
-# for HMR service`, and the process exits BEFORE serving — after printing its URL, which makes the
-# failure easy to misread as a working launch. The same package on an official node build (v24.19
-# and v25 from the node distribution) loads that addon and serves without the flag, so this is a
-# build difference, not a version one. The flag is the upstream-supported path, so `cmd` execs
-# `node --expose-internals <install>/lib/bin.js` instead of the `dsh` shim. Drop the flag the day
-# the addon learns this build, and re-test by launching, not by reading: the URL line prints either
-# way. Note what the flag costs: internal Node modules become reachable from in-cage code, which is
-# a boundary INSIDE a cage that already runs the agent's own code.
+# THE NODE IS THE BUNDLE'S, and it has to be the official build. dsh's boot reaches Node's internal
+# module loader through the native addon `node-addon-require-builtin`, which locates it by
+# recognizing the machine code of a compiled V8 getter; it recognizes the official Node.js builds
+# and not nixpkgs' one, on which it answers `Unsupported/no-getter (x64 sysv getter is not a
+# recognized this->field accessor)` and dsh exits before serving. So the bundle names
+# `mise:node@lts`, the official build mise installs from `nodejs.org`, rather than `nix:nodejs`. A
+# project whose own mise pool carries a `node` puts that one first on `PATH`, which is fine as long
+# as it is an official build too.
+#
+# WHY `cmd` IS STILL A WRAPPER: the cage's summary (below) reaches dsh as a `--patch` file the
+# script writes, and the program is started as `node <install>/lib/bin.js`, from the install mise
+# reports, rather than through a shim whose location a mise upgrade may move.
 #
 # HOW THE BROWSER REACHES IT. The cage runs in an empty network namespace, so a port the server
 # binds on the cage's `127.0.0.1` is NOT reachable from the host by default — that is the boundary.
@@ -121,13 +104,11 @@
 # provider request also carries a stable anonymous id (`x-deepseek-harness-user-id`) persisted
 # there, plus the session id when one exists.
 #
-# GROUNDED, and how: this profile was LAUNCHED. In the cage, mise installed the harness, the guard
-# built `pty.node` with no host outside `@npm-registry` reached (the egress log for the run names
-# only the packument fetch), and the browser UI answered `200` on the host's `127.0.0.1:3080`
-# through the forward — its page titled `DeepSeek Harness`. Both fixes come from that run rather
-# than from reading: the first launch died on the missing addon binary (now the bundle's
-# `provision`), the second on the internals loader (the `--expose-internals` of `cmd`), and the
-# third served. The rest is read from upstream
+# GROUNDED, and how: this profile was LAUNCHED. In the cage, mise installed the harness and the
+# official node, and the server answered on `127.0.0.1:3080`; the browser UI answers on the host's
+# `127.0.0.1:3080` through the forward, its page titled `DeepSeek Harness`. The node choice comes
+# from launching rather than reading: on nixpkgs' node the boot dies on the internals loader, on
+# the official build it serves. The rest is read from upstream
 # sources: the launcher grammar and the `web` alias passing app flags through (apps/cli/src/args.ts,
 # confirmed by `dsh web --help` printing the web app's own flags), the default port and the
 # `--host 0.0.0.0` refusal (packages/bundle/web-app/src/startup.ts, apps/cli/reference/README.md),
@@ -158,14 +139,10 @@ set -eu
 # The package directory inside a `mise:npm:` install, without assuming which layout mise wrote:
 # it has published both `<install>/lib/node_modules/<pkg>` and `<install>/node_modules/<pkg>`, so a
 # hardcoded one stops resolving the day an upgrade lands the other and the launch dies on a missing
-# entry point. Newest layout first. The bundle's install step picks its directory the same way.
+# entry point. Newest layout first.
 dsh_root="$(mise where 'npm:@deepseek-ai/dsh')"
 dsh_dir="$dsh_root/node_modules/@deepseek-ai/dsh"
 [ -d "$dsh_dir" ] || dsh_dir="$dsh_root/lib/node_modules/@deepseek-ai/dsh"
-# `--expose-internals` instead of a bare `dsh`: the loader reaches Node's internal module loader
-# either through that flag or through a native addon, and the addon refuses this cage's node build
-# (see the header). Without it the boot dies applying the reload plugin.
-#
 # The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects,
 # which operations it offers), handed to the agent as instructions through a patch overlay that
 # inserts a second `dsh-agent-instructions` row. That row reads only the `AGENTS.md` of a home
@@ -188,7 +165,7 @@ if [ -r /opt/sbx/contract-summary.md ] && mkdir -p /etc/deepseek-harness/home 2>
 PATCH
   patch=(--patch /etc/deepseek-harness/contract.patch.yml)
 fi
-exec node --expose-internals "$dsh_dir/lib/bin.js" web "${patch[@]}" --port 3080 "$@"
+exec node "$dsh_dir/lib/bin.js" web "${patch[@]}" --port 3080 "$@"
 """,
     "deepseek-harness",
 ]
@@ -207,12 +184,10 @@ forward = [3080]
 #]
 
 # --- The agent's requirements come from its bundle ------------------------------------------------
-# `use` pulls in the `deepseek-harness` BUNDLE — the harness package, the node runtime and the
-# node-gyp toolchain its one source-built addon needs, the host it must reach, and its install-time
-# mute — from one declaration shared with the bundle file itself, so this profile cannot fall behind
-# when the agent's requirements change. The install step rides the bundle too, as its `provision`,
-# which sbx runs before this command; what stays here is the command, the posture and the
-# credential choices.
+# `use` pulls in the `deepseek-harness` BUNDLE — the harness package, the official node runtime,
+# the hosts it must reach, and its install-time mute — from one declaration shared with the bundle
+# file itself, so this profile cannot fall behind when the agent's requirements change; what stays
+# here is the command, the posture and the credential choices.
 #
 # THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/deepseek-harness.toml

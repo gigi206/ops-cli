@@ -26,55 +26,26 @@
 # whether it arrives as an in-cage placeholder the egress proxy replaces or as a key stored inside
 # the cage is a posture decision, not a package one.
 #
-# THE TOOLCHAIN IS PART OF THE INSTALL, not of the cage's shape. Three of the four native pieces in
-# dsh's closure arrive as platform optional dependencies, which mise places even under
-# `--ignore-scripts`. The fourth, `node-pty`, ships no Linux prebuild and builds from source, so
-# python3, make and a C++ compiler belong to what "installed" means for this agent — and the build
-# itself is the `provision` below, which sbx runs before the
-# consuming app's `cmd`. What that app still owes is the `--expose-internals` flag the loader needs
-# on this cage's node build — see `examples/app/deepseek-harness.toml`; a profile that names this
-# bundle and execs a bare `dsh` gets a server that prints its URL and exits.
+# THE NODE IS PART OF THE INSTALL. dsh's boot reaches Node's internal module loader through the
+# native addon `node-addon-require-builtin`, which locates it by recognizing the machine code of one
+# compiled V8 getter, and it recognizes the code of the official Node.js builds only. On nixpkgs'
+# node it fails with `Unsupported/no-getter`, and dsh has no other route to the loader, so it dies at
+# boot. The bundle therefore names the official build, which mise installs from `nodejs.org`. Every
+# native piece of dsh's closure — that addon, the Landlock runner, ripgrep and `node-pty` — arrives
+# as a platform prebuild mise places even under `--ignore-scripts`, so nothing is compiled in the
+# cage and the bundle carries no toolchain.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-# The one install step the script-free npm install leaves undone, and the reason this bundle is
-# complete rather than a package whose loader dies at boot. `node-pty` ships no Linux prebuild and
-# builds from source, so `--ignore-scripts` leaves `pty.node` absent — and the web profile loads
-# node-pty at BOOT, so the launch prints its URL and then exits, which reads like a working start.
-# `--nodedir` points node-gyp at the node package's own headers, so the build fetches nothing and
-# `nodejs.org` stays out of every allowlist.
-#
-# The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
-# remember that one succeeded. Keying on the built artifact also self-heals — `sbx upgrade mise`
-# lands a fresh install directory with no `pty.node`, so the next launch rebuilds it there.
-provision = [
-    "bash",
-    "-c",
-    '''
-set -eu
-# The package directory inside a `mise:npm:` install, without assuming which layout mise wrote.
-# It has published both — `<install>/lib/node_modules/<pkg>` and `<install>/node_modules/<pkg>` —
-# so a step that hardcodes one starts failing the day an upgrade lands the other, with a `cd` into
-# a path that is not there. Both are checked, newest layout first.
-dsh_root="$(mise where 'npm:@deepseek-ai/dsh')"
-dsh_dir="$dsh_root/node_modules/@deepseek-ai/dsh"
-[ -d "$dsh_dir" ] || dsh_dir="$dsh_root/lib/node_modules/@deepseek-ai/dsh"
-# `sbx app upgrade deepseek-harness` raises SBX_UPGRADE to ask for a re-install; without it the guard
-# below keeps the build to once.
-if [ ! -e "$dsh_dir/node_modules/node-pty/build/Release/pty.node" ] || [ -n "${SBX_UPGRADE:-}" ]; then
-  echo "deepseek-harness: building node-pty, the addon the script-free install leaves out …" >&2
-  node_prefix="$(dirname "$(dirname "$(command -v node)")")"
-  ( cd "$dsh_dir" && npm rebuild node-pty --nodedir="$node_prefix" )
-fi
-''',
-]
 allow = [
     # Install-time (mise's npm backend): the packument, the dsh tarballs, and the platform
-    # packages carrying the native binaries — the shared `@npm-registry` group. The in-cage
-    # `npm rebuild` of node-pty reads the same host and compiles against local headers.
+    # packages carrying the native binaries — the shared `@npm-registry` group.
     "@npm-registry",
+    # Install-time (mise's node backend): the official Node.js release tarball and the
+    # `SHASUMS256.txt` it is checked against. Read-only.
+    "{GET} https://nodejs.org/dist/*",
     # Runtime: chat completions and the `web_search` tool's `/anthropic/v1` endpoint, one host,
     # opened to every verb because both are POSTed.
     "{*} https://api.deepseek.com",
@@ -86,8 +57,8 @@ mute = [
 
 # THE VENDOR PUBLISHES FASTER THAN mise's FRESHNESS DELAY, so the package resolves to no version
 # and neither the first launch's equip nor `sbx app upgrade deepseek-harness` can proceed. The
-# `provision` above is downstream of that: it starts with `mise where` under `set -eu`, so it fails
-# at its first line whenever the package is not installed. Naming the package here lifts the delay
+# consuming app's command is downstream of that: it starts with `mise where` under `set -eu`, so it
+# fails at its first line whenever the package is not installed. Naming the package here lifts the delay
 # for it alone, at the cost of accepting a build this vendor published moments ago.
 # THE TRIGGER THAT REMOVES THE LINE: `dsh` starts publishing at a cadence slower than the delay,
 # which for a package still on `-rc` tags most likely means its first stable release.
@@ -95,10 +66,10 @@ accepts_fresh_releases = ["dsh"]
 
 [packages]
 dsh = "mise:npm:@deepseek-ai/dsh"  # the harness itself, from npm
-nodejs = "nix:nodejs"              # runs dsh, installs it, and supplies the headers the addon build reads
-python3 = "nix:python3"            # node-gyp's interpreter, for the node-pty build
-gnumake = "nix:gnumake"            # node-gyp's make
-gcc = "nix:gcc"                    # the C++ compiler that build needs
+# The OFFICIAL Node.js build, not nixpkgs' one (see the header). `lts` follows Node's long-term
+# support line, which stays inside both dsh's `engines` (`>=24.9`) and the range the native addon is
+# built and tested for (Node 20 to 26), and mise rolls it forward with the rest of the app.
+nodejs = "mise:node@lts"           # runs dsh and performs its npm install
 
 [env]
 # mise picks the client that performs an `npm:` install itself (`npm.package_manager = "auto"`), and
