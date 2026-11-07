@@ -199,14 +199,37 @@ pub(super) fn mise_token_display<'a>(tokens: impl IntoIterator<Item = &'a String
 /// the host-side `nix:` path, and trust-independent: this is the open self-equip path, so the
 /// tools are equipped whether or not the project is trusted (the egress allowlist is the
 /// control over where they may be fetched from).
+///
+/// A tool the cage's `MISE_DISABLE_TOOLS` names is left out. mise honours that variable when it
+/// reads a config, but a tool handed to `mise install` by name is installed regardless, so passing
+/// it would undo the setting: a project that provides `rust` through its own rustup and disables
+/// mise's would see every launch try, and fail, to fetch the toolchain it opted out of.
 pub(super) fn auto_equip_tokens(cfg: &crate::config::Resolved) -> Vec<String> {
+    let disabled = disabled_mise_tools(&cfg.env);
     cfg.mise
         .as_ref()
         .map(|m| {
             crate::sandbox::nixhub::parse_nix_tools(&m.files)
                 .non_nix
                 .into_iter()
+                .filter(|t| !disabled.contains(&t.token.strip_prefix("core:").unwrap_or(&t.token)))
                 .map(|t| format!("{}@{}", t.token, t.version))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The tools the cage's `MISE_DISABLE_TOOLS` names: the last value `env` sets for it, split on the
+/// commas mise reads it with. Empty when it is unset.
+fn disabled_mise_tools(env: &[(String, String)]) -> Vec<&str> {
+    env.iter()
+        .rev()
+        .find(|(key, _)| key == "MISE_DISABLE_TOOLS")
+        .map(|(_, value)| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|tool| !tool.is_empty())
                 .collect()
         })
         .unwrap_or_default()

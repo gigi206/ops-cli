@@ -55,6 +55,11 @@ trusted/global-only choice: an untrusted project may *declare* `aqua:evil/x` but
 cannot *open* egress to fetch it. Under `network = "none"` the install is skipped with
 a by-name warning; under a filtering posture the fetch rides the allowlist.
 
+A tool the cage's `MISE_DISABLE_TOOLS` names is not equipped. mise honours that variable when it
+reads the file, but installs a tool it is handed by name regardless, so sbx leaves it out: a
+project that brings `rust` through its own rustup and sets `MISE_DISABLE_TOOLS = "rust"` in its
+`[env]` sees no launch try to fetch the toolchain it opted out of.
+
 A non-`nix:` tool fetches upstream at first install, so it **kills offline
 first-launch**: the price of freshness versus the nix seed's offline reuse.
 

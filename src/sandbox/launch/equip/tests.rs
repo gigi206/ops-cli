@@ -28,6 +28,34 @@ fn auto_equip_tokens_formats_non_nix_tools_and_ignores_trust() {
     );
 }
 
+/// A tool handed to `mise install` by name is installed whatever `MISE_DISABLE_TOOLS` says, so the
+/// equip leaves out the tools that variable names, the last value set winning, with or without the
+/// `core:` prefix mise gives its built-in tools.
+#[test]
+fn auto_equip_leaves_out_the_tools_mise_disable_tools_names() {
+    let mut cfg = crate::testutil::resolved_channels(None, None);
+    cfg.mise = Some(crate::config::MiseConfig {
+        name: "mise.toml".into(),
+        state: crate::trust::TrustState::Trusted,
+        files: vec![(
+            "mise.toml".into(),
+            b"[tools]\nrust = \"1.99.1\"\n\"core:zig\" = \"0.15.2\"\nnode = \"26\"\n".to_vec(),
+        )],
+    });
+    cfg.env = vec![
+        ("MISE_DISABLE_TOOLS".into(), "node".into()),
+        ("MISE_DISABLE_TOOLS".into(), " rust , zig ".into()),
+    ];
+    assert_eq!(auto_equip_tokens(&cfg), vec!["node@26".to_string()]);
+
+    cfg.env.clear();
+    assert_eq!(
+        auto_equip_tokens(&cfg).len(),
+        3,
+        "an unset variable disables nothing"
+    );
+}
+
 /// `wrap_mise_equip` already proves a hostile `.mise.toml` token cannot inject *shell*. The
 /// other end of the same token is the launching terminal, which reads escapes: the two launch
 /// messages that name these tools printed them verbatim, so a `[tools]` key of
