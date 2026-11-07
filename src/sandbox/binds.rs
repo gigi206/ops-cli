@@ -2041,11 +2041,6 @@ pub(crate) fn build_spec(
         .mode(0o700)
         .create(&open_router)?;
     let xdg_open = open_router.join("xdg-open");
-    super::atomicfile::write_atomic_mode(
-        &xdg_open,
-        super::openuri::router(open).as_bytes(),
-        Some(0o755),
-    )?;
 
     // The portal's route to the same router: a desktop-entry directory and the mime defaults naming
     // it, staged here (outside every writable mount, like the router) and bound read-only at the
@@ -2269,6 +2264,23 @@ pub(crate) fn build_spec(
             io::ErrorKind::InvalidInput,
             format!("invalid sandbox spec: {e:?}"),
         )
+    })
+    .and_then(|spec| {
+        // Written once the spec is final, because the router carries the cage's `PATH`
+        // ([`super::openuri::router`]) and that is settled only by the assembly. The bind already
+        // names this file, and nothing runs in the cage before the spec is launched.
+        let path = spec
+            .env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "PATH")
+            .map_or("", |(_, value)| value.as_str());
+        super::atomicfile::write_atomic_mode(
+            &xdg_open,
+            super::openuri::router(open, path).as_bytes(),
+            Some(0o755),
+        )?;
+        Ok(spec)
     })
 }
 

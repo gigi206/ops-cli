@@ -1611,7 +1611,7 @@ fn the_staged_router_is_a_posix_sh_script_that_exits_zero() {
     // exits 0 — the whole point is a tool calling `xdg-open` does not see a failure — and
     // surface its argument so the user can act on it. Asserted on what the module *emits*,
     // since that is the byte sequence the launch stages and binds.
-    let staged = super::super::openuri::router(&Default::default());
+    let staged = super::super::openuri::router(&Default::default(), "/cage/bin");
     assert!(
         staged.starts_with("#!/bin/sh\n"),
         "the router is a /bin/sh script"

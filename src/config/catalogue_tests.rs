@@ -2347,12 +2347,18 @@ fn the_claude_desktop_policy_lets_the_login_pages_captcha_complete() {
         )
     };
     for host in ["hcaptcha.com", "api.hcaptcha.com", "api2.hcaptcha.com"] {
-        assert!(
-            allowed(host, "POST"),
-            "the captcha posts its check to {host}"
-        );
+        for method in ["POST", "OPTIONS"] {
+            assert!(
+                allowed(host, method),
+                "the captcha sends its check to {host} with {method}"
+            );
+        }
     }
-    for host in ["newassets.hcaptcha.com", "c0ffee.w.hcaptcha.com"] {
+    for host in [
+        "js.hcaptcha.com",
+        "newassets.hcaptcha.com",
+        "c0ffee.w.hcaptcha.com",
+    ] {
         assert!(
             allowed(host, "GET"),
             "the captcha loads its widget from {host}"
