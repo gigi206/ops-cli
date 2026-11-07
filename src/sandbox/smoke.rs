@@ -325,6 +325,38 @@ mod tests {
         assert!(report.is_hardened());
     }
 
+    /// The probe's script needs nothing but its shell. Where `/bin/sh` lives in a store, the cage's
+    /// `/usr/bin` holds no `cat`, `grep` or the like, so a script that called one read nothing and
+    /// the launch reported no hardening. Run with a `PATH` that names no directory, the script must
+    /// still print the kernel's status lines and answer for the home.
+    #[test]
+    fn the_probe_script_runs_on_shell_builtins_alone() {
+        let dir = crate::testutil::TmpDir::new();
+        let argv = probe_argv(Path::new("/bin/sh"), Some(dir.path().as_os_str()));
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env_clear()
+            .env("PATH", dir.path().join("no-such-dir"))
+            .output()
+            .expect("run the probe's own script");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the script failed: {}\n{stdout}{stderr}",
+            out.status
+        );
+        assert!(
+            stdout.lines().any(|l| l.starts_with("NoNewPrivs:\t"))
+                && stdout.lines().any(|l| l.starts_with("CapEff:\t")),
+            "the status lines were not read without a program on PATH:\n{stdout}{stderr}"
+        );
+        assert!(
+            stdout.lines().any(|l| l == "HOSTHOME=PRESENT"),
+            "the home was not answered without a program on PATH:\n{stdout}{stderr}"
+        );
+    }
+
     /// A shell under `/usr` is run as `/bin/sh` with nothing more bound; one in a store is run by
     /// its own path with the store's directory bound; and that directory is never one holding the
     /// host home, nor a shell the probe could not follow.
