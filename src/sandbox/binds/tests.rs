@@ -1540,6 +1540,77 @@ fn build_spec_refuses_an_open_pin_parent_the_cage_pointed_out_of_the_home() {
     );
 }
 
+/// The router the launch stages carries the cage's final `PATH`, so a handler named by its program
+/// resolves on the cage's package directories whoever calls `xdg-open`. Claude Desktop opens its
+/// sign-in link with a reduced `PATH`, and a router that kept the caller's never found `chromium`.
+/// Read off the file the launch wrote, against the `PATH` the spec gives the cage.
+#[test]
+fn the_staged_router_carries_the_cages_final_path() {
+    let data = TmpDir::new();
+    let project = TmpDir::new();
+    std::fs::write(project.path().join("README"), b"hi").unwrap();
+    let mut open = std::collections::BTreeMap::new();
+    open.insert(
+        "https".to_string(),
+        crate::config::OpenHandler {
+            argv: vec!["chromium".to_string()],
+            mode: crate::config::OpenMode::Exec,
+        },
+    );
+    let browser_bin = [PathBuf::from("/store/chromium/bin")];
+    let overlay = Overlay {
+        env: &[],
+        binds: &[],
+        bin_paths: &browser_bin,
+        timezone: DEFAULT_ZONE,
+        fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
+        share_install_pools: false,
+        share_project_pool: false,
+        git_config_read_only: false,
+    };
+    let spec = build_spec(
+        data.path(),
+        project.path(),
+        Runtime::ProjectDefault,
+        &userland(),
+        &nix_mount(),
+        &overlay,
+        &[],
+        NetPolicy::Shared,
+        &Default::default(),
+        &Default::default(),
+        crate::sandbox::seccomp::SeccompPolicy::default(),
+        &[],
+        &open,
+        false,
+        vec![OsString::from("/bin/sh")],
+    )
+    .expect("build spec");
+    let path = spec
+        .env
+        .iter()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| value.clone())
+        .expect("the cage sets PATH");
+    assert!(path.contains("/store/chromium/bin"), "{path}");
+    let staged = spec
+        .mounts
+        .iter()
+        .find_map(|m| match m {
+            Mount::RoBind { src, dest } if dest == Path::new(OPEN_ROUTER_DIR) => {
+                Some(src.join("xdg-open"))
+            }
+            _ => None,
+        })
+        .expect("the router's directory is bound");
+    let router = std::fs::read_to_string(&staged).expect("the launch wrote the router");
+    assert!(
+        router.contains(&format!("PATH='{path}'\nexport PATH\n")),
+        "the router must set the cage's final PATH before any handler runs:\n{router}"
+    );
+}
+
 #[test]
 fn usr_bin_env_is_symlinked_to_coreutils_env() {
     // An interpreted tool's `#!/usr/bin/env <interp>` shebang must resolve: the cage
