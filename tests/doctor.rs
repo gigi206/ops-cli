@@ -248,6 +248,34 @@ fn doctor_reports_a_refused_engine_override_as_refused_not_missing() {
     );
 }
 
+/// A data directory sbx refused is not a missing one. With `$XDG_DATA_HOME` set to a path too long
+/// for the sockets sbx binds under it, the store check used to say no `$XDG_DATA_HOME` was set; it
+/// is a failed check that points at the refusal, which stderr names.
+#[test]
+fn doctor_reports_a_refused_data_directory_as_refused_not_unset() {
+    let data = TmpDir::new("dr");
+    let long = data.path().join("d".repeat(120));
+    let out = sbx()
+        .arg("doctor")
+        .env("XDG_DATA_HOME", &long)
+        .output()
+        .expect("spawn sbx doctor");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let store = the_check(&stdout, "store");
+    assert_eq!(store.tag, "FAIL", "stdout was:\n{stdout}");
+    assert_eq!(
+        detail(store.text, "store"),
+        Some("refused (the reason is printed above)"),
+        "stdout was:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("sbx's data directory is"),
+        "the refusal names the directory; stderr was:\n{stderr}"
+    );
+    assert_eq!(verdict(&out), 1, "a refused data directory stops sbx");
+}
+
 /// Whether an unprivileged process gets a capability-bearing user namespace here, asked the way
 /// `doctor`'s own stand-in asks before it classifies a failed launch: a forked child creates a user
 /// namespace, then a mount namespace inside it, which needs `CAP_SYS_ADMIN` there.

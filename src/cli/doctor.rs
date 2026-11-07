@@ -33,6 +33,11 @@ const NIX_OVERRIDE_REMEDIATION: &str = "fix the ownership or permissions of the 
 SBX_NIX_BIN names (it must be owned by you or root, and not world-writable), or unset SBX_NIX_BIN \
 to let sbx resolve nix itself";
 
+/// The way out of a data directory sbx refused. The refusal, printed on stderr when the directory
+/// was resolved, names the variable or the volume at fault and its own way out; this points there.
+const DATA_DIR_REMEDIATION: &str = "clear the data-directory refusal printed above: it names the \
+variable or the volume at fault, and how to fix it";
+
 /// [`NIX_OVERRIDE_REMEDIATION`] for the sandbox engine.
 const BWRAP_OVERRIDE_REMEDIATION: &str = "fix the ownership or permissions of the bubblewrap \
 binary SBX_BWRAP_BIN names (it must be owned by you or root, and not world-writable), or unset \
@@ -321,6 +326,14 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
                 None => rep.check("ok", "channel", "not yet resolved — seeded on first launch"),
             }
             report_distro(&mut rep, layout);
+        }
+        // A refused directory is not a missing one: the variable is set, sbx declined it, and every
+        // command that needs the store stops, so it is a failed check with its remedy. Only a
+        // machine that names no base at all is the warning.
+        None if store::data_dir_refused() => {
+            rep.check("fail", "store", "refused (the reason is printed above)");
+            remediation.push(DATA_DIR_REMEDIATION);
+            rep.check("warn", "channel", "unresolved (no data directory)");
         }
         None => {
             rep.check(

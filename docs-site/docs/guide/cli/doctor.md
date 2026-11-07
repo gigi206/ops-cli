@@ -21,7 +21,8 @@ best-effort resource limiting, whether a filtering launch can transparently capt
 client that ignores the proxy variables (and, where the host refuses `sbx` the network
 namespace that takes, the cause and what lifts it), whether your git reads a bare repository
 it finds (`safe.bareRepository`, with the command that makes it refuse one), the store
-location and channel revision, and the **storage posture**: whether the data directory lives in an encapsulated
+location and channel revision (a data directory sbx refused, such as one too long for the sockets
+bound under it, is a failure that points at the refusal printed above it), and the **storage posture**: whether the data directory lives in an encapsulated
 [volume](storage), or, when it does not, whether one is worth adopting on this host
 (the filesystem it sits on, and whether btrfs, loop devices and udisks2 are present).
 That line is always informational, never a failure: a volume is never a prerequisite. It does flag one
