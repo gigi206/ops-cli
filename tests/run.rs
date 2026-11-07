@@ -7656,6 +7656,14 @@ fn an_app_finds_the_project_tools_sbx_run_installed_without_fetching_them() {
         cache_reachable(),
         "skipping project pool e2e: the network is unreachable"
     );
+    // The pool is shared only from a held descriptor, so a bubblewrap without `--bind-fd` shares
+    // nothing, by design, and this host lacks the capability rather than the launch getting it wrong.
+    let bwrap = std::env::var_os("SBX_BWRAP_BIN").unwrap_or_else(|| "bwrap".into());
+    let help = std::process::Command::new(&bwrap).arg("--help").output();
+    if !help.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("--ro-bind-fd")) {
+        skip_incapable!("skipping project pool e2e: the bubblewrap here has no `--ro-bind-fd`");
+        return;
+    }
 
     std::fs::write(
         project.path().join("mise.toml"),
@@ -7707,10 +7715,14 @@ fn an_app_finds_the_project_tools_sbx_run_installed_without_fetching_them() {
         out.status.success() && stdout.contains("cowsay"),
         "the app must find the tool `sbx run` installed: {stdout}{stderr}"
     );
-    assert!(
-        !stderr.contains("registry.npmjs.org") && !stderr.contains("failed"),
-        "the app must not try to fetch a tool the project's pool holds: {stderr}"
-    );
+    // mise's own failure marks and the registry's host: the launch's equip announcement names the
+    // tool itself, so the tool's name says nothing either way.
+    for mark in ["✗", "Failed to install", "registry.npmjs.org"] {
+        assert!(
+            !stderr.contains(mark),
+            "the app must not try to fetch a tool the project's pool holds ({mark}): {stderr}"
+        );
+    }
 }
 
 #[test]

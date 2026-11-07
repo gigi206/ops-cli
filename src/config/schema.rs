@@ -68,8 +68,10 @@ pub(crate) struct RawConfig {
     /// — the grant is about *these* apps in *this* project, and a machine-wide default would open
     /// it for projects that never asked. What it gives up is that a tool one app installed becomes
     /// a tool another app can run: an app that equips the version a second app is about to ask for
-    /// gets its copy run instead. The project's `/nix` store is already shared this way (see the
-    /// security model); this extends the same shape to the backends that never touch the store.
+    /// gets its copy run instead. The pool `sbx run` fills is read the same way, last, so what the
+    /// project's own shell installed is also a tool an app can run. The project's `/nix` store is
+    /// already shared this way (see the security model); this extends the same shape to the
+    /// backends that never touch the store.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) apps_share_install_pools: bool,
     /// Inline nix flakes, declared as `[flakes.<name>]` tables. Each carries a full `flake.nix`

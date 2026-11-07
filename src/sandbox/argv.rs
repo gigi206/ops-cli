@@ -86,6 +86,17 @@ pub(crate) fn compose_with(
             ),
         ));
     }
+    if let Some(dest) = spec.unheld_project_pool() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to launch: the project's mise pool would be mounted at `{}` by its path, \
+                 which a cage that writes its home could repoint; it is shared only from a held \
+                 descriptor",
+                dest.display()
+            ),
+        ));
+    }
     let mut argv = to_argv(spec);
     // Each held bind source a mount takes travels as a copy of its descriptor, owned by the command
     // like the others, so the spec keeps its own and can be composed again; the list names the copy.
@@ -539,6 +550,36 @@ mod tests {
     /// Positions of `needle` in the argv, as a convenience for ordering asserts.
     fn index_of(argv: &[OsString], needle: &str) -> Option<usize> {
         argv.iter().position(|a| a == needle)
+    }
+
+    /// The project's shared mise pool lies inside a home another cage writes, so a spec that mounts
+    /// it with no held source, as one rebuilt from another's mounts would, is refused; held, it goes
+    /// to bwrap as a descriptor.
+    #[test]
+    fn the_projects_pool_is_mounted_from_a_held_descriptor_or_not_at_all() {
+        let tmp = crate::testutil::TmpDir::new();
+        let pool = tmp.join("pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        let dest = super::super::binds::project_pool_dest();
+        let mounts = vec![Mount::RoBindTry {
+            src: pool.clone(),
+            dest: dest.clone(),
+        }];
+
+        let by_path = spec(mounts.clone(), Vec::new(), NetPolicy::Shared);
+        let Err(refused) = compose(Path::new("/bwrap"), &by_path) else {
+            panic!("a pool mounted by path is refused");
+        };
+        assert!(refused.to_string().contains("by its path"), "{refused}");
+
+        let fd = std::fs::File::open(&pool).unwrap();
+        let held = spec(mounts, Vec::new(), NetPolicy::Shared).with_held_sources(vec![
+            super::super::spec::HeldSource::mounted_at(pool, dest.clone(), fd.into()),
+        ]);
+        let argv = to_argv(&held);
+        let at = index_of(&argv, "--ro-bind-fd").expect("the pool goes by descriptor");
+        assert_eq!(argv[at + 2], dest.as_os_str());
+        compose(Path::new("/bwrap"), &held).expect("a held pool composes");
     }
 
     /// A held bind source reaches bwrap as a descriptor, by the last mount of its path onto itself

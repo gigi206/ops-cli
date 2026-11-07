@@ -116,8 +116,8 @@ pub(crate) struct ConfigView {
     pub(crate) allow_insecure_http: bool,
     /// Which layer opened plaintext fetching (`Default` when none did).
     pub(crate) allow_insecure_http_origin: ProvenanceView,
-    /// Whether this project's apps may read each other's mise install pools
-    /// (`apps_share_install_pools = true`).
+    /// Whether this project's apps may read each other's mise install pools, and the one `sbx run`
+    /// fills (`apps_share_install_pools = true`).
     pub(crate) apps_share_install_pools: bool,
     /// Which layer granted it (`Default` when none did; only a project can).
     pub(crate) apps_share_install_pools_origin: ProvenanceView,

@@ -484,6 +484,21 @@ impl SandboxSpec {
         })
     }
 
+    /// The project's shared mise pool, when a mount lays it with no held source to mount from.
+    ///
+    /// That pool lies inside a home another cage writes, so a mount of it by path would let that
+    /// cage swap a parent for a link and choose what this one sees. Only a held source makes it
+    /// safe, and a spec rebuilt from another's mounts carries none, so [`super::argv::compose`]
+    /// refuses such a spec rather than trusting every path that builds one to have held it.
+    pub(crate) fn unheld_project_pool(&self) -> Option<PathBuf> {
+        let dest = super::binds::project_pool_dest();
+        self.mounts
+            .iter()
+            .zip(self.handed_sources())
+            .any(|(m, held)| m.dest() == dest && held.is_none())
+            .then_some(dest)
+    }
+
     /// For each mount, the held source bwrap mounts there from its descriptor, if any.
     ///
     /// A source goes to the **last** mount of its path onto its destination, the one the cage sees

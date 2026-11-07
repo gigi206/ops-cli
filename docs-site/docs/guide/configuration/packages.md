@@ -266,8 +266,9 @@ What it gives up is that a tool one app installed becomes a tool another app can
 equips the version a second app is about to ask for gets its copy run instead, and the version a
 project declares is written in a file every app in it can read. The project's `/nix` store is
 [already shared this way](../concepts/security-model#the-store-an-agent-writes-into-is-shared-by-the-projects-apps);
-this extends the same shape to the backends that never touch the store. Leave it off unless the
-apps in the project are ones you would let each other's tools run.
+this extends the same shape to the backends that never touch the store. The same holds for the
+project's own shell: what `sbx run` installed in its pool, an app may run. Leave it off unless the
+apps in the project, and what runs in its shell, are ones you would let each other's tools run.
 
 ### `flake:`: a nix flake output
 

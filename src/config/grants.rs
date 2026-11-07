@@ -239,7 +239,7 @@ fn delta(before: &Resolved, after: &Resolved, app: Option<&String>, out: &mut Ve
             "apps_share_install_pools",
             "true".into(),
             Risk::Notable,
-            "one app can place a program another runs",
+            "one app, or the project's `sbx run` shell, can place a program another app runs",
         );
     }
     for (name, settings) in plugin {

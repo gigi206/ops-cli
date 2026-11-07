@@ -1615,6 +1615,12 @@ const MISE_SHARED_INCAGE: &str = "/opt/sbx/mise-shared";
 /// name may not start with `-`, so it never meets one.
 pub(crate) const PROJECT_POOL: &str = "-project";
 
+/// Where a cage finds the project's own mise pool when it is shared: the one destination a spec may
+/// mount only from a held source ([`super::spec::SandboxSpec::unheld_project_pool`]).
+pub(crate) fn project_pool_dest() -> PathBuf {
+    Path::new(MISE_SHARED_INCAGE).join(PROJECT_POOL)
+}
+
 /// The project's own mise pool, as a shared pool: `(PROJECT_POOL, <host pool>)`, or `None` when the
 /// project's home holds no `installs` reached through real directories alone.
 ///
@@ -1637,7 +1643,7 @@ pub(crate) fn hold_project_pool(
     cwd: &Path,
     spec: &super::spec::SandboxSpec,
 ) -> Result<Option<super::spec::HeldSource>, String> {
-    let dest = Path::new(MISE_SHARED_INCAGE).join(PROJECT_POOL);
+    let dest = project_pool_dest();
     if !spec.mounts.iter().any(|m| m.dest() == dest) {
         return Ok(None);
     }
