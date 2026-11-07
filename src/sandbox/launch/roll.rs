@@ -390,7 +390,25 @@ pub(crate) fn upgrade_mise_packages(
         // noise is shown only when the roll fails, so its cause is visible.
         let (code, out) = run_captured(&prep.bwrap, &spec, &prep.cfg.limits);
         drop(guard);
-        if code == 0 {
+        // A clean exit is not yet a clean roll: see [`not_installed`].
+        let absent = match code {
+            0 => match not_installed(&out, &tokens) {
+                Ok(tools) if tools.is_empty() => None,
+                Ok(tools) => Some(format!("not installed: {}", tools.join(", "))),
+                Err(why) => Some(format!("could not be checked — {why}")),
+            },
+            _ => None,
+        };
+        if let Some(why) = absent {
+            outln!(
+                "{}",
+                roll_line(&name, width, &format!("{warn}{why}{r}"), pal)
+            );
+            crate::diag::warn(&format!("`{}`: {why}", home.label()));
+            echo_cage_output(&out);
+            failed += 1;
+            ok = false;
+        } else if code == 0 {
             match mise_transitions(&out).as_slice() {
                 [] if mise_up_to_date(&out) => {
                     outln!(
@@ -1243,6 +1261,22 @@ fn token_names_app(token: &str, name: &str) -> bool {
     let bare = token.split('[').next().unwrap_or(token);
     let last = bare.rsplit(['/', ':']).next().unwrap_or(bare);
     last == name
+}
+
+/// The declared tools a roll that exited 0 left uninstalled, read from the report
+/// [`mise_upgrade_cmd`] prints after the upgrade; an error when that report is missing or unreadable.
+///
+/// mise answers `All tools are up to date` over a pool that holds nothing, which is what the launch's
+/// best-effort equip leaves when a first install fails, so a clean exit alone would report a tool
+/// that cannot be installed as current.
+fn not_installed(captured: &str, tokens: &[String]) -> Result<Vec<String>, String> {
+    Ok(parse_mise_state(captured, tokens, "bump")?
+        .into_iter()
+        .filter_map(|check| match check {
+            MiseCheck::NotEquipped { tool } => Some(tool),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Whether mise reported nothing to do. mise prints `All tools are up to date` (to stderr) when a

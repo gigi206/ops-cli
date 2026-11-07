@@ -165,24 +165,17 @@ fn a_mise_package_is_pinned_at_equip_and_only_a_bump_roll_moves_it() {
     let bash = PathBuf::from("/nix/store/bash/bin/bash");
     let tokens = vec!["aqua:example/demo-tool".to_string()];
 
-    let plain = mise_upgrade_cmd(binds::Runtime::ProjectDefault, &mise, &bash, &tokens);
-    assert_eq!(plain[1], OsString::from("upgrade"));
-    assert_eq!(
-        plain[2],
-        OsString::from("--bump"),
-        "a pinned tool only advances with --bump"
-    );
-    assert_eq!(plain[3], OsString::from("aqua:example/demo-tool"));
-
-    // The same on the global-app lane, where the roll runs through a shell to pin the pool.
-    let global = mise_upgrade_cmd(binds::Runtime::GlobalApp("demo-app"), &mise, &bash, &tokens);
-    assert!(
-        global[2]
-            .to_string_lossy()
-            .contains("upgrade --bump \"$@\""),
-        "the global lane bumps too: {}",
-        global[2].to_string_lossy()
-    );
+    for rt in [
+        binds::Runtime::ProjectDefault,
+        binds::Runtime::GlobalApp("demo-app"),
+    ] {
+        let cmd = mise_upgrade_cmd(rt, &mise, &bash, &tokens);
+        let script = cmd[2].to_string_lossy();
+        assert!(
+            script.contains("'/nix/store/mise/bin/mise' upgrade --bump \"$@\""),
+            "a pinned tool only advances with --bump: {script}"
+        );
+    }
 }
 
 /// What the launch says it is about to do is what it does.
@@ -466,34 +459,43 @@ fn mise_upgrade_cmd_pins_the_app_global_pool_only_for_a_global_app() {
     // else `mise upgrade` finds nothing and silently rolls nothing (a shipped-command regression).
     let mise = PathBuf::from("/nix/store/mise/bin/mise");
     let bash = PathBuf::from("/nix/store/bash/bin/bash");
-    let tokens = vec!["aqua:example/demo-tool".to_string()];
+    let tokens = vec![
+        "aqua:example/demo-tool".to_string(),
+        "x'; rm -rf ~; echo '".to_string(),
+    ];
     let data_dir = crate::sandbox::binds::mise_app_global_data_dir();
 
-    // global app: pinned to the app-global pool via a bash MISE_DATA_DIR prefix
-    let g = mise_upgrade_cmd(binds::Runtime::GlobalApp("cc"), &mise, &bash, &tokens);
-    assert_eq!(g[0], OsString::from("/nix/store/bash/bin/bash"));
-    let script = g[2].to_string_lossy();
-    assert!(
-        script.contains(&format!(
-            "MISE_DATA_DIR='{data_dir}' exec '/nix/store/mise/bin/mise' upgrade"
-        )),
-        "the global-app roll must pin the app-global data dir: {script}"
-    );
-    assert_eq!(g[4], OsString::from("aqua:example/demo-tool")); // token positional
-
-    // sbx run / a per-project app: single pool (the ambient primary), plain unwrapped command
-    for rt in [
-        binds::Runtime::ProjectDefault,
-        binds::Runtime::ProjectApp("cc"),
+    // A global app is pinned to the app-global pool; `sbx run` and a per-project app have a single
+    // pool, the ambient primary, and are not.
+    for (rt, pinned) in [
+        (binds::Runtime::GlobalApp("cc"), true),
+        (binds::Runtime::ProjectApp("cc"), false),
+        (binds::Runtime::ProjectDefault, false),
     ] {
-        let c = mise_upgrade_cmd(rt, &mise, &bash, &tokens);
-        assert_eq!(c[0], OsString::from("/nix/store/mise/bin/mise"));
-        assert_eq!(c[1], OsString::from("upgrade"));
-        // `--bump` sits between the verb and the tokens on this lane too: the launch pins the
-        // config at the installed version, and a pinned range is one a plain roll would call
-        // already satisfied.
-        assert_eq!(c[2], OsString::from("--bump"));
-        assert_eq!(c[3], OsString::from("aqua:example/demo-tool"));
+        let cmd = mise_upgrade_cmd(rt, &mise, &bash, &tokens);
+        assert_eq!(cmd[0], OsString::from("/nix/store/bash/bin/bash"));
+        let script = cmd[2].to_string_lossy();
+        assert!(
+            script.starts_with("set -e; "),
+            "a failing upgrade fails the cage before its report: {script}"
+        );
+        assert_eq!(
+            script.contains(&format!("export MISE_DATA_DIR='{data_dir}'; ")),
+            pinned,
+            "only a global app's installs live in the app-global pool: {script}"
+        );
+        // The pool's listing follows the upgrade, so the roll can tell a current tool from one the
+        // equip never installed.
+        let upgrade = script.find("upgrade --bump \"$@\"").expect("the roll");
+        let report = script.find(MISE_STATE_MARKER).expect("the report");
+        assert!(upgrade < report, "{script}");
+        assert!(script.contains("'/nix/store/mise/bin/mise' ls --global --json"));
+        // The tokens are data: positional, never in the script.
+        assert!(!script.contains("rm -rf"));
+        assert_eq!(
+            cmd[4..],
+            tokens.iter().map(OsString::from).collect::<Vec<_>>()[..]
+        );
     }
 }
 

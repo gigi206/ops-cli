@@ -624,6 +624,33 @@ fn a_plain_roll_reads_latest_where_a_bump_roll_reads_bump() {
     );
 }
 
+/// A roll whose equip could not install a tool exits 0 with the same verdict a current pool gets,
+/// so only the pool's listing after it tells the two apart. Both captures are what mise 2026.10.17
+/// printed in a cage, the first with the attestation host refused, the second after a roll.
+#[test]
+fn a_roll_over_a_tool_the_equip_never_installed_names_it() {
+    let tokens = vec!["yq".to_string()];
+    let refused = format!(
+        "mise ERROR Failed to install aqua:mikefarah/yq@latest: cosign bundle-based verification \
+         failed\nmise All tools are up to date\n{MISE_STATE_MARKER}\n{{\"ls\":{{}}\n,\"outdated\":{{}}}}\n"
+    );
+    assert!(
+        mise_up_to_date(&refused),
+        "mise's own verdict cannot tell this roll from a current one"
+    );
+    assert_eq!(not_installed(&refused, &tokens), Ok(vec!["yq".to_string()]));
+
+    let rolled = format!(
+        "Upgraded 1 tool:\n  yq 4.50.1 → 4.54.2\n{MISE_STATE_MARKER}\n{{\"ls\":{{\n  \"yq\": [{{\
+         \"version\": \"4.54.2\", \"requested_version\": \"4.54.2\", \"installed\": true, \
+         \"active\": true}}]\n}}\n,\"outdated\":{{}}}}\n"
+    );
+    assert_eq!(not_installed(&rolled, &tokens), Ok(vec![]));
+
+    // An exit 0 with no report is not read as a pool holding everything.
+    assert!(not_installed("mise All tools are up to date\n", &tokens).is_err());
+}
+
 #[test]
 fn a_mise_check_that_found_no_document_is_an_error_not_a_clean_report() {
     let tokens = vec!["aqua:example/demo-tool".to_string()];

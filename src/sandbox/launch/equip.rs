@@ -37,18 +37,25 @@ pub(super) fn equip_announcement(tokens: &[String]) -> String {
     )
 }
 
-/// The `mise upgrade <tokens>` command for one roll group. The rolled tokens are the group's
+/// The `mise upgrade <tokens>` command for one roll group, followed by the home's
+/// [`mise_ls_report`] closed with an empty `outdated`. The rolled tokens are the group's
 /// `[packages] mise:` tools, which for a **global app** live in the app-global home pool (Lane-1
 /// `mise use -g` pins them there). The cage's ambient primary for a global app is the *per-project*
 /// pool, which does not hold them, so a plain `mise upgrade` there would find nothing and silently
 /// roll nothing — a regression of a shipped command. So for a global app the roll is pinned to the
-/// app-global pool via a bash `MISE_DATA_DIR=<app-global>` prefix; the tokens ride `"$@"`
-/// positionally, the two interpolated values go through [`shell_quote`], and `exec` keeps the roll
-/// the cage's main process. Both values are sbx's own — the mise path it resolved and a fixed cage
-/// path — so nothing untrusted reaches the script either way; quoting them makes that a property of
-/// how the line is built rather than of what the values happen to contain, which is the form that
-/// survives a path acquiring a space. Other runtimes have a single pool (the home), already the
-/// ambient primary, so the plain command runs unwrapped.
+/// app-global pool via an exported `MISE_DATA_DIR=<app-global>`; other runtimes have a single pool
+/// (the home), already the ambient primary. The tokens ride `"$@"` positionally and the two
+/// interpolated values go through [`shell_quote`]. Both values are sbx's own — the mise path it
+/// resolved and a fixed cage path — so nothing untrusted reaches the script either way; quoting them
+/// makes that a property of how the line is built rather than of what the values happen to contain,
+/// which is the form that survives a path acquiring a space.
+///
+/// The report is what tells a tool that is current from one that was never installed. The launch's
+/// equip runs before this command and is best-effort, so a tool whose install fails there (its
+/// registry or its attestation host refused by the egress allowlist) leaves nothing behind, and
+/// `mise upgrade` over nothing says `All tools are up to date` and exits 0, exactly as it does over
+/// a current pool. Only the pool's own listing separates the two. `set -e` keeps a failing upgrade
+/// the cage's exit status, so the report is printed only after an upgrade that succeeded.
 ///
 /// `--bump` is the other half of the launch's `use -g --pin`. A plain `mise upgrade` keeps whatever
 /// range the config states, and after a pin that range is one exact version: the roll would report
@@ -64,31 +71,42 @@ pub(super) fn mise_upgrade_cmd(
     bash: &Path,
     tokens: &[String],
 ) -> Vec<OsString> {
-    if matches!(runtime, binds::Runtime::GlobalApp(_)) {
-        let data_dir = binds::mise_app_global_data_dir();
-        let script = format!(
-            "MISE_DATA_DIR={data_dir} exec {mise} upgrade {MISE_ROLL_FLAG} \"$@\"",
-            data_dir = shell_quote(&data_dir),
-            mise = shell_quote(&mise.to_string_lossy()),
-        );
-        let mut cmd = vec![
-            bash.as_os_str().to_os_string(),
-            OsString::from("-c"),
-            OsString::from(script),
-            // `$0` — a label; the tokens are `$1..$n`.
-            OsString::from("sbx-mise-upgrade"),
-        ];
-        cmd.extend(tokens.iter().map(OsString::from));
-        cmd
-    } else {
-        let mut cmd = vec![
-            mise.as_os_str().to_os_string(),
-            OsString::from("upgrade"),
-            OsString::from(MISE_ROLL_FLAG),
-        ];
-        cmd.extend(tokens.iter().map(OsString::from));
-        cmd
+    let mise = shell_quote(&mise.to_string_lossy());
+    let script = format!(
+        "set -e; {pin}{mise} upgrade {MISE_ROLL_FLAG} \"$@\"; {report}; printf '{{}}}}\\n'",
+        pin = mise_pool_pin(runtime),
+        report = mise_ls_report(&mise),
+    );
+    let mut cmd = vec![
+        bash.as_os_str().to_os_string(),
+        OsString::from("-c"),
+        OsString::from(script),
+        // `$0` — a label; the tokens are `$1..$n`.
+        OsString::from("sbx-mise-upgrade"),
+    ];
+    cmd.extend(tokens.iter().map(OsString::from));
+    cmd
+}
+
+/// The `export MISE_DATA_DIR=…; ` a script opens with so its mise reads the pool the launch
+/// equipped: the app-global one for a global app, nothing for the runtimes whose ambient primary
+/// already is that pool.
+fn mise_pool_pin(runtime: binds::Runtime) -> String {
+    match binds::app_equip_data_dir(runtime) {
+        Some(data_dir) => format!("export MISE_DATA_DIR={}; ", shell_quote(&data_dir)),
+        None => String::new(),
     }
+}
+
+/// The opening of the document [`mise_state_cmd`] and [`mise_upgrade_cmd`] print after
+/// [`MISE_STATE_MARKER`]: `{"ls":` the home's global config with what it has installed
+/// (`mise ls --global --json`), then `,"outdated":`, which each caller closes with its own value.
+/// `mise` is the already-quoted path.
+fn mise_ls_report(mise: &str) -> String {
+    format!(
+        "printf '%s\\n{{\"ls\":' '{MISE_STATE_MARKER}'; {mise} ls --global --json; \
+         printf ',\"outdated\":'"
+    )
 }
 
 /// The line [`mise_state_cmd`] prints before its JSON document, so the reader finds the document
@@ -113,14 +131,11 @@ pub(super) fn mise_state_cmd(
     bash: &Path,
     tokens: &[String],
 ) -> Vec<OsString> {
-    let pin = match binds::app_equip_data_dir(runtime) {
-        Some(data_dir) => format!("export MISE_DATA_DIR={}; ", shell_quote(&data_dir)),
-        None => String::new(),
-    };
     let mise = shell_quote(&mise.to_string_lossy());
     let script = format!(
-        "set -e; {pin}printf '%s\\n{{\"ls\":' '{MISE_STATE_MARKER}'; {mise} ls --global --json; \
-         printf ',\"outdated\":'; {mise} outdated {MISE_ROLL_FLAG} --json \"$@\"; printf '}}\\n'"
+        "set -e; {pin}{report}; {mise} outdated {MISE_ROLL_FLAG} --json \"$@\"; printf '}}\\n'",
+        pin = mise_pool_pin(runtime),
+        report = mise_ls_report(&mise),
     );
     let mut cmd = vec![
         bash.as_os_str().to_os_string(),

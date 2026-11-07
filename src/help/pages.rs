@@ -1905,6 +1905,10 @@ pub(super) const PAGES: &[Page] = &[
         details: "Rolls managed channels forward by re-resolving and rewriting their locks, so\n\
             versions advance only here, never on an sbx binary update.\n\
             \n\
+            A `mise:` package rolls in its app's cage, and one still not installed after the\n\
+            roll (its first install refused, say, by the egress allowlist) fails that app with\n\
+            mise's output rather than reading as up to date.\n\
+            \n\
             `provision` is the channel for an agent that rides no `[packages]` backend: its\n\
             bundle INSTALLS it (a clone and a build, a vendor script), so there is no lock to\n\
             rewrite and what advances it is running that install again. Each such app's install\n\
