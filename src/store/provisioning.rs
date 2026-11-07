@@ -179,12 +179,13 @@ fn provision_command(
 /// `allow_unfree` opts the one build into the unfree-permitting invocation described on
 /// [`provision_unfree`].
 ///
-/// Writes the out-link and no stamp, deliberately: a `nix:` attribute names the pinned channel
-/// revision, so `nix build` is an eval-cache hit and there is nothing for a short-circuit to save.
-/// It may nevertheless repoint an out-link that a stamping provisioner wrote — `[packages]` roots
-/// every entry at `<gcroots>/<name>` whatever backend declared it — which is why the stamp records
-/// its target and [`reuse_built_expr`] checks it, rather than each non-stamping writer being made
-/// to clear a stamp it does not know about.
+/// A build from a pinned reference is stamped like the other provisioners' ([`reuse_built_expr`]),
+/// and a later call whose stamp, out-link and marked output all still hold returns without running
+/// nix. Even an evaluation-cache hit costs a process and an evaluation, and a launch provisions its
+/// whole base userland through here, so the short-circuit is what keeps a warm launch from paying
+/// for every package it already holds. The stamp records its target because the out-link is not
+/// this provisioner's alone: `[packages]` roots every entry at `<gcroots>/<name>` whatever backend
+/// declared it.
 fn provision_licensed(
     nix: &Path,
     layout: &Layout,
@@ -202,6 +203,16 @@ fn provision_licensed(
             .recursive(true)
             .mode(0o700)
             .create(parent)?;
+    }
+
+    // A pinned reference names one derivation for good, so the output a previous build selected
+    // is the output this one would select. An unpinned one (a local path, a branch) may move under
+    // an unchanged spelling, and always rebuilds.
+    let stamp = expr_stamp_path(gcroot);
+    let digest = expr_digest(&attr_build_key(flake_ref, attr, marker, allow_unfree));
+    let pinned = super::channel::is_pinned_revision(flake_ref);
+    if pinned && let Some(path) = reuse_built_expr(layout, gcroot, marker, &stamp, &digest) {
+        return Ok(path);
     }
 
     let mut cmd = provision_command(nix, layout, gcroot, flake_ref, attr, allow_unfree);
@@ -222,7 +233,19 @@ fn provision_licensed(
     }
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    select_marked_output(layout, &stdout, attr, marker)
+    let resolved = select_marked_output(layout, &stdout, attr, marker)?;
+    if pinned {
+        write_expr_stamp(&stamp, &digest, &resolved);
+    }
+    Ok(resolved)
+}
+
+/// What [`provision_licensed`] stamps a build with: every input that decides which output it
+/// selects. The leading tag keeps it apart from the expressions and flake targets the other
+/// provisioners stamp the same `<gcroot>.expr` with, so a gcroot that changes backend never matches
+/// a stamp the other backend wrote.
+fn attr_build_key(flake_ref: &str, attr: &str, marker: &str, allow_unfree: bool) -> String {
+    format!("nix-attr\n{flake_ref}\n{attr}\n{marker}\nunfree={allow_unfree}")
 }
 
 /// The out-link rooting the pinned channel's own flake **source**, placed beside the base
@@ -489,8 +512,9 @@ fn expr_digest(expr: &str) -> String {
 }
 
 /// The already-built output for an expression, when it can be reused without rebuilding: the stamp
-/// records this exact expression's digest **and the out-link it was written for**, the out-link
-/// still points there, and its output still carries `marker`. `None` (⇒ rebuild) on any miss —
+/// records this exact expression's digest **and the out-link it was written for**, the out-link (or,
+/// for an output other than the default one, its `<gcroot>-<output>` sibling: [`out_links`]) still
+/// points there, and its output still carries `marker`. `None` (⇒ rebuild) on any miss —
 /// absent/stale stamp, an out-link that has moved, a dangling or garbage-collected out-link, or a
 /// missing marker — so a changed expression or a vanished output always rebuilds. The out-link
 /// points at the logical `/nix/store/<hash>` path (mapped through [`physical_path`] for the marker
@@ -520,8 +544,8 @@ fn reuse_built_expr(
     if recorded_digest.trim() != digest {
         return None;
     }
-    let logical = std::fs::read_link(gcroot).ok()?;
-    if Path::new(recorded_target.trim()) != logical {
+    let logical = PathBuf::from(recorded_target.trim());
+    if !out_links(gcroot).any(|link| std::fs::read_link(link).is_ok_and(|t| t == logical)) {
         return None;
     }
     physical_path(layout, &logical)
@@ -529,6 +553,32 @@ fn reuse_built_expr(
         .symlink_metadata()
         .ok()?;
     Some(logical)
+}
+
+/// The out-links one `nix build --out-link <gcroot>` can leave: `gcroot` itself for the default
+/// output, and `<gcroot>-<output>` beside it for every other (`jq-bin`, `curl-bin`). The output the
+/// build selected may be any of them, so a stamp holds when one of them still points at it.
+fn out_links(gcroot: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    let prefix = gcroot.file_name().map(|name| {
+        let mut prefix = name.to_owned();
+        prefix.push("-");
+        prefix
+    });
+    let siblings = gcroot
+        .parent()
+        .zip(prefix)
+        .and_then(|(dir, prefix)| {
+            let entries = std::fs::read_dir(dir).ok()?;
+            Some(entries.flatten().map(|e| e.path()).filter(move |path| {
+                path.file_name().is_some_and(|name| {
+                    name.as_encoded_bytes()
+                        .starts_with(prefix.as_encoded_bytes())
+                })
+            }))
+        })
+        .into_iter()
+        .flatten();
+    std::iter::once(gcroot.to_path_buf()).chain(siblings)
 }
 
 /// Write the expression stamp: the digest, then the logical out-link target it describes, one per
@@ -969,6 +1019,165 @@ mod tests {
         // A garbage-collected output (the out-link's target is gone) → rebuild rather than reuse.
         std::fs::remove_dir_all(&physical).unwrap();
         assert!(reuse_built_expr(&layout, &gcroot, marker, &stamp, &da).is_none());
+    }
+
+    /// A stand-in `nix build` that counts its runs, leaves its out-links the way nix names them
+    /// (`<link>` for the default output, `<link>-<output>` for the others) and prints the outputs.
+    /// Each entry of `outputs` is `(link suffix, logical store path)`, `""` for the default output.
+    fn counting_nix(dir: &Path, outputs: &[(&str, &str)]) -> PathBuf {
+        let nix = dir.join("nix");
+        let mut body = String::from(
+            "d=\"$(dirname \"$0\")\"\n\
+             echo x >> \"$d/runs\"\n\
+             while [ $# -gt 0 ]; do [ \"$1\" = --out-link ] && link=\"$2\"; shift; done\n",
+        );
+        for (suffix, logical) in outputs {
+            body.push_str(&format!(
+                "ln -sfn {logical} \"$link{suffix}\"\necho {logical}\n"
+            ));
+        }
+        crate::testutil::write_script(&nix, &body);
+        nix
+    }
+
+    fn runs(dir: &Path) -> usize {
+        std::fs::read_to_string(dir.join("runs")).map_or(0, |r| r.lines().count())
+    }
+
+    /// A built output, as the store holds it: a logical path whose physical copy carries `marker`.
+    fn built_output(layout: &Layout, logical: &str, marker: &str) {
+        let physical = physical_path(layout, Path::new(logical)).join(marker);
+        std::fs::create_dir_all(physical.parent().unwrap()).unwrap();
+        std::fs::write(physical, b"x").unwrap();
+    }
+
+    const PINNED: &str = "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567";
+    const OUT: &str = "/nix/store/00000000000000000000000000000000-tool";
+
+    /// A launch provisions its whole base userland through `provision`, and every call ran
+    /// `nix build` even when the output was already built and rooted: a warm launch paid a process
+    /// and an evaluation for each package it already held. A second call with the same inputs must
+    /// not run nix, and returns the same output.
+    #[test]
+    fn a_built_attribute_is_served_again_without_running_nix() {
+        let data = TmpDir::new();
+        let layout = Layout::under(&data.join("sbx"));
+        built_output(&layout, OUT, "bin/tool");
+        let nix = counting_nix(data.path(), &[("", OUT)]);
+        let gcroot = data.path().join("roots").join("tool");
+        let provision_once = || {
+            crate::testutil::result_past_etxtbsy("nix", || {
+                provision(&nix, &layout, &gcroot, PINNED, "tool", "bin/tool")
+            })
+            .unwrap()
+        };
+
+        assert_eq!(provision_once(), PathBuf::from(OUT));
+        assert_eq!(runs(data.path()), 1, "a first provision builds");
+        assert_eq!(provision_once(), PathBuf::from(OUT));
+        assert_eq!(runs(data.path()), 1, "a warm provision must not run nix");
+    }
+
+    /// The output a build selects is often not the default one (`jq`'s binaries are in `jq.bin`),
+    /// and nix then roots it at `<gcroot>-bin`, never at `<gcroot>`. The reuse must find it there,
+    /// or every such package rebuilds on every launch.
+    #[test]
+    fn a_built_attribute_whose_output_is_not_the_default_one_is_served_again() {
+        let data = TmpDir::new();
+        let layout = Layout::under(&data.join("sbx"));
+        let bin = "/nix/store/11111111111111111111111111111111-jq-bin";
+        let man = "/nix/store/22222222222222222222222222222222-jq-man";
+        built_output(&layout, bin, "bin/jq");
+        built_output(&layout, man, "share/man/jq.1");
+        let nix = counting_nix(data.path(), &[("-bin", bin), ("-man", man)]);
+        let gcroot = data.path().join("roots").join("jq");
+        for _ in 0..2 {
+            let got = crate::testutil::result_past_etxtbsy("nix", || {
+                provision(&nix, &layout, &gcroot, PINNED, "jq", "bin/jq")
+            })
+            .unwrap();
+            assert_eq!(got, PathBuf::from(bin));
+        }
+        assert_eq!(
+            runs(data.path()),
+            1,
+            "the `-bin` out-link roots the stamped output"
+        );
+    }
+
+    /// Every input that decides the output must send the call back to nix when it changes: the
+    /// revision, the licence allowance, the marker, an out-link no longer pointing at the stamped
+    /// output, a collected output, and a reference that is not pinned to a revision at all.
+    #[test]
+    fn a_changed_input_or_a_lost_output_runs_nix_again() {
+        let data = TmpDir::new();
+        let layout = Layout::under(&data.join("sbx"));
+        built_output(&layout, OUT, "bin/tool");
+        built_output(&layout, OUT, "bin/other");
+        let nix = counting_nix(data.path(), &[("", OUT)]);
+        let gcroot = data.path().join("roots").join("tool");
+        let call = |flake_ref: &str, marker: &str, unfree: bool| {
+            crate::testutil::result_past_etxtbsy("nix", || {
+                if unfree {
+                    provision_unfree(&nix, &layout, &gcroot, flake_ref, "tool", marker)
+                } else {
+                    provision(&nix, &layout, &gcroot, flake_ref, "tool", marker)
+                }
+            })
+            .unwrap();
+        };
+        let expected = std::cell::Cell::new(0);
+        let check = |what: &str, flake_ref: &str, marker: &str, unfree: bool| {
+            call(flake_ref, marker, unfree);
+            expected.set(expected.get() + 1);
+            assert_eq!(runs(data.path()), expected.get(), "{what} must run nix");
+        };
+
+        check("a first provision", PINNED, "bin/tool", false);
+        let rolled = "github:NixOS/nixpkgs/89abcdef0123456789abcdef0123456789abcdef";
+        check("another revision", rolled, "bin/tool", false);
+        check("the licence allowance", rolled, "bin/tool", true);
+        check("another marker", rolled, "bin/other", true);
+        check(
+            "an unpinned reference",
+            "github:NixOS/nixpkgs/nixos-unstable",
+            "bin/tool",
+            false,
+        );
+        check(
+            "the same unpinned reference",
+            "github:NixOS/nixpkgs/nixos-unstable",
+            "bin/tool",
+            false,
+        );
+
+        // Warm again, then lose what the stamp vouches for.
+        check(
+            "a return to the pinned reference",
+            PINNED,
+            "bin/tool",
+            false,
+        );
+        call(PINNED, "bin/tool", false);
+        assert_eq!(runs(data.path()), expected.get(), "warm again");
+        std::fs::remove_file(&gcroot).unwrap();
+        std::os::unix::fs::symlink("/nix/store/33333333333333333333333333333333-x", &gcroot)
+            .unwrap();
+        check("an out-link that moved", PINNED, "bin/tool", false);
+        std::fs::remove_dir_all(physical_path(&layout, Path::new(OUT))).unwrap();
+        built_output(&layout, OUT, "share/doc");
+        let e = crate::testutil::result_past_etxtbsy("nix", || {
+            provision(&nix, &layout, &gcroot, PINNED, "tool", "bin/tool")
+        });
+        assert!(
+            e.is_err(),
+            "a collected output is rebuilt, and this one lacks its marker"
+        );
+        assert_eq!(
+            runs(data.path()),
+            expected.get() + 1,
+            "a collected output must run nix"
+        );
     }
 }
 
