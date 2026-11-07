@@ -1208,7 +1208,12 @@ fn mise_equip_lanes<'a>(
 ) -> Vec<(String, String)> {
     let mut autoequip_env: Vec<(String, String)> = Vec::new();
     let global_mise = crate::sandbox::packages::mise_packages(&prep.cfg.packages);
-    let auto_equip = auto_equip_tokens(&prep.cfg);
+    // The project's own lane, unless this cage serves only the declarations of its group.
+    let auto_equip = if prep.project_lane {
+        auto_equip_tokens(&prep.cfg)
+    } else {
+        Vec::new()
+    };
     // A global app's Lane-1 `mise use -g` must install an app `[packages] mise:` tool into the
     // app-global home pool (installed once, shared across projects, and where `sbx app show`/`list`/
     // `gc` read), not the ambient per-project primary. Pin the equip step there for a global app;

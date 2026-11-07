@@ -157,6 +157,12 @@ struct Prepared {
     /// installing what it lacks. The environment the equip lanes contribute is kept either way, so
     /// the in-cage mise reads the same configuration it would after equipping.
     equips: bool,
+    /// Whether the cage equips the project's own toolchain, the non-`nix:` tools its mise file
+    /// declares (lane 2). `true` for every launch; `false` for the `sbx upgrade` roll cages, which
+    /// install or roll an app's own declarations: what the project the roll was started from asks
+    /// for is no input to them, and equipping it there would fetch that project's tools under every
+    /// app's egress and seed a pool for each app the project never ran.
+    project_lane: bool,
     /// What an unresolvable credential costs this launch. `Abort` everywhere but the batch rolls,
     /// which run one captured command per app and must not let a credential that command never
     /// sends decide whether the app is upgraded — see [`crate::sandbox::egress::Unresolved`].
@@ -1345,6 +1351,7 @@ fn prepare_engines(
         userland,
         in_batch: false,
         equips: true,
+        project_lane: true,
         unresolved_secret: crate::sandbox::egress::Unresolved::Abort,
         learn_exec: false,
         contract_text: None,

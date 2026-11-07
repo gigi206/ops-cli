@@ -58,6 +58,11 @@ what belongs to the project alone: the mise engine, the project's `nix:` tools, 
 pool, the baseline's packages, and the image. What each backend does when a roll reaches
 it is the table in [What each backend does on upgrade](#what-each-backend-does-on-upgrade).
 
+Each cage a roll starts serves its app's own declarations and nothing else. The tools the
+project's mise file declares from another backend than `nix:` (`npm:`, `aqua:`, `cargo:`…)
+are not installed there, whichever project the roll is started from: they belong to the
+project, and its next launch equips them as usual.
+
 See [`sbx upgrade`](../cli/upgrade) for the flags (`-a <name>`, `--project <path>`,
 `-n, --dry-run`) and the per-target behavior. `--dry-run` reports what a roll would move
 and writes no lock; [Checking before rolling](../cli/upgrade#checking-before-rolling)

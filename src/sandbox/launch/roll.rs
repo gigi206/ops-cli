@@ -204,13 +204,15 @@ fn withheld_mise_packages(cfg: &crate::config::Resolved, only: Option<&str>) -> 
 /// app's `nix:` packages — and the base userland under them — against a revision the app's own
 /// launch never runs on, the very skew [`Prepared`] documents a single channel per launch to avoid.
 ///
-/// Carries the two postures every roll cage shares: the batch flag (one cage per group, so `build`'s
-/// per-cage assembly lines would bury the roll result) and the unresolved-secret rule (a roll
-/// fetches packages, so a credential that cannot be resolved now denies its own destination for
-/// this cage instead of failing the upgrade).
+/// Carries the three postures every roll cage shares: the batch flag (one cage per group, so
+/// `build`'s per-cage assembly lines would bury the roll result), no project lane (a roll serves
+/// the group's own declarations, whatever project it was started from) and the unresolved-secret
+/// rule (a roll fetches packages, so a credential that cannot be resolved now denies its own
+/// destination for this cage instead of failing the upgrade).
 fn prepare_roll_cage(cwd: &Path, app: Option<&str>) -> Result<Prepared, ExitCode> {
     let mut prep = prepare_in(cwd.to_path_buf(), &crate::config::Override::none(), app)?;
     prep.in_batch = true;
+    prep.project_lane = false;
     prep.unresolved_secret = crate::sandbox::egress::Unresolved::DenyDestination;
     Ok(prep)
 }

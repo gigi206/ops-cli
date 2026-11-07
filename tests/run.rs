@@ -7634,6 +7634,83 @@ fn a_global_apps_npm_tool_rolls_whatever_node_the_projects_mise_file_names() {
 }
 
 #[test]
+fn an_upgrade_leaves_the_projects_own_mise_tools_out_of_every_app_cage() {
+    // A roll cage serves its app's own declarations. It also equipped the non-`nix:` tools of the
+    // mise file of whatever project `sbx upgrade` was started from: every app's cage re-listed that
+    // project's whole toolchain, fetched it under the app's egress, and seeded a per-project pool
+    // for apps the project never ran. Teeth: the app's egress admits the registry the project's
+    // tool comes from, so an equip in the roll cage would succeed and leave the tool in a pool of
+    // the app; the roll must leave it in none. Skips (never fails) without a sandbox or the network.
+    let project = TmpDir::prefixed("r", "upl-proj");
+    let data = TmpDir::prefixed("r", "upl-data");
+    let state = TmpDir::prefixed("r", "upl-state");
+
+    probe_or_skip!(
+        "project lane roll e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
+    need_reachable!(
+        cache_reachable(),
+        "skipping project lane roll e2e: the network is unreachable"
+    );
+
+    std::fs::write(
+        project.path().join("mise.toml"),
+        "[tools]\n\"npm:cowsay\" = \"1.6.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[app.np]\ncmd = [\"true\"]\n[app.np.network]\nmode = \"deny\"\n\
+         allow = [\"{GET,HEAD} https://registry.npmjs.org\"]\n[app.np.packages]\n\
+         ni = \"mise:npm:@antfu/ni\"\nnode = \"nix:nodejs\"\n",
+    )
+    .unwrap();
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", "--yes", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["upgrade", "mise"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(out.status.success(), "the app's roll must succeed: {log}");
+    let app_global = data
+        .path()
+        .join("sbx/apps/np/home/.local/share/mise/installs");
+    assert!(
+        mise_installs_entries(&app_global)
+            .iter()
+            .any(|e| e.contains("antfu")),
+        "the roll must have equipped the app's own tool, at {}: {log}",
+        app_global.display()
+    );
+    let mut pools = per_project_app_mise_installs(data.path(), "np");
+    pools.push((app_global.clone(), mise_installs_entries(&app_global)));
+    assert!(
+        pools
+            .iter()
+            .all(|(_, entries)| !entries.iter().any(|e| e.contains("cowsay"))),
+        "the project's own tool must not be equipped in the app's roll cage: {pools:?}\n{log}"
+    );
+}
+
+#[test]
 fn an_app_finds_the_project_tools_sbx_run_installed_without_fetching_them() {
     // An app's `[network]` replaces the project's, so a tool the project's mise file declares from a
     // host only the project allows failed to install at every app launch, and the app never had it.
