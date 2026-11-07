@@ -12,10 +12,11 @@
 //! bubblewrap cannot nest the mount and pid namespaces on a cap-stripped userns,
 //! so reaching a hardened process at all means every layer worked.
 //!
-//! The probe binds host `/usr` only to give itself a userland to run in; the
-//! hardening it verifies is userland-independent, so this neither needs nor
-//! touches nix or the store. Its working directory is a throwaway temp dir,
-//! removed on drop, so the check leaves nothing behind on the host.
+//! The probe binds host `/usr` only to give itself a userland to run in, and, where the host's
+//! `/bin/sh` resolves outside `/usr` (NixOS, or a cage running sbx), the store directory that shell
+//! lives in, read-only. The hardening it verifies is userland-independent, so it provisions nothing.
+//! Its working directory is a throwaway temp dir, removed on drop, so the check leaves nothing
+//! behind on the host.
 
 use super::spec::{Mount, NetPolicy, SandboxSpec};
 use std::ffi::{OsStr, OsString};
@@ -61,12 +62,16 @@ impl SmokeReport {
 /// this check reporting that the host home did not leak into the cage when it had not looked. A
 /// hardening probe that can be made to pass by the shape of a path is not one. As an argument the
 /// home reaches `[ -e ]` as the bytes it is. `/root` stands in only for a home that is not set.
-fn probe_argv(host_home: Option<&OsStr>) -> Vec<OsString> {
+///
+/// The script uses shell builtins alone, because the shell is all the probe is sure to have: a host
+/// whose userland lives in a store has no `cat` under `/usr`.
+fn probe_argv(shell: &Path, host_home: Option<&OsStr>) -> Vec<OsString> {
     vec![
-        OsString::from("/bin/sh"),
+        shell.as_os_str().to_os_string(),
         OsString::from("-c"),
         OsString::from(
-            "cat /proc/self/status; printf 'HOSTHOME='; \
+            "while IFS= read -r line; do printf '%s\\n' \"$line\"; done < /proc/self/status; \
+             printf 'HOSTHOME='; \
              if [ -e \"$1\" ]; then echo PRESENT; else echo ABSENT; fi",
         ),
         // `$0`, a label.
@@ -96,9 +101,23 @@ const PROBE_POLL: Duration = Duration::from_millis(20);
 /// valid, so a failure is bubblewrap not spawning); a launch that runs but is not
 /// hardened is a successful call returning a non-hardened report.
 pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
-    let work = ScratchDir::new()?;
+    let home = std::env::var_os("HOME");
+    let (shell, store) = probe_shell(
+        std::fs::canonicalize("/bin/sh").ok(),
+        home.as_deref().map(Path::new),
+    );
+    launch(bwrap, &shell, store, home.as_deref())
+}
 
-    let spec = probe_spec(work.path(), probe_argv(std::env::var_os("HOME").as_deref()))?;
+/// [`run`] with the shell and its store already chosen.
+fn launch(
+    bwrap: &Path,
+    shell: &Path,
+    store: Option<PathBuf>,
+    home: Option<&OsStr>,
+) -> io::Result<SmokeReport> {
+    let work = ScratchDir::new()?;
+    let spec = probe_spec(work.path(), store, probe_argv(shell, home))?;
     // The composed list carries the mandatory seccomp filters, so `doctor` proves the real launch
     // path — hardening *and* filter — works on this host, not just the namespaces. The anonymous
     // files behind it (the filters, and the cage's environment) are the command's own, open for as
@@ -137,13 +156,46 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
     })
 }
 
+/// The shell the probe runs, and the directory to bind read-only for it when it lives outside `/usr`.
+///
+/// The cage's `/bin` is a link to `usr/bin`, which holds a shell on a distribution that keeps its
+/// userland there and none on one that keeps it in a store, where the host's `/bin/sh` is a link to
+/// `/nix/store/…`. The probe follows that link and runs the shell by the path it reaches, binding the
+/// two leading components of that path (`/nix/store`), which hold the shell and the libraries it was
+/// linked against. A directory that holds the host home is never bound, since the probe's other
+/// question is whether that home is visible: the probe keeps `/bin/sh` there, and a launch failure
+/// is reported as before.
+///
+/// `resolved` is where `/bin/sh` leads, `None` when it could not be followed.
+fn probe_shell(resolved: Option<PathBuf>, home: Option<&Path>) -> (PathBuf, Option<PathBuf>) {
+    let fallback = (PathBuf::from("/bin/sh"), None);
+    let Some(shell) = resolved else {
+        return fallback;
+    };
+    if shell.starts_with("/usr") {
+        return fallback;
+    }
+    let root: PathBuf = shell.components().take(3).collect();
+    if root == shell || home.is_some_and(|h| h.starts_with(&root)) {
+        return fallback;
+    }
+    (shell, Some(root))
+}
+
 /// The canonical minimal hardened spec: host `/usr` bound read-only for a
-/// userland, the usual FHS symlinks, fresh proc/dev/tmpfs, and a throwaway rw
-/// workdir. The hardening itself is added unconditionally by `to_argv`, so this
-/// only supplies the userland the probe runs in.
-fn probe_spec(work: &Path, argv: Vec<OsString>) -> io::Result<SandboxSpec> {
-    // The userland is the canonical minimal set; the probe adds only its throwaway rw workdir.
+/// userland, the usual FHS symlinks, fresh proc/dev/tmpfs, a throwaway rw
+/// workdir, and the store directory [`probe_shell`] found, if any. The hardening itself is added
+/// unconditionally by `to_argv`, so this only supplies the userland the probe runs in.
+fn probe_spec(work: &Path, store: Option<PathBuf>, argv: Vec<OsString>) -> io::Result<SandboxSpec> {
+    // The userland is the canonical minimal set; the probe adds its throwaway rw workdir and the
+    // store its shell lives in.
     let mut mounts = super::spec::minimal_userland_mounts();
+    if let Some(store) = store {
+        mounts.push(Mount::RoBind {
+            src: store.clone(),
+            dest: store,
+        });
+    }
     mounts.push(Mount::Bind {
         src: work.to_path_buf(),
         dest: PathBuf::from("/work"),
@@ -222,7 +274,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt as _;
         let dir = crate::testutil::TmpDir::new();
         let runs = |home: &Path| {
-            let argv = probe_argv(Some(home.as_os_str()));
+            let argv = probe_argv(Path::new("/bin/sh"), Some(home.as_os_str()));
             assert_eq!(argv.last().map(OsString::as_os_str), Some(home.as_os_str()));
             let out = std::process::Command::new(&argv[0])
                 .args(&argv[1..])
@@ -245,7 +297,9 @@ mod tests {
         }
         // Unset is the one case answered by a stand-in.
         assert_eq!(
-            probe_argv(None).last().map(OsString::as_os_str),
+            probe_argv(Path::new("/bin/sh"), None)
+                .last()
+                .map(OsString::as_os_str),
             Some(OsStr::new("/root"))
         );
     }
@@ -269,6 +323,71 @@ mod tests {
             "the host home leaked into the sandbox"
         );
         assert!(report.is_hardened());
+    }
+
+    /// A shell under `/usr` is run as `/bin/sh` with nothing more bound; one in a store is run by
+    /// its own path with the store's directory bound; and that directory is never one holding the
+    /// host home, nor a shell the probe could not follow.
+    #[test]
+    fn the_probe_runs_a_store_shell_from_its_store() {
+        let sh = || (PathBuf::from("/bin/sh"), None);
+        let bash = PathBuf::from("/nix/store/abc-bash-5.3/bin/bash");
+        assert_eq!(probe_shell(Some("/usr/bin/dash".into()), None), sh());
+        assert_eq!(
+            probe_shell(Some(bash.clone()), Some(Path::new("/home/u"))),
+            (bash.clone(), Some(PathBuf::from("/nix/store")))
+        );
+        assert_eq!(
+            probe_shell(Some(bash.clone()), Some(Path::new("/nix/store/home"))),
+            sh()
+        );
+        assert_eq!(probe_shell(Some("/sh".into()), None), sh());
+        assert_eq!(probe_shell(None, None), sh());
+        let work = Path::new("/tmp/w");
+        let spec = probe_spec(
+            work,
+            Some(PathBuf::from("/nix/store")),
+            probe_argv(&bash, None),
+        )
+        .unwrap();
+        assert!(spec.mounts().iter().any(|m| matches!(m,
+            Mount::RoBind { src, dest } if src == Path::new("/nix/store") && dest == src)));
+    }
+
+    /// The case the store binding exists for, launched: a shell from the host's nix store, run by
+    /// its own path with only `/usr` and that store bound, reaches a hardened process. Before, the
+    /// probe asked for `/bin/sh` through the cage's `/usr/bin` and read the status with `cat`, and a
+    /// host whose shell lives in a store has neither there.
+    #[test]
+    fn a_shell_from_a_store_launches_a_hardened_probe() {
+        let Some(bwrap) = prerequisites() else {
+            skip_incapable!("skipping store-shell smoke: no bwrap or no capability-bearing userns");
+            return;
+        };
+        let Some(bash) = std::fs::read_dir("/nix/store").ok().and_then(|dir| {
+            dir.flatten()
+                .map(|e| e.path().join("bin/bash"))
+                .find(|p| p.is_file())
+        }) else {
+            skip_incapable!("skipping store-shell smoke: no bash in /nix/store");
+            return;
+        };
+        let report = launch(
+            &bwrap,
+            &bash,
+            Some(PathBuf::from("/nix/store")),
+            std::env::var_os("HOME").as_deref(),
+        )
+        .expect("the probe should run where the host can sandbox");
+        assert!(
+            report.is_hardened(),
+            "{bash:?} did not launch hardened; stderr:\n{}",
+            report.stderr
+        );
+        assert!(
+            report.host_home_absent,
+            "the host home leaked into the sandbox"
+        );
     }
 
     #[test]

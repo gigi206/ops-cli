@@ -52,10 +52,9 @@ host has to launch the outer cage with a `bwrap` at another path, which `SBX_BWR
 launch rather than for every cage, and only where
 `kernel.apparmor_restrict_unprivileged_userns` is `0`.
 
-A nested `sbx` differs from one on a host in three ways: its test binary has to be static, since the
-inner cage holds no loader for a dynamic one; there is no `systemd-run`, so the inner cage carries no
-resource limits of its own; and `sbx doctor` reports the launch probe as failed, because the
-`/bin/sh` it runs is a link into a store the probe does not bind.
+A nested `sbx` differs from one on a host in two ways: its test binary has to be static, since the
+inner cage holds no loader for a dynamic one; and there is no `systemd-run`, so the inner cage carries
+no resource limits of its own.
 
 ## The grammar
 
