@@ -7564,6 +7564,157 @@ fn sbx_upgrade_mise_rolls_a_global_apps_app_global_tool() {
 }
 
 #[test]
+fn a_global_apps_npm_tool_rolls_whatever_node_the_projects_mise_file_names() {
+    // An app's `[packages] mise:` tool lives in a pool every project shares, so the project's own
+    // mise file must not shape how it installs. A backend with an install dependency took it from
+    // there: with the project naming a `node` the app's egress cannot fetch, every `npm:` tool
+    // failed to equip and to roll (`requires configured install dependency 'node@26'`). Teeth: the
+    // roll succeeds and the tool lands in the app-global pool, which takes both the equip and the
+    // roll running away from the project's mise file. Skips (never fails) without a sandbox or the
+    // network.
+    let project = TmpDir::prefixed("r", "unp-proj");
+    let data = TmpDir::prefixed("r", "unp-data");
+    let state = TmpDir::prefixed("r", "unp-state");
+
+    probe_or_skip!(
+        "npm tool roll e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
+    need_reachable!(
+        cache_reachable(),
+        "skipping npm tool roll e2e: the network is unreachable"
+    );
+
+    // The project's toolchain names a node only nodejs.org serves, which the app's list refuses.
+    std::fs::write(project.path().join("mise.toml"), "[tools]\nnode = \"26\"\n").unwrap();
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[app.np]\ncmd = [\"true\"]\n[app.np.network]\nmode = \"deny\"\n\
+         allow = [\"{GET,HEAD} https://registry.npmjs.org\"]\n[app.np.packages]\n\
+         ni = \"mise:npm:@antfu/ni\"\nnode = \"nix:nodejs\"\n",
+    )
+    .unwrap();
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", "--yes", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["upgrade", "mise"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "the app's npm: tool must equip and roll whatever node the project's mise file names: {log}"
+    );
+    let installs = data
+        .path()
+        .join("sbx/apps/np/home/.local/share/mise/installs");
+    assert!(
+        mise_installs_entries(&installs)
+            .iter()
+            .any(|e| e.contains("antfu")),
+        "the npm: tool must be installed in the app-global pool, at {}: {log}",
+        installs.display()
+    );
+}
+
+#[test]
+fn a_dry_run_from_a_project_never_launched_creates_no_project() {
+    // `sbx upgrade --dry-run` writes nothing, yet from a directory no cage had used it built a cage
+    // for each app to ask mise, and each cage created that project's runtime tree and filled its
+    // store with the base userland. Teeth: with an app equipped from project A, a dry run from
+    // project B names the app as not checked and leaves the projects tree exactly as it was. Skips
+    // (never fails) without a sandbox or the network.
+    let proj_a = TmpDir::prefixed("r", "dnl-a");
+    let proj_b = TmpDir::prefixed("r", "dnl-b");
+    let data = TmpDir::prefixed("r", "dnl-data");
+    let state = TmpDir::prefixed("r", "dnl-state");
+
+    probe_or_skip!(
+        "never-launched dry run e2e",
+        run_in(proj_a.path(), data.path(), &["true"])
+    );
+    need_reachable!(
+        cache_reachable(),
+        "skipping never-launched dry run e2e: the network is unreachable"
+    );
+    need_reachable!(
+        common::github_api_has_quota(),
+        "skipping never-launched dry run e2e: github's api quota is spent, and the `mise:aqua:` \
+         tool resolves its release through it"
+    );
+
+    let toml =
+        "[app.dr]\ncmd = [\"true\"]\n[app.dr.packages]\nrg = \"mise:aqua:BurntSushi/ripgrep\"\n";
+    for project in [&proj_a, &proj_b] {
+        std::fs::write(project.path().join(".sbx.toml"), toml).unwrap();
+        let trusted = sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["trust", "--yes", ".sbx.toml"],
+        );
+        assert!(
+            trusted.status.success(),
+            "sbx trust failed: {}",
+            String::from_utf8_lossy(&trusted.stderr)
+        );
+    }
+    // Equip the app from A, so its home holds a mise config and a dry run has a question to ask.
+    let equipped = sbx_in(
+        proj_a.path(),
+        data.path(),
+        state.path(),
+        &["upgrade", "mise"],
+    );
+    assert!(
+        equipped.status.success(),
+        "equipping the app from project A failed: {}",
+        String::from_utf8_lossy(&equipped.stderr)
+    );
+
+    let projects = data.path().join("sbx/projects");
+    let listed = || mise_installs_entries(&projects);
+    let before = listed();
+    let out = sbx_in(
+        proj_b.path(),
+        data.path(),
+        state.path(),
+        &["upgrade", "--dry-run", "mise"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(out.status.success(), "the dry run failed: {log}");
+    assert!(
+        log.contains("this project has no store yet"),
+        "the app is named as not checked, for the store a cage would seed: {log}"
+    );
+    assert_eq!(
+        listed(),
+        before,
+        "a dry run from a project never launched must create no project tree: {log}"
+    );
+}
+
+#[test]
 fn a_flake_package_builds_host_side_into_the_shared_store_and_a_fresh_project_reuses_it() {
     // The load-bearing proof of the `flake:` backend's host-side build: a `flake:` package is now
     // built HOST-SIDE into the shared store — like a `nix:` attribute, not in-cage into the

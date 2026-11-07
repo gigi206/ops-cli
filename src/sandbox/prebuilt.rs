@@ -2319,6 +2319,48 @@ mod tests {
         assert!(pins(&layout, &id, &lock_file(&kind)).is_empty());
     }
 
+    /// A dry run from a project no cage has used builds no resolver cage there: building one would
+    /// create the project's runtime tree and fill its store, which is a launch's work. The resolver
+    /// is named as not checked and the project's tree is never created. The nix path does not exist,
+    /// so a cage the run tried to build would fail rather than report.
+    #[test]
+    fn a_dry_run_seeds_no_store_for_a_project_never_launched() {
+        let data = TmpDir::new();
+        let project = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let kind = Recording::default();
+        let cfg = resolved(
+            vec![pkg(
+                "demo-app",
+                crate::config::Backend::TarballResolve {
+                    command: vec!["print-the-newest-url".to_string()],
+                },
+                true,
+            )],
+            vec![],
+        );
+        let outcomes = upgrade_project(
+            &kind,
+            Path::new("/nonexistent/nix"),
+            &layout,
+            project.path(),
+            &cfg,
+            None,
+            crate::sandbox::RollMode::DryRun,
+        )
+        .expect("a dry run reports");
+        assert!(
+            matches!(outcomes.as_slice(), [Upgrade::NotChecked { url, why }]
+                if url == "resolve:demo-app" && why.contains("seed this project's store")),
+            "the resolver is named as not checked for the store it would seed"
+        );
+        let id = super::super::binds::project_runtime_id(project.path()).unwrap();
+        assert!(
+            !super::super::projectstore::project_dir(&layout, &id).exists(),
+            "a dry run creates no project tree"
+        );
+    }
+
     /// `--app <name>` narrows the roll set and leaves the prune universe whole.
     ///
     /// The two halves are asserted separately because only one of them fails safe. A narrowed roll

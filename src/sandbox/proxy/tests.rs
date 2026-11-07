@@ -9192,6 +9192,32 @@ fn builtin_allow_set_is_unioned_regardless_of_trust() {
     assert!(!p.permits("example.com", 443, "/"));
 }
 
+/// mise reads Sigstore's trust root before it installs any attested `aqua:` or `github:` release,
+/// whatever the app, so the host belongs to the built-in set: refused, the first install of such a
+/// tool fails in every cage that did not list it (`TUF repository load failed`). Read-only, like
+/// the rest of the set.
+#[test]
+fn the_built_in_set_reads_sigstores_trust_root_and_nothing_more() {
+    let p = union_with_builtin(EgressPolicy::default());
+    let host = "tuf-repo-cdn.sigstore.dev";
+    for method in ["GET", "HEAD"] {
+        assert!(
+            matches!(
+                p.explain(host, 443, "/timestamp.json", method),
+                crate::allowlist::Decision::AllowedBy(rule) if rule.builtin
+            ),
+            "{method} on the trust root must ride the built-in set"
+        );
+    }
+    assert!(
+        !matches!(
+            p.explain(host, 443, "/timestamp.json", "POST"),
+            crate::allowlist::Decision::AllowedBy(_)
+        ),
+        "the built-in lane carries no write verb"
+    );
+}
+
 /// With reuse off, the proxy must force `Connection: close` on the request it forwards even when
 /// the client sent no `Connection` header: nothing is going to come back for that connection, so
 /// leaving it open would hold an upstream socket for a launch that will never use it. The policy
