@@ -109,6 +109,11 @@ Equipped **in-cage** with `mise use -g --pin <token>` at launch, fetched upstrea
 works: `aqua:`, `github:`, `npm:`, `cargo:`, a plain registry token, etc. Advances
 with [`sbx upgrade mise`](../housekeeping/upgrade).
 
+The equip and the roll run mise as if started at `/`, outside the project: the tool's pool is
+shared by every project the app is launched from, so the project's own `mise.toml` does not
+shape it. That file still equips the project's tools in the same cage; it just does not decide,
+say, which `node` an `npm:` package of the app installs with.
+
 mise's own tool options ride the token in brackets, and a declaration may carry them:
 
 ```toml

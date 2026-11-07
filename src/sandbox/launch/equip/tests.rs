@@ -75,7 +75,7 @@ fn an_interpolated_mise_path_is_one_word_whatever_it_contains() {
     let tokens = vec!["aqua:example/demo-tool".to_string()];
     let cmd = vec![OsString::from("demo-app")];
 
-    let argv = wrap_mise_equip(&mise, &bash, "install", &tokens, None, cmd);
+    let argv = wrap_mise_equip(&mise, &bash, "install", &tokens, None, false, cmd);
     let script = argv[2].to_string_lossy();
 
     assert!(
@@ -98,7 +98,7 @@ fn wrap_autoequip_passes_tokens_and_command_positionally() {
     ];
     let cmd = vec![OsString::from("demo-app"), OsString::from("--print")];
 
-    let argv = wrap_mise_equip(&mise, &bash, "install", &tokens, None, cmd);
+    let argv = wrap_mise_equip(&mise, &bash, "install", &tokens, None, false, cmd);
 
     assert_eq!(argv[0], OsString::from("/nix/store/bash/bin/bash"));
     assert_eq!(argv[1], OsString::from("-c"));
@@ -106,6 +106,8 @@ fn wrap_autoequip_passes_tokens_and_command_positionally() {
     // mise by absolute path; the slice/shift use the count, not the tokens; the command
     // is exec'd (so it stays the cage's main process) after the tokens are shifted off.
     assert!(script.contains("'/nix/store/mise/bin/mise' install \"${@:1:2}\""));
+    // The project's lane equips the project's own mise file, so it runs where that file is.
+    assert!(!script.contains(MISE_OUTSIDE_PROJECT), "{script}");
     assert!(script.contains("shift 2;"));
     assert!(script.trim_end().ends_with("exec \"$@\""));
     assert!(
@@ -130,10 +132,10 @@ fn wrap_mise_equip_uses_the_global_verb_for_app_packages() {
     let tokens = vec!["aqua:example/demo-tool".to_string()];
     let cmd = vec![OsString::from("demo-app")];
 
-    let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, None, cmd);
+    let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, None, true, cmd);
 
     let script = argv[2].to_string_lossy();
-    assert!(script.contains("'/nix/store/mise/bin/mise' use -g \"${@:1:1}\""));
+    assert!(script.contains("'/nix/store/mise/bin/mise' -C / use -g \"${@:1:1}\""));
     assert!(script.contains("shift 1;"));
     // no data-dir override: the equip runs under the ambient primary
     assert!(!script.contains("MISE_DATA_DIR="));
@@ -172,7 +174,7 @@ fn a_mise_package_is_pinned_at_equip_and_only_a_bump_roll_moves_it() {
         let cmd = mise_upgrade_cmd(rt, &mise, &bash, &tokens);
         let script = cmd[2].to_string_lossy();
         assert!(
-            script.contains("'/nix/store/mise/bin/mise' upgrade --bump \"$@\""),
+            script.contains("'/nix/store/mise/bin/mise' -C / upgrade --bump \"$@\""),
             "a pinned tool only advances with --bump: {script}"
         );
     }
@@ -216,13 +218,13 @@ fn wrap_mise_equip_pins_the_app_global_data_dir_for_the_global_lane() {
     let cmd = vec![OsString::from("demo-app")];
     let data_dir = crate::sandbox::binds::mise_app_global_data_dir();
 
-    let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, Some(&data_dir), cmd);
+    let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, Some(&data_dir), true, cmd);
 
     let script = argv[2].to_string_lossy();
     // the equip's MISE_DATA_DIR is pinned to the app-global home, quoted, before mise
     assert!(
         script.contains(&format!(
-            "MISE_DATA_DIR='{data_dir}' '/nix/store/mise/bin/mise' use -g"
+            "MISE_DATA_DIR='{data_dir}' '/nix/store/mise/bin/mise' -C / use -g"
         )),
         "the global lane must pin the app-global data dir: {script}"
     );
@@ -280,6 +282,7 @@ fn running_the_equip_script_gives_mise_the_pinned_dir_and_the_command_the_ambien
             "use -g",
             &tokens,
             pin,
+            true,
             vec![cmd.clone().into_os_string()],
         );
         let out = std::process::Command::new(&argv[0])
@@ -373,6 +376,7 @@ fn running_the_equip_script_reinstalls_a_pipx_tool_whose_python_is_gone() {
             "use -g --pin",
             &tokens,
             pin,
+            true,
             vec![OsString::from("true")],
         );
         let out = std::process::Command::new(&argv[0])
@@ -387,8 +391,8 @@ fn running_the_equip_script_reinstalls_a_pipx_tool_whose_python_is_gone() {
         let calls = std::fs::read_to_string(&record).expect("the stub recorded its calls");
         assert_eq!(
             calls,
-            "mise install --force pipx:broken-tool@1.2.0\n\
-             mise use -g --pin pipx:broken-tool pipx:healthy-tool@3.0 pipx:absent-tool \
+            "mise -C / install --force pipx:broken-tool@1.2.0\n\
+             mise -C / use -g --pin pipx:broken-tool pipx:healthy-tool@3.0 pipx:absent-tool \
              aqua:example/demo-tool\n",
             "exactly the broken pipx install is repaired, then the equip runs (pin {pin:?})"
         );
@@ -429,6 +433,7 @@ fn running_the_equip_script_repairs_a_pipx_tool_whose_directory_mise_named_from_
         "use -g --pin",
         &["pipx:Broken-Caps".to_string(), "pipx:Kept-Caps".to_string()],
         None,
+        true,
         vec![OsString::from("true")],
     );
     let out = std::process::Command::new(&argv[0])
@@ -445,9 +450,9 @@ fn running_the_equip_script_repairs_a_pipx_tool_whose_directory_mise_named_from_
     );
     assert_eq!(
         std::fs::read_to_string(&record).expect("the stub recorded its calls"),
-        "mise install --force pipx:Broken-Caps@2.0\n\
-         mise install --force pipx:Kept-Caps@1.0\n\
-         mise use -g --pin pipx:Broken-Caps pipx:Kept-Caps\n"
+        "mise -C / install --force pipx:Broken-Caps@2.0\n\
+         mise -C / install --force pipx:Kept-Caps@1.0\n\
+         mise -C / use -g --pin pipx:Broken-Caps pipx:Kept-Caps\n"
     );
 }
 
@@ -489,7 +494,7 @@ fn mise_upgrade_cmd_pins_the_app_global_pool_only_for_a_global_app() {
         let upgrade = script.find("upgrade --bump \"$@\"").expect("the roll");
         let report = script.find(MISE_STATE_MARKER).expect("the report");
         assert!(upgrade < report, "{script}");
-        assert!(script.contains("'/nix/store/mise/bin/mise' ls --global --json"));
+        assert!(script.contains("'/nix/store/mise/bin/mise' -C / ls --global --json"));
         // The tokens are data: positional, never in the script.
         assert!(!script.contains("rm -rf"));
         assert_eq!(
@@ -824,9 +829,9 @@ fn mise_state_cmd_asks_both_questions_in_the_pool_the_roll_advances() {
             "only a global app's installs live in the app-global pool: {script}"
         );
         assert!(script.contains(MISE_STATE_MARKER));
-        assert!(script.contains("'/nix/store/mise/bin/mise' ls --global --json"));
+        assert!(script.contains("'/nix/store/mise/bin/mise' -C / ls --global --json"));
         // The roll's own flag, so the target `outdated` names is the one the roll would write.
-        assert!(script.contains("'/nix/store/mise/bin/mise' outdated --bump --json \"$@\""));
+        assert!(script.contains("'/nix/store/mise/bin/mise' -C / outdated --bump --json \"$@\""));
         // The tokens are data: positional, never in the script.
         assert!(!script.contains("rm -rf"));
         assert_eq!(

@@ -1253,6 +1253,8 @@ fn mise_equip_lanes<'a>(
                             // Lane 2 (project `.mise.toml` tools) runs under the ambient primary —
                             // the per-project pool for a global app, which is where these belong.
                             None,
+                            // In the project, whose own mise file is what this lane equips.
+                            false,
                             cmd,
                         )
                     }),
@@ -1295,6 +1297,8 @@ fn mise_equip_lanes<'a>(
                             // above); None for other runtimes, where the ambient primary is already
                             // app-global.
                             app_global_mise_dir.as_deref(),
+                            // Away from the project's mise file: see `MISE_OUTSIDE_PROJECT`.
+                            true,
                             cmd,
                         )
                     }),

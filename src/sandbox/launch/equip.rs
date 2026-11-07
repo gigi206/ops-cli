@@ -24,6 +24,19 @@ use super::*;
 pub(super) const MISE_EQUIP_VERB: &str = "use -g --pin";
 const MISE_ROLL_FLAG: &str = "--bump";
 
+/// The global option that runs a mise invocation as if started at `/`, outside the project.
+///
+/// An app's `[packages] mise:` tools live in a pool of their own (the app-global one for a global
+/// app), shared by every project the app is launched from, so how they are installed and rolled
+/// must not depend on the project at hand. Run from the project directory, mise reads the
+/// project's own `mise.toml` too, and a backend that declares an install dependency takes it from
+/// there: an `npm:` tool then requires the `node` that file names, which the app's egress cannot
+/// fetch, and the install fails (`requires configured install dependency 'node@26'`) for a tool
+/// that installs cleanly anywhere else. From `/` only the home's global config applies, and the
+/// dependency falls back to the `node` on the cage's PATH. The project's own tools (lane 2, a plain
+/// `install`) are the one equip that reads that file on purpose, so they never take this.
+pub(super) const MISE_OUTSIDE_PROJECT: &str = "-C /";
+
 /// The line a launch prints before equipping an app's `mise:` tools.
 ///
 /// Built here rather than formatted at the call site so the announcement and the invocation read
@@ -55,7 +68,8 @@ pub(super) fn equip_announcement(tokens: &[String]) -> String {
 /// registry or its attestation host refused by the egress allowlist) leaves nothing behind, and
 /// `mise upgrade` over nothing says `All tools are up to date` and exits 0, exactly as it does over
 /// a current pool. Only the pool's own listing separates the two. `set -e` keeps a failing upgrade
-/// the cage's exit status, so the report is printed only after an upgrade that succeeded.
+/// the cage's exit status, so the report is printed only after an upgrade that succeeded. Both run
+/// with [`MISE_OUTSIDE_PROJECT`], for the reason given there.
 ///
 /// `--bump` is the other half of the launch's `use -g --pin`. A plain `mise upgrade` keeps whatever
 /// range the config states, and after a pin that range is one exact version: the roll would report
@@ -71,7 +85,7 @@ pub(super) fn mise_upgrade_cmd(
     bash: &Path,
     tokens: &[String],
 ) -> Vec<OsString> {
-    let mise = shell_quote(&mise.to_string_lossy());
+    let mise = mise_outside_project(mise);
     let script = format!(
         "set -e; {pin}{mise} upgrade {MISE_ROLL_FLAG} \"$@\"; {report}; printf '{{}}}}\\n'",
         pin = mise_pool_pin(runtime),
@@ -86,6 +100,15 @@ pub(super) fn mise_upgrade_cmd(
     ];
     cmd.extend(tokens.iter().map(OsString::from));
     cmd
+}
+
+/// The quoted mise path followed by [`MISE_OUTSIDE_PROJECT`], for an invocation that acts on the
+/// app's own pool.
+fn mise_outside_project(mise: &Path) -> String {
+    format!(
+        "{} {MISE_OUTSIDE_PROJECT}",
+        shell_quote(&mise.to_string_lossy())
+    )
 }
 
 /// The `export MISE_DATA_DIR=…; ` a script opens with so its mise reads the pool the launch
@@ -121,8 +144,9 @@ pub(super) const MISE_STATE_MARKER: &str = "@@sbx-mise-state@@";
 /// Both questions are needed. `outdated` lists only what is behind: a tool that is current and one
 /// that was never installed are both absent from it, and only `ls` tells them apart.
 ///
-/// Run through bash in every runtime, with the same `MISE_DATA_DIR` pin [`mise_upgrade_cmd`] takes
-/// for a global app, so `ls` reads the installs the roll would advance. `set -e` makes a failing
+/// Run through bash in every runtime, with the same `MISE_DATA_DIR` pin and the same
+/// [`MISE_OUTSIDE_PROJECT`] [`mise_upgrade_cmd`] takes, so `ls` reads the installs the roll would
+/// advance and `outdated` answers for the roll's own configuration. `set -e` makes a failing
 /// mise the cage's exit status. The tokens ride `"$@"` positionally and the two interpolated values
 /// go through [`shell_quote`], for the reasons given there.
 pub(super) fn mise_state_cmd(
@@ -131,7 +155,7 @@ pub(super) fn mise_state_cmd(
     bash: &Path,
     tokens: &[String],
 ) -> Vec<OsString> {
-    let mise = shell_quote(&mise.to_string_lossy());
+    let mise = mise_outside_project(mise);
     let script = format!(
         "set -e; {pin}{report}; {mise} outdated {MISE_ROLL_FLAG} --json \"$@\"; printf '}}\\n'",
         pin = mise_pool_pin(runtime),
@@ -199,6 +223,11 @@ pub(super) fn auto_equip_tokens(cfg: &crate::config::Resolved) -> Vec<String> {
 /// failed equip does not abort the command (the missing tool surfaces when it is used), matching
 /// the self-equip posture rather than the host `nix:` hard-fail guarantee.
 ///
+/// `outside_project` runs every mise invocation of the script with [`MISE_OUTSIDE_PROJECT`]: the
+/// app's lane sets it, so the project's own mise file shapes neither the equip nor the repair,
+/// and the project's lane, which equips exactly that file, does not. The exec'd command keeps the
+/// cage's working directory either way.
+///
 /// `mise_data_dir`, when `Some`, pins **only the equip step's** `MISE_DATA_DIR` (the exec'd command
 /// keeps the cage's ambient value). This is how a global app's Lane-1 `mise use -g` installs an app
 /// package into the app-global home pool while the ambient primary is the per-project pool. The
@@ -230,6 +259,7 @@ pub(super) fn wrap_mise_equip(
     verb: &str,
     tokens: &[String],
     mise_data_dir: Option<&str>,
+    outside_project: bool,
     cmd: Vec<OsString>,
 ) -> Vec<OsString> {
     let n = tokens.len();
@@ -237,7 +267,10 @@ pub(super) fn wrap_mise_equip(
         Some(dir) => format!("MISE_DATA_DIR={} ", shell_quote(dir)),
         None => String::new(),
     };
-    let mise = shell_quote(&mise.to_string_lossy());
+    let mise = match outside_project {
+        true => mise_outside_project(mise),
+        false => shell_quote(&mise.to_string_lossy()),
+    };
     // `(locator, key, display name)` per `pipx:` token, all three riding `"$@"`. The key is the
     // token's `mise_key`, which the directory mise installs it under reduces to as well: mise splits
     // and lowercases a word in capitals, so that directory's name cannot be derived from the token.
