@@ -55,7 +55,7 @@ zig                             = "0.15.2"
 #
 # The major is pinned to the one `docs.yml` builds the published site with: a site that builds
 # here and not there is the failure this closes.
-node                            = "24"
+node                            = "26"
 # The TS/JS language server for the Docusaurus docs-site. `typescript` is capped at
 # the 5.x line because it is the last to ship tsserver (typescript 7/tsgo does not,
 # and typescript-language-server needs it); docs-site keeps its own
