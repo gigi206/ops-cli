@@ -143,9 +143,14 @@ xz = "nix:xz"
 #     refuses the build over the two of them. The `.out` output is named rather than the package,
 #     because nixpkgs' Qt setup hooks refuse a derivation that pulls Qt 5 and Qt 6 together
 #     ("detected mismatched Qt dependencies") and those hooks ride the `dev` output.
+#   * `tpm2-tss` — the native `remote-control-device-key.node` addon links against the TPM software
+#     stack (`libtss2-esys.so.0`, `libtss2-mu.so.0`, `libtss2-tcti-device.so.0`), which it uses to
+#     hold the remote-control device key. A cage grants no `/dev/tpm*`, so the addon finds no TPM at
+#     run time; the libraries are what lets the build resolve and the module load at all.
 [deb.codex-desktop]
 libs = [
     "libusb1",
     "qt5.qtbase.out",
     "qt6.qtbase.out",
+    "tpm2-tss",
 ]

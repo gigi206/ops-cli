@@ -1397,6 +1397,106 @@ fn the_hermes_desktop_install_step_writes_its_marker_and_yields_to_a_roll() {
     );
 }
 
+#[test]
+fn the_trae_install_step_reinstalls_a_tool_whose_interpreter_is_gone() {
+    // Runs the SHIPPED step, unmodified, against a stand-in home with stand-in `git` and `uv` that
+    // record what they were asked. The tool's venv links its interpreter into the nix store, so a
+    // channel roll followed by a collection leaves `trae-cli` in place around a dead link: the step
+    // must read that as "not installed", while a sound install is left alone on an ordinary launch
+    // and re-done on a roll.
+    let script = shipped_install_step("trae");
+    let tmp = TmpDir::new();
+    let home = tmp.path().join("home");
+    let stubs = tmp.path().join("stubs");
+    let log = tmp.path().join("calls");
+    std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+    std::fs::create_dir_all(&stubs).unwrap();
+    let stub = |name: &str, body: &str| {
+        let path = stubs.join(name);
+        std::fs::write(
+            &path,
+            format!("#!{}\n{body}", program_on_path("bash").display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+    };
+    // `git clone … <dir>` leaves the checkout's directory; `uv export` its output file.
+    stub(
+        "git",
+        &format!(
+            "echo \"git $*\" >> {log}\nfor a; do last=$a; done\nmkdir -p \"$last\"\n",
+            log = log.display()
+        ),
+    );
+    stub(
+        "uv",
+        &format!(
+            "echo \"uv $*\" >> {log}\n\
+             while [ $# -gt 0 ]; do [ \"$1\" = --output-file ] && : > \"$2\"; shift; done\n",
+            log = log.display()
+        ),
+    );
+    let venv = home.join(".local/share/uv/tools/trae-agent");
+    let interpreter = venv.join("bin/python");
+    std::fs::create_dir_all(venv.join("bin")).unwrap();
+    // The entry point stays executable throughout: it is what the step used to judge by.
+    std::fs::copy(program_on_path("true"), home.join(".local/bin/trae-cli")).unwrap();
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").expect("the test runner has a PATH")
+    );
+
+    let installs = |upgrade: bool| -> bool {
+        let _ = std::fs::remove_file(&log);
+        let out = crate::testutil::run_within(
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .env("HOME", &home)
+                .env("PATH", &path)
+                .env("SBX_UPGRADE", if upgrade { "1" } else { "" })
+                .env_remove("TRAE_SBX_UPDATE")
+                .stdin(std::process::Stdio::null()),
+            "the shipped step",
+        );
+        assert!(
+            out.status.success(),
+            "the step failed ({}): {}{}",
+            out.status,
+            out.stdout,
+            out.stderr
+        );
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.starts_with("uv tool install "))
+    };
+
+    // 1. An interpreter collected from under the venv: a dangling link.
+    std::os::unix::fs::symlink(tmp.path().join("collected/python3"), &interpreter).unwrap();
+    assert!(
+        installs(false),
+        "the step kept a venv whose interpreter is gone, so every launch ends on a bad interpreter"
+    );
+    assert!(
+        !interpreter.is_symlink(),
+        "the step re-installed over the stale venv instead of removing it first"
+    );
+
+    // 2. A sound install is left alone on an ordinary launch.
+    std::fs::create_dir_all(venv.join("bin")).unwrap();
+    std::os::unix::fs::symlink(program_on_path("true"), &interpreter).unwrap();
+    assert!(
+        !installs(false),
+        "an ordinary launch re-installed a tool whose interpreter runs"
+    );
+
+    // 3. A roll re-installs the same sound install regardless.
+    assert!(installs(true), "the roll left the install as it found it");
+}
+
 /// `name`, as an absolute path, found the way a launch finds a program: by walking `PATH`.
 ///
 /// The step below is run with a `PATH` of this fixture's own making, and a program named without a
@@ -2344,6 +2444,42 @@ fn the_claude_desktop_bundle_carries_the_library_its_native_module_links() {
         libs.iter().any(|lib| lib == "pipewire"),
         "the claude-desktop `.deb` needs `pipewire` among its `libs`: {libs:?}"
     );
+}
+
+/// Codex Desktop's native `remote-control-device-key.node` addon links the TPM software stack
+/// (`libtss2-esys.so.0`, `libtss2-mu.so.0`, `libtss2-tcti-device.so.0`), which the shared prebuilt
+/// library set does not carry, and autoPatchelf refuses the `.deb` outright: the app could neither
+/// launch nor roll. The bundle names `tpm2-tss` for its package alone; this holds it there.
+#[test]
+fn the_codex_desktop_bundle_carries_the_library_its_native_module_links() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/bundle/codex-desktop.toml");
+    let bundle = shipped_bundle(&path);
+    let libs = bundle
+        .deb
+        .get("codex-desktop")
+        .map(|table| table.libs.as_slice())
+        .unwrap_or_default();
+    assert!(
+        libs.iter().any(|lib| lib == "tpm2-tss"),
+        "the codex-desktop `.deb` needs `tpm2-tss` among its `libs`: {libs:?}"
+    );
+}
+
+/// MiMo Code's npm package is a Node launcher that downloads the native binary on the first run and
+/// unpacks it by spawning `tar -xzf`. The cage's base toolset carries neither `tar` nor `gzip`, so
+/// without them the download succeeds and the launch ends on `spawn tar ENOENT`, with nothing to run.
+#[test]
+fn the_mimo_bundle_carries_the_tools_its_launcher_unpacks_with() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/bundle/mimo.toml");
+    let bundle = shipped_bundle(&path);
+    for locator in ["nix:gnutar", "nix:gzip"] {
+        assert!(
+            bundle.packages.values().any(|declared| declared == locator),
+            "the mimo bundle needs `{locator}` among its packages: {:?}",
+            bundle.packages
+        );
+    }
 }
 
 /// Claude Desktop's login page runs an hCaptcha bot check before any sign-in, and refused, the

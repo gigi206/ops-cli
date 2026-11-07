@@ -55,3 +55,10 @@ mute = [
 [packages]
 nodejs = "nix:nodejs"           # the `bin/mimo` Node shim is what launches — needed at RUNTIME
 mimo = "mise:npm:@mimo-ai/cli"  # the vendor's own npm scope
+# The npm package carries only a Node launcher: on the first run it downloads the native binary for
+# this platform from the vendor's file store (`mimocode.cnbj1.mi-fds.com`, allowed above), checks its
+# digest, and unpacks it by spawning `tar -xzf`. Neither `tar` nor the `gzip` it hands decompression
+# to is part of the cage's base toolset, so without these the download succeeds and the launch ends
+# on `spawn tar ENOENT`, with no binary to run.
+tar = "nix:gnutar"
+gzip = "nix:gzip"

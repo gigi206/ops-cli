@@ -361,7 +361,7 @@ The 69 shipped bundles, and what each carries:
 | `cline` | 3 (`mise:`, `nix:`) | 8 egress entries | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `codebuddy` | 2 (`mise:`, `nix:`) | 5 egress entries, 2 env vars | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `codex` | 1 (`mise:`) | 6 egress entries | none |
-| `codex-desktop` | 4 (`deb:`, `nix:`) | 24 egress entries, 3 `deb:` library attributes | `chromium-background`, `chromium-spellcheck` |
+| `codex-desktop` | 4 (`deb:`, `nix:`) | 24 egress entries, 4 `deb:` library attributes | `chromium-background`, `chromium-spellcheck` |
 | `command-code` | 2 (`mise:`, `nix:`) | 14 egress entries | `github-install`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `copilot` | 1 (`mise:`) | 6 egress entries | none |
 | `cortex` | 2 (`mise:`, `nix:`) | 6 egress entries | none |
@@ -386,7 +386,7 @@ The 69 shipped bundles, and what each carries:
 | `kimi` | 2 (`mise:`, `nix:`) | 9 egress entries | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `kiro` | 2 (`nix:`) | 34 egress entries, 2 env vars, an install step | `chromium-background`, `chromium-spellcheck`, `google-signin-incage` |
 | `kiro-desktop` | 2 (`nix:`, `tarball:`) | 32 egress entries, 1 env var, a `tarball:` resolver | `chromium-background`, `chromium-spellcheck`, `google-signin-incage` |
-| `mimo` | 2 (`mise:`, `nix:`) | 8 egress entries | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
+| `mimo` | 4 (`mise:`, `nix:`) | 8 egress entries | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `muse` | none | 4 egress entries, 1 env var, an install step | none |
 | `nanobot` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `nova` | 2 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |

@@ -43,9 +43,17 @@ provision = [
 set -eo pipefail
 src="$HOME/.trae/src"
 bin_link="$HOME/.local/bin/trae-cli"
+venv="$HOME/.local/share/uv/tools/trae-agent"
 repo_url="https://github.com/bytedance/trae-agent.git"
-if [ ! -x "$bin_link" ] || [ -n "${SBX_UPGRADE:-}${TRAE_SBX_UPDATE:-}" ]; then
-  rm -rf "$src"
+# The guard RUNS the tool's interpreter rather than testing the entry point. The tool's venv links
+# its `bin/python` into the nix store, so an interpreter that moves — which is what `sbx upgrade nix`
+# followed by a collection does — leaves `trae-cli` and its venv in place around a dead link: a guard
+# keyed on `-x "$bin_link"` passes forever while every launch ends on "bad interpreter". Running it
+# covers the absent, the half-created and the stale install at once.
+if ! "$venv/bin/python" -c '' 2>/dev/null || [ -n "${SBX_UPGRADE:-}${TRAE_SBX_UPDATE:-}" ]; then
+  # A stale venv is removed rather than repaired, and `--force` below lets the install replace the
+  # entry point that venv leaves behind in `~/.local/bin`.
+  rm -rf "$src" "$venv"
   git clone --depth 1 "$repo_url" "$src"
   cd "$src"
   # `--with docker --with pexpect --with unidiff`: upstream's start-up path imports these
@@ -55,7 +63,15 @@ if [ ! -x "$bin_link" ] || [ -n "${SBX_UPGRADE:-}${TRAE_SBX_UPDATE:-}" ]; then
   # than through the extra, which would also drag `datasets`; the cage has no Docker to talk to
   # anyway, so what is needed is only that the imports succeed. Drop them once upstream makes that
   # import optional or moves the dependencies.
-  uv tool install --python python3.12 --with docker --with pexpect --with unidiff .
+  #
+  # `-c`: the checkout ships a `uv.lock`, and `uv tool install` reads none, resolving every unpinned
+  # dependency to its newest release instead. Upstream pins `mcp` exactly but leaves `pydantic`
+  # open, and a pydantic newer than the lock removed a private helper that pinned `mcp` imports,
+  # so a fresh install dies at `ImportError` before the CLI prints anything. Exporting the lock as
+  # constraints installs the versions upstream resolved and tested, extras included, so the three
+  # `--with` modules land at their locked versions too.
+  uv export --frozen --no-hashes --all-extras --no-emit-project --output-file "$src/.sbx-constraints.txt" >/dev/null
+  uv tool install --force --python python3.12 -c "$src/.sbx-constraints.txt" --with docker --with pexpect --with unidiff .
 fi
 ''',
 ]
