@@ -13,9 +13,10 @@
 # homes, then launches each app whose resolved packages include a prebuilt one, without a display
 # (`--gui none`). Provisioning runs before the cage and prints `cannot provision` when a build
 # fails, which is the first thing this job judges by. The second is a built program that cannot
-# start: an app with no display posture of its own is a command-line agent, and its `--version`
-# ending on a signal means the binary the build produced is broken — the shape a faulty patchelf
-# leaves, which builds cleanly and then dies of SIGSEGV before the program's first line. Beyond
+# start: an app that does not open a window (its posture is not `gui = "wayland"`; an `offscreen`
+# one runs without a display already) is a command-line agent, and its `--version` ending on a
+# signal means the binary the build produced is broken — the shape a faulty patchelf leaves, which
+# builds cleanly and then dies of SIGSEGV before the program's first line. Beyond
 # those two, what the app's own command does headless on a runner is no part of the question: a
 # desktop app without its display, or an agent asking for a sign-in, says nothing about the build.
 # Each app's tree is purged and the store collected before the next, so the run fits the runner's
@@ -137,9 +138,10 @@ jobs:
             # rather than a package that built.
             if grep -qE 'cannot provision|the sandbox cannot run' <<<"$out"; then
               failed+=("$app: $(grep -E 'cannot provision|the sandbox cannot run' <<<"$out" | head -n 1)")
-            # A command-line agent (no `gui:` in its resolved posture) whose `--version` died on a
-            # signal ran a broken binary. `timeout` reports its own expiry as 124, below this range.
-            elif [ "$rc" -ge 128 ] && ! "$sbx" config show --app "$app" 2>/dev/null | grep -qE '^ *gui:'; then
+            # A command-line agent (no `gui: wayland` in its resolved posture: an `offscreen` app opens
+            # no window either) whose `--version` died on a signal ran a broken binary. `timeout`
+            # reports its own expiry as 124, below this range.
+            elif [ "$rc" -ge 128 ] && ! "$sbx" config show --app "$app" 2>/dev/null | grep -qE '^ *gui: *wayland'; then
               failed+=("$app: \`--version\` died on signal $((rc - 128)) (exit $rc) — the built binary does not start")
             fi
             "$sbx" app rm "$app" --purge >/dev/null 2>&1 || true
