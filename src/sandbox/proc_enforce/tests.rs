@@ -1038,14 +1038,18 @@ fn a_signal_during_the_handoff_receive_does_not_refuse_it() {
     let (recv, send) = UnixStream::pair().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let receiver = std::thread::spawn(move || {
-        // SAFETY: names the calling thread.
-        tx.send(unsafe { libc::pthread_self() }).unwrap();
+        // SAFETY: names the calling thread. Sent as an integer: musl's `pthread_t` is a pointer,
+        // which is not `Send`.
+        tx.send(unsafe { libc::pthread_self() } as usize).unwrap();
         recv_fd_raw(&recv)
     });
     let thread = rx.recv().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(200));
     // SAFETY: `thread` is the receiver, alive until it has taken the descriptor sent below.
-    assert_eq!(unsafe { libc::pthread_kill(thread, libc::SIGUSR1) }, 0);
+    assert_eq!(
+        unsafe { libc::pthread_kill(thread as libc::pthread_t, libc::SIGUSR1) },
+        0
+    );
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(
         !receiver.is_finished(),

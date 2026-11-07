@@ -84,13 +84,13 @@ runs:
     - name: Install zig (linker for the musl target)
       uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       with:
-        version: 0.13.0
+        version: 0.15.2
 
     - name: Install cargo-zigbuild
       # Pinned to the version `mise.toml` names, so the local musl build and the published one go
       # through the same wrapper. Bump the two together.
       shell: bash
-      run: cargo install cargo-zigbuild@0.23.0 --locked
+      run: cargo install cargo-zigbuild@0.24.1 --locked
 
     - name: Install Nix
       uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
