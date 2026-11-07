@@ -68,6 +68,18 @@
       "addLabels": ["security"]
     },
     {
+      "description": "The uuid override under sockjs stays on 11: uuid 12 and later are ESM only, and sockjs loads it with require.",
+      "matchManagers": ["npm"],
+      "matchDepNames": ["uuid"],
+      "allowedVersions": "<12"
+    },
+    {
+      "description": "The editor's typescript stays on 5: typescript 7 ships no tsserver, which typescript-language-server needs. docs-site's own typescript is not held back.",
+      "matchManagers": ["mise"],
+      "matchDepNames": ["npm:typescript"],
+      "allowedVersions": "<6"
+    },
+    {
       "description": "dtolnay/rust-toolchain names its versions by branch, not by tag, so a digest lookup fails. Its pins move with rust-toolchain.toml, which Renovate does read.",
       "matchPackageNames": ["dtolnay/rust-toolchain"],
       "enabled": false
@@ -81,10 +93,10 @@
   ],
   "customManagers": [
     {
-      "description": "The pinned nixpkgs revision behind the static nix and bwrap engines, which no manager reads on its own because it lives inside a shell task.",
+      "description": "The pinned nixpkgs revision behind the static nix and bwrap engines, which no manager reads on its own: it lives inside mise.toml's shell tasks and in the workflows' NIXPKGS_REV, and all of them move together.",
       "customType": "regex",
-      "managerFilePatterns": ["/^mise\\.toml$/"],
-      "matchStrings": ["github:NixOS/nixpkgs/(?<currentDigest>[0-9a-f]{40})#"],
+      "managerFilePatterns": ["/^mise\\.toml$/", "/^\\.github/workflows/[^/]+\\.yml$/"],
+      "matchStrings": ["github:NixOS/nixpkgs/(?<currentDigest>[0-9a-f]{40})#", "NIXPKGS_REV: \"(?<currentDigest>[0-9a-f]{40})\""],
       "depNameTemplate": "NixOS/nixpkgs",
       "packageNameTemplate": "https://github.com/NixOS/nixpkgs",
       "currentValueTemplate": "nixos-unstable",
