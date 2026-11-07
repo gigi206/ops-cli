@@ -228,24 +228,37 @@ pub(crate) struct SandboxSpec {
 /// same sources when they hold the same open objects, not merely equal names.
 #[derive(Debug, Clone)]
 pub(crate) struct HeldSource {
-    /// The canonical path of the bind, the `src` and `dest` of its [`Mount`].
+    /// The canonical host path of the bind, the `src` of its [`Mount`].
     pub(super) path: PathBuf,
+    /// Where the cage finds it, the `dest` of its [`Mount`]: the path itself for a config bind.
+    pub(super) dest: PathBuf,
     /// The source, open by `O_PATH`.
     pub(super) fd: std::sync::Arc<std::os::fd::OwnedFd>,
 }
 
 impl HeldSource {
-    /// Hold `fd` as the source of the bind at `path`.
+    /// Hold `fd` as the source of the bind at `path`, which the cage finds at that same path.
     pub(crate) fn new(path: PathBuf, fd: std::os::fd::OwnedFd) -> Self {
+        Self::mounted_at(path.clone(), path, fd)
+    }
+
+    /// Hold `fd` as the source of the bind from the host's `path` to the cage's `dest`.
+    pub(crate) fn mounted_at(path: PathBuf, dest: PathBuf, fd: std::os::fd::OwnedFd) -> Self {
         Self {
             path,
+            dest,
             fd: std::sync::Arc::new(fd),
         }
     }
 
-    /// The canonical path of the bind, where the cage finds it.
+    /// The canonical host path of the bind.
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Where the cage finds the bind.
+    pub(crate) fn dest(&self) -> &Path {
+        &self.dest
     }
 
     /// The held object's device and inode, as `stat -c %d:%i` prints them for the path it is
@@ -267,7 +280,9 @@ impl HeldSource {
 
 impl PartialEq for HeldSource {
     fn eq(&self, other: &Self) -> bool {
-        self.path == other.path && std::sync::Arc::ptr_eq(&self.fd, &other.fd)
+        self.path == other.path
+            && self.dest == other.dest
+            && std::sync::Arc::ptr_eq(&self.fd, &other.fd)
     }
 }
 
@@ -471,10 +486,11 @@ impl SandboxSpec {
 
     /// For each mount, the held source bwrap mounts there from its descriptor, if any.
     ///
-    /// A source goes to the **last** mount of its path onto itself, the one the cage sees there: the
-    /// config bind it was opened for is laid before every structural mount, and a control-plane pin
-    /// of the same directory is laid after it ([`lay_pins`](super::binds::lay_pins)), so a
-    /// descriptor given to the first would leave the visible mount resolved by path. bwrap 0.10.0
+    /// A source goes to the **last** mount of its path onto its destination, the one the cage sees
+    /// there: the config bind it was opened for is laid before every structural mount, and a
+    /// control-plane pin of the same directory is laid after it
+    /// ([`lay_pins`](super::binds::lay_pins)), so a descriptor given to the first would leave the
+    /// visible mount resolved by path. bwrap 0.10.0
     /// and later close such a descriptor once they have mounted it, so an earlier mount of the same
     /// path goes by path, shadowed by the one that does not. Two sources of one path meet at one
     /// mount, and the second goes to none.
@@ -484,7 +500,7 @@ impl SandboxSpec {
             let last = self.mounts.iter().rposition(|m| match m {
                 Mount::Bind { src, dest }
                 | Mount::RoBind { src, dest }
-                | Mount::RoBindTry { src, dest } => src == dest && *src == held.path,
+                | Mount::RoBindTry { src, dest } => *src == held.path && *dest == held.dest,
                 _ => false,
             });
             if let Some(at) = last {

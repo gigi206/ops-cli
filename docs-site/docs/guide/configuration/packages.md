@@ -232,6 +232,17 @@ An app's own tools win. Its pool and its home are searched before any neighbour'
 holds itself is always the one it resolves, and a neighbour supplies only a version it has nowhere
 else.
 
+The grant also reaches the pool `sbx run` fills, last of all. That is where the project's own
+tools land when they are fetched under the project's own `[network]`, which an app's posture
+replaces rather than extends: an app whose egress refuses `nodejs.org` finds the `node` the project
+declares there instead of failing to fetch it at every launch. A tool the project's mise file asks
+for by an exact version resolves from it with no network at all; one asked for by a range or
+`latest` still asks its registry which release that names. Unlike an app's pool, this one sits
+inside a home its cage can write, so it is shared only where bubblewrap mounts a source from a
+descriptor (`--bind-fd`): the launch holds the pool open with every link on its path refused, and
+the cage checks what it sees there against what was held before anything runs. On a bubblewrap
+without it, the pool is not shared.
+
 Only a global app has a pool of its own to share. An app declared
 [`home_scope = "project"`](apps) roots its home under the project already, so its mise data has
 no second pool: it neither offers a pool nor reads one.

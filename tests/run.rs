@@ -7278,16 +7278,19 @@ fn a_shared_pool_lets_the_second_app_reuse_what_the_first_installed() {
          [app.two]\ncmd = [\"sh\", \"-c\", \"rg --version\"]\n",
     )
     .unwrap();
-    std::fs::write(
-        project.path().join("mise.toml"),
-        "[tools]\n\"aqua:BurntSushi/ripgrep\" = \"latest\"\n",
-    )
-    .unwrap();
 
     probe_or_skip!(
         "shared-pool e2e",
         run_in(project.path(), data.path(), &["true"])
     );
+    // Declared only after the probe: the probe is an `sbx run`, which would equip the tool into the
+    // project's own pool, and the grant reaches that pool too, so the first app would find it there
+    // and install nothing of its own.
+    std::fs::write(
+        project.path().join("mise.toml"),
+        "[tools]\n\"aqua:BurntSushi/ripgrep\" = \"latest\"\n",
+    )
+    .unwrap();
     need_reachable!(
         cache_reachable(),
         "skipping shared-pool e2e: the network is unreachable"
@@ -7630,6 +7633,83 @@ fn a_global_apps_npm_tool_rolls_whatever_node_the_projects_mise_file_names() {
             .any(|e| e.contains("antfu")),
         "the npm: tool must be installed in the app-global pool, at {}: {log}",
         installs.display()
+    );
+}
+
+#[test]
+fn an_app_finds_the_project_tools_sbx_run_installed_without_fetching_them() {
+    // An app's `[network]` replaces the project's, so a tool the project's mise file declares from a
+    // host only the project allows failed to install at every app launch, and the app never had it.
+    // Under `apps_share_install_pools` the app reads the pool `sbx run` filled. Teeth: `sbx run`
+    // installs an exact-version `npm:` tool under the project's egress, and the app, whose egress
+    // refuses the registry, then runs it with no failed install and no request to the registry.
+    // Skips (never fails) without a sandbox or the network.
+    let project = TmpDir::prefixed("r", "ppl-proj");
+    let data = TmpDir::prefixed("r", "ppl-data");
+    let state = TmpDir::prefixed("r", "ppl-state");
+
+    probe_or_skip!(
+        "project pool e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
+    need_reachable!(
+        cache_reachable(),
+        "skipping project pool e2e: the network is unreachable"
+    );
+
+    std::fs::write(
+        project.path().join("mise.toml"),
+        "[tools]\n\"npm:cowsay\" = \"1.6.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "apps_share_install_pools = true\n\
+         [network]\nmode = \"deny\"\nallow = [\"{GET,HEAD} https://registry.npmjs.org\"]\n\
+         [packages]\nnode = \"nix:nodejs\"\n\
+         [app.pp]\ncmd = [\"sh\", \"-c\", \"command -v cowsay\"]\n\
+         [app.pp.network]\nmode = \"deny\"\n",
+    )
+    .unwrap();
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", "--yes"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let filled = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "true"],
+    );
+    assert!(
+        filled.status.success(),
+        "sbx run must install the project's tool under the project's egress: {}",
+        String::from_utf8_lossy(&filled.stderr)
+    );
+
+    let out = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["app", "run", "pp"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("cowsay"),
+        "the app must find the tool `sbx run` installed: {stdout}{stderr}"
+    );
+    assert!(
+        !stderr.contains("registry.npmjs.org") && !stderr.contains("failed"),
+        "the app must not try to fetch a tool the project's pool holds: {stderr}"
     );
 }
 

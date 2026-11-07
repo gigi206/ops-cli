@@ -62,9 +62,13 @@ node                            = "26"
 # `typescript: ^7` devDependency for `npm run typecheck` — the two coexist.
 # Keep the `tsserver.path` in the omp LSP config (~/.omp/agent/lsp.json) in sync
 # with the resolved typescript version when it bumps.
-"npm:typescript"                = "5"
-# Floats, for the same reason as rust-analyzer: it serves the editor and builds nothing.
-"npm:typescript-language-server" = "latest"
+#
+# These two and `cargo-callgraph` below are exact versions rather than a range or `latest`: an app
+# launched from this project reads the tools `sbx run` installed (`apps_share_install_pools` in
+# `.sbx.toml`), and only an exact version resolves there without asking a registry the app's egress
+# refuses.
+"npm:typescript"                = "5.9.3"
+"npm:typescript-language-server" = "6.0.3"
 # Fast text search (`rg`), first rung of the navigation ladder in CLAUDE.md.
 # Floats like rust-analyzer: prebuilt via aqua, serves the editor and
 # builds nothing.
@@ -72,8 +76,9 @@ node                            = "26"
 # Call-graph navigation for agents and editors (`cargo callgraph`, MCP server
 # wired in opencode.json / .mcp.json). Floats like rust-analyzer: it reads the
 # crate rather than building it, so no version of it can change what CI accepts.
-# First run indexes the workspace (minutes), then disk-cached.
-"cargo:cargo-callgraph" = "latest"
+# First run indexes the workspace (minutes), then disk-cached. Exact, for the reason given at
+# `npm:typescript` above.
+"cargo:cargo-callgraph" = "0.1.0"
 
 # ============================================================================
 # Tasks — invoked via `mise run <name>`. `mise run ci` is the full one-liner you

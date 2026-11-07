@@ -10,6 +10,11 @@
 # A cage test needs a static binary, since the nested cage holds no loader for a dynamic one:
 # `cargo-zigbuild test --target x86_64-unknown-linux-musl --test <suite>`.
 
+# An app launched from here reads the project's tools from the pool `sbx run` filled, read-only,
+# instead of fetching them under its own egress, which refuses the hosts below. Each app's own pool
+# is shared with the others the same way.
+apps_share_install_pools = true
+
 # Read-only: what the tools of `mise.toml` and cargo fetch, on top of the nix and GitHub hosts the
 # self-equip lane already opens.
 [network]

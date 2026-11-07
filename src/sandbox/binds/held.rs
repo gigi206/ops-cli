@@ -102,7 +102,7 @@ pub(crate) fn held_source_check(
                 held.path().display()
             )
         })?;
-        argv.push(held.path().as_os_str().to_owned());
+        argv.push(held.dest().as_os_str().to_owned());
         argv.push(OsString::from(identity));
     }
     Ok(argv)

@@ -109,6 +109,7 @@ fn assembled_from(paths: &SandboxPaths) -> SandboxSpec {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     assemble(
@@ -196,6 +197,7 @@ fn assembled_on_distro() -> SandboxSpec {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let mut userland = userland();
@@ -843,6 +845,7 @@ fn assemble_binds_a_device_after_the_minimal_dev() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let devices = [PathBuf::from("/dev/dri"), PathBuf::from("/dev/kvm")];
@@ -1109,6 +1112,7 @@ fn assemble_emits_launcher_extra_binds_after_the_structural_mounts() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let extra = [
@@ -1188,6 +1192,7 @@ fn assemble_with_zone(
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     assemble(
@@ -1504,6 +1509,7 @@ fn build_spec_refuses_an_open_pin_parent_the_cage_pointed_out_of_the_home() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let err = build_spec(
@@ -1799,6 +1805,7 @@ fn a_writable_nix_mount_is_a_read_write_bind_of_the_per_project_store() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let spec = assemble(
@@ -2233,6 +2240,7 @@ fn assemble_binds_the_per_project_mise_pool_and_puts_both_shims_on_path() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let spec = assemble(
@@ -2335,6 +2343,7 @@ fn build_spec_registers_the_nix_plugin_under_both_pools_for_a_global_app() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let spec = build_spec(
@@ -2471,6 +2480,7 @@ fn every_runtime_names_the_host_directory_a_declared_tool_installs_into() {
             fresh_release_tokens: &[],
             ignored_mise_paths: &[],
             share_install_pools: false,
+            share_project_pool: false,
             git_config_read_only: false,
         };
         let spec = build_spec(
@@ -2542,6 +2552,7 @@ fn the_grant_puts_the_other_apps_pools_behind_the_apps_own_and_read_only() {
             fresh_release_tokens: &[],
             ignored_mise_paths: &[],
             share_install_pools: share,
+            share_project_pool: false,
             git_config_read_only: false,
         };
         build_spec(
@@ -2611,6 +2622,108 @@ fn the_grant_puts_the_other_apps_pools_behind_the_apps_own_and_read_only() {
         Some(format!("{SANDBOX_HOME}/{MISE_DATA_REL}/installs")),
         "an ungranted cage keeps the app-global fallback and nothing else"
     );
+}
+
+/// The pool `sbx run` fills lies inside a home its cage writes, so the grant reaches it only when the
+/// launch can hold it: bound read-only behind every app pool, mounted from a descriptor opened with
+/// every link refused, and left out when the launch cannot do that or the pool is not what a launch
+/// left.
+#[test]
+fn the_grant_reaches_the_pool_sbx_run_fills_only_from_a_held_descriptor() {
+    let data = TmpDir::new();
+    let project = TmpDir::new();
+    std::fs::write(project.path().join("README"), b"hi").unwrap();
+    let id = project_id(&project.path().canonicalize().unwrap());
+    let base = data.path().join("projects").join(&id);
+    std::fs::create_dir_all(base.join("apps/neighbour/mise/installs/nix-jq/1.8.1")).unwrap();
+    let pool = base.join("home").join(MISE_DATA_REL);
+    std::fs::create_dir_all(pool.join("installs/node/26.13.0")).unwrap();
+    let dest = Path::new(MISE_SHARED_INCAGE).join(PROJECT_POOL);
+
+    let spec_for = |project_pool: bool| {
+        let overlay = Overlay {
+            env: &[],
+            binds: &[],
+            bin_paths: &[],
+            timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
+            ignored_mise_paths: &[],
+            share_install_pools: true,
+            share_project_pool: project_pool,
+            git_config_read_only: false,
+        };
+        build_spec(
+            data.path(),
+            project.path(),
+            Runtime::GlobalApp("asker"),
+            &userland(),
+            &nix_mount(),
+            &overlay,
+            &[],
+            NetPolicy::Shared,
+            &Default::default(),
+            &Default::default(),
+            crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
+            &Default::default(),
+            false,
+            vec![OsString::from("/bin/sh")],
+        )
+        .expect("build spec")
+    };
+    let dirs = |spec: &SandboxSpec| {
+        spec.env
+            .iter()
+            .find(|(key, _)| key == "MISE_SHARED_INSTALL_DIRS")
+            .map(|(_, v)| v.clone())
+    };
+
+    let granted = spec_for(true);
+    assert!(
+        granted.mounts.iter().any(|m| matches!(
+            m,
+            Mount::RoBindTry { src, dest: d } if *d == dest && *src == pool
+        )),
+        "the project's pool is not bound read-only at {}",
+        dest.display()
+    );
+    assert_eq!(
+        dirs(&granted),
+        Some(format!(
+            "{SANDBOX_HOME}/{MISE_DATA_REL}/installs:{MISE_SHARED_INCAGE}/neighbour/installs:\
+             {MISE_SHARED_INCAGE}/{PROJECT_POOL}/installs"
+        )),
+        "the project's pool comes after the app's own installs and every neighbour's"
+    );
+    // Mounted from the object the launch held, never by the path a cage could repoint.
+    let held = hold_project_pool(data.path(), project.path(), &granted)
+        .expect("the pool holds")
+        .expect("the plan mounts it");
+    assert_eq!(held.dest(), dest);
+    let handed = granted.with_held_sources(vec![held]);
+    assert_eq!(
+        handed
+            .seen_held_sources()
+            .iter()
+            .map(|h| h.dest())
+            .collect::<Vec<_>>(),
+        vec![dest.as_path()],
+        "the cage sees the held pool at its shared destination"
+    );
+
+    // Without a bubblewrap that takes a descriptor, the pool is not shared at all.
+    let by_path = spec_for(false);
+    assert!(!by_path.mounts.iter().any(|m| m.dest() == dest));
+    assert!(
+        hold_project_pool(data.path(), project.path(), &by_path)
+            .expect("nothing to hold")
+            .is_none()
+    );
+
+    // A pool whose `installs` is a link is not what a launch left, and is not shared.
+    std::fs::rename(pool.join("installs"), base.join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(base.join("elsewhere"), pool.join("installs")).unwrap();
+    assert!(!spec_for(true).mounts.iter().any(|m| m.dest() == dest));
 }
 
 #[test]
@@ -2942,6 +3055,7 @@ fn the_capture_tap_replaces_the_cages_resolver_with_exactly_one_mount() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let spec_of = |capture: bool| {

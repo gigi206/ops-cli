@@ -54,6 +54,7 @@ fn the_generated_argv_launches_a_working_hermetic_shell() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     // this smoke exercises the userland against the shared store, read-only — the
@@ -235,6 +236,7 @@ fn the_nix_ld_shim_serves_foreign_binaries_and_unskews_cross_channel_tools() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let foreign_spec = build_spec(
@@ -287,6 +289,7 @@ fn the_nix_ld_shim_serves_foreign_binaries_and_unskews_cross_channel_tools() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let cross_spec = build_spec(
@@ -442,6 +445,7 @@ fn the_cage_runs_from_a_writable_per_project_store_seeded_with_the_base_closure(
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     // the cage reads the base userland AND writes into `/nix` — proving the rw bind
@@ -636,6 +640,7 @@ fn the_cage_builds_a_fresh_derivation_offline_from_the_seeded_base() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let cmd = vec![
@@ -820,6 +825,7 @@ fn the_cage_self_equips_a_nix_tool_via_mise() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let cmd = vec![
@@ -958,6 +964,7 @@ fn a_mise_used_tool_is_activated_on_path_in_a_later_launch() {
             fresh_release_tokens: &[],
             ignored_mise_paths: &[],
             share_install_pools: false,
+            share_project_pool: false,
             git_config_read_only: false,
         };
         let cmd = vec![
@@ -1095,6 +1102,7 @@ fn a_global_app_cage_puts_both_mise_shims_dirs_on_path_and_splits_the_pool() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let nix_mount = NixMount {
@@ -1274,6 +1282,7 @@ fn a_neighbour_pool_removed_between_the_plan_and_the_spawn_does_not_fail_the_lau
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: true,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let nix_mount = NixMount {
@@ -1397,6 +1406,7 @@ fn a_declared_distribution_is_the_cage_root_and_every_mount_still_lands() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let nix_mount = NixMount {

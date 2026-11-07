@@ -750,6 +750,11 @@ pub(crate) struct Overlay<'a> {
     /// (`apps_share_install_pools`, a trusted project's grant). Only a global app has such a pool,
     /// so it changes nothing for the other runtimes.
     pub(crate) share_install_pools: bool,
+    /// Whether that grant also reaches the pool `sbx run` fills ([`PROJECT_POOL`]). It takes a
+    /// bubblewrap that mounts a source from its descriptor, since that pool, unlike an app's, lies
+    /// inside a home its cage can write: by path, a parent swapped for a link between the plan and
+    /// the mount would choose what the reading cage sees.
+    pub(crate) share_project_pool: bool,
     /// Whether the cage cannot write the configuration the project's git reads, `.git/config` or
     /// the one a `.git` file leads to (sbx's own read-only default, or a declared mask). Then git
     /// cannot record the upstream a `push -u` sets, and the cage's git is told to push a branch to
@@ -1605,6 +1610,57 @@ const MISE_PROJECT_INCAGE: &str = "/opt/sbx/mise-project";
 /// [`STRUCTURAL_DESTS`] carries, its per-app children being derived the way the home's are.
 const MISE_SHARED_INCAGE: &str = "/opt/sbx/mise-shared";
 
+/// The name the project's own mise pool, the one `sbx run` fills, goes by among the shared pools:
+/// its directory under [`MISE_SHARED_INCAGE`] and its place in `MISE_SHARED_INSTALL_DIRS`. An app
+/// name may not start with `-`, so it never meets one.
+pub(crate) const PROJECT_POOL: &str = "-project";
+
+/// The project's own mise pool, as a shared pool: `(PROJECT_POOL, <host pool>)`, or `None` when the
+/// project's home holds no `installs` reached through real directories alone.
+///
+/// The pool sits inside the home `sbx run`'s cage writes, so it is never mounted by path: the
+/// launch holds it with [`hold_project_pool`] and bubblewrap mounts the held object.
+fn project_pool(data_dir: &Path, project: &Path) -> Option<(String, PathBuf)> {
+    let base = data_dir.join("projects").join(project_id(project));
+    let pool = Path::new("home").join(MISE_DATA_REL);
+    super::cagedir::open_beneath(&base, &pool.join("installs")).ok()?;
+    Some((PROJECT_POOL.to_string(), base.join(pool)))
+}
+
+/// Hold the project's own mise pool open, every link on its path refused, as the source bubblewrap
+/// mounts at its shared destination, when `spec` mounts it there. `None` when it does not.
+///
+/// An error is a pool the plan found and the launch can no longer hold: a component replaced since,
+/// which the launch is refused over rather than mounting what the path names now.
+pub(crate) fn hold_project_pool(
+    data_dir: &Path,
+    cwd: &Path,
+    spec: &super::spec::SandboxSpec,
+) -> Result<Option<super::spec::HeldSource>, String> {
+    let dest = Path::new(MISE_SHARED_INCAGE).join(PROJECT_POOL);
+    if !spec.mounts.iter().any(|m| m.dest() == dest) {
+        return Ok(None);
+    }
+    let project = canonicalize_project(cwd).map_err(|e| format!("cannot read the project: {e}"))?;
+    let base = data_dir.join("projects").join(project_id(&project));
+    let rel = Path::new("home").join(MISE_DATA_REL);
+    super::cagedir::hold_entry_beneath(&base, &rel)
+        .map(|fd| {
+            Some(super::spec::HeldSource::mounted_at(
+                base.join(&rel),
+                dest,
+                fd,
+            ))
+        })
+        .map_err(|e| {
+            format!(
+                "cannot hold the project's mise pool {}: {e}. It was found when the launch was \
+                 planned, so a component of its path has been replaced or removed since",
+                base.join(&rel).display()
+            )
+        })
+}
+
 /// mise's app-global data dir inside the cage — the sandbox `$HOME`'s mise dir. For a global app,
 /// Lane-1 `mise use -g` of an app `[packages] mise:` tool must run pinned here (not the per-project
 /// primary [`MISE_PROJECT_INCAGE`]) so the tool is installed once and shared across every project,
@@ -2154,13 +2210,19 @@ pub(crate) fn build_spec(
     // own, so only a global app has neighbours to read; `project_mise_pools` discovers them on
     // disk, so the set is exactly the apps that have run in this project and equipped something.
     // The app's own pool is excluded by name — it is the writable primary, not a fallback.
-    let mise_shared_pools: Vec<(String, PathBuf)> =
+    let mut mise_shared_pools: Vec<(String, PathBuf)> =
         match (overlay.share_install_pools, runtime.app()) {
             (true, Some(app)) if rt.mise_project_src.is_some() => {
                 super::inspect::project_mise_pools(data_dir, &project_id(&project), app)
             }
             _ => Vec::new(),
         };
+    // And the pool `sbx run` fills, which holds what the project's own mise file declares: an app
+    // whose egress refuses those tools' hosts finds them there instead of failing to fetch them.
+    // Last, so a neighbour app's copy and the app's own come first.
+    if overlay.share_project_pool && rt.mise_project_src.is_some() {
+        mise_shared_pools.extend(project_pool(data_dir, &project));
+    }
 
     let paths = SandboxPaths {
         project: &project,

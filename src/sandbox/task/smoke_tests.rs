@@ -110,6 +110,7 @@ fn engine_on(
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        share_project_pool: false,
         git_config_read_only: false,
     };
     let nix_mount = super::super::binds::NixMount {
