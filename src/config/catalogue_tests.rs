@@ -2116,7 +2116,8 @@ fn no_shipped_package_is_frozen_at_the_version_it_names() {
 }
 
 /// Every shipped app's egress policy, by app name, as the loader resolves it with the shipped groups
-/// declared: what a launch of that app hands its proxy before the built-in rules are unioned in.
+/// declared and the shipped bundles folded in: what a launch of that app hands its proxy before the
+/// built-in rules are unioned in.
 pub(crate) fn shipped_egress_policies() -> Vec<(String, crate::allowlist::EgressPolicy)> {
     let toml_files = |dir: &str| -> Vec<(String, Vec<u8>)> {
         shipped_files(dir)
@@ -2141,6 +2142,21 @@ pub(crate) fn shipped_egress_policies() -> Vec<(String, crate::allowlist::Egress
         let app = schema::parse_app(&bytes).unwrap_or_else(|e| panic!("app {name}: {e}"));
         global.app.insert(name, app);
     }
+    // Each app's `use = [<bundle>, …]` folds in as the loader folds it, so a rule an app takes from
+    // its bundle is part of the policy that app launches with.
+    let bundles = shipped_files("examples/bundle")
+        .into_iter()
+        .map(|p| {
+            let stem = p.file_stem().unwrap().to_string_lossy().into_owned();
+            (stem, shipped_bundle(&p))
+        })
+        .collect();
+    super::load::expand_bundles(
+        &mut global.app,
+        &bundles,
+        &mut super::load::BundleFold::default(),
+        super::load::FoldLayer::Profile,
+    );
     let resolved = super::resolve(global, None, &super::PluginRegistry::default());
     resolved
         .apps

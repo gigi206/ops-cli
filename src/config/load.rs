@@ -1746,7 +1746,7 @@ fn merge_config_dirs(
 /// above may replace the app's network and take the loss out of the profile's hands
 /// ([`set_aside_replaced`]), and what stands is weighed by [`settle_bundles`] once the resolution
 /// says what the posture is.
-fn expand_bundles(
+pub(super) fn expand_bundles(
     apps: &mut BTreeMap<String, RawApp>,
     bundles: &BTreeMap<String, RawBundle>,
     fold: &mut BundleFold,
@@ -1848,7 +1848,7 @@ fn resolve_use<'a>(
 /// resolved apps by [`settle_bundles`], since what a lost egress entry costs depends on the posture
 /// the app runs under, which only the resolution knows.
 #[derive(Default)]
-struct BundleFold {
+pub(super) struct BundleFold {
     /// Said on the app, wherever its own notes are.
     notes: BTreeMap<String, Vec<String>>,
     /// Why the app may not launch: a `use` entry naming no bundle sbx can read.
@@ -1862,7 +1862,7 @@ struct BundleFold {
 
 /// The layer an app's `use` was folded in, which is where its `[network]` table would be written.
 #[derive(Clone, Copy)]
-enum FoldLayer {
+pub(super) enum FoldLayer {
     /// The app's profile under `apps/`.
     Profile,
     /// The app's `[app.<name>]` in the project config.
