@@ -2309,3 +2309,23 @@ fn only_a_line_of_code_reads_the_upgrade_signal() {
         );
     }
 }
+
+/// Claude Desktop's own native module (`@ant/claude-native/claude-native-binding.node`) links
+/// `libpipewire-0.3.so.0`, which the shared prebuilt library set does not carry, and autoPatchelf
+/// refuses the `.deb` outright over an unsatisfied dependency: the app could neither launch nor
+/// roll. The bundle names the library for its package alone; this holds it there.
+#[test]
+fn the_claude_desktop_bundle_carries_the_library_its_native_module_links() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/bundle/claude-desktop.toml");
+    let bundle = shipped_bundle(&path);
+    let libs = bundle
+        .deb
+        .get("claude-desktop")
+        .map(|table| table.libs.as_slice())
+        .unwrap_or_default();
+    assert!(
+        libs.iter().any(|lib| lib == "pipewire"),
+        "the claude-desktop `.deb` needs `pipewire` among its `libs`: {libs:?}"
+    );
+}

@@ -357,7 +357,7 @@ The 69 shipped bundles, and what each carries:
 | `auggie` | 2 (`mise:`, `nix:`) | 7 egress entries, 1 env var | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `autohand` | 2 (`mise:`, `nix:`) | 6 egress entries | `github-install`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `claude-code` | 1 (`mise:`) | 6 egress entries, 3 env vars | none |
-| `claude-desktop` | 2 (`deb:`, `nix:`) | 24 egress entries, 3 env vars | `chromium-background`, `chromium-spellcheck`, `google-signin-incage` |
+| `claude-desktop` | 2 (`deb:`, `nix:`) | 24 egress entries, 3 env vars, 1 `deb:` library attribute | `chromium-background`, `chromium-spellcheck`, `google-signin-incage` |
 | `cline` | 3 (`mise:`, `nix:`) | 8 egress entries | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `codebuddy` | 2 (`mise:`, `nix:`) | 5 egress entries, 2 env vars | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `codex` | 1 (`mise:`) | 6 egress entries | none |

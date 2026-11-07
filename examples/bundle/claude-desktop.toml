@@ -132,3 +132,10 @@ chromium = "nix:chromium"
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
 DISABLE_TELEMETRY = "1"
 DISABLE_ERROR_REPORTING = "1"
+
+# One attribute the shared prebuilt library set does not carry, added for THIS package only so no
+# other Electron app pays for its closure. The app's own native module
+# (`@ant/claude-native/claude-native-binding.node`) links `libpipewire-0.3.so.0`, and without it the
+# `.deb` build fails outright: autoPatchelf refuses an unsatisfied dependency.
+[deb.claude-desktop]
+libs = ["pipewire"]
