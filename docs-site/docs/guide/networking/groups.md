@@ -199,7 +199,6 @@ group opens what it carries, a `mute` group keeps refusals out of the default
 | `npm-runtime` | allow | 1 entry | `registry.npmjs.org` for every verb, for the agents that pull packages at runtime. |
 | `openrouter` | allow | 1 entry | The OpenRouter API, a provider you choose; the key stays in the app's own `[secret]` block. |
 | `pypi` | allow | 2 entries | The Python install lane: the index and its file host, `GET` only. |
-| `sigstore` | allow | 1 entry | The Sigstore trust root mise reads to verify a release's artifact attestations before it installs it, `GET` only. |
 
 A group lists what the apps referencing it share, not everything they reach. When one
 app needs more than its group, it writes the extra rule beside the reference, and the

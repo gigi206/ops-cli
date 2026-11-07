@@ -291,9 +291,12 @@ allowed so a project can provision its toolchain even when untrusted:
 - `*.githubusercontent.com`: raw content and release assets
 - `search.devbox.sh`: the Nixhub metadata endpoint the nix resolver queries (overridable via the per-toolkit resolver plugin)
 - `mise-versions.jdx.dev`: mise's version index
+- `tuf-repo-cdn.sigstore.dev`: Sigstore's trust root, which mise verifies a release's
+  artifact attestations against before it installs an `aqua:` or `github:` tool that
+  publishes them
 
-These are the *version-resolution and nix-source* hosts both self-equip front-ends
-(in-cage nix and the `mise:` backends) need. The per-tool *artifact* hosts (npm, a
+These are the *version-resolution, verification and nix-source* hosts both self-equip
+front-ends (in-cage nix and the `mise:` backends) need, whatever the tool. The per-tool *artifact* hosts (npm, a
 release host) are **not** in this set: a profile that fetches from them must list
 them explicitly. The whole set is shown in `sbx config` (and in
 [`sbx net rules --source builtin`](observability)), so it is never a silent

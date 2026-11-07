@@ -161,10 +161,10 @@ provisioned host-side, before the cage, so only `mise:` is governed by the cage'
 distribution host must be in `[network].allow` (e.g. `registry.npmjs.org` for `npm:`,
 `github.com` for `aqua:`/`github:`). An `aqua:` tool whose release carries artifact
 attestations, a bare registry name such as `yq` included when the registry maps it to
-`aqua:`, is verified against Sigstore's trust root before it is installed, so it also
-needs `tuf-repo-cdn.sigstore.dev`, which the
-[`sigstore` group](../networking/groups#the-shipped-groups) carries. Refused, the install
-fails with `TUF repository load failed`. Under `network = "none"` a declared `mise:` tool
+`aqua:`, is verified against Sigstore's trust root before it is installed; that host is in
+the [built-in self-equip set](../networking/modes#the-built-in-self-equip-set), so a
+profile does not list it, and a `deny` that carves it back out fails the install with
+`TUF repository load failed`. Under `network = "none"` a declared `mise:` tool
 cannot be fetched and is absent (a warning, unless it was already equipped). This is
 **by design**, a `mise:` tool is fetched upstream-direct at launch, which is exactly
 what keeps it fresher than nixpkgs; the host-side backends trade that freshness for a

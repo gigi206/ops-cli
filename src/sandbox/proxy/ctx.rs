@@ -35,8 +35,8 @@ pub(super) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// All pinned to :443 (every one is HTTPS-only, so closing port 80 is pure least-privilege). The
 /// whole set is scoped to `{GET,HEAD}`: substitution, channel and tarball fetches (incl. the
-/// `github:`/`mise:github:` source and release downloads, which are GETs), raw content, and the
-/// nixhub/mise version indexes are all read-only, so a write verb on this always-on lane serves no
+/// `github:`/`mise:github:` source and release downloads, which are GETs), raw content, the
+/// nixhub/mise version indexes and Sigstore's trust root are all read-only, so a write verb on this always-on lane serves no
 /// self-equip purpose and is refused. A rare git-over-HTTPS push/clone that POSTs to
 /// `git-upload-pack` is the user's to allow explicitly (`allow {*} github.com`). The explicit
 /// `{GET,HEAD}` also makes every entry immune to a per-app `default_methods` rewrite (only an
@@ -44,23 +44,26 @@ pub(super) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// lane's verb semantics, not raw exfiltration (a GET query string still carries data out).
 pub(crate) fn builtin_allow_hosts() -> &'static [&'static str] {
     &[
-        "{GET,HEAD} cache.nixos.org:443",         // binary substitution
-        "{GET,HEAD} *.nixos.org:443",             // channels / releases / tarballs
+        "{GET,HEAD} cache.nixos.org:443",           // binary substitution
+        "{GET,HEAD} *.nixos.org:443",               // channels / releases / tarballs
         "{GET,HEAD} github.com:443", // `github:NixOS/nixpkgs/<rev>` source (tarball fetch is GET)
         "{GET,HEAD} api.github.com:443", // the github tarball/redirect endpoint
         "{GET,HEAD} codeload.github.com:443", // the github archive download host
         "{GET,HEAD} *.githubusercontent.com:443", // raw content / release assets
         "{GET,HEAD} search.devbox.sh:443", // the nixhub metadata endpoint the nix resolver GETs
         "{GET,HEAD} mise-versions.jdx.dev:443", // mise's version index — the resolver any `mise:` backend GETs
+        "{GET,HEAD} tuf-repo-cdn.sigstore.dev:443", // Sigstore's trust root, read before mise installs an attested release
     ]
 }
 
 /// The built-in egress always permitted so a project can self-equip its toolchain even when
 /// untrusted: the nix binary cache, the nixpkgs source github fetches, the nixhub metadata
-/// endpoint the nix resolver queries, and mise's version index. Both self-equip front-ends —
-/// in-cage nix and the always-on `mise:` backends — run regardless of trust, so each front-end's
-/// version-resolution host belongs here; the artifact hosts they download from (npm, the per-tool
-/// release host) stay per-profile. Unioned into every policy regardless of trust (a user `deny`
+/// endpoint the nix resolver queries, mise's version index, and the Sigstore trust root mise
+/// verifies an attested release against before it installs it. Both self-equip front-ends —
+/// in-cage nix and the always-on `mise:` backends — run regardless of trust, so the hosts each
+/// front-end's own resolution and verification read belong here, whatever tool is being
+/// installed; the artifact hosts they download from (npm, the per-tool release host) stay
+/// per-profile. Unioned into every policy regardless of trust (a user `deny`
 /// can still carve it). The exact set is refined empirically against a real self-equip and is
 /// shown in `sbx config`, so it is never a silent allowance.
 ///
