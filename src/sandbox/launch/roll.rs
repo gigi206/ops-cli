@@ -12,7 +12,7 @@
 
 use super::build::build;
 use super::cage::{echo_cage_output, run_captured};
-use super::equip::{MISE_STATE_MARKER, mise_state_cmd, mise_upgrade_cmd};
+use super::equip::{MISE_BEFORE_MARKER, MISE_STATE_MARKER, mise_state_cmd, mise_upgrade_cmd};
 use super::startup::provision_only_cmd;
 use super::*;
 use crate::sandbox::packages::mise_tool_key;
@@ -411,8 +411,20 @@ pub(crate) fn upgrade_mise_packages(
             failed += 1;
             ok = false;
         } else if code == 0 {
-            match mise_transitions(&out).as_slice() {
-                [] if mise_up_to_date(&out) => {
+            // mise names a move only where it rewrote a pin, and says "up to date" only where it
+            // had nothing to do; a tool declared by an alias gets neither. The pool listings taken
+            // around the upgrade then say what moved, if anything did.
+            let mut transitions = mise_transitions(&out);
+            let mut current = mise_up_to_date(&out);
+            if transitions.is_empty()
+                && !current
+                && let Some(moves) = pool_moves(&out, &tokens)
+            {
+                current = moves.is_empty();
+                transitions = moves;
+            }
+            match transitions.as_slice() {
+                [] if current => {
                     outln!(
                         "{}",
                         roll_line(&name, width, &format!("{dim}up to date{r}"), pal)
@@ -1247,6 +1259,56 @@ pub(super) fn mise_transitions(captured: &str) -> Vec<String> {
         .filter(|l| l.contains(" → "))
         .map(crate::sandbox::sanitize)
         .collect()
+}
+
+/// The moves a roll made, read from the pool listings taken before and after the upgrade, as
+/// `<tool> <old> → <new>` lines in the shape [`mise_transitions`] returns. Empty when no declared
+/// tool's active version changed, and `None` when either listing is missing or unreadable, which
+/// leaves the caller with what mise said.
+///
+/// A tool absent before and present after was installed by the roll and is not a move: its first
+/// version has nothing to be compared with, and the not-installed check reports the opposite case.
+fn pool_moves(captured: &str, tokens: &[String]) -> Option<Vec<String>> {
+    let listing = |marker: &str, inner: Option<&str>| -> Option<serde_json::Value> {
+        let (_, after) = captured.split_once(marker)?;
+        let after = match inner {
+            Some(open) => after.trim_start().strip_prefix(open)?,
+            None => after,
+        };
+        serde_json::Deserializer::from_str(after.trim_start())
+            .into_iter::<serde_json::Value>()
+            .next()?
+            .ok()
+    };
+    let before = listing(MISE_BEFORE_MARKER, None)?;
+    let after = listing(MISE_STATE_MARKER, Some("{\"ls\":"))?;
+    let active = |doc: &serde_json::Value, key: &str| -> Option<String> {
+        doc.get(key)?
+            .as_array()?
+            .iter()
+            .find(|e| {
+                e.get("installed").and_then(serde_json::Value::as_bool) == Some(true)
+                    && e.get("active").and_then(serde_json::Value::as_bool) != Some(false)
+            })?
+            .get("version")?
+            .as_str()
+            .map(crate::sandbox::sanitize)
+    };
+    let mut moves = Vec::new();
+    let mut seen = Vec::new();
+    for token in tokens {
+        let key = mise_tool_key(token);
+        if seen.contains(&key) {
+            continue;
+        }
+        if let (Some(old), Some(new)) = (active(&before, &key), active(&after, &key))
+            && old != new
+        {
+            moves.push(format!("{} {old} → {new}", crate::sandbox::sanitize(&key)));
+        }
+        seen.push(key);
+    }
+    Some(moves)
 }
 
 /// Whether one `<token> <old> → <new>` transition moved a tool somewhere the two versions do not

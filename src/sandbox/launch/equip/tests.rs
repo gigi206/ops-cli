@@ -522,6 +522,9 @@ fn mise_upgrade_cmd_pins_the_app_global_pool_only_for_a_global_app() {
         let upgrade = script.find("upgrade --bump \"$@\"").expect("the roll");
         let report = script.find(MISE_STATE_MARKER).expect("the report");
         assert!(upgrade < report, "{script}");
+        // And one precedes it, so a move mise does not name can still be read off the two.
+        let before = script.find(MISE_BEFORE_MARKER).expect("the listing before");
+        assert!(before < upgrade, "{script}");
         assert!(script.contains("'/nix/store/mise/bin/mise' -C / ls --global --json"));
         // The tokens are data: positional, never in the script.
         assert!(!script.contains("rm -rf"));

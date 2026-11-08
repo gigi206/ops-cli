@@ -790,3 +790,56 @@ fn a_dry_run_counts_a_project_with_no_store_as_one_a_cage_would_seed() {
         project.path()
     ));
 }
+
+/// What the roll command prints for one tool around the upgrade, as mise 2026.10.17 answered in a
+/// cage: the listing before, what `mise upgrade --bump` said, then the report after.
+fn captured_roll(before: &str, said: &str, after: &str) -> String {
+    let ls = |version: &str| {
+        format!(
+            "{{\"node\": [{{\"version\": \"{version}\", \"requested_version\": \"lts\", \
+             \"installed\": true, \"active\": true}}]}}"
+        )
+    };
+    format!(
+        "{MISE_BEFORE_MARKER}\n{}\n{said}\n{MISE_STATE_MARKER}\n{{\"ls\":{}\n,\"outdated\":{{}}}}\n",
+        ls(before),
+        ls(after)
+    )
+}
+
+/// A tool declared by an alias (`node@lts`) is pinned back to the alias by `--bump`, so mise prints
+/// neither a move nor "up to date", whatever it did. The roll reported `upgraded` for it at every
+/// run, with no version, when nothing had moved; the listings around the upgrade say what did.
+#[test]
+fn a_roll_mise_does_not_describe_is_read_off_the_pool_listings() {
+    let said = "mise ✓ core:node@24.22.2  0ms\nmise ████ 1/1 · resolved 1 tools in 1ms";
+    let tokens = vec!["node@lts".to_string()];
+
+    let still = captured_roll("24.22.2", said, "24.22.2");
+    assert!(mise_transitions(&still).is_empty() && !mise_up_to_date(&still));
+    assert_eq!(
+        pool_moves(&still, &tokens),
+        Some(Vec::new()),
+        "nothing moved"
+    );
+
+    let moved = captured_roll("24.22.2", said, "24.23.0");
+    assert_eq!(
+        pool_moves(&moved, &tokens),
+        Some(vec!["node 24.22.2 → 24.23.0".to_string()]),
+        "the move is named in the shape mise's own lines take"
+    );
+    assert!(transition_regression(&pool_moves(&moved, &tokens).unwrap()[0]).is_none());
+}
+
+/// Output without the listing before, a roll command from before it was added or one cut short,
+/// says nothing about what moved, so the caller keeps what mise said.
+#[test]
+fn a_roll_without_both_listings_reports_no_moves() {
+    let tokens = vec!["node@lts".to_string()];
+    let after_only = format!(
+        "{MISE_STATE_MARKER}\n{{\"ls\":{{\"node\": [{{\"version\": \"24.22.2\", \"installed\": true}}]}}\n,\"outdated\":{{}}}}\n"
+    );
+    assert_eq!(pool_moves(&after_only, &tokens), None);
+    assert_eq!(pool_moves("no report at all", &tokens), None);
+}

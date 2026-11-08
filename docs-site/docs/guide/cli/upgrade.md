@@ -54,7 +54,9 @@ itself. Lock writes are atomic (a reader sees old-or-new, never torn).
   (host-side, under a `task pool` line), leaving `nixpkgs.lock` intact. A declared
   `mise:` package that is still not installed once the roll has run (its first install
   failed, say on an attestation host the egress allowlist refuses) fails its home with
-  mise's output, instead of being reported up to date.
+  mise's output, instead of being reported up to date. Each home's line gives the versions
+  it moved between, read from the pool before and after the roll where mise names no move
+  itself, as for a package declared by an alias (`mise:node@lts`).
 - `sbx upgrade provision` re-runs the bundle install steps, one cage per app, with
   `SBX_UPGRADE=1` so each step installs whatever its guard would have said. `all` runs
   the same steps without it, leaving each guard to decide, so an agent whose guard

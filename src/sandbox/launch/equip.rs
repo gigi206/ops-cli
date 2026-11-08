@@ -50,8 +50,9 @@ pub(super) fn equip_announcement(tokens: &[String]) -> String {
     )
 }
 
-/// The `mise upgrade <tokens>` command for one roll group, followed by the home's
-/// [`mise_ls_report`] closed with an empty `outdated`. The rolled tokens are the group's
+/// The `mise upgrade <tokens>` command for one roll group, preceded by the home's pool listing
+/// after [`MISE_BEFORE_MARKER`] and followed by its [`mise_ls_report`] closed with an empty
+/// `outdated`. The rolled tokens are the group's
 /// `[packages] mise:` tools, which for a **global app** live in the app-global home pool (Lane-1
 /// `mise use -g` pins them there). The cage's ambient primary for a global app is the *per-project*
 /// pool, which does not hold them, so a plain `mise upgrade` there would find nothing and silently
@@ -87,7 +88,8 @@ pub(super) fn mise_upgrade_cmd(
 ) -> Vec<OsString> {
     let mise = mise_outside_project(mise);
     let script = format!(
-        "set -e; {pin}{mise} upgrade {MISE_ROLL_FLAG} \"$@\"; {report}; printf '{{}}}}\\n'",
+        "set -e; {pin}printf '%s\\n' '{MISE_BEFORE_MARKER}'; {mise} ls --global --json; \
+         {mise} upgrade {MISE_ROLL_FLAG} \"$@\"; {report}; printf '{{}}}}\\n'",
         pin = mise_pool_pin(runtime),
         report = mise_ls_report(&mise),
     );
@@ -131,6 +133,13 @@ fn mise_ls_report(mise: &str) -> String {
          printf ',\"outdated\":'"
     )
 }
+
+/// The line [`mise_upgrade_cmd`] prints before the pool listing it takes ahead of the upgrade.
+///
+/// mise names a version move only when the move rewrites the config's pin. A tool declared by an
+/// alias (`node@lts`) is pinned back to the alias by `--bump`, so a move there prints nothing, and
+/// so does no move at all: the listing before and the one after are what tell the two apart.
+pub(super) const MISE_BEFORE_MARKER: &str = "@@sbx-mise-before@@";
 
 /// The line [`mise_state_cmd`] prints before its JSON document, so the reader finds the document
 /// whatever a wrap printed on stdout ahead of it.
