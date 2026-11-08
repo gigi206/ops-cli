@@ -1012,6 +1012,31 @@ impl Resolved {
         }
     }
 
+    /// `incoming` with the `shared_credential` groups of `outgoing` when it declares none of its
+    /// own, the posture an override lays over the resolved one.
+    ///
+    /// A group grants no reach: it only says which hosts are one service, so that a credential the
+    /// cage obtained on one of them is not refused as a leak on its way to another. A posture that
+    /// replaces the table without restating them, `--net allow` above all, left the leak tripwire
+    /// stricter than the configuration it replaced, and the app's own authenticated traffic was
+    /// refused under the posture meant to open the network. The rules are not carried: those are
+    /// what a replacing posture is for.
+    fn keep_shared_credential(outgoing: &NetworkPolicy, incoming: NetworkPolicy) -> NetworkPolicy {
+        match (outgoing, incoming) {
+            (NetworkPolicy::Allowlist(had), NetworkPolicy::Allowlist(gets))
+                if gets.shared_credential().is_empty() && !had.shared_credential().is_empty() =>
+            {
+                let groups = had
+                    .shared_credential()
+                    .iter()
+                    .map(|group| group.to_vec())
+                    .collect();
+                NetworkPolicy::Allowlist(Box::new(gets.with_shared_credential(groups)))
+            }
+            (_, incoming) => incoming,
+        }
+    }
+
     /// What a bare network posture is about to drop, or `None` when nothing is lost.
     ///
     /// A posture with no rules of its own replaces the whole table rather than merging into it, which
@@ -1337,7 +1362,7 @@ impl Resolved {
                         .push(override_replaced_deny_note(OVERRIDE_SOURCE, &dropped));
                 }
             }
-            self.network = policy;
+            self.network = Self::keep_shared_credential(&self.network, policy);
             self.network_origin = Provenance::Override;
         }
         if let Some(policy) = new_gui {
@@ -1449,7 +1474,7 @@ impl Resolved {
             self.warnings.append(&mut fs_notes);
             // `declares_nothing`, not `is_empty`: the latter asks whether there are mounts to lay
             // down, and a `scan`-only table lays down none — asking it here dropped the override
-            // entirely, so `--config '[fs] scan = [...]'` protected nothing.
+            // entirely, so `--config 'fs.scan = [...]'` protected nothing.
             if !over.declares_nothing() {
                 self.fs.union(over);
                 self.fs_origin = Provenance::Override;
@@ -1635,8 +1660,14 @@ fn build_override_scalars(
         // else — fail-closed in an `allow` list, which is where a one-shot reference belongs.
         // A `deny` entry that cannot be read is fatal here like an unknown mode: a one-shot
         // override must be exact, and one entry left out would leave its host reachable.
+        //
+        // A table naming no `mode` amends the policy below rather than replacing it, as a project's
+        // mode-less app overlay does: with no posture of its own it is an addition to one. Replaced,
+        // `--config 'network.capture = "bodies"'` (the documented way to watch an app's traffic)
+        // dropped every rule of the app it was meant to observe. A posture string, or a table
+        // that names a mode, is still a policy of its own and replaces.
         let mut unapplied = Vec::new();
-        match validate_network(
+        match validate_network_amending(
             notes,
             &mut unapplied,
             OVERRIDE_SOURCE,

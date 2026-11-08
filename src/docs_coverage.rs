@@ -1916,3 +1916,88 @@ fn a_doc_line_without_its_space_is_still_text() {
         ["x.rs:1  A first paragraph."]
     );
 }
+
+/// Where a line offers a one-shot config blob that opens with a table header and goes on with a key
+/// on the same line, `'[network] capture = "bodies"'`: the byte offset of each blob. Every flag that
+/// takes a blob is matched, `--config` and the `SBX_CONFIG=` variable, quoted either way and with
+/// the quote escaped, as a Rust literal writes it.
+///
+/// TOML ends a table header at the line, so such a blob is refused at the launch with a parse error
+/// on the key. Its dotted form (`'network.capture = "bodies"'`) says the same in one line.
+fn one_line_table_blobs(text: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for flag in ["--config", "SBX_CONFIG="] {
+        for (at, _) in text.match_indices(flag) {
+            let rest = text[at + flag.len()..].trim_start_matches([' ', '\t']);
+            let rest = rest.strip_prefix('\\').unwrap_or(rest);
+            let Some(rest) = rest.strip_prefix(['\'', '"']) else {
+                continue;
+            };
+            let Some(rest) = rest.strip_prefix('[') else {
+                continue;
+            };
+            let name_len = rest
+                .find(|c: char| !(c.is_ascii_lowercase() || c == '_' || c == '.'))
+                .unwrap_or(rest.len());
+            let rest = &rest[name_len..];
+            if name_len > 0
+                && rest
+                    .strip_prefix(']')
+                    .and_then(|r| r.strip_prefix([' ', '\t']))
+                    .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_alphabetic()))
+            {
+                out.push(at);
+            }
+        }
+    }
+    out
+}
+
+/// What a reader is told to type must run. Three messages sbx printed and four guide pages offered a
+/// `--config` blob that opened the `[network]` table and set `capture` on the same line, which the
+/// launch refuses with a TOML parse error, and the one-line form is the natural one to write next
+/// to the ones already there.
+#[test]
+fn no_one_shot_blob_offered_to_a_reader_opens_a_table_on_its_own_line() {
+    let mut found = Vec::new();
+    let sources = crate::testutil::crate_sources()
+        .into_iter()
+        .filter_map(|path| Some((path.clone(), crate::testutil::read_listed(&path)?)));
+    for (path, text) in guide_pages().into_iter().chain(sources) {
+        for at in one_line_table_blobs(&text) {
+            let line = text[..at].lines().count().max(1);
+            found.push(format!("{}:{line}", path.display()));
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "a blob opening a table header on one line is refused at the launch; write the key \
+         dotted (`network.capture = …`) instead: {found:?}"
+    );
+}
+
+/// Each spelling the guard reads, and what it leaves alone. Built with `format!` so this file does
+/// not itself carry the shape the guard above sweeps for.
+#[test]
+fn a_one_line_table_blob_is_found_in_each_spelling() {
+    let header = |table: &str| format!("[{table}]");
+    for blob in [
+        format!(
+            "sbx run --config '{} capture = \"bodies\"'",
+            header("network")
+        ),
+        format!("--config \"{} deny = []\"", header("fs")),
+        format!("`--config \\'{} capture = 1\\'`", header("network")),
+        format!("SBX_CONFIG='{} mode = \"ask\"'", header("proc")),
+    ] {
+        assert_eq!(one_line_table_blobs(&blob).len(), 1, "{blob}");
+    }
+    for fine in [
+        "sbx run --config 'network.capture = \"bodies\"'".to_string(),
+        format!("--config '{}\\ncapture = 1'", header("network")),
+        "--config @extra.toml".to_string(),
+        format!("a `{} capture` key", header("network")),
+    ] {
+        assert!(one_line_table_blobs(&fine).is_empty(), "{fine}");
+    }
+}

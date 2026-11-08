@@ -56,7 +56,7 @@ impl FsPolicy {
     ///
     /// It differs from [`FsPolicy::is_empty`] exactly on the fields that close a file without a
     /// mount, and the difference is load-bearing. Measured on the shipped binary when the override
-    /// plane asked the mount question instead of this one: `--config '[fs] scan = [...]'` protected
+    /// plane asked the mount question instead of this one: `--config 'fs.scan = [...]'` protected
     /// nothing at all, while the same table written in a `.sbx.toml` refused the file, and adding an
     /// unrelated `deny` to the same blob made the scan work again. The warnings fired on both
     /// planes, so the table looked wired while the launch saw none of it.

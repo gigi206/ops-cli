@@ -168,7 +168,7 @@ The one-shot **allow/deny lists** are not on this flag: set them in a `--config`
 table (`sbx run --config '[proc]\nmode="enforce"\ndeny=["curl"]' -- …`), or add them live to a
 running session with [`sbx proc allow`/`deny --session`](proc). A bare `--proc <mode>` **replaces
 the whole policy** (mode *and* any lists), so put the mode and its lists **together in one `--config`
-blob**: do **not** split them across `--proc enforce` + `--config '[proc] deny=[…]'`, as the typed
+blob**: do **not** split them across `--proc enforce` + `--config 'proc.deny=[…]'`, as the typed
 `--proc` beats the blob wholesale and would silently discard the deny list (leaving you with
 enforce-*nothing*, a fail-open).
 
@@ -199,7 +199,7 @@ does not silently remove the spacing that made them bearable.
 
 Within the override itself the ordinary rule still applies: the typed flag replaces a `--config`
 blob's `[notify]` table wholesale, period included. So do **not** split one intent across
-`--notify always` + `--config '[notify] repeat_after=…'`; put both in the blob.
+`--notify always` + `--config 'notify.repeat_after=…'`; put both in the blob.
 
 #### The `--net` posture
 
@@ -219,8 +219,29 @@ A bare posture **replaces the whole `network` field**, its lists included, exact
 project's curated allowlist for the run: it discards it and leaves the filtering
 default, which reaches only the [built-in self-equip
 set](../networking/modes#the-built-in-self-equip-set). Bare `ask` likewise carries no
-`ask_timeout`, so a parked request waits **indefinitely**. To keep or add rules, and to
-bound `ask`, put the mode and its table together in one `--config` blob.
+`ask_timeout`, so a parked request waits **indefinitely**. To bound `ask`, put the mode and
+its table together in one `--config` blob.
+
+What a replacing posture keeps is the
+[`shared_credential`](network#hosts-that-are-one-service-shared_credential) groups, when it
+declares none of its own. A group opens no host; it only says which hosts are one service,
+so that the credential an app signed in with is not refused as a leak on its way to another
+of them. Dropped, the leak tripwire under `--net allow` was stricter than under the
+configuration it replaced, and an app's own authenticated traffic was refused.
+
+To add to the configured policy rather than replace it, give `--config` a `[network]` table
+that names **no `mode`**. It amends the policy below, as a project's mode-less
+[app overlay](network#the-one-table-that-amends-a-mode-less-app-overlay) does: its lists are appended, and a setting it leaves out keeps
+the configured value. This is the one-launch way to watch an app's traffic without changing
+what it may reach:
+
+```sh
+sbx app run my-app --config 'network.capture = "headers"'
+```
+
+Combined with a typed `--net`, the table is gone again: the flag is the higher tier and
+replaces the blob's `network` whole, the rule `[notify]` follows above. Put the mode in the
+blob instead (`network.mode = "allow"`).
 
 sbx says so at the launch that does it, counting what goes:
 
@@ -234,8 +255,8 @@ rules of its own says nothing. Without it the first symptom was a refusal naming
 app's own rules had covered, which reads as a fault in the app instead of the consequence of the
 flag just typed.
 
-A value that brings rules of its own, a list shorthand below or a `--config` blob with its own
-table, is a deliberate swap rather than a silent loss, so its lists go unremarked, except the
+A value that brings rules of its own, a list shorthand below or a `--config` blob whose table
+names a `mode`, is a deliberate swap rather than a silent loss, so its lists go unremarked, except the
 `deny` rules it leaves behind: each is a host the configuration closed and this launch may
 reach, so each is named, as a config layer's replacing table names them. With
 `deny = ["tracker.example.com"]` in the configuration and `--net deny=ads.example.com`:
@@ -341,10 +362,10 @@ stops being published: an override moves a forward, it never closes one. See
 
 `[fs]` is the one collection where the union is not just a merge convention but the whole
 guarantee: an override can close *more* of the project for one launch
-(`--config '[fs] deny = ["scratch.key"]'`), and there is no spelling that reopens what a
+(`--config 'fs.deny = ["scratch.key"]'`), and there is no spelling that reopens what a
 config layer closed. Its `scan_max_kb` ceiling folds the same way between override tiers:
 the larger window wins. `git_writable` is a setting rather than a list: the higher tier
-decides when it says anything, so `--config '[fs] git_writable = true'` lets one launch
+decides when it says anything, so `--config 'fs.git_writable = true'` lets one launch
 write `.git/hooks/` and `.git/config`, which the cage otherwise gets read-only.
 
 ## Fail-closed on an invalid value

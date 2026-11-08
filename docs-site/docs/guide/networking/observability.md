@@ -337,7 +337,7 @@ the `[network]` table: an untrusted project's `.sbx.toml` cannot start capturing
 own traffic. For a one-off debugging run, turn it on for that launch only:
 
 ```bash
-sbx run --config '[network] capture = "bodies"'
+sbx run --config 'network.capture = "bodies"'
 sbx net logs --with-body --follow    # from another terminal
 ```
 

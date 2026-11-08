@@ -1368,7 +1368,7 @@ fn split_hosts(hosts: &str, label: &str, kind: &str) -> Result<Vec<String>, Stri
         return Err(format!(
             "{label}: a `re:` pattern containing a comma cannot go through `{kind}=` — the value is \
              split on commas, which cut `{hosts}` into fragments that are no longer a valid \
-             pattern. Pass it as config instead: `--config '[network] {kind} = [\"re:…\"]'` (a \
+             pattern. Pass it as config instead: `--config 'network.{kind} = [\"re:…\"]'` (a \
              comma-free regex is fine here, e.g. `{kind}=re:.*`)"
         ));
     }

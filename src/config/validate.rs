@@ -1066,10 +1066,15 @@ pub(super) fn validate_network_table(
             // to the layer below when it names none. Written as guards rather than folded into
             // `amended_with` because both are `Option`/empty-shaped rather than plain lists.
             if !http2.is_empty() {
-                p = p.with_http2(http2);
+                let mut hosts = p.http2_hosts().to_vec();
+                hosts.extend(http2);
+                p = p.with_http2(hosts);
             }
             if !shared_credential.is_empty() {
-                p = p.with_shared_credential(shared_credential);
+                let mut groups: Vec<Vec<String>> =
+                    p.shared_credential().iter().map(|g| g.to_vec()).collect();
+                groups.extend(shared_credential);
+                p = p.with_shared_credential(groups);
             }
             // Appended to the layer below's, as the rules they reserve are.
             p.with_reserved(reserved)

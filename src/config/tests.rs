@@ -10030,9 +10030,10 @@ fn an_override_reference_to_an_undefined_group_is_dropped_with_a_warning() {
     );
 }
 
-/// The one-shot plane rebuilds the policy exactly as a config layer does, so it gives up the same
-/// settings — and says so under its own source label. It is the plane where a reader is least
-/// likely to expect it: `--config '[network] allow=[…]'` reads as adding one rule for one launch.
+/// A one-shot table that names a `mode` rebuilds the policy exactly as a config layer does, so it
+/// gives up the same settings, and says so under its own source label. It is the plane where a
+/// reader is least likely to expect it, since the same table without its `mode` adds to the
+/// policy instead.
 #[test]
 fn a_one_shot_override_says_what_its_network_table_gives_up() {
     let table = |capture: Option<&str>, allow: &[&str]| {
@@ -10080,6 +10081,126 @@ fn a_one_shot_override_says_what_its_network_table_gives_up() {
         said.contains("setting it carried does not apply here: `capture`"),
         "{said}"
     );
+}
+
+/// The configuration the two override tests below lay a one-shot `network` over: a filtering
+/// policy with two rules of its own and a group of hosts that are one service.
+fn a_policy_with_rules_and_a_shared_credential_group() -> Resolved {
+    let base: RawConfig = toml::from_str(
+        "[network]\nmode = \"deny\"\nallow = [\"app.example.test\", \"api.example.test\"]\n\
+         shared_credential = [[\"app.example.test\", \"api.example.test\"]]\n",
+    )
+    .expect("the base parses");
+    resolve_no_plugins(base, None)
+}
+
+/// `--config 'network.capture = "headers"'` is the documented way to watch an app's traffic for
+/// one launch. Read as a policy of its own, that table replaced the configured one and dropped
+/// every rule and group of the app it was meant to observe, so the app under observation was not
+/// the app at all. A table with no `mode` amends instead.
+#[test]
+fn a_mode_less_one_shot_network_table_adds_to_the_policy_rather_than_replacing_it() {
+    let applied = with_override(
+        a_policy_with_rules_and_a_shared_credential_group(),
+        toml::from_str("network.capture = \"headers\"\n").expect("the override parses"),
+    );
+    let NetworkPolicy::Allowlist(policy) = &applied.network else {
+        panic!("still a filtering posture: {:?}", applied.network);
+    };
+    assert_eq!(
+        policy.capture_level(),
+        crate::sandbox::control::CaptureLevel::Headers,
+        "the override's own setting applies"
+    );
+    assert_eq!(
+        policy.allow_rules().iter().filter(|r| !r.builtin).count(),
+        2,
+        "the configured rules stay: {:?}",
+        policy.allow_rules()
+    );
+    assert!(
+        !policy.shared_credential().is_empty(),
+        "the configured group stays"
+    );
+    assert!(
+        !applied
+            .warnings
+            .iter()
+            .any(|w| w.contains("replaces the whole") || w.contains("replaces the layer below")),
+        "nothing is replaced, so nothing is reported dropped: {:?}",
+        applied.warnings
+    );
+}
+
+/// A table that amends adds its lists to the ones below, the groups and `http2` hosts included.
+/// Those two were set rather than extended, so a layer naming one group of its own dropped the
+/// groups of the bundle it was laid over, and the app's sign-in broke at its next request.
+#[test]
+fn an_amending_network_table_adds_its_groups_and_http2_hosts_to_the_ones_below() {
+    let base: RawConfig = toml::from_str(
+        "[network]\nmode = \"deny\"\nhttp2 = [\"grpc.example.test\"]\n\
+         shared_credential = [[\"app.example.test\", \"api.example.test\"]]\n",
+    )
+    .expect("the base parses");
+    let applied = with_override(
+        resolve_no_plugins(base, None),
+        toml::from_str(
+            "[network]\nhttp2 = [\"rpc.other.test\"]\n\
+             shared_credential = [[\"one.other.test\", \"two.other.test\"]]\n",
+        )
+        .expect("the override parses"),
+    );
+    let NetworkPolicy::Allowlist(policy) = &applied.network else {
+        panic!("still a filtering posture: {:?}", applied.network);
+    };
+    for host in ["app.example.test", "one.other.test"] {
+        assert!(
+            policy
+                .shared_credential()
+                .iter()
+                .any(|group| group.iter().any(|h| h == host)),
+            "the group naming {host} is kept: {:?}",
+            policy.shared_credential()
+        );
+    }
+    assert_eq!(
+        policy.http2_hosts().len(),
+        2,
+        "both layers' h2 hosts: {:?}",
+        policy.http2_hosts()
+    );
+}
+
+/// A posture that replaces the table keeps the `shared_credential` groups when it declares none.
+/// A group opens no host. Dropped, the leak tripwire under `--net allow` refused an app's own
+/// session token on its way between the hosts of one service, which the configuration it replaced
+/// let through: the posture meant to open the network broke the sign-in.
+#[test]
+fn a_replacing_one_shot_posture_keeps_the_shared_credential_groups() {
+    for (spelling, text) in [
+        ("--net allow", "network = \"allow\"\n"),
+        ("a mode-only table", "network.mode = \"allow\"\n"),
+        (
+            "a rule list",
+            "[network]\nmode = \"deny\"\nallow = [\"other.example.test\"]\n",
+        ),
+    ] {
+        let applied = with_override(
+            a_policy_with_rules_and_a_shared_credential_group(),
+            toml::from_str(text).expect("the override parses"),
+        );
+        let NetworkPolicy::Allowlist(policy) = &applied.network else {
+            panic!("{spelling}: a filtering posture: {:?}", applied.network);
+        };
+        assert!(
+            policy
+                .shared_credential()
+                .iter()
+                .any(|group| group.iter().any(|h| h == "app.example.test")),
+            "{spelling}: the group survives the replacement: {:?}",
+            policy.shared_credential()
+        );
+    }
 }
 
 #[test]
@@ -14283,9 +14404,10 @@ fn a_bare_posture_names_the_table_it_drops_and_stays_quiet_when_it_drops_nothing
 /// A one-shot override that brings rules of its own replaces the configuration's for the launch,
 /// and a `deny` rule it drops opens a host the configuration closed: each is named, against the
 /// override, with `--config` as the way to keep it, since `--net` carries one list at a time. That
-/// holds for a list shorthand's table and for a blob's, with a `mode` or without one. A bare
-/// posture is left to its own count, which already says the `deny` went. A rule the override
-/// restates is not named, nor anything under `none`, where nothing reaches.
+/// holds for a list shorthand's table and for a blob's that names a `mode`; a blob's table without
+/// one amends the policy and drops nothing. A bare posture is left to its own count, which already
+/// says the `deny` went. A rule the override restates is not named, nor anything under `none`,
+/// where nothing reaches.
 #[test]
 fn a_deny_rule_a_one_shot_override_with_rules_of_its_own_drops_is_named() {
     let parse = |text: &str| schema::parse(text.as_bytes()).expect("the config parses");
@@ -14308,7 +14430,6 @@ fn a_deny_rule_a_one_shot_override_with_rules_of_its_own_drops_is_named() {
     for blob in [
         "[network]\nmode = \"deny\"\nallow = [\"*.example.com\"]\n",
         "[network]\nmode = \"allow\"\ndeny = [\"ads.example.com\"]\n",
-        "[network]\nallow = [\"*.example.com\"]\n",
     ] {
         let r = over(blob);
         let said = named(&r);
@@ -14327,6 +14448,7 @@ fn a_deny_rule_a_one_shot_override_with_rules_of_its_own_drops_is_named() {
 
     for blob in [
         "[network]\nmode = \"allow\"\ndeny = [\"tracker.example.com\", \"ads.example.com\"]\n",
+        "[network]\nallow = [\"*.example.com\"]\n",
         "network = \"none\"\n",
     ] {
         let r = over(blob);

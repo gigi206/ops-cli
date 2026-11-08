@@ -139,7 +139,7 @@ For a one-off debugging run, prefer the one-shot override, which needs no file e
 is trusted by invocation:
 
 ```bash
-sbx run --config '[network] capture = "bodies"'
+sbx run --config 'network.capture = "bodies"'
 ```
 
 Every inspected path is captured: HTTPS, inspected cleartext,
@@ -710,6 +710,10 @@ This is why `sbx net allow|deny|mute --app <name> --local` writes a mode-less ta
 you add joins the app's own rules instead of standing in for them. It is also why `deny` and
 `mute` are accepted there even though they are refused where no posture exists at all: an app
 that inherits a filtering posture has something to tighten and something to suppress.
+
+A one-shot `--config` blob whose `[network]` table names no `mode` amends the same way, for one
+launch: `--config 'network.capture = "headers"'` watches an app's traffic under the rules it
+already has. See [One-shot overrides](overrides#the---net-posture).
 
 Every other layered table composes instead of replacing: [`[limits]`](limits) merges field by
 field, [`[fs]`](fs), [`forward`](../networking/forward), [`[devices]`](devices), [`[seccomp]`](seccomp)

@@ -3395,7 +3395,7 @@ pub(super) const PAGES: &[Page] = &[
             `--with-body` the leading bytes of each body. It prints as an indented block under the\n\
             event line, `>` for what the cage sent and `<` for what came back. Nothing is shown for\n\
             a session that does not capture; turn it on for one launch with\n\
-            `sbx run --config \'[network] capture = \"bodies\"\'`, or in a trusted config file.\n\
+            `sbx run --config \'network.capture = \"bodies\"\'`, or in a trusted config file.\n\
             \n\
             What a capture never contains: any configured secret (every value is masked before the\n\
             bytes are stored) and any credential sbx injects (the head recorded is the client\'s own,\n\

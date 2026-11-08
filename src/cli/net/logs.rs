@@ -749,7 +749,7 @@ fn render_logs(
                 o,
                 "    {dim}(no captured traffic here — either this session is not capturing (set \
                  `[network] capture = \"bodies\"`, or launch with \
-                 `--config '[network] capture = \"bodies\"'`), or nothing it did carried any: a \
+                 `--config 'network.capture = \"bodies\"'`), or nothing it did carried any: a \
                  refused request and a `tcp://` splice never do){r}"
             );
         }

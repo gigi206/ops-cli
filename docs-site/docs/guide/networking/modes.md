@@ -261,7 +261,7 @@ Two practical notes on the catch-all form:
 
 - `--net allow=…` splits its value on **commas**, so a regex containing one (a
   `{n,m}` quantifier, an alternation list) must go through
-  `--config '[network] allow = ["re:…"]'` instead. You do not have to remember it:
+  `--config 'network.allow = ["re:…"]'` instead. You do not have to remember it:
   a value whose split would break a `re:` pattern is refused whole, naming the cure.
   A comma-free regex (`--net 'allow=re:.*'`) and a list mixing hosts with an intact
   pattern (`--net 'allow=github.com,re:^https://api\.'`) are unaffected.
