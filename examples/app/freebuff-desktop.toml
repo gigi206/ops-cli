@@ -155,14 +155,19 @@ use = ["freebuff-desktop"]
 # a tool calling `xdg-open` and an Electron app calling the portal under `dbus = true` — and sbx
 # freezes the routing, so nothing running in the cage can answer a sign-in link in its place.
 #
-# The hand-written wrapper this replaces also had a catch-all branch handing every OTHER scheme to
-# `freebuff`. It was speculative: the registered handler only ever claimed http/https, so the portal
-# never used it. If FreeBuff answers a scheme of its own, declare it here as one more key.
+# `freebuff` is the app's own scheme. Once the sign-in completes, the page offers
+# `freebuff://auth/complete`; the app carries no token in it and only brings its window back to the
+# front, the sign-in itself having already landed through the polling. Without this key the browser
+# finds no handler and shows an empty "Open With…" dialog. The command starts a second `freebuff`,
+# which hands its arguments to the running instance and exits. It repeats the launch flags, because
+# a second instance started without `--no-sandbox` dies on Chromium's setuid sandbox check before it
+# can pass anything on.
 #
 # Must stay below every top-level key: written above one, TOML would fold that key into this table.
 [open]
 http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
 https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
+freebuff = ["freebuff", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=gnome-libsecret"]
 
 [network]
 # EGRESS — the filtering allowlist WORKS for Freebuff (its Bun orchestrator honors the proxy sbx sets:

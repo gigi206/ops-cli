@@ -2600,3 +2600,77 @@ fn the_claude_desktop_policy_lets_the_login_pages_captcha_complete() {
         );
     }
 }
+
+/// Freebuff's login page runs Cloudflare Turnstile and Google reCAPTCHA before it accepts a
+/// sign-in. Refused, the check never completes, the page stops short of the device-code approval
+/// the app polls for, and the app stays signed out. Turnstile serves its interactive widget from a
+/// subdomain, and reCAPTCHA posts its answer back under its own path on `www.google.com`, which the
+/// shared Google sign-in lane opens to reads only.
+#[test]
+fn the_freebuff_desktop_policy_lets_the_login_pages_human_checks_complete() {
+    let policies = shipped_egress_policies();
+    let (_, policy) = policies
+        .iter()
+        .find(|(name, _)| name == "freebuff-desktop")
+        .expect("freebuff-desktop is a shipped app");
+    let allowed = |host: &str, path: &str, method: &str| {
+        matches!(
+            policy.explain(host, 443, path, method),
+            crate::allowlist::Decision::AllowedBy(_)
+        )
+    };
+    for (host, path, method) in [
+        (
+            "challenges.cloudflare.com",
+            "/cdn-cgi/challenge-platform/h/b/turnstile/x",
+            "GET",
+        ),
+        (
+            "challenges.cloudflare.com",
+            "/cdn-cgi/challenge-platform/h/b/fo/x",
+            "POST",
+        ),
+        (
+            "hagen.challenges.cloudflare.com",
+            "/cdn-cgi/challenge-platform/h/b/i/x",
+            "GET",
+        ),
+        ("www.google.com", "/recaptcha/api2/reload", "POST"),
+        ("www.google.com", "/recaptcha/api2/clr", "POST"),
+    ] {
+        assert!(
+            allowed(host, path, method),
+            "the login page's check sends {method} {host}{path}"
+        );
+    }
+}
+
+/// Once the sign-in completes, the page hands the browser `freebuff://auth/complete`, which brings
+/// the app's window back. With no `freebuff` route the in-cage browser finds no handler and shows an
+/// empty "Open With…" dialog. The route starts a second instance to relay the link, and that
+/// instance dies on Chromium's setuid sandbox check unless it carries `--no-sandbox` too.
+#[test]
+fn the_freebuff_desktop_profile_routes_its_sign_in_return_link_to_the_app() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/app/freebuff-desktop.toml");
+    let app = schema::parse_app(&std::fs::read(&path).expect("read the profile"))
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let argv = match app.open.get("freebuff") {
+        Some(schema::RawOpen::Argv(cmd)) => cmd.clone().into_argv(),
+        Some(schema::RawOpen::Detailed(table)) => table
+            .cmd
+            .clone()
+            .map(schema::RawCmd::into_argv)
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    assert_eq!(
+        argv.first().map(String::as_str),
+        Some("freebuff"),
+        "`freebuff://` must open the app itself: {argv:?}"
+    );
+    assert!(
+        argv.iter().any(|arg| arg == "--no-sandbox"),
+        "the relaying instance needs `--no-sandbox`: {argv:?}"
+    );
+}

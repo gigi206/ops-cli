@@ -44,6 +44,13 @@ allow = [
     # Freebuff's own site/API (login landing, update checks) — its vendor domain, not a third party.
     "{*} https://freebuff.com",
     "{*} https://www.freebuff.com",
+    # The human checks the login page runs before it accepts a sign-in: Cloudflare Turnstile, whose
+    # interactive widget is served from a subdomain of the same host (the apex and its subdomains
+    # are opened together), and Google reCAPTCHA, whose widget POSTs back to its own path. Without
+    # them the check never completes and the page stops short of the device-code approval the app
+    # is polling for.
+    "{*} https://*.challenges.cloudflare.com",
+    "{*} https://www.google.com/recaptcha/*",
     # Runtime npm fetches — the Bun orchestrator/SDK pulls packages (agent CLIs, plugins) at runtime.
     "@npm-runtime",
     # GitHub account sign-in and forge access. sbx's built-in set already reads github.com and
