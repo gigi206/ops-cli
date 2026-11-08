@@ -413,7 +413,7 @@ The 69 shipped bundles, and what each carries:
 | `stakpak` | 1 (`mise:`) | 5 egress entries | `models-catalog` |
 | `trae` | 2 (`nix:`) | 2 egress entries, an install step | `github`, `pypi` |
 | `traycer` | 2 (`mise:`, `nix:`) | 8 egress entries | `github-install`, `npm-audit`, `npm-jsr`, `npm-registry` |
-| `traycer-desktop` | 1 (`deb:`) | 7 egress entries, a `deb:` resolver | `chromium-spellcheck`, `github-install` |
+| `traycer-desktop` | 2 (`deb:`, `nix:`) | 11 egress entries, 1 env var, a `deb:` resolver | `chromium-background`, `chromium-spellcheck`, `github-install` |
 | `vibe` | 4 (`mise:`, `nix:`) | 13 egress entries | `chromium-background`, `chromium-spellcheck`, `google-signin-incage`, `pypi` |
 | `vtcode` | 3 (`mise:`, `nix:`) | none | none |
 | `warp` | 1 (`tarball:`) | 6 egress entries, a `tarball:` resolver | none |

@@ -1564,6 +1564,115 @@ fn the_reasonix_desktop_command_names_the_service_its_package_ships() {
     );
 }
 
+/// The Traycer host runs in the cage beside the shell, because the CLI would install it as a
+/// `systemd --user` service and a cage has no user session: the shell's attempt ended on "the systemd
+/// user manager is not reachable" and the host never started. Runs the SHIPPED service against a
+/// stand-in package whose CLI records its arguments. Its first install has to accept the store-format
+/// loss, which the CLI otherwise refuses without a service manager to consult, and that is sound
+/// only while no host was ever installed: a later start must not pass the flag again.
+#[test]
+fn the_traycer_desktop_host_runs_in_the_cage_and_accepts_a_loss_only_on_a_first_install() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/app/traycer-desktop.toml");
+    let raw = schema::parse_app(&std::fs::read(&path).expect("read the profile")).unwrap();
+    let argv = match raw.service.get("host") {
+        Some(schema::RawService::Argv(cmd)) => cmd.clone().into_argv(),
+        Some(schema::RawService::Detailed(table)) => table
+            .cmd
+            .clone()
+            .map(schema::RawCmd::into_argv)
+            .unwrap_or_default(),
+        None => panic!("the profile declares no `host` service"),
+    };
+    let script = shell_command_string(&argv).expect("the service is a shell script");
+
+    let tmp = TmpDir::new();
+    let pkg = tmp.path().join("pkg");
+    let home = tmp.path().join("home");
+    let cli_dir = pkg.join("opt/Traycer/resources/cli/linux-x64");
+    std::fs::create_dir_all(pkg.join("bin")).unwrap();
+    std::fs::create_dir_all(&cli_dir).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let executable = |path: &std::path::Path, body: &str| {
+        std::fs::write(
+            path,
+            format!("#!{}\n{body}", program_on_path("bash").display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+    };
+    executable(&pkg.join("bin/traycer-desktop"), "exit 0\n");
+    executable(
+        &cli_dir.join("traycer"),
+        "printf '%s\\n' \"$*\" >> \"$HOME/calls\"\n\
+         if [ \"$1 $2\" = 'host install' ]; then mkdir -p \"$HOME/.traycer/host/install\"; fi\n",
+    );
+    let run = || {
+        let out = crate::testutil::run_within(
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(script)
+                .env("HOME", &home)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        pkg.join("bin").display(),
+                        std::env::var("PATH").expect("the test runner has a PATH")
+                    ),
+                )
+                .stdin(std::process::Stdio::null()),
+            "the shipped service",
+        );
+        assert!(
+            out.status.success(),
+            "the service failed ({}): {}{}",
+            out.status,
+            out.stdout,
+            out.stderr
+        );
+        std::fs::read_to_string(home.join("calls")).unwrap_or_default()
+    };
+
+    assert_eq!(
+        run(),
+        "host install --no-service-register --accept-store-format-loss\nhost start\n",
+        "a first launch installs the host without a service, then runs it in the foreground"
+    );
+    std::fs::remove_file(home.join("calls")).unwrap();
+    assert_eq!(
+        run(),
+        "host start\n",
+        "once a host is installed, it is started as installed and no loss is accepted again"
+    );
+}
+
+/// The CLI the shell spawns is a Bun binary that trusts the cage's proxy only through Node's CA
+/// variables, and Electron removes `NODE_EXTRA_CA_CERTS` from its children's environment: every
+/// registry read then failed with `E_REGISTRY_UNAVAILABLE`. The variable Electron passes through
+/// must ride the bundle.
+#[test]
+fn the_traycer_desktop_bundle_points_the_spawned_cli_at_the_cage_store() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/bundle/traycer-desktop.toml");
+    let bundle = shipped_bundle(&path);
+    assert_eq!(
+        bundle.env.get("NODE_USE_SYSTEM_CA").map(String::as_str),
+        Some("1"),
+        "the spawned CLI needs `NODE_USE_SYSTEM_CA`: {:?}",
+        bundle.env
+    );
+    assert!(
+        bundle
+            .allow
+            .iter()
+            .any(|entry| entry == "tcp://authn.traycer.ai:443"),
+        "the shell's own sign-in fetch needs the raw splice: {:?}",
+        bundle.allow
+    );
+}
+
 /// `name`, as an absolute path, found the way a launch finds a program: by walking `PATH`.
 ///
 /// The step below is run with a `PATH` of this fixture's own making, and a program named without a

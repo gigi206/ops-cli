@@ -32,9 +32,10 @@
 # the NSS database Chromium would otherwise read.
 #
 # CREDENTIAL POSTURE — an account, reached by a device login. The shell asks `authn.traycer.ai` for
-# a device code and shows a short code with `app.traycer.ai/device` to approve in a browser. In a
-# cage with no browser of its own, approve it on the host: the flow is entirely outbound, so nothing
-# has to listen inside. The session persists in this app's isolated `$HOME`.
+# a device code and shows a short code with `app.traycer.ai/device` to approve in a browser. "Open
+# approval page" opens it in the in-cage Chromium the bundle carries, through the `[open]` table
+# below, so the approval happens behind the same egress allowlist; the flow is entirely outbound,
+# so nothing has to listen inside. The session persists in this app's isolated `$HOME`.
 #
 # EGRESS — honest scope. The hosts in the bundle are GROUNDED, read out of Traycer's own published
 # source (`authnBaseUrl`, `cloudUiBaseUrl`, the preconnect list, and the GitHub trio the bundled CLI
@@ -92,6 +93,32 @@ dbus = true
 use = ["traycer-desktop"]
 
 # No `[packages]` here: what the bundle installs comes from it — see `use` above.
+
+# The Traycer host, run in the cage beside the shell. Its CLI installs the host as a `systemd --user`
+# service, and a cage has no user session to register one with: the shell's own attempt ends on
+# "the systemd user manager is not reachable" and the host never starts. Reaching the session from
+# here would run the host outside the cage, so the host runs inside it instead, in the foreground,
+# where the shell finds it on the loopback.
+#
+# The first install goes through the same CLI without a service (`--no-service-register`). Its
+# store-format check still asks the service manager whether a host could start during the swap, and
+# with none to ask it refuses unless the possible loss of chat stores is accepted. The flag is passed
+# only while no host has ever been installed in this home, when there is no chat store to lose; once
+# one is, the host is started as installed, and an update is the shell's to offer.
+[service.host]
+cmd = [
+    "bash",
+    "-c",
+    # One line: a service's argument may carry no control character, a newline included.
+    'cli="$(dirname "$(dirname "$(readlink -f "$(command -v traycer-desktop)")")")/opt/Traycer/resources/cli/linux-x64/traycer"; if [ ! -d "$HOME/.traycer/host/install" ]; then "$cli" host install --no-service-register --accept-store-format-loss || exit 1; fi; exec "$cli" host start',
+]
+
+# Where a link opens: web links go to the in-cage Chromium, so the device-login approval page opens
+# in the cage rather than nowhere. Must stay below every top-level key: written above one, TOML
+# would fold that key into this table.
+[open]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--no-first-run", "--no-default-browser-check"]
 
 [network]
 mode = "deny"
