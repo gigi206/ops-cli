@@ -12,6 +12,7 @@
 # requirements silently falls behind the app.
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-background.toml
 #     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #     sbx net groups import examples/net-groups/github-install.toml
 #
