@@ -79,8 +79,12 @@ fn an_image_missing_what_a_userland_supplies_is_refused_by_name() {
         .expect_err("an image without bash or a loader cannot host a cage");
     let message = err.to_string();
     // Every missing path, not the first: a user fixing them one launch at a time learns the list
-    // one entry at a time.
-    for path in ["/bin/bash", "/usr/bin/env", "/lib64/ld-linux-x86-64.so.2"] {
+    // one entry at a time. Read off the list a distribution has to supply, so a path added to it
+    // is held to the same rule.
+    for path in crate::sandbox::binds::DISTRO_SUPPLIED {
+        if *path == "/bin/sh" {
+            continue;
+        }
         assert!(
             message.contains(path),
             "`{path}` is not named in `{message}`"
@@ -211,6 +215,43 @@ fn a_launch_leaves_a_lock_that_moved_while_it_provisioned() {
     assert_eq!(
         crate::store::read_lock_lines(&lock).unwrap(),
         Some((locator.to_string(), Some(newest)))
+    );
+}
+
+/// The two answers `pin_unless_moved` gives that the race above does not reach. A lock that moved
+/// to exactly what this launch provisioned is already its pin, and is neither a race to report nor
+/// a write to make. A lock unchanged since the read but naming another image, as after the project
+/// switched images, is this launch's to rewrite.
+#[test]
+fn a_lock_already_on_what_was_provisioned_is_kept_and_one_for_another_image_is_rewritten() {
+    let tmp = crate::testutil::TmpDir::new();
+    let lock = tmp.join("distro.lock");
+    let locator = "oci:docker.io/library/debian:12";
+    let older = format!("sha256:{}", "a".repeat(64));
+    let newer = format!("sha256:{}", "b".repeat(64));
+
+    crate::store::write_lock(&lock, locator, &older).unwrap();
+    let read = crate::store::read_lock_lines(&lock).unwrap();
+    // Another writer pins what this launch provisioned meanwhile.
+    crate::store::write_lock(&lock, locator, &newer).unwrap();
+    let written = std::fs::read(&lock).unwrap();
+    assert!(
+        pin_unless_moved(&lock, locator, &newer, &read).unwrap(),
+        "the lock already holds this launch's pin"
+    );
+    assert_eq!(
+        std::fs::read(&lock).unwrap(),
+        written,
+        "and is left as it is"
+    );
+
+    // The lock names another image and nothing moved since the read: the launch pins its own.
+    crate::store::write_lock(&lock, "oci:docker.io/library/debian:11", &older).unwrap();
+    let read = crate::store::read_lock_lines(&lock).unwrap();
+    assert!(pin_unless_moved(&lock, locator, &newer, &read).unwrap());
+    assert_eq!(
+        crate::store::read_lock_lines(&lock).unwrap(),
+        Some((locator.to_string(), Some(newer)))
     );
 }
 
