@@ -67,13 +67,16 @@ impl Drop for LiveDir {
 ///
 /// A directory already at the name is a dead predecessor's — a live launch of this process holds
 /// it in [`LIVE_DIRS`] first — so it is removed, without following any link inside it, and made
-/// again. One a killed process left behind is also reaped by `sbx gc`, which reads the pid off its
-/// name and removes the entries of launches no longer running.
+/// again. The removal is [`super::gc::force_remove_dir_all`], which widens each directory before
+/// emptying it: the cage can leave one read-only with entries inside, which a plain
+/// `remove_dir_all` cannot empty, and the launch would then fail on its own directory. One a killed
+/// process left behind is also reaped by `sbx gc`, which reads the pid off its name and removes the
+/// entries of launches no longer running.
 pub(crate) fn fresh_dir(dir: &Path) -> io::Result<()> {
     let make = || std::fs::DirBuilder::new().mode(0o700).create(dir);
     match make() {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            std::fs::remove_dir_all(dir)?;
+            super::gc::force_remove_dir_all(dir)?;
             make()
         }
         made => made,
@@ -84,6 +87,27 @@ pub(crate) fn fresh_dir(dir: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    /// A predecessor's cage can leave a directory it made read-only, holding an entry, which no
+    /// `unlink` reaches until its mode is widened again. The launch still gets its directory back
+    /// empty, rather than failing on what that cage left.
+    #[test]
+    fn a_directory_the_cage_made_read_only_inside_it_is_emptied_too() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TmpDir::new();
+        let dir = tmp.path().join("fwd-1");
+        let locked = dir.join("p-9119.sock");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("held"), b"").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let made = fresh_dir(&dir);
+        // Widened again whatever happened, so the fixture can be removed after a red run.
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
+        made.expect("make the directory again");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
 
     /// A launch directory already at its name is a dead predecessor's, and the launch gets it back
     /// empty and `0700` whatever the predecessor's cage left: a widened mode, a stale socket, a
