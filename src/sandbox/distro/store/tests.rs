@@ -130,12 +130,15 @@ fn a_provisioned_image_lands_with_its_lock_and_its_mountpoints() {
     // so no bubblewrap is started and this one is never looked up.
     let bwrap = Path::new("bwrap");
 
+    // Only the network's failures are skipped: a registry that answered, or a step of `provision`
+    // that failed here, is what this test exists to catch.
     let rootfs = match provision(&layout, bwrap, locator, &lock, "proj0001", None, None) {
         Ok(r) => r,
-        Err(e) => {
-            skip_unreachable!("skipping the provision: {e}");
+        Err(e) if super::super::registry::tests::transient(&e) => {
+            skip_unreachable!("skipping the provision: no verdict came back: {e}");
             return;
         }
+        Err(e) => panic!("provisioning failed, and not on the network: {e}"),
     };
 
     let release = std::fs::read_to_string(rootfs.join("etc/os-release")).expect("os-release");
@@ -162,9 +165,15 @@ fn a_provisioned_image_lands_with_its_lock_and_its_mountpoints() {
     assert_eq!(rootfs, image_dir(&layout, &digest).join("rootfs"));
 
     // Nothing half-written is left beside it: a partial tree is removed or renamed, never kept.
+    // Every entry is read: one that cannot be is a listing that cannot say nothing is left.
     let leftovers: Vec<_> = std::fs::read_dir(layout.distro_dir())
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .expect("the image store is listed")
+        .map(|e| {
+            e.expect("an entry of the image store")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
         .filter(|n| n.contains(".partial"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");

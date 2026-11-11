@@ -477,5 +477,7 @@ fn digest_of(bytes: &[u8]) -> String {
     )
 }
 
+// Visible to the rest of `distro` for `tests::transient`, which the image store's provisioning test
+// asks the same question with.
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

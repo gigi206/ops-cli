@@ -62,7 +62,10 @@ fn a_digest_is_computed_over_the_bytes_that_came_back() {
 /// - `no complete response head …`, which any failure while a response head was arriving becomes;
 /// - `answered` with `408`, `429` or a `5xx`, the statuses about the moment rather than the
 ///   request, as `tests/common`'s `transient_fetch_failure` splits them for nix's downloads.
-fn transient(e: &io::Error) -> bool {
+///
+/// The image store's provisioning test asks it of `provision`, which passes this client's errors
+/// on as they are.
+pub(in crate::sandbox::distro) fn transient(e: &io::Error) -> bool {
     if matches!(
         e.kind(),
         io::ErrorKind::ConnectionReset
