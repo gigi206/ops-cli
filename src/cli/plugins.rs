@@ -1941,26 +1941,23 @@ fn plugins_store_list(only_installed: bool, only_store: Option<&str>, json: bool
     // The two "nothing to list" exits come before the human listing and after the JSON one: a
     // consumer asking for a document must get one whether or not there are stores, or it has to
     // tell an empty result from a command that printed prose. The human reader wants the opposite —
-    // the line that says how to add a store.
-    let empty = names.is_empty() || layout.is_none();
-    if json && empty {
-        if let Err(code) = crate::print_json(
-            "plugins store list",
-            &serde_json::json!({ "stores": Vec::<serde_json::Value>::new() }),
-        ) {
-            return code;
+    // the line that says how to add a store. Without a data directory `names` is empty, so a
+    // listing with something in it always has the layout it reads.
+    let Some(layout) = layout.as_ref().filter(|_| !names.is_empty()) else {
+        if json {
+            if let Err(code) = crate::print_json(
+                "plugins store list",
+                &serde_json::json!({ "stores": Vec::<serde_json::Value>::new() }),
+            ) {
+                return code;
+            }
+            return ExitCode::SUCCESS;
         }
-        return ExitCode::SUCCESS;
-    }
-    if names.is_empty() {
         outln!("{h}configured plugin stores:{r} (none)");
         outln!(
             "  {dim}(add one with: sbx plugins store add --name <n> --url <git-url> \
              --key <hex>){r}"
         );
-        return ExitCode::SUCCESS;
-    }
-    let Some(layout) = layout.as_ref() else {
         return ExitCode::SUCCESS;
     };
     if json {
