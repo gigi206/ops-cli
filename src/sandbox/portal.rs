@@ -359,10 +359,32 @@ fn gtk_theme_for(color_scheme: &str) -> Option<&'static str> {
 /// [`keyfile_body`] writes), start
 /// `dbus-daemon --fork` (which blocks until the socket is ready, then returns — no race), and
 /// `exec "$@"`. The command rides `"$@"` positionally, so nothing from it is re-parsed by the shell;
-/// every value baked into the script is an sbx-controlled store path or a fixed literal. The heredoc
-/// bodies use a quoted delimiter so the shell performs no expansion on the (already-substituted)
-/// config. Pure over its inputs, so the shape is unit-tested without launching a cage.
+/// every value baked into the script is an sbx-controlled store path or a fixed literal, and each
+/// path is written as one single-quoted word, so the shell reads it back as itself whatever it
+/// holds. The heredoc bodies use a quoted delimiter so the shell performs no expansion on the
+/// (already-substituted) config. Pure over its inputs, so the shape is unit-tested without launching
+/// a cage, and the script it writes is run under `bash` with stand-ins for every program it names.
 pub(crate) fn wrap_command(
+    bash: &Path,
+    env_bin: &Path,
+    provision: &Provision,
+    color_scheme: Option<&str>,
+    cmd: Vec<OsString>,
+) -> Vec<OsString> {
+    wrap_command_at(
+        Path::new(CAGE_DIR),
+        bash,
+        env_bin,
+        provision,
+        color_scheme,
+        cmd,
+    )
+}
+
+/// [`wrap_command`] with the portal directory at `dir`. The launch passes [`CAGE_DIR`]; a test
+/// passes a directory of its own, so the script it writes can be run outside a cage.
+fn wrap_command_at(
+    dir: &Path,
     bash: &Path,
     env_bin: &Path,
     provision: &Provision,
@@ -374,10 +396,14 @@ pub(crate) fn wrap_command(
     // shim installs its filter, while the cage's PATH leads through directories the cage itself can
     // write (its own store, its mise shims) — so a bare name would let in-cage code pick what runs
     // unfiltered. `plumbing_pins` pins the store root they live in read-only.
-    let mkdir = env_bin.with_file_name("mkdir");
-    let cat = env_bin.with_file_name("cat");
-    let sleep = env_bin.with_file_name("sleep");
-    let dbus_send = provision.dbus_daemon.with_file_name("dbus-send");
+    //
+    // Each path is written as one shell word, quoted, whatever bytes it holds: a store path never
+    // carries a quote, a space or a `$`, but nothing in this function is what says so.
+    let word = |path: &Path| super::shell_quote(&path.display().to_string());
+    let mkdir = word(&env_bin.with_file_name("mkdir"));
+    let cat = word(&env_bin.with_file_name("cat"));
+    let sleep = word(&env_bin.with_file_name("sleep"));
+    let send = word(&provision.dbus_daemon.with_file_name("dbus-send"));
     let Provision {
         dbus_daemon,
         xdp_root,
@@ -386,7 +412,7 @@ pub(crate) fn wrap_command(
         keyring_daemon,
         ..
     } = provision;
-    let session = session_conf(CAGE_SOCK, xdp_root, gtk_root);
+    let session = session_conf(&dir.join("bus").display().to_string(), xdp_root, gtk_root);
     let seed = match color_scheme.and_then(keyfile_body) {
         Some(keyfile) => {
             // The keyfile is shared with the theme relay via `KEYFILE_REL` (its parent is the dir to
@@ -396,11 +422,9 @@ pub(crate) fn wrap_command(
             // no static `GTK_THEME` env, which GTK reads once at start and could not follow a switch.
             let kf_parent = KEYFILE_REL.rsplit_once('/').map_or(KEYFILE_REL, |(p, _)| p);
             format!(
-                "'{mkdir}' -p \"$HOME/{kf_parent}\" 2>/dev/null\n\
-                 '{cat}' > \"$HOME/{KEYFILE_REL}\" <<'SBXPORTALKF' 2>/dev/null || true\n\
-                 {keyfile}SBXPORTALKF\n",
-                mkdir = mkdir.display(),
-                cat = cat.display(),
+                "{mkdir} -p \"$HOME/{kf_parent}\" 2>/dev/null\n\
+                 {cat} > \"$HOME/{KEYFILE_REL}\" <<'SBXPORTALKF' 2>/dev/null || true\n\
+                 {keyfile}SBXPORTALKF\n"
             )
         }
         None => String::new(),
@@ -415,10 +439,9 @@ pub(crate) fn wrap_command(
     // then opens the URL only much later (at login), so a short bounded retry catches the file whenever
     // it lands. Best-effort, never blocks; the background job dies with the cage (its PID-1 reaper).
     let index = format!(
-        "( for _ in 1 2 3; do \"{udd}\" \"$HOME/.local/share/applications\" >/dev/null 2>&1; \
-         '{sleep}' 1; done ) &\n",
-        udd = update_desktop_db.display(),
-        sleep = sleep.display(),
+        "( for _ in 1 2 3; do {udd} \"$HOME/.local/share/applications\" >/dev/null 2>&1; \
+         {sleep} 1; done ) &\n",
+        udd = word(update_desktop_db),
     );
     // The Secret Service, started AFTER the bus it registers on. `--daemonize` returns once the
     // daemon has read the passphrase and forked, but before it claims `org.freedesktop.secrets`,
@@ -432,33 +455,31 @@ pub(crate) fn wrap_command(
     // preamble: a cage whose keyring will not open still launches, with the app back on whatever
     // fallback it chooses.
     let keyring = format!(
-        "if printf %s '{pass}' | \"{kr}\" --unlock --components=secrets --daemonize \
+        "if printf %s {pass} | {kr} --unlock --components=secrets --daemonize \
          >/dev/null 2>&1; then\n\
          for _ in {{1..50}}; do\n\
-         case \"$(\"{send}\" --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+         case \"$({send} --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
          org.freedesktop.DBus.NameHasOwner string:{SECRETS_NAME} 2>/dev/null)\" in\n\
          *'boolean true'*) break ;;\n\
          esac\n\
-         '{sleep}' 0.1\n\
+         {sleep} 0.1\n\
          done\n\
          fi\n",
-        pass = KEYRING_PASSPHRASE,
-        kr = keyring_daemon.display(),
-        send = dbus_send.display(),
-        sleep = sleep.display(),
+        pass = super::shell_quote(KEYRING_PASSPHRASE),
+        kr = word(keyring_daemon),
     );
     let preamble = format!(
-        "'{mkdir}' -p {dir}/xdg-desktop-portal 2>/dev/null\n\
-         '{cat}' > {dir}/session.conf <<'SBXPORTALCF'\n{session}SBXPORTALCF\n\
-         '{cat}' > {dir}/xdg-desktop-portal/portals.conf <<'SBXPORTALPF'\n{portals}SBXPORTALPF\n\
+        "{mkdir} -p {portal_dir} 2>/dev/null\n\
+         {cat} > {session_file} <<'SBXPORTALCF'\n{session}SBXPORTALCF\n\
+         {cat} > {portals_file} <<'SBXPORTALPF'\n{portals}SBXPORTALPF\n\
          {seed}\
-         {daemon} --config-file={dir}/session.conf --fork </dev/null >/dev/null 2>&1 || true\n\
+         {daemon} --config-file={session_file} --fork </dev/null >/dev/null 2>&1 || true\n\
          {keyring}\
          {index}",
-        dir = CAGE_DIR,
-        mkdir = mkdir.display(),
-        cat = cat.display(),
-        daemon = dbus_daemon.display(),
+        portal_dir = word(&dir.join("xdg-desktop-portal")),
+        session_file = word(&dir.join("session.conf")),
+        portals_file = word(&dir.join("xdg-desktop-portal/portals.conf")),
+        daemon = word(dbus_daemon),
         portals = PORTALS_CONF,
     );
     super::egress::wrap_background(bash, &preamble, "sbx-incage-portal", cmd)
@@ -586,16 +607,19 @@ mod tests {
         let script = argv[2].to_string_lossy();
         // the daemon is started with --fork (blocks until the socket is ready), config from the cage
         assert!(script.contains(
-            "/nix/store/ddd-dbus/bin/dbus-daemon --config-file=/run/sbx-portal/session.conf --fork"
+            "'/nix/store/ddd-dbus/bin/dbus-daemon' --config-file='/run/sbx-portal/session.conf' --fork"
         ));
+        // the bus listens on the socket under the portal directory, the one the cage's clients
+        // are pointed at
+        assert!(script.contains(&format!("<listen>unix:path={CAGE_SOCK}</listen>")));
         // portals.conf selects the gtk backend
         assert!(script.contains("default=gtk"));
         // every helper the preamble runs is an absolute store path, never a bare name: the
         // preamble is the cage's first process, before the `[proc]` shim filters anything, and
         // the cage's own PATH leads through directories the cage can write
-        assert!(script.contains("'/nix/store/hash-coreutils/bin/mkdir' -p /run/sbx-portal"));
+        assert!(script.contains("'/nix/store/hash-coreutils/bin/mkdir' -p '/run/sbx-portal"));
         assert!(
-            script.contains("'/nix/store/hash-coreutils/bin/cat' > /run/sbx-portal/session.conf")
+            script.contains("'/nix/store/hash-coreutils/bin/cat' > '/run/sbx-portal/session.conf'")
         );
         assert!(script.contains("'/nix/store/hash-coreutils/bin/sleep' 1"));
         for bare in ["mkdir ", "cat ", "sleep "] {
@@ -612,11 +636,11 @@ mod tests {
         // the dialog's dark theme comes from the live-watched gtk-theme keyfile key instead
         assert!(!script.contains("GTK_THEME"));
         // the daemon is started plainly (no env prefix), config from the cage
-        assert!(script.contains("\n/nix/store/ddd-dbus/bin/dbus-daemon --config-file="));
+        assert!(script.contains("\n'/nix/store/ddd-dbus/bin/dbus-daemon' --config-file="));
         // the desktop-database indexer is backgrounded (so it runs after the app registers its
         // deep-link handler), by absolute store path, targeting the cage home's applications dir
         assert!(script.contains(
-            "\"/nix/store/eee-dfu/bin/update-desktop-database\" \"$HOME/.local/share/applications\""
+            "'/nix/store/eee-dfu/bin/update-desktop-database' \"$HOME/.local/share/applications\""
         ));
         assert!(
             script.contains("done ) &"),
@@ -643,7 +667,7 @@ mod tests {
         );
         let script = argv[2].to_string_lossy();
         let bus = script
-            .find("dbus-daemon --config-file=")
+            .find("dbus-daemon' --config-file=")
             .expect("the bus is started");
         let keyring = script
             .find("gnome-keyring-daemon")
@@ -670,7 +694,7 @@ mod tests {
             "the wait follows the keyring's start: {script}"
         );
         assert!(
-            script.contains("/nix/store/ddd-dbus/bin/dbus-send\" --session"),
+            script.contains("/nix/store/ddd-dbus/bin/dbus-send' --session"),
             "the name is asked of the private bus by the store's own dbus-send: {script}"
         );
         assert!(
@@ -707,6 +731,191 @@ mod tests {
             script.contains(&format!("printf %s '{KEYRING_PASSPHRASE}' |")),
             "the passphrase must arrive on stdin: {script}"
         );
+    }
+
+    /// What running the preamble outside a cage left: how `bash` ended, and every line the
+    /// stand-ins logged, one per run, each the path it was run by followed by its arguments.
+    struct Preamble {
+        ran: crate::testutil::Ran,
+        log: String,
+    }
+
+    /// The stand-ins [`run_preamble`] installs under its root, by their place in a [`Provision`].
+    fn stand_in_provision(root: &Path) -> (PathBuf, Provision) {
+        let env_bin = root.join("coreutils/bin/env");
+        let provision = Provision {
+            roots: Vec::new(),
+            dbus_daemon: root.join("dbus/bin/dbus-daemon"),
+            xdp_root: root.join("xdp"),
+            gtk_root: root.join("gtk"),
+            update_desktop_db: root.join("dfu/bin/update-desktop-database"),
+            keyring_daemon: root.join("gk/bin/gnome-keyring-daemon"),
+        };
+        (env_bin, provision)
+    }
+
+    /// Run the preamble [`wrap_command_at`] writes under a real `bash`, outside any cage, with its
+    /// portal directory at `<root>/run` and `$HOME` at `<root>/home`. Every program it names is a
+    /// stand-in under `root` that logs how it was run; `mkdir` and `cat` then do their real work,
+    /// `sleep` returns at once, `dbus-send` answers that the name has an owner, and the bus daemon
+    /// and the keyring exit 1 when named in `failing`, 0 otherwise. The command is a stand-in too,
+    /// `<root>/app`.
+    ///
+    /// The environment is cleared, so nothing the script does can reach the real home. The run is
+    /// made again while a stand-in it executes is still held open for writing by a fork in another
+    /// test (`ETXTBSY`), and the background indexing loop is waited out before the log is read.
+    fn run_preamble(root: &Path, scheme: Option<&str>, failing: &[&str]) -> Preamble {
+        use crate::testutil::write_script;
+        let (env_bin, provision) = stand_in_provision(root);
+        let log = root.join("log");
+        let log_line = "printf '%s\\n' \"$0 $*\" >> \"$SBX_TEST_LOG\"";
+        let exit = |name: &str| {
+            if failing.contains(&name) {
+                "exit 1"
+            } else {
+                "exit 0"
+            }
+        };
+        let programs: [(PathBuf, String); 9] = [
+            (env_bin.clone(), format!("{log_line}\nexec env \"$@\"")),
+            (
+                env_bin.with_file_name("mkdir"),
+                format!("{log_line}\nexec mkdir \"$@\""),
+            ),
+            (
+                env_bin.with_file_name("cat"),
+                format!("{log_line}\nexec cat \"$@\""),
+            ),
+            (env_bin.with_file_name("sleep"), log_line.to_string()),
+            (
+                provision.dbus_daemon.clone(),
+                format!("{log_line}\n{}", exit("dbus-daemon")),
+            ),
+            (
+                provision.dbus_daemon.with_file_name("dbus-send"),
+                format!("{log_line}\nprintf 'boolean true\\n'"),
+            ),
+            (
+                provision.update_desktop_db.clone(),
+                format!("{log_line}\nexit 1"),
+            ),
+            (
+                provision.keyring_daemon.clone(),
+                format!("{log_line}\n{}", exit("gnome-keyring-daemon")),
+            ),
+            (root.join("app"), log_line.to_string()),
+        ];
+        for (path, body) in &programs {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_script(path, body);
+        }
+        let dir = root.join("run");
+        let home = root.join("home");
+        let argv = wrap_command_at(
+            &dir,
+            Path::new("/bin/bash"),
+            &env_bin,
+            &provision,
+            scheme,
+            vec![root.join("app").into_os_string()],
+        );
+        for _ in 0..50 {
+            let _ = std::fs::remove_file(&log);
+            let _ = crate::sandbox::gc::force_remove_dir_all(&dir);
+            let _ = crate::sandbox::gc::force_remove_dir_all(&home);
+            std::fs::create_dir_all(&home).unwrap();
+            let ran = crate::testutil::run_within(
+                std::process::Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("HOME", &home)
+                    .env("SBX_TEST_LOG", &log)
+                    .current_dir(root)
+                    .stdin(std::process::Stdio::null()),
+                "the portal preamble",
+            );
+            if ran.stderr.contains("Text file busy") {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            // The indexer runs three times in the background, after `exec "$@"` has ended the
+            // script; its last run is the last line any stand-in writes.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let read = || std::fs::read_to_string(&log).unwrap_or_default();
+            while read().matches("update-desktop-database ").count() < 3
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            return Preamble { ran, log: read() };
+        }
+        panic!("a stand-in stayed held open for writing by another test's fork");
+    }
+
+    /// Every path the preamble names reaches the shell as one word, whatever it holds: a space, a
+    /// quote of either kind, a command substitution. A path the shell split, ended early or ran a
+    /// command from would leave the portal unstarted, or run something the path only names.
+    #[test]
+    fn every_path_the_preamble_names_reaches_the_shell_as_itself() {
+        for shape in [" ", "'", "\"", "$(touch pwned)", "`touch pwned`"] {
+            let tmp = crate::testutil::TmpDir::new();
+            let root = tmp.path().join(format!("x{shape}y"));
+            std::fs::create_dir(&root).unwrap();
+            let Preamble { ran, log } = run_preamble(&root, Some("prefer-dark"), &[]);
+            let (env_bin, provision) = stand_in_provision(&root);
+            let dir = root.join("run");
+            let expected = [
+                format!(
+                    "{} -p {}",
+                    env_bin.with_file_name("mkdir").display(),
+                    dir.join("xdg-desktop-portal").display()
+                ),
+                format!(
+                    "{} --config-file={} --fork",
+                    provision.dbus_daemon.display(),
+                    dir.join("session.conf").display()
+                ),
+                format!(
+                    "{} --unlock --components=secrets --daemonize",
+                    provision.keyring_daemon.display()
+                ),
+                format!(
+                    "{} --session --print-reply",
+                    provision.dbus_daemon.with_file_name("dbus-send").display()
+                ),
+                format!(
+                    "{} {}",
+                    provision.update_desktop_db.display(),
+                    root.join("home/.local/share/applications").display()
+                ),
+                format!("{} 1", env_bin.with_file_name("sleep").display()),
+                root.join("app").display().to_string(),
+            ];
+            for line in &expected {
+                assert!(
+                    log.lines().any(|l| l.starts_with(line.as_str())),
+                    "{shape:?}: no run of `{line}`:\n{log}\n{}",
+                    ran.stderr
+                );
+            }
+            assert!(
+                std::fs::read_to_string(dir.join("session.conf"))
+                    .is_ok_and(|c| c.contains("<busconfig>")),
+                "{shape:?}: the bus configuration is not where the daemon is told to read it:\n{}",
+                ran.stderr
+            );
+            assert!(
+                std::fs::read_to_string(root.join("home").join(KEYFILE_REL))
+                    .is_ok_and(|k| k.contains("color-scheme='prefer-dark'")),
+                "{shape:?}: the theme is not seeded:\n{}",
+                ran.stderr
+            );
+            assert!(
+                !root.join("pwned").exists() && !tmp.path().join("pwned").exists(),
+                "{shape:?}: a path ran a command"
+            );
+        }
     }
 
     #[test]
