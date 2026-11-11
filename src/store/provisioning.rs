@@ -131,6 +131,18 @@ pub(crate) fn provision_unfree(
     provision_licensed(nix, layout, gcroot, flake_ref, attr, marker, true)
 }
 
+/// Create the directory a gcroot lives in, owner-only from the start, so a loose umask never leaves
+/// a window in which another user can read it — the mode [`ensure`] gives the data directory and
+/// the store, which this sits under.
+fn ensure_gcroot_parent(gcroot: &Path) -> io::Result<()> {
+    use std::fs::DirBuilder;
+    use std::os::unix::fs::DirBuilderExt;
+    match gcroot.parent() {
+        Some(parent) => DirBuilder::new().recursive(true).mode(0o700).create(parent),
+        None => Ok(()),
+    }
+}
+
 /// Assemble (without spawning) the `nix build` invocation [`provision_licensed`] runs, so its
 /// argv is unit-testable without a real nix. A free build selects `<flake_ref>#<attr>`
 /// positionally; an unfree build instead evaluates a **pure** `--expr` that re-imports the pinned
@@ -196,14 +208,7 @@ fn provision_licensed(
     allow_unfree: bool,
 ) -> io::Result<PathBuf> {
     ensure(layout)?;
-    if let Some(parent) = gcroot.parent() {
-        use std::fs::DirBuilder;
-        use std::os::unix::fs::DirBuilderExt;
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-    }
+    ensure_gcroot_parent(gcroot)?;
 
     // A pinned reference names one derivation for good, so the output a previous build selected
     // is the output this one would select. An unpinned one (a local path, a branch) may move under
@@ -372,14 +377,7 @@ pub(crate) fn provision_flake(
     marker: &str,
 ) -> io::Result<PathBuf> {
     ensure(layout)?;
-    if let Some(parent) = gcroot.parent() {
-        use std::fs::DirBuilder;
-        use std::os::unix::fs::DirBuilderExt;
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-    }
+    ensure_gcroot_parent(gcroot)?;
 
     let stamp = expr_stamp_path(gcroot);
     let digest = expr_digest(target);
@@ -446,14 +444,7 @@ pub(crate) fn provision_expr(
     marker: &str,
 ) -> io::Result<PathBuf> {
     ensure(layout)?;
-    if let Some(parent) = gcroot.parent() {
-        use std::fs::DirBuilder;
-        use std::os::unix::fs::DirBuilderExt;
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-    }
+    ensure_gcroot_parent(gcroot)?;
 
     let stamp = expr_stamp_path(gcroot);
     let digest = expr_digest(expr);
