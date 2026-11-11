@@ -1667,13 +1667,24 @@ pub(crate) fn install_from_store(
 /// only in what an existing plugin of that name means. The old tree is moved aside and kept until
 /// the new one is in place, and restored if the swap fails, so an upgrade that cannot complete
 /// leaves the plugin the user already had — the hole that `rm` followed by a fresh install opens.
+///
+/// `held` is the record the caller compared the store's listing against. What is replaced must
+/// still be that build when it is moved aside: the caller decided on it at an earlier read, and a
+/// plugin removed since, or installed again from elsewhere, is not the one it decided to replace.
 pub(crate) fn replace_from_store(
     layout: &crate::store::Layout,
     source: &Path,
     claim: StoreClaim<'_>,
     origin: origin::Origin,
+    held: &origin::Origin,
 ) -> Result<Installed, String> {
-    install_inner(layout, source, Some(claim), origin, Placement::Replace)
+    install_inner(
+        layout,
+        source,
+        Some(claim),
+        origin,
+        Placement::Replace(held),
+    )
 }
 
 /// `origin` is where the plugin came from, recorded once it is in place — passed in rather than
@@ -1684,11 +1695,12 @@ pub(crate) fn replace_from_store(
 /// where silently overwriting would discard a plugin the user did not ask to lose) or a
 /// replacement (the upgrade verb, which exists to do exactly that).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Placement {
+enum Placement<'a> {
     /// Refuse if the name is taken.
     Fresh,
-    /// Swap the new tree in over the old one, keeping the old one until the swap succeeds.
-    Replace,
+    /// Swap the new tree in over the old one, keeping the old one until the swap succeeds. The
+    /// plugin replaced must still be the build this record names.
+    Replace(&'a origin::Origin),
 }
 
 /// Refuse a staged copy that does not declare what its source declared when it was checked: the
@@ -1730,7 +1742,7 @@ fn install_inner(
     source: &Path,
     expect: Option<StoreClaim<'_>>,
     origin: origin::Origin,
-    placement: Placement,
+    placement: Placement<'_>,
 ) -> Result<Installed, String> {
     let exp = Expansion::from_env();
 
@@ -1970,18 +1982,49 @@ fn install_inner(
     // directory — and keeps it until the new one is in place. If the swap fails, the old plugin is
     // moved back: a failed upgrade must be a non-event, never the "removed, then failed to
     // install" hole that doing this with `rm` + install leaves.
-    let displaced = if placement == Placement::Replace && dest.exists() {
-        let aside =
-            layout
-                .data_dir()
-                .join(format!(".plugin-old-{}-{}", std::process::id(), unique()));
-        if let Err(e) = std::fs::rename(&dest, &aside) {
-            tidy(&staging);
-            return Err(format!("could not set the installed plugin aside: {e}"));
+    //
+    // The rename is also what tells a plugin removed since the caller compared it: one that is no
+    // longer there is not replaced, since placing it would install again what was just removed.
+    // Once the tree is aside it is this install's alone, so its record is read then: a plugin
+    // installed again from elsewhere since is not the build the caller decided to replace, and it
+    // is moved back untouched.
+    let displaced = match placement {
+        Placement::Fresh => None,
+        Placement::Replace(held) => {
+            let aside =
+                layout
+                    .data_dir()
+                    .join(format!(".plugin-old-{}-{}", std::process::id(), unique()));
+            if let Err(e) = std::fs::rename(&dest, &aside) {
+                tidy(&staging);
+                return Err(if e.kind() == std::io::ErrorKind::NotFound {
+                    format!(
+                        "plugin `{name}` was removed since it was compared with its store, so \
+                         nothing was placed"
+                    )
+                } else {
+                    format!("could not set the installed plugin aside: {e}")
+                });
+            }
+            let now = origin::read(layout, &name);
+            if !now.same_store_build(held) {
+                tidy(&staging);
+                let back = std::fs::rename(&aside, &dest);
+                return Err(match back {
+                    Ok(()) => format!(
+                        "plugin `{name}` changed since it was compared with its store (it is now \
+                         installed from {}), so it is left as it is — run the upgrade again",
+                        now.short()
+                    ),
+                    Err(why) => format!(
+                        "plugin `{name}` changed since it was compared with its store, and it \
+                         could not be put back ({why}) — it is at {}",
+                        aside.display()
+                    ),
+                });
+            }
+            Some(aside)
         }
-        Some(aside)
-    } else {
-        None
     };
 
     match std::fs::rename(&stage, &dest) {
@@ -5285,6 +5328,7 @@ mod tests {
             &second,
             resolver_claim(&second, "kp", "kp"),
             store_origin(),
+            &origin::read(&layout, "kp"),
         )
         .expect("replace");
 
@@ -5339,6 +5383,7 @@ mod tests {
             &bad,
             resolver_claim(&bad, "kp", "kp"),
             store_origin(),
+            &origin::read(&layout, "kp"),
         )
         .unwrap_err();
         assert!(err.contains("refusing the mismatch"), "{err}");
@@ -5363,14 +5408,12 @@ mod tests {
         let checked = source_plugin(src_root.path(), "checked", manifest, 0o755);
         let swapped = source_plugin(src_root.path(), "swapped", manifest, 0o755);
         fs::write(swapped.join("extra"), "not in the catalogue\n").unwrap();
-        let place = [install_from_store, replace_from_store];
-        for (placement, place) in ["install", "upgrade"].into_iter().zip(place) {
-            let err = place(
-                &layout,
-                &swapped,
-                resolver_claim(&checked, "kp", "kp"),
-                store_origin(),
-            )
+        for placement in ["install", "upgrade"] {
+            let claim = resolver_claim(&checked, "kp", "kp");
+            let err = match placement {
+                "install" => install_from_store(&layout, &swapped, claim, store_origin()),
+                _ => replace_from_store(&layout, &swapped, claim, store_origin(), &store_origin()),
+            }
             .unwrap_err();
             assert!(
                 err.contains("does not match the catalogue"),

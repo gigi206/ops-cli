@@ -2334,12 +2334,10 @@ fn plugins_upgrade(args: &[OsString]) -> ExitCode {
 
     let mut failed = 0usize;
     for (dir_name, v) in &stale {
-        let have = index
-            .by_name
-            .get(dir_name)
-            .and_then(|p| p.version.as_deref())
-            .unwrap_or("")
-            .trim();
+        let Some(installed) = index.by_name.get(dir_name) else {
+            continue;
+        };
+        let have = installed.version.as_deref().unwrap_or("").trim();
         let wording = drift_wording(have, v.listed_version.trim());
         if dry_run {
             outln!(
@@ -2349,7 +2347,7 @@ fn plugins_upgrade(args: &[OsString]) -> ExitCode {
             );
             continue;
         }
-        match stores::upgrade_plugin(&layout, &v.store, dir_name) {
+        match stores::upgrade_plugin(&layout, &v.store, dir_name, &installed.origin) {
             // Past tense needs its own sentence: the pending wording ("update available: …") reads
             // as a thing still to do once it has been done.
             Ok(_) => {

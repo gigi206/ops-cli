@@ -819,7 +819,7 @@ pub(crate) fn install_plugin(
     store_name: &str,
     plugin_name: &str,
 ) -> Result<crate::plugins::Installed, String> {
-    place_plugin(layout, store_name, plugin_name, false)
+    place_plugin(layout, store_name, plugin_name, None)
 }
 
 /// Replace an installed plugin with what the store's catalogue lists now — `sbx plugins upgrade`.
@@ -828,12 +828,17 @@ pub(crate) fn install_plugin(
 /// name and scheme), because an upgrade installs code exactly as an install does. The only
 /// difference is that the name being taken is the point rather than a refusal — and the swap keeps
 /// the installed plugin until the new one is in place.
+///
+/// `held` is the plugin's record as the caller read it to decide on the upgrade; a plugin that is
+/// no longer that build when it is replaced is left as it is (see
+/// [`crate::plugins::replace_from_store`]).
 pub(crate) fn upgrade_plugin(
     layout: &crate::store::Layout,
     store_name: &str,
     plugin_name: &str,
+    held: &crate::plugins::origin::Origin,
 ) -> Result<crate::plugins::Installed, String> {
-    place_plugin(layout, store_name, plugin_name, true)
+    place_plugin(layout, store_name, plugin_name, Some(held))
 }
 
 /// Where a catalogue entry's `path` lands under a store's cached checkout.
@@ -898,12 +903,13 @@ fn locate_in_checkout(checkout: &Path, rel: &Path) -> Located {
     Located::Dir(at)
 }
 
-/// The shared body: verify a store's listed plugin and place it, replacing an existing one or not.
+/// The shared body: verify a store's listed plugin and place it, replacing the build `held` names
+/// or, without one, refusing a name already taken.
 fn place_plugin(
     layout: &crate::store::Layout,
     store_name: &str,
     plugin_name: &str,
-    replace: bool,
+    held: Option<&crate::plugins::origin::Origin>,
 ) -> Result<crate::plugins::Installed, String> {
     crate::plugins::validate_install_name(store_name)?;
     if !layout.store_path(store_name).exists() {
@@ -973,7 +979,7 @@ fn place_plugin(
         url,
         sha256: Some(entry.sha256.clone()),
     };
-    if replace {
+    if let Some(held) = held {
         crate::plugins::replace_from_store(
             layout,
             &plugin_dir,
@@ -984,6 +990,7 @@ fn place_plugin(
                 sha256: entry.sha256.clone(),
             },
             origin,
+            held,
         )
     } else {
         crate::plugins::install_from_store(
@@ -2660,6 +2667,63 @@ mod tests {
                 sha256: Some(catalogue.plugins["pass"].sha256.clone()),
             }
         );
+    }
+
+    /// An upgrade replaces the build it compared and nothing else. A plugin removed since it was
+    /// compared is not installed again, and one installed again from elsewhere since is left as it
+    /// is: both are told where the tree is moved aside, which leaves no window between the check
+    /// and the swap.
+    #[test]
+    fn an_upgrade_replaces_only_the_build_it_compared() {
+        let Some(git) = git_or_skip() else { return };
+        let repo = crate::testutil::TmpDir::new();
+        let data = crate::testutil::TmpDir::new();
+        let pubkey = build_signed_store(repo.path(), 1);
+        let url = commit_repo(&git, repo.path());
+        let layout = crate::store::Layout::under(data.path());
+        add(&layout, "default", &url, pubkey, &git).expect("add the store");
+        install_plugin(&layout, "default", "pass").expect("install from the store");
+        let held = crate::plugins::origin::read(&layout, "pass");
+        let dest = layout.plugins_dir().join("pass");
+
+        crate::plugins::remove(&layout, "pass").expect("remove the plugin");
+        let err = upgrade_plugin(&layout, "default", "pass", &held).unwrap_err();
+        assert!(err.contains("was removed"), "{err}");
+        assert!(!dest.exists(), "a plugin removed since is installed again");
+
+        let local = crate::testutil::TmpDir::new();
+        let source = local.path().join("pass");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(
+            source.join("plugin.toml"),
+            "name = \"pass\"\ntype = \"resolver\"\nscheme = \"secret-store\"\nexec = \"resolve\"\n",
+        )
+        .unwrap();
+        std::fs::write(source.join("resolve"), "#!/bin/sh\necho local\n").unwrap();
+        std::fs::set_permissions(
+            source.join("resolve"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        crate::plugins::install(&layout, &source).expect("install locally");
+        let err = upgrade_plugin(&layout, "default", "pass", &held).unwrap_err();
+        assert!(err.contains("changed since"), "{err}");
+        assert!(
+            matches!(
+                crate::plugins::origin::read(&layout, "pass"),
+                crate::plugins::origin::Origin::Local { .. }
+            ),
+            "the local plugin's record is kept"
+        );
+        let kept = std::fs::read_to_string(dest.join("resolve")).unwrap();
+        assert!(kept.contains("local"), "the local plugin is kept: {kept}");
+        let leaked: Vec<_> = std::fs::read_dir(data.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".plugin-old-") || n.starts_with(".plugin-stage-"))
+            .collect();
+        assert!(leaked.is_empty(), "a swap temp leaked: {leaked:?}");
     }
 
     #[test]

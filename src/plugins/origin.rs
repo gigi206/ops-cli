@@ -119,6 +119,28 @@ impl Origin {
         }
     }
 
+    /// Whether this record names the same store build as `other`: the store, and the digest of the
+    /// tree that was placed — what an upgrade compares a plugin's store listing against before it
+    /// decides to replace it. The URL is left out, since it follows the store's configuration
+    /// rather than the plugin. A record without a digest names no build, so it matches nothing.
+    pub(crate) fn same_store_build(&self, other: &Origin) -> bool {
+        match (self, other) {
+            (
+                Origin::Store {
+                    store: a,
+                    sha256: Some(x),
+                    ..
+                },
+                Origin::Store {
+                    store: b,
+                    sha256: Some(y),
+                    ..
+                },
+            ) => a == b && x == y,
+            _ => false,
+        }
+    }
+
     /// The record's TOML form. Only [`Origin::Unknown`] has none — an unknown origin is the
     /// *absence* of a record, so it is never written. A value that cannot be rendered as a TOML
     /// string costs its own field and no more, per [`push_field`].

@@ -158,6 +158,11 @@ upgrade that cannot complete leaves what you had. Doing it by hand with
 `sbx plugins rm` followed by a fresh install deletes first: if the install then
 fails, you are left with nothing.
 
+`upgrade` replaces only the build it compared. A plugin removed while it runs is
+not installed again, and one installed again from elsewhere under the same name
+is left as it is: the swap checks both as it sets the old tree aside, and says
+which one it met.
+
 Every comparison reads the **cached** catalogue, so it is only as fresh as your
 last `sbx plugins store update`: which is why the output says so rather than
 implying a currency nothing checked.
