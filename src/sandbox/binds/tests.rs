@@ -703,6 +703,19 @@ fn a_nesting_note_writes_the_host_home_as_a_tilde_and_leaves_the_rest() {
     assert_eq!(elided(Path::new("/etc"), Some(Path::new("/"))), "/etc");
 }
 
+/// A bind that contains several of sbx's own mounts is told about more than the first.
+///
+/// Each of them is a path inside the bind that the cage shows as sbx's rather than the bind's, and
+/// a note naming one reads as if that were the only one. The names stop after a few, with a count
+/// of the rest, since a bind of `/` contains every one of them.
+#[test]
+fn a_bind_containing_several_sbx_mounts_names_more_than_the_first() {
+    let etc = structural_nesting_warning(Path::new("/etc"), false, None).expect("a nesting note");
+    assert!(etc.contains("`/etc/group`"), "{etc}");
+    let root = structural_nesting_warning(Path::new("/"), false, None).expect("a nesting note");
+    assert!(root.contains(" more"), "{root}");
+}
+
 /// A bind aimed at one of the launcher's own destinations is named, not silently replaced.
 ///
 /// The launcher appends its binds after the config's, so a `[[binds]]` at one of them is shadowed

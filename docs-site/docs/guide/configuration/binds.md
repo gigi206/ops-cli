@@ -127,7 +127,8 @@ colliding exactly) is resolved by path and handled fail-closed, with a warning. 
 *descendant* of a structural mount (e.g. a path under `/tmp`, which the cage covers
 with a tmpfs) may be listed by `sbx config show` yet dropped by the launch; an
 *ancestor* (e.g. `/etc`) would over-expose that directory. `sbx` warns when a config
-bind's destination nests with a structural mount.
+bind's destination nests with a structural mount, naming the mount a descendant sits under, or
+the mounts an ancestor contains (the first few, then how many more).
 
 A **read-only** ancestor can be impossible to establish at all. `sbx` mounts its own files
 after the config binds, so each one under the bind must find room inside the bound host

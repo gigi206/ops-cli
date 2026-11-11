@@ -17,52 +17,83 @@ use super::{
 };
 use std::path::Path;
 
-/// How a config bind's destination overlaps a structural mount destination.
+/// How a config bind's destination overlaps the cage's own mount destinations.
 enum Nesting {
-    /// The bind sits at or under the structural path: the cage mounts over it, so the bind is
+    /// The bind sits at or under this structural path: the cage mounts over it, so the bind is
     /// shadowed and never appears inside.
-    Shadowed,
-    /// The bind contains the structural path: the cage mounts that path over part of the bound
-    /// directory, so that sub-path inside the cage is sbx's, not the bind's.
-    Contains,
+    Shadowed(&'static str),
+    /// The bind contains these structural paths, in list order, never empty, and none inside
+    /// another: the cage mounts each of them over part of the bound directory, so those sub-paths
+    /// inside the cage are sbx's, not the bind's.
+    Contains(Vec<&'static str>),
 }
 
-/// If the canonical config-bind destination `dest` *nests* with a fixed structural mount
-/// destination — it is a strict ancestor or descendant of one — return that structural path and
-/// the relationship. An *exact* match is deliberately not reported: that collision is reconciled
-/// correctly by [`super::assemble`] (the structural mount wins — the control that stops a config
-/// bind displacing `/nix`). A nesting overlap is *not* reconciled — a descendant is shadowed by
-/// the later mount and vanishes; an ancestor over-exposes the host directory around the
-/// structural files — so it is the footgun worth surfacing.
-fn structural_nesting_conflict(dest: &Path) -> Option<(&'static str, Nesting)> {
-    let nesting = |s: &'static str| {
-        let structural = Path::new(s);
-        if dest == structural {
-            None
-        } else if dest.starts_with(structural) {
-            Some((s, Nesting::Shadowed))
-        } else if structural.starts_with(dest) {
-            Some((s, Nesting::Contains))
-        } else {
-            None
-        }
-    };
-    if let Some(hit) = STRUCTURAL_DESTS.iter().copied().find_map(nesting) {
-        return Some(hit);
-    }
+/// How the canonical config-bind destination `dest` *nests* with the fixed structural mount
+/// destinations — it is a strict ancestor or descendant of one — or `None` when it does not. An
+/// *exact* match is deliberately not reported: that collision is reconciled correctly by
+/// [`super::assemble`] (the structural mount wins — the control that stops a config bind displacing
+/// `/nix`). A nesting overlap is *not* reconciled — a descendant is shadowed by the later mount and
+/// vanishes; an ancestor over-exposes the host directory around the structural files — so it is the
+/// footgun worth surfacing.
+///
+/// Shadowed is asked first, of every list, because a bind under one of sbx's mounts is not in the
+/// cage at all, whatever it contains. Contains then names every mount inside the bind, not only the
+/// first: each is a sub-path the cage shows as sbx's, and a note naming one would read as if it
+/// were the only one.
+fn structural_nesting_conflict(dest: &Path) -> Option<Nesting> {
+    let under = |s: &str| dest != Path::new(s) && dest.starts_with(s);
     // The launcher's own destinations, mounted after the config binds like the structural ones and
     // shadowing a bind the same way — but with the exact match reported rather than passed over.
     // For a structural mount that collision is the control working (a config bind must not displace
     // `/nix`), and the user who wrote it learns nothing from being told. For one of these it is the
     // opposite: nobody writes `[[binds]] path = "/run/sbx-pulse"` meaning "let sbx replace this",
     // and what they get is a bind that does nothing, silently. See [`super::LAUNCHER_DESTS`].
-    LAUNCHER_DESTS.iter().copied().find_map(|s| {
-        if dest == Path::new(s) {
-            Some((s, Nesting::Shadowed))
-        } else {
-            nesting(s)
-        }
-    })
+    let shadowing = STRUCTURAL_DESTS
+        .iter()
+        .copied()
+        .find(|s| under(s))
+        .or_else(|| {
+            LAUNCHER_DESTS
+                .iter()
+                .copied()
+                .find(|s| dest == Path::new(s) || under(s))
+        });
+    if let Some(s) = shadowing {
+        return Some(Nesting::Shadowed(s));
+    }
+    let inside: Vec<&'static str> = STRUCTURAL_DESTS
+        .iter()
+        .chain(LAUNCHER_DESTS)
+        .copied()
+        .filter(|s| Path::new(s) != dest && Path::new(s).starts_with(dest))
+        .collect();
+    // One inside another of them is mounted over sbx's own mount, not over the bind.
+    let outermost: Vec<&'static str> = inside
+        .iter()
+        .copied()
+        .filter(|s| !inside.iter().any(|o| o != s && Path::new(s).starts_with(o)))
+        .collect();
+    (!outermost.is_empty()).then_some(Nesting::Contains(outermost))
+}
+
+/// How many of the mounts a bind contains its note names before counting the rest: a bind of `/`
+/// contains every one of them, and these notes reach `sbx config show`'s compact view.
+const NAMED_MOUNTS: usize = 3;
+
+/// `paths` as a note lists them: each in backquotes, the first [`NAMED_MOUNTS`] by name and the
+/// rest as a count. Pure.
+fn named_mounts(paths: &[&str]) -> String {
+    let named: Vec<String> = paths
+        .iter()
+        .take(NAMED_MOUNTS)
+        .map(|p| format!("`{p}`"))
+        .collect();
+    match (named.split_last(), paths.len().saturating_sub(NAMED_MOUNTS)) {
+        (None, _) => String::new(),
+        (Some((last, [])), 0) => last.clone(),
+        (Some((last, rest)), 0) => format!("{} and {last}", rest.join(", ")),
+        (Some(_), more) => format!("{} and {more} more", named.join(", ")),
+    }
 }
 
 /// Whether a config bind at canonical `dest` is what the cage finds at that path, or `false` when a
@@ -313,8 +344,8 @@ pub(crate) fn structural_nesting_warning(
              mask: those are applied after the project rather than before it"
         ));
     }
-    structural_nesting_conflict(dest).map(|(structural, nesting)| match nesting {
-        Nesting::Shadowed => {
+    structural_nesting_conflict(dest).map(|nesting| match nesting {
+        Nesting::Shadowed(structural) => {
             // A `/dev/*` path is the common case worth steering: a plain bind of a device node is
             // both shadowed here *and* (were it not) `nodev` — visible but unusable. `[devices]` is
             // the field that actually exposes a host device with device access.
@@ -328,17 +359,31 @@ pub(crate) fn structural_nesting_warning(
                  over it, so the bind is shadowed and will not appear inside{dev_hint}"
             )
         }
-        Nesting::Contains => {
-            let write_note = if writable {
-                " — and being read-write, the cage can write through to the host files around it"
-            } else {
-                ""
+        Nesting::Contains(inside) => {
+            let around = |what: &str| {
+                if writable {
+                    format!(
+                        " — and being read-write, the cage can write through to the host files \
+                         around {what}"
+                    )
+                } else {
+                    String::new()
+                }
             };
-            format!(
-                "bind `{shown}` contains the sandbox's own mount `{structural}` — the cage mounts that \
-                 path over part of it, so `{structural}` inside the cage is sbx's, not your \
-                 bind's{write_note}"
-            )
+            match inside.as_slice() {
+                [structural] => format!(
+                    "bind `{shown}` contains the sandbox's own mount `{structural}` — the cage \
+                     mounts that path over part of it, so `{structural}` inside the cage is sbx's, \
+                     not your bind's{}",
+                    around("it"),
+                ),
+                _ => format!(
+                    "bind `{shown}` contains the sandbox's own mounts {} — the cage mounts those \
+                     paths over parts of it, so inside the cage they are sbx's, not your bind's{}",
+                    named_mounts(&inside),
+                    around("them"),
+                ),
+            }
         }
     })
 }
