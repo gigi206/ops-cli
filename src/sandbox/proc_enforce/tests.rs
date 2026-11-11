@@ -3217,6 +3217,38 @@ fn a_parked_decision_times_out_while_the_cage_keeps_the_receive_loop_busy() {
     );
 }
 
+/// A parked `execve` the cage named with spaces, `=` and `path=` in it, a newline among them, still
+/// lists as the one row it is, carrying its own id and pid. The server writes three numbers, then
+/// the path, sanitised on its way into the registry and last on the row, and the reader takes the
+/// path whole after the first `path=`, so nothing the cage names reaches the head.
+#[test]
+fn a_parked_path_spelling_fields_lists_as_one_row_with_its_own_numbers() {
+    use std::os::fd::AsRawFd as _;
+    let dir = TmpDir::new();
+    let socket = dir.join("ask.sock");
+    let pending = std::sync::Arc::new(PendingExec::new());
+    // `park` keeps a copy of the descriptor it is given and nothing here answers through it, so any
+    // open descriptor stands in for the listener.
+    let stand_in = std::fs::File::open("/dev/null").expect("open a stand-in descriptor");
+    let path = "/tmp/a b=c path=/bin/sh id=9 pid=1\npending id=5 pid=1 waiting=0 path=/x";
+    pending.park(stand_in.as_raw_fd(), 42, 4242, path);
+    let listener = UnixListener::bind(&socket).expect("bind the control socket");
+    let served = pending.clone();
+    std::thread::spawn(move || {
+        let _ = crate::sandbox::proc_control::serve_enforced(
+            listener,
+            std::sync::Arc::new(crate::sandbox::proc_control::ExecRing::new(4)),
+            served,
+            std::sync::Arc::new(ProcOverlay::new()),
+            ProcMode::Ask,
+        );
+    });
+    let rows = crate::sandbox::proc_control::read_pending(&socket).expect("the listing");
+    assert_eq!(rows.len(), 1, "one park, one row: {rows:?}");
+    assert_eq!((rows[0].id, rows[0].pid), (42, 4242), "{rows:?}");
+    assert_eq!(rows[0].path, crate::sandbox::sanitize(path));
+}
+
 /// A parked `execve` answers through a descriptor of its own, not through the supervisor's.
 ///
 /// [`PendingExec::answer`] takes an entry out of the registry and answers it after releasing the
