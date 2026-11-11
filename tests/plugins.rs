@@ -1221,6 +1221,27 @@ fn an_escape_in_a_refusal_or_an_environment_value_is_written_as_text() {
     }
 }
 
+/// A configured store whose configuration cannot be read is said by the JSON listing as by the
+/// human one, rather than left out of the document without a word.
+#[test]
+fn the_json_store_listing_says_a_store_it_cannot_read() {
+    let home = TmpDir::new("plugins");
+    let store = home.path().join("sbx/stores/mine");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("store.toml"), "not toml at all [").unwrap();
+    for args in [
+        &["plugins", "store", "list"][..],
+        &["plugins", "store", "list", "--json"],
+    ] {
+        let (_code, out, err) = run_both(args, home.path());
+        assert!(
+            err.contains("store 'mine'") && err.contains("malformed"),
+            "`sbx {}` says the store it cannot read:\nstdout:\n{out}stderr:\n{err}",
+            args.join(" ")
+        );
+    }
+}
+
 #[test]
 fn a_scheme_claimed_twice_disables_every_claimant_until_one_remains() {
     let home = TmpDir::new("plugins");

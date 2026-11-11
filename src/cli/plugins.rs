@@ -2002,8 +2002,14 @@ fn plugins_store_list(only_installed: bool, only_store: Option<&str>, json: bool
     if json {
         let mut stores_out: Vec<serde_json::Value> = Vec::new();
         for name in &names {
-            let Ok(cfg) = stores::read_configured(layout, name) else {
-                continue;
+            // Said as the human listing says it: a configured store that leaves the document
+            // without a word reads as one that is not configured.
+            let cfg = match stores::read_configured(layout, name) {
+                Ok(cfg) => cfg,
+                Err(why) => {
+                    diag::warn(&format!("store '{name}': {why}"));
+                    continue;
+                }
             };
             let catalogue = stores::cached_catalogue(layout, name);
             let entries: Vec<serde_json::Value> = match &catalogue {
