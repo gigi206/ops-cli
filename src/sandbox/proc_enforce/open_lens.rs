@@ -5,7 +5,9 @@
 //! counterpart of [`crate::open_policy`], which holds the matching itself.
 //!
 //! Everything here is per launch. The scan cache and the remembered mount sets hang off
-//! [`OpenLens`], so two sessions never share a verdict formed against another's patterns.
+//! [`OpenLens`], so two sessions never share a verdict formed against another's patterns. The one
+//! process-wide fact is [`OPENAT2_UNAVAILABLE`]: whether the kernel offers `openat2` is the same
+//! for every launch the process runs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -66,7 +68,10 @@ pub(super) fn open_name(
             Err(_) => {
                 // Once: a cage that keeps naming them would otherwise fill the session's output
                 // with the same line, and it is the same line every time.
-                if !UNNAMEABLE_OPEN_SAID.swap(true, Ordering::Relaxed) {
+                if !undecidable
+                    .unnameable_open_said
+                    .swap(true, Ordering::Relaxed)
+                {
                     crate::diag::warn(
                         "an open named a path that is not valid UTF-8, and the content lens \
                          resolves, scans and serves by name — so it was refused rather than \
@@ -89,10 +94,6 @@ pub(super) fn open_name(
     }
     OpenName::Unreadable
 }
-
-/// Set once an open has been refused for naming a path this supervisor cannot carry, so a cage that
-/// keeps doing it pays one line for the session rather than one per open.
-static UNNAMEABLE_OPEN_SAID: AtomicBool = AtomicBool::new(false);
 
 /// Decide one notified open and answer it, from the syscall's own arguments.
 ///

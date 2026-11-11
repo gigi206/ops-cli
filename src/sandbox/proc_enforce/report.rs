@@ -50,6 +50,11 @@ pub(super) struct Undecidable {
     pub(super) open: AtomicU64,
     /// An `execve` whose calling program could not be read, or is not a name a policy can hold.
     pub(super) caller: AtomicU64,
+    /// Set once an open has been refused for naming a path this supervisor cannot carry, so a cage
+    /// that keeps doing it pays one line for the run rather than one per open. Kept per supervisor
+    /// rather than per process: one process can run several at once, a session's and its tasks',
+    /// and each cage is owed its own line.
+    pub(super) unnameable_open_said: std::sync::atomic::AtomicBool,
 }
 
 impl Undecidable {

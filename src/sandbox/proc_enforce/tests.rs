@@ -5043,6 +5043,35 @@ fn a_descriptor_the_caller_holds_is_refused_as_something_that_is_there() {
     panic!("no pair of descriptor numbers stayed closed in this process long enough to measure");
 }
 
+/// The line an open refused for its name earns is said once per supervisor, not once per
+/// process: a session and its tasks run their supervisors side by side, and the first to meet such
+/// an open must not leave the others silent.
+#[test]
+fn each_supervisor_says_once_that_it_refused_an_open_it_could_not_name() {
+    let me = std::process::id();
+    let name = b"p\xff\0";
+    for parts in [DecidingParts::with_lens(), DecidingParts::with_lens()] {
+        assert!(
+            !parts
+                .undecidable
+                .unnameable_open_said
+                .load(Ordering::Relaxed),
+            "a supervisor starts with nothing said"
+        );
+        assert!(matches!(
+            open_name(true, &parts.undecidable, me, name.as_ptr() as u64, None),
+            OpenName::Unusable
+        ));
+        assert!(
+            parts
+                .undecidable
+                .unnameable_open_said
+                .load(Ordering::Relaxed),
+            "this supervisor has said it"
+        );
+    }
+}
+
 #[test]
 fn an_open_the_lens_cannot_name_is_counted_because_it_leaves_nothing_else_behind() {
     // Unlike an exec, an open the lens could not name leaves no trace at all: this lens records
