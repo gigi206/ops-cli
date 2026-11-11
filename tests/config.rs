@@ -137,7 +137,8 @@ fn reorders(c: char) -> bool {
 fn config_show_writes_what_a_config_chose_as_text_that_drives_nothing() {
     // `config show` is how a project's file is read before anyone approves it, so each value below
     // carries its own tag and a right-to-left override, and the ones no gate refuses an escape
-    // sequence and a line break as well. The app comes from the untrusted project, the rest from
+    // sequence and a line break as well. The header name is the exception, a plain one: it is held
+    // to the HTTP token, which refuses both. The app comes from the untrusted project, the rest from
     // the global config, where the gates that let a reordering character through are the ones
     // that decide.
     let fx = Project::new("cfg");
@@ -160,7 +161,7 @@ allow = ["https://api.github.com/F07RLO"]
 
 [secret."api.github.com"]
 from   = "env://GH_TOKEN"
-header = "X-F12RLO"
+header = "X-Probe"
 type   = "bearer"
 prefix = "F13RLO "
 
@@ -217,7 +218,6 @@ F10 = "F10RLO"
         "F06",
         "F07",
         "F11",
-        "F12",
         "F13",
     ] {
         assert!(
@@ -3287,14 +3287,14 @@ description = "the task's own token"
 
 #[test]
 fn the_secret_inventory_writes_what_a_config_chose_as_text_that_drives_nothing() {
-    // A header name passes a gate that refuses control characters but not one that reorders a
-    // line, and a `file://` or `sops://` path passes no gate at all: each is the config's to spell,
-    // for a launch-wide credential, a task's environment and a task's injection alike.
+    // A `file://` or `sops://` path passes no gate at all: it is the config's to spell, for a
+    // launch-wide credential and a task's environment alike. A header name is held to the HTTP
+    // token, which admits neither kind of character, so the headers here are plain ones.
     let fx = Project::new("cfg");
     fx.write_global(
         &r#"[secret."api.example.com"]
 from   = "file:///S01\u001b[7m\nforgedRLO"
-header = "X-S02RLO"
+header = "X-Probe"
 type   = "bearer"
 
 [task.probe]
@@ -3306,7 +3306,7 @@ PROBE_TOKEN = "sops:///S03RLO.yaml"
 
 [task.probe.inject."api.github.com"]
 from   = "env://GH_TOKEN"
-header = "X-S04RLO"
+header = "X-Probe"
 type   = "bearer"
 "#
         .replace("RLO", "\\u202eX"),
@@ -3327,7 +3327,7 @@ type   = "bearer"
         "the inventory wrote a character that drives the terminal:\n{stdout:?}"
     );
     // Escaped, not dropped, as `config show` writes the same values.
-    for tag in ["S01\\x1b[7m\\x0aforged", "S02", "S03", "S04"] {
+    for tag in ["S01\\x1b[7m\\x0aforged", "S03"] {
         assert!(
             stdout.contains(&format!("{tag}\\u{{202e}}X")),
             "`{tag}` is not shown escaped:\n{stdout}"
@@ -3336,7 +3336,13 @@ type   = "bearer"
 
     // The machine document is not a terminal: it keeps the bytes the config holds.
     let doc = common::json_of(&fx.run_ok(&["secret", "list", "--json"]));
-    assert_eq!(doc["credentials"][0]["headers"][0], "X-S02\u{202e}X");
+    let source = doc["credentials"][0]["sources"][0]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        source.contains("S01\u{1b}[7m\nforged\u{202e}X"),
+        "the document keeps the source as the config spells it: {source:?}"
+    );
 }
 
 #[test]
