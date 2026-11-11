@@ -191,12 +191,15 @@ fn a_failure_is_named_by_what_the_unpack_said_or_how_it_ended() {
         "a layer's unpack was killed by signal 9"
     );
     let long = vec![b'x'; MESSAGE_MAX + 10];
-    let cut = outcome(&ended(exited(1), b"", &long)).expect_err("a long refusal");
+    let cut = outcome(&ended(exited(1), b"", &long))
+        .expect_err("a long refusal")
+        .to_string();
+    // The end of the message is what is asserted, so it is what a failure shows, however short the
+    // message turned out to be.
+    let tail = cut.get(cut.len().saturating_sub(40)..).unwrap_or(&cut);
     assert!(
-        cut.to_string()
-            .ends_with(&format!("[cut at {MESSAGE_MAX} bytes]")),
-        "{}",
-        &cut.to_string()[MESSAGE_MAX - 10..]
+        cut.ends_with(&format!("[cut at {MESSAGE_MAX} bytes]")),
+        "{tail}"
     );
 }
 
@@ -602,7 +605,9 @@ fn no_production_code_applies_a_layer_outside_the_unpacks_process() {
         if crate::testutil::is_test_only_source(&file) || test_only.contains(&file) {
             continue;
         }
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let Some(text) = crate::testutil::read_listed(&file) else {
+            continue;
+        };
         let production = crate::testutil::production_half(&text);
         let relative = file.display().to_string().replacen(&root, "", 1);
         if crate::testutil::calls_function(&production, "layers::apply(") {
