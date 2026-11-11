@@ -482,7 +482,19 @@ fn read_within(socket: &Path, cmd: &str, timeout: Duration) -> io::Result<Vec<St
 }
 
 /// Connect to a session's control socket and send it one command line, both under `timeout`.
+///
+/// A command carrying a control character is refused before anything is sent. The server reads one
+/// line, so a newline in a `REMEMBER` rule would end the command early, load the part before it as
+/// a rule of its own and answer `ok`, and the caller would report the whole rule loaded. The rule
+/// grammar every caller admits rules through refuses one already ([`proc_policy::validate_rule`]);
+/// this keeps the wire from depending on that.
 fn send(socket: &Path, cmd: &str, timeout: Duration) -> io::Result<UnixStream> {
+    if cmd.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a control command must not contain control characters",
+        ));
+    }
     let stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
@@ -737,6 +749,25 @@ mod tests {
 
         let tail = read_exec_log(&socket, Some(1)).unwrap();
         assert_eq!(tail.events.iter().map(|e| e.seq).collect::<Vec<_>>(), [2]);
+    }
+
+    /// A rule that would not reach the server as one line is never sent. The socket here does not
+    /// exist, so a rule that got as far as the connect fails there instead, with `NotFound`.
+    #[test]
+    fn a_rule_carrying_a_control_character_is_refused_before_it_is_sent() {
+        let dir = crate::testutil::TmpDir::new();
+        let socket = dir.join("absent.sock");
+        for rule in ["curl\nsh", "curl\rsh", "curl\u{1b}sh"] {
+            let e = inject_proc_rule(&socket, Verdict::Deny, rule)
+                .expect_err("a rule with a control character must not load");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{rule:?}: {e}");
+        }
+        let e = inject_proc_rule(&socket, Verdict::Deny, "curl").expect_err("no socket");
+        assert_eq!(
+            e.kind(),
+            io::ErrorKind::NotFound,
+            "a clean rule goes as far as the connect"
+        );
     }
 
     #[test]
