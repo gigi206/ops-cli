@@ -73,14 +73,18 @@ pub(crate) struct ExecEvent {
 /// control characters to **spaces**, so it turns a newline into exactly the separator that breaks
 /// the head.
 ///
-/// Two characters cannot appear in a head token, so those two are replaced. It costs fidelity on a
+/// Whitespace and `=` cannot appear in a head token, so they are replaced. It costs fidelity on a
 /// legitimate path containing a space — which the head parse could not carry either way, and which
-/// used to drop the event rather than render it oddly.
+/// used to drop the event rather than render it oddly. Every other control character is replaced
+/// too: a head token is printed as well as parsed, and an escape kept here would drive the terminal
+/// that reads `sbx proc logs`. What reaches this through [`ExecRing::push_verdict`] is sanitised
+/// first, so on that path nothing is left for it to catch; it is what makes the token safe on its
+/// own, whatever is handed to it.
 fn head_token(value: &str) -> String {
     value
         .chars()
         .map(|c| {
-            if c.is_whitespace() || c == '=' {
+            if c.is_whitespace() || c == '=' || c.is_control() {
                 '_'
             } else {
                 c
@@ -576,6 +580,18 @@ mod tests {
             "a control character in the caller must not become a head separator"
         );
         assert_eq!(snap.events[1].command, "/usr/bin/gi t");
+    }
+
+    /// A head token is safe on its own, not only after the sanitiser: a control character that is
+    /// not whitespace (an escape, a bell, DEL) breaks no parse, so only this rule keeps it from the
+    /// terminal that prints the token.
+    #[test]
+    fn a_head_token_carries_no_control_character() {
+        assert_eq!(
+            head_token("/bin/\u{1b}[2Jba\u{7}sh\u{7f}"),
+            "/bin/_[2Jba_sh_"
+        );
+        assert_eq!(head_token("a b=c\nd"), "a_b_c_d");
     }
 
     /// The head is parsed as `split_whitespace()` then `split_once('=')`, with the field closure
