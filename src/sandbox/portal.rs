@@ -88,8 +88,9 @@ pub(crate) const CAGE_DIR: &str = "/run/sbx-portal";
 /// [`HostDir::socket`] on the host.
 const CAGE_SOCK: &str = "/run/sbx-portal/bus";
 
-/// The host directory bind-mounted into the cage at [`CAGE_DIR`]. Per-launch (the pid keeps
-/// concurrent launches from colliding), under `<data>/portal`.
+/// The host directory bind-mounted into the cage at [`CAGE_DIR`], under `<data>/portal`, named by
+/// the launcher pid alone: `sbx gc` reads the pid off the name to sweep a dead launch's directory.
+/// Two launches of one process would name the same directory, which [`HostDir::create`] refuses.
 fn host_dir(layout: &Layout) -> PathBuf {
     layout
         .data_dir()
@@ -103,6 +104,9 @@ fn host_dir(layout: &Layout) -> PathBuf {
 /// relay attached to it) must be cleaned up when the launch ends rather than leaked by an exec.
 pub(crate) struct HostDir {
     dir: PathBuf,
+    /// This process's hold on `dir`, given back once `Drop` has removed it: a field drops after
+    /// the body of `Drop::drop`.
+    _live: super::launchdir::LiveDir,
 }
 
 impl HostDir {
@@ -114,6 +118,9 @@ impl HostDir {
     /// inside included, and makes it again, never adopting what sits at the name. A failure is
     /// returned rather than the directory reused as found, so the launch runs without a portal
     /// rather than in a directory that is not its own.
+    ///
+    /// A second launch of this process is refused while the first holds the directory
+    /// ([`super::launchdir::LiveDir`]), rather than emptying the first's bus socket from under it.
     pub(crate) fn create(layout: &Layout) -> io::Result<HostDir> {
         use std::os::unix::fs::PermissionsExt;
         let dir = host_dir(layout);
@@ -124,8 +131,9 @@ impl HostDir {
                 .create(parent)?;
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
+        let live = super::launchdir::LiveDir::take(&dir)?;
         super::launchdir::fresh_dir(&dir)?;
-        Ok(HostDir { dir })
+        Ok(HostDir { dir, _live: live })
     }
 
     /// The host path of the directory, to bind into the cage at [`CAGE_DIR`].
@@ -730,7 +738,7 @@ mod tests {
     fn host_dir_is_per_launch_and_the_socket_sits_under_it() {
         let layout = Layout::under(Path::new("/data"));
         let dir = host_dir(&layout);
-        // under <data>/portal, keyed by pid so concurrent launches never collide
+        // under <data>/portal, named by the pid alone, which `sbx gc` reads
         assert!(dir.starts_with(Path::new("/data").join("portal")));
         assert_eq!(
             dir.file_name().unwrap().to_string_lossy(),
@@ -756,6 +764,29 @@ mod tests {
         }
         // dropped → removed
         assert!(!path.exists());
+    }
+
+    /// A second launch of this process is refused the portal directory while the first holds it,
+    /// rather than emptying the first's bus socket from under it, and admitted once the first has
+    /// ended. The name is the pid alone, which `sbx gc` reads.
+    #[test]
+    fn a_second_launch_of_the_process_is_refused_the_portal_directory_while_the_first_holds_it() {
+        let tmp = crate::testutil::TmpDir::new();
+        let layout = Layout::under(tmp.path());
+        let first = HostDir::create(&layout).expect("create host dir");
+        std::fs::write(first.socket(), b"").unwrap();
+
+        let e = HostDir::create(&layout)
+            .err()
+            .expect("a second launch is refused");
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+        assert!(
+            first.socket().exists(),
+            "the first launch's socket is left alone"
+        );
+        drop(first);
+        let second = HostDir::create(&layout).expect("admitted once the first has ended");
+        drop(second);
     }
 
     /// A portal directory already at the launch's name is a dead predecessor's, whose cage could
