@@ -21,7 +21,7 @@
 //! by the reader; the observer sanitises it of control characters, so it can never inject a second
 //! line.
 
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -354,9 +354,12 @@ pub(crate) fn read_pending(socket: &Path) -> io::Result<Vec<ParkedView>> {
 }
 
 /// [`read_pending`] under a caller-chosen deadline — see [`GLANCE_TIMEOUT`].
+///
+/// A session that answers `err …` fails the read ([`read_within`]): an observing session serves
+/// `LOG` alone, and its refusal is not a list of nothing parked.
 pub(crate) fn read_pending_within(socket: &Path, timeout: Duration) -> io::Result<Vec<ParkedView>> {
     let mut out = Vec::new();
-    for line in read_within(socket, "LIST", timeout)? {
+    for line in read_within(socket, "LIST", timeout, PARKED_ANSWER_MAX)? {
         if let Some(p) = parse_pending_line(&line) {
             out.push(p);
         }
@@ -365,26 +368,40 @@ pub(crate) fn read_pending_within(socket: &Path, timeout: Duration) -> io::Resul
 }
 
 /// Decide one parked `execve` by its notification id (`ALLOW <id>` / `DENY <id>`). Returns the exec
-/// path that was decided, or `None` if the id was unknown (already answered / timed out).
+/// path that was decided, or `None` if the session holds no such id (already answered / timed out).
+///
+/// Only `err not-found` means that. Any other `err …` is a session that refused the verb, an
+/// observing one among them, and is an error ([`super::reply::refused`]); so is an answer that did
+/// not arrive whole ([`answer_line`]), after which the exec may or may not have been decided. Read
+/// as an unknown id, either one told the user the exec had been decided or had timed out.
 pub(crate) fn answer_pending(socket: &Path, id: u64, allow: bool) -> io::Result<Option<String>> {
     let verb = if allow { "ALLOW" } else { "DENY" };
-    let reply = query(socket, &format!("{verb} {id}"))?;
-    let line = reply.lines().next().unwrap_or("");
-    if let Some(path) = line.strip_prefix("ok path=") {
-        Ok(Some(path.to_string()))
-    } else {
-        Ok(None)
+    let line = answer_line(socket, &format!("{verb} {id}"))?;
+    match line.strip_prefix("ok path=") {
+        Some(path) => Ok(Some(path.to_string())),
+        None if line == "err not-found" => Ok(None),
+        None => Err(super::reply::refused(&line)),
     }
 }
 
-/// Decide every parked `execve` on a session at once (`ALLOW *` / `DENY *`). Returns each decided path.
+/// Decide every parked `execve` on a session at once (`ALLOW *` / `DENY *`). Returns each decided
+/// path, none when nothing was parked.
+///
+/// The answer is taken whole ([`read_within`]): a server's `err …` is an error, the refusal of a
+/// session that does not decide, rather than nothing decided, and an answer cut before its `ok` is
+/// an error too. By then some of the parked `execve`s may have been decided, so the caller cannot
+/// say which, and says that, rather than list the paths that arrived as all there were.
 pub(crate) fn answer_all_pending(socket: &Path, allow: bool) -> io::Result<Vec<String>> {
     let verb = if allow { "ALLOW" } else { "DENY" };
-    let reply = query(socket, &format!("{verb} *"))?;
-    Ok(reply
-        .lines()
-        .filter_map(|l| l.strip_prefix("answered path=").map(str::to_string))
-        .collect())
+    Ok(read_within(
+        socket,
+        &format!("{verb} *"),
+        QUERY_TIMEOUT,
+        PARKED_ANSWER_MAX,
+    )?
+    .into_iter()
+    .filter_map(|l| l.strip_prefix("answered path=").map(str::to_string))
+    .collect())
 }
 
 /// The outcome of loading a `--session` rule into a running session's overlay.
@@ -401,7 +418,8 @@ pub(crate) enum InjectOutcome {
 
 /// Load a live `--session` rule into one session's overlay (`REMEMBER ALLOW|DENY <rule>`). A session
 /// whose socket is absent (not enforcing, or a dead/stale launch) fails the connect, which the caller
-/// distinguishes from a refusal.
+/// distinguishes from a refusal. So does an answer that did not arrive whole ([`answer_line`]): the
+/// rule may have been loaded before it was cut, and a refusal would say it is not in force.
 pub(crate) fn inject_proc_rule(
     socket: &Path,
     verdict: Verdict,
@@ -412,8 +430,7 @@ pub(crate) fn inject_proc_rule(
     } else {
         "ALLOW"
     };
-    let reply = query(socket, &format!("REMEMBER {verb} {rule}"))?;
-    let first = reply.lines().next().unwrap_or("");
+    let first = answer_line(socket, &format!("REMEMBER {verb} {rule}"))?;
     Ok(if first == "ok" {
         InjectOutcome::Loaded
     } else if first == "err inert" {
@@ -431,10 +448,14 @@ pub(crate) struct OverlayRule {
 }
 
 /// List a session's live `--session` overlay rules (`RULES`). An absent socket (not enforcing / dead)
-/// fails the connect, distinguished from an empty overlay.
+/// fails the connect, distinguished from an empty overlay, and a session answering `err …` fails the
+/// read ([`read_within`]).
+///
+/// This answer has no ceiling of its own: the overlay holds every rule the host loaded into it, as
+/// many as were loaded, so any bound would be one a real listing could run past.
 pub(crate) fn read_overlay_rules(socket: &Path) -> io::Result<Vec<OverlayRule>> {
     let mut out = Vec::new();
-    for line in read_within(socket, "RULES", QUERY_TIMEOUT)? {
+    for line in read_within(socket, "RULES", QUERY_TIMEOUT, u64::MAX)? {
         if let Some(rest) = line.strip_prefix("rule allow ") {
             out.push(OverlayRule {
                 verdict: "allow",
@@ -460,25 +481,66 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// because a menu that is one item short is better than a prompt that stalls.
 pub(crate) const GLANCE_TIMEOUT: Duration = Duration::from_millis(150);
 
-/// Send one command line to a session's control socket and return the full reply text.
-fn query(socket: &Path, cmd: &str) -> io::Result<String> {
-    query_within(socket, cmd, QUERY_TIMEOUT)
+/// The decimal digits of the largest `u64`, and of the largest `u32`: the widest a number on a
+/// `pending` row can be written.
+const U64_DIGITS: usize = u64::MAX.ilog10() as usize + 1;
+const U32_DIGITS: usize = u32::MAX.ilog10() as usize + 1;
+
+/// The longest line the server of this socket writes about a parked `execve`, and so the longest it
+/// writes at all ([`dispatch_enforced`]). Of the three shapes, a `LIST` row is the longest: three
+/// numbers ahead of the path, where the `ok path=` of an answer by id and the `answered path=` of
+/// `ALLOW *` carry the path alone. The path is sanitised on its way into the registry, so it holds at
+/// most [`SANITIZED_CHARS`](super::SANITIZED_CHARS) characters, of four bytes each at most.
+const LINE_MAX: usize = "pending id= pid= waiting= path=\n".len()
+    + 2 * U64_DIGITS
+    + U32_DIGITS
+    + 4 * super::SANITIZED_CHARS;
+
+/// The most an answer about the parked `execve`s can hold: a line for each of the most a session
+/// parks at once ([`super::proc_enforce::ASK_PENDING_CAP`]), then its `ok`. A reader stops there, so
+/// an answer that runs on is read as one cut short ([`super::reply`]) and never held in full.
+const PARKED_ANSWER_MAX: u64 =
+    (super::proc_enforce::ASK_PENDING_CAP * LINE_MAX + "ok\n".len()) as u64;
+
+/// Send `cmd` and read the one line a verb that acts is answered with, at most [`LINE_MAX`] bytes.
+///
+/// A line that ends before its newline is an [`io::ErrorKind::UnexpectedEof`] error, which
+/// [`super::reply::unanswered`] counts: the session closed before it had answered, or wrote a line
+/// past the longest it writes. Either way it was reached and its answer did not arrive whole, so
+/// what the verb did is not known, and a caller says so rather than read the fragment as a refusal.
+/// The line is read as bytes and decoded only once whole, for the reason [`super::reply::answer`]
+/// does: a cut inside a character is a cut, not a decode error no caller counts as one.
+fn answer_line(socket: &Path, cmd: &str) -> io::Result<String> {
+    let stream = send(socket, cmd, QUERY_TIMEOUT)?;
+    let mut line = Vec::new();
+    BufReader::new((&stream).take(LINE_MAX as u64)).read_until(b'\n', &mut line)?;
+    match line.strip_suffix(b"\n") {
+        Some(whole) => Ok(String::from_utf8_lossy(whole).into_owned()),
+        None => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the session's answer ended before its line did",
+        )),
+    }
 }
 
-/// [`query`] under a caller-chosen deadline, for a caller that would rather come back empty
-/// than wait.
-fn query_within(socket: &Path, cmd: &str, timeout: Duration) -> io::Result<String> {
+/// Send `cmd` and take its answer whole ([`super::reply`]): the lines before the closing `ok`, read
+/// from at most `most` bytes. An answer cut before its `ok`, or one running past `most`, is an error a
+/// caller tells from an empty answer.
+///
+/// So is a server's `err …` line ([`super::reply::refused`]). An observing session serves `LOG`
+/// alone and refuses every other verb with one, and a refusal read as a whole answer listed nothing
+/// parked, no rule loaded, and nothing decided.
+fn read_within(socket: &Path, cmd: &str, timeout: Duration, most: u64) -> io::Result<Vec<String>> {
     let stream = send(socket, cmd, timeout)?;
-    let mut reply = String::new();
-    BufReader::new(&stream).read_to_string(&mut reply)?;
-    Ok(reply)
-}
-
-/// [`query_within`] for a verb that only reads: the lines before the closing `ok`, and an answer
-/// cut before it as an error ([`super::reply`]).
-fn read_within(socket: &Path, cmd: &str, timeout: Duration) -> io::Result<Vec<String>> {
-    let stream = send(socket, cmd, timeout)?;
-    super::reply::answer(BufReader::new(&stream)).collect()
+    let mut lines = Vec::new();
+    for line in super::reply::answer(BufReader::new((&stream).take(most))) {
+        let line = line?;
+        if line.starts_with("err ") {
+            return Err(super::reply::refused(&line));
+        }
+        lines.push(line);
+    }
+    Ok(lines)
 }
 
 /// Connect to a session's control socket and send it one command line, the connect and the write
@@ -816,6 +878,181 @@ mod tests {
             );
         }
         drop(listener);
+    }
+
+    /// Bind `socket`, take one connection, read its command line, write `wire` and close: a session
+    /// whose answer is exactly those bytes. Both directions are bounded, so a reader that never sends
+    /// its command, or stops reading, ends the stand-in rather than holding it.
+    fn answer_once(socket: &Path, wire: Vec<u8>) -> std::thread::JoinHandle<()> {
+        let listener = UnixListener::bind(socket).expect("bind the stand-in session");
+        std::thread::spawn(move || {
+            if let Ok((conn, _)) = listener.accept() {
+                let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
+                let mut command = String::new();
+                let _ = BufReader::new(&conn).read_line(&mut command);
+                let _ = (&conn).write_all(&wire);
+            }
+        })
+    }
+
+    /// Ask a stand-in session answering `wire` through `read`, one connection each.
+    fn ask_once<T>(
+        socket: &Path,
+        wire: &[u8],
+        read: impl Fn(&Path) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let _ = std::fs::remove_file(socket);
+        let session = answer_once(socket, wire.to_vec());
+        let got = read(socket);
+        session.join().expect("the stand-in session");
+        got
+    }
+
+    /// An observing session serves `LOG` alone and answers every other verb `err bad-request`. Read as
+    /// a whole answer, that refusal listed nothing parked and no rule, decided nothing for `*`, and
+    /// made an id unknown, "already decided or timed out". Each reader fails on it now, with an error
+    /// that is not a cut, so a listing passes over the session and a decision says why none was made.
+    #[test]
+    fn an_observing_session_refuses_the_ask_verbs_rather_than_answering_none() {
+        use crate::testutil::TmpDir;
+        let dir = TmpDir::new();
+        let socket = dir.join("observe.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let ring = Arc::new(ExecRing::new(10));
+        std::thread::spawn(move || {
+            let _ = serve(listener, ring);
+        });
+        type Reader = fn(&Path) -> io::Result<()>;
+        let readers: [(&str, Reader); 4] = [
+            ("LIST", |s| read_pending(s).map(drop)),
+            ("RULES", |s| read_overlay_rules(s).map(drop)),
+            ("ALLOW <id>", |s| answer_pending(s, 1, true).map(drop)),
+            ("ALLOW *", |s| answer_all_pending(s, true).map(drop)),
+        ];
+        for (verb, read) in readers {
+            match read(&socket) {
+                Ok(()) => panic!("{verb}: an observing session's refusal read as an answer"),
+                Err(e) => {
+                    assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{verb}: {e}");
+                    assert!(
+                        !crate::sandbox::reply::unanswered(&e),
+                        "{verb}: a refusal is not a cut"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A verb that acts may have acted by the time its answer is cut. Read at face value, a cut
+    /// answer to `ALLOW <id>` made the id unknown, one to `ALLOW *` listed the paths that happened to
+    /// arrive as all there were, and one to `REMEMBER` was a refusal: each a claim about what the
+    /// session did that it never made. Each is an error [`super::super::reply::unanswered`] counts
+    /// now, and a whole answer reads as it did.
+    #[test]
+    fn a_decision_whose_answer_is_cut_is_not_read_as_made_or_refused() {
+        use crate::testutil::TmpDir;
+        type Ask = fn(&Path) -> io::Result<String>;
+        let by_id: Ask = |s| answer_pending(s, 7, true).map(|p| format!("{p:?}"));
+        let all: Ask = |s| answer_all_pending(s, true).map(|p| format!("{p:?}"));
+        let load: Ask = |s| inject_proc_rule(s, Verdict::Deny, "curl").map(|o| format!("{o:?}"));
+        let dir = TmpDir::new();
+        let socket = dir.join("answer.sock");
+        for (wire, read, want) in [
+            (&b"ok path=/bin/sh\n"[..], by_id, r#"Some("/bin/sh")"#),
+            (&b"err not-found\n"[..], by_id, "None"),
+            (&b"answered path=/bin/sh\nok\n"[..], all, r#"["/bin/sh"]"#),
+            (&b"ok\n"[..], all, "[]"),
+            (&b"ok\n"[..], load, "Loaded"),
+            (&b"err inert\n"[..], load, "Inert"),
+            (&b"err bad-request\n"[..], load, "Refused"),
+        ] {
+            let got = ask_once(&socket, wire, read);
+            assert_eq!(
+                got.as_deref().map_err(io::Error::kind),
+                Ok(want),
+                "a whole answer {wire:?}"
+            );
+        }
+        for (wire, read) in [
+            (&b""[..], by_id),
+            (&b"ok path=/bin/sh"[..], by_id),
+            (&b""[..], all),
+            (&b"answered path=/bin/sh\n"[..], all),
+            (&b""[..], load),
+            (&b"o"[..], load),
+        ] {
+            let got = ask_once(&socket, wire, read);
+            assert!(
+                got.as_ref().is_err_and(crate::sandbox::reply::unanswered),
+                "a cut answer {wire:?} read as {got:?}"
+            );
+        }
+    }
+
+    /// A reader takes no more of an answer than a session can write, so one that runs on is read as
+    /// cut and never held whole. The bound comes from the server's own limits: a row for each
+    /// `execve` it can park at once, each as long as a sanitised path makes it. So a full answer of
+    /// the longest rows is still read whole, and one twice as long is not.
+    #[test]
+    fn an_answer_is_read_up_to_the_longest_a_session_writes_and_no_further() {
+        use crate::sandbox::proc_enforce::ASK_PENDING_CAP;
+        use crate::testutil::TmpDir;
+        let dir = TmpDir::new();
+        let socket = dir.join("answer.sock");
+        // The longest path a parked row carries: what the sanitiser makes of a long name written in
+        // four-byte characters.
+        let path =
+            crate::sandbox::sanitize(&"\u{1d11e}".repeat(2 * crate::sandbox::SANITIZED_CHARS));
+        let row = format!(
+            "pending id={} pid={} waiting={} path={path}\n",
+            u64::MAX,
+            u32::MAX,
+            u64::MAX
+        );
+        assert!(
+            row.len() <= LINE_MAX && row.len() + 4 > LINE_MAX,
+            "{}",
+            row.len()
+        );
+        let answered = format!("answered path={path}\n");
+        let answer = |line: &str, rows: usize| (line.repeat(rows) + "ok\n").into_bytes();
+        let list = |s: &Path| read_pending_within(s, QUERY_TIMEOUT).map(|v| v.len());
+        let all = |s: &Path| answer_all_pending(s, true).map(|v| v.len());
+
+        assert_eq!(
+            ask_once(&socket, &answer(&row, ASK_PENDING_CAP), list).ok(),
+            Some(ASK_PENDING_CAP)
+        );
+        assert_eq!(
+            ask_once(&socket, &answer(&answered, ASK_PENDING_CAP), all).ok(),
+            Some(ASK_PENDING_CAP)
+        );
+        for (verb, got) in [
+            (
+                "LIST",
+                ask_once(&socket, &answer(&row, 2 * ASK_PENDING_CAP), list),
+            ),
+            (
+                "ALLOW *",
+                ask_once(&socket, &answer(&answered, 2 * ASK_PENDING_CAP), all),
+            ),
+        ] {
+            assert!(
+                got.as_ref().is_err_and(crate::sandbox::reply::unanswered),
+                "{verb}: an answer past the longest a session writes read as {got:?}"
+            );
+        }
+        for long in [
+            format!("ok path={}\n", "x".repeat(LINE_MAX)),
+            format!("ok path={}\n", "\u{1d11e}".repeat(LINE_MAX / 4 + 1)),
+        ] {
+            let got = ask_once(&socket, long.as_bytes(), |s| answer_pending(s, 7, true));
+            assert!(
+                got.as_ref().is_err_and(crate::sandbox::reply::unanswered),
+                "a line past the longest a session writes read as {got:?}"
+            );
+        }
     }
 
     #[test]

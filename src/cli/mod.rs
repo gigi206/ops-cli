@@ -112,6 +112,17 @@ pub(crate) fn json_epoch_ms(at: u128) -> u64 {
     u64::try_from(at).unwrap_or(u64::MAX)
 }
 
+/// The error a `--session` rule load gives a session in scope it could not get an answer from, each
+/// with why: reached and not answered in full, or not asked at all. Whether that session holds the
+/// rule is not known, so the load exits 2, the code a load left unconfirmed gives. Shared by `sbx net`
+/// and `sbx proc`, whose loads end in that same state.
+pub(crate) fn unread_load(pid: u32, e: &std::io::Error) -> String {
+    format!(
+        "sbx: session {pid} could not be asked to load the rule ({e}), so whether it holds it is \
+         not known — run the command again once it answers."
+    )
+}
+
 /// Say that a listing across sessions reached `pid` and did not get its whole answer, so what that
 /// session holds is missing from it; `missing` says what, as the rest of the sentence ("what it has
 /// parked is not listed"). The listing still shows every answer that came whole, and exits 1 rather

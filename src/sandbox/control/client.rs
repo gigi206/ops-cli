@@ -314,10 +314,7 @@ pub(crate) fn read_log(
         // answer before any: read as a whole one, it would hand a follow a `head` of 0 and move its
         // cursor back to the start of the ring.
         if line.starts_with("err ") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("the session answered `{}`", crate::sandbox::sanitize(&line)),
-            ));
+            return Err(crate::sandbox::reply::refused(&line));
         }
         if let Some(v) = line.strip_prefix("dropped=") {
             dropped = v.parse().unwrap_or(0);
@@ -920,10 +917,7 @@ pub(crate) fn query_manual(data_dir: &Path, pid: u32) -> io::Result<Vec<ManualRu
         // An `err` ends the answer before any rule: read as a whole one, it would list a session
         // that refused as one holding no rule.
         if line.starts_with("err ") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("the session answered `{}`", crate::sandbox::sanitize(&line)),
-            ));
+            return Err(crate::sandbox::reply::refused(&line));
         }
         // The rule text is everything after the kind prefix — taken as the whole remainder, so a
         // rule carrying whitespace (a `re:` regex loaded with `--session`) round-trips intact.

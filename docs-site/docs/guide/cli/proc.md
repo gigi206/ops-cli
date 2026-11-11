@@ -191,6 +191,11 @@ allow <id>` lets it run (the syscall continues), `deny <id>` refuses it (the sys
 A session that is reached and does not answer in full is named on standard error, the listing does
 not say nothing is parked, and it exits 1 ([exit codes](../reference/exit-codes#a-listing-that-could-not-read-a-session-exits-1)).
 
+A decision that was not made exits 2 and says why: the session has no control socket (it does
+not enforce `[proc]`), it answers that it decides nothing (an observing session parks no
+`execve`), or it did not answer in full. In the last case the `execve` may have been decided
+before the answer was cut, so run `sbx proc pending` to see what is still parked.
+
 ```sh
 sbx proc pending
 # parked exec — awaiting a decision

@@ -215,6 +215,7 @@ fn proc_inject_session(
     let mut loaded: Vec<u32> = Vec::new();
     let mut inert: Vec<u32> = Vec::new();
     let mut refused: Vec<u32> = Vec::new();
+    let mut unread: Vec<(u32, std::io::Error)> = Vec::new();
     for s in sessions {
         let pid = s.pid;
         if !in_scope(pid, &project_pids, &app_pids) {
@@ -226,7 +227,10 @@ fn proc_inject_session(
             Ok(sandbox::proc_control::InjectOutcome::Inert) => inert.push(pid),
             Ok(sandbox::proc_control::InjectOutcome::Refused) => refused.push(pid),
             // A dead socket, or a session that does not enforce `[proc]`: nothing to load into.
-            Err(_) => {}
+            Err(e) if sandbox::control::session_gone(&e) => {}
+            // Reached or not, it did not say whether it took the rule: named, so a load that may not
+            // be in force there does not read as one that reached nothing, or as a refusal.
+            Err(e) => unread.push((pid, e)),
         }
     }
 
@@ -261,6 +265,9 @@ fn proc_inject_session(
                 .join(", ")
         ));
     }
+    for (pid, e) in &unread {
+        diag::error(&crate::cli::unread_load(*pid, e));
+    }
     if !refused.is_empty() {
         diag::error(&format!(
             "sbx: session(s) {} refused the rule (an older sbx without --session rule support, or a \
@@ -271,14 +278,16 @@ fn proc_inject_session(
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
-    } else if loaded.is_empty() && inert.is_empty() {
+    } else if loaded.is_empty() && inert.is_empty() && unread.is_empty() {
         diag::error(
             "sbx: no enforcing session in scope to load the rule into — launch one with `[proc] mode \
              = \"enforce\"`/`\"ask\"`, or write it to config (drop --session)",
         );
     }
-    // An inert `allow` holds its effect already: under `enforce` everything not denied runs.
-    crate::session_load_code(loaded.len() + inert.len(), refused.len(), 0)
+    // An inert `allow` holds its effect already: under `enforce` everything not denied runs. A
+    // session that could not be asked is in the state an unconfirmed egress load is in: whether the
+    // rule is in force there is not known, and running the load again settles it.
+    crate::session_load_code(loaded.len() + inert.len(), refused.len(), unread.len())
 }
 
 /// `sbx proc rules [-a <app>] [--all]`: list the live `--session` rule overlay of the running
@@ -568,10 +577,8 @@ fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
                 ));
                 ExitCode::from(2)
             }
-            Err(_) => {
-                diag::error(&format!(
-                    "sbx: proc pending: session {pid} is not enforcing (no control socket)"
-                ));
+            Err(e) => {
+                diag::error(&answer_failure(pid, "its parked execs", &e));
                 ExitCode::from(2)
             }
         }
@@ -593,13 +600,34 @@ fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
                 ));
                 ExitCode::from(2)
             }
-            Err(_) => {
-                diag::error(&format!(
-                    "sbx: proc pending: session {pid} is not enforcing (no control socket)"
-                ));
+            Err(e) => {
+                diag::error(&answer_failure(pid, &format!("`{id}`"), &e));
                 ExitCode::from(2)
             }
         }
+    }
+}
+
+/// What `sbx proc pending allow|deny` says when session `pid` gave no decision about `what` (an id,
+/// or its parked execs), by why. A session with no control socket is not enforcing. One that was
+/// reached and did not answer in full may have decided before it was cut, so the decision is
+/// unknown rather than refused. One that answered `err …` refused the verb, as an observing session
+/// does. Anything else is said in its own words.
+fn answer_failure(pid: u32, what: &str, e: &std::io::Error) -> String {
+    if sandbox::control::session_gone(e) {
+        format!("sbx: proc pending: session {pid} is not enforcing (no control socket)")
+    } else if sandbox::lens::unanswered(e) {
+        format!(
+            "sbx: proc pending: session {pid} did not answer in full ({e}), so whether {what} \
+             was decided is not known — `sbx proc pending` lists what is still parked"
+        )
+    } else if e.kind() == std::io::ErrorKind::InvalidData {
+        format!(
+            "sbx: proc pending: session {pid} decides no parked exec ({e}) — only a session in \
+             `[proc] mode = \"ask\"` parks one"
+        )
+    } else {
+        format!("sbx: proc pending: session {pid} could not be asked ({e})")
     }
 }
 
@@ -949,6 +977,27 @@ mod tests {
     /// not hold it, so the load exits 1 even though another session took it.
     #[test]
     fn a_session_rule_a_session_refused_exits_1() {
+        assert_eq!(
+            load_into_two_sessions([Some("ok"), Some("err unknown command")]),
+            ExitCode::FAILURE
+        );
+    }
+
+    /// A session that read the load and closed without answering may hold the rule or not: it is
+    /// named as one that could not be asked, and the load exits 2, the code an unconfirmed egress
+    /// load gives. Read as a refusal, it said the rule was not in force there and exited 1.
+    #[test]
+    fn a_session_rule_load_left_unanswered_exits_2() {
+        assert_eq!(
+            load_into_two_sessions([Some("ok"), None]),
+            ExitCode::from(2)
+        );
+    }
+
+    /// Load `curl` into two live sessions, this process and a child, each answered by a stand-in
+    /// socket with its reply (`None` closes without one), and return the exit code. Each stand-in
+    /// must have been asked for exactly that rule.
+    fn load_into_two_sessions(replies: [Option<&'static str>; 2]) -> ExitCode {
         use crate::session::{self, Kind, Registry, Session, SessionRuntime};
         use crate::testutil::{EnvVar, TmpDir, env_lock};
         use std::io::{BufRead, BufReader, Write};
@@ -971,7 +1020,7 @@ mod tests {
         };
         let registry = Registry::at(data.path());
         let mut stand_ins = Vec::new();
-        for (s, reply) in [(&me, "ok"), (&other, "err unknown command")] {
+        for (s, reply) in [&me, &other].into_iter().zip(replies) {
             registry.register(s).expect("register the session");
             let socket = sandbox::proc_control::proc_control_socket(data.path(), s.pid);
             std::fs::create_dir_all(socket.parent().unwrap())
@@ -983,9 +1032,11 @@ mod tests {
                 BufReader::new(&stream)
                     .read_line(&mut cmd)
                     .expect("read the command");
-                (&stream)
-                    .write_all(format!("{reply}\n").as_bytes())
-                    .expect("write the reply");
+                if let Some(reply) = reply {
+                    (&stream)
+                        .write_all(format!("{reply}\n").as_bytes())
+                        .expect("write the reply");
+                }
                 cmd.trim_end().to_string()
             });
             stand_ins.push((socket, session));
@@ -1008,6 +1059,33 @@ mod tests {
             let received = session.join().expect("the stand-in session thread");
             assert_eq!(received, "REMEMBER DENY curl");
         }
-        assert_eq!(code, ExitCode::FAILURE);
+        code
+    }
+
+    /// `sbx proc pending allow|deny` exits 2 whatever kept the decision from being made, so only its
+    /// words tell the cases apart: no socket, a cut answer (the exec may have been decided), a
+    /// refusal (an observing session decides nothing), and anything else in its own words.
+    #[test]
+    fn a_decision_that_was_not_made_says_why() {
+        use std::io::{Error, ErrorKind};
+        let says = |e: Error| answer_failure(12, "`12.7`", &e);
+        let gone = says(Error::from(ErrorKind::NotFound));
+        assert!(
+            gone.contains("is not enforcing (no control socket)"),
+            "{gone}"
+        );
+        let cut = says(Error::new(ErrorKind::UnexpectedEof, "cut"));
+        assert!(
+            cut.contains("whether `12.7` was decided is not known"),
+            "{cut}"
+        );
+        let refused = says(Error::new(
+            ErrorKind::InvalidData,
+            "the session answered `err bad-request`",
+        ));
+        assert!(refused.contains("decides no parked exec"), "{refused}");
+        assert!(refused.contains("err bad-request"), "{refused}");
+        let other = says(Error::from(ErrorKind::PermissionDenied));
+        assert!(other.contains("could not be asked"), "{other}");
     }
 }

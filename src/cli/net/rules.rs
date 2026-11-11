@@ -730,10 +730,7 @@ fn inject_shortfall(
         ));
     }
     for (pid, e) in unread {
-        errors.push(format!(
-            "sbx: session {pid} could not be asked to load the rule ({e}), so whether it holds it \
-             is not known — run the command again once it answers."
-        ));
+        errors.push(crate::cli::unread_load(*pid, e));
     }
     if !loaded.is_empty() {
         return (errors, None);

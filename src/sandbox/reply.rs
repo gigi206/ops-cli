@@ -15,9 +15,10 @@
 //! both, a cut and a reader that ran out of time as the one fact a reader needs: the session was
 //! reached and its answer did not arrive in full.
 //!
-//! The verbs that act (an answer to a parked request, a remembered rule, a stop) are not read
-//! through this. By the time their answer is cut the action may already have landed, and each of
-//! those readers says what it makes of a missing reply.
+//! The verbs that act (an answer to a parked request, a remembered rule, a stop) may already have
+//! landed by the time their answer is cut, so each of their readers says what it makes of a missing
+//! reply. The exec plane's `ALLOW *` and `DENY *` read their many-line answer through [`answer`] all
+//! the same, and take the cut as the error that says what was decided is not known.
 
 use std::io::{self, BufRead};
 
@@ -36,6 +37,20 @@ pub(crate) fn unanswered(e: &io::Error) -> bool {
             | io::ErrorKind::BrokenPipe
             | io::ErrorKind::WouldBlock
             | io::ErrorKind::TimedOut
+    )
+}
+
+/// The error a reader makes of a server's `err …` line: the session was reached, read the command and
+/// refused it, a verb it does not serve or a request it could not act on. The answer arrived whole,
+/// so it is not one [`unanswered`] counts; [`io::ErrorKind::InvalidData`], with the server's words,
+/// sanitised.
+///
+/// A refusal read as a whole answer is the reader's own mistake: it lists a session that refused as
+/// one holding nothing.
+pub(crate) fn refused(line: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("the session answered `{}`", crate::sandbox::sanitize(line)),
     )
 }
 

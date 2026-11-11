@@ -173,7 +173,7 @@ mod target;
 
 pub(crate) use open_lens::open_probe;
 pub(crate) use overlay::ProcOverlay;
-pub(crate) use pending::PendingExec;
+pub(crate) use pending::{ASK_PENDING_CAP, PendingExec};
 // Re-exported for the signer channel, which asks the same question of its plugin's socket before
 // each request: whether anything is there to read, and whether the other end has hung up.
 pub(crate) use notify::poll_events;

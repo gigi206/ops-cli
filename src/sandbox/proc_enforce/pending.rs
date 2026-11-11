@@ -11,8 +11,9 @@ use crate::sandbox::locks::locked;
 
 /// The most `ask`-parked `execve`s a session holds at once. Beyond this, a further undecided `execve`
 /// is denied outright (fail-closed) rather than growing the registry without bound — mirroring the
-/// egress ask flood cap.
-const ASK_PENDING_CAP: usize = 256;
+/// egress ask flood cap. It bounds the answers that list them too, which is what the client of the
+/// control socket reads them against.
+pub(crate) const ASK_PENDING_CAP: usize = 256;
 
 /// How long an `ask`-parked `execve` waits for a human decision before it is auto-denied. A finite
 /// bound is load-bearing: a parked `execve` blocks its process, and a parent `wait`ing on it would
