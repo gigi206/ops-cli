@@ -299,7 +299,10 @@ fn check_header_list(headers: Vec<String>, field: &str) -> Result<Vec<String>, S
 /// Whether `name` is a header field name: a non-empty HTTP token (RFC 9110 §5.6.2). Checked rather
 /// than assumed because a name with a colon, a space or a control byte would not be a header at all
 /// — it would be a way to write a second line into the request head.
-fn is_header_name(name: &str) -> bool {
+///
+/// The one rule for a header name sbx puts on a request, whoever declared it: a signer's manifest
+/// here, a `[secret]` entry in [`crate::config`].
+pub(crate) fn is_header_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()

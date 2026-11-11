@@ -632,7 +632,10 @@ fn expand_locator(template: &str, scheme: &str, key: &str) -> Result<String, Str
     while let Some(open) = rest.find('{') {
         let after = &rest[open + 1..];
         let Some(close) = after.find('}') else {
-            break;
+            return Err(format!(
+                "the `[secret.defaults.resolver.{scheme}] locator` `{template}` opens a `{{` that \
+                 never closes"
+            ));
         };
         let name = &after[..close];
         if name != "key" {
@@ -852,17 +855,22 @@ pub(super) fn validate_secret_target(to: &str) -> Result<Rule, String> {
     }
 }
 
-/// A header name usable in a request head: a non-empty token free of control characters,
-/// whitespace, and `:`, so it can never split the head or carry a second header.
+/// A header name usable in a request head: a non-empty HTTP token
+/// ([`crate::plugins::signer::is_header_name`]), so it can never split the head or carry a second
+/// header, and is a name both planes put on a request as written. Refusing only control
+/// characters, whitespace and `:` would let through a byte outside the token set, which an h2
+/// request refuses when the header is added and an h1 one would carry into the head as a field name
+/// no server parses as one.
 fn validate_header_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("the `header` name is empty".to_string());
     }
-    if name
-        .chars()
-        .any(|c| c.is_control() || c.is_whitespace() || c == ':')
-    {
-        return Err(format!("invalid `header` name `{name}`"));
+    if !crate::plugins::signer::is_header_name(name) {
+        return Err(format!(
+            "invalid `header` name `{}`: a header name is an HTTP token (letters, digits and \
+             !#$%&'*+-.^_`|~)",
+            name.escape_debug()
+        ));
     }
     Ok(())
 }

@@ -9368,6 +9368,25 @@ fn validate(secret: RawHostSecret) -> Result<HeaderSecret, String> {
     vhs("api.github.com", secret, &SecretDefaults::default())
 }
 
+/// A header name is an HTTP token (RFC 9110 §5.6.2). Anything else is refused where it is declared:
+/// an h2 request refuses it when the header is added, and an h1 request head would carry it as
+/// written, a field name no server parses as one.
+#[test]
+fn a_header_name_that_is_not_an_http_token_is_refused() {
+    for bad in ["X-T\u{f6}ken", "X(Api)", "X\"Key"] {
+        let mut secret = raw_secret_from(vec!["env://API_KEY"]);
+        secret.header = Some(bad.into());
+        let refused = validate(secret).err();
+        assert!(
+            refused.as_deref().is_some_and(|e| e.contains("header")),
+            "`{bad}` is taken for a header name: {refused:?}"
+        );
+    }
+    let mut token = raw_secret_from(vec!["env://API_KEY"]);
+    token.header = Some("X-Api-Key".into());
+    assert!(validate(token).is_ok(), "a token is a header name");
+}
+
 /// `by_other` reads `bare` or `deny`, defaults to `bare`, and is refused without a `by`, where it
 /// would say nothing.
 #[test]
@@ -11893,6 +11912,20 @@ fn a_terse_key_expands_through_a_plugin_locator_template() {
         }
         other => panic!("expected one keepassxc:// source, got {other:?}"),
     }
+}
+
+/// A `{` that never closes is refused like a placeholder that is not `{key}`: passed through, the
+/// rest of the template reaches the plugin's `argv[1]` as written, braces and all.
+#[test]
+fn a_plugin_locator_template_with_an_unclosed_brace_is_rejected() {
+    let reg = PluginRegistry::with([plugin("keepassxc")]);
+    let d = SecretDefaults::from_raw(&raw_plugin_defaults(
+        &["keepassxc"],
+        "keepassxc",
+        Some("agents.kdbx/{key}/{folder"),
+    ));
+    let err = vhs_with_defaults(terse("github"), &d, &reg).unwrap_err();
+    assert!(err.contains("never closes"), "{err}");
 }
 
 #[test]

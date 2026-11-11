@@ -56,7 +56,7 @@ reserved key, `defaults`, holds the resolver settings: so a host cannot be named
 |---|---|
 | `kind` | The broker kind. Optional; defaults to `"http-header"`, the only kind today. |
 | `key` **or** `from` | The SOURCE, exactly one. Terse `key` (expanded through `[secret.defaults]`) or a verbose `from` ref/chain. See [Resolvers](resolvers). |
-| `header` | The header name to set, e.g. `Authorization`. |
+| `header` | The header name to set, an HTTP token (RFC 9110: letters, digits and a few marks, no space or `:`), e.g. `Authorization`. |
 | `type` | How to shape the value: `bearer`, `basic`, or `raw`. |
 | `prefix` | Optional override of the type's default prefix. |
 
