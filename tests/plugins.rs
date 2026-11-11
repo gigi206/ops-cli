@@ -720,6 +720,42 @@ fn a_store_flag_without_a_usable_value_is_refused_naming_the_flag() {
     assert!(slipped.is_empty(), "{}", slipped.join("\n"));
 }
 
+/// `store publish` holds its flags' values to the same rule: an option in place of `--key` is not
+/// taken for the key file, which had the store's secret signing key generated under that option's
+/// name in the current directory, and a `--key` or `--rev` without a value names the flag.
+#[test]
+fn a_publish_flag_without_a_usable_value_is_refused_and_writes_no_key() {
+    let home = TmpDir::new("plugins");
+    let repo = TmpDir::new("plugins");
+    local_plugin(&repo.path().join("plugins"), "kp", "kp");
+    let tree = repo.path().to_str().unwrap();
+    // The arguments after `publish <tree>`, and what the refusal says.
+    let cases: &[(&[&str], &str)] = &[
+        (&["--key", "--rev"], "`--key` needs"),
+        (&["--key"], "`--key` needs"),
+        (&["--key", "k", "--rev"], "`--rev` needs"),
+    ];
+    let mut slipped = Vec::new();
+    for (tail, said) in cases {
+        let mut cmd = sbx(&["plugins", "store", "publish", tree], home.path());
+        cmd.args(*tail);
+        let (code, out, err) = both(&mut cmd);
+        if code != 2 || !err.contains(said) {
+            slipped.push(format!(
+                "`{}` exited {code}, expected 2 saying {said:?}:\nstdout:\n{out}stderr:\n{err}",
+                shown(&cmd)
+            ));
+        }
+    }
+    if home.path().join("--rev").exists() {
+        slipped.push("a signing key was written under an option's name, `--rev`".to_string());
+    }
+    if repo.path().join("catalogue.toml").exists() {
+        slipped.push("the tree was published".to_string());
+    }
+    assert!(slipped.is_empty(), "{}", slipped.join("\n"));
+}
+
 #[test]
 fn the_markers_and_the_installed_filter_agree_on_what_is_in_place() {
     if !git_works() {

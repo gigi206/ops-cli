@@ -1198,6 +1198,7 @@ fn report_missing_trust_anchor(
 /// across publishes) or generated and persisted owner-only on first use; it is the store's secret
 /// and never leaves the operator's host.
 fn plugins_store_publish(args: &[OsString]) -> ExitCode {
+    const VERB: &str = "plugins store publish";
     let usage = format!(
         "sbx: usage: {}",
         help::synopsis_of(&["plugins", "store", "publish"])
@@ -1208,11 +1209,23 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.to_str() {
-            Some("--key") => key = it.next().map(|v| v.as_os_str()),
+            // A path, so it may be any bytes, but held to the same rule about what follows the
+            // flag: taken as the key file, an option would have the store's secret signing key
+            // generated under its name in the current directory.
+            Some("--key") => {
+                match crate::cli::option_os(it.next(), "--key", "the signing key file") {
+                    Ok(v) => key = Some(v),
+                    Err(why) => {
+                        diag::error(&format!("sbx: {VERB}: {why}"));
+                        errln!("{usage}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             Some("--rev") => {
-                let Some(value) = it.next().and_then(|v| v.to_str()) else {
-                    errln!("{usage}");
-                    return ExitCode::from(2);
+                let value = match flag_value(&mut it, VERB, "--rev", "a revision number", &usage) {
+                    Ok(v) => v,
+                    Err(code) => return code,
                 };
                 match value.parse::<u64>() {
                     Ok(n) => rev = Some(n),
