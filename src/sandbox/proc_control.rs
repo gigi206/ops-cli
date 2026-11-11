@@ -75,11 +75,11 @@ pub(crate) struct ExecEvent {
 ///
 /// Whitespace and `=` cannot appear in a head token, so they are replaced. It costs fidelity on a
 /// legitimate path containing a space — which the head parse could not carry either way, and which
-/// used to drop the event rather than render it oddly. Every other control character is replaced
-/// too: a head token is printed as well as parsed, and an escape kept here would drive the terminal
-/// that reads `sbx proc logs`. What reaches this through [`ExecRing::push_verdict`] is sanitised
-/// first, so on that path nothing is left for it to catch; it is what makes the token safe on its
-/// own, whatever is handed to it.
+/// would drop the event, left as it is, rather than render it oddly. Every other control character
+/// is replaced too: a head token is printed as well as parsed, and an escape kept here would drive
+/// the terminal that reads `sbx proc logs`. What reaches this through [`ExecRing::push_verdict`] is
+/// sanitised first, so on that path nothing is left for it to catch; it is what makes the token
+/// safe on its own, whatever is handed to it.
 fn head_token(value: &str) -> String {
     value
         .chars()
@@ -373,7 +373,7 @@ pub(crate) fn read_pending_within(socket: &Path, timeout: Duration) -> io::Resul
 /// Only `err not-found` means that. Any other `err …` is a session that refused the verb, an
 /// observing one among them, and is an error ([`super::reply::refused`]); so is an answer that did
 /// not arrive whole ([`answer_line`]), after which the exec may or may not have been decided. Read
-/// as an unknown id, either one told the user the exec had been decided or had timed out.
+/// as an unknown id, either one would tell the user the exec had been decided or had timed out.
 pub(crate) fn answer_pending(socket: &Path, id: u64, allow: bool) -> io::Result<Option<String>> {
     let verb = if allow { "ALLOW" } else { "DENY" };
     let line = answer_line(socket, &format!("{verb} {id}"))?;
@@ -533,8 +533,8 @@ fn answer_line(socket: &Path, cmd: &str) -> io::Result<String> {
 /// caller tells from an empty answer.
 ///
 /// So is a server's `err …` line ([`super::reply::refused`]). An observing session serves `LOG`
-/// alone and refuses every other verb with one, and a refusal read as a whole answer listed nothing
-/// parked, no rule loaded, and nothing decided.
+/// alone and refuses every other verb with one, and a refusal read as a whole answer would list
+/// nothing parked, no rule loaded, and nothing decided.
 fn read_within(socket: &Path, cmd: &str, timeout: Duration, most: u64) -> io::Result<Vec<String>> {
     let stream = send(socket, cmd, timeout)?;
     let mut lines = Vec::new();
@@ -709,10 +709,10 @@ mod tests {
     }
 
     /// The verdict is a head token like the caller, and is held to the same rule. Every producer
-    /// passes one of a few fixed words, but the parameter is a `&str`, and a verdict carrying a space
-    /// and an `=` rewrote the fields after it on the way back in, or erased the event when a token
-    /// had no `=`. A policy deciding by target alone passes no caller, so the line has no `by=` of
-    /// its own, and a verdict spelling one would have named a caller nobody read.
+    /// passes one of a few fixed words, but the parameter is a `&str`, and a verdict carrying a
+    /// space and an `=` would rewrite the fields after it on the way back in, or erase the event
+    /// when a token has no `=`. A policy deciding by target alone passes no caller, so the line has
+    /// no `by=` of its own, and a verdict spelling one would name a caller nobody read.
     #[test]
     fn a_verdict_cannot_overwrite_or_erase_the_fields_beside_it() {
         for (caller, verdict) in [
@@ -822,7 +822,7 @@ mod tests {
     }
 
     /// A rule that would not reach the server as one line is never sent. The socket here does not
-    /// exist, so a rule that got as far as the connect fails there instead, with `NotFound`.
+    /// exist, so a rule that gets as far as the connect fails there instead, with `NotFound`.
     #[test]
     fn a_rule_carrying_a_control_character_is_refused_before_it_is_sent() {
         let dir = crate::testutil::TmpDir::new();
@@ -843,10 +843,11 @@ mod tests {
     /// A session whose listener stopped accepting does not hold a reader past its budget.
     ///
     /// Once a listener's backlog is full, a plain connect sleeps until it drains, and a supervisor
-    /// that stopped accepting (stopped by a signal, or wedged) never drains it: `sbx proc pending`,
-    /// `sbx proc logs` and the completion oracle waited there for good, whatever timeout they had
-    /// asked for. A backlog of zero holds one connection, so every reader after it is the one that
-    /// waits. Both doors are tried: the verbs this module sends, and the `LOG` read every lens shares.
+    /// that stopped accepting (stopped by a signal, or wedged) never drains it: through a plain
+    /// connect, `sbx proc pending`, `sbx proc logs` and the completion oracle would wait there for
+    /// good, whatever timeout they asked for. A backlog of zero holds one connection, so every
+    /// reader after it is the one that waits. Both doors are tried: the verbs this module sends,
+    /// and the `LOG` read every lens shares.
     #[test]
     fn a_session_that_stopped_accepting_does_not_hold_the_reader() {
         use crate::testutil::TmpDir;
@@ -914,10 +915,11 @@ mod tests {
         got
     }
 
-    /// An observing session serves `LOG` alone and answers every other verb `err bad-request`. Read as
-    /// a whole answer, that refusal listed nothing parked and no rule, decided nothing for `*`, and
-    /// made an id unknown, "already decided or timed out". Each reader fails on it now, with an error
-    /// that is not a cut, so a listing passes over the session and a decision says why none was made.
+    /// An observing session serves `LOG` alone and answers every other verb `err bad-request`. Read
+    /// as a whole answer, that refusal would list nothing parked and no rule, decide nothing for
+    /// `*`, and make an id unknown, "already decided or timed out". Each reader fails on it
+    /// instead, with an error that is not a cut, so a listing passes over the session and a
+    /// decision says why none was made.
     #[test]
     fn an_observing_session_refuses_the_ask_verbs_rather_than_answering_none() {
         use crate::testutil::TmpDir;
@@ -950,10 +952,10 @@ mod tests {
     }
 
     /// A verb that acts may have acted by the time its answer is cut. Read at face value, a cut
-    /// answer to `ALLOW <id>` made the id unknown, one to `ALLOW *` listed the paths that happened to
-    /// arrive as all there were, and one to `REMEMBER` was a refusal: each a claim about what the
-    /// session did that it never made. Each is an error [`super::super::reply::unanswered`] counts
-    /// now, and a whole answer reads as it did.
+    /// answer to `ALLOW <id>` would make the id unknown, one to `ALLOW *` would list the paths that
+    /// happened to arrive as all there were, and one to `REMEMBER` would be a refusal: each a claim
+    /// about what the session did that it never made. Each is an error
+    /// [`super::super::reply::unanswered`] counts, and a whole answer reads as written.
     #[test]
     fn a_decision_whose_answer_is_cut_is_not_read_as_made_or_refused() {
         use crate::testutil::TmpDir;

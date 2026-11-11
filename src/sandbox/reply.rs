@@ -114,9 +114,9 @@ impl<R: BufRead> Iterator for Answer<R> {
 /// Read as bytes and decoded lossily, where `BufRead::lines` fails on bytes that are not UTF-8. A
 /// server writes only text, so such bytes are an answer cut inside a character, by a reader's own
 /// bound or by a session that closed mid-write, and that cut is what the reader has to learn. A
-/// decode error is not one [`unanswered`] counts, so a listing passed over the session in silence;
-/// decoded, the fragment is handed over like any line, and the end of the stream after it says the
-/// answer was cut.
+/// decode error is not one [`unanswered`] counts, so a listing would pass over the session in
+/// silence; decoded, the fragment is handed over like any line, and the end of the stream after it
+/// says the answer was cut.
 fn line_of<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
     let mut bytes = Vec::new();
     if reader.read_until(b'\n', &mut bytes)? == 0 {

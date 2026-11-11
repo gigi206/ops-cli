@@ -985,7 +985,7 @@ mod tests {
 
     /// A session that read the load and closed without answering may hold the rule or not: it is
     /// named as one that could not be asked, and the load exits 2, the code an unconfirmed egress
-    /// load gives. Read as a refusal, it said the rule was not in force there and exited 1.
+    /// load gives. Read as a refusal, it would say the rule is not in force there, and exit 1.
     #[test]
     fn a_session_rule_load_left_unanswered_exits_2() {
         assert_eq!(
