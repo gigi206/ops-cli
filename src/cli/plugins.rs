@@ -2381,8 +2381,9 @@ fn plugins_upgrade(args: &[OsString]) -> ExitCode {
 }
 
 /// `sbx plugins verify [<name>]`: re-hash one installed plugin's tree — or every one — and compare
-/// it against the digest recorded when it was placed. On demand only: it reads every file of every
-/// plugin, which is why it is a verb of its own and never runs on the launch path.
+/// it against the digest recorded when it was placed. On demand only, as the `list` marker and the
+/// `info` line that read the same digest are: it reads every file of every plugin, which is why it
+/// never runs on the launch path. What sets it apart is its exit, which a script can branch on.
 ///
 /// Exit is non-zero when a tree **changed**. A plugin with no recorded digest is reported plainly
 /// and does not fail the command: nothing was attested, which is a different answer from "this was
