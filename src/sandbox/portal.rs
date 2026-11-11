@@ -773,9 +773,13 @@ mod tests {
     /// `gnome-keyring-daemon` exit 1, `dbus-send` answers that the name has none, and `seed` finds a
     /// file where the keyfile's directory belongs. The command is a stand-in too, `<root>/app`.
     ///
-    /// The environment is cleared, so nothing the script does can reach the real home. The run is
-    /// made again while a stand-in it executes is still held open for writing by a fork in another
-    /// test (`ETXTBSY`), and the background indexing loop is waited out before the log is read.
+    /// The environment is cleared, so nothing the script does can reach the real home, and the
+    /// background indexing loop is waited out before the log is read.
+    ///
+    /// Each stand-in is run once on its own before the script runs, past `ETXTBSY`: a fork in
+    /// another test can still hold a copy of the descriptor that wrote it, and the script sends
+    /// most of its programs' errors to `/dev/null`, where a refused `exec` would go unseen. A run
+    /// that succeeds proves no such copy is left, and none can come back.
     fn run_preamble(root: &Path, scheme: Option<&str>, failing: &[&str]) -> Preamble {
         use crate::testutil::write_script;
         let (env_bin, provision) = stand_in_provision(root);
@@ -824,6 +828,11 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             write_script(path, body);
         }
+        for (path, _) in &programs {
+            crate::testutil::output_past_etxtbsy(
+                std::process::Command::new(path).env("SBX_TEST_LOG", root.join("warm-up.log")),
+            );
+        }
         let dir = root.join("run");
         let home = root.join("home");
         let argv = wrap_command_at(
@@ -834,41 +843,31 @@ mod tests {
             scheme,
             vec![root.join("app").into_os_string()],
         );
-        for _ in 0..50 {
-            let _ = std::fs::remove_file(&log);
-            let _ = crate::sandbox::gc::force_remove_dir_all(&dir);
-            let _ = crate::sandbox::gc::force_remove_dir_all(&home);
-            std::fs::create_dir_all(&home).unwrap();
-            if failing.contains(&"seed") {
-                std::fs::write(home.join(".config"), b"").unwrap();
-            }
-            let ran = crate::testutil::run_within(
-                std::process::Command::new(&argv[0])
-                    .args(&argv[1..])
-                    .env_clear()
-                    .env("PATH", "/usr/bin:/bin")
-                    .env("HOME", &home)
-                    .env("SBX_TEST_LOG", &log)
-                    .current_dir(root)
-                    .stdin(std::process::Stdio::null()),
-                "the portal preamble",
-            );
-            if ran.stderr.contains("Text file busy") {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                continue;
-            }
-            // The indexer runs three times in the background, after `exec "$@"` has ended the
-            // script; its last run is the last line any stand-in writes.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            let read = || std::fs::read_to_string(&log).unwrap_or_default();
-            while read().matches("update-desktop-database ").count() < 3
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            return Preamble { ran, log: read() };
+        std::fs::create_dir_all(&home).unwrap();
+        if failing.contains(&"seed") {
+            std::fs::write(home.join(".config"), b"").unwrap();
         }
-        panic!("a stand-in stayed held open for writing by another test's fork");
+        let ran = crate::testutil::run_within(
+            std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &home)
+                .env("SBX_TEST_LOG", &log)
+                .current_dir(root)
+                .stdin(std::process::Stdio::null()),
+            "the portal preamble",
+        );
+        // The indexer runs three times in the background, after `exec "$@"` has ended the script;
+        // its last run is the last line any stand-in writes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let read = || std::fs::read_to_string(&log).unwrap_or_default();
+        while read().matches("update-desktop-database ").count() < 3
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Preamble { ran, log: read() }
     }
 
     /// Every path the preamble names reaches the shell as one word, whatever it holds: a space, a
@@ -1092,6 +1091,11 @@ mod tests {
     /// reusing it as found with the socket it will hold readable to others.
     #[test]
     fn a_portal_directory_a_dead_cage_left_is_made_again_empty_and_private() {
+        // SAFETY: `geteuid` reads this process's credentials and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!("running as root, which empties a directory whatever its mode");
+            return;
+        }
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = crate::testutil::TmpDir::new();
         let layout = Layout::under(tmp.path());
@@ -1134,6 +1138,11 @@ mod tests {
     /// end of the launch still removes the whole directory.
     #[test]
     fn a_portal_directory_the_cage_made_read_only_inside_is_removed_at_the_end() {
+        // SAFETY: `geteuid` reads this process's credentials and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!("running as root, which empties a directory whatever its mode");
+            return;
+        }
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = crate::testutil::TmpDir::new();
         let layout = Layout::under(tmp.path());

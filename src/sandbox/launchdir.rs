@@ -93,6 +93,11 @@ mod tests {
     /// empty, rather than failing on what that cage left.
     #[test]
     fn a_directory_the_cage_made_read_only_inside_it_is_emptied_too() {
+        // SAFETY: `geteuid` reads this process's credentials and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!("running as root, which empties a directory whatever its mode");
+            return;
+        }
         use std::os::unix::fs::PermissionsExt as _;
 
         let tmp = TmpDir::new();
