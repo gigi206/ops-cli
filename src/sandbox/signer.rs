@@ -545,7 +545,9 @@ impl SignerProcess {
         parse_hello_reply(&line).map_err(|why| cannot(&why))?;
         // The conversation is handed over as a descriptor, and bytes this reader already took off it
         // would not go with it: the proxy's first answer would be one the plugin gave to no
-        // question it asked. A plugin speaks after its acceptance only when asked.
+        // question it asked. A plugin speaks after its acceptance only when asked; bytes it writes
+        // later stay on the socket, where the channel looks before each question
+        // ([`SignerChannel::sign`]).
         if !reader.buffer().is_empty() {
             return Err(cannot(
                 "it said more than its acceptance before being asked anything",
@@ -635,6 +637,24 @@ impl SignerChannel {
     fn read_line(&mut self) -> io::Result<String> {
         super::broker::read_bounded_line(&mut self.reader, MAX_LINE_BYTES)
     }
+
+    /// Why the plugin cannot be asked a question now, when it has spoken unasked or hung up: bytes
+    /// in this reader's buffer, or on the socket. Looked at without reading, and without changing
+    /// the descriptor's blocking mode, which its other copies share.
+    fn unasked(&self) -> Option<String> {
+        use std::os::fd::AsRawFd;
+        if !self.reader.buffer().is_empty() {
+            return Some("the plugin wrote a line it was not asked for".to_string());
+        }
+        let events = super::proc_enforce::poll_events(self.reader.get_ref().as_raw_fd(), 0);
+        if events & libc::POLLHUP != 0 {
+            Some("the plugin closed its end of the conversation".to_string())
+        } else if events & libc::POLLIN != 0 {
+            Some("the plugin wrote without being asked".to_string())
+        } else {
+            None
+        }
+    }
 }
 
 impl Signing for SignerChannel {
@@ -649,6 +669,16 @@ impl Signing for SignerChannel {
             me.dead = Some(why.clone());
             why
         };
+        // A plugin speaks when asked, once. Anything already there when a question is about to go
+        // out answers no question: a second line that came with the last answer and sits in this
+        // reader's buffer, or bytes written to the socket since. Read as this question's answer, it
+        // would sign the request with words formed before the request was seen, and the real answer
+        // would be read as the next request's. So it buries the plugin before anything is asked.
+        // This proves no answer fresh — bytes written just after the check read like a fast answer
+        // — what it catches is a plugin that says more than it is asked.
+        if let Some(why) = self.unasked() {
+            return Err(bury(self, why));
+        }
         let seq = self.seq;
         self.seq += 1;
         let mut writer = self.reader.get_ref();
@@ -1108,6 +1138,117 @@ mod tests {
             let _plugin = answering.join().unwrap();
             assert_eq!(got.is_ok(), accepted, "{said:?}: {got:?}");
         }
+    }
+
+    /// What a plugin writes that no question asked for buries it before the next question goes out,
+    /// wherever those bytes wait: in the reader's buffer, where a second line written with the first
+    /// answer lands, or on the socket, where one written later does. Read as the next answer, either
+    /// would sign that request with words formed before it was seen. A plugin that hung up is named
+    /// as one rather than found out by the write that follows.
+    ///
+    /// Each conduct is sequenced so it reaches its own branch: the later write is made only once the
+    /// first answer has been read, and the hang-up likewise. The well-behaved plugin keeps the check
+    /// from passing by burying every plugin, and the failures are collected, so one run names every
+    /// conduct a check lets through.
+    #[test]
+    fn a_plugin_that_speaks_unasked_is_buried_before_the_next_question() {
+        #[derive(Clone, Copy, Debug)]
+        enum Conduct {
+            AnswersEachQuestion,
+            TwoAnswersAtOnce,
+            WritesAgainLater,
+            HangsUp,
+        }
+        let answer = |seq: u64| {
+            format!(
+                "{}\n",
+                serde_json::json!({ "seq": seq, "headers": { "Authorization": "v" } })
+            )
+        };
+        let request = SignRequest {
+            method: "GET",
+            host: "api.example.com",
+            port: 443,
+            target: "/",
+            headers: Vec::new(),
+            body: None,
+        };
+        let mut wrong = Vec::new();
+        for (conduct, expected) in [
+            (Conduct::AnswersEachQuestion, None),
+            (Conduct::TwoAnswersAtOnce, Some("not asked for")),
+            (Conduct::WritesAgainLater, Some("without being asked")),
+            (Conduct::HangsUp, Some("closed its end")),
+        ] {
+            let (process, plugin) = SignerProcess::stand_in(&["Authorization"]);
+            let mut channel = SignerChannel::new(
+                process.handoff().unwrap(),
+                vec!["Authorization".to_string()],
+            );
+            let (first_read, first_read_rx) = std::sync::mpsc::channel::<()>();
+            let (settled, settled_rx) = std::sync::mpsc::channel::<()>();
+            let (done, done_rx) = std::sync::mpsc::channel::<()>();
+            let serving = std::thread::spawn(move || {
+                // Bounded, so a check that never puts the question fails this test rather than
+                // leaving the plugin waiting for it, and the test waiting for the plugin.
+                plugin
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut questions = io::BufReader::new(plugin.try_clone().unwrap());
+                let mut question = String::new();
+                io::BufRead::read_line(&mut questions, &mut question).unwrap();
+                match conduct {
+                    Conduct::TwoAnswersAtOnce => {
+                        (&plugin)
+                            .write_all((answer(0) + &answer(1)).as_bytes())
+                            .unwrap();
+                        settled.send(()).unwrap();
+                    }
+                    Conduct::AnswersEachQuestion => {
+                        (&plugin).write_all(answer(0).as_bytes()).unwrap();
+                        settled.send(()).unwrap();
+                        question.clear();
+                        io::BufRead::read_line(&mut questions, &mut question).unwrap();
+                        (&plugin).write_all(answer(1).as_bytes()).unwrap();
+                    }
+                    Conduct::WritesAgainLater => {
+                        (&plugin).write_all(answer(0).as_bytes()).unwrap();
+                        first_read_rx.recv().unwrap();
+                        (&plugin).write_all(answer(1).as_bytes()).unwrap();
+                        settled.send(()).unwrap();
+                    }
+                    Conduct::HangsUp => {
+                        (&plugin).write_all(answer(0).as_bytes()).unwrap();
+                        first_read_rx.recv().unwrap();
+                        drop(questions);
+                        drop(plugin);
+                        settled.send(()).unwrap();
+                        return;
+                    }
+                }
+                // Held until the test is done with it, so no conduct but the hang-up ends the
+                // conversation early.
+                let _ = done_rx.recv();
+                drop(plugin);
+            });
+            let first = channel.sign(&request);
+            let _ = first_read.send(());
+            settled_rx.recv().unwrap();
+            let second = channel.sign(&request);
+            drop(done);
+            serving.join().unwrap();
+            let met = match (&first, &second, expected) {
+                (Ok(_), Ok(_), None) => true,
+                (Ok(_), Err(why), Some(expected)) => why.contains(expected),
+                _ => false,
+            };
+            if !met {
+                wrong.push(format!(
+                    "{conduct:?}: first {first:?}, second {second:?}, expected {expected:?}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// What a plugin says when it declines, or when its answer is unreadable, reaches the launching

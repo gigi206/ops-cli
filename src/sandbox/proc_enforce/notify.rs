@@ -258,7 +258,7 @@ pub(super) fn try_send_resp(
 ///
 /// `0` for a timeout, and for a poll error too, so a caller re-checks its stop flag rather than
 /// spinning.
-pub(super) fn poll_events(fd: libc::c_int, timeout_ms: libc::c_int) -> libc::c_short {
+pub(crate) fn poll_events(fd: libc::c_int, timeout_ms: libc::c_int) -> libc::c_short {
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,

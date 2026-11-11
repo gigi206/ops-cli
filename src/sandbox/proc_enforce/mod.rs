@@ -174,11 +174,14 @@ mod target;
 pub(crate) use open_lens::open_probe;
 pub(crate) use overlay::ProcOverlay;
 pub(crate) use pending::PendingExec;
+// Re-exported for the signer channel, which asks the same question of its plugin's socket before
+// each request: whether anything is there to read, and whether the other end has hung up.
+pub(crate) use notify::poll_events;
 
 use cagepath::{cage_spelling, caller_proc_path, names_caller_descriptor, open_target_path};
 use notify::{
-    notif_id_valid, notif_of, notif_recv_code, poll_events, poll_readable, recv_fd,
-    respond_continue, respond_errno,
+    notif_id_valid, notif_of, notif_recv_code, poll_readable, recv_fd, respond_continue,
+    respond_errno,
 };
 use open_lens::{CageMounts, OpenLens, handle_open, probe_and_vouch, probe_in_cage_root};
 use pending::SWEEP_EVERY;
