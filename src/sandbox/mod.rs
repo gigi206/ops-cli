@@ -16,6 +16,9 @@ mod binds;
 // Making a directory under a tree the cage can write, with symlinks refused — the rule several
 // host-side placements share, stated once.
 mod cagedir;
+// A launch's own runtime directory bound read-write into its cage: one holder per process, and
+// handed over empty and owner-only whatever a predecessor's cage left in it.
+mod launchdir;
 // Waiting on a cage under a ceiling it cannot outlive — what every host-side runner does when the
 // budget runs out, stated once.
 mod cagewait;

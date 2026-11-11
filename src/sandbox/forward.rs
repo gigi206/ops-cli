@@ -42,6 +42,7 @@
 //! with a note).
 
 use super::binds::ExtraBind;
+use super::launchdir::{LiveDir, fresh_dir};
 use crate::config::ForwardPort;
 use crate::store::Layout;
 use std::ffi::OsString;
@@ -308,72 +309,6 @@ fn no_ipv6_loopback(e: &io::Error) -> bool {
 /// data directory the cap accepts.
 pub(crate) fn dir_name(pid: u32) -> String {
     format!("fwd-{pid}")
-}
-
-/// The forward directories a launch of this process holds, so a second launch running at the same
-/// time is refused its directory rather than emptying it under the first.
-static LIVE_DIRS: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
-
-/// One launch's hold on its forward directory in [`LIVE_DIRS`], released on drop.
-struct LiveDir(PathBuf);
-
-impl LiveDir {
-    /// Hold `dir`, or refuse when a launch of this process already does.
-    ///
-    /// The name carries the pid alone, so two launches of one process name one directory, and the
-    /// second's [`fresh_dir`] would empty the first's sockets. sbx launches one cage at a time per
-    /// process — `sbx upgrade` drops each launch's guard before the next — so this is the shape a
-    /// future caller could reach rather than one that runs today.
-    fn take(dir: &Path) -> io::Result<Self> {
-        let mut live = LIVE_DIRS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !live.insert(dir.to_path_buf()) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "another launch of this process is forwarding through {}; one forwarding \
-                     launch runs at a time per process",
-                    dir.display()
-                ),
-            ));
-        }
-        Ok(LiveDir(dir.to_path_buf()))
-    }
-}
-
-impl Drop for LiveDir {
-    fn drop(&mut self) {
-        LIVE_DIRS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.0);
-    }
-}
-
-/// Make `dir`, one launch's forward directory, empty and `0700`, whatever was at that name.
-///
-/// The directory is bound into the cage read-write, so the cage can widen its mode, and leave a
-/// socket, a fifo or a directory at any name in it. Keyed by pid, it is the directory a later
-/// process inherits when its pid is that of a `SIGKILL`ed predecessor whose teardown never ran:
-/// reused as found, its mode stayed as that cage left it (`DirBuilder::mode` applies only to a
-/// directory it creates), and a leftover at a socket's name made the in-cage `socat UNIX-LISTEN`
-/// fail into `/dev/null`, so the forward carried nothing and said nothing.
-///
-/// A directory already at the name is a dead predecessor's — a live launch of this process holds
-/// it in [`LIVE_DIRS`] first — so it is removed, without following any link inside it, and made
-/// again. One a killed process left behind is also reaped by `sbx gc`, which reads the pid off its
-/// name and removes the entries of launches no longer running.
-fn fresh_dir(dir: &Path) -> io::Result<()> {
-    let make = || std::fs::DirBuilder::new().mode(0o700).create(dir);
-    match make() {
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            std::fs::remove_dir_all(dir)?;
-            make()
-        }
-        made => made,
-    }
 }
 
 /// Put `listener` into non-blocking mode and spawn its accept loop. Non-blocking so the loop can
@@ -1324,36 +1259,6 @@ mod tests {
             "a failed `start` must not leave its socket directory behind"
         );
         drop(held);
-    }
-
-    /// A forward directory already at its name is a dead predecessor's, and the launch gets it back
-    /// empty and `0700` whatever the predecessor's cage left: a widened mode, a stale socket, a
-    /// directory at a socket's name, a link out of it. The link's target is left alone.
-    #[test]
-    fn a_directory_left_by_a_dead_predecessor_is_made_again_empty_and_private() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let tmp = TmpDir::new();
-        let outside = tmp.path().join("outside");
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::write(outside.join("kept"), b"").unwrap();
-        let dir = tmp.path().join("fwd-1");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::write(dir.join("p-9119.sock"), b"").unwrap();
-        std::fs::create_dir(dir.join("p-9120.sock")).unwrap();
-        std::os::unix::fs::symlink(&outside, dir.join("p-9121.sock")).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-
-        fresh_dir(&dir).expect("make the directory again");
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-        assert_eq!(
-            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert!(
-            outside.join("kept").exists(),
-            "a link inside is not followed"
-        );
     }
 
     /// A second launch of this process is refused its forward directory while the first holds it,
