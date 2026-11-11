@@ -55,8 +55,22 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
         "sbx-gui-data",
         "share/glib-2.0/schemas",
     )?;
+    if lacks_dark_theme(&store::physical_path(layout, &root)) {
+        crate::diag::warn(
+            "the GUI data carries no `Adwaita-dark` theme, so a file dialog opens light whatever \
+             the host's light/dark preference",
+        );
+    }
     let env = data_env(&root);
     Ok(GuiDataLayer { root, env })
+}
+
+/// Whether the GUI data set at `set`, its host path, lacks the named dark theme the portal's keyfile
+/// selects under `prefer-dark`. Asked of the output rather than in its build: the theme only decides
+/// how a dialog looks, and a build failed for it would also drop the schemas a dialog cannot open
+/// without.
+fn lacks_dark_theme(set: &Path) -> bool {
+    !set.join("share/themes/Adwaita-dark").is_dir()
 }
 
 /// The env that points the cage's glib/GTK at the provisioned data: `XDG_DATA_DIRS` at the output's
@@ -72,9 +86,10 @@ fn data_env(root: &Path) -> Vec<(String, String)> {
 
 /// The generated derivation: the pinned nixpkgs' `runCommand` around [`BUILD_SCRIPT`], given the
 /// three packages it draws from by their store paths. The placeholders are substituted
-/// (`@NIXPKGS@`/`@SYSTEM@`); `nixpkgs` is a channel name, a 40-hex revision or a pinned GitHub
-/// reference by the grammars the config holds it to, and `system` is sbx's own, so neither carries
-/// a character a Nix string would read as anything but itself.
+/// (`@NIXPKGS@`/`@SYSTEM@`). `nixpkgs` is the flake reference the channel resolved to,
+/// `github:NixOS/nixpkgs/<40-hex revision>` or a pinned `github:<owner>/<repo>/<40-hex>`, each
+/// part held to a grammar of letters, digits and `-._` before it is written; `system` is sbx's
+/// own. Neither carries a character a Nix string would read as anything but itself.
 fn derivation_expr(nixpkgs: &str, system: &str) -> String {
     const TEMPLATE: &str = r#"let pkgs = (builtins.getFlake "@NIXPKGS@").legacyPackages.@SYSTEM@;
 in pkgs.runCommand "sbx-gui-data" { nativeBuildInputs = [ pkgs.glib ]; } ''
@@ -96,13 +111,17 @@ in pkgs.runCommand "sbx-gui-data" { nativeBuildInputs = [ pkgs.glib ]; } ''
 /// schemas and GTK, compile them into one `gschemas.compiled`, and stage `gnome-themes-extra`'s
 /// `share/themes`, the source of the named `Adwaita-dark` theme the file dialog uses.
 ///
-/// Every piece the cage depends on is checked before the output is let through, and its absence
-/// fails the build by name. The schemas the portal's keyfile and the file dialog read are
+/// Every piece a dialog cannot open without is checked before the output is let through, and its
+/// absence fails the build by name. The schemas the portal's keyfile and the file dialog read are
 /// `org.gnome.desktop.interface` and `org.gtk.Settings.FileChooser`; without either, GTK aborts
 /// **FATAL** at the dialog's first `g_settings_new`, so a set that compiled without them would be
-/// a crash shipped as a success. The same holds for a compile that wrote nothing and for a theme
-/// directory without `Adwaita-dark`. A nixpkgs that moved one of these is then a failed provision,
-/// which the launch reports, rather than an output reused on every launch after.
+/// a crash shipped as a success, and the same holds for a compile that wrote nothing. A nixpkgs that
+/// moved one of these is then a failed provision, which the launch reports, rather than an output
+/// reused on every launch after.
+///
+/// The dark theme is not one of them. Without `Adwaita-dark` the dialog opens light, and a build
+/// failed for it would take the schemas down with it, which is the crash this set exists to
+/// prevent; [`provision`] says so instead ([`lacks_dark_theme`]).
 const BUILD_SCRIPT: &str = r#"mkdir -p "$out/share/glib-2.0/schemas"
 for p in @SCHEMAS@ @GTK@; do
   find "$p/share/gsettings-schemas" -name "*.gschema.xml" -exec cp -f -t "$out/share/glib-2.0/schemas" {} + \
@@ -116,8 +135,6 @@ glib-compile-schemas "$out/share/glib-2.0/schemas"
 test -s "$out/share/glib-2.0/schemas/gschemas.compiled" \
   || { echo "sbx-gui-data: the schemas compiled to nothing" >&2; exit 1; }
 cp -r @THEMES@/share/themes "$out/share/themes"
-test -d "$out/share/themes/Adwaita-dark" \
-  || { echo "sbx-gui-data: Adwaita-dark is missing from the themes" >&2; exit 1; }
 "#;
 
 /// [`BUILD_SCRIPT`] with the roots of the three packages it draws from: the desktop schemas, GTK
@@ -173,7 +190,6 @@ mod tests {
             Some("the desktop schemas"),
             Some("the file chooser schema"),
             Some("the compiled schemas"),
-            Some("the dark theme"),
         ] {
             let tmp = TmpDir::new();
             let root = tmp.path();
@@ -189,10 +205,7 @@ mod tests {
             if missing != Some("the file chooser schema") {
                 std::fs::write(gtk.join("org.gtk.Settings.FileChooser.gschema.xml"), "x").unwrap();
             }
-            std::fs::create_dir_all(themes.join("Adwaita")).unwrap();
-            if missing != Some("the dark theme") {
-                std::fs::create_dir_all(themes.join("Adwaita-dark")).unwrap();
-            }
+            std::fs::create_dir_all(themes.join("Adwaita-dark")).unwrap();
             let bin = root.join("bin");
             std::fs::create_dir_all(&bin).unwrap();
             let compile = bin.join("glib-compile-schemas");
@@ -245,6 +258,17 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// A set without the dark theme is told apart from one with it, so the launch can say why a
+    /// dialog opens light.
+    #[test]
+    fn a_set_without_the_dark_theme_is_told_apart() {
+        let tmp = crate::testutil::TmpDir::new();
+        std::fs::create_dir_all(tmp.join("share/themes/Adwaita")).unwrap();
+        assert!(lacks_dark_theme(tmp.path()));
+        std::fs::create_dir_all(tmp.join("share/themes/Adwaita-dark")).unwrap();
+        assert!(!lacks_dark_theme(tmp.path()));
     }
 
     #[test]
