@@ -58,7 +58,7 @@ use std::path::{Path, PathBuf};
 /// treats that fallback as fatal never finishes rendering. They share the revision-keyed `gui` gcroot directory with the
 /// fonts/certutil/GUI data (all GUI-hole provisions on the same channel), so `sbx gc` keeps or drops
 /// them together.
-const PACKAGES: &[(&str, &str, &str)] = &[
+const PACKAGES: [(&str, &str, &str); 5] = [
     ("dbus", "bin/dbus-daemon", "dbus"),
     (
         "xdg-desktop-portal",
@@ -138,7 +138,7 @@ impl Drop for HostDir {
 
 /// The provisioned in-cage portal: the store roots to seed and the logical paths the cage uses.
 pub(crate) struct Provision {
-    /// Logical store roots (dbus, xdg-desktop-portal, the GTK backend), to seed into the project
+    /// Logical store roots of every package in [`PACKAGES`], in its order, to seed into the project
     /// store so the cage reads them through `/nix`.
     pub(crate) roots: Vec<PathBuf>,
     /// Logical path of `dbus-daemon` (run inside the cage).
@@ -155,31 +155,34 @@ pub(crate) struct Provision {
     pub(crate) keyring_daemon: PathBuf,
 }
 
-/// Provision the three portal packages into sbx's store against the pinned `nixpkgs`, sharing the
+/// Provision the five portal packages into sbx's store against the pinned `nixpkgs`, sharing the
 /// revision-keyed `gui` gcroot directory with the other GUI-hole provisions.
+///
+/// Each package is named where it is used: [`PACKAGES`] is taken apart by position into one binding
+/// per package, so a list that gained or lost an entry no longer compiles, where reading the roots
+/// back by index panicked at the missing one or handed one package's root to another's field.
 pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Result<Provision> {
     let base = layout
         .data_dir()
         .join("gcroots")
         .join("gui")
         .join(store::revision_of(nixpkgs));
-    let mut roots: Vec<PathBuf> = Vec::new();
-    let mut resolved: Vec<PathBuf> = Vec::new();
-    for (attr, marker, name) in PACKAGES {
-        let root = store::provision(nix, layout, &base.join(name), nixpkgs, attr, marker)?;
-        resolved.push(root.clone());
-        roots.push(root);
-    }
-    // `resolved` is in `PACKAGES` order: dbus, xdg-desktop-portal, xdg-desktop-portal-gtk,
-    // desktop-file-utils, gnome-keyring.
-    let dbus_root = &resolved[0];
+    let get = |(attr, marker, name): (&str, &str, &str)| {
+        store::provision(nix, layout, &base.join(name), nixpkgs, attr, marker)
+    };
+    let [dbus, xdp, gtk, dfu, keyring] = PACKAGES;
+    let dbus = get(dbus)?;
+    let xdp = get(xdp)?;
+    let gtk = get(gtk)?;
+    let dfu = get(dfu)?;
+    let keyring = get(keyring)?;
     Ok(Provision {
-        dbus_daemon: dbus_root.join("bin/dbus-daemon"),
-        xdp_root: resolved[1].clone(),
-        gtk_root: resolved[2].clone(),
-        update_desktop_db: resolved[3].join("bin/update-desktop-database"),
-        keyring_daemon: resolved[4].join("bin/gnome-keyring-daemon"),
-        roots,
+        dbus_daemon: dbus.join("bin/dbus-daemon"),
+        update_desktop_db: dfu.join("bin/update-desktop-database"),
+        keyring_daemon: keyring.join("bin/gnome-keyring-daemon"),
+        roots: vec![dbus, xdp.clone(), gtk.clone(), dfu, keyring],
+        xdp_root: xdp,
+        gtk_root: gtk,
     })
 }
 
