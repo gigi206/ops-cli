@@ -528,10 +528,18 @@ impl SignerProcess {
         self.channel.flush()?;
         let mut reader = io::BufReader::new(reader_side);
         let line = super::broker::read_bounded_line(&mut reader, MAX_LINE_BYTES)?;
+        // The reason quotes the plugin's own words — its `error`, or a field name it invented — and
+        // this error reaches the launching terminal. Escaping there keeps a line break, which would
+        // start a line that reads as sbx's, and cuts nothing from a line read up to
+        // [`MAX_LINE_BYTES`]: so it is reduced the way a resolver's stderr is, to one bounded line.
         let cannot = |why: &str| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("the `{}` signer plugin cannot sign: {why}", plugin.name),
+                format!(
+                    "the `{}` signer plugin cannot sign: {}",
+                    plugin.name,
+                    super::resolver::one_line_detail(why.as_bytes())
+                ),
             )
         };
         parse_hello_reply(&line).map_err(|why| cannot(&why))?;
@@ -1100,5 +1108,54 @@ mod tests {
             let _plugin = answering.join().unwrap();
             assert_eq!(got.is_ok(), accepted, "{said:?}: {got:?}");
         }
+    }
+
+    /// What a plugin says when it declines, or when its answer is unreadable, reaches the launching
+    /// terminal inside the launch's error. It is one bounded line there, as a resolver's stderr is:
+    /// a line break in it would start a line that reads as sbx's own, and a line read up to
+    /// [`MAX_LINE_BYTES`] would fill the screen. Both routes the plugin's words take are tried — its
+    /// `error`, and a field name it invented, which the parser's refusal quotes.
+    #[test]
+    fn a_plugins_words_at_the_handshake_reach_the_terminal_as_one_bounded_line() {
+        let long = "x".repeat(4096);
+        let mut wrong = Vec::new();
+        for said in [
+            serde_json::json!({ "ok": false, "error": format!("no\nsbx: note: forged{long}") }),
+            serde_json::json!({ "ok": true, format!("k\nsbx: note: forged{long}"): 1 }),
+        ] {
+            let (mut process, plugin) = SignerProcess::stand_in(&["Authorization"]);
+            let reader_side = process.channel.try_clone().unwrap();
+            let line = format!("{said}\n");
+            let answering = std::thread::spawn(move || {
+                let mut hello = String::new();
+                io::BufRead::read_line(
+                    &mut io::BufReader::new(plugin.try_clone().unwrap()),
+                    &mut hello,
+                )
+                .unwrap();
+                (&plugin).write_all(line.as_bytes()).unwrap();
+                plugin
+            });
+            let got = process.handshake(
+                &demo_plugin(),
+                "api.example.com",
+                Credential::Plaintext("the-key".to_string()),
+                reader_side,
+            );
+            let _plugin = answering.join().unwrap();
+            let shown = got.expect_err("refused").to_string();
+            // Collected rather than asserted in turn, so one run names every route that fails.
+            if !shown.contains("forged") || shown.contains('\n') || shown.chars().count() >= 400 {
+                wrong.push(format!(
+                    "{} characters: {:?}",
+                    shown.chars().count(),
+                    shown.chars().take(120).collect::<String>()
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "the plugin's words must reach the terminal as one bounded line: {wrong:#?}"
+        );
     }
 }

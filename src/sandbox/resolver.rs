@@ -726,13 +726,14 @@ fn run_within(
     Ok(value)
 }
 
-/// The longest plugin diagnostic sbx repeats. A resolver's stderr is text of its own choosing, so
+/// The longest plugin diagnostic sbx repeats. A plugin's diagnostic is text of its own choosing, so
 /// bound how much of it can reach a terminal or a log line.
 const DETAIL_MAX: usize = 200;
 
-/// Reduce a plugin's stderr to one safe display line, [`one_line`] cut to [`DETAIL_MAX`]
-/// characters.
-fn one_line_detail(raw: &[u8]) -> String {
+/// Reduce a plugin's diagnostic to one safe display line, [`one_line`] cut to [`DETAIL_MAX`]
+/// characters: a resolver's stderr, and a signer's reason for declining at its handshake, which
+/// reach the launching terminal the same way.
+pub(super) fn one_line_detail(raw: &[u8]) -> String {
     let mut out = one_line(raw);
     if out.chars().count() > DETAIL_MAX {
         out = out.chars().take(DETAIL_MAX - 1).collect::<String>() + "…";
