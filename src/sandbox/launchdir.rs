@@ -1,9 +1,9 @@
 //! A launch's own runtime directory, bound read-write into its cage.
 //!
-//! The port forwarder ([`super::forward`]) gives its launch a host directory under the data
-//! directory, keyed by the launcher pid, and binds it into the cage read-write so that sockets made
-//! on one side are reached from the other. Two things follow from that shape, for any directory
-//! that has it.
+//! The port forwarder ([`super::forward`]) and the in-cage portal ([`super::portal`]) each give
+//! their launch a host directory under the data directory, keyed by the launcher pid, and bind it
+//! into the cage read-write so that sockets made on one side are reached from the other. Two
+//! things follow from that shape, and they are stated here once for both.
 //!
 //! The name carries the pid alone, so two launches of one process would name one directory:
 //! [`LiveDir`] refuses the second while the first holds it. And the directory a launch is handed

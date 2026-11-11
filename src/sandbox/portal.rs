@@ -106,15 +106,25 @@ pub(crate) struct HostDir {
 }
 
 impl HostDir {
-    /// Create the per-launch host portal directory (0700, owner-only), clearing any stale
-    /// predecessor from a crashed prior launch of the same pid.
+    /// Create the per-launch host portal directory, owner-only and empty, in an owner-only
+    /// `<data>/portal`.
+    ///
+    /// A directory already at the name is a crashed predecessor's of the same pid, whose cage could
+    /// write anything into it: [`super::launchdir::fresh_dir`] removes it, a read-only directory
+    /// inside included, and makes it again, never adopting what sits at the name. A failure is
+    /// returned rather than the directory reused as found, so the launch runs without a portal
+    /// rather than in a directory that is not its own.
     pub(crate) fn create(layout: &Layout) -> io::Result<HostDir> {
+        use std::os::unix::fs::PermissionsExt;
         let dir = host_dir(layout);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)?;
+        if let Some(parent) = dir.parent() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+        super::launchdir::fresh_dir(&dir)?;
         Ok(HostDir { dir })
     }
 
@@ -131,8 +141,9 @@ impl HostDir {
 }
 
 impl Drop for HostDir {
+    /// Removed the way it was emptied: the cage may have left a read-only directory inside.
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = super::gc::force_remove_dir_all(&self.dir);
     }
 }
 
@@ -745,5 +756,70 @@ mod tests {
         }
         // dropped → removed
         assert!(!path.exists());
+    }
+
+    /// A portal directory already at the launch's name is a dead predecessor's, whose cage could
+    /// widen its mode and leave a read-only directory with an entry in it, which a plain
+    /// `remove_dir_all` cannot empty. The launch still gets it back empty and `0700`, rather than
+    /// reusing it as found with the socket it will hold readable to others.
+    #[test]
+    fn a_portal_directory_a_dead_cage_left_is_made_again_empty_and_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = crate::testutil::TmpDir::new();
+        let layout = Layout::under(tmp.path());
+        let stale = host_dir(&layout);
+        let locked = stale.join("xdg-desktop-portal");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("portals.conf"), b"").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let made = HostDir::create(&layout);
+        // Widened again whatever happened, so the fixture can be removed after a red run.
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
+        let hd = made.expect("create host dir");
+        let mode = std::fs::metadata(hd.dir()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the directory is owner-only again");
+        assert_eq!(
+            std::fs::read_dir(hd.dir()).unwrap().count(),
+            0,
+            "nothing the dead cage left is still there"
+        );
+    }
+
+    /// The directory the per-launch ones sit in is owner-only too, including one found looser.
+    #[test]
+    fn the_portal_parent_is_owner_only_even_when_found_looser() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = crate::testutil::TmpDir::new();
+        let layout = Layout::under(tmp.path());
+        let parent = layout.data_dir().join("portal");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _hd = HostDir::create(&layout).expect("create host dir");
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    /// The cage can make a read-only directory with an entry inside the one bound to it, and the
+    /// end of the launch still removes the whole directory.
+    #[test]
+    fn a_portal_directory_the_cage_made_read_only_inside_is_removed_at_the_end() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = crate::testutil::TmpDir::new();
+        let layout = Layout::under(tmp.path());
+        let hd = HostDir::create(&layout).expect("create host dir");
+        let path = hd.dir().to_path_buf();
+        let locked = path.join("xdg-desktop-portal");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("portals.conf"), b"").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        drop(hd);
+        let left = path.exists();
+        // Widened again whatever happened, so the fixture can be removed after a red run.
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
+        assert!(!left, "the launch's portal directory outlives it");
     }
 }
