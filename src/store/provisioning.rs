@@ -131,6 +131,30 @@ pub(crate) fn provision_unfree(
     provision_licensed(nix, layout, gcroot, flake_ref, attr, marker, true)
 }
 
+/// Refuse a `marker` that is not a relative path inside an output: empty, absolute, or stepping out
+/// with `.` or `..`.
+///
+/// A marker is joined onto an output's tree to probe it, and `Path::join` replaces the whole path
+/// with an absolute one, so `/etc/passwd` would have probed the host's own file and selected any
+/// output for it, and `..` a sibling's tree. Every marker sbx passes is a constant relative path;
+/// this keeps the probe inside the output whatever a later caller passes.
+fn check_marker(marker: &str) -> io::Result<()> {
+    use std::path::Component;
+    let path = Path::new(marker);
+    let inside = path.components().next().is_some()
+        && path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)));
+    if inside {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the marker `{marker}` is not a relative path inside an output"),
+        ))
+    }
+}
+
 /// Create the directory a gcroot lives in, owner-only from the start, so a loose umask never leaves
 /// a window in which another user can read it — the mode [`ensure`] gives the data directory and
 /// the store, which this sits under.
@@ -207,6 +231,7 @@ fn provision_licensed(
     marker: &str,
     allow_unfree: bool,
 ) -> io::Result<PathBuf> {
+    check_marker(marker)?;
     ensure(layout)?;
     ensure_gcroot_parent(gcroot)?;
 
@@ -374,6 +399,7 @@ pub(crate) fn provision_flake(
     label: &str,
     marker: &str,
 ) -> io::Result<PathBuf> {
+    check_marker(marker)?;
     ensure(layout)?;
     ensure_gcroot_parent(gcroot)?;
 
@@ -441,6 +467,7 @@ pub(crate) fn provision_expr(
     label: &str,
     marker: &str,
 ) -> io::Result<PathBuf> {
+    check_marker(marker)?;
     ensure(layout)?;
     ensure_gcroot_parent(gcroot)?;
 
@@ -1167,6 +1194,46 @@ mod tests {
             expected.get() + 1,
             "a collected output must run nix"
         );
+    }
+
+    /// A marker that is not a relative path inside an output is refused by every provisioner before
+    /// nix runs: joined onto an output's tree, an absolute one would probe a host file and `..` a
+    /// sibling's tree.
+    #[test]
+    fn a_marker_outside_the_output_is_refused_before_nix_runs() {
+        let data = TmpDir::new();
+        let nix = data.path().join("nix");
+        let ran = data.path().join("ran");
+        crate::testutil::write_script(
+            &nix,
+            &format!("echo x >> {}", crate::testutil::sh_word(&ran)),
+        );
+        let layout = Layout::under(data.path());
+        let gcroot = data.path().join("roots").join("pkg");
+        for marker in ["", "/etc/passwd", "../x", "bin/../../x", "./bin"] {
+            let refusals = [
+                provision(
+                    &nix,
+                    &layout,
+                    &gcroot,
+                    "github:NixOS/nixpkgs/x",
+                    "hello",
+                    marker,
+                ),
+                provision_flake(&nix, &layout, &gcroot, "github:o/r", "pkg", marker),
+                provision_expr(&nix, &layout, &gcroot, "{ }", "pkg", marker),
+            ];
+            for (i, refused) in refusals.into_iter().enumerate() {
+                let e = refused.expect_err(marker);
+                assert_eq!(
+                    e.kind(),
+                    io::ErrorKind::InvalidInput,
+                    "provisioner {i}, `{marker}`: {e}"
+                );
+            }
+        }
+        assert!(!ran.exists(), "nix ran for a refused marker");
+        assert!(check_marker("bin").is_ok() && check_marker("lib/locale/locale-archive").is_ok());
     }
 
     /// The directory the channel source is rooted in is created owner-only, as every other gcroot
