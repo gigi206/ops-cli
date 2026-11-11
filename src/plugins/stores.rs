@@ -730,9 +730,15 @@ pub(crate) fn read_configured(
     let pubkey = decode_key(&raw.pubkey)
         .map_err(|e| format!("the configuration of store `{name}` has an invalid key: {e}"))?;
     // Held to the rule an add holds it to, for a file edited since: every verb takes the URL from
-    // here, to print it or to hand it to git.
-    validate_url(&raw.url)
-        .map_err(|e| format!("the configuration of store `{name}` is refused: {e}"))?;
+    // here, to print it or to hand it to git. The refusal names both ways out, since every verb
+    // that reads the configuration now refuses the store; `store rm` does not read it.
+    validate_url(&raw.url).map_err(|e| {
+        format!(
+            "the configuration of store `{name}` is refused: {e} — correct its `url` in {}, or \
+             remove the store with `sbx plugins store rm {name}`",
+            dir.join(STORE_TOML).display()
+        )
+    })?;
 
     // The floor is best-effort: a missing or unparsable lock means "no floor yet" (0), never an
     // error, so a legacy or truncated lock cannot wedge a store.
@@ -2398,8 +2404,11 @@ mod tests {
             )
             .unwrap();
             let read = read_configured(&layout, "mine");
-            if read.is_ok() != admitted {
-                wrong.push(format!("{url}: {:?}", read.map(|c| c.url)));
+            match read {
+                Ok(_) if admitted => {}
+                // The refusal names the way out, which `store rm` is: it reads no configuration.
+                Err(why) if !admitted && why.contains("sbx plugins store rm mine") => {}
+                other => wrong.push(format!("{url}: {:?}", other.map(|c| c.url))),
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
