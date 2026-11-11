@@ -70,25 +70,63 @@ fn data_env(root: &Path) -> Vec<(String, String)> {
     )]
 }
 
-/// The generated derivation: collect every `.gschema.xml` from the GNOME desktop schemas and GTK
-/// (whose `org.gtk.Settings.FileChooser` the file dialog reads), compile them into one
-/// `gschemas.compiled`, and stage `gnome-themes-extra`'s `share/themes` (the source of the named
-/// `Adwaita-dark` theme the file dialog uses). The placeholders are substituted
-/// (`@NIXPKGS@`/`@SYSTEM@`); every interpolated value is sbx-controlled, so the expression carries
-/// nothing to escape.
+/// The generated derivation: the pinned nixpkgs' `runCommand` around [`BUILD_SCRIPT`], given the
+/// three packages it draws from by their store paths. The placeholders are substituted
+/// (`@NIXPKGS@`/`@SYSTEM@`); `nixpkgs` is a channel name, a 40-hex revision or a pinned GitHub
+/// reference by the grammars the config holds it to, and `system` is sbx's own, so neither carries
+/// a character a Nix string would read as anything but itself.
 fn derivation_expr(nixpkgs: &str, system: &str) -> String {
     const TEMPLATE: &str = r#"let pkgs = (builtins.getFlake "@NIXPKGS@").legacyPackages.@SYSTEM@;
 in pkgs.runCommand "sbx-gui-data" { nativeBuildInputs = [ pkgs.glib ]; } ''
-  mkdir -p $out/share/glib-2.0/schemas
-  for p in ${pkgs.gsettings-desktop-schemas} ${pkgs.gtk3}; do
-    find "$p/share/gsettings-schemas" -name "*.gschema.xml" -exec cp -f -t $out/share/glib-2.0/schemas {} + 2>/dev/null || true
-  done
-  glib-compile-schemas $out/share/glib-2.0/schemas
-  cp -r ${pkgs.gnome-themes-extra}/share/themes $out/share/themes
-''"#;
+@SCRIPT@''"#;
     TEMPLATE
+        .replace(
+            "@SCRIPT@",
+            &build_script(
+                "${pkgs.gsettings-desktop-schemas}",
+                "${pkgs.gtk3}",
+                "${pkgs.gnome-themes-extra}",
+            ),
+        )
         .replace("@NIXPKGS@", nixpkgs)
         .replace("@SYSTEM@", system)
+}
+
+/// What the derivation runs, with `$out` set: collect every `.gschema.xml` from the GNOME desktop
+/// schemas and GTK, compile them into one `gschemas.compiled`, and stage `gnome-themes-extra`'s
+/// `share/themes`, the source of the named `Adwaita-dark` theme the file dialog uses.
+///
+/// Every piece the cage depends on is checked before the output is let through, and its absence
+/// fails the build by name. The schemas the portal's keyfile and the file dialog read are
+/// `org.gnome.desktop.interface` and `org.gtk.Settings.FileChooser`; without either, GTK aborts
+/// **FATAL** at the dialog's first `g_settings_new`, so a set that compiled without them would be
+/// a crash shipped as a success. The same holds for a compile that wrote nothing and for a theme
+/// directory without `Adwaita-dark`. A nixpkgs that moved one of these is then a failed provision,
+/// which the launch reports, rather than an output reused on every launch after.
+const BUILD_SCRIPT: &str = r#"mkdir -p "$out/share/glib-2.0/schemas"
+for p in @SCHEMAS@ @GTK@; do
+  find "$p/share/gsettings-schemas" -name "*.gschema.xml" -exec cp -f -t "$out/share/glib-2.0/schemas" {} + \
+    || { echo "sbx-gui-data: no GSettings schemas under $p" >&2; exit 1; }
+done
+for schema in org.gnome.desktop.interface org.gtk.Settings.FileChooser; do
+  test -e "$out/share/glib-2.0/schemas/$schema.gschema.xml" \
+    || { echo "sbx-gui-data: the $schema schema is missing" >&2; exit 1; }
+done
+glib-compile-schemas "$out/share/glib-2.0/schemas"
+test -s "$out/share/glib-2.0/schemas/gschemas.compiled" \
+  || { echo "sbx-gui-data: the schemas compiled to nothing" >&2; exit 1; }
+cp -r @THEMES@/share/themes "$out/share/themes"
+test -d "$out/share/themes/Adwaita-dark" \
+  || { echo "sbx-gui-data: Adwaita-dark is missing from the themes" >&2; exit 1; }
+"#;
+
+/// [`BUILD_SCRIPT`] with the roots of the three packages it draws from: the desktop schemas, GTK
+/// and the themes. The derivation passes Nix antiquotations; a test passes directories of its own.
+fn build_script(schemas: &str, gtk: &str, themes: &str) -> String {
+    BUILD_SCRIPT
+        .replace("@SCHEMAS@", schemas)
+        .replace("@GTK@", gtk)
+        .replace("@THEMES@", themes)
 }
 
 #[cfg(test)]
@@ -122,6 +160,91 @@ mod tests {
         };
         let expr = derivation_expr("github:NixOS/nixpkgs/abc", "x86_64-linux");
         crate::testutil::assert_nix_parses(&instantiate, "guidata::derivation_expr", &expr);
+    }
+
+    /// The build step, run under `bash` over three package directories of its own and a stand-in
+    /// `glib-compile-schemas`: a complete set builds, and a set missing any piece the cage depends
+    /// on fails rather than ships. Each shape takes away one piece of the complete set.
+    #[test]
+    fn the_build_step_fails_rather_than_ship_a_set_missing_a_piece() {
+        use crate::testutil::{TmpDir, write_script};
+        for missing in [
+            None,
+            Some("the desktop schemas"),
+            Some("the file chooser schema"),
+            Some("the compiled schemas"),
+            Some("the dark theme"),
+        ] {
+            let tmp = TmpDir::new();
+            let root = tmp.path();
+            let schemas = root.join("schemas/share/gsettings-schemas/d/glib-2.0/schemas");
+            let gtk = root.join("gtk/share/gsettings-schemas/g/glib-2.0/schemas");
+            let themes = root.join("themes/share/themes");
+            std::fs::create_dir_all(&gtk).unwrap();
+            if missing != Some("the desktop schemas") {
+                std::fs::create_dir_all(&schemas).unwrap();
+                std::fs::write(schemas.join("org.gnome.desktop.interface.gschema.xml"), "x")
+                    .unwrap();
+            }
+            if missing != Some("the file chooser schema") {
+                std::fs::write(gtk.join("org.gtk.Settings.FileChooser.gschema.xml"), "x").unwrap();
+            }
+            std::fs::create_dir_all(themes.join("Adwaita")).unwrap();
+            if missing != Some("the dark theme") {
+                std::fs::create_dir_all(themes.join("Adwaita-dark")).unwrap();
+            }
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let compile = bin.join("glib-compile-schemas");
+            write_script(
+                &compile,
+                if missing == Some("the compiled schemas") {
+                    ":"
+                } else {
+                    "printf 'compiled' > \"$1/gschemas.compiled\""
+                },
+            );
+            // Run once on its own, so a fork in another test still holding the descriptor that
+            // wrote it is waited out here rather than met by the script, which would read as a
+            // failed compile.
+            crate::testutil::output_past_etxtbsy(std::process::Command::new(&compile).arg(&bin));
+            let _ = std::fs::remove_file(bin.join("gschemas.compiled"));
+
+            let out = root.join("out");
+            let word = |p: &Path| crate::testutil::sh_word(p);
+            let script = build_script(
+                &word(&root.join("schemas")),
+                &word(&root.join("gtk")),
+                &word(&root.join("themes")),
+            );
+            let ran = crate::testutil::run_within(
+                std::process::Command::new("/bin/bash")
+                    .args(["-c", &script])
+                    .env_clear()
+                    .env("out", &out)
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin.display())),
+                "the gui data build step",
+            );
+            match missing {
+                None => {
+                    assert!(
+                        ran.status.success(),
+                        "the complete set builds: {}",
+                        ran.stderr
+                    );
+                    assert!(
+                        out.join("share/glib-2.0/schemas/gschemas.compiled")
+                            .is_file()
+                    );
+                    assert!(out.join("share/themes/Adwaita-dark").is_dir());
+                }
+                Some(piece) => assert!(
+                    !ran.status.success(),
+                    "a set without {piece} must fail its build: {}",
+                    ran.stderr
+                ),
+            }
+        }
     }
 
     #[test]
