@@ -292,9 +292,7 @@ pub(crate) fn root_channel_source(nix: &Path, layout: &Layout, roots: &Path, fla
     let Some(nix_store) = resolve_nix_store(Some(layout)) else {
         return;
     };
-    if let Some(parent) = link.parent()
-        && std::fs::create_dir_all(parent).is_err()
-    {
+    if ensure_gcroot_parent(&link).is_err() {
         return;
     }
     // `--indirect` registers the link in the store's own `gcroots/auto/`, which is what makes it a
@@ -1169,6 +1167,41 @@ mod tests {
             expected.get() + 1,
             "a collected output must run nix"
         );
+    }
+
+    /// The directory the channel source is rooted in is created owner-only, as every other gcroot
+    /// directory is, whatever the umask: it sits in the data directory, which is kept to its owner.
+    /// The engine is a pair of stand-ins in the layout's own engine directory, so nothing is
+    /// downloaded and the nix the host carries is never asked.
+    #[test]
+    fn the_channel_source_is_rooted_in_an_owner_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new();
+        let layout = Layout::under(&tmp.path().join("data"));
+        let engine = layout.engine_dir();
+        std::fs::create_dir_all(&engine).unwrap();
+        let nix = engine.join("nix");
+        crate::testutil::write_script(
+            &nix,
+            "echo 'Path: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-source'",
+        );
+        crate::testutil::write_script(&engine.join("nix-store"), "exit 0");
+        let roots = layout.data_dir().join("gcroots").join("channel");
+
+        // A stand-in just written can meet `ETXTBSY` while a forking thread holds it open, and this
+        // function swallows every failure, so the call is repeated until the directory is there.
+        for _ in 0..50 {
+            root_channel_source(&nix, &layout, &roots, "github:NixOS/nixpkgs/x");
+            if roots.is_dir() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        for dir in [roots.parent().unwrap(), roots.as_path()] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
     }
 }
 
