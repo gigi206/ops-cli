@@ -158,7 +158,8 @@ pub(crate) enum Room {
     /// Nothing is there, and this uid may write the nearest directory that exists above it.
     Creatable,
     /// Nothing is there, and the nearest directory that exists above it refuses this uid a write:
-    /// root-owned, or on a read-only mount.
+    /// root-owned, or on a read-only mount. Or the path cannot be looked at at all, under a file or
+    /// under a directory this uid may not search, where nothing can be created either.
     Missing,
 }
 
@@ -177,9 +178,17 @@ impl Room {
 
 /// What this host holds at `p`, asked of the kernel ([`crate::pathfind::access_ok`]) rather than
 /// read from mode bits, so ownership, ACLs and a read-only mount all count.
+///
+/// Only a path the kernel says is not there is asked about the directory above it. Any other
+/// failure to look at `p` (a file where a directory belongs, a directory this uid may not search,
+/// a loop of links) is a path nothing can be created at, and bwrap fails on it the same way. Once
+/// `p` is absent, every entry above its first missing component could be looked at, so the walk up
+/// ends on the nearest one that exists.
 fn host_room(p: &Path) -> Room {
-    if p.symlink_metadata().is_ok() {
-        return Room::Present;
+    match p.symlink_metadata() {
+        Ok(_) => return Room::Present,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Room::Missing,
     }
     let nearest = p.ancestors().skip(1).find(|a| a.symlink_metadata().is_ok());
     match nearest {
@@ -205,8 +214,8 @@ fn dropped_note(dest: &Path, blocking: &str, link: bool) -> String {
     let why = if link {
         "a link the sandbox creates there, which cannot be placed inside a bind"
     } else {
-        "a path the sandbox mounts there, which this host does not have and which cannot be \
-         created inside the bind"
+        "a path the sandbox mounts there, which this host does not have or does not let this \
+         user reach, and which cannot be created inside the bind"
     };
     let ca_note = if blocking == CAGE_CA_BUNDLE {
         "; the cage's TLS does not need it, since sbx binds its own CA bundle"

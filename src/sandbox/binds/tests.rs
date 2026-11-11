@@ -358,6 +358,45 @@ fn structural_symlinks_lists_every_link_assemble_emits() {
     }
 }
 
+/// A path sbx mounts on that cannot be looked at is not taken for one that is merely absent.
+///
+/// Absent, a writable bind gets its mountpoint created inside it, as far as the nearest directory
+/// above lets this uid write. But under a file, or under a directory this uid may not search, the
+/// path cannot be looked at, and nothing can be created there either: read as absent, the nearest
+/// entry above it was asked for a write instead, a file or a write-only directory said yes, and
+/// the bind was kept for a launch that bwrap then refused.
+#[test]
+fn a_mountpoint_that_cannot_be_looked_at_drops_the_bind_that_holds_it() {
+    use super::nesting::launch_unestablishable_bind_warning;
+    let tmp = TmpDir::new();
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"").unwrap();
+    let under_a_file = file.join("x");
+    assert!(
+        launch_unestablishable_bind_warning(tmp.path(), true, [under_a_file.as_path()]).is_some(),
+        "a mountpoint under a file is kept"
+    );
+
+    // SAFETY: `geteuid` reads this process's credentials and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        skip_incapable!("running as root, which searches a directory whatever its mode");
+        return;
+    }
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o200)).unwrap();
+    let under_a_locked_dir = locked.join("x");
+    let kept =
+        launch_unestablishable_bind_warning(tmp.path(), true, [under_a_locked_dir.as_path()])
+            .is_none();
+    // Searchable again whatever happened, so the fixture can be removed after a red run.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !kept,
+        "a mountpoint under a directory this uid may not search is kept"
+    );
+}
+
 /// A launcher destination blocks a bind only on a launch that mounts it: `/run` holds the audio
 /// socket when audio is on and nothing of sbx's otherwise.
 #[test]
