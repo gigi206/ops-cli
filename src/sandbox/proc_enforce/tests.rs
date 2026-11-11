@@ -1777,6 +1777,63 @@ fn the_shortest_open_how_the_kernel_accepts_is_the_whole_first_version() {
     );
 }
 
+/// A file the scan passed, rewritten in place at the same length with its modification time put
+/// back, is scanned again rather than answered from the cache.
+///
+/// The cache keys a verdict by the file's identity, and every field of it but one is the cage's to
+/// set: the inode and the size stay what they were, and `utimensat` restores the modification
+/// time to the nanosecond. The change time is the kernel's alone, so it is what tells the rewrite
+/// apart; without it, the secret written after a clean scan was opened on the clean verdict.
+#[test]
+fn a_rewrite_that_restores_the_modification_time_is_scanned_again() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = TmpDir::new();
+    let file = dir.path().join("rewritten.txt");
+    std::fs::write(&file, b"API key: xx-ABC123DEF456GHI789\n").expect("write the clean fixture");
+    let lens = OpenLens::new(
+        crate::open_policy::OpenPolicy::compile(
+            &[r"sk-[A-Za-z0-9]{12,}".to_string()],
+            crate::open_policy::MAX_SCAN_DEFAULT,
+        )
+        .expect("the test pattern compiles")
+        .expect("a non-empty list yields a policy"),
+        std::fs::canonicalize(dir.path()).expect("canonical fixture root"),
+    );
+    let name = file.to_str().expect("utf-8 fixture path");
+    let me = std::process::id();
+    assert!(
+        !open_is_refused(&lens, me, libc::AT_FDCWD, name).refused,
+        "the clean file is open"
+    );
+    let before = std::fs::metadata(&file).expect("stat the clean fixture");
+
+    // Past the change time's granularity, which is a clock tick on many kernels: a rewrite inside
+    // the same tick keeps it, and that window is the one the cache key cannot close.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::fs::write(&file, b"API key: sk-ABC123DEF456GHI789\n").expect("rewrite in place");
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .and_then(|f| f.set_modified(before.modified()?))
+        .expect("put the modification time back");
+    let after = std::fs::metadata(&file).expect("stat the rewritten fixture");
+    assert_eq!(
+        (after.ino(), after.size(), after.mtime(), after.mtime_nsec()),
+        (
+            before.ino(),
+            before.size(),
+            before.mtime(),
+            before.mtime_nsec()
+        ),
+        "the premise: the rewrite left every field but the change time as it was"
+    );
+
+    assert!(
+        open_is_refused(&lens, me, libc::AT_FDCWD, name).refused,
+        "the secret written after the clean scan is refused"
+    );
+}
+
 /// The refusal a person reads is composed from the name the **cage** wrote, and a Linux path may
 /// carry a newline or an escape sequence. Both `diag::warn` sites in the open path put that name
 /// on a line that reaches the operator's terminal and the session log `sbx logs` reads, so an

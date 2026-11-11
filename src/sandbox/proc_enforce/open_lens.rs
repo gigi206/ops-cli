@@ -211,9 +211,12 @@ pub(super) fn handle_open(
 /// answer, and a rewrite changes at least one of these fields.
 ///
 /// `mtime` alone would miss a write that lands inside the same timestamp granularity, so size and
-/// inode ride along. This is a cache key, not a boundary: a rewrite that preserved all four would
-/// serve a stale verdict, which is the same window a scan-at-open filesystem has and is why the lens
-/// is a backstop rather than a proof.
+/// inode ride along — and `mtime` is the cage's to set besides, since `utimensat` puts it back to
+/// the nanosecond after a rewrite of the same length. The change time is not: the kernel sets it on
+/// every write and every `utimensat`, and nothing a process calls sets it back. This is a cache
+/// key, not a boundary: a rewrite of the same length inside one tick of the change time's clock
+/// would serve a stale verdict, which is the same window a scan-at-open filesystem has and is why
+/// the lens is a backstop rather than a proof.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
 pub(super) struct FileId {
     pub(super) dev: u64,
@@ -221,6 +224,8 @@ pub(super) struct FileId {
     size: u64,
     mtime: i64,
     mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
 }
 
 impl FileId {
@@ -232,6 +237,8 @@ impl FileId {
             size: meta.size(),
             mtime: meta.mtime(),
             mtime_nsec: meta.mtime_nsec(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
         }
     }
 }
