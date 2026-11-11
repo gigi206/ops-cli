@@ -141,7 +141,7 @@ impl super::lens::Event for ExecEvent {
 pub(crate) type ExecSnapshot = super::lens::Snapshot<ExecEvent>;
 
 /// A bounded ring of recent exec events. Shared (via `Arc`) between the observer thread (which
-/// [`push`](ExecRing::push)es) and the control serve thread (which [`snapshot`](super::lens::Ring::snapshot)s
+/// [`push`](ExecRing::push)es) and the control serve thread (which [`snapshot`](ExecRing::snapshot)s
 /// for `sbx proc logs`). The sequencing and eviction are [`super::lens::Ring`]'s; what this adds is
 /// the shape of an exec event, and the two ways one arrives.
 pub(crate) struct ExecRing(super::lens::Ring<ExecEvent>);
@@ -193,22 +193,22 @@ impl ExecRing {
             command,
         })
     }
-}
 
-/// The ring underneath, so a snapshot reads the same on this lens as on any other: `snapshot` is
-/// [`super::lens::Ring`]'s and is reached through here, while `push` above stays this lens's own.
-impl std::ops::Deref for ExecRing {
-    type Target = super::lens::Ring<ExecEvent>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    /// The events past `after` — [`super::lens::Ring::snapshot`], and the only part of the ring
+    /// this lens hands out.
+    ///
+    /// The ring itself stays private to this module. Its [`push_with`](super::lens::Ring::push_with)
+    /// takes an event as given, so a ring reachable from outside would be a second door, one where
+    /// no caller or command is sanitised, and nothing would say a new producer had used it.
+    pub(crate) fn snapshot(&self, after: Option<u64>) -> ExecSnapshot {
+        self.0.snapshot(after)
     }
 }
 
 /// Serve the control socket, answering `LOG` from the ring the observer pushes to. See
 /// [`super::lens::serve`].
 pub(crate) fn serve(listener: UnixListener, ring: Arc<ExecRing>) -> io::Result<()> {
-    super::lens::serve(listener, move |cmd| super::lens::dispatch_log(cmd, &ring))
+    super::lens::serve(listener, move |cmd| super::lens::dispatch_log(cmd, &ring.0))
 }
 
 /// Serve the control socket for an **enforcing** session (`[proc] mode = enforce|ask`): like
@@ -269,7 +269,7 @@ fn dispatch_enforced(
     }
     let mut parts = cmd.split_whitespace();
     match parts.next() {
-        Some("LOG") => super::lens::dispatch_log(cmd, ring),
+        Some("LOG") => super::lens::dispatch_log(cmd, &ring.0),
         Some("LIST") => {
             let mut out = String::new();
             for (id, pid, path, waited) in pending.list() {

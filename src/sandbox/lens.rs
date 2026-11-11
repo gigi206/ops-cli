@@ -1056,6 +1056,44 @@ mod tests {
         assert!(calls >= 5, "the guard found {calls} `push_with` calls");
     }
 
+    /// A lens's ring wrapper is the one door its events come through: its `push` is where the
+    /// free-form fields are sanitised, while [`Ring::push_with`] underneath takes an event as given.
+    /// A `Deref` to that ring opens a second door to the whole crate, and nothing would say a new
+    /// producer had come in through it.
+    ///
+    /// Read from the sources, since a door left open is not something a test can see at run time:
+    /// every `Deref` impl whose block names `lens::Ring<` is collected, and the set must be exactly
+    /// the wrappers listed below. A wrapper that is given its `Deref` back fails here, and one that
+    /// loses it is taken off the list.
+    #[test]
+    fn no_lens_ring_hands_out_the_ring_underneath() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut derefs = Vec::new();
+        for path in crate::testutil::crate_sources() {
+            let text = std::fs::read_to_string(&path).expect("read a source");
+            let production = crate::testutil::production_half(&text);
+            for (at, _) in production.match_indices("Deref for ") {
+                let block = &production[at..];
+                let block = &block[..block.find("\n}").unwrap_or(block.len())];
+                if block.contains("lens::Ring<") {
+                    let rel = path.strip_prefix(root).unwrap_or(&path);
+                    derefs.push(rel.display().to_string());
+                }
+            }
+        }
+        derefs.sort();
+        assert_eq!(
+            derefs,
+            [
+                "src/sandbox/broker_control.rs",
+                "src/sandbox/fs_control.rs",
+                "src/sandbox/signer_control.rs",
+                "src/sandbox/sshagent_control.rs",
+            ],
+            "the lens rings that still hand out the ring underneath"
+        );
+    }
+
     /// The least an event can be: a sequence number and nothing else. The ring's contract is about
     /// sequencing and eviction, so a lens's own fields would only be noise here — each lens tests
     /// that its `push` maps its arguments onto its own event.
