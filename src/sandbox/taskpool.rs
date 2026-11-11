@@ -473,9 +473,11 @@ pub(crate) fn upgrade(
 /// leaves as a single argument naming the tool. The argv is therefore not a picture of the pool,
 /// which is worth saying where the two stop matching.
 fn upgrade_argv(mise_bin: &Path, tokens: &[String]) -> Vec<OsString> {
+    // After `--`, as the install's are: a tool is never read as an option.
     let mut argv = vec![
         mise_bin.as_os_str().to_os_string(),
         OsString::from("upgrade"),
+        OsString::from("--"),
     ];
     let mut seen: Vec<&str> = Vec::new();
     for token in tokens {
@@ -532,10 +534,14 @@ fn install_spec(
     // `use -g` rather than a bare `install`: it installs, records the version in the pool's own
     // global config, and writes the shims. A shim resolves its version from that config, so a plain
     // `install` would leave shims that cannot decide what to run.
+    //
+    // The tokens follow `--`, so mise reads each as a tool and never as an option: the declaration
+    // refuses a leading `-`, and this holds whatever reaches here.
     let mut argv = vec![
         mise_bin.as_os_str().to_os_string(),
         OsString::from("use"),
         OsString::from("-g"),
+        OsString::from("--"),
     ];
     argv.extend(tokens.iter().map(OsString::from));
 
@@ -1118,7 +1124,8 @@ mod tests {
         assert_eq!(env("PATH"), Some("/bin"), "the base userland stays on PATH");
 
         // `use -g` rather than `install`: it also records the version and writes the shims a task
-        // resolves through. A bare `install` leaves shims that cannot decide what to run.
+        // resolves through. A bare `install` leaves shims that cannot decide what to run. The
+        // tokens follow `--`, so none is read as an option.
         let argv: Vec<String> = spec
             .cmd
             .iter()
@@ -1130,6 +1137,7 @@ mod tests {
                 "/nix/store/abc-mise/bin/mise".to_string(),
                 "use".to_string(),
                 "-g".to_string(),
+                "--".to_string(),
                 "node@22".to_string()
             ]
         );
@@ -1137,7 +1145,7 @@ mod tests {
 
     /// The roll asks mise to move a *tool*, so the `@version` comes off: `mise upgrade jq@1.8.2`
     /// would ask it to move to where it already is. Duplicates collapse — two tasks sharing a tool
-    /// roll it once.
+    /// roll it once. The tools follow `--`, as the install's do, so none is read as an option.
     #[test]
     fn the_roll_names_tools_without_their_versions() {
         let argv: Vec<String> = upgrade_argv(
@@ -1156,6 +1164,7 @@ mod tests {
             vec![
                 "/nix/store/abc-mise/bin/mise".to_string(),
                 "upgrade".to_string(),
+                "--".to_string(),
                 "node".to_string(),
                 "aqua:cli/gh".to_string(),
             ]

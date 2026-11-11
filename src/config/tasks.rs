@@ -568,6 +568,13 @@ fn validate_task_packages(raw: &[String]) -> Result<Vec<String>, String> {
         if token.split('/').any(|c| c == "." || c == "..") {
             return Err(format!("`{entry}`: a mise tool token carries no `.`/`..`"));
         }
+        // A leading `-` would read as an option to the `mise` it reaches (`mise:--help` printed
+        // the help and installed nothing), and no tool is named that way.
+        if token.starts_with('-') {
+            return Err(format!(
+                "`{entry}`: a mise tool token does not start with `-`"
+            ));
+        }
         if !out.iter().any(|t| t == token) {
             out.push(token.to_string());
         }
@@ -2348,7 +2355,8 @@ mod tests {
     }
 
     /// A token reaches both a `mise install` argv and a path under the pool, so the characters that
-    /// would make either ambiguous are refused rather than quietly rewritten.
+    /// would make either ambiguous are refused rather than quietly rewritten, and so is a leading
+    /// `-`, which mise would read as an option.
     #[test]
     fn a_malformed_token_is_refused() {
         for bad in [
@@ -2357,6 +2365,8 @@ mod tests {
             "mise:a b",
             "mise:../escape",
             "mise:x/../y",
+            "mise:--help",
+            "mise:-y",
         ] {
             assert!(
                 validate_task_packages(&[bad.into()]).is_err(),
