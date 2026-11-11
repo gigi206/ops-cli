@@ -1109,6 +1109,24 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// One line typed at a prompt of [`offer_verification`], or `None` once one cannot be read — the
+/// terminal gone, or bytes that are not UTF-8. That is said, with the command that confirms the key
+/// later: the person who started answering is owed more than an exchange that stops.
+fn read_answer() -> Option<String> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    match std::io::stdin().lock().read_line(&mut line) {
+        Ok(_) => Some(line),
+        Err(e) => {
+            diag::warn(&format!(
+                "cannot read the answer ({e}): the store is configured, and its key can be \
+                 confirmed later with `sbx plugins store verify`"
+            ));
+            None
+        }
+    }
+}
+
 /// Ask, right after a trust-on-first-use add, whether the user already holds the store's key from
 /// somewhere else — and confirm it on the spot if so, saving a second command. Only on a terminal
 /// (both stdin and stderr): a scripted or piped run behaves exactly as it did, and the printed
@@ -1120,7 +1138,6 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
 ///
 /// Declining is the default and costs nothing — the same command remains available later.
 fn offer_verification(layout: &store::Layout, name: &str) {
-    use std::io::BufRead;
     if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
         return;
     }
@@ -1131,10 +1148,9 @@ fn offer_verification(layout: &store::Layout, name: &str) {
     )) {
         return;
     }
-    let mut line = String::new();
-    if std::io::stdin().lock().read_line(&mut line).is_err() {
+    let Some(line) = read_answer() else {
         return;
-    }
+    };
     if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         return;
     }
@@ -1143,10 +1159,9 @@ fn offer_verification(layout: &store::Layout, name: &str) {
     )) {
         return;
     }
-    let mut key = String::new();
-    if std::io::stdin().lock().read_line(&mut key).is_err() {
+    let Some(key) = read_answer() else {
         return;
-    }
+    };
     let key = key.trim();
     if key.is_empty() {
         return;

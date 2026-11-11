@@ -756,6 +756,65 @@ fn a_publish_flag_without_a_usable_value_is_refused_and_writes_no_key() {
     assert!(slipped.is_empty(), "{}", slipped.join("\n"));
 }
 
+/// After a trust-on-first-use add, a terminal is asked whether it holds the store's key from
+/// elsewhere, then for the key. An answer to either that cannot be read, here one that is not
+/// UTF-8, is said with the command that confirms the key later, rather than ending the exchange in
+/// silence. Each question is answered so in a run of its own.
+#[test]
+fn an_answer_the_key_questions_cannot_read_is_said() {
+    if !git_works() {
+        skip_incapable!("skipping: no working git on PATH");
+        return;
+    }
+    let repo = TmpDir::new("plugins");
+    local_plugin(&repo.path().join("plugins"), "kp", "kp");
+    let signer = TmpDir::new("plugins");
+    let (url, _) = signed_store(signer.path(), repo.path(), &signer.path().join("key"), None);
+
+    // The prompt each typed line answers, in order.
+    let runs: &[&[(&str, &[u8])]] = &[
+        &[("[y/N]", b"\xff\n")],
+        &[("[y/N]", b"y\n"), ("empty to skip", b"\xff\n")],
+    ];
+    for run in runs {
+        let home = TmpDir::new("plugins");
+        let mut pty = common::pty::Pty::open(None);
+        let mut add = sbx(
+            &[
+                "plugins", "store", "add", "--name", "mine", "--url", &url, "--trust",
+            ],
+            home.path(),
+        );
+        add.stdin(pty.stdio())
+            .stderr(pty.stdio())
+            .stdout(std::process::Stdio::null());
+        let _add = common::pty::Reaped(add.spawn().expect("spawn sbx"));
+        // The command holds copies of the terminal for its streams, and the session ends only
+        // once every copy outside the child is closed.
+        drop(add);
+        pty.release_slave();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut seen = Vec::new();
+        for (prompt, typed) in *run {
+            assert!(
+                pty.read_until(&mut seen, deadline, |o| {
+                    String::from_utf8_lossy(o).contains(prompt)
+                }),
+                "`{prompt}` is asked:\n{}",
+                String::from_utf8_lossy(&seen)
+            );
+            pty.send(typed);
+        }
+        pty.read_until(&mut seen, deadline, |_| false);
+        let seen = String::from_utf8_lossy(&seen);
+        assert!(
+            seen.contains("cannot read the answer") && seen.contains("sbx plugins store verify"),
+            "an unreadable answer is said:\n{seen}"
+        );
+    }
+}
+
 #[test]
 fn the_markers_and_the_installed_filter_agree_on_what_is_in_place() {
     if !git_works() {
