@@ -714,6 +714,13 @@ fn a_bind_containing_several_sbx_mounts_names_more_than_the_first() {
     assert!(etc.contains("`/etc/group`"), "{etc}");
     let root = structural_nesting_warning(Path::new("/"), false, None).expect("a nesting note");
     assert!(root.contains(" more"), "{root}");
+    // A mount inside another of sbx's is mounted over sbx's, not over the bind, so `/opt` names
+    // `/opt/sbx` alone, and not what sbx mounts inside it.
+    let opt = structural_nesting_warning(Path::new("/opt"), false, None).expect("a nesting note");
+    assert!(
+        opt.contains("`/opt/sbx`") && !opt.contains("`/opt/sbx/") && !opt.contains(" more"),
+        "{opt}"
+    );
 }
 
 /// A bind aimed at one of the launcher's own destinations is named, not silently replaced.
