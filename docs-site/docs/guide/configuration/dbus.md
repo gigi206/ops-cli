@@ -95,8 +95,9 @@ This posture:
   portal (its file chooser falls back to its own dialog); if the host theme cannot be read, the app
   opens in its default theme; if there is no host notifications daemon, notifications are simply
   absent. None of these fail the launch. Neither does a step that fails inside the cage: if the
-  private bus or the cage's Secret Service does not start, or the theme cannot be written into the
-  cage, a line starting `sbx:` on the app's standard error says which, and the app runs without it.
+  private bus does not start, if the cage's Secret Service does not start or does not answer in
+  time, or if the theme cannot be written into the cage, a line starting `sbx:` on the app's
+  standard error says which, and the app runs without it.
 
 The in-cage front-end activates every portal backend interface in-cage (Screenshot, ScreenCast, …),
 not only the file chooser. This adds **no** reach beyond what the display hole already grants: those

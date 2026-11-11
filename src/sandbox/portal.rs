@@ -458,7 +458,8 @@ fn wrap_command_at(
     // login stored on one launch is still there on the next. Best-effort like the rest of the
     // preamble: a cage whose keyring will not open, or whose name never gets an owner, still
     // launches, with the app back on whatever fallback it chooses, and a line on standard error
-    // says so. Like the bus's and the seed's, that line is the only sign: an app that will not
+    // says which of the two it was: a daemon that started may still claim its name after the wait,
+    // on a loaded host, so that line does not say it failed to start. Like the bus's and the seed's, that line is the only sign: an app that will not
     // finish rendering without the service otherwise shows nothing of why.
     let keyring = format!(
         "sbx_secrets=\n\
@@ -471,9 +472,12 @@ fn wrap_command_at(
          esac\n\
          {sleep} 0.1\n\
          done\n\
-         fi\n\
          [ -n \"$sbx_secrets\" ] || echo 'sbx: `dbus = true` but the in-cage Secret Service did not \
-         start — the app runs without one' 1>&2\n",
+         answer on the private bus within five seconds — the app may start before it does' 1>&2\n\
+         else\n\
+         echo 'sbx: `dbus = true` but the in-cage Secret Service did not start — the app runs \
+         without one' 1>&2\n\
+         fi\n",
         pass = super::shell_quote(KEYRING_PASSPHRASE),
         kr = word(keyring_daemon),
     );
@@ -948,7 +952,10 @@ mod tests {
                 "gnome-keyring-daemon",
                 "the in-cage Secret Service did not start",
             ),
-            ("dbus-send", "the in-cage Secret Service did not start"),
+            (
+                "dbus-send",
+                "the in-cage Secret Service did not answer on the private bus within five seconds",
+            ),
             ("seed", "the host theme could not be seeded"),
         ] {
             let tmp = crate::testutil::TmpDir::new();
@@ -966,6 +973,15 @@ mod tests {
                 "{failing}: the app did not run:\n{log}"
             );
         }
+        // A daemon that started but whose name never got an owner is not said to have failed to
+        // start: on a loaded host it may still claim the name after the wait.
+        let tmp = crate::testutil::TmpDir::new();
+        let Preamble { ran, .. } = run_preamble(tmp.path(), Some("prefer-dark"), &["dbus-send"]);
+        assert!(
+            !ran.stderr.contains("Secret Service did not start"),
+            "{}",
+            ran.stderr
+        );
         let tmp = crate::testutil::TmpDir::new();
         let Preamble { ran, .. } = run_preamble(tmp.path(), Some("prefer-dark"), &[]);
         assert!(!ran.stderr.contains("sbx: "), "{}", ran.stderr);
