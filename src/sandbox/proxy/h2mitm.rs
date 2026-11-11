@@ -745,9 +745,10 @@ async fn relay(
     }
     // The client's own headers were decoded by `h2` and cannot fail to be re-added, so the only way
     // this builder refuses is a header **sbx** is adding whose value cannot be one. It is a backstop
-    // rather than a live path — a signer's value is already refused at the plugin boundary if it
-    // carries a newline or a NUL — and it is named for its cause: reporting it as a malformed
-    // request would blame the caller for a header the caller never sent.
+    // rather than a live path — a resolved credential and a signer's value are both refused where
+    // they are admitted if they carry a control byte, by the rule this builder applies — and it is
+    // named for its cause: reporting it as a malformed request would blame the caller for a header
+    // the caller never sent.
     let up_req = match builder.body(()) {
         Ok(r) => r,
         Err(_) => {

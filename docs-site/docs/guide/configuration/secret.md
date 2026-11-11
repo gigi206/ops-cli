@@ -163,8 +163,8 @@ Three properties hold whatever the plugin does:
   concrete host, so the plugin is shown the requests of exactly the host its own
   declaration names, which is the host that already receives that credential.
 - **It sets only the headers its manifest declared.** A header outside `sets_headers`
-  refuses the whole answer, and a value carrying a newline is refused too: the request
-  head is sbx's to frame.
+  refuses the whole answer, and a value carrying a control character (a newline among
+  them) is refused too: the request head is sbx's to frame.
 - **A request that could not be signed is not sent.** Any failure, including a plugin
   that says it cannot sign, refuses the request with a `403` and the reason
   `signer-refused`. It is never sent unsigned, which would reach the destination as an

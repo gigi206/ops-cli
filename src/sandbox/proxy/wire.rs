@@ -138,8 +138,21 @@ pub(super) fn list_names(value: &str, token: &str) -> bool {
 /// `http::HeaderValue`: a byte must be HTAB, visible ASCII, or `obs-text`. Adopting it here is what
 /// makes the same request refused on every plane rather than on one of the three.
 pub(super) fn head_carries_control_byte(head: &Head) -> bool {
-    let bad = |s: &str| s.bytes().any(|b| b != b'\t' && (b < 0x20 || b == 0x7f));
-    bad(&head.request_line) || head.headers.iter().any(|(k, v)| bad(k) || bad(v))
+    carries_control_byte(&head.request_line)
+        || head
+            .headers
+            .iter()
+            .any(|(k, v)| carries_control_byte(k) || carries_control_byte(v))
+}
+
+/// Whether `s` carries a byte a request head may not: one below `0x20` other than HTAB, or DEL.
+///
+/// The one rule for a byte on a head, whoever wrote it. [`head_carries_control_byte`] applies it to
+/// what a client sent; the values sbx adds itself — a resolved credential, a signer plugin's answer —
+/// meet it where they are admitted, because the HTTP/1.1 planes write those out verbatim and only
+/// the HTTP/2 plane's own header type would refuse one later.
+pub(crate) fn carries_control_byte(s: &str) -> bool {
+    s.bytes().any(|b| b != b'\t' && (b < 0x20 || b == 0x7f))
 }
 
 /// What a request's framing says, once every ambiguity a downstream parser could desync on has been

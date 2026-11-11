@@ -1585,9 +1585,9 @@ struct Kept {
 /// its outbound-redaction needles. The plaintext is read into a local, formed into the header value
 /// and into the needles, and dropped — it never reaches the cage. Every error names the **source**,
 /// never the value: an unset variable, an unreadable or empty file, or a value with an embedded
-/// CR/LF/NUL (which would split the request head and inject arbitrary headers upstream — the common
-/// trip is a file's trailing newline, stripped here before the check). A value below `min_len` is
-/// injected but not redacted (warned, never silently).
+/// control character (a CR or LF would split the request head and inject arbitrary headers
+/// upstream — the common trip is a file's trailing newline, stripped here before the check). A
+/// value below `min_len` is injected but not redacted (warned, never silently).
 fn resolve_one(
     secret: &HeaderSecret,
     project_root: &Path,
@@ -1831,7 +1831,7 @@ fn read_source(
         // the agent's cage. The full ref (`scheme://locator`) reconstructs exactly — `parse_secret_ref`
         // split it on the first `://` — and goes to the plugin as `argv[1]`. Its stdout flows
         // through the same `classify_value` as every other source: empty → a clean absent (fall
-        // through to the next source in the chain), an embedded CR/LF/NUL → a hard error. A non-zero
+        // through to the next source in the chain), an embedded control byte → a hard error. A non-zero
         // exit is already a hard error inside `resolver::run`, propagated here (never a silent absent).
         SecretSource::Plugin { plugin, locator } => {
             let reff = format!("{}://{locator}", plugin.scheme);
@@ -2107,16 +2107,21 @@ pub(super) fn strip_trailing_line_ending(s: &str) -> &str {
 
 /// Trim and classify a value read from a source: strip a single trailing line ending (a file
 /// commonly ends in one), then an empty result is a clean **absent** (`Ok(None)` — fall through to
-/// the next source), while an embedded CR/LF/NUL is a **hard** error (`Err`) — it cannot be an HTTP
-/// header value, and a found-but-malformed secret must fail closed rather than fall through.
+/// the next source), while an embedded control byte is a **hard** error (`Err`) — it cannot be an
+/// HTTP header value, and a found-but-malformed secret must fail closed rather than fall through.
+///
+/// The byte rule is the one a request head is read by ([`super::proxy::carries_control_byte`]), not
+/// CR, LF and NUL alone: the HTTP/1.1 planes write the formed value out verbatim, so a VT or a DEL
+/// let through here reached the upstream from inside a header sbx wrote, while the HTTP/2 plane
+/// refused the same request later under a reason that blames no source.
 fn classify_value(raw: &str, header: &str, label: &str) -> io::Result<Option<String>> {
     let trimmed = strip_trailing_line_ending(raw);
     if trimmed.is_empty() {
         return Ok(None);
     }
-    if trimmed.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+    if super::proxy::carries_control_byte(trimmed) {
         return Err(io::Error::other(format!(
-            "the secret for `{header}` from {label} contains a newline or NUL \
+            "the secret for `{header}` from {label} contains a control character \
              (it cannot be an HTTP header value)"
         )));
     }
@@ -4741,9 +4746,46 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("newline or NUL"),
+            err.contains("control character"),
             "an embedded newline must fail closed (header-splitting): {err}"
         );
+    }
+
+    /// Every control byte a request head refuses fails a resolved secret closed, not CR, LF and NUL
+    /// alone: the HTTP/1.1 planes write the formed value out verbatim. Collected rather than
+    /// asserted in turn, so one run on a check that lets any through names every one it lets
+    /// through. HTAB and a byte above `0x7f` are header-value bytes and still resolve, so refusing
+    /// everything outside visible ASCII does not pass.
+    #[test]
+    fn a_secret_carrying_any_control_byte_fails_closed() {
+        let resolve = |value: &str| {
+            read_source(
+                &SecretSource::Env("SBX_TEST_EGRESS_CONTROL_BYTE".into()),
+                "Authorization",
+                Path::new("/nonexistent-project"),
+                Path::new(UNUSED_BWRAP),
+                &[],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("{value:?}: {e}"))
+        };
+        let _lock = env_lock();
+        let let_through: Vec<&str> = ["a\x01b", "a\x0bb", "a\x0cb", "a\x1fb", "a\x7fb"]
+            .into_iter()
+            .filter(|bad| {
+                let _var = EnvVar::set("SBX_TEST_EGRESS_CONTROL_BYTE", bad);
+                resolve(bad).is_ok()
+            })
+            .collect();
+        assert!(
+            let_through.is_empty(),
+            "a control byte reached a resolved secret: {let_through:?}"
+        );
+
+        for fine in ["tok\tken", "jeton-é"] {
+            let _var = EnvVar::set("SBX_TEST_EGRESS_CONTROL_BYTE", fine);
+            resolve(fine).unwrap_or_else(|e| panic!("a header value is refused: {e}"));
+        }
     }
 
     /// Read `path` as a file source of the project at `project`.

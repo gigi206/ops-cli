@@ -126,7 +126,7 @@
 //! | `502` | `upstream-head-too-large` | the upstream sent more than [`HEAD_MAX`] bytes of response head without the blank line that ends it. Relaying what fits would cut one byte stream in two — the head's mask runs over its own bytes and the body's carry starts empty, so a reflected secret straddling the cut is masked by neither — and the truncation already broke the exchange, since the rest of the head would cross as body. Distinct from `bad-request:head`, which is the same shape in the request the cage sent |
 //! | `502` | `upstream-not-websocket` | a permitted WebSocket upgrade was answered by a `101` that did not switch to the WebSocket asked for: an `Upgrade` other than `websocket` alone, or a `Sec-WebSocket-Accept` that does not answer the handshake's key ([`websocket`]). Past a `101` the relay carries whatever protocol the server switched to, and one that honoured `h2c` would hand the cage raw HTTP/2 to the origin, past every rule on path and method |
 //! | `502` | `upstream-closed`        | the upstream was reached and then closed (or reset the stream) before answering. Distinct from `upstream-unreachable`, which means the connection was never made: this one falls *after* the allow is recorded, so the exchange reads as an allow whose status never arrived, with this error beside it |
-//! | `502` | `injected-header-invalid` | a header sbx was adding could not be one (HTTP/2 plane). A backstop, not a live path: a signer's value is refused at the plugin boundary if it carries a newline or a NUL. Named for its cause rather than folded into `bad-request`, which would blame the caller for a header the caller never sent |
+//! | `502` | `injected-header-invalid` | a header sbx was adding could not be one (HTTP/2 plane). A backstop, not a live path: a resolved credential and a signer's value are refused where they are admitted if they carry a control byte, by the rule [`carries_control_byte`] states for every plane. Named for its cause rather than folded into `bad-request`, which would blame the caller for a header the caller never sent |
 //!
 //! A genuine upstream status (e.g. a `404`) is streamed back unchanged and carries no such
 //! header — save that a reflected secret is masked out of it on the way back (see *Credential
@@ -246,6 +246,9 @@ use wire::*;
 // injection path strips one by, or a manifest can name a spelling the guard does not recognise and
 // the injection does. See [`header_name_eq`]'s own doc for why `_` folds onto `-`.
 pub(crate) use wire::header_name_eq;
+// Re-exported for the same reason: a credential and a signer's answer are admitted by the rule a
+// request head is read by, so what one plane would refuse is refused before any plane writes it.
+pub(crate) use wire::carries_control_byte;
 
 /// Serve the egress proxy on `listener` (the host end of the cage's bound socket), one thread per
 /// connection. Each accepted stream gets the per-socket timeouts before it is handled, so a slow

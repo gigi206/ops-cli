@@ -10,9 +10,9 @@
 //!
 //! - **Only the headers its manifest declared.** A header outside `sets_headers` refuses the whole
 //!   answer, so the manifest is the bound and not a description of one.
-//! - **Only values that are header values.** A CR, LF or NUL in a value would end the header and
-//!   start whatever the plugin wrote next: the request head is sbx's to frame. This is the same
-//!   refusal a statically resolved credential meets.
+//! - **Only values that are header values.** A CR or LF in a value would end the header and start
+//!   whatever the plugin wrote next: the request head is sbx's to frame. Every other control byte
+//!   is refused with them, and this is the same refusal a statically resolved credential meets.
 //! - **Fail-closed.** Every failure here refuses the request. A request that could not be signed is
 //!   never sent unsigned: it would reach the destination as an anonymous one, and what comes back
 //!   would be an authentication error for a reason that has nothing to do with the credential.
@@ -404,7 +404,10 @@ pub(crate) fn parse_signature(
 ///
 /// The same refusal a statically resolved credential meets, for the same reason and with more at
 /// stake: a CR or LF ends the header and starts whatever follows it, so a plugin that could write
-/// one would be writing the rest of the request rather than authenticating it.
+/// one would be writing the rest of the request rather than authenticating it. Every other control
+/// byte is refused with them, by the rule a request head is read by
+/// ([`super::proxy::carries_control_byte`]): the HTTP/1.1 planes write this value out verbatim, so
+/// a byte another parser frames by would reach the upstream from inside a header sbx wrote.
 fn check_value(name: &str, value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("the value for `{name}` is empty"));
@@ -416,9 +419,10 @@ fn check_value(name: &str, value: &str) -> Result<(), String> {
             value.len()
         ));
     }
-    if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+    if super::proxy::carries_control_byte(value) {
         return Err(format!(
-            "the value for `{name}` contains a newline or NUL (it cannot be an HTTP header value)"
+            "the value for `{name}` contains a control character (it cannot be an HTTP header \
+             value)"
         ));
     }
     Ok(())
@@ -801,7 +805,33 @@ mod tests {
         for bad in ["a\r\nX-Evil: 1", "a\nb", "a\0b"] {
             let err = answer(serde_json::json!({ "seq": 7, "headers": { "Authorization": bad } }))
                 .expect_err("a splitting byte is refused");
-            assert!(err.contains("newline or NUL"), "{err}");
+            assert!(err.contains("control character"), "{err}");
+        }
+    }
+
+    /// The other control bytes, which the HTTP/1.1 planes would write out verbatim and the HTTP/2
+    /// plane's header type refuses: SOH, VT and FF, the unit separator, DEL. Each
+    /// is collected rather than asserted in turn, so one run on a check that lets any of them
+    /// through names every one it lets through.
+    ///
+    /// Not satisfiable by refusing every value with a byte outside visible ASCII: HTAB is a header
+    /// value's own whitespace, and a byte above `0x7f` is `obs-text`, and both still sign.
+    #[test]
+    fn every_control_byte_a_head_refuses_is_refused_in_a_value() {
+        let let_through: Vec<&str> = ["a\x01b", "a\x0bb", "a\x0cb", "a\x1fb", "a\x7fb"]
+            .into_iter()
+            .filter(|bad| {
+                answer(serde_json::json!({ "seq": 7, "headers": { "Authorization": bad } })).is_ok()
+            })
+            .collect();
+        assert!(
+            let_through.is_empty(),
+            "a control byte reached a signed header: {let_through:?}"
+        );
+
+        for fine in ["AWS4 a\tb", "jeton-é"] {
+            answer(serde_json::json!({ "seq": 7, "headers": { "Authorization": fine } }))
+                .unwrap_or_else(|e| panic!("{fine:?} is a header value: {e}"));
         }
     }
 
