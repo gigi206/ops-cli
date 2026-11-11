@@ -298,8 +298,22 @@ impl InstalledIndex {
                         continue;
                     }
                 };
-                let Ok(name) = e.file_name().into_string() else {
-                    continue;
+                // Every surface built on this index names a plugin by its directory, so one whose
+                // name is not UTF-8 cannot be listed, verified or upgraded here, and discovery
+                // refuses to load it. A directory is said rather than skipped, so it does not go
+                // unseen, quoted with its bytes escaped so it can be told apart and typed back to
+                // rename it. Anything else was never a plugin, and no install name, which is
+                // UTF-8, can collide with it.
+                let name = match e.file_name().into_string() {
+                    Ok(name) => name,
+                    Err(raw) => {
+                        if ft.is_dir() {
+                            diag::warn(&format!(
+                                "plugins: {raw:?} is left out — its name is not UTF-8: rename it"
+                            ));
+                        }
+                        continue;
+                    }
                 };
                 // Dot-prefixed entries are sbx's own bookkeeping (the origin records, a staging
                 // tree caught mid-install), never a plugin: an install name may not begin with a

@@ -903,6 +903,40 @@ fn verify_says_when_the_plugins_directory_cannot_be_read() {
     );
 }
 
+/// A plugin is managed by its directory name, so a tree whose name is not UTF-8 is neither loaded
+/// nor passed over in silence: the listing names it rather than listing it as resolving under its
+/// manifest name, and `verify`, which reads the directory itself, says it left it out. A file of
+/// that kind beside it stays quiet.
+#[test]
+fn a_plugin_directory_whose_name_is_not_utf8_is_said_and_not_loaded() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let home = TmpDir::new("plugins");
+    let plugins = home.path().join("sbx/plugins");
+    let placed = local_plugin(&plugins, "hm", "hm");
+    std::fs::rename(
+        &placed,
+        plugins.join(std::ffi::OsStr::from_bytes(b"latin\xe9")),
+    )
+    .unwrap();
+    // A file of that kind was never a plugin, and no install name can collide with it.
+    std::fs::write(plugins.join(std::ffi::OsStr::from_bytes(b"note\xe9")), b"").unwrap();
+
+    let (_code, out, err) = run_both(&["plugins", "list"], home.path());
+    assert!(
+        !out.contains("hm://") && err.contains(r#""latin\xE9""#) && err.contains("not UTF-8"),
+        "the plugin is named and not loaded:\nstdout:\n{out}stderr:\n{err}"
+    );
+    let (_code, out, err) = run_both(&["plugins", "verify"], home.path());
+    assert!(
+        err.contains(r#""latin\xE9""#) && err.contains("is left out"),
+        "verify says what it left out:\nstdout:\n{out}stderr:\n{err}"
+    );
+    assert!(
+        !err.contains(r"note\xE9"),
+        "a file is not a plugin left out:\nstderr:\n{err}"
+    );
+}
+
 #[test]
 fn a_scheme_claimed_twice_disables_every_claimant_until_one_remains() {
     let home = TmpDir::new("plugins");

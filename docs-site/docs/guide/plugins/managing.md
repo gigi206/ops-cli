@@ -60,7 +60,10 @@ tree through no symbolic link (stricter than the config-file safety gate, becaus
 this is code about to run in the TCB).
 
 Loading is **infallible and fail-closed**. A malformed manifest, an unsupported
-type or a reserved or ill-formed scheme produces a warning and skips that plugin, never a failed launch, and never a silently-honored bad plugin. **Two plugins
+type or a reserved or ill-formed scheme produces a warning and skips that plugin, never a failed launch, and never a silently-honored bad plugin. So does
+a plugin directory whose name is not UTF-8: `sbx plugins rm`, `verify` and `upgrade`
+name a plugin by its directory, which such a name cannot be written as, so rename
+it to load it. **Two plugins
 claiming one scheme** drops *both* (never an arbitrary winner) and is reported
 rather than merely warned about: see below. A project's `.sbx.toml` may only
 *reference* a scheme, and only if the project is trusted (an untrusted project's

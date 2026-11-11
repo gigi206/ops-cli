@@ -385,7 +385,7 @@ impl ResolverPlugin {
     /// takes and the key its origin record is filed under. It may differ from `name` (a
     /// hand-placed tree can declare any manifest `name`), so every message whose remedy is a
     /// command must use this, never `name`. Falls back to `name` only if the directory name is
-    /// not UTF-8, which discovery would already have had to walk past.
+    /// not UTF-8, which discovery refuses, so a loaded plugin never reaches the fallback.
     pub(crate) fn dir_name(&self) -> &str {
         dir_name_of(&self.dir, &self.name)
     }
@@ -400,9 +400,9 @@ impl ResolverPlugin {
 }
 
 /// A plugin's on-disk identity: the directory name, falling back to the manifest `name` only if
-/// it is not UTF-8, which discovery would already have had to walk past. Shared by both plugin
-/// types, because every message whose remedy is a `sbx plugins rm` must spell the token that
-/// command takes — the manifest `name` may differ from it.
+/// it is not UTF-8, which discovery refuses, so a loaded plugin never reaches it. Shared by both
+/// plugin types, because every message whose remedy is a `sbx plugins rm` must spell the token
+/// that command takes — the manifest `name` may differ from it.
 fn dir_name_of<'a>(dir: &'a Path, name: &'a str) -> &'a str {
     dir.file_name().and_then(OsStr::to_str).unwrap_or(name)
 }
@@ -773,22 +773,36 @@ impl PluginRegistry {
         let mut conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut name_conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (dir, link) in dirs {
+            let shown = dir.file_name().unwrap_or_default().to_string_lossy();
             if link {
-                let name = dir.file_name().and_then(OsStr::to_str).unwrap_or("?");
                 warnings.push(format!(
-                    "plugins: ignoring `{name}` — it is a symbolic link, and a plugin is read \
+                    "plugins: ignoring `{shown}` — it is a symbolic link, and a plugin is read \
                      only from a tree that sits here itself: replace the link with the tree it \
                      points at"
                 ));
                 continue;
             }
             let plugin = match load_one(&dir, exp) {
+                // A plugin is managed by its directory name: `sbx plugins rm`, `verify` and
+                // `upgrade` take it as their argument, and its origin record is filed under it.
+                // A name that is not UTF-8 cannot be written as any of those, so a plugin loaded
+                // from it would run at every launch while each of them could neither name it nor
+                // see it. It is refused here, where it would otherwise become live.
+                // The name is quoted with its bytes escaped, so the directory to rename can be
+                // told from another that renders alike and typed back into a shell.
+                Ok(Some(_)) if dir.file_name().and_then(OsStr::to_str).is_none() => {
+                    let raw = dir.file_name().unwrap_or_default();
+                    warnings.push(format!(
+                        "plugins: ignoring {raw:?} — its directory name is not UTF-8, and a \
+                         plugin is managed by that name: rename the directory"
+                    ));
+                    continue;
+                }
                 Ok(Some(plugin)) => plugin,
                 // Not a plugin directory (no manifest) — skip quietly.
                 Ok(None) => continue,
                 Err(e) => {
-                    let name = dir.file_name().and_then(OsStr::to_str).unwrap_or("?");
-                    warnings.push(format!("plugins: ignoring `{name}` — {e}"));
+                    warnings.push(format!("plugins: ignoring `{shown}` — {e}"));
                     continue;
                 }
             };
@@ -3324,6 +3338,41 @@ mod tests {
         assert!(
             warnings[0].contains("`linked`") && warnings[0].contains("symbolic link"),
             "the link is named, and why it is skipped: {warnings:?}"
+        );
+    }
+
+    /// A plugin is managed by its directory name, which `sbx plugins rm`, `verify` and `upgrade`
+    /// take and its origin record is filed under, so a tree whose name is not UTF-8 is named and
+    /// not loaded: loaded, it would run at every launch under a name none of them can write. A
+    /// directory of that kind without a manifest was never a plugin and stays quiet, and a plugin
+    /// beside them, the witness, still loads.
+    #[test]
+    fn a_plugin_whose_directory_name_is_not_utf8_is_named_and_not_loaded() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let root = crate::testutil::TmpDir::new();
+        let plugins = root.path().join("plugins");
+        let manifest = |name: &str| {
+            format!("name=\"{name}\"\ntype=\"resolver\"\nscheme=\"{name}\"\nexec=\"run\"\n")
+        };
+        write_plugin(&plugins, "real", &manifest("real"));
+        let raw = plugins.join(OsStr::from_bytes(b"latin\xe9"));
+        fs::create_dir(&raw).unwrap();
+        fs::write(raw.join("plugin.toml"), manifest("hidden")).unwrap();
+        fs::create_dir(plugins.join(OsStr::from_bytes(b"data\xe9"))).unwrap();
+
+        let (reg, warnings) = load(&plugins);
+        assert!(
+            reg.resolver("real").is_some(),
+            "the witness loads: {warnings:?}"
+        );
+        assert!(
+            reg.resolver("hidden").is_none(),
+            "a plugin no command can name is not loaded"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(r#""latin\xE9""#) && warnings[0].contains("not UTF-8"),
+            "the directory is named, and why it is skipped: {warnings:?}"
         );
     }
 
