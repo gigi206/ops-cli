@@ -729,6 +729,10 @@ pub(crate) fn read_configured(
         .map_err(|e| format!("the configuration of store `{name}` is malformed: {e}"))?;
     let pubkey = decode_key(&raw.pubkey)
         .map_err(|e| format!("the configuration of store `{name}` has an invalid key: {e}"))?;
+    // Held to the rule an add holds it to, for a file edited since: every verb takes the URL from
+    // here, to print it or to hand it to git.
+    validate_url(&raw.url)
+        .map_err(|e| format!("the configuration of store `{name}` is refused: {e}"))?;
 
     // The floor is best-effort: a missing or unparsable lock means "no floor yet" (0), never an
     // error, so a legacy or truncated lock cannot wedge a store.
@@ -2368,6 +2372,37 @@ mod tests {
             return;
         };
         assert!(listed.is_err(), "{listed:?}");
+    }
+
+    /// A `store.toml` edited by hand is held to the rule `store add` holds its URL to: a control
+    /// character or a character that reorders a line is refused at the read, which every verb that
+    /// prints the URL or hands it to git takes it from. A URL the rule admits, the witness, reads.
+    #[test]
+    fn a_hand_edited_store_url_is_held_to_the_rule_an_add_applies() {
+        let data = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let dir = layout.store_path("mine");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = "00".repeat(32);
+        // The URL as the TOML file spells it, and whether the read admits it.
+        let cases = [
+            ("https://example.com/s.git", true),
+            ("https://example.com/\\u001b[2J.git", false),
+            ("https://example.com/\\u202es.git", false),
+        ];
+        let mut wrong = Vec::new();
+        for (url, admitted) in cases {
+            std::fs::write(
+                dir.join(STORE_TOML),
+                format!("url = \"{url}\"\npubkey = \"{key}\"\n"),
+            )
+            .unwrap();
+            let read = read_configured(&layout, "mine");
+            if read.is_ok() != admitted {
+                wrong.push(format!("{url}: {:?}", read.map(|c| c.url)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
