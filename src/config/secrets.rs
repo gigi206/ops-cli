@@ -488,9 +488,9 @@ pub(super) fn warn_resolver_bindings(
             ));
         } else if plugins.resolver(scheme).is_none() {
             warnings.push(format!(
-                "`[secret.defaults.resolver.{scheme}]`: no installed resolver plugin claims \
-                 `{scheme}://` — check the spelling against `sbx plugins list` (the table is \
-                 otherwise inert)"
+                "{source}: `[secret.defaults.resolver.{scheme}]`: no installed resolver plugin \
+                 claims `{scheme}://` — check the spelling against `sbx plugins list` (the table \
+                 is otherwise inert)"
             ));
         }
     }

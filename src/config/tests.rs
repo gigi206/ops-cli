@@ -11914,6 +11914,26 @@ fn a_terse_key_expands_through_a_plugin_locator_template() {
     }
 }
 
+/// Every warning about a `[secret.defaults.resolver.<scheme>]` table names the file it was read
+/// from, the one for a scheme no plugin claims included: a reader with a global config, a project
+/// config and an override in play has nothing else to tell which table to fix.
+#[test]
+fn a_resolver_table_no_plugin_claims_is_named_with_its_file() {
+    let mut warnings = Vec::new();
+    warn_resolver_bindings(
+        &mut warnings,
+        "the-source-file",
+        &raw_plugin_defaults(&["keepassxc"], "keepassxc", None),
+        &PluginRegistry::default(),
+    );
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].starts_with("the-source-file: "),
+        "{}",
+        warnings[0]
+    );
+}
+
 /// A `{` that never closes is refused like a placeholder that is not `{key}`: passed through, the
 /// rest of the template reaches the plugin's `argv[1]` as written, braces and all.
 #[test]
