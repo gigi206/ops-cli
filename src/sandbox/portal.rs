@@ -330,26 +330,33 @@ pub(crate) const KEYFILE_REL: &str = ".config/glib-2.0/settings/keyfile";
 /// so the dark scheme must name a *distinct* dark theme — `Adwaita-dark`, the standalone theme the
 /// GUI-data hole stages from `gnome-themes-extra` (GTK itself carries only the light built-in). GTK3
 /// watches this key live via the keyfile backend, so a relay rewrite re-themes the open dialog.
-pub(crate) fn keyfile_body(color_scheme: &str) -> String {
-    format!(
-        "[org/gnome/desktop/interface]\ncolor-scheme='{color_scheme}'\ngtk-theme='{gtk}'\n",
-        gtk = gtk_theme_for(color_scheme),
-    )
+///
+/// `None` for anything but the three names [`color_scheme_name`] maps to. The scheme is written
+/// between quotes into this body, and the launch seed writes the body into a heredoc its preamble
+/// runs: a quote there adds a GSettings key, and a line holding the heredoc's delimiter ends it
+/// early and runs what follows as shell. Every source of a scheme yields one of the three names,
+/// so a value outside them seeds nothing rather than being written as found.
+pub(crate) fn keyfile_body(color_scheme: &str) -> Option<String> {
+    let gtk = gtk_theme_for(color_scheme)?;
+    Some(format!(
+        "[org/gnome/desktop/interface]\ncolor-scheme='{color_scheme}'\ngtk-theme='{gtk}'\n"
+    ))
 }
 
-/// The named GTK theme for a color scheme: the standalone `Adwaita-dark` under `prefer-dark`, else
-/// the light `Adwaita` (`prefer-light` and the no-preference `default` both open light, matching the
-/// host desktop's own no-preference behaviour). Pure.
-fn gtk_theme_for(color_scheme: &str) -> &'static str {
-    if color_scheme == "prefer-dark" {
-        "Adwaita-dark"
-    } else {
-        "Adwaita"
+/// The named GTK theme for a color scheme: the standalone `Adwaita-dark` under `prefer-dark`, the
+/// light `Adwaita` under `prefer-light` and the no-preference `default` (both open light, matching
+/// the host desktop's own no-preference behaviour), and `None` for any other name. Pure.
+fn gtk_theme_for(color_scheme: &str) -> Option<&'static str> {
+    match color_scheme {
+        "prefer-dark" => Some("Adwaita-dark"),
+        "prefer-light" | "default" => Some("Adwaita"),
+        _ => None,
     }
 }
 
 /// Wrap `cmd` so the cage stands up its private portal before the app runs: write the generated bus
-/// config and `portals.conf`, seed the host theme (when `color_scheme` is `Some`), start
+/// config and `portals.conf`, seed the host theme (when `color_scheme` is one of the names
+/// [`keyfile_body`] writes), start
 /// `dbus-daemon --fork` (which blocks until the socket is ready, then returns — no race), and
 /// `exec "$@"`. The command rides `"$@"` positionally, so nothing from it is re-parsed by the shell;
 /// every value baked into the script is an sbx-controlled store path or a fixed literal. The heredoc
@@ -380,8 +387,8 @@ pub(crate) fn wrap_command(
         ..
     } = provision;
     let session = session_conf(CAGE_SOCK, xdp_root, gtk_root);
-    let seed = match color_scheme {
-        Some(scheme) => {
+    let seed = match color_scheme.and_then(keyfile_body) {
+        Some(keyfile) => {
             // The keyfile is shared with the theme relay via `KEYFILE_REL` (its parent is the dir to
             // create) so the seed and the live rewrites target the same file. It carries both surface
             // keys: `color-scheme` (the app follows it) and `gtk-theme` (the file dialog follows it),
@@ -394,7 +401,6 @@ pub(crate) fn wrap_command(
                  {keyfile}SBXPORTALKF\n",
                 mkdir = mkdir.display(),
                 cat = cat.display(),
-                keyfile = keyfile_body(scheme),
             )
         }
         None => String::new(),
@@ -718,20 +724,48 @@ mod tests {
         assert!(!script.contains("keyfile"));
     }
 
+    /// A color scheme is one of three names, and only those are seeded. Anything else would be
+    /// written into the keyfile between quotes and into a heredoc the preamble runs, where a quote
+    /// adds a GSettings key and a line holding the heredoc's delimiter ends it early, running what
+    /// follows as shell.
+    #[test]
+    fn a_color_scheme_outside_the_three_names_seeds_nothing() {
+        for scheme in [
+            "prefer-dark'\ngtk-theme='Evil",
+            "prefer-dark\nSBXPORTALKF\necho escaped",
+            "",
+        ] {
+            let argv = wrap_command(
+                Path::new("/bin/bash"),
+                Path::new("/nix/store/hash-coreutils/bin/env"),
+                &demo_provision(),
+                Some(scheme),
+                vec![OsString::from("x")],
+            );
+            let script = argv[2].to_string_lossy();
+            assert!(
+                !script.contains("SBXPORTALKF"),
+                "{scheme:?} is seeded: {script}"
+            );
+        }
+    }
+
     #[test]
     fn keyfile_body_pairs_the_color_scheme_with_a_named_gtk_theme() {
         // prefer-dark selects the standalone dark theme for the file dialog...
-        let dark = keyfile_body("prefer-dark");
+        let dark = keyfile_body("prefer-dark").expect("a scheme name");
         assert!(dark.contains("color-scheme='prefer-dark'"));
         assert!(dark.contains("gtk-theme='Adwaita-dark'"));
         // ...while every non-dark scheme opens light Adwaita (prefer-light and the no-preference
         // default alike), never the nonexistent dark variant.
         for scheme in ["prefer-light", "default"] {
-            let body = keyfile_body(scheme);
+            let body = keyfile_body(scheme).expect("a scheme name");
             assert!(body.contains(&format!("color-scheme='{scheme}'")));
             assert!(body.contains("gtk-theme='Adwaita'"));
             assert!(!body.contains("Adwaita-dark"));
         }
+        // ...and a value outside the three names has no body at all.
+        assert_eq!(keyfile_body("prefer-dark'\ngtk-theme='Evil"), None);
     }
 
     #[test]

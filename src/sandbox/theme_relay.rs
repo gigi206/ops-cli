@@ -655,10 +655,20 @@ fn write_keyfile(home: &Path, scheme: &str) {
 
 /// The fallible body of [`write_keyfile`], split out so every step's error can propagate with `?`
 /// while the caller stays best-effort.
+///
+/// A scheme outside the names [`super::portal::keyfile_body`] writes is refused before anything is
+/// created: written as found, it would add keys of its own to the keyfile.
 fn write_keyfile_confined(home: &Path, scheme: &str) -> std::io::Result<()> {
     use std::ffi::OsStr;
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
+
+    let body = super::portal::keyfile_body(scheme).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a color scheme the keyfile holds",
+        )
+    })?;
 
     #[expect(
         clippy::expect_used,
@@ -685,9 +695,7 @@ fn write_keyfile_confined(home: &Path, scheme: &str) -> std::io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
-    let write = f
-        .write_all(super::portal::keyfile_body(scheme).as_bytes())
-        .and_then(|()| f.sync_all());
+    let write = f.write_all(body.as_bytes()).and_then(|()| f.sync_all());
     drop(f);
     if let Err(e) = write {
         // The half-written temp is removed.
@@ -767,16 +775,31 @@ mod tests {
         write_keyfile(&home, super::super::portal::color_scheme_name(1));
         assert_eq!(
             std::fs::read_to_string(&keyfile).unwrap(),
-            super::super::portal::keyfile_body("prefer-dark")
+            super::super::portal::keyfile_body("prefer-dark").expect("a scheme name")
         );
 
         // A second write replaces the content and leaves no temp file behind.
         write_keyfile(&home, super::super::portal::color_scheme_name(2));
         assert_eq!(
             std::fs::read_to_string(&keyfile).unwrap(),
-            super::super::portal::keyfile_body("prefer-light")
+            super::super::portal::keyfile_body("prefer-light").expect("a scheme name")
         );
         assert!(!keyfile.parent().unwrap().join(TMP_NAME).exists());
+    }
+
+    /// The keyfile is written only for one of the three scheme names. Any other value would land
+    /// between the quotes of `color-scheme=`, where a quote and a newline add a key of their own.
+    #[test]
+    fn write_keyfile_writes_nothing_for_a_scheme_outside_the_three_names() {
+        let tmp = crate::testutil::TmpDir::new();
+        let home = tmp.path().to_path_buf();
+        let keyfile = home.join(super::super::portal::KEYFILE_REL);
+        write_keyfile(&home, "prefer-dark'\ngtk-theme='Evil");
+        assert!(
+            !keyfile.exists(),
+            "{}",
+            std::fs::read_to_string(&keyfile).unwrap_or_default()
+        );
     }
 
     /// The relay writes host-side, with the user's privileges, into a directory the cage holds
@@ -810,7 +833,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(home.join(super::super::portal::KEYFILE_REL)).unwrap(),
-            super::super::portal::keyfile_body("prefer-dark"),
+            super::super::portal::keyfile_body("prefer-dark").expect("a scheme name"),
             "clearing a stale temp must leave the ordinary write working"
         );
 
