@@ -525,10 +525,7 @@ fn expr_stamp_path(gcroot: &Path) -> PathBuf {
 /// reused. The expression carries the nixpkgs revision, system, and every sbx-controlled input
 /// verbatim, so an equal hash means an identical derivation and output.
 fn expr_digest(expr: &str) -> String {
-    Sha256::digest(expr.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    crate::plugins::catalogue::to_hex(&Sha256::digest(expr.as_bytes()))
 }
 
 /// The already-built output for an expression, when it can be reused without rebuilding: the stamp
