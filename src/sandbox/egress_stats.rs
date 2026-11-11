@@ -585,6 +585,19 @@ const COMPACT_LOCK: &str = ".compact.lock";
 /// on the launch path for pure housekeeping; a process that cannot take the lock has nothing to do,
 /// because the process holding it is doing exactly this work.
 fn lock_compact(egress_dir: &Path) -> Option<std::fs::File> {
+    take_compact_lock(egress_dir, libc::LOCK_EX | libc::LOCK_NB)
+}
+
+/// Take the fold lock, waiting for a fold that holds it, or `None` when the directory cannot carry
+/// the lock at all. For [`reset`], which removes what a fold reads and rewrites, and which a user
+/// ran on purpose: a fold is short, and waiting it out is what keeps its rollup from putting back
+/// the counters the reset is removing.
+fn wait_for_compact_lock(egress_dir: &Path) -> Option<std::fs::File> {
+    take_compact_lock(egress_dir, libc::LOCK_EX)
+}
+
+/// The fold lock under `operation`, the `flock` flags that say whether to wait.
+fn take_compact_lock(egress_dir: &Path, operation: libc::c_int) -> Option<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new()
@@ -594,10 +607,10 @@ fn lock_compact(egress_dir: &Path) -> Option<std::fs::File> {
         .mode(0o600)
         .open(egress_dir.join(COMPACT_LOCK))
         .ok()?;
-    // SAFETY: `flock` on a valid owned fd. `LOCK_NB` returns `EWOULDBLOCK` instead of blocking when
-    // another open file description holds the lock. The fd lives in the returned handle, so the lock
-    // is held until the caller drops it.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    // SAFETY: `flock` on a valid owned fd. With `LOCK_NB` it returns `EWOULDBLOCK` instead of
+    // blocking when another open file description holds the lock. The fd lives in the returned
+    // handle, so the lock is held until the caller drops it.
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
         return None;
     }
     Some(file)
@@ -826,7 +839,13 @@ pub(crate) fn aggregate(egress_dir: &Path, project: &str, app: Option<&str>) -> 
 /// counters in memory and rewrites its file on the next decision, so its lifetime totals reappear —
 /// `--reset` does not zero a running agent's counters (that would need a control message to the live
 /// proxy; not implemented). Reset after the sessions you want cleared have exited.
+///
+/// Run under the fold's own lock, waited for ([`wait_for_compact_lock`]). A [`compact`] reads the
+/// sessions, writes their rollup, then unlinks them: a reset between its read and its write would
+/// have the rollup put back every counter it had just removed. A directory that cannot carry the
+/// lock cannot carry a fold either, so the reset then runs without it.
 pub(crate) fn reset(egress_dir: &Path, project: &str, app: Option<&str>) -> usize {
+    let _lock = wait_for_compact_lock(egress_dir);
     let Ok(entries) = std::fs::read_dir(egress_dir) else {
         return 0;
     };
@@ -1669,6 +1688,33 @@ mod tests {
             "a resolution gets no row of its own: {:?}",
             parsed.tally.hosts
         );
+    }
+
+    /// A reset waits for a fold in progress rather than running beside it. The fold reads the
+    /// sessions, writes the rollup and only then unlinks them: a reset between the read and the
+    /// write would see its removals undone by a rollup carrying the counters it had just erased.
+    #[test]
+    fn a_reset_waits_for_a_fold_in_progress() {
+        let dir = TmpDir::new();
+        let egress = dir.path().to_path_buf();
+        session_file(&egress, 1, 11, "/p", "api.example.com", 3);
+
+        let held = lock_compact(&egress).expect("the fold lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let theirs = egress.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(reset(&theirs, "/p", None));
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the reset ran while a fold held the directory"
+        );
+        drop(held);
+        let removed = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the reset ends once the fold has");
+        assert_eq!(removed, 1);
     }
 
     #[test]
