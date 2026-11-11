@@ -936,6 +936,26 @@ fn plugins_store(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// What a `--key` takes, as the refusal of a missing or unusable one names it.
+const KEY_VALUE: &str = "a key (<hex|@file>)";
+
+/// The value after `flag`, or the usage exit having said why there is none. Held to
+/// [`crate::cli::option_value`]'s rule, so a missing value, an option in its place or one that is
+/// not text is refused naming the flag, never read as the flag being absent.
+fn flag_value<'a>(
+    it: &mut std::slice::Iter<'a, OsString>,
+    verb: &str,
+    flag: &str,
+    what: &str,
+    usage: &str,
+) -> Result<&'a str, ExitCode> {
+    crate::cli::option_value(it.next(), verb, flag, what).map_err(|why| {
+        diag::error(&why);
+        errln!("{usage}");
+        ExitCode::from(2)
+    })
+}
+
 /// `sbx plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)`: configure a
 /// remote signed plugin store and fetch it for the first time. The repository is cloned, its
 /// catalogue verified, and the verified result cached under the data directory. A deliberate user
@@ -945,6 +965,7 @@ fn plugins_store(args: &[OsString]) -> ExitCode {
 /// authenticity; the pinned key's fingerprint is printed for out-of-band verification). One of the
 /// two is required: a store with no verifying key would be unsigned, refused fail-closed.
 fn plugins_store_add(args: &[OsString]) -> ExitCode {
+    const VERB: &str = "plugins store add";
     let usage = format!(
         "sbx: usage: {}",
         help::synopsis_of(&["plugins", "store", "add"])
@@ -954,23 +975,20 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         match flag.to_str() {
-            Some("--name") => name = it.next().and_then(|v| v.to_str()),
-            Some("--url") => url = it.next().and_then(|v| v.to_str()),
+            Some("--name") => match flag_value(&mut it, VERB, "--name", "a store name", &usage) {
+                Ok(v) => name = Some(v),
+                Err(code) => return code,
+            },
+            Some("--url") => match flag_value(&mut it, VERB, "--url", "a URL", &usage) {
+                Ok(v) => url = Some(v),
+                Err(code) => return code,
+            },
             // A `--key` with nothing usable after it is a usage error, not the absence of the flag:
             // folded into `None` it would read as "no trust anchor given" and send the verb down the
             // staging-clone path, which fetches the store over the network before refusing.
-            Some("--key") => match it.next().map(|v| v.to_str()) {
-                Some(Some(v)) => key = Some(v),
-                Some(None) => {
-                    diag::error("sbx: --key: the key is not valid UTF-8 (expected <hex|@file>)");
-                    errln!("{usage}");
-                    return ExitCode::from(2);
-                }
-                None => {
-                    diag::error("sbx: --key needs the key to pin (<hex|@file>)");
-                    errln!("{usage}");
-                    return ExitCode::from(2);
-                }
+            Some("--key") => match flag_value(&mut it, VERB, "--key", KEY_VALUE, &usage) {
+                Ok(v) => key = Some(v),
+                Err(code) => return code,
             },
             Some("--trust") => trust = true,
             other => {
@@ -1521,8 +1539,13 @@ fn plugins_store_verify(args: &[OsString]) -> ExitCode {
     let mut it = args.iter();
     while let Some(tok) = it.next() {
         match tok.to_str() {
-            Some("--key") => key = it.next().and_then(|v| v.to_str()),
-            Some(other) if !other.starts_with("--") && name.is_none() => name = Some(other),
+            Some("--key") => {
+                match flag_value(&mut it, "plugins store verify", "--key", KEY_VALUE, &usage) {
+                    Ok(v) => key = Some(v),
+                    Err(code) => return code,
+                }
+            }
+            Some(other) if !other.starts_with('-') && name.is_none() => name = Some(other),
             other => {
                 diag::error(&format!(
                     "sbx: unexpected argument '{}'",
@@ -1582,7 +1605,14 @@ fn plugins_store_rekey(args: &[OsString]) -> ExitCode {
     let mut it = args.iter();
     while let Some(tok) = it.next() {
         match tok.to_str() {
-            Some("--key") => key = it.next().and_then(|v| v.to_str()),
+            // Read as the flag's absence, a `--key` whose value is missing or not text would leave
+            // `--trust` alone on the line, and that re-accepts whatever key the store now ships.
+            Some("--key") => {
+                match flag_value(&mut it, "plugins store rekey", "--key", KEY_VALUE, &usage) {
+                    Ok(v) => key = Some(v),
+                    Err(code) => return code,
+                }
+            }
             Some("--trust") => trust = true,
             Some("--yes") => yes = true,
             Some(other) if !other.starts_with('-') && name.is_none() => name = Some(other),

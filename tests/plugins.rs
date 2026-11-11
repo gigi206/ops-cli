@@ -586,6 +586,31 @@ fn a_store_that_changes_its_key_is_named_and_rotated_only_deliberately() {
     let info = run(&["plugins", "store", "info", "mine"], home.path());
     assert!(info.contains(&first), "the pin is untouched:\n{info}");
 
+    // A `--key` whose value is missing or not text is refused, even beside `--trust` and `--yes`:
+    // read as no key at all, it left `--trust` alone on the line, which re-accepts whatever key
+    // the store now ships. The exit is checked on its own, so each shape answers for itself.
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let rekey = [
+            "plugins", "store", "rekey", "mine", "--trust", "--yes", "--key",
+        ];
+        for last in [Some(std::ffi::OsStr::from_bytes(b"\xff")), None] {
+            let mut cmd = sbx(&rekey, home.path());
+            if let Some(last) = last {
+                cmd.arg(last);
+            }
+            let (code, out, err) = both(&mut cmd);
+            assert_eq!(
+                code,
+                2,
+                "`{}` is refused:\nstdout:\n{out}stderr:\n{err}",
+                shown(&cmd)
+            );
+            let info = run(&["plugins", "store", "info", "mine"], home.path());
+            assert!(info.contains(&first), "the pin is untouched:\n{info}");
+        }
+    }
+
     // The filter reaches a remote store's entries too, and says when it has none installed.
     let listing = run(&["plugins", "store", "list", "--installed"], home.path());
     assert!(
@@ -610,6 +635,89 @@ fn a_store_that_changes_its_key_is_named_and_rotated_only_deliberately() {
     assert!(info.contains(&second), "{info}");
     assert!(!info.contains(&first), "the old key is gone:\n{info}");
     run(&["plugins", "store", "update", "mine"], home.path());
+}
+
+/// A store verb's flag whose value is missing or not text is refused naming the flag, never read as
+/// the flag being absent: read that way it fell to a bare usage line that does not say which value
+/// was wrong, `rekey` asked for the very `--key` it was given, and an option in the name slot of
+/// `verify` was taken for a store's name. Each shape is held apart, so one that slips is named.
+#[test]
+fn a_store_flag_without_a_usable_value_is_refused_naming_the_flag() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let home = TmpDir::new("plugins");
+    let raw = std::ffi::OsStr::from_bytes(b"\xff");
+    let key = "00".repeat(32);
+    // The arguments, the token that ends the line (`None`: none), and what the refusal says.
+    let cases: &[(&[&str], Option<&std::ffi::OsStr>, &str)] = &[
+        (
+            &[
+                "plugins", "store", "add", "--url", "u", "--key", &key, "--name",
+            ],
+            Some(raw),
+            "`--name` needs",
+        ),
+        (
+            &[
+                "plugins", "store", "add", "--url", "u", "--key", &key, "--name",
+            ],
+            None,
+            "`--name` needs",
+        ),
+        (
+            &[
+                "plugins", "store", "add", "--name", "n", "--key", &key, "--url",
+            ],
+            Some(raw),
+            "`--url` needs",
+        ),
+        (
+            &[
+                "plugins", "store", "add", "--name", "n", "--key", &key, "--url",
+            ],
+            None,
+            "`--url` needs",
+        ),
+        (
+            &["plugins", "store", "verify", "mine", "--key"],
+            Some(raw),
+            "`--key` needs",
+        ),
+        (
+            &["plugins", "store", "verify", "mine", "--key"],
+            None,
+            "`--key` needs",
+        ),
+        (
+            &["plugins", "store", "rekey", "mine", "--key"],
+            Some(raw),
+            "`--key` needs",
+        ),
+        (
+            &["plugins", "store", "rekey", "mine", "--key"],
+            None,
+            "`--key` needs",
+        ),
+        (
+            &["plugins", "store", "verify", "-j", "--key", &key],
+            None,
+            "unexpected argument '-j'",
+        ),
+    ];
+    let mut slipped = Vec::new();
+    for (args, last, said) in cases {
+        let mut cmd = sbx(args, home.path());
+        if let Some(last) = last {
+            cmd.arg(last);
+        }
+        let (code, out, err) = both(&mut cmd);
+        if code != 2 || !err.contains(said) {
+            slipped.push(format!(
+                "`{}` exited {code}, expected 2 saying {said:?}:\nstdout:\n{out}stderr:\n{err}",
+                shown(&cmd)
+            ));
+        }
+    }
+    assert!(slipped.is_empty(), "{}", slipped.join("\n"));
 }
 
 #[test]

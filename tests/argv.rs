@@ -267,6 +267,11 @@ fn an_option_is_never_taken_as_another_options_value() {
         &["app", "import", "p.toml", "--as", "--force"],
         &["bundle", "import", "p.toml", "--as", "--force"],
         &["net", "groups", "import", "p.toml", "--as", "--force"],
+        &[
+            "plugins", "store", "add", "--url", "u", "--trust", "--name", "--json",
+        ],
+        &["plugins", "store", "verify", "mine", "--key", "--json"],
+        &["plugins", "store", "rekey", "mine", "--key", "--yes"],
     ];
     for args in cases {
         let (code, out) = run(args, home.path());
