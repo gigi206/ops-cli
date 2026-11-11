@@ -2024,13 +2024,22 @@ fn synthetic_passwd_carries_the_identity_and_no_host_account() {
         user: "sandbox".to_string(),
     };
     let passwd = passwd_contents(&id, SANDBOX_HOME, SANDBOX_SHELL);
-    assert!(passwd.contains("sandbox:x:1000:1000:sandbox:/home/sandbox:/bin/sh"));
-    assert!(passwd.contains("nobody:x:65534:"));
-    // no real host login leaked in
-    assert!(!passwd.contains("/home/gigi"));
+    // The identity and `nobody`, and nothing else: whoever runs the tests, no host account can be
+    // among the lines.
+    assert_eq!(
+        passwd.lines().collect::<Vec<_>>(),
+        [
+            "sandbox:x:1000:1000:sandbox:/home/sandbox:/bin/sh",
+            "nobody:x:65534:65534:nobody:/:/sbin/nologin",
+        ],
+        "{passwd}"
+    );
     let group = group_contents(&id);
-    assert!(group.contains("sandbox:x:1000:"));
-    assert!(group.contains("nogroup:x:65534:"));
+    assert_eq!(
+        group.lines().collect::<Vec<_>>(),
+        ["sandbox:x:1000:", "nogroup:x:65534:"],
+        "{group}"
+    );
 }
 
 #[test]
@@ -2128,10 +2137,16 @@ fn canonicalize_project_follows_symlinks_and_requires_a_directory() {
         real.canonicalize().unwrap()
     );
 
-    // a file is rejected
+    // a file is rejected, by the directory check rather than by anything else that could fail
     let file = base.join("file");
     std::fs::write(&file, b"x").unwrap();
-    assert!(canonicalize_project(&file).is_err());
+    let refused = canonicalize_project(&file).expect_err("a file is not a project");
+    assert_eq!(
+        refused.kind(),
+        std::io::ErrorKind::InvalidInput,
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("not a directory"), "{refused}");
 }
 
 #[test]
@@ -3260,7 +3275,10 @@ fn the_capture_tap_replaces_the_cages_resolver_with_exactly_one_mount() {
         other => panic!("expected the host's resolver, tried: {other:?}"),
     }
     assert!(
-        !src.exists(),
+        matches!(
+            src.symlink_metadata(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        ),
         "the synthetic file is removed when no tap is wired, so a later launch cannot read a stale one"
     );
 }
@@ -3327,12 +3345,14 @@ fn host(path: &str, writable: bool) -> ExtraBind {
     }
 }
 
-/// No mount laid after a pin sits at or above its path, so nothing covers it.
+/// Every pin is laid, and no mount laid after it sits at or above its path, so nothing covers it.
+/// A pin not laid at all fails here rather than passing as one nothing covers.
 fn assert_nothing_covers_a_pin(mounts: &[Mount], pins: &[ExtraBind]) {
     for pin in pins {
-        let Some(at) = mounts.iter().position(|m| *m == pin.mount()) else {
-            continue;
-        };
+        let at = mounts
+            .iter()
+            .position(|m| *m == pin.mount())
+            .unwrap_or_else(|| panic!("{} is not laid: {mounts:#?}", pin.dest.display()));
         for m in &mounts[at + 1..] {
             assert!(
                 !pin.dest.starts_with(m.dest()),
