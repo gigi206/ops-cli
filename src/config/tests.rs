@@ -9378,7 +9378,9 @@ fn a_header_name_that_is_not_an_http_token_is_refused() {
         secret.header = Some(bad.into());
         let refused = validate(secret).err();
         assert!(
-            refused.as_deref().is_some_and(|e| e.contains("header")),
+            refused
+                .as_deref()
+                .is_some_and(|e| e.contains("invalid `header` name")),
             "`{bad}` is taken for a header name: {refused:?}"
         );
     }

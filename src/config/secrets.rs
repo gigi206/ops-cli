@@ -621,10 +621,11 @@ fn build_ref(
 
 /// Write `key` into a plugin scheme's `locator` template, `{key}` being the one placeholder.
 ///
-/// Two refusals, both fail-closed. A template that never writes `{key}` would give every terse key
+/// Three refusals, all fail-closed. A template that never writes `{key}` would give every terse key
 /// the same locator, so one entry's secret would answer for another's. An unknown placeholder is
 /// refused rather than passed through, because a `{`…`}` reaching the plugin's `argv[1]` is a
-/// locator the user believes carries a value and that the plugin will look up literally.
+/// locator the user believes carries a value and that the plugin will look up literally — and a
+/// `{` that never closes is refused for the same reason.
 fn expand_locator(template: &str, scheme: &str, key: &str) -> Result<String, String> {
     let mut out = String::with_capacity(template.len() + key.len());
     let mut rest = template;

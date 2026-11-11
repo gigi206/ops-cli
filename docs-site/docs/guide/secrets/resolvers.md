@@ -184,7 +184,8 @@ key = "api-demo-app"               # → vault-demo://agents/api-demo-app
 the key is the whole locator, `vault-demo://api-example`, which is what a vault
 addressed by host or by entry name already wants. A template that never writes
 `{key}` is refused: every terse key would resolve the same locator, so one
-entry's credential would answer for another's.
+entry's credential would answer for another's. So is any other placeholder, and a
+`{` that never closes: either would reach the plugin as literal braces.
 
 This is what the terse form buys over a per-entry `from`: the vault is named
 once. Moving these secrets to a different one is a single edit, not one per
