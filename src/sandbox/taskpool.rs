@@ -112,48 +112,35 @@ fn answers_version(dir: &str, wanted: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('.'))
 }
 
-/// The installed version that answers `token`'s declared version, given what the pool realized for
-/// the tool — the half of the satisfaction rule that reads `installs/`.
+/// Whether the pool realized `tool` at the version a token declares — the half of the satisfaction
+/// rule that reads `installs/`.
 ///
-/// - an exact `@version` selects the directory of that name;
-/// - a **partial** `@version` (`22`, `22.3`) selects the concrete version it names. mise records the
-///   spec verbatim and materializes the partial as a *symlink* beside the concrete directory, and
+/// - an exact `@version` is answered by the directory of that name;
+/// - a **partial** `@version` (`22`, `22.3`) by a concrete version it names. mise records the spec
+///   verbatim and materializes the partial as a *symlink* beside the concrete directory, and
 ///   [`inspect::mise_installed_in`] keeps only real directories — so looking for a directory called
 ///   `22` can never find one, however successfully the tool installed;
-/// - a named alias (`latest`, and mise's channel aliases) resolves like a bare token, for the same
-///   reason and because the alias the config records is what a shim resolves through. `mise use -g
-///   node@latest` and `mise use -g node` write the same `[tools]` entry, so they must not be two
-///   different questions here;
-/// - a bare token prefers mise's `latest` alias — which is exactly what a bare request resolved to
-///   — and otherwise takes the highest concrete version, so a pool that accumulated two versions
-///   answers with a *chosen* one rather than an arbitrary one.
+/// - a named alias (`latest`, and mise's channel aliases) is answered like a bare token, for the
+///   same reason and because the alias the config records is what a shim resolves through. `mise
+///   use -g node@latest` and `mise use -g node` write the same `[tools]` entry, so they must not be
+///   two different questions here;
+/// - a bare token by any version the pool holds, mise's `latest` alias included.
 ///
-/// Nothing is put on a task's `PATH` from this: [`shims_incage`] is. What this decides is whether
-/// the pool holds the tool the declaration asked for, and a spelling it can never answer is a token
-/// reported missing on every launch, forever.
-fn version_dir(tool: &InstalledTool, wanted: Option<&str>) -> Option<String> {
+/// Which version a task runs is not decided here. Its `PATH` gets the shims ([`shims_incage`]),
+/// which resolve through the version the pool's config records, and [`bins_for`] holds that record
+/// to the declaration. So this answers only whether the pool holds the tool the declaration asked
+/// for — and a spelling it can never answer is a token reported missing on every launch, forever.
+fn realizes(tool: &InstalledTool, wanted: Option<&str>) -> bool {
     match wanted {
         // The alias or the exact version, whenever mise materialized it as a real directory.
-        Some(v) if tool.versions.iter().any(|d| d == v) => Some(v.to_string()),
+        Some(v) if tool.versions.iter().any(|d| d == v) => true,
         // A version-shaped spec is honoured as declared: only a concrete version it names answers
-        // it, so `node@22` is never served by an installed `node@24`.
-        Some(v) if v.starts_with(|c: char| c.is_ascii_digit()) => {
-            let concrete = inspect::concrete_versions(tool);
-            // `mise_installed_in` sorts ascending, so the last match is the highest.
-            concrete
-                .iter()
-                .rev()
-                .find(|d| answers_version(d.as_str(), v))
-                .cloned()
-        }
+        // it, so `node@22` is never answered by an installed `node@24`.
+        Some(v) if v.starts_with(|c: char| c.is_ascii_digit()) => inspect::concrete_versions(tool)
+            .iter()
+            .any(|d| answers_version(d, v)),
         // A bare token, or a named alias mise resolved to something concrete.
-        Some(_) | None => {
-            if tool.versions.iter().any(|d| d == "latest") {
-                return Some("latest".to_string());
-            }
-            // `mise_installed_in` sorts ascending, so the last concrete entry is the highest.
-            inspect::concrete_versions(tool).last().cloned()
-        }
+        Some(_) | None => !tool.versions.is_empty(),
     }
 }
 
@@ -298,8 +285,7 @@ pub(crate) fn bins_for(pool: &Path, tokens: &[String]) -> PoolBins {
         let realized = installed
             .iter()
             .find(|t| t.is(locator))
-            .and_then(|t| version_dir(t, wanted))
-            .is_some();
+            .is_some_and(|t| realizes(t, wanted));
         let pinned = recorded.get(locator).map(String::as_str) == Some(wanted_spec(wanted));
         if realized && pinned {
             satisfied = true;
