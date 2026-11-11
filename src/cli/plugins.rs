@@ -775,6 +775,25 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
     }
 }
 
+/// What a plugin's page leaves out when the current directory cannot be read.
+const GRANT_UNREAD: &str = "what the config grants this plugin is not shown";
+
+/// The config the current directory resolves, for the lines of a plugin's page or install that
+/// read it. `None` when the directory cannot be read, which is said here, once, followed by
+/// `consequence`: those lines would otherwise answer "nothing configured" about a config no one
+/// looked at.
+fn config_here(consequence: &str) -> Option<crate::config::Resolved> {
+    match std::env::current_dir() {
+        Ok(cwd) => Some(crate::config::load(&cwd)),
+        Err(e) => {
+            diag::warn(&format!(
+                "plugins: cannot read the current directory ({e}) — {consequence}"
+            ));
+            None
+        }
+    }
+}
+
 /// Build whatever `[plugin.<name>] programs` names for the plugin just placed, and report it.
 ///
 /// Runs here rather than at launch because a plugin's program is **project-independent**: it is
@@ -818,10 +837,13 @@ fn provision_configured_programs(layout: &store::Layout, plugin_name: &str) -> E
     else {
         return ExitCode::SUCCESS;
     };
-    let Ok(cwd) = std::env::current_dir() else {
+    let Some(resolved) = config_here(&format!(
+        "`[plugin.{plugin_name}] programs` is not read, so nothing it names is built: if it names \
+         a program the plugin runs, run `sbx plugins rm {dir_name}` and install it again from a \
+         readable directory"
+    )) else {
         return ExitCode::SUCCESS;
     };
-    let resolved = crate::config::load(&cwd);
     let Some(raw) = resolved.plugin.get(plugin_name) else {
         return ExitCode::SUCCESS;
     };
@@ -2560,6 +2582,7 @@ fn plugins_info(key: Option<&str>, json: bool) -> ExitCode {
         p.check_exec(),
         &pal,
     );
+    let here = config_here(GRANT_UNREAD);
     outln!("  sandbox grant:");
     outln!("    network:     {}", p.sandbox.network);
     outln!("    state:       {}", state_grant(p));
@@ -2569,10 +2592,10 @@ fn plugins_info(key: Option<&str>, json: bool) -> ExitCode {
         &p.name,
         &p.sandbox,
         Some(&p.sandbox.brokers),
-        err,
-        r,
+        here.as_ref(),
+        &pal,
     );
-    print_plugin_host_config(&p.name, &p.sandbox, err, r);
+    print_plugin_host_config(&p.name, &p.sandbox, here.as_ref(), err, r);
     ExitCode::SUCCESS
 }
 
@@ -2674,6 +2697,7 @@ fn print_grant_programs(
     dir_name: &str,
     name: &str,
     programs: &[String],
+    here: Option<&crate::config::Resolved>,
     err: &str,
     r: &str,
 ) {
@@ -2681,9 +2705,7 @@ fn print_grant_programs(
         outln!("    programs:    (none)");
         return;
     }
-    let configured: std::collections::BTreeMap<String, String> = std::env::current_dir()
-        .ok()
-        .map(|cwd| crate::config::load(&cwd))
+    let configured: std::collections::BTreeMap<String, String> = here
         .and_then(|c| c.plugin.get(name).cloned())
         .map(|raw| {
             let mut ignored = Vec::new();
@@ -2734,16 +2756,17 @@ fn print_shared_grant(
     name: &str,
     grant: &plugins::SandboxGrant,
     fences: Option<&[String]>,
-    err: &str,
-    r: &str,
+    here: Option<&crate::config::Resolved>,
+    pal: &style::Palette,
 ) {
-    print_grant_programs(layout, dir_name, name, &grant.programs, err, r);
+    let (err, r) = (pal.err, pal.reset);
+    print_grant_programs(layout, dir_name, name, &grant.programs, here, err, r);
     print_grant_paths("allow_paths", &grant.allow_paths);
     print_grant_masks(&grant.mask_paths);
     print_grant_env("allow_env", &grant.allow_env);
     print_grant_env_paths(&grant.allow_env_paths, err, r);
     if let Some(brokers) = fences {
-        print_grant_brokers(brokers);
+        print_grant_brokers(brokers, here);
     }
     // The closure, when a declared program lives in the nix store. Shown because it is the one part
     // of the grant no manifest names, so it would otherwise be the largest thing a launch binds and
@@ -2867,17 +2890,16 @@ fn info_broker(
     );
     // The host resource is the config's to name, so it is read from there rather than from the
     // manifest — and a broker nothing binds is the difference between installed and in use.
-    let bound = std::env::current_dir()
-        .map(|cwd| crate::config::load(&cwd))
-        .ok()
-        .and_then(|cfg| {
-            cfg.brokers
-                .iter()
-                .find(|b| b.name == p.name)
-                .map(|b| (b.socket.describe(), b.allow.clone()))
-        });
+    let here = config_here(GRANT_UNREAD);
+    let bound = here.as_ref().map(|cfg| {
+        cfg.brokers
+            .iter()
+            .find(|b| b.name == p.name)
+            .map(|b| (b.socket.describe(), b.allow.clone()))
+    });
     match bound {
-        Some((socket, allow)) => {
+        None => outln!("  bound by the global config: cannot be told (the config is not read)"),
+        Some(Some((socket, allow))) => {
             outln!("  bound by the global config:");
             outln!("    socket:      {n}{socket}{r}");
             outln!(
@@ -2894,7 +2916,7 @@ fn info_broker(
                 }
             );
         }
-        None => outln!(
+        Some(None) => outln!(
             "  bound by the global config: no — add `[broker.{}] socket` to stand it up",
             p.name
         ),
@@ -2908,8 +2930,16 @@ fn info_broker(
          none of the three"
     );
     print_kind_path_rule("broker");
-    print_shared_grant(layout, p.dir_name(), &p.name, &p.sandbox, None, err, r);
-    print_plugin_host_config(&p.name, &p.sandbox, err, r);
+    print_shared_grant(
+        layout,
+        p.dir_name(),
+        &p.name,
+        &p.sandbox,
+        None,
+        here.as_ref(),
+        pal,
+    );
+    print_plugin_host_config(&p.name, &p.sandbox, here.as_ref(), err, r);
     ExitCode::SUCCESS
 }
 
@@ -2962,14 +2992,23 @@ fn info_signer(
             algorithm.name()
         );
     }
+    let here = config_here(GRANT_UNREAD);
     outln!("  sandbox grant:");
     outln!(
         "    network:     no, and neither state nor a broker fence — a signer plugin may declare \
          none of the three"
     );
     print_kind_path_rule("signer");
-    print_shared_grant(layout, p.dir_name(), &p.name, &p.sandbox, None, err, r);
-    print_plugin_host_config(&p.name, &p.sandbox, err, r);
+    print_shared_grant(
+        layout,
+        p.dir_name(),
+        &p.name,
+        &p.sandbox,
+        None,
+        here.as_ref(),
+        pal,
+    );
+    print_plugin_host_config(&p.name, &p.sandbox, here.as_ref(), err, r);
     ExitCode::SUCCESS
 }
 
@@ -2984,12 +3023,14 @@ fn info_signer(
 /// A variable the manifest does not declare is shown as ignored rather than omitted: the config
 /// says it, so the answer to "why is it not applying" belongs here. One printer for every type,
 /// because `[plugin.<name>]` means the same thing whatever the plugin does with it.
-fn print_plugin_host_config(name: &str, grant: &plugins::SandboxGrant, err: &str, r: &str) {
-    let Ok(cwd) = std::env::current_dir() else {
-        return;
-    };
-    let resolved = crate::config::load(&cwd);
-    let Some(raw) = resolved.plugin.get(name) else {
+fn print_plugin_host_config(
+    name: &str,
+    grant: &plugins::SandboxGrant,
+    here: Option<&crate::config::Resolved>,
+    err: &str,
+    r: &str,
+) {
+    let Some(raw) = here.and_then(|resolved| resolved.plugin.get(name)) else {
         return;
     };
     if raw.env.is_empty() {
@@ -3038,20 +3079,21 @@ fn how_the_cage_finds_it(p: &crate::plugins::broker::BrokerPlugin) -> String {
 /// nothing at launch, and a reader asking "does my `pass://` reach the agent?" is asking exactly
 /// that. The plugin's own directory is never consulted here — only the two declarations that have
 /// to agree.
-fn print_grant_brokers(names: &[String]) {
+fn print_grant_brokers(names: &[String], here: Option<&crate::config::Resolved>) {
     if names.is_empty() {
         outln!("    brokers:     (none)");
         return;
     }
-    let bound: Vec<String> = std::env::current_dir()
-        .map(|cwd| crate::config::load(&cwd))
-        .map(|cfg| cfg.brokers.iter().map(|b| b.name.clone()).collect())
-        .unwrap_or_default();
+    let bound: Option<Vec<&str>> =
+        here.map(|cfg| cfg.brokers.iter().map(|b| b.name.as_str()).collect());
     let shown: Vec<String> = names
         .iter()
-        .map(|name| match bound.contains(name) {
-            true => name.clone(),
-            false => format!("{name} (no `[broker.{name}]` binds it — the plugin runs without it)"),
+        .map(|name| match &bound {
+            None => format!("{name} (whether a `[broker.{name}]` binds it cannot be told)"),
+            Some(bound) if bound.contains(&name.as_str()) => name.clone(),
+            Some(_) => {
+                format!("{name} (no `[broker.{name}]` binds it — the plugin runs without it)")
+            }
         })
         .collect();
     outln!("    brokers:     {}", shown.join(", "));

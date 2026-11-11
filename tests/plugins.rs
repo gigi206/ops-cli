@@ -1081,6 +1081,54 @@ fn a_plugin_directory_whose_name_is_not_utf8_is_said_and_not_loaded() {
     );
 }
 
+/// Run `sbx <args>` from a working directory removed before it starts, the one state in which the
+/// current directory cannot be read.
+fn run_from_a_removed_cwd(args: &[&str], home: &Path) -> (i32, String, String) {
+    let gone = home.join("gone");
+    std::fs::create_dir(&gone).unwrap();
+    let sbx = sbx(args, home);
+    let mut sh = Command::new("sh");
+    sh.arg("-c")
+        .arg(r#"cd "$1" && rmdir "$1" && shift && exec "$@""#)
+        .arg("sh")
+        .arg(&gone)
+        .arg(sbx.get_program())
+        .args(sbx.get_args())
+        .envs(sbx.get_envs().filter_map(|(k, v)| Some((k, v?))));
+    both(&mut sh)
+}
+
+/// A plugin's page and its install read the config of the current directory, and one that cannot
+/// be read is said rather than taken for a config naming nothing: the page told a broker grant
+/// "no `[broker.agent]` binds it — the plugin runs without it" about a config no one looked at, and
+/// an install skipped building the programs `[plugin.<name>]` names without a word.
+#[test]
+fn an_unreadable_current_directory_is_said_rather_than_read_as_no_config() {
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
+    let dir = local_plugin(src.path(), "hm", "hm");
+    let manifest = dir.join("plugin.toml");
+    let mut text = std::fs::read_to_string(&manifest).unwrap();
+    text.push_str("[sandbox]\nprograms = [\"hm-tool\"]\nbrokers = [\"agent\"]\n");
+    std::fs::write(&manifest, text).unwrap();
+
+    let (code, out, err) =
+        run_from_a_removed_cwd(&["plugins", "install", dir.to_str().unwrap()], home.path());
+    assert!(
+        code == 0 && err.contains("cannot read the current directory") && err.contains("programs"),
+        "the install says what it did not read:\nstdout:\n{out}stderr:\n{err}"
+    );
+    let (_code, out, err) = run_from_a_removed_cwd(&["plugins", "info", "hm"], home.path());
+    assert!(
+        err.contains("cannot read the current directory"),
+        "the page says what it did not read:\nstdout:\n{out}stderr:\n{err}"
+    );
+    assert!(
+        !out.contains("no `[broker.agent]` binds it") && out.contains("cannot be told"),
+        "the page does not answer for a config it did not read:\n{out}"
+    );
+}
+
 #[test]
 fn a_scheme_claimed_twice_disables_every_claimant_until_one_remains() {
     let home = TmpDir::new("plugins");
