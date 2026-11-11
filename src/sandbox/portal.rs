@@ -423,7 +423,9 @@ fn wrap_command_at(
             let kf_parent = KEYFILE_REL.rsplit_once('/').map_or(KEYFILE_REL, |(p, _)| p);
             format!(
                 "{mkdir} -p \"$HOME/{kf_parent}\" 2>/dev/null\n\
-                 {cat} > \"$HOME/{KEYFILE_REL}\" <<'SBXPORTALKF' 2>/dev/null || true\n\
+                 {{ {cat} > \"$HOME/{KEYFILE_REL}\"; }} 2>/dev/null <<'SBXPORTALKF' \
+                 || echo 'sbx: the host theme could not be seeded into the cage — the app opens in \
+                 its default theme' 1>&2\n\
                  {keyfile}SBXPORTALKF\n"
             )
         }
@@ -438,6 +440,8 @@ fn wrap_command_at(
     // The app writes its `.desktop` in its OWN command preamble (which `exec "$@"` runs AFTER this),
     // then opens the URL only much later (at login), so a short bounded retry catches the file whenever
     // it lands. Best-effort, never blocks; the background job dies with the cage (its PID-1 reaper).
+    // Silent, unlike the steps below: before the app registers a handler there is no directory to
+    // index, and the indexer fails on that, which is every launch of an app that registers none.
     let index = format!(
         "( for _ in 1 2 3; do {udd} \"$HOME/.local/share/applications\" >/dev/null 2>&1; \
          {sleep} 1; done ) &\n",
@@ -452,19 +456,24 @@ fn wrap_command_at(
     // lens would record), and `--components=secrets` starts only the Secret Service: no ssh-agent
     // (sbx brokers that one), no PKCS#11. The keyring file lands in the app's isolated home, so a
     // login stored on one launch is still there on the next. Best-effort like the rest of the
-    // preamble: a cage whose keyring will not open still launches, with the app back on whatever
-    // fallback it chooses.
+    // preamble: a cage whose keyring will not open, or whose name never gets an owner, still
+    // launches, with the app back on whatever fallback it chooses, and a line on standard error
+    // says so. Like the bus's and the seed's, that line is the only sign: an app that will not
+    // finish rendering without the service otherwise shows nothing of why.
     let keyring = format!(
-        "if printf %s {pass} | {kr} --unlock --components=secrets --daemonize \
+        "sbx_secrets=\n\
+         if printf %s {pass} | {kr} --unlock --components=secrets --daemonize \
          >/dev/null 2>&1; then\n\
          for _ in {{1..50}}; do\n\
          case \"$({send} --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
          org.freedesktop.DBus.NameHasOwner string:{SECRETS_NAME} 2>/dev/null)\" in\n\
-         *'boolean true'*) break ;;\n\
+         *'boolean true'*) sbx_secrets=1; break ;;\n\
          esac\n\
          {sleep} 0.1\n\
          done\n\
-         fi\n",
+         fi\n\
+         [ -n \"$sbx_secrets\" ] || echo 'sbx: `dbus = true` but the in-cage Secret Service did not \
+         start — the app runs without one' 1>&2\n",
         pass = super::shell_quote(KEYRING_PASSPHRASE),
         kr = word(keyring_daemon),
     );
@@ -473,7 +482,9 @@ fn wrap_command_at(
          {cat} > {session_file} <<'SBXPORTALCF'\n{session}SBXPORTALCF\n\
          {cat} > {portals_file} <<'SBXPORTALPF'\n{portals}SBXPORTALPF\n\
          {seed}\
-         {daemon} --config-file={session_file} --fork </dev/null >/dev/null 2>&1 || true\n\
+         {daemon} --config-file={session_file} --fork </dev/null >/dev/null 2>&1 \
+         || echo 'sbx: `dbus = true` but the in-cage session bus did not start — running without \
+         an in-cage desktop portal' 1>&2\n\
          {keyring}\
          {index}",
         portal_dir = word(&dir.join("xdg-desktop-portal")),
@@ -758,8 +769,9 @@ mod tests {
     /// portal directory at `<root>/run` and `$HOME` at `<root>/home`. Every program it names is a
     /// stand-in under `root` that logs how it was run; `mkdir` and `cat` then do their real work,
     /// `sleep` returns at once, `dbus-send` answers that the name has an owner, and the bus daemon
-    /// and the keyring exit 1 when named in `failing`, 0 otherwise. The command is a stand-in too,
-    /// `<root>/app`.
+    /// and the keyring exit 0. Each step named in `failing` fails instead: `dbus-daemon` and
+    /// `gnome-keyring-daemon` exit 1, `dbus-send` answers that the name has none, and `seed` finds a
+    /// file where the keyfile's directory belongs. The command is a stand-in too, `<root>/app`.
     ///
     /// The environment is cleared, so nothing the script does can reach the real home. The run is
     /// made again while a stand-in it executes is still held open for writing by a fork in another
@@ -793,7 +805,10 @@ mod tests {
             ),
             (
                 provision.dbus_daemon.with_file_name("dbus-send"),
-                format!("{log_line}\nprintf 'boolean true\\n'"),
+                format!(
+                    "{log_line}\nprintf 'boolean {}\\n'",
+                    !failing.contains(&"dbus-send")
+                ),
             ),
             (
                 provision.update_desktop_db.clone(),
@@ -824,6 +839,9 @@ mod tests {
             let _ = crate::sandbox::gc::force_remove_dir_all(&dir);
             let _ = crate::sandbox::gc::force_remove_dir_all(&home);
             std::fs::create_dir_all(&home).unwrap();
+            if failing.contains(&"seed") {
+                std::fs::write(home.join(".config"), b"").unwrap();
+            }
             let ran = crate::testutil::run_within(
                 std::process::Command::new(&argv[0])
                     .args(&argv[1..])
@@ -916,6 +934,42 @@ mod tests {
                 "{shape:?}: a path ran a command"
             );
         }
+    }
+
+    /// A step of the portal that fails says so on standard error, and the app still runs: without
+    /// the bus there is no file chooser, without the Secret Service an app may not finish starting,
+    /// and without the seed it opens in its default theme, and none of it should be found out by
+    /// its effect alone. A run where nothing fails says nothing, the indexer included: it fails on
+    /// every launch whose app has registered no handler, which is the usual one.
+    #[test]
+    fn a_portal_step_that_fails_says_so_and_the_app_still_runs() {
+        for (failing, said) in [
+            ("dbus-daemon", "the in-cage session bus did not start"),
+            (
+                "gnome-keyring-daemon",
+                "the in-cage Secret Service did not start",
+            ),
+            ("dbus-send", "the in-cage Secret Service did not start"),
+            ("seed", "the host theme could not be seeded"),
+        ] {
+            let tmp = crate::testutil::TmpDir::new();
+            let Preamble { ran, log } = run_preamble(tmp.path(), Some("prefer-dark"), &[failing]);
+            assert!(
+                ran.stderr
+                    .lines()
+                    .any(|l| l.starts_with("sbx: ") && l.contains(said)),
+                "{failing}: nothing says {said:?}: {}",
+                ran.stderr
+            );
+            let app = tmp.path().join("app").display().to_string();
+            assert!(
+                log.lines().any(|l| l.starts_with(app.as_str())),
+                "{failing}: the app did not run:\n{log}"
+            );
+        }
+        let tmp = crate::testutil::TmpDir::new();
+        let Preamble { ran, .. } = run_preamble(tmp.path(), Some("prefer-dark"), &[]);
+        assert!(!ran.stderr.contains("sbx: "), "{}", ran.stderr);
     }
 
     #[test]
