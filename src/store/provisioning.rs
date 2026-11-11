@@ -361,11 +361,15 @@ fn source_path_from_metadata(stdout: &str) -> Option<PathBuf> {
         .lines()
         .filter(|l| l.contains("Path:"))
         .flat_map(str::split_whitespace)
-        .find(|t| {
-            t.strip_prefix("/nix/store/")
-                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
-        })
+        .find(|t| is_store_path(t))
         .map(PathBuf::from)
+}
+
+/// Whether `s` names one logical store path, `/nix/store/<name>` and nothing below it: the only
+/// shape a line nix prints may take before it becomes a path sbx probes or roots.
+fn is_store_path(s: &str) -> bool {
+    s.strip_prefix("/nix/store/")
+        .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
 }
 
 /// Provision a `flake:` package from a full flake build *target* into the user-owned store,
@@ -637,6 +641,7 @@ fn select_marked_output(
 ) -> io::Result<PathBuf> {
     stdout
         .lines()
+        .filter(|line| is_store_path(line))
         .map(PathBuf::from)
         .find(|logical| {
             physical_path(layout, logical)
@@ -1234,6 +1239,30 @@ mod tests {
         }
         assert!(!ran.exists(), "nix ran for a refused marker");
         assert!(check_marker("bin").is_ok() && check_marker("lib/locale/locale-archive").is_ok());
+    }
+
+    /// Only a line naming a store path is probed for the marker. Every line is mapped under the
+    /// store root, so a line nix did not mean as an output, such as nix's own `/nix/var` state,
+    /// would otherwise be selected wherever that tree happens to carry the marker.
+    #[test]
+    fn only_a_store_path_line_is_selected_as_an_output() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let state = physical_path(&layout, Path::new("/nix/var/nix/profiles"));
+        std::fs::create_dir_all(state.join("bin")).unwrap();
+        let out = physical_path(&layout, Path::new("/nix/store/aaaa-pkg"));
+        std::fs::create_dir_all(out.join("bin")).unwrap();
+
+        let refused = select_marked_output(&layout, "/nix/var/nix/profiles\n", "pkg", "bin");
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::NotFound);
+        let chosen = select_marked_output(
+            &layout,
+            "/nix/var/nix/profiles\n/nix/store/aaaa-pkg\n",
+            "pkg",
+            "bin",
+        )
+        .unwrap();
+        assert_eq!(chosen, Path::new("/nix/store/aaaa-pkg"));
     }
 
     /// The directory the channel source is rooted in is created owner-only, as every other gcroot
