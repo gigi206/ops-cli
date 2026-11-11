@@ -974,8 +974,12 @@ pub(crate) fn bind_and_serve(
 ///
 /// A line the reader does not recognise is skipped rather than failing the read, so a session
 /// serving a field this reader has never heard of is still readable.
+///
+/// The connect is bounded like every read after it: a plain one to a listener whose backlog is full
+/// sleeps until the backlog drains ([`super::broker::connect_unix_within`]), and a supervisor that
+/// stopped accepting never lets it.
 pub(crate) fn read_log<E: Event>(socket: &Path, after: Option<u64>) -> io::Result<Snapshot<E>> {
-    let stream = UnixStream::connect(socket)?;
+    let stream = super::broker::connect_unix_within(socket, IO_TIMEOUT)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut cmd = String::from("LOG");

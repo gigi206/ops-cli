@@ -481,7 +481,10 @@ fn read_within(socket: &Path, cmd: &str, timeout: Duration) -> io::Result<Vec<St
     super::reply::answer(BufReader::new(&stream)).collect()
 }
 
-/// Connect to a session's control socket and send it one command line, both under `timeout`.
+/// Connect to a session's control socket and send it one command line, the connect and the write
+/// both under `timeout`. A plain `UnixStream::connect` cannot be bounded, and one to a listener whose
+/// backlog is full sleeps until the backlog drains ([`super::broker::connect_unix_within`]), which a
+/// supervisor that stopped accepting never lets happen.
 ///
 /// A command carrying a control character is refused before anything is sent. The server reads one
 /// line, so a newline in a `REMEMBER` rule would end the command early, load the part before it as
@@ -495,7 +498,7 @@ fn send(socket: &Path, cmd: &str, timeout: Duration) -> io::Result<UnixStream> {
             "a control command must not contain control characters",
         ));
     }
-    let stream = UnixStream::connect(socket)?;
+    let stream = super::broker::connect_unix_within(socket, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     (&stream).write_all(format!("{cmd}\n").as_bytes())?;
@@ -768,6 +771,51 @@ mod tests {
             io::ErrorKind::NotFound,
             "a clean rule goes as far as the connect"
         );
+    }
+
+    /// A session whose listener stopped accepting does not hold a reader past its budget.
+    ///
+    /// Once a listener's backlog is full, a plain connect sleeps until it drains, and a supervisor
+    /// that stopped accepting (stopped by a signal, or wedged) never drains it: `sbx proc pending`,
+    /// `sbx proc logs` and the completion oracle waited there for good, whatever timeout they had
+    /// asked for. A backlog of zero holds one connection, so every reader after it is the one that
+    /// waits. Both doors are tried: the verbs this module sends, and the `LOG` read every lens shares.
+    #[test]
+    fn a_session_that_stopped_accepting_does_not_hold_the_reader() {
+        use crate::testutil::TmpDir;
+        use std::os::fd::AsRawFd;
+        let dir = TmpDir::new();
+        let socket = dir.join("full.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        // SAFETY: listen(2) on a listening socket this test owns; it only lowers the backlog.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let _queued = UnixStream::connect(&socket).expect("the first connection fits the backlog");
+
+        type Reader = fn(&Path) -> io::Result<()>;
+        let readers: [(&str, Reader); 2] = [
+            ("LIST", |s| {
+                read_pending_within(s, Duration::from_millis(200)).map(drop)
+            }),
+            ("LOG", |s| read_exec_log(s, None).map(drop)),
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (name, read) in readers {
+            let (tx, socket) = (tx.clone(), socket.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send((name, read(&socket).map_err(|e| e.kind())));
+            });
+        }
+        for _ in 0..readers.len() {
+            let (name, read) = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("a reader is still held by a listener that never accepts");
+            assert_eq!(
+                read,
+                Err(io::ErrorKind::WouldBlock),
+                "{name}: the connect must end on its budget"
+            );
+        }
+        drop(listener);
     }
 
     #[test]
