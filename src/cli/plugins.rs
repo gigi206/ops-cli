@@ -2425,6 +2425,26 @@ fn nothing_answers(key: &str) -> String {
     )
 }
 
+/// What `plugins info` says of a resolver's `state` grant. Named even when absent, and named
+/// *loudly* when present: every other line of the grant is read-only, so the one that is not is the
+/// line a reader most needs to find. A plugin whose directory gives its state no place is refused
+/// at launch, and the line says so rather than naming an empty path.
+fn state_grant(p: &plugins::ResolverPlugin) -> String {
+    if !p.sandbox.state {
+        return "no (nothing the plugin writes outlives the run)".to_string();
+    }
+    match crate::sandbox::resolver::state_dir(p) {
+        Some(dir) => format!(
+            "yes — a private writable directory that survives the run ({})",
+            dir.display()
+        ),
+        None => format!(
+            "yes — but {} gives it no place, so a launch refuses the plugin",
+            p.dir.display()
+        ),
+    }
+}
+
 /// `sbx plugins info <scheme|name>`: the full manifest and sandbox grant of the plugin a key
 /// reaches — a resolver by the scheme it claims, a broker or a signer by its name, neither of which
 /// claims a scheme. A built-in scheme is reported as such (not an error); a key nothing installed
@@ -2504,12 +2524,15 @@ fn plugins_info(key: Option<&str>, json: bool) -> ExitCode {
             "healthy": p.check_exec().is_ok(),
             "grant": {
                 "network": p.sandbox.network,
-                "state_dir": p.sandbox.state.then(|| {
-                    crate::sandbox::resolver::state_dir(p)
-                        .unwrap_or_default()
-                        .display()
-                        .to_string()
-                }),
+                // `state` is said apart from its directory, which is null both where there is no
+                // grant and where the plugin's directory gives the state no place.
+                "state": p.sandbox.state,
+                "state_dir": p
+                    .sandbox
+                    .state
+                    .then(|| crate::sandbox::resolver::state_dir(p))
+                    .flatten()
+                    .map(|dir| dir.display().to_string()),
                 "programs": p.sandbox.programs,
                 "allow_paths": p.sandbox.allow_paths.iter().map(|x| x.display().to_string()).collect::<Vec<_>>(),
                 "mask_paths": p.sandbox.mask_paths.iter().map(|x| x.display().to_string()).collect::<Vec<_>>(),
@@ -2539,17 +2562,7 @@ fn plugins_info(key: Option<&str>, json: bool) -> ExitCode {
     );
     outln!("  sandbox grant:");
     outln!("    network:     {}", p.sandbox.network);
-    // Named even when absent, and named *loudly* when present: every other line of this grant is
-    // read-only, so the one that is not is the line a reader most needs to find.
-    match p.sandbox.state {
-        true => outln!(
-            "    state:       yes — a private writable directory that survives the run ({})",
-            crate::sandbox::resolver::state_dir(p)
-                .unwrap_or_default()
-                .display()
-        ),
-        false => outln!("    state:       no (nothing the plugin writes outlives the run)"),
-    }
+    outln!("    state:       {}", state_grant(p));
     print_shared_grant(
         &layout,
         p.dir_name(),
@@ -3077,6 +3090,35 @@ fn env_path_shown(key: &str, value: Option<String>, err: &str, r: &str) -> Strin
 
 #[cfg(test)]
 mod tests {
+
+    /// A `state` grant is said with the directory a launch binds, and where the plugin's directory
+    /// gives the state no place, which the launcher refuses, the line says that rather than naming
+    /// an empty path as the directory.
+    #[test]
+    fn a_state_grant_with_no_place_says_the_launch_refuses_it() {
+        let plugin = |dir: &str, state: bool| crate::plugins::ResolverPlugin {
+            name: "kp".to_string(),
+            scheme: "kp".to_string(),
+            dir: std::path::PathBuf::from(dir),
+            exec: std::path::PathBuf::from("resolve"),
+            sandbox: crate::plugins::SandboxGrant {
+                state,
+                ..Default::default()
+            },
+            version: None,
+            description: None,
+            host: Default::default(),
+        };
+        assert_eq!(
+            super::state_grant(&plugin("/data/plugins/kp", true)),
+            "yes — a private writable directory that survives the run (/data/plugin-state/kp)"
+        );
+        assert_eq!(
+            super::state_grant(&plugin("/kp", true)),
+            "yes — but /kp gives it no place, so a launch refuses the plugin"
+        );
+        assert!(super::state_grant(&plugin("/kp", false)).starts_with("no "));
+    }
 
     /// A manifest's free text cannot repaint the page a person opened to judge it.
     ///
