@@ -375,7 +375,8 @@ const STATX_MNT_ID: libc::c_uint = 0x1000;
 /// Declared here rather than taken from `libc`, which carries the type for some targets and not for
 /// the static one this ships as. The layout is the kernel's ABI, fixed by it: a field read at the
 /// wrong offset would come back as whatever sits there, plausibly and in silence, so the size and
-/// the offsets of the two fields read here are asserted rather than assumed.
+/// the offsets of the two fields read here are asserted rather than assumed, by
+/// `the_statx_layout_matches_the_kernels` in this module's tests.
 #[repr(C)]
 pub(super) struct Statx {
     pub(super) mask: u32,
