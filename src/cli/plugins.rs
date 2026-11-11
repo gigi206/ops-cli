@@ -633,8 +633,10 @@ fn print_health(
     pal: &style::Palette,
 ) {
     let (err, r) = (pal.err, pal.reset);
+    // The reason can name a component of the manifest's `exec`, held to no charset, so it is
+    // written as text: an escape in it could otherwise rewrite the markers beside it.
     if let Err(why) = runnable {
-        out!("  {err}[not runnable: {why}]{r}");
+        out!("  {err}[not runnable: {}]{r}", diag::visible(&why));
     }
     match plugins::integrity(layout, dir_name) {
         plugins::Integrity::Modified => out!("  {err}[modified since install]{r}"),
@@ -2672,7 +2674,7 @@ fn print_about(
     );
     match runnable {
         Ok(()) => outln!(),
-        Err(why) => outln!("  {err}[not runnable: {why}]{r}"),
+        Err(why) => outln!("  {err}[not runnable: {}]{r}", diag::visible(&why)),
     }
 }
 
@@ -3138,9 +3140,13 @@ fn print_grant_env_paths(keys: &[String], err: &str, r: &str) {
 fn env_path_shown(key: &str, value: Option<String>, err: &str, r: &str) -> String {
     match value {
         None => format!("{key} -> unset (the manifest's own paths apply)"),
+        // An environment value, held to no charset: shown as text, as a config's values are.
         Some(v) => match crate::sandbox::resolver::unbindable(&v) {
-            None => format!("{key} -> {v}"),
-            Some(why) => format!("{key} -> {err}{v} (it {why}, so a launch drops it){r}"),
+            None => format!("{key} -> {}", diag::visible(&v)),
+            Some(why) => format!(
+                "{key} -> {err}{} (it {why}, so a launch drops it){r}",
+                diag::visible(&v)
+            ),
         },
     }
 }

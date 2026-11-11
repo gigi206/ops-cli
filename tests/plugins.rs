@@ -1188,6 +1188,39 @@ fn an_unreadable_current_directory_is_said_rather_than_read_as_no_config() {
     );
 }
 
+/// What `plugins list` and `plugins info` print from a source they do not vouch for is written as
+/// text: the reason an executable would be refused can name a component of the manifest's `exec`,
+/// held to no charset, and an `allow_env_paths` variable's value is the host environment's. An
+/// escape in either reached the terminal as it was, where it could rewrite the lines beside it.
+#[test]
+fn an_escape_in_a_refusal_or_an_environment_value_is_written_as_text() {
+    let home = TmpDir::new("plugins");
+    let plugins = home.path().join("sbx/plugins");
+    let dir = plugins.join("hm");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name=\"hm\"\ntype=\"resolver\"\nscheme=\"hm\"\nexec=\"a\\u001b[2Jb/run\"\n\
+         [sandbox]\nallow_env_paths=[\"HM_PATH\"]\n",
+    )
+    .unwrap();
+    // The executable is reached through a link, which a runner refuses, naming the link.
+    let elsewhere = home.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, dir.join("a\u{1b}[2Jb")).unwrap();
+
+    for args in [&["plugins", "list"][..], &["plugins", "info", "hm"]] {
+        let mut cmd = sbx(args, home.path());
+        cmd.env("HM_PATH", "/x\u{1b}[2J");
+        let (_code, out, err) = both(&mut cmd);
+        assert!(
+            out.contains("not runnable") && !out.contains('\u{1b}') && !err.contains('\u{1b}'),
+            "`sbx {}` writes what it does not vouch for as text:\nstdout:\n{out}stderr:\n{err}",
+            args.join(" ")
+        );
+    }
+}
+
 #[test]
 fn a_scheme_claimed_twice_disables_every_claimant_until_one_remains() {
     let home = TmpDir::new("plugins");
