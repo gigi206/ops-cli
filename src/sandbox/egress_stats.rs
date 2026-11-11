@@ -388,7 +388,7 @@ impl EgressStats {
         }
         let body = serialize(&self.project, self.app.as_deref(), tally);
         let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
-        write_stats_file(&self.path, &seq.to_string(), &body)?;
+        write_stats_file(&self.path, &seq.to_string(), &body, false)?;
         *written = *place;
         Ok(())
     }
@@ -786,9 +786,14 @@ fn compact_with(
 
 /// Write a folded file atomically (temp + rename), so a reader never sees it half-written and an
 /// interrupted fold leaves the sources still standing.
+///
+/// Durably, unlike a session's own flushes: the fold unlinks the sources once this returns, and
+/// those counters then live nowhere else. Without the flush, a power loss could keep the rename
+/// and the unlinks, which are metadata, and lose the rollup's bytes, so every count it had taken
+/// over would be gone.
 fn write_rollup(target: &Path, project: &str, app: Option<&str>, tally: &Tally) -> io::Result<()> {
     let body = serialize(project, app, tally);
-    write_stats_file(target, &std::process::id().to_string(), &body)
+    write_stats_file(target, &std::process::id().to_string(), &body, true)
 }
 
 /// Write one counters file atomically: an owner-only temp sibling named `<target>.tmp.<suffix>`,
@@ -800,7 +805,11 @@ fn write_rollup(target: &Path, project: &str, app: Option<&str>, tally: &Tally) 
 /// the intermediates by it, so a writer that spelled its temp differently would have its orphans
 /// read back as session files. What the suffix carries is only what tells two writers apart — a
 /// per-instance sequence number for the session flush, the pid for the fold.
-fn write_stats_file(target: &Path, tmp_suffix: &str, body: &str) -> io::Result<()> {
+///
+/// `durable` flushes the file before the rename and the directory after it. A session's flush
+/// passes `false`: it runs on the request path, and a lost write there is rewritten from memory by
+/// the next one. The fold's rollup passes `true` ([`write_rollup`]).
+fn write_stats_file(target: &Path, tmp_suffix: &str, body: &str, durable: bool) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = target.with_extension(format!("tmp.{tmp_suffix}"));
     // Owner-only: the counters live under the 0700 egress dir, but tighten the file too.
@@ -811,11 +820,17 @@ fn write_stats_file(target: &Path, tmp_suffix: &str, body: &str) -> io::Result<(
             .truncate(true)
             .mode(0o600)
             .open(&tmp)?;
-        f.write_all(body.as_bytes())
+        f.write_all(body.as_bytes())?;
+        if durable {
+            f.sync_all()?;
+        }
+        Ok(())
     };
     let result = write().and_then(|()| std::fs::rename(&tmp, target));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
+    } else if durable && let Some(dir) = target.parent() {
+        crate::sandbox::atomicfile::sync_dir(dir);
     }
     result
 }
