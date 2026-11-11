@@ -228,6 +228,13 @@ pub(crate) struct EgressStats {
     /// nothing.
     recordable: bool,
     inner: Mutex<Tally>,
+    /// How many snapshots have been taken for writing, so each carries its place in the order the
+    /// counters reached it. Bumped only under `inner`, alongside the clone.
+    snapshots: AtomicU64,
+    /// The place of the snapshot last written to the file. Writes run outside `inner`, so two can
+    /// overlap and land in either order; one older than what the file already holds is dropped
+    /// rather than written over it.
+    written: Mutex<u64>,
 }
 
 /// Whether a session file can carry this identity.
@@ -269,6 +276,8 @@ impl EgressStats {
             next_flush_ms: AtomicU64::new(0),
             pending: AtomicBool::new(false),
             inner: Mutex::new(Tally::default()),
+            snapshots: AtomicU64::new(0),
+            written: Mutex::new(0),
         }
     }
 
@@ -288,8 +297,10 @@ impl EgressStats {
     ///
     /// The flush is best-effort: a write error must never break egress, so it is dropped (the next
     /// record rewrites the file anyway). The snapshot is taken under the lock and written outside
-    /// it, so a burst of concurrent records does not serialise on file I/O; the counters are
-    /// monotonic, so a lost flush race is at most an off-by-a-few that the next record corrects.
+    /// it, so a burst of concurrent records does not serialise on counting. Two writes can then
+    /// overlap, a record's and the flusher's, and the older snapshot's rename could land last; each
+    /// snapshot carries its place ([`Self::snapshot_for_writing`]), and [`Self::flush`] drops one
+    /// older than what the file holds, so the file never steps back to fewer counts than it had.
     fn mutate(&self, change: impl FnOnce(&mut Tally)) {
         let snapshot = {
             let mut tally = locked(&self.inner);
@@ -301,9 +312,16 @@ impl EgressStats {
             // Cleared before the snapshot is taken and under the same lock, so a decision recorded
             // after this one cannot have its flag cleared by this write.
             self.pending.store(false, Ordering::Relaxed);
-            tally.clone()
+            self.snapshot_for_writing(&tally)
         };
         let _ = self.flush(&snapshot);
+    }
+
+    /// `tally` cloned, with its place among the snapshots taken for writing. Called only under
+    /// `inner`, which is what makes the order of the places the order of the counts.
+    fn snapshot_for_writing(&self, tally: &Tally) -> (u64, Tally) {
+        let place = self.snapshots.fetch_add(1, Ordering::Relaxed) + 1;
+        (place, tally.clone())
     }
 
     /// Whether enough time has passed since the last write to take another. Called only under
@@ -328,7 +346,7 @@ impl EgressStats {
             if !self.pending.swap(false, Ordering::Relaxed) {
                 return;
             }
-            tally.clone()
+            self.snapshot_for_writing(&tally)
         };
         let _ = self.flush(&snapshot);
     }
@@ -339,7 +357,7 @@ impl EgressStats {
         let snapshot = {
             let tally = locked(&self.inner);
             self.pending.store(false, Ordering::Relaxed);
-            tally.clone()
+            self.snapshot_for_writing(&tally)
         };
         let _ = self.flush(&snapshot);
     }
@@ -353,15 +371,26 @@ impl EgressStats {
 
     /// Serialise a snapshot to the session file atomically (temp + rename), so a reader never sees a
     /// torn file and a crash mid-write leaves the prior good file in place.
-    fn flush(&self, tally: &Tally) -> io::Result<()> {
+    ///
+    /// `(place, tally)` is what [`Self::snapshot_for_writing`] took. The write runs under `written`,
+    /// and one whose place is not past the last written is dropped: an older snapshot reaching the
+    /// rename after a newer one would leave the file holding fewer counts than it had, with nothing
+    /// pending to correct it until the next decision, which a session gone quiet never makes.
+    fn flush(&self, (place, tally): &(u64, Tally)) -> io::Result<()> {
         // Nothing is written for an identity the file cannot carry: the counters stay in memory for
         // the session and are simply not persisted (see [`identity_is_recordable`]).
         if !self.recordable {
             return Ok(());
         }
+        let mut written = locked(&self.written);
+        if *place <= *written {
+            return Ok(());
+        }
         let body = serialize(&self.project, self.app.as_deref(), tally);
         let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
-        write_stats_file(&self.path, &seq.to_string(), &body)
+        write_stats_file(&self.path, &seq.to_string(), &body)?;
+        *written = *place;
+        Ok(())
     }
 }
 
@@ -1687,6 +1716,44 @@ mod tests {
             vec!["api.example.com"],
             "a resolution gets no row of its own: {:?}",
             parsed.tally.hosts
+        );
+    }
+
+    /// Two snapshots written in the reverse of the order they were taken: the older one, landing
+    /// last, is dropped, so the file keeps the counts it already had rather than stepping back.
+    #[test]
+    fn an_older_snapshot_landing_after_a_newer_one_is_dropped() {
+        let dir = TmpDir::new();
+        let stats = EgressStats::new(dir.path().join("stats-1-11"), "/p".into(), None);
+        let tally = |allow| Tally {
+            hosts: [(
+                "h.test".to_string(),
+                Counts {
+                    allow,
+                    deny: 0,
+                    blocked: 0,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Tally::default()
+        };
+        let (older, newer) = {
+            let one = tally(1);
+            let two = tally(2);
+            (
+                stats.snapshot_for_writing(&one),
+                stats.snapshot_for_writing(&two),
+            )
+        };
+        stats.flush(&newer).expect("the newer snapshot is written");
+        stats
+            .flush(&older)
+            .expect("the older one is dropped, not refused");
+        assert_eq!(
+            aggregate(dir.path(), "/p", None).hosts["h.test"].allow,
+            2,
+            "the file keeps the newer counts"
         );
     }
 
