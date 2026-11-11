@@ -60,6 +60,10 @@ fn a_digest_is_computed_over_the_bytes_that_came_back() {
 /// - `resolving …` and `connecting to …`, which [`http`] wraps the name lookup and the connection
 ///   in;
 /// - `no complete response head …`, which any failure while a response head was arriving becomes;
+/// - `… body shorter than Content-Length`, a body the connection stopped delivering before the
+///   length it declared, which is how a layer download cut half-way ends. A body cut where no
+///   length was declared reaches the caller as a size or a digest that does not match, which a
+///   registry serving the wrong bytes also produces, so it is asserted;
 /// - `answered` with `408`, `429` or a `5xx`, the statuses about the moment rather than the
 ///   request, as `tests/common`'s `transient_fetch_failure` splits them for nix's downloads.
 ///
@@ -82,6 +86,7 @@ pub(in crate::sandbox::distro) fn transient(e: &io::Error) -> bool {
     ["resolving ", "connecting to ", "no complete response head "]
         .iter()
         .any(|shape| text.starts_with(shape))
+        || text.ends_with("body shorter than Content-Length")
         || answered(e).is_some_and(momentary)
 }
 
@@ -118,6 +123,13 @@ fn a_registry_never_heard_from_is_told_apart_from_one_that_answered() {
         panic!("nothing listens on the port any more, and a response came back");
     };
     assert!(transient(&refused), "{refused}");
+
+    // A body the connection stopped delivering before its declared length, as the copy every
+    // `Content-Length` body goes through reports it: the cut a layer download meets half-way.
+    let mut cut: &[u8] = b"ab";
+    let short = crate::sandbox::proxy::wire::copy_exact(&mut cut, &mut Vec::new(), 5)
+        .expect_err("a body shorter than its length is refused");
+    assert!(transient(&short), "{short}");
 
     // The shapes the network's failures and the moment's statuses take in this module's errors.
     assert!(transient(&io::Error::from(io::ErrorKind::WouldBlock)));
