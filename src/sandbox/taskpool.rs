@@ -88,13 +88,18 @@ fn installs_dir(pool: &Path) -> PathBuf {
 /// mise's separator is `@`, which also opens an npm scope (`npm:@example/tool`), so the split is
 /// looked for only in the token's **last path segment** and only past its first character:
 /// `npm:@example/tool` has no version, `npm:@example/tool@1.2` has `1.2`, `node@22` has `22`.
+///
+/// An `@` with nothing after it names no version: mise reads `node@` as the bare `node`, and so
+/// does this. Split off as an empty version, it would ask the pool to record a spec mise never
+/// writes, and the token would read missing on every launch.
 pub(crate) fn split_version(token: &str) -> (&str, Option<&str>) {
     let segment_start = token.rfind('/').map(|i| i + 1).unwrap_or(0);
     let segment = &token[segment_start..];
     match segment.char_indices().skip(1).find(|(_, c)| *c == '@') {
         Some((offset, _)) => {
             let at = segment_start + offset;
-            (&token[..at], Some(&token[at + 1..]))
+            let version = &token[at + 1..];
+            (&token[..at], (!version.is_empty()).then_some(version))
         }
         None => (token, None),
     }
@@ -783,6 +788,30 @@ mod tests {
             split_version("npm:@example/tool@1.2"),
             ("npm:@example/tool", Some("1.2"))
         );
+    }
+
+    /// An `@` with nothing after it is the bare token, as mise reads it: a pool filled for `jq@`
+    /// records `latest`, as for `jq`, and satisfies it, and `jq@` beside `jq` is one request rather
+    /// than two versions of one tool.
+    #[test]
+    fn a_version_left_empty_is_the_bare_token_mise_reads_it_as() {
+        assert_eq!(split_version("node@"), ("node", None));
+        assert_eq!(
+            split_version("npm:@example/tool@"),
+            ("npm:@example/tool", None)
+        );
+
+        let base = TmpDir::new();
+        let pool = base.join("task-mise");
+        realize(&pool, "jq", None, &["1.7.1"]);
+        assert_eq!(
+            bins_for(&pool, &["jq@".to_string()]).missing,
+            Vec::<String>::new(),
+            "a filled pool satisfies the token it was filled for"
+        );
+        let (kept, conflicting) = one_spec_per_tool(&["jq@".to_string(), "jq".to_string()]);
+        assert_eq!(kept, vec!["jq@".to_string()]);
+        assert!(conflicting.is_empty(), "{conflicting:?}");
     }
 
     // The pool is matched by the token mise *recorded* before the directory name: the record is
