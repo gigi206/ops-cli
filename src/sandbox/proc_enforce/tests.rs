@@ -3801,10 +3801,13 @@ fn a_target_that_can_be_reached_and_not_read_is_refused() {
     // says so -- an `execve` the kernel had refused comes back as the spawn's own error, and no
     // shell runs. The shell's failure is then its own, worded and numbered as that shell does:
     // dash exits 2 and bash 126, which is the refusal's code too, so the arms below tell a refusal
-    // from it by the ring and not by the code alone.
-    let ran = std::process::Command::new(&path)
-        .output()
-        .expect("the kernel must really start the interpreter here, or this test measures nothing");
+    // from it by the ring and not by the code alone. The file was just written, so its first exec
+    // waits out the `ETXTBSY` a neighbouring test's fork can cause; once it has run, no copy of the
+    // write descriptor is left for the runs below to meet.
+    let ran = crate::testutil::result_past_etxtbsy("run the script", || {
+        std::process::Command::new(&path).output()
+    })
+    .expect("the kernel must really start the interpreter here, or this test measures nothing");
     let shell_failure = ran.status.code();
     assert!(
         shell_failure.is_some_and(|c| c != 0 && c != 7) && !ran.stderr.is_empty(),
