@@ -486,11 +486,15 @@ pub(crate) const GLANCE_TIMEOUT: Duration = Duration::from_millis(150);
 const U64_DIGITS: usize = u64::MAX.ilog10() as usize + 1;
 const U32_DIGITS: usize = u32::MAX.ilog10() as usize + 1;
 
-/// The longest line the server of this socket writes about a parked `execve`, and so the longest it
-/// writes at all ([`dispatch_enforced`]). Of the three shapes, a `LIST` row is the longest: three
-/// numbers ahead of the path, where the `ok path=` of an answer by id and the `answered path=` of
-/// `ALLOW *` carry the path alone. The path is sanitised on its way into the registry, so it holds at
-/// most [`SANITIZED_CHARS`](super::SANITIZED_CHARS) characters, of four bytes each at most.
+/// The longest line the server of this socket writes about a parked `execve`, which is also the
+/// longest it answers a verb that acts with ([`dispatch_enforced`]). Of the three shapes, a `LIST`
+/// row is the longest: three numbers ahead of the path, where the `ok path=` of an answer by id
+/// and the `answered path=` of `ALLOW *` carry the path alone (a `REMEMBER` is answered by a
+/// word). The path is sanitised on its way into the registry, so it holds at most
+/// [`SANITIZED_CHARS`](super::SANITIZED_CHARS) characters, of four bytes each at most.
+///
+/// A `LOG` event line can run longer, with a caller and a command each that long. It is read by
+/// [`super::lens::read_log`], never against this bound.
 const LINE_MAX: usize = "pending id= pid= waiting= path=\n".len()
     + 2 * U64_DIGITS
     + U32_DIGITS
@@ -506,10 +510,11 @@ const PARKED_ANSWER_MAX: u64 =
 ///
 /// A line that ends before its newline is an [`io::ErrorKind::UnexpectedEof`] error, which
 /// [`super::reply::unanswered`] counts: the session closed before it had answered, or wrote a line
-/// past the longest it writes. Either way it was reached and its answer did not arrive whole, so
-/// what the verb did is not known, and a caller says so rather than read the fragment as a refusal.
-/// The line is read as bytes and decoded only once whole, for the reason [`super::reply::answer`]
-/// does: a cut inside a character is a cut, not a decode error no caller counts as one.
+/// longer than any it answers such a verb with. Either way it was reached and its answer did not
+/// arrive whole, so what the verb did is not known, and a caller says so rather than read the
+/// fragment as a refusal. The line is read as bytes and decoded only once whole, for the reason
+/// [`super::reply::answer`] does: a cut inside a character is a cut, not a decode error no caller
+/// counts as one.
 fn answer_line(socket: &Path, cmd: &str) -> io::Result<String> {
     let stream = send(socket, cmd, QUERY_TIMEOUT)?;
     let mut line = Vec::new();
