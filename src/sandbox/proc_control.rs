@@ -183,16 +183,22 @@ impl ExecRing {
     ///
     /// This is not the decision's view of either value: a verdict is reached on the raw path, above,
     /// and only what is *reported* passes through here.
+    ///
+    /// The verdict is one of a few fixed words today, and it is still made a head token here: it
+    /// sits among the whitespace-split head fields, and nothing in a `&str` says it is one of those
+    /// words. A verdict spelling `deny pid=1` would rewrite the pid beside it on the way back in, the
+    /// way a caller path could ([`head_token`]).
     pub(crate) fn push_verdict(&self, pid: u32, caller: &str, command: &str, verdict: &str) -> u64 {
         let caller = head_token(&super::observe_feed::sanitize(caller));
         let command = super::observe_feed::sanitize(command);
+        let verdict = head_token(&super::observe_feed::sanitize(verdict));
         // Sanitised above rather than in here: `push_with` runs its closure under the ring's lock,
         // which is for building the event and nothing else.
         self.0.push_with(move |seq, at_epoch_ms| ExecEvent {
             seq,
             at_epoch_ms,
             pid,
-            verdict: verdict.to_string(),
+            verdict,
             caller,
             command,
         })
@@ -615,6 +621,33 @@ mod tests {
                 (read.pid, read.verdict.as_str(), read.seq),
                 (7, "deny", 1),
                 "the caller rewrote a field beside it: {line:?}"
+            );
+            assert_eq!(read.command, "/usr/bin/git");
+        }
+    }
+
+    /// The verdict is a head token like the caller, and is held to the same rule. Every producer
+    /// passes one of a few fixed words, but the parameter is a `&str`, and a verdict carrying a space
+    /// and an `=` rewrote the fields after it on the way back in, or erased the event when a token
+    /// had no `=`. A policy deciding by target alone passes no caller, so the line has no `by=` of
+    /// its own, and a verdict spelling one would have named a caller nobody read.
+    #[test]
+    fn a_verdict_cannot_overwrite_or_erase_the_fields_beside_it() {
+        for (caller, verdict) in [
+            ("/bin/bash", "deny pid=1 seq=999"),
+            ("/bin/bash", "deny\nevent seq=998 pid=1"),
+            ("/bin/bash", "deny plain"),
+            ("", "deny by=/tmp/evil"),
+        ] {
+            let ring = ExecRing::new(10);
+            ring.push_verdict(7, caller, "/usr/bin/git", verdict);
+            let line = ring.snapshot(None).events[0].format_line();
+            let read = ExecEvent::parse_line(line.trim_end())
+                .unwrap_or_else(|| panic!("the event was erased by its verdict: {line:?}"));
+            assert_eq!(
+                (read.pid, read.seq, read.caller.as_str()),
+                (7, 1, caller),
+                "the verdict rewrote a field beside it: {line:?}"
             );
             assert_eq!(read.command, "/usr/bin/git");
         }
