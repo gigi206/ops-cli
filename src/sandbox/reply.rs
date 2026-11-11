@@ -47,7 +47,7 @@ pub(crate) fn unanswered(e: &io::Error) -> bool {
 /// session is there, and its answer did not arrive whole.
 pub(crate) fn answer<R: BufRead>(reader: R) -> Answer<R> {
     Answer {
-        lines: reader.lines(),
+        reader,
         ends_on_err: false,
         done: false,
     }
@@ -55,7 +55,7 @@ pub(crate) fn answer<R: BufRead>(reader: R) -> Answer<R> {
 
 /// The iterator [`answer`] returns.
 pub(crate) struct Answer<R> {
-    lines: io::Lines<R>,
+    reader: R,
     /// Whether the last line read was an `err …` one, which may end an answer without `ok`.
     ends_on_err: bool,
     done: bool,
@@ -68,20 +68,20 @@ impl<R: BufRead> Iterator for Answer<R> {
         if self.done {
             return None;
         }
-        match self.lines.next() {
-            Some(Ok(line)) if line == "ok" => {
+        match line_of(&mut self.reader) {
+            Ok(Some(line)) if line == "ok" => {
                 self.done = true;
                 None
             }
-            Some(Ok(line)) => {
+            Ok(Some(line)) => {
                 self.ends_on_err = line.starts_with("err ");
                 Some(Ok(line))
             }
-            Some(Err(e)) => {
+            Err(e) => {
                 self.done = true;
                 Some(Err(e))
             }
-            None => {
+            Ok(None) => {
                 self.done = true;
                 (!self.ends_on_err).then(|| {
                     Err(io::Error::new(
@@ -92,6 +92,28 @@ impl<R: BufRead> Iterator for Answer<R> {
             }
         }
     }
+}
+
+/// One line of an answer without its line ending, or `None` at the end of the stream.
+///
+/// Read as bytes and decoded lossily, where `BufRead::lines` fails on bytes that are not UTF-8. A
+/// server writes only text, so such bytes are an answer cut inside a character, by a reader's own
+/// bound or by a session that closed mid-write, and that cut is what the reader has to learn. A
+/// decode error is not one [`unanswered`] counts, so a listing passed over the session in silence;
+/// decoded, the fragment is handed over like any line, and the end of the stream after it says the
+/// answer was cut.
+fn line_of<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    if reader.read_until(b'\n', &mut bytes)? == 0 {
+        return Ok(None);
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 #[cfg(test)]
@@ -157,6 +179,24 @@ mod tests {
         let gone = std::os::unix::net::UnixStream::connect(&stale).expect_err("nobody serves it");
         assert_eq!(gone.kind(), io::ErrorKind::ConnectionRefused, "{gone}");
         assert!(!unanswered(&gone));
+    }
+
+    /// A line cut inside a character is a cut like any other, not a decode error a reader cannot
+    /// tell from a fault of its own. Each case ends on the end of the stream after the fragment.
+    #[test]
+    fn an_answer_cut_inside_a_character_is_cut() {
+        let wire = b"head=2\nevent cmd=\xf0\x9d\x84\x9e\n\xf0\x9d";
+        assert_eq!(
+            answer(&wire[..])
+                .map(|line| line.map_err(|e| e.kind()))
+                .collect::<Vec<_>>(),
+            vec![
+                Ok("head=2".to_string()),
+                Ok("event cmd=\u{1d11e}".to_string()),
+                Ok("\u{fffd}".to_string()),
+                Err(io::ErrorKind::UnexpectedEof),
+            ]
+        );
     }
 
     #[test]
@@ -234,6 +274,11 @@ mod tests {
                 ("whole", &b"head=3\nok\n"[..], Some(true)),
                 ("an err line", &b"err bad-request\n"[..], None),
                 ("cut after a line", &b"head=3\n"[..], Some(false)),
+                (
+                    "cut inside a character",
+                    &b"head=3\nevent \xf0\x9d"[..],
+                    Some(false),
+                ),
                 ("closed unanswered", &b""[..], Some(false)),
             ] {
                 let socket = dir.join("answer.sock");
