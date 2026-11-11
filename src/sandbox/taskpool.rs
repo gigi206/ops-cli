@@ -672,11 +672,16 @@ fn run(
     let reader = std::thread::spawn(move || tee_to_stderr(&mut err_pipe));
 
     let deadline = Instant::now() + INSTALL_TIMEOUT;
-    let (status, timed_out) = super::cagewait::wait_capped(&mut child, deadline, POLL_INTERVAL)?;
+    let waited = super::cagewait::wait_capped(&mut child, deadline, POLL_INTERVAL);
+    // Both forwarding threads are joined before the wait's answer is read, an error included, so
+    // neither outlives the run and interleaves into the message its caller prints next. The joins
+    // cannot hang on an error: the wait fails only once the cage is dead and reaped (see
+    // [`super::cagewait::wait_capped`]), so its pipes are at their end. The stdout tail is kept,
+    // not dropped: it is the half a wrapped backend writes its failure to. A thread that panicked
+    // leaves an empty tail, which only words the message: `ok` is read from the exit status.
     let mut stderr = reader.join().unwrap_or_default();
-    // Joined so the forwarding thread cannot outlive the run and interleave into a later message —
-    // and its tail is kept, not dropped: it is the half a wrapped backend writes its failure to.
     let stdout = out_reader.join().unwrap_or_default();
+    let (status, timed_out) = waited?;
     if timed_out {
         stderr.extend_from_slice(
             format!(
