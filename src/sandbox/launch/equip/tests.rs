@@ -233,6 +233,19 @@ fn the_equip_line_names_the_invocation_it_runs() {
     );
 }
 
+/// The equip line writes its tokens as text, whatever they hold: a token carrying an escape, a
+/// carriage return or a newline reaches the terminal stripped of them, as the project's own tools
+/// do, and its visible text is kept.
+#[test]
+fn the_equip_line_writes_its_tokens_as_text() {
+    let line = equip_announcement(&["x\u{1b}[2K\rsbx: project trusted\n@1.0".to_string()]);
+    assert!(
+        !line.chars().any(char::is_control),
+        "nothing the terminal acts on may reach it: {line:?}"
+    );
+    assert!(line.contains("sbx: project trusted"), "{line:?}");
+}
+
 #[test]
 fn wrap_mise_equip_pins_the_app_global_data_dir_for_the_global_lane() {
     // For a global app, Lane-1 `mise use -g` is pinned to the app-global home pool so the app

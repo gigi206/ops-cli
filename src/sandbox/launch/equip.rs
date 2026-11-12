@@ -43,10 +43,16 @@ pub(super) const MISE_OUTSIDE_PROJECT: &str = "-C /";
 /// from the same constant: a launch that names one command and runs another sends whoever reads the
 /// transcript looking for the wrong thing, and that is precisely what a hand-written copy of the
 /// verb drifts into.
+///
+/// The tokens are written through [`mise_token_display`], as the project's own tools are. These
+/// were held to the mise token grammar when the configuration was read, which admits no character
+/// the sanitizer replaces; one longer than its cap is cut on this line, which only names it, while
+/// the token handed to mise stays whole. The line is safe for the terminal by how it is built
+/// rather than by what its tokens happen to contain.
 pub(super) fn equip_announcement(tokens: &[String]) -> String {
     format!(
         "sbx: equipping app packages in-cage via mise {MISE_EQUIP_VERB}: {}",
-        tokens.join(", ")
+        mise_token_display(tokens)
     )
 }
 
