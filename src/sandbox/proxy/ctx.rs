@@ -883,8 +883,13 @@ impl ProxyCtx {
 /// Whether one decision is announced at all: the whole rule, pure over its inputs so every branch
 /// is pinned by a test rather than only reachable through a live proxy. What an announcement says
 /// is the supervisor's to write ([`super::events`]).
+///
+/// An answered ask is recognised by the tag its refusal is logged with, read from the refusal
+/// itself, so the two cannot be spelled apart: a second spelling here would go on comparing after
+/// the tag changed, and every answered ask would be announced again.
 fn announced(kind: StatKind, reason: &str, muted: bool, notices: bool) -> bool {
-    !(matches!(kind, StatKind::Allow) || muted || (reason == "asked-denied" && notices))
+    let answered = reason == super::PolicyRefusal::AskedDenied.tag();
+    !(matches!(kind, StatKind::Allow) || muted || (answered && notices))
 }
 
 /// Append the built-in self-equip allow rules to a policy's allow list (deny is unchanged, so a
@@ -975,9 +980,10 @@ mod notify_tests {
     fn an_answered_ask_is_not_announced_twice() {
         // Under the interactive posture the person was already shown this exact request and answered
         // it (or let it time out). A second, after-the-fact notification is pure noise.
-        assert!(!announced(StatKind::Deny, "asked-denied", false, true));
+        let answered = super::super::PolicyRefusal::AskedDenied.tag();
+        assert!(!announced(StatKind::Deny, answered, false, true));
         // With the park notices off, nothing announced it the first time, so the refusal is said.
-        assert!(announced(StatKind::Deny, "asked-denied", false, false));
+        assert!(announced(StatKind::Deny, answered, false, false));
     }
 }
 
