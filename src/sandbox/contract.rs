@@ -845,11 +845,15 @@ fn summary_paths(masks: &Expanded, binds: &[Bind], project: Option<&Path>) -> St
             None => others += 1,
         }
     }
-    let bound: Vec<String> = binds
+    // Sorted and deduplicated as the contract's own list is ([`sorted_list`]): one layer may name a
+    // path twice, or as `~/x` and `$HOME/x`, and only the layers are merged by path.
+    let mut bound: Vec<String> = binds
         .iter()
         .filter(|b| !b.writable)
         .map(|b| code(&b.path.display().to_string()))
         .collect();
+    bound.sort();
+    bound.dedup();
     if named.is_empty() && bound.is_empty() && others == 0 {
         return String::new();
     }
@@ -1995,6 +1999,22 @@ mod tests {
             );
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The summary names each read-only bind once, in order, as the contract does: a layer is not
+    /// merged by path within itself, so one that names a path twice hands it over twice.
+    #[test]
+    fn the_summary_names_each_read_only_bind_once_and_in_order() {
+        let (_tmp, none) = masks_for(&[], &[]);
+        let ro = |p: &str| Bind {
+            path: std::path::PathBuf::from(p),
+            writable: false,
+        };
+        let text = summary_paths(&none, &[ro("/srv/b"), ro("/srv/a"), ro("/srv/b")], None);
+        assert!(
+            text.contains("- read-only binds: `/srv/a`, `/srv/b`\n"),
+            "{text}"
+        );
     }
 
     #[test]
