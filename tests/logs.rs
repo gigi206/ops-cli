@@ -505,6 +505,36 @@ fn a_merged_follow_asks_again_a_feed_that_did_not_answer_at_first() {
     }
 }
 
+/// A token that is not UTF-8 is named in the refusal, by every view and by `sbx logs`.
+///
+/// Read through its UTF-8 form, such a token is `""`, and the refusal would name an empty argument
+/// that was never typed.
+#[test]
+fn a_view_names_an_argument_that_is_not_utf8() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+    let data = TmpDir::new("l");
+    for verb in [
+        &["fs", "logs"][..],
+        &["proc", "logs"],
+        &["ssh-agent", "logs"],
+        &["logs"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(verb)
+            .arg(OsString::from_vec(b"caf\xe9".to_vec()))
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("run the logs view");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{verb:?}: {err}");
+        assert!(
+            err.contains(r#"unexpected argument "caf\xE9""#),
+            "{verb:?} names the token it refuses: {err}"
+        );
+    }
+}
+
 /// The three views take the same flags and refuse the same things in their own name. A view that
 /// borrowed a sibling's name here would be reporting the wrong command to the user.
 #[test]

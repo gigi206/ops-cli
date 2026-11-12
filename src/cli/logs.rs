@@ -115,12 +115,9 @@ pub(crate) fn run<E: crate::sandbox::lens::Event>(
                 }
                 id = Some(s);
             }
-            other => {
-                diag::error(&format!(
-                    "sbx: {}: unexpected argument {:?}",
-                    view.verb,
-                    other.unwrap_or_default()
-                ));
+            // The token itself, not its UTF-8 reading: one that has none would be named `""`.
+            _ => {
+                diag::error(&format!("sbx: {}: unexpected argument {a:?}", view.verb));
                 err!("{}", help::page_usage(view.page).unwrap_or_default());
                 return ExitCode::from(2);
             }
@@ -997,11 +994,9 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
                 }
                 id = Some(s);
             }
-            other => {
-                diag::error(&format!(
-                    "sbx: logs: unexpected argument {:?}",
-                    other.unwrap_or_default()
-                ));
+            // The token itself, as in the per-lens views.
+            _ => {
+                diag::error(&format!("sbx: logs: unexpected argument {a:?}"));
                 err!("{}", help::page_usage(&["logs"]).unwrap_or_default());
                 return ExitCode::from(2);
             }
