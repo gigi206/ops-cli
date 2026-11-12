@@ -361,8 +361,9 @@ mod tests {
     /// are refused, `clone3` and the x32 ABI are answered `ENOSYS` so a fallback is taken, and the
     /// calls the proxy makes still work, starting a thread and reading a document handed over in a
     /// file among them. Among those are the read and write bounds and `TCP_NODELAY` the proxy sets
-    /// on each upstream socket and does not check: a filter that refused one would leave that
-    /// socket unbounded without a word, so the test is where the refusal shows.
+    /// on each upstream socket and does not check: a filter that refused a bound would leave that
+    /// socket unbounded, and one that refused `TCP_NODELAY` would leave Nagle on, both without a
+    /// word, so the test is where the refusal shows.
     #[test]
     fn the_proxys_filters_refuse_what_its_work_does_not_make() {
         let outcomes = in_a_process(concat!(module_path!(), "::the_probes_process"));
