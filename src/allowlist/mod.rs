@@ -744,6 +744,18 @@ pub(crate) fn canonical_segments(target: &str) -> Vec<String> {
 /// or a non-hex pair is left as-is. Invalid UTF-8 from decoding is replaced lossily — the
 /// result is only ever compared, never executed.
 fn percent_decode(s: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(s)).into_owned()
+}
+
+/// Whether `s` decodes ([`percent_decode`]) to text with nothing replaced: valid UTF-8 that holds
+/// no U+FFFD. Read lossily, every byte that is not UTF-8 becomes U+FFFD, so two paths that differ
+/// only in such bytes, or in a literal U+FFFD, compare equal.
+pub(super) fn decodes_to_text(s: &str) -> bool {
+    std::str::from_utf8(&percent_decode_bytes(s)).is_ok_and(|text| !text.contains('\u{fffd}'))
+}
+
+/// The bytes [`percent_decode`] reads `s` as, before any of them is replaced.
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -759,7 +771,7 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// The value of one hex digit, or `None` if the byte is not `[0-9A-Fa-f]`.

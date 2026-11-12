@@ -828,6 +828,17 @@ fn parse_path_rule(
              this would open `{opened}` with any query at all. Use `re:` to constrain a query"
         ));
     }
+    // A path that does not decode to text is read lossily, every byte that is not UTF-8 becoming
+    // U+FFFD, so an allow written for `/a%FF` admitted `/a%FE`, `/a%80` and every other such byte in
+    // that place, and one holding a literal U+FFFD admitted them all. Refused on the allow side,
+    // where that widening opens; a deny keeps its wider match, since what it widens is what it
+    // closes, and a mute changes no verdict.
+    if slot == Slot::Allow && !super::decodes_to_text(path) {
+        return Err(format!(
+            "entry `{s}` writes a path that does not decode to text — a request path is compared \
+             as text, so this would also admit every other byte that is not UTF-8 in its place"
+        ));
+    }
     // A `#fragment` and a segment's `;parameters` are cut from the rule's own path by
     // `canonical_segments` exactly as they are from a request's, so a rule carrying either matches
     // the bare path while displaying a form that names something narrower. That is the same

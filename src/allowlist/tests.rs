@@ -3597,3 +3597,28 @@ fn a_target_without_a_leading_slash_is_read_under_the_root() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("; "));
 }
+
+/// An allow path that does not decode to text is refused: read lossily, it would admit every other
+/// byte that is not UTF-8 in its place. A deny keeps such a path, since its wider match closes, and
+/// a target `sbx test net` tests is a request, not a rule. Every shape misread is reported
+/// together.
+#[test]
+fn an_allow_path_that_does_not_decode_to_text_is_refused() {
+    let mut wrong = Vec::new();
+    for (entry, slot, kept) in [
+        ("x.test/caf%C3%A9", Slot::Allow, true),
+        ("x.test/a%FF", Slot::Allow, false),
+        ("x.test/a%c3", Slot::Allow, false),
+        ("x.test/a\u{fffd}", Slot::Allow, false),
+        ("x.test/a%FF", Slot::Deny, true),
+        ("https://x.test/a%FF", Slot::Target, true),
+    ] {
+        if classify_in(entry, slot).is_ok() != kept {
+            wrong.push(format!(
+                "`{entry}` in {slot:?} is {}",
+                if kept { "refused" } else { "kept" }
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("; "));
+}
