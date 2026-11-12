@@ -154,9 +154,10 @@ Those last three share one reason. Before a path rule is matched, the matcher cu
 query, a fragment and `;parameters` off the request path (see [path
 canonicalization](#path-canonicalization)) and off the rule's own path with them, so
 a rule carrying one matches the bare path while reading as something narrower. A
-`re:` rule is matched against the request URL with those parts still attached (and
-against the canonical rebuild as well, see [Regex](#regex)), which is why the regex
-below can name what a path rule cannot:
+`re:` rule is matched against the request URL with its query and `;parameters` still
+attached (and against the canonical rebuild as well, see [Regex](#regex)), which is why
+the regex below can name what a path rule cannot. The fragment is not attached even
+there: no server is given it, so it names nothing a request asks for.
 
 ```toml
 allow = ["files.test/app;jsessionid"]   # refused: the parameters are not matched
@@ -198,7 +199,11 @@ server folds back onto a denied path escapes the deny. A *rule* written with `%2
 or `%2F` in its own path is refused like the delimiter written in clear, and so is a
 segment that only decodes to `.` or `..` (`/a/%2e%2e/b`), because the same decoding
 would make it match a path other than the one it reads as. Dots written plainly say
-what they do and are resolved as written.
+what they do and are resolved as written. An `allow` path that does not decode to text
+(`/a%FF`, a lone `%C3`, a literal U+FFFD) is refused too: a request path is compared as
+text, every byte that is not UTF-8 reading as U+FFFD, so such a rule would also admit
+every other such byte in its place. A `deny` keeps it, since what that wider match
+reaches is what it closes.
 For a query-specific or otherwise arbitrary pattern, use `re:` (which is decoded but
 **not** `.`/`..`-resolved: see below).
 
@@ -223,8 +228,10 @@ Three `re:` caveats:
 
 - **It is matched twice: against the request as sent, and against its canonical form.**
   A match on either is a match. The request as sent is decoded, with its query attached
-  and its `.`/`..` left as written; the canonical form is the one a path rule sees, with
-  `.`/`..` resolved and the query removed. So a deny like `re:…/secret$` now catches
+  and its `.`/`..` left as written, but without its fragment, which no server is sent;
+  a target that does not start with `/` is read under the root, so the URL always names
+  the request's own host. The canonical form is the one a path rule sees, with `.`/`..`
+  resolved and the query removed. So a deny like `re:…/secret$` now catches
   `/foo/../secret` and `/secret?x=1`, and a pattern naming a query still fires on the
   form that has one. The cost is on the other side: an **allow** written as a regex is
   also matched twice, so it admits a little more than one form alone would. When a rule
