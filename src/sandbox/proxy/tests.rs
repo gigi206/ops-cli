@@ -2846,9 +2846,10 @@ fn a_learned_needle_masks_a_logged_path_for_its_own_service_only() {
 }
 
 /// A logged or parked path is masked with every value the launch has carried, as a capture is, not
-/// with the live set alone: a declared value a re-resolution replaced, and a learned one that newer
-/// learned values pushed out, are still values the cage may send. Both shapes are checked before
-/// the verdict.
+/// with the live set alone. What a cage can produce is a token it signed in with that newer learned
+/// tokens pushed out of the live set. A declared value a re-resolution replaced is one sbx issued
+/// and the cage never held; it is masked the same way, since the history holds it. Both shapes are
+/// checked before the verdict.
 #[test]
 fn a_value_retired_from_the_live_set_is_still_masked_in_a_logged_path() {
     const DECLARED: &str = "declared-old-value-0123456789";

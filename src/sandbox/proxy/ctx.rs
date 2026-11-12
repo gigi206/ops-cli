@@ -601,9 +601,9 @@ impl ProxyCtx {
     /// ASCII and same-length, so the result stays valid UTF-8.
     ///
     /// The needles are the ones a capture is masked with ([`Credentials::masking_needles`]): every
-    /// value the launch has carried, not only the live ones. A declared value a re-resolution
-    /// replaced, or a learned one that newer learned values pushed out of the live set, is still a
-    /// value the cage may send, and the record that shows it is the same operator surface.
+    /// value the launch has carried, not only the live ones. A token the cage signed in with is
+    /// still one it may send after newer learned tokens have pushed it out of the live set, and the
+    /// record that shows it is the same operator surface as the capture.
     ///
     /// Reached from the **park** as well as the log ([`super::decide_https`]): a parked request is
     /// printed by `sbx net pending` and by the park notice, so a path that is masked on its way into
