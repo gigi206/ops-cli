@@ -258,10 +258,11 @@ fn detach_parent(
         // The daemon closed the pipe without signalling success: it failed before launch. Reap it,
         // and keep how it ended, which says where the cause is ([`failed_start`]).
         //
-        // Retried on `EINTR`, in the form `pty::supervise` uses: a signal arriving while this waits
-        // — a `SIGWINCH` from a resized terminal is enough — returns without reaping, and the
-        // daemon then stays a zombie for as long as this shell lives. The child has already exited,
-        // so the loop turns at most once more.
+        // Retried on `EINTR`, in the form `pty::reap` uses. sbx installs no signal handler in this
+        // process, and a signal under its default disposition does not interrupt the wait, so the
+        // loop is there for a handler added to it later: an interrupted wait would return without
+        // reaping, and [`failed_start`] would lose how the daemon ended. The child has already
+        // exited, so the loop turns at most once more.
         let mut status: libc::c_int = 0;
         let reaped = loop {
             // SAFETY: `waitpid` on our own child, which nothing else in this process reaps, into a
