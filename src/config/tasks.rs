@@ -1456,6 +1456,7 @@ mod tests {
             "NODE_PATH",
             "node_path",
             "PERL5LIB",
+            "PERLLIB",
             "RUBYLIB",
             "CLASSPATH",
             "LUA_PATH",

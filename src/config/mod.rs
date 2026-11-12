@@ -180,6 +180,7 @@ const INTERPRETER_IMPORT_PATHS: &[&str] = &[
     "PYTHONHOME",
     "NODE_PATH",
     "PERL5LIB",
+    "PERLLIB",
     "RUBYLIB",
     "CLASSPATH",
     "LUA_PATH",

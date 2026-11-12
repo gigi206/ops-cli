@@ -90,8 +90,8 @@ few structural keys:
   mise to approve without asking. A project's own mise file is read in its cage by
   design; which other files are is not the project's to say.
 - A search path an interpreter imports from: `PYTHONPATH`, `PYTHONHOME`, `NODE_PATH`,
-  `PERL5LIB`, `RUBYLIB`, `CLASSPATH`, `LUA_PATH`, `LUA_CPATH`, `GEM_PATH`, `R_LIBS`,
-  `JULIA_LOAD_PATH`, `PSModulePath`. Nothing is named and nothing is executed directly;
+  `PERL5LIB`, `PERLLIB`, `RUBYLIB`, `CLASSPATH`, `LUA_PATH`, `LUA_CPATH`, `GEM_PATH`,
+  `R_LIBS`, `JULIA_LOAD_PATH`, `PSModulePath`. Nothing is named and nothing is executed directly;
   a module the interpreter was going to import anyway is simply answered from a
   directory the value chose (a `sitecustomize.py` on `PYTHONPATH` runs before the
   program's first line).

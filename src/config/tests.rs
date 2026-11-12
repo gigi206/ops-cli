@@ -5623,6 +5623,7 @@ fn an_untrusted_project_cannot_set_a_key_that_runs_code_without_naming_a_startup
         "PYTHONHOME",
         "NODE_PATH",
         "PERL5LIB",
+        "PERLLIB",
         "RUBYLIB",
         "CLASSPATH",
         "LUA_PATH",
