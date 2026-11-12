@@ -86,6 +86,12 @@ fn session_runtime_maps_each_launch_runtime_to_its_owned_form() {
 fn exec_refuses_a_private_tty_spec() {
     // a private-tty spec must go through the pty supervisor; exec-replace has
     // no pty to offer, so it must refuse *before* actually exec'ing anything.
+    //
+    // The program it is handed cannot be executed, and no `systemd-run` is put in front of it.
+    // Were the refusal gone, `exec` would replace this test binary with what it runs: a real
+    // program, or this host's `systemd-run`, would end the test run with that program's status
+    // and no result, where a program that is not there comes back as the exec's own error and
+    // fails the assertion below.
     let spec = SandboxSpec::new(
         PathBuf::from("/work"),
         vec![],
@@ -94,10 +100,11 @@ fn exec_refuses_a_private_tty_spec() {
         vec![OsString::from("/bin/true")],
     )
     .unwrap()
+    .with_limit_scope(crate::sandbox::cgroup::Scope::unlimited())
     .with_private_tty();
 
     let err = exec(
-        Path::new("/bin/true"),
+        Path::new("/nonexistent/bwrap"),
         &spec,
         &crate::sandbox::cgroup::Limits::default(),
     );
