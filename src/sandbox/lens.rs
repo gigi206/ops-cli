@@ -428,7 +428,11 @@ fn record_entry_key(name: &str) -> Option<(u32, u64)> {
 /// will not report, a file that will not unlink — none of them is worth failing a launch over, and
 /// each simply leaves a record in place. The one thing that is not best-effort is skipping a live
 /// session: a record still being appended to must never be a candidate, whatever its age.
-fn prune_records(dir: &Path, keep: usize, is_live: &dyn Fn(u32) -> bool) {
+///
+/// A session is live by the incarnation its record's name carries, pid and start time together. A
+/// pid alone is any process the kernel has since handed that number to, which would keep a finished
+/// session's record out of the prune for as long as that process runs.
+fn prune_records(dir: &Path, keep: usize, is_live: &dyn Fn(u32, u64) -> bool) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -436,8 +440,8 @@ fn prune_records(dir: &Path, keep: usize, is_live: &dyn Fn(u32) -> bool) {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name();
-            let (pid, _) = record_entry_key(name.to_str()?)?;
-            if is_live(pid) {
+            let (pid, ticks) = record_entry_key(name.to_str()?)?;
+            if is_live(pid, ticks) {
                 return None;
             }
             let at = e.metadata().ok()?.modified().ok()?;
@@ -507,7 +511,7 @@ impl Recorder {
         // Before the new file, not after: the ceiling is on what the directory holds, and opening
         // first would let a launch that fails on the write leave the directory one over.
         if let Some(dir) = path.parent() {
-            prune_records(dir, RECORD_KEEP, &crate::session::pid_is_live);
+            prune_records(dir, RECORD_KEEP, &crate::session::incarnation_is_live);
         }
         let mut header = format!("project={project}\n");
         if let Some(app) = app {
@@ -1599,7 +1603,7 @@ mod tests {
         std::fs::write(&live, "project=/p\n").unwrap();
         filetime_set(&live, std::time::SystemTime::UNIX_EPOCH);
 
-        prune_records(dir.path(), 1, &|pid| pid == 99);
+        prune_records(dir.path(), 1, &|pid, _| pid == 99);
 
         assert!(!dir.path().join("record-10-1.log").exists(), "oldest kept");
         assert!(
@@ -1613,6 +1617,49 @@ mod tests {
         assert!(
             live.exists(),
             "a live session's record must survive the prune whatever its age"
+        );
+    }
+
+    /// A finished session's record whose pid a running process now holds is still a finished
+    /// session's record. Every record below names this test's own pid, which is live, under a start
+    /// time this process does not have: read by the pid alone, none would be a candidate and opening
+    /// one more would leave the directory past its ceiling.
+    #[test]
+    fn a_record_whose_pid_was_handed_on_is_still_pruned() {
+        let dir = crate::testutil::TmpDir::new();
+        let me = std::process::id();
+        let mine = crate::session::read_start_ticks(me).expect("this process's start time");
+        for i in 0..=RECORD_KEEP as u64 {
+            let name = dir.path().join(format!("record-{me}-{}.log", mine + 1 + i));
+            std::fs::write(&name, "project=/p\n").unwrap();
+            filetime_set(
+                &name,
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100 + i),
+            );
+        }
+        let opened = Recorder::create(&record_path(dir.path(), me, mine), "/p", None, needles(&[]))
+            .expect("the record opens");
+        drop(opened);
+        let finished = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name() != format!("record-{me}-{mine}.log").as_str())
+            .count();
+        assert_eq!(
+            finished, RECORD_KEEP,
+            "the finished records under a pid that was handed on are pruned to the ceiling"
+        );
+
+        // And the incarnation that is running keeps its record under the same predicate, however
+        // old and whatever the ceiling.
+        let running = crate::testutil::TmpDir::new();
+        let own = record_path(running.path(), me, mine);
+        std::fs::write(&own, "project=/p\n").unwrap();
+        filetime_set(&own, std::time::SystemTime::UNIX_EPOCH);
+        prune_records(running.path(), 0, &crate::session::incarnation_is_live);
+        assert!(
+            own.exists(),
+            "the running incarnation's record survives the prune"
         );
     }
 

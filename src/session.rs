@@ -835,7 +835,14 @@ fn parse_record(path: &Path) -> Option<Session> {
 /// reaps. A detached session's daemon is orphaned to init by design, so where
 /// init does not reap, nothing clears it.
 fn is_alive(session: &Session) -> bool {
-    pid_is_live(session.pid) && read_start_ticks(session.pid) == Some(session.start_ticks)
+    incarnation_is_live(session.pid, session.start_ticks)
+}
+
+/// Whether `pid` still names the process that started at `start_ticks`: [`pid_is_live`], paired
+/// with the start-time match it asks of a caller that recorded one. What [`is_alive`] asks of a
+/// session, for a caller that holds the pair without a session record around it.
+pub(crate) fn incarnation_is_live(pid: u32, start_ticks: u64) -> bool {
+    pid_is_live(pid) && read_start_ticks(pid) == Some(start_ticks)
 }
 
 /// Whether `pid` names a process that is still **running** — the cheap pre-filter half of
