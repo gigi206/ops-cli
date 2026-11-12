@@ -635,13 +635,25 @@ fn policy_grants(
                 );
             }
         }
+        // What still reaches a destination once its reservation is lifted: a posture that does not
+        // refuse by default (`allow` admits it, `ask` lets a person admit any program), or an
+        // `allow` rule, the built-in self-equip set's included, reaching some of it for any verb,
+        // path or plane.
+        let builtin = crate::sandbox::builtin_allow_rules();
+        let still_reached = |was: &Reservation| {
+            after.default_action() != DefaultAction::Deny
+                || after
+                    .allow_rules()
+                    .iter()
+                    .chain(&builtin)
+                    .any(|r| was.opened_by(r))
+        };
         for was in before.reserved() {
             let rule = was.rule();
             match reservation_of(after, rule) {
-                // Lifted while an `allow` rule still reaches some of the destination, for any verb,
-                // path or plane: that part opens to everyone. Lifted with its destination closed,
-                // it grants nothing.
-                None if after.allow_rules().iter().any(|r| was.opened_by(r)) => push(
+                // Lifted while the destination is still reached: that part opens to everyone.
+                // Lifted with its destination closed, it grants nothing.
+                None if still_reached(was) => push(
                     "network",
                     format!("reserve {rule}"),
                     Risk::High,
@@ -1092,14 +1104,15 @@ mod tests {
 
     /// A lifted reservation is a grant whatever shape the `allow` that still reaches it has: a verb
     /// set, `WS`, a path, a raw splice, the clear or a pattern each opens the destination to every
-    /// program. An `allow` for another host leaves nothing to report. Every shape misread is
-    /// reported together.
+    /// program, and with no `allow` at all an `allow` or `ask` posture, or the built-in self-equip
+    /// set, still reaches it. An `allow` for another host, or a host nothing reaches, leaves nothing
+    /// to report. Every shape misread is reported together.
     #[test]
     fn a_lifted_reservation_is_a_grant_whatever_shape_the_allow_has() {
         let lifted = |allow: &str| {
             let base = format!("[network]\nmode = \"deny\"\nallow = [\"{allow}\"]\n");
             let reserved =
-                format!("{base}\n[network.reserve.\"codeload.github.com\"]\nby = [\"git\"]\n");
+                format!("{base}\n[network.reserve.\"api.example.test\"]\nby = [\"git\"]\n");
             seen(&over(&reserved, &base))
                 .into_iter()
                 .map(|(field, what, risk)| (field, what.to_string(), risk))
@@ -1107,21 +1120,21 @@ mod tests {
         };
         let high = vec![(
             "network",
-            "reserve https://codeload.github.com".to_string(),
+            "reserve https://api.example.test".to_string(),
             Risk::High,
         )];
         assert_eq!(
-            lifted("*.github.com"),
+            lifted("*.example.test"),
             high,
             "calibration: a wildcard over the host"
         );
         let mut wrong: Vec<String> = [
-            "{GET} https://codeload.github.com",
-            "{*,WS} https://codeload.github.com",
-            "https://codeload.github.com/v1",
-            "tcp://codeload.github.com:443",
-            "http://codeload.github.com:443",
-            "re:^https://codeload\\\\.github\\\\.com/",
+            "{GET} https://api.example.test",
+            "{*,WS} https://api.example.test",
+            "https://api.example.test/v1",
+            "tcp://api.example.test:443",
+            "http://api.example.test:443",
+            "re:^https://api\\\\.example\\\\.test/",
         ]
         .into_iter()
         .filter(|allow| lifted(allow) != high)
@@ -1129,6 +1142,24 @@ mod tests {
         .collect();
         if !lifted("https://other.test").is_empty() {
             wrong.push("an allow for another host reports a grant".to_string());
+        }
+        // No `allow` rule at all: the posture, or the built-in set, still reaches the host.
+        let bare = |mode: &str, host: &str| {
+            let base = format!("[network]\nmode = \"{mode}\"\n");
+            let reserved = format!("{base}\n[network.reserve.\"{host}\"]\nby = [\"git\"]\n");
+            seen(&over(&reserved, &base)).len()
+        };
+        for (mode, host) in [
+            ("allow", "api.example.test"),
+            ("ask", "api.example.test"),
+            ("deny", "codeload.github.com"),
+        ] {
+            if bare(mode, host) != 1 {
+                wrong.push(format!("`{host}` lifted under `{mode}` reports nothing"));
+            }
+        }
+        if bare("deny", "api.example.test") != 0 {
+            wrong.push("a host nothing reaches reports a grant".to_string());
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
