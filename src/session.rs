@@ -190,6 +190,14 @@ impl Session {
         }
     }
 
+    /// Whether the process this record names still runs, as the incarnation it recorded: the test
+    /// the registry lists by ([`is_alive`]), for a reader that holds a session past the listing.
+    /// One that has ended answers no while its pid is still in `/proc`, a zombie nothing has
+    /// reaped, and so does a process that has taken the pid since.
+    pub(crate) fn is_running(&self) -> bool {
+        is_alive(self)
+    }
+
     /// Whether `id` names this session, by either of the two things a listing shows for it.
     ///
     /// `sbx session ls` leads with NAME, the cage's own `sbx-<slug>`, and carries PID further

@@ -788,8 +788,11 @@ fn proc_live(args: &[OsString]) -> ExitCode {
         Ok(t) => t,
         Err(code) => return code,
     };
-    // Resolve once, then poll `/proc` by pid — the record is not needed again. When the pid's tree
-    // vanishes the session has ended, so the loop exits cleanly.
+    // Resolve once, then poll `/proc` by pid while the session still runs as the one resolved. Its
+    // pid alone outlasts it: a session that ended stays in `/proc` as a zombie until something
+    // reaps it, and a process that takes the pid afterwards has a tree of its own, so the session
+    // is asked each tick and the loop ends once it has.
+    let session = target.clone();
     let (pid, label, project) = (target.pid, target.label(), target.project.clone());
     // The frame's project line, as text, as `proc ls` writes it; the JSON keeps the path itself.
     let shown = diag::visible(&project.display().to_string());
@@ -797,7 +800,11 @@ fn proc_live(args: &[OsString]) -> ExitCode {
     let (dim, r) = (pal.dim, pal.reset);
     let secs = parsed.interval.as_secs();
     loop {
-        let tree = observe::tree(pid);
+        let tree = if session.is_running() {
+            observe::tree(pid)
+        } else {
+            None
+        };
         let mut out = std::io::stdout().lock();
         let wrote = match &tree {
             Some(tree) if parsed.json => {

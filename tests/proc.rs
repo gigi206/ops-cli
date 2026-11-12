@@ -198,6 +198,53 @@ fn proc_ls_writes_the_sessions_project_as_text() {
     );
 }
 
+/// `sbx proc live` ends once the session it watches has, though the session's pid is still in
+/// `/proc`. Here the session is a child of this test that exits and is not reaped until the view is
+/// done: a zombie, whose entry still reads as a one-process tree. Following the pid alone, the view
+/// went on drawing that entry, as it would have drawn a process that took the pid afterwards.
+#[test]
+fn proc_live_ends_with_its_session_though_the_pid_lingers() {
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
+    let mut session = Command::new("sleep")
+        .arg("2")
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("a session to watch");
+    common::write_session_record(data.path(), session.id(), "project", proj.path());
+    let id = session.id().to_string();
+    let mut view = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["proc", "live", &id, "--json"])
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env_remove("SBX_DATA_DIR")
+        .env("LC_ALL", "C.UTF-8")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run sbx");
+    let ended = common::procs::wait_until(Instant::now() + Duration::from_secs(20), || {
+        matches!(view.try_wait(), Ok(Some(_)))
+    });
+    if !ended {
+        let _ = view.kill();
+    }
+    let out = view.wait_with_output().expect("the view's output");
+    let _ = session.wait();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        ended,
+        "`sbx proc live` still drew session {id} 20 s on, after it had ended; its last frame:\n{}",
+        stdout.lines().last().unwrap_or_default()
+    );
+    assert!(
+        out.status.success() && stdout.lines().count() >= 1,
+        "the view of a session that ended exits 0 having drawn it while it ran, got {}:\n{stdout}{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `sbx proc live --json` whose snapshot cannot be written fails, said once, and one whose reader
 /// has gone does not. A full disk under `> file` leaves a stream cut short there, which a script
 /// reading the exit code has to learn; a reader gone, `… | head`, is the end of a pipeline the
