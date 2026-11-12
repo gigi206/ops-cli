@@ -925,17 +925,33 @@ fn rm_an_unknown_id_fails_without_touching_other_trees() {
     );
 }
 
+/// A path-shaped id is refused before any join reaches a recursive delete, and before any tree of
+/// the batch goes: it is a usage error, as `show` reads the same ids, and a removal is destructive,
+/// so a typo at the end must not cost the ids named ahead of it. It was a failed removal (exit 1),
+/// reached only once the trees ahead of it were gone. Every shape is tried behind a real id, and
+/// each wrong answer is collected before the test fails.
 #[test]
-fn rm_rejects_a_path_shaped_id() {
+fn rm_refuses_a_path_shaped_id_before_removing_anything() {
     let fx = Project::new("projects");
-    // A traversal id must be refused before any join reaches a recursive delete.
-    let out = fx.run(&["projects", "rm", "../escape"]);
-    assert_eq!(out.status.code(), Some(1), "a path-shaped id is refused");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("invalid project id"),
-        "should name the invalid id:\n{}",
-        text(&out)
-    );
+    let gone = fx.proj.path().join("gone");
+    let mut wrong = Vec::new();
+    for bad in ["../escape", "/etc", "../..", "a/b", "."] {
+        let keep = fx.make_tree("keepkeepkeepkeep", Some(&gone));
+        let out = fx.run(&["projects", "rm", "keepkeepkeepkeep", bad]);
+        if out.status.code() != Some(2) || !text(&out).contains("invalid project id") {
+            wrong.push(format!(
+                "`{bad}`: exit {:?}, not a named usage error:\n{}",
+                out.status.code(),
+                text(&out)
+            ));
+        }
+        if !keep.exists() {
+            wrong.push(format!(
+                "`{bad}`: the real id named ahead of it was removed"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// The pid of a process that has run and been reaped — dead by construction, so a liveness check

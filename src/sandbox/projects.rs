@@ -873,6 +873,24 @@ pub(crate) fn projects_rm(
     pal: &crate::style::Palette,
 ) -> ExitCode {
     let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
+    // Every id is read before anything else is: a path-shaped one is a usage error, the exit `show`
+    // gives it, and it stops the batch before any tree goes, as `sbx app rm` stops on a name it
+    // cannot take. Checked only when the loop below reached it, it would cost the trees named ahead
+    // of it and read as a removal that failed. `Path::join` replaces the base with an absolute id
+    // and walks out of it for a `../`, which is what the check stands between.
+    let misnamed: Vec<&String> = ids
+        .iter()
+        .filter(|id| !super::gc::is_safe_tree_id(id))
+        .collect();
+    if !misnamed.is_empty() {
+        for id in misnamed {
+            crate::diag::error(&format!(
+                "sbx projects rm: invalid project id `{id}` — expected a single tree name \
+                 (an id `sbx projects` lists), not a path."
+            ));
+        }
+        return ExitCode::from(2);
+    }
     let layout = match crate::layout_or_fail() {
         Ok(l) => l,
         Err(code) => return code,
@@ -917,14 +935,6 @@ pub(crate) fn projects_rm(
     let mut absent = false;
 
     for id in ids {
-        if !super::gc::is_safe_tree_id(id) {
-            crate::diag::error(&format!(
-                "sbx projects rm: invalid project id `{id}` — expected a single tree name \
-                 (an id `sbx projects` lists), not a path."
-            ));
-            had_error = true;
-            continue;
-        }
         // Guard the tree you are standing in: an idle current project is not `Live`, so naming its
         // exact id would delete the store and home of this very directory. `--force` is the opt-in.
         if let Some(refusal) = rm_refuses_current(id, &current, force) {
