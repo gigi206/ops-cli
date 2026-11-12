@@ -153,15 +153,44 @@ fn launch(
     }
     let out = child.wait_with_output()?;
     drop(command);
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let answers = read_answers(&String::from_utf8_lossy(&out.stdout));
 
     Ok(SmokeReport {
         launched: out.status.success(),
-        no_new_privs: stdout.contains("NoNewPrivs:\t1"),
-        caps_dropped: stdout.contains("CapEff:\t0000000000000000"),
-        host_home_absent: stdout.contains("HOSTHOME=ABSENT"),
+        no_new_privs: answers.no_new_privs,
+        caps_dropped: answers.caps_dropped,
+        host_home_absent: answers.host_home_absent,
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     })
+}
+
+/// The probe's answers, as its script printed them.
+struct Answers {
+    no_new_privs: bool,
+    caps_dropped: bool,
+    host_home_absent: bool,
+}
+
+/// Read the probe's answers from its output, each from one whole line.
+///
+/// A status line is found by its key and judged by its whole value: `NoNewPrivs` must be `1`, and
+/// every digit of `CapEff` zero, however many the kernel prints. Searched for as a substring,
+/// `NoNewPrivs:\t1` is also found in `NoNewPrivs:\t10`, and sixteen zeros at the head of a wider
+/// `CapEff` that is not zero, so the hardening check would pass on a value it never read. The home
+/// answer is the script's own line, not a match inside another one. A missing line answers no.
+fn read_answers(stdout: &str) -> Answers {
+    let field = |key: &str| {
+        stdout.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name == key).then(|| value.trim())
+        })
+    };
+    Answers {
+        no_new_privs: field("NoNewPrivs") == Some("1"),
+        caps_dropped: field("CapEff")
+            .is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b == b'0')),
+        host_home_absent: stdout.lines().any(|line| line == "HOSTHOME=ABSENT"),
+    }
 }
 
 /// The shell the probe runs, and the directory to bind read-only for it when it lives outside `/usr`.
@@ -442,6 +471,46 @@ mod tests {
         assert!(
             report.host_home_absent,
             "the host home leaked into the sandbox"
+        );
+    }
+
+    /// Run [`launch`] against a stand-in for `bwrap`: a `/bin/sh` script running `body`, written on
+    /// shell builtins alone so it does the same whatever environment it is handed.
+    fn launch_stand_in(body: &str) -> io::Result<SmokeReport> {
+        let dir = crate::testutil::TmpDir::new();
+        let bwrap = dir.path().join("bwrap");
+        crate::testutil::write_script(&bwrap, body);
+        crate::testutil::result_past_etxtbsy("the stand-in bwrap", || {
+            launch(&bwrap, Path::new("/bin/sh"), None, None)
+        })
+    }
+
+    /// Each answer is read from its own whole line. The canonical output is the control that the
+    /// stand-in's lines are read at all; each value after it is one a substring search accepts and
+    /// a read of the field does not.
+    #[test]
+    fn each_answer_is_read_from_its_own_whole_line() {
+        let report = |lines: &str| {
+            launch_stand_in(&format!("printf '{lines}'")).expect("the stand-in bwrap runs")
+        };
+        let canonical = report(r"NoNewPrivs:\t1\nCapEff:\t0000000000000000\nHOSTHOME=ABSENT\n");
+        assert!(canonical.launched, "the stand-in exits 0");
+        assert!(canonical.no_new_privs, "`NoNewPrivs: 1` is read");
+        assert!(canonical.caps_dropped, "a zero `CapEff` is read");
+        assert!(canonical.host_home_absent, "`HOSTHOME=ABSENT` is read");
+
+        assert!(
+            !report(r"NoNewPrivs:\t10\nCapEff:\t0000000000000000\nHOSTHOME=ABSENT\n").no_new_privs,
+            "`10` is not `1`"
+        );
+        assert!(
+            !report(r"NoNewPrivs:\t1\nCapEff:\t00000000000000001\nHOSTHOME=ABSENT\n").caps_dropped,
+            "a `CapEff` wider than sixteen digits keeps the capability its last digit sets"
+        );
+        assert!(
+            !report(r"Name:\tHOSTHOME=ABSENT\nNoNewPrivs:\t1\nCapEff:\t0000000000000000\nHOSTHOME=PRESENT\n")
+                .host_home_absent,
+            "the home answer is the script's own line, not a match inside another one"
         );
     }
 
