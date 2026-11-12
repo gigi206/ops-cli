@@ -22,7 +22,7 @@
 //! notify, though: `RegNotifyChangeKeyValue` blocks until the theme value is written and returns
 //! within milliseconds of it, so the relay follows Windows through one long-lived interop process
 //! whose output it reads ([`WATCH_SCRIPT`]) rather than by asking again on a timer. Which source a
-//! launch follows is decided the way the seed decides it ([`read_host_color_scheme`]): the portal
+//! launch follows is the one the seed read ([`read_host_theme`]), handed to the relay: the portal
 //! when it answers, Windows when it does not and the kernel is a WSL one.
 //!
 //! Lifecycle mirrors [`super::notify_relay`]: [`ThemeRelay::start`] spawns a dedicated thread driving
@@ -66,17 +66,32 @@ pub(crate) trait HostSettings {
 /// seconds) — the price of giving up is the app opening in its default theme, not a failed launch.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Read the host's current light/dark preference, for seeding the cage's theme at launch. Returns
-/// the GSettings keyfile value (`prefer-dark`/`prefer-light`/`default`), or `None` when there is no
-/// session bus, no desktop portal, or the reply carries no `uint32` — in which case the app opens
-/// in its default theme.
+/// What the launch read of the host's light/dark preference: the value to seed the cage with, and
+/// whether the desktop portal gave it.
+pub(crate) struct HostTheme {
+    /// The GSettings keyfile value (`prefer-dark`/`prefer-light`/`default`), or `None` when no
+    /// source answered, in which case the app opens in its default theme.
+    pub(crate) scheme: Option<String>,
+    /// Whether the portal answered, which decides the source the relay follows
+    /// ([`theme_source`]). Carried to [`ThemeRelay::start`] rather than asked again there: the
+    /// relay would ask the same bus the same question, and wait up to [`READ_TIMEOUT`] for it on a
+    /// thread its launch's end cannot interrupt.
+    pub(crate) portal_answered: bool,
+}
+
+/// Read the host's current light/dark preference, for seeding the cage's theme at launch, and say
+/// which source gave it ([`HostTheme`]). The scheme is `None` when there is no session bus, no
+/// desktop portal, or the reply carries no `uint32`.
 ///
 /// Deliberately the same D-Bus client, proxy and value unwrapping the relay uses for the change
 /// signal: the value read once at launch and the values mirrored afterwards must be the same
 /// setting read the same way, or the app would open on one interpretation and switch to another.
-pub(crate) fn read_host_color_scheme() -> Option<String> {
+pub(crate) fn read_host_theme() -> HostTheme {
     if let Some(from_portal) = portal_color_scheme() {
-        return Some(from_portal);
+        return HostTheme {
+            scheme: Some(from_portal),
+            portal_answered: true,
+        };
     }
     // No portal answered. Under WSL that is the normal case rather than a failure — the desktop
     // whose preference this is runs on the Windows side, which answers through a registry value
@@ -86,7 +101,7 @@ pub(crate) fn read_host_color_scheme() -> Option<String> {
     // gated on the host being that host, so a Linux host with no portal spawns nothing and reads no
     // theme file. What it does read is its own `/proc/self/mountinfo`, to tell it is not a Mac's
     // guest.
-    match theme_source(
+    let scheme = match theme_source(
         false,
         host_is_wsl(),
         super::lima_mac::mounted(super::lima_mac::THEME_MOUNT),
@@ -94,6 +109,10 @@ pub(crate) fn read_host_color_scheme() -> Option<String> {
         ThemeSource::Windows => windows_fallback(true, read_windows_color_scheme),
         ThemeSource::Mac => mac_fallback(true, super::lima_mac::read_color_scheme),
         ThemeSource::Portal | ThemeSource::Nothing => None,
+    };
+    HostTheme {
+        scheme,
+        portal_answered: false,
     }
 }
 
@@ -443,10 +462,10 @@ fn bus_error_is_a_teardown_race(msg: &str) -> bool {
 /// watcher that will not start is a capability this launch loses and says so once.
 fn run_relay(
     home: PathBuf,
+    portal_answered: bool,
     shutdown: async_channel::Receiver<()>,
     watcher: &std::sync::Mutex<WatchSlot>,
 ) {
-    let portal_answered = portal_color_scheme().is_some();
     let is_wsl = host_is_wsl();
     let mac_bridge = super::lima_mac::mounted(super::lima_mac::THEME_MOUNT);
     if theme_source(portal_answered, is_wsl, mac_bridge) == ThemeSource::Mac {
@@ -545,13 +564,16 @@ impl ThemeRelay {
     /// caller that handed over an already-joined path would leave nothing to say where the trusted
     /// prefix ends. Infallible — any failure inside the thread warns and leaves the app on its
     /// at-launch theme (best-effort).
-    pub(crate) fn start(home: PathBuf) -> ThemeRelay {
+    ///
+    /// `portal_answered` is the launch's own read ([`HostTheme::portal_answered`]): the relay
+    /// follows the source the seed came from, and is told it rather than asking again.
+    pub(crate) fn start(home: PathBuf, portal_answered: bool) -> ThemeRelay {
         let (shutdown, rx) = async_channel::bounded::<()>(1);
         let watcher = std::sync::Arc::new(std::sync::Mutex::new(WatchSlot::default()));
         let theirs = std::sync::Arc::clone(&watcher);
         let handle = std::thread::Builder::new()
             .name("sbx-theme-relay".to_string())
-            .spawn(move || run_relay(home, rx, &theirs))
+            .spawn(move || run_relay(home, portal_answered, rx, &theirs))
             .ok();
         ThemeRelay {
             shutdown,
@@ -590,10 +612,19 @@ async fn run_portal(
     home: PathBuf,
     shutdown: async_channel::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Host session bus (ambient $DBUS_SESSION_BUS_ADDRESS) and a proxy onto its desktop portal.
-    let host_conn = zbus::Connection::session().await?;
-    let settings = HostSettingsProxy::new(&host_conn).await?;
-    let mut changes = settings.receive_setting_changed().await?;
+    // Host session bus (ambient $DBUS_SESSION_BUS_ADDRESS) and a proxy onto its desktop portal,
+    // raced against the launch's end: a bus that accepts the connection and never answers would
+    // otherwise hold this thread, and with it the `join` in `ThemeRelay::drop`, for good.
+    let subscribe = async {
+        let host_conn = zbus::Connection::session().await?;
+        let settings = HostSettingsProxy::new(&host_conn).await?;
+        let changes = settings.receive_setting_changed().await?;
+        Ok::<_, zbus::Error>((host_conn, settings, changes))
+    };
+    let (_host_conn, _settings, mut changes) = futures_util::select! {
+        _ = shutdown.recv().fuse() => return Ok(()),
+        subscribed = subscribe.fuse() => subscribed?,
+    };
     loop {
         futures_util::select! {
             _ = shutdown.recv().fuse() => break,
@@ -763,7 +794,7 @@ mod tests {
             skip_incapable!("skipping host theme read: no desktop portal on the session bus");
             return;
         }
-        let scheme = read_host_color_scheme();
+        let scheme = read_host_theme().scheme;
         assert!(
             matches!(
                 scheme.as_deref(),
@@ -771,6 +802,79 @@ mod tests {
             ),
             "a host with a desktop portal must yield a scheme, got {scheme:?}"
         );
+    }
+
+    /// A relay whose session bus accepts the connection and never answers ends when its launch
+    /// does. The subscription is raced against the launch's end, and the relay no longer reads the
+    /// portal again before choosing what to follow: either wait, unraced, held the `join` in
+    /// `ThemeRelay::drop`, the second one for good. Run alone, so the process's session bus can be
+    /// one that never answers.
+    #[test]
+    fn a_relay_whose_bus_never_answers_ends_with_its_launch() {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = crate::testutil::TmpDir::new();
+        let bus = dir.join("bus");
+        let listener = UnixListener::bind(&bus).expect("a socket for the silent bus");
+        listener
+            .set_nonblocking(true)
+            .expect("a listener that can be told to stop");
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopping = std::sync::Arc::clone(&stop);
+        // Every connection is accepted and kept open, and nothing is ever written back.
+        let silent = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !stopping.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((conn, _)) => held.push(conn),
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+        });
+
+        let ran = crate::testutil::run_within(
+            crate::testutil::alone(
+                concat!(module_path!(), "::a_relay_on_a_silent_bus"),
+                dir.path(),
+            )
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", bus.display()),
+            )
+            .stdin(std::process::Stdio::null()),
+            "the relay on a silent bus",
+        );
+        stop.store(true, Ordering::Relaxed);
+        silent.join().expect("the silent bus stops");
+        assert!(
+            ran.ended_well(),
+            "the process ended with {}: {}{}",
+            ran.status,
+            ran.stdout,
+            ran.stderr
+        );
+    }
+
+    /// The relay run by [`a_relay_whose_bus_never_answers_ends_with_its_launch`]; anywhere else it
+    /// does nothing.
+    #[test]
+    #[ignore = "run alone, on a session bus of the test that runs it"]
+    fn a_relay_on_a_silent_bus() {
+        crate::testutil::when_run_alone(|dir| {
+            let home = Path::new(dir).join("home");
+            std::fs::create_dir_all(&home)?;
+            let relay = ThemeRelay::start(home, false);
+            // Long enough for the thread to be waiting on the bus.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let ending = std::time::Instant::now();
+            drop(relay);
+            match ending.elapsed() {
+                took if took < std::time::Duration::from_secs(1) => Ok(()),
+                took => Err(std::io::Error::other(format!(
+                    "the relay took {took:?} to end with its launch"
+                ))),
+            }
+        });
     }
 
     #[test]

@@ -742,7 +742,7 @@ fn portal_stack(
 ) -> PortalStack {
     let mut portal_host: Option<crate::sandbox::portal::HostDir> = None;
     let mut notify_relay: Option<crate::sandbox::notify_relay::NotifyRelay> = None;
-    let mut theme_relay: Option<crate::sandbox::theme_relay::ThemeRelay> = None;
+    let mut theme_home: Option<std::path::PathBuf> = None;
 
     // In-cage desktop portal: under `gui = "wayland"` AND `dbus = true`, provision the portal
     // stack (dbus + xdg-desktop-portal + the GTK backend) host-side — before the seed, so its roots
@@ -770,16 +770,12 @@ fn portal_stack(
                         hd.socket(),
                         needles,
                     ));
-                    // Start the live-theme relay: it mirrors later host light/dark switches into the
-                    // in-cage GSettings keyfile (through the home bind), so the in-cage portal
-                    // re-emits SettingChanged and the app follows the change live. The home is
-                    // derived exactly as `build_spec` binds it, so both target the same file — and it
-                    // is handed over unjoined because the relay walks the rest of the way itself,
-                    // refusing a symlink at every cage-writable component.
-                    // Best-effort: a home path that cannot be resolved just leaves the at-launch theme.
-                    if let Ok(home) = binds::home_src(prep.layout.data_dir(), &prep.cwd, runtime) {
-                        theme_relay = Some(crate::sandbox::theme_relay::ThemeRelay::start(home));
-                    }
+                    // The home the live-theme relay writes into, started below once the seed has
+                    // been read. Derived exactly as `build_spec` binds it, so both target the same
+                    // file — and handed over unjoined because the relay walks the rest of the way
+                    // itself, refusing a symlink at every cage-writable component. Best-effort: a
+                    // home path that cannot be resolved just leaves the at-launch theme.
+                    theme_home = binds::home_src(prep.layout.data_dir(), &prep.cwd, runtime).ok();
                     portal_host = Some(hd);
                     Some(p)
                 }
@@ -814,16 +810,27 @@ fn portal_stack(
     // over the session bus directly rather than by running a provisioned `dbus-send`: a binary in
     // sbx's relocated store names an interpreter under a `/nix` the host does not have, so it
     // could not be executed here at all.
-    let portal_scheme = portal
+    let host_theme = portal
         .as_ref()
-        .and_then(|_| crate::sandbox::theme_relay::read_host_color_scheme());
+        .map(|_| crate::sandbox::theme_relay::read_host_theme());
+    // The live-theme relay: it mirrors later host light/dark switches into the in-cage GSettings
+    // keyfile (through the home bind), so the in-cage portal re-emits SettingChanged and the app
+    // follows the change live. Started after the seed, and handed what the seed found, so it follows
+    // the source the seed read rather than asking the bus again.
+    let theme_relay = match (theme_home, &host_theme) {
+        (Some(home), Some(theme)) => Some(crate::sandbox::theme_relay::ThemeRelay::start(
+            home,
+            theme.portal_answered,
+        )),
+        _ => None,
+    };
 
     PortalStack {
         theme_relay,
         notify_relay,
         host_dir: portal_host,
         portal,
-        scheme: portal_scheme,
+        scheme: host_theme.and_then(|theme| theme.scheme),
     }
 }
 
