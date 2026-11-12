@@ -258,8 +258,8 @@ fn bearer_request(field: &str) -> io::Result<Option<String>> {
 /// A bearer token for `image`, or `None` when the registry answered without asking for one.
 ///
 /// `challenge` is the `WWW-Authenticate` value the registry sent with its `401`, read by
-/// [`challenges`]. Only its `Bearer` challenge is followed here; a `Basic` one is answered by the
-/// caller, which has the credential and the original request to repeat.
+/// [`challenges`]. Only its `Bearer` challenge is followed here; a `Basic` one is answered by
+/// [`authorization`] when no `Bearer` one is offered.
 ///
 /// `credential` goes on **this** request and nowhere else. It is what the registry's token service
 /// exchanges for a token scoped to one repository, and once that token exists it is what every
@@ -341,22 +341,19 @@ fn get_authenticated(
     let Some(challenge) = answerable_challenge(&first)? else {
         return Ok(first);
     };
-    // A registry that asks for `Basic` has no token service to go through, so the credential
-    // answers the original request. Common on a self-hosted registry, and the reason the challenge
-    // is read rather than assumed to be `Bearer`.
-    let authorization = match basic_answer(challenge, credential) {
-        Some(header) => header.to_string(),
-        None => match token(challenge, credential)? {
-            Some(token) => format!("Bearer {token}"),
-            None => return Ok(first),
-        },
+    let Some(authorization) = authorization(&challenge, credential)? else {
+        return Ok(first);
     };
     let mut headers = base;
     headers.push(("Authorization", &authorization));
     http::get(url, &headers)
 }
 
-/// The challenge on `response` worth answering, or `None` when it carries none.
+/// The challenges on `response` worth answering, or `None` when it carries none.
+///
+/// Every `WWW-Authenticate` field is read, joined as one list: a registry may offer each scheme in a
+/// field of its own, and the first field alone may name one sbx does not answer while a later one
+/// names one it does.
 ///
 /// A `401` is only a registry's challenge when the registry is what answered. [`http::get`] and
 /// [`http::head`] follow redirects, so the response may have been written by whatever host the
@@ -365,13 +362,15 @@ fn get_authenticated(
 /// credential is scoped to the registry the configuration names, so a challenge from a redirect hop
 /// is refused rather than followed; a blob served from object storage that needs no challenge is
 /// unaffected, since it answers `200`.
-fn answerable_challenge(response: &http::Response) -> io::Result<Option<&str>> {
+fn answerable_challenge(response: &http::Response) -> io::Result<Option<String>> {
     if response.status != 401 {
         return Ok(None);
     }
-    let Some(challenge) = response.header("www-authenticate") else {
+    let fields: Vec<&str> = response.header_values("www-authenticate").collect();
+    if fields.is_empty() {
         return Ok(None);
-    };
+    }
+    let challenge = fields.join(", ");
     if response.redirected {
         return Err(io::Error::other(format!(
             "a host reached by redirect asked for authentication ({challenge}): \
@@ -381,14 +380,31 @@ fn answerable_challenge(response: &http::Response) -> io::Result<Option<&str>> {
     Ok(Some(challenge))
 }
 
-/// The credential to answer a `Basic` challenge with, or `None` when the challenge is not `Basic`
-/// or no credential was configured. A `Basic` challenge with nothing to answer it falls through to
-/// the token path, which returns the registry's own `401` rather than inventing an error.
+/// The `Authorization` header that answers the challenges in `challenge`, or `None` when none of
+/// them is one sbx answers. Both requests that meet a challenge, a manifest's and a blob's, answer
+/// it here, so neither can answer it differently.
+///
+/// A `Bearer` challenge is followed to its token service whenever one is offered: the credential
+/// then goes on the token request alone, and what the registry receives is a token scoped to one
+/// repository. A registry that offers only `Basic` has no token service to go through, which is
+/// common on a self-hosted one, and the credential answers the request itself.
+fn authorization(challenge: &str, credential: Option<&Credential>) -> io::Result<Option<String>> {
+    if let Some(header) = basic_answer(challenge, credential) {
+        return Ok(Some(header.to_string()));
+    }
+    Ok(token(challenge, credential)?.map(|t| format!("Bearer {t}")))
+}
+
+/// The credential to answer a `Basic` challenge with: `Some` when the challenges in `challenge`
+/// offer `Basic` and no `Bearer`, and a credential is configured. A `Bearer` challenge beside it
+/// wins even without a realm, and its refusal names the realm it lacks rather than sending the
+/// credential on every request. A `Basic` challenge with nothing to answer it falls through to the
+/// token path, which returns the registry's own `401` rather than inventing an error.
 fn basic_answer<'a>(challenge: &str, credential: Option<&'a Credential>) -> Option<&'a str> {
-    challenge
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("basic")
+    let offered = challenges(challenge);
+    let basic_only =
+        offered.iter().any(|c| c.is("basic")) && !offered.iter().any(|c| c.is("bearer"));
+    basic_only
         .then(|| credential.map(Credential::header))
         .flatten()
 }
@@ -406,14 +422,10 @@ fn get_authenticated_to_writer<W: io::Write>(
     // answered `200` with the layer, which the document cap then refused for being too large:
     // no layer past four megabytes could be fetched from quay.io or registry.k8s.io at all.
     let probe = http::head(url, &[])?;
-    if let Some(challenge) = answerable_challenge(&probe)? {
-        let authorization = match basic_answer(challenge, credential) {
-            Some(header) => Some(header.to_string()),
-            None => token(challenge, credential)?.map(|t| format!("Bearer {t}")),
-        };
-        if let Some(authorization) = authorization {
-            return http::get_to_writer(url, &[("Authorization", &authorization)], sink, cap);
-        }
+    if let Some(challenge) = answerable_challenge(&probe)?
+        && let Some(authorization) = authorization(&challenge, credential)?
+    {
+        return http::get_to_writer(url, &[("Authorization", &authorization)], sink, cap);
     }
     http::get_to_writer(url, &[], sink, cap)
 }

@@ -204,7 +204,8 @@ fn a_tag_resolves_to_the_digest_the_registry_itself_reports() {
         "the registry serves the manifest a tag names"
     );
     let advertised = served
-        .header("docker-content-digest")
+        .header_values("docker-content-digest")
+        .next()
         .expect("a registry states the digest of the manifest it serves")
         .to_string();
     assert_eq!(
@@ -386,7 +387,7 @@ fn a_challenge_from_a_redirect_hop_is_not_answered() {
     };
     // The registry itself challenged: this is the exchange the credential exists for.
     assert_eq!(
-        answerable_challenge(&answered(false)).unwrap(),
+        answerable_challenge(&answered(false)).unwrap().as_deref(),
         Some(challenge)
     );
     // A host the registry redirected to challenged: it names a realm of its own choosing, and
@@ -993,4 +994,116 @@ fn a_challenge_field_the_grammar_cannot_read_ends_the_reading() {
     for ((field, read), expected) in fields.iter().zip(read).zip(expected) {
         assert_eq!(read, expected, "`{field}`");
     }
+}
+
+/// The credential itself answers only a registry that offers `Basic` and no `Bearer`: a `Bearer`
+/// challenge offered beside it is followed to its token service, whichever comes first, so the
+/// credential stays on the token request. The scheme is the challenge's whole first token, wherever
+/// in the field the challenge stands.
+///
+/// Every shape runs before any is asserted, so a choice that fails names each shape it fails.
+#[test]
+fn a_basic_challenge_is_answered_only_when_no_bearer_one_is_offered() {
+    let c = Credential::basic("u:p");
+    let shapes = [
+        (
+            "a scheme that only begins with `basic`",
+            r#"Basicx realm="y""#,
+            None,
+        ),
+        (
+            "a Basic challenge behind another scheme",
+            r#"Negotiate, Basic realm="x""#,
+            Some(c.header()),
+        ),
+        (
+            "a Bearer challenge behind a Basic one",
+            r#"Basic realm="x", Bearer realm="https://auth.example/token""#,
+            None,
+        ),
+        (
+            "a Basic challenge behind a Bearer one",
+            r#"Bearer realm="https://auth.example/token", Basic realm="x""#,
+            None,
+        ),
+        (
+            "a Bearer challenge with no realm beside a Basic one",
+            r#"Bearer service="registry.example", Basic realm="x""#,
+            None,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (shape, field, wanted) in shapes {
+        let answered = basic_answer(field, Some(&c));
+        if answered != wanted {
+            failures.push(format!("{shape}: {answered:?}, wanted {wanted:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+
+    // The `Bearer` challenge with no realm is what gets answered, and its refusal names the realm
+    // it lacks before any request is made, rather than the credential going out on its own.
+    let err = authorization(
+        r#"Bearer service="registry.example", Basic realm="x""#,
+        Some(&c),
+    )
+    .expect_err("a Bearer challenge with no realm names nowhere to ask");
+    assert!(err.to_string().contains("names no realm"), "{err}");
+}
+
+/// A registry may offer each scheme in a `WWW-Authenticate` field of its own, and every field is
+/// read: a `Bearer` challenge in the second field is found though the first names only `Basic`.
+#[test]
+fn every_challenge_field_of_a_response_is_read() {
+    let response = super::super::http::Response {
+        status: 401,
+        headers: vec![
+            (
+                "WWW-Authenticate".to_string(),
+                r#"Basic realm="x""#.to_string(),
+            ),
+            ("Content-Type".to_string(), "application/json".to_string()),
+            (
+                "www-authenticate".to_string(),
+                r#"Bearer realm="https://auth.example/token",service="registry.example""#
+                    .to_string(),
+            ),
+        ],
+        body: Vec::new(),
+        redirected: false,
+    };
+    let challenge = answerable_challenge(&response)
+        .expect("the registry itself challenged")
+        .expect("a 401 with challenges is answerable");
+    assert_eq!(
+        bearer_request(&challenge).expect("a well-formed Bearer challenge"),
+        Some("https://auth.example/token?service=registry.example".to_string()),
+        "the Bearer challenge of the second field is the one followed"
+    );
+    assert_eq!(
+        basic_answer(&challenge, Some(&Credential::basic("u:p"))),
+        None,
+        "and the Basic one of the first is not answered with the credential"
+    );
+}
+
+/// A registry that offers only `Basic` is answered with the credential through `authorization`, the
+/// one decision both the manifest and the blob request go through; with no credential, or a scheme
+/// that only begins with `basic`, nothing is answered. No field here names a `Bearer` realm: that
+/// path makes a request.
+#[test]
+fn a_basic_only_registry_is_answered_through_the_one_decision() {
+    let c = Credential::basic("u:p");
+    assert_eq!(
+        authorization(r#"Basic realm="x""#, Some(&c)).expect("no request is made"),
+        Some(c.header().to_string())
+    );
+    assert_eq!(
+        authorization(r#"Basic realm="x""#, None).expect("no request is made"),
+        None
+    );
+    assert_eq!(
+        authorization(r#"Basicx realm="y""#, Some(&c)).expect("no request is made"),
+        None
+    );
 }

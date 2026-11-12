@@ -71,11 +71,12 @@ pub(super) struct Response {
 }
 
 impl Response {
-    /// The first value of `name`, compared case-insensitively as HTTP requires.
-    pub(super) fn header(&self, name: &str) -> Option<&str> {
+    /// Every value of `name`, in the order the fields came, the name compared case-insensitively as
+    /// HTTP requires. A field may be repeated, and each repetition carries values of its own.
+    pub(super) fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
         self.headers
             .iter()
-            .find(|(k, _)| wire::header_name_eq(k, name))
+            .filter(move |(k, _)| wire::header_name_eq(k, name))
             .map(|(_, v)| v.as_str())
     }
 }

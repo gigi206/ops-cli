@@ -244,20 +244,27 @@ fn a_status_that_is_not_a_redirect_yields_no_target() {
     }
 }
 
+/// A header is read case-insensitively, and a repeated one gives every value it carries, in the
+/// order the fields came.
 #[test]
 fn a_header_is_read_case_insensitively() {
     let r = Response {
         status: 401,
-        headers: headers(&[("WWW-Authenticate", "Bearer realm=\"https://auth\"")]),
+        headers: headers(&[
+            ("WWW-Authenticate", "Basic realm=\"x\""),
+            ("Content-Length", "0"),
+            ("www-authenticate", "Bearer realm=\"https://auth\""),
+        ]),
         body: Vec::new(),
         redirected: false,
     };
+    let values = |name| r.header_values(name).collect::<Vec<_>>();
     assert_eq!(
-        r.header("www-authenticate"),
-        Some("Bearer realm=\"https://auth\"")
+        values("www-authenticate"),
+        ["Basic realm=\"x\"", "Bearer realm=\"https://auth\""]
     );
-    assert_eq!(r.header("Www-Authenticate"), r.header("WWW-AUTHENTICATE"));
-    assert_eq!(r.header("content-type"), None);
+    assert_eq!(values("Www-Authenticate"), values("WWW-AUTHENTICATE"));
+    assert!(values("content-type").is_empty());
 }
 
 /// A streamed body is bounded whatever framing the server chose.

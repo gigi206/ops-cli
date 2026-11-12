@@ -187,7 +187,8 @@ around:
 
 A registry that answers with a `Basic` challenge instead of pointing at a token service, as
 a self-hosted one often does, gets the credential on the request itself. That is the only
-other place it goes.
+other place it goes. A registry that offers both schemes is answered through its token
+service, whichever it names first, so the credential stays on the token request.
 
 A redirect is followed only to an `https://` URL written plainly: one that carries user
 information (`user@host`), an unbracketed IPv6 address, a space, a non-ASCII character or a
