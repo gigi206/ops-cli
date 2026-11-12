@@ -152,6 +152,7 @@ fn a_registry_never_heard_from_is_told_apart_from_one_that_answered() {
         "registry-1.docker.io served a manifest hashing to sha256:0 for the pin sha256:1",
         "layer sha256:0 came back as sha256:1",
         "docker.io/library/alpine:3.22 carries no linux/amd64 image",
+        "oci:registry.example/team/app:1 nests more than 4 indexes before naming a manifest",
     ] {
         assert!(!transient(&io::Error::other(verdict)), "{verdict}");
     }
@@ -496,4 +497,113 @@ fn the_challenge_probe_does_not_read_the_blob_it_asks_about() {
         Err(e) => panic!("the fetch stopped before the blob's body, and not on the network: {e}"),
         Ok(written) => panic!("a sink that takes nothing was reported {written} bytes"),
     }
+}
+
+/// A layer digest the canned manifests below name. No test fetches its bytes.
+const LAYER: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+/// A manifest naming one layer, as a registry serves it.
+fn manifest_naming(layer: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "digest": layer,
+            "size": 1,
+        }],
+    }))
+    .expect("a manifest serializes")
+}
+
+/// An index whose one entry names the document `below`, for `platform` when one is given.
+fn index_naming(below: &[u8], platform: Option<(&str, &str)>) -> Vec<u8> {
+    let mut entry = serde_json::json!({
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": digest_of(below),
+        "size": below.len(),
+    });
+    if let Some((os, architecture)) = platform {
+        entry["platform"] = serde_json::json!({ "os": os, "architecture": architecture });
+    }
+    serde_json::to_vec(&serde_json::json!({ "schemaVersion": 2, "manifests": [entry] }))
+        .expect("an index serializes")
+}
+
+/// A registry serving `documents`: the first for a tag, and each under the digest of its bytes.
+fn serving(documents: &[Vec<u8>]) -> impl FnMut(&ImageRef) -> io::Result<Vec<u8>> + '_ {
+    move |image| match &image.reference {
+        Reference::Tag(_) => Ok(documents[0].clone()),
+        Reference::Digest(digest) => documents
+            .iter()
+            .find(|document| digest_of(document) == *digest)
+            .cloned()
+            .ok_or_else(|| io::Error::other(format!("nothing is served under {digest}"))),
+    }
+}
+
+/// An index may name another, and the nest is followed as deep as [`MAX_INDEX_DEPTH`] and no
+/// deeper.
+///
+/// Each level is fetched by the digest the level above names, so a registry cannot make a loop of
+/// them, but it can build a chain from the leaf up for as long as it likes, and every link is one
+/// more request.
+#[test]
+fn a_nest_of_indexes_is_followed_only_so_deep() {
+    let image = reference::parse("oci:registry.example/team/app:1").expect("a valid reference");
+    // Built from the leaf up, as a registry would have to: each index names the digest of the
+    // document below it, and the top comes first.
+    let chain = |indexes: usize| {
+        let mut documents = vec![manifest_naming(LAYER)];
+        for _ in 0..indexes {
+            let below = documents.last().expect("the leaf").clone();
+            documents.push(index_naming(&below, Some((OS, ARCH))));
+        }
+        documents.reverse();
+        documents
+    };
+
+    let deepest = chain(MAX_INDEX_DEPTH);
+    let resolved =
+        resolve_with(&image, serving(&deepest)).expect("a nest as deep as the bound resolves");
+    assert_eq!(
+        resolved.digest,
+        digest_of(&deepest[0]),
+        "pinned to the top index"
+    );
+    let layers: Vec<&str> = resolved.layers.iter().map(|l| l.digest.as_str()).collect();
+    assert_eq!(layers, [LAYER], "the layers of the manifest at the bottom");
+
+    let deeper = chain(MAX_INDEX_DEPTH + 1);
+    let mut requests = 0;
+    let err = resolve_with(&image, |image| {
+        requests += 1;
+        serving(&deeper)(image)
+    })
+    .expect_err("one level more is refused");
+    assert!(err.to_string().contains("nests more than"), "{err}");
+    assert_eq!(
+        requests,
+        MAX_INDEX_DEPTH + 1,
+        "the level past the bound is refused before it is asked for"
+    );
+}
+
+/// The platform manifest an index picks is held to the digest the index names, as a pin the
+/// configuration wrote is.
+#[test]
+fn a_platform_manifest_is_checked_against_the_digest_its_index_names() {
+    let image = reference::parse("oci:registry.example/team/app:1").expect("a valid reference");
+    let named = manifest_naming(LAYER);
+    let index = index_naming(&named, Some((OS, ARCH)));
+    let other = manifest_naming(&format!("sha256:{}", "2".repeat(64)));
+    // The registry answers the digest the index names with other bytes.
+    let err = resolve_with(&image, |image: &ImageRef| match image.reference {
+        Reference::Tag(_) => Ok(index.clone()),
+        Reference::Digest(_) => Ok(other.clone()),
+    })
+    .expect_err("bytes that do not hash to the digest the index names are refused");
+    assert!(
+        err.to_string().contains("served a manifest hashing to"),
+        "{err}"
+    );
 }

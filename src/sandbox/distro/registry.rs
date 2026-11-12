@@ -288,6 +288,16 @@ fn get_authenticated_to_writer<W: io::Write>(
     http::get_to_writer(url, &[], sink, cap)
 }
 
+/// How many indexes a resolve reads through before the manifest that names the layers.
+///
+/// The image-index spec asks a client to follow an index that names another, so a nest is read
+/// rather than refused. Each level is one more request, though, and the registry decides how many
+/// there are: content addressing rules out a cycle, since every level is fetched by the digest the
+/// level above names and checked against it, but not a chain built from the leaf up, as long as
+/// the registry cares to make it. The bound keeps the number of requests a resolve makes out of
+/// the registry's hands, and the loop that reads the levels keeps their number off the stack.
+const MAX_INDEX_DEPTH: usize = 4;
+
 /// Resolve `image` to the digest and layer list of a `linux/amd64` image.
 ///
 /// A tag becomes the digest the registry serves for it *now*, which is what a lock records. A
@@ -295,11 +305,16 @@ fn get_authenticated_to_writer<W: io::Write>(
 /// fetched by that digest and checked against it, so this path proves the pin rather than trusting
 /// it.
 pub(super) fn resolve(image: &ImageRef, credential: Option<&Credential>) -> io::Result<Image> {
+    resolve_with(image, |image| manifest_body(image, credential))
+}
+
+/// The manifest `image` names, as the registry served it, before anything has checked it.
+fn manifest_body(image: &ImageRef, credential: Option<&Credential>) -> io::Result<Vec<u8>> {
     let selector = match &image.reference {
-        Reference::Tag(tag) => tag.clone(),
-        Reference::Digest(digest) => digest.clone(),
+        Reference::Tag(tag) => tag,
+        Reference::Digest(digest) => digest,
     };
-    let url = v2_url(image, "manifests", &selector);
+    let url = v2_url(image, "manifests", selector);
     let response = get_authenticated(&url, Some(MANIFEST_ACCEPT), credential)?;
     if response.status != 200 {
         return Err(io::Error::other(format!(
@@ -309,9 +324,49 @@ pub(super) fn resolve(image: &ImageRef, credential: Option<&Credential>) -> io::
             image.locator()
         )));
     }
-    let digest = digest_of(&response.body);
-    // A locator that named a digest gets it checked against the bytes that came back: the point of
-    // pinning by content is lost if the content is taken on the registry's word.
+    Ok(response.body)
+}
+
+/// [`resolve`], with every manifest read through `fetch`: the transport is the caller's, and what
+/// the bytes are allowed to say is decided here.
+fn resolve_with(
+    image: &ImageRef,
+    mut fetch: impl FnMut(&ImageRef) -> io::Result<Vec<u8>>,
+) -> io::Result<Image> {
+    let (digest, mut doc) = checked_manifest(image, &mut fetch)?;
+    // An index names one manifest per platform; a manifest names layers. Which came back depends on
+    // how the image was pushed, so the shape decides rather than the request. The layers come from
+    // the platform manifest, but the pin stays the digest the reference resolved to: a lock that
+    // named the per-platform manifest would not match what a tag resolves to anywhere else.
+    let mut depth = 0;
+    while let Some(manifests) = doc.get("manifests").and_then(|m| m.as_array()) {
+        if depth == MAX_INDEX_DEPTH {
+            return Err(io::Error::other(format!(
+                "{} nests more than {MAX_INDEX_DEPTH} indexes before naming a manifest",
+                image.locator()
+            )));
+        }
+        depth += 1;
+        let platform = image.pinned(platform_entry(manifests, image)?);
+        doc = checked_manifest(&platform, &mut fetch)?.1;
+    }
+    Ok(Image {
+        digest,
+        layers: layers_of(&doc, image)?,
+    })
+}
+
+/// The manifest `image` names, parsed, with the digest of the bytes it came as.
+///
+/// A reference that names a digest gets it checked against those bytes, at every level: the pin a
+/// configuration wrote and the platform manifest an index picked alike. The point of pinning by
+/// content is lost if the content is taken on the registry's word.
+fn checked_manifest(
+    image: &ImageRef,
+    fetch: &mut impl FnMut(&ImageRef) -> io::Result<Vec<u8>>,
+) -> io::Result<(String, serde_json::Value)> {
+    let body = fetch(image)?;
+    let digest = digest_of(&body);
     if let Reference::Digest(pinned) = &image.reference
         && &digest != pinned
     {
@@ -320,41 +375,35 @@ pub(super) fn resolve(image: &ImageRef, credential: Option<&Credential>) -> io::
             image.api_host()
         )));
     }
-    let doc: serde_json::Value = serde_json::from_slice(&response.body)
+    let doc = serde_json::from_slice(&body)
         .map_err(|e| io::Error::other(format!("parsing the manifest: {e}")))?;
+    Ok((digest, doc))
+}
 
-    // An index names one manifest per platform; a manifest names layers. Which came back depends on
-    // how the image was pushed, so the shape decides rather than the request.
-    if let Some(manifests) = doc.get("manifests").and_then(|m| m.as_array()) {
-        let picked = manifests
-            .iter()
-            .find(|entry| {
-                let platform = entry.get("platform");
-                let os = platform.and_then(|p| p.get("os")).and_then(|v| v.as_str());
-                let arch = platform
-                    .and_then(|p| p.get("architecture"))
-                    .and_then(|v| v.as_str());
-                os == Some(OS) && arch == Some(ARCH)
-            })
-            .and_then(|entry| entry.get("digest"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                io::Error::other(format!("{} carries no {OS}/{ARCH} image", image.locator()))
-            })?;
-        let picked = reference::valid_digest(picked)
-            .ok_or_else(|| io::Error::other("the index names a malformed digest"))?;
-        // The layers come from the platform manifest, but the pin stays the digest the reference
-        // resolved to: a lock that named the per-platform manifest would not match what a tag
-        // resolves to anywhere else.
-        let platform = resolve(&image.pinned(picked), credential)?;
-        return Ok(Image {
-            digest,
-            layers: platform.layers,
-        });
-    }
+/// The digest of the `linux/amd64` entry among an index's `manifests`.
+fn platform_entry<'a>(manifests: &'a [serde_json::Value], image: &ImageRef) -> io::Result<&'a str> {
+    let picked = manifests
+        .iter()
+        .find(|entry| {
+            let platform = entry.get("platform");
+            let os = platform.and_then(|p| p.get("os")).and_then(|v| v.as_str());
+            let arch = platform
+                .and_then(|p| p.get("architecture"))
+                .and_then(|v| v.as_str());
+            os == Some(OS) && arch == Some(ARCH)
+        })
+        .and_then(|entry| entry.get("digest"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            io::Error::other(format!("{} carries no {OS}/{ARCH} image", image.locator()))
+        })?;
+    reference::valid_digest(picked)
+        .ok_or_else(|| io::Error::other("the index names a malformed digest"))
+}
 
-    let layers = doc
-        .get("layers")
+/// The layers a manifest names, in the order they are applied.
+fn layers_of(doc: &serde_json::Value, image: &ImageRef) -> io::Result<Vec<Layer>> {
+    doc.get("layers")
         .and_then(|l| l.as_array())
         .ok_or_else(|| io::Error::other(format!("{} names no layers", image.locator())))?
         .iter()
@@ -374,8 +423,7 @@ pub(super) fn resolve(image: &ImageRef, credential: Option<&Credential>) -> io::
                 size: entry.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
             })
         })
-        .collect::<io::Result<Vec<_>>>()?;
-    Ok(Image { digest, layers })
+        .collect()
 }
 
 /// What may be written while fetching a layer, before its digest can answer.
