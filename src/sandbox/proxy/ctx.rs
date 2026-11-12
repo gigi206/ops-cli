@@ -634,6 +634,12 @@ impl ProxyCtx {
         from: usize,
     ) -> Result<(std::net::TcpStream, usize, usize), ConnectRefusal> {
         let (stream, at, of) = self.answered(asked, self.link.connect(asked, check, from))?;
+        // Unchecked, since none of the three can fail here but by a refusal: the bound is a
+        // constant above zero (`UPSTREAM_TIMEOUT`, or a test's own), the socket a TCP connection
+        // the supervisor opened and handed over. The proxy's seccomp filter, the only one that
+        // rules on `setsockopt` in this process, allows exactly these options, and its test sets
+        // them on a TCP socket (`seccomp::proxy`): a filter that refused a bound, which would leave
+        // this socket unbounded, or `TCP_NODELAY`, which would leave Nagle on, fails that test.
         let _ = stream.set_read_timeout(Some(self.timeout));
         let _ = stream.set_write_timeout(Some(self.timeout));
         // Nagle off. Every relay here writes a head and then a body, and on a connection that stays
