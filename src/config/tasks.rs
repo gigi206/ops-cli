@@ -200,6 +200,11 @@ pub(super) fn validate_task(
     if raw.cmd[0].trim().is_empty() {
         return Err("`cmd[0]` is blank — it names the program sbx runs".to_string());
     }
+    // No argument can hold a NUL, so an element carrying one could never be passed: refused with
+    // the declaration, which names it, as a parameter's value is when a caller supplies it.
+    if let Some(i) = raw.cmd.iter().position(|arg| arg.contains('\0')) {
+        return Err(format!("`cmd[{i}]` contains a NUL byte"));
+    }
     // The program must be sbx's choice alone: a placeholder in argv0 would let a caller steer which
     // binary runs, which is the one thing a declared task exists to prevent.
     if placeholders(&raw.cmd[0]).next().is_some() {
@@ -1250,6 +1255,22 @@ mod tests {
             })
             .collect();
         assert!(missed.is_empty(), "a blank program passes: {missed:?}");
+    }
+
+    /// A `cmd` element carrying a NUL is refused when the declaration is read, naming the element,
+    /// whether it is the program or an argument. Every element the refusal misses is reported
+    /// together.
+    #[test]
+    fn a_cmd_element_with_a_nul_is_refused() {
+        let missed: Vec<usize> = [0, 1]
+            .into_iter()
+            .filter(|&i| {
+                let mut raw = raw_task();
+                raw.cmd[i].insert(1, '\0');
+                !validate(raw).is_err_and(|e| e.contains(&format!("cmd[{i}]")) && e.contains("NUL"))
+            })
+            .collect();
+        assert!(missed.is_empty(), "a NUL passes in cmd{missed:?}");
     }
 
     /// A fixed `env` value carrying a NUL is refused when the declaration is read, naming the
