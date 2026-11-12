@@ -620,27 +620,30 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
     // appending inside the microseconds between two statements. What is asserted is the ordinary
     // output; this is the reasoning, stated where the bound is.
     //
-    // `Err` carries the code the caller returns. A closed downstream pipe is an `Err(SUCCESS)`
-    // rather than a failure: Rust ignores `SIGPIPE`, so a reader that walked away (`… | head`)
-    // surfaces only as this write error, and ending the view here at exit 0 is what keeps a
-    // `--follow` from polling into a pipe nobody holds — the discipline `sbx fs logs`/`sbx logs`
-    // already state and act on.
+    // `Err` carries the code the caller returns. A write that fails ends the reading there, which
+    // is what keeps a `--follow` from polling into a pipe nobody holds, and is accounted for as
+    // every verb's unwritable output is (`crate::cli::note_output_failure`): a reader that walked
+    // away (`… | head`) leaves exit 0, since Rust ignores `SIGPIPE` and the write error is the only
+    // notice of it, and anything else, a full disk under `> file`, is said once and exits 1. A log
+    // that cannot be read is a failure of its own, named by its path.
+    let unreadable = |e: std::io::Error| {
+        diag::error(&format!(
+            "sbx: cannot read the session log {}: {e}",
+            path.display()
+        ));
+        ExitCode::FAILURE
+    };
     let stream_range = |at: u64, until: u64| -> Result<(), ExitCode> {
         use std::io::{Read as _, Seek as _};
-        let Ok(mut f) = std::fs::File::open(&path) else {
-            diag::error(&format!(
-                "sbx: cannot read the session log {}",
-                path.display()
-            ));
-            return Err(ExitCode::FAILURE);
-        };
-        if at > 0 && f.seek(std::io::SeekFrom::Start(at)).is_err() {
-            return Err(ExitCode::FAILURE);
+        let mut f = std::fs::File::open(&path).map_err(unreadable)?;
+        if at > 0 {
+            f.seek(std::io::SeekFrom::Start(at)).map_err(unreadable)?;
         }
-        let mut out = std::io::stdout();
-        std::io::copy(&mut f.take(until.saturating_sub(at)), &mut out)
-            .map(|_| ())
-            .map_err(|_| ExitCode::SUCCESS)
+        match copy_log(f.take(until.saturating_sub(at)), &mut std::io::stdout()) {
+            Ok(()) => Ok(()),
+            Err(CopyFailed::Read(e)) => Err(unreadable(e)),
+            Err(CopyFailed::Write(e)) => Err(undelivered(&e)),
+        }
     };
 
     // `--all` with no limit copies the whole file, so it needs no window at all — only the header
@@ -749,7 +752,7 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
             let mut out = std::io::stdout();
             out.write_all(body)
                 .and_then(|()| out.flush())
-                .map_err(|_| ExitCode::SUCCESS)
+                .map_err(|e| undelivered(&e))
         }
     };
     if let Err(code) = printed {
@@ -833,10 +836,11 @@ fn explain_missing_log(data_dir: &Path, id: u32, path: &Path) -> ExitCode {
 /// exits between the two would otherwise have them dropped. Sampling first means a drain that
 /// follows a dead reading has the complete final file in front of it.
 ///
-/// A drain that cannot deliver ends the follow, at exit 0: Rust ignores `SIGPIPE`, so a reader that
-/// walked away (`sbx session logs <id> -f | head`) is announced only by the write error, and
-/// discarding it left this loop opening the log, reading it and failing to write it every 250 ms
-/// until the detached session exited — with the user's shell held on the pipeline the whole time.
+/// A drain that cannot deliver ends the follow. Rust ignores `SIGPIPE`, so a reader that walked away
+/// (`sbx session logs <id> -f | head`) is announced only by the write error, and a loop that went on
+/// would open the log, read it and fail to write it every poll until the detached session exited,
+/// with the user's shell held on the pipeline the whole time. The failure is accounted for by
+/// [`undelivered`]: exit 0 for a reader gone, 1 for anything else.
 ///
 /// A registry that can no longer be read ends the follow at exit 1, after the drain that sample
 /// precedes: what the session wrote up to then is printed, and the follow does not go on waiting
@@ -845,8 +849,8 @@ fn follow_log(path: &Path, mut pos: u64, data_dir: &Path, id: u32) -> ExitCode {
     let mut out = std::io::stdout();
     loop {
         let live = session_is_live(data_dir, id);
-        if drain_log(path, &mut pos, &mut out).is_err() {
-            return ExitCode::SUCCESS;
+        if let Err(e) = drain_log(path, &mut pos, &mut out) {
+            return undelivered(&e);
         }
         match live {
             Ok(true) => {}
@@ -886,6 +890,45 @@ fn drain_log<W: std::io::Write>(path: &Path, pos: &mut u64, out: &mut W) -> std:
     out.flush()?;
     *pos += buf.len() as u64;
     Ok(())
+}
+
+/// The code a reading ends with once a write of the log to standard output has failed. The failure
+/// is accounted for as every verb's is ([`crate::cli::note_output_failure`]) and the reading stops
+/// there. [`crate::cli::output_verdict`] turns the success into exit 1, except for a reader that
+/// has gone.
+fn undelivered(e: &std::io::Error) -> ExitCode {
+    crate::cli::note_output_failure(e);
+    ExitCode::SUCCESS
+}
+
+/// Why [`copy_log`] stopped short, by the side that failed: the log and standard output fail for
+/// different reasons and are answered differently.
+#[derive(Debug)]
+enum CopyFailed {
+    Read(std::io::Error),
+    Write(std::io::Error),
+}
+
+/// Copy everything `src` yields to `out`, one [`LOG_CHUNK`] at a time, and flush it.
+///
+/// A read the kernel interrupted is retried. Any other failure is returned with the side it came
+/// from, which `std::io::copy` does not say: a log that cannot be read is a failure about the log,
+/// and a write that fails is accounted for as standard output's.
+fn copy_log<R: std::io::Read, W: std::io::Write>(
+    mut src: R,
+    out: &mut W,
+) -> Result<(), CopyFailed> {
+    let mut chunk = vec![0u8; LOG_CHUNK as usize];
+    loop {
+        let n = match src.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(CopyFailed::Read(e)),
+        };
+        out.write_all(&chunk[..n]).map_err(CopyFailed::Write)?;
+    }
+    out.flush().map_err(CopyFailed::Write)
 }
 
 #[cfg(test)]
@@ -1229,6 +1272,77 @@ mod tests {
         // A log that is not there is not a delivery failure: the follow keeps polling for it.
         let mut pos = 0u64;
         assert!(drain_log(&dir.join("no-such.log"), &mut pos, &mut ClosedPipe).is_ok());
+    }
+
+    /// A log that hands out its steps in order: bytes, or the error a read of it returns.
+    struct Scripted(std::collections::VecDeque<std::io::Result<&'static [u8]>>);
+
+    impl std::io::Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                None => Ok(0),
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(e)) => Err(e),
+            }
+        }
+    }
+
+    /// A stdout stand-in that takes every write and refuses the flush, the way a line-buffered
+    /// stdout on a full disk refuses the tail of a log that does not end in a newline.
+    struct Unflushable;
+
+    impl std::io::Write for Unflushable {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        }
+    }
+
+    /// A copy of the log says which side failed, which `std::io::copy` does not. A log that cannot be
+    /// read is a failure about the log, and a write that fails is standard output's, accounted for
+    /// by [`crate::cli::note_output_failure`], which exempts a reader gone and nothing else.
+    #[test]
+    fn a_copy_of_the_log_names_the_side_that_failed() {
+        let log = |steps: Vec<std::io::Result<&'static [u8]>>| Scripted(steps.into());
+        let interrupted = || std::io::Error::from(std::io::ErrorKind::Interrupted);
+
+        // Delivered whole, the interrupted read retried rather than ending the copy.
+        let mut sink: Vec<u8> = Vec::new();
+        let copied = copy_log(
+            log(vec![Ok(b"one\n"), Err(interrupted()), Ok(b"two\n")]),
+            &mut sink,
+        );
+        assert!(copied.is_ok(), "{copied:?}");
+        assert_eq!(sink, b"one\ntwo\n");
+
+        // The log fails: what came before it is delivered, and the failure is the read's.
+        let mut sink: Vec<u8> = Vec::new();
+        let copied = copy_log(
+            log(vec![Ok(b"one\n"), Err(std::io::Error::other("unreadable"))]),
+            &mut sink,
+        );
+        assert!(
+            matches!(&copied, Err(CopyFailed::Read(e)) if e.to_string() == "unreadable"),
+            "{copied:?}"
+        );
+        assert_eq!(sink, b"one\n");
+
+        // Standard output fails, on a write or on the flush that ends the copy.
+        let copied = copy_log(log(vec![Ok(b"one\n")]), &mut ClosedPipe);
+        assert!(
+            matches!(&copied, Err(CopyFailed::Write(e)) if e.kind() == std::io::ErrorKind::BrokenPipe),
+            "{copied:?}"
+        );
+        let copied = copy_log(log(vec![Ok(b"one")]), &mut Unflushable);
+        assert!(
+            matches!(&copied, Err(CopyFailed::Write(e)) if e.kind() == std::io::ErrorKind::StorageFull),
+            "{copied:?}"
+        );
     }
 
     /// A bare `--` ends the options rather than becoming a target. Ids are PIDs, so `--` can only

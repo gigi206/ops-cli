@@ -175,6 +175,15 @@ pub fn finish_within(cmd: &mut Command, limit: Duration) -> Option<ExitStatus> {
     }
 }
 
+/// The writing end of a pipe whose reading end is already closed, as one of a child's streams: the
+/// child's first write to it fails every time rather than by a race.
+pub fn closed_pipe() -> Stdio {
+    let (reader, writer) = std::io::pipe().expect("create a pipe");
+    // Closed before the child exists: a reading end still open would let the write succeed.
+    drop(reader);
+    writer.into()
+}
+
 /// Run `cmd` to its end with both streams captured, killing it once `limit` passes: `Some` with
 /// what it printed when it ended in time, `None` when it had to be killed.
 ///

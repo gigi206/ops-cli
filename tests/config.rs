@@ -10,6 +10,7 @@
 #[macro_use]
 mod common;
 use common::fixture::TmpDir;
+use common::procs::closed_pipe;
 use common::project::Project;
 
 use std::path::{Path, PathBuf};
@@ -6834,15 +6835,6 @@ fn every_listing_verb_that_offers_json_emits_a_document_even_when_empty() {
             )
         });
     }
-}
-
-/// The writing end of a pipe whose reading end is already closed, as one of a child's streams: the
-/// child's first write to it fails every time rather than by a race.
-fn closed_pipe() -> std::process::Stdio {
-    let (reader, writer) = std::io::pipe().expect("create a pipe");
-    // Closed before the child exists: a reading end still open would let the write succeed.
-    drop(reader);
-    writer.into()
 }
 
 /// Run `sbx <args>` with its standard output a [`closed_pipe`].

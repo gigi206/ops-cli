@@ -15,7 +15,8 @@ mod common;
 
 use common::fixture::TmpDir;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// A data directory with the log directory made: a fixture under the suites' own root, created
 /// afresh and removed when it drops ([`TmpDir`]), never a name in the shared temporary directory
@@ -336,4 +337,121 @@ fn a_header_stamp_the_agent_chose_cannot_stop_the_log_being_read() {
         "and nothing panicked: {}",
         err(&o)
     );
+}
+
+/// Start `sbx <args>` over `data` with standard output on `stdout`, a destination [`sbx_in`] cannot
+/// take since it pipes both streams itself, and standard error into the file `said`, which a test
+/// can read while the reading runs.
+fn spawn_onto(data: &Path, args: &[&str], stdout: Stdio, said: &Path) -> Child {
+    let said =
+        std::fs::File::create(said).unwrap_or_else(|e| panic!("create {}: {e}", said.display()));
+    Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(args)
+        .env("SBX_DATA_DIR", data)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(said)
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn `sbx {}`: {e}", args.join(" ")))
+}
+
+/// `child`'s exit status once it ends, or a failure naming `args` when it is still running 60 s on:
+/// a reading that goes on writing into an output that refuses it would otherwise hold the suite.
+fn reaped(mut child: Child, args: &[&str]) -> ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut status = None;
+    let ended = common::procs::wait_until(deadline, || {
+        status = child.try_wait().expect("wait for sbx");
+        status.is_some()
+    });
+    if !ended {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("`sbx {}` still runs 60 s on", args.join(" "));
+    }
+    status.expect("an ended child has a status")
+}
+
+/// A reading whose output cannot be written fails, said once, and one whose reader has gone does
+/// not, for each way the log reaches standard output: a copy of the file (`--all`), the window a
+/// plain reading prints, and a follow's drains. A full disk under `> file` leaves an incomplete log
+/// there, which a script reading the exit code has to learn; a reader gone, `… | head`, is the end
+/// of a pipeline the shell reports as fine. Every shape is run and the ones that fail are listed
+/// together, so each is held to its own write.
+///
+/// The follow's log holds only the header, so the reading before the follow writes nothing, and the
+/// line appended once the note is out reaches standard output through the follow alone: the note is
+/// said after the reading has fixed where the follow resumes. The session is this test's process,
+/// registered as running, so the follow does not end on an exited session before it writes.
+#[test]
+fn a_reading_it_cannot_write_fails_once_and_a_reader_gone_does_not() {
+    let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+        skip_incapable!(
+            "skipping a_reading_it_cannot_write_fails_once_and_a_reader_gone_does_not: no /dev/full here"
+        );
+        return;
+    };
+    // `write_session_record` takes the `XDG_DATA_HOME` the data directory sits in.
+    let root = TmpDir::prefixed("slogs", "unwritten");
+    let data = root.join("sbx");
+    std::fs::create_dir_all(data.join("logs")).expect("make the log directory");
+    let pid = std::process::id();
+    common::write_session_record(root.path(), pid, "project", Path::new("/p"));
+    let log = data.join("logs").join(format!("{pid}.log"));
+    let header = format!("=== sbx session {pid} started=1700000100 ===\n");
+    let said = root.join("stderr");
+    let id = pid.to_string();
+
+    let mut failed = Vec::new();
+    for (shape, args) in [
+        ("a copy of the file", vec!["session", "logs", &id, "--all"]),
+        ("the window", vec!["session", "logs", &id]),
+        ("a follow", vec!["session", "logs", &id, "-f"]),
+    ] {
+        let follow = args.contains(&"-f");
+        for (onto, stdout, code, told) in [
+            (
+                "a full disk",
+                Stdio::from(full.try_clone().expect("reopen /dev/full")),
+                1,
+                1,
+            ),
+            ("a closed pipe", common::procs::closed_pipe(), 0, 0),
+        ] {
+            let body = if follow { "" } else { NEW_BODY };
+            std::fs::write(&log, format!("{header}{body}")).expect("write the log");
+            let mut child = spawn_onto(&data, &args, stdout, &said);
+            if follow {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let noted = common::procs::wait_until(deadline, || {
+                    std::fs::read_to_string(&said).is_ok_and(|s| {
+                        s.split_inclusive('\n')
+                            .any(|l| l.starts_with("sbx: note: session") && l.ends_with('\n'))
+                    })
+                });
+                let note = std::fs::read_to_string(&said).unwrap_or_default();
+                if !noted || !note.contains(&format!("session {pid} — running")) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{shape} onto {onto} is not the follow of a running session: {note}");
+                }
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&log)
+                    .and_then(|mut f| f.write_all(b"after the note\n"))
+                    .expect("append to the log");
+            }
+            let status = reaped(child, &args);
+            let stderr = std::fs::read_to_string(&said).expect("read stderr");
+            let says = stderr.matches("cannot write to standard output").count();
+            if status.code() != Some(code) || says != told {
+                failed.push(format!(
+                    "{shape} onto {onto}: exit {status}, said {says} time(s), want exit {code} \
+                     said {told}:\n{stderr}"
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
