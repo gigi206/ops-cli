@@ -380,8 +380,10 @@ pub(crate) fn nvidia_bridge_in(root: &Path) -> Option<NvidiaBridge> {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             // Only NVIDIA's own declarations: the directory is shared, and another vendor's
-            // platform has no business entering a cage on the GPU flag's account.
-            if name.contains("nvidia") && name.ends_with(".json") {
+            // platform has no business entering a cage on the GPU flag's account. And only one that
+            // leads to a file, as the vendor declaration and the Vulkan manifest are held to: a
+            // dangling link bound read-only would fail every launch rather than lose one platform.
+            if name.contains("nvidia") && name.ends_with(".json") && entry.path().exists() {
                 platforms.push((entry.path(), cage_platforms.join(name)));
             }
         }
@@ -986,6 +988,34 @@ mod tests {
                 "libnvidia-ptxjitcompiler.so.1"
             ],
             "the driver's shared objects, and nothing the CUDA toolkit installed beside them"
+        );
+    }
+
+    /// A platform declaration that is a dangling link is left out, as a missing vendor declaration
+    /// or Vulkan manifest is: bound read-only, its absent source would fail every `gpu = true`
+    /// launch instead of costing the one platform.
+    #[test]
+    fn a_dangling_platform_declaration_is_not_bound() {
+        let root = crate::testutil::TmpDir::new();
+        let dir = root.join("usr/lib/x86_64-linux-gnu");
+        std::fs::create_dir_all(&dir).expect("stage the driver directory");
+        std::fs::write(dir.join("libEGL_nvidia.so.0"), b"").expect("stage the vendor");
+        let platforms = root.join("usr/share/egl/egl_external_platform.d");
+        std::fs::create_dir_all(&platforms).expect("stage the platform directory");
+        std::fs::write(platforms.join("10_nvidia_wayland.json"), b"{}").expect("stage one");
+        std::os::unix::fs::symlink(
+            "/nonexistent/15_nvidia_gbm.json",
+            platforms.join("15_nvidia_gbm.json"),
+        )
+        .expect("stage a dangling one");
+
+        let bridge = nvidia_bridge_in(root.path()).expect("the vendor library makes it a bridge");
+        let bound: Vec<PathBuf> = bridge.platforms.into_iter().map(|(_, dest)| dest).collect();
+        assert_eq!(
+            bound,
+            [PathBuf::from(
+                "/run/sbx-nvidia/egl_external_platform.d/10_nvidia_wayland.json"
+            )]
         );
     }
 
