@@ -6,12 +6,14 @@
 //! source carries no release and is refused, and so is a binary its user cannot replace: the Lima
 //! guest's, which provisioning installs as root, or one a package manager placed.
 //!
-//! The steps are `install.sh`'s, through the fetcher sbx already drives. The `.sha256` published
-//! beside the asset is read first, always afresh, since a rolling tag keeps its address while its
+//! The steps are `install.sh`'s, through the fetcher sbx already drives, and a check before the
+//! rename that the script does not make. The `.sha256` published beside the asset is read first, always afresh, since a rolling tag keeps its address while its
 //! content changes. When it names the bytes running now, nothing is downloaded. Otherwise the asset
 //! is fetched into sbx's store with that digest handed to nix, so a mismatched download never lands.
 //! Its copy is written beside the binary, run once with `--version`, and renamed over it only if
-//! that run succeeds within a deadline: a binary that cannot run here never replaces one that can.
+//! that run succeeds within a deadline and names the release it was fetched from: a binary that
+//! cannot run here never replaces one that can, and the next upgrade, which follows the release
+//! the binary names, neither moves to another release nor finds none to follow.
 //!
 //! What the checksum proves is integrity, not authenticity. It comes from the same release as the
 //! binary, so it catches a download corrupted or cut short, not a release that was tampered with,
@@ -303,7 +305,16 @@ fn upgrade(run: &Upgrade) -> Result<Outcome, String> {
     };
     let mut to = String::new();
     atomicfile::write_atomic_checked(run.target, &bytes, Some(mode), |staged| {
-        to = version_of(staged, run.version_deadline)?;
+        let line = version_of(staged, run.version_deadline)?;
+        // The next `upgrade self` follows the release the new binary names. One that names none is
+        // refused as a build from source, one that names another rolling tag moves to that tag, and
+        // one that names an older version fetches this same release again on every run.
+        if release::tag_of(&line) != Some(tag.as_str()) {
+            return Err(io::Error::other(format!(
+                "the downloaded binary reports `{line}`, which is not a build published as `{tag}`"
+            )));
+        }
+        to = line;
         Ok(())
     })
     .map_err(|e| format!("{} was left as it was: {e}", run.target.display()))?;
@@ -698,6 +709,37 @@ mod tests {
                 failures.push(format!(
                     "{shape} removed: {outcome:?}, file back: {put_back}, directory back: {dir_back}"
                 ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// The new binary must name the release it was fetched from, exactly, since the next upgrade
+    /// follows the release it names. A build from source, another rolling tag, an older version and
+    /// a tag that only begins with the one fetched are each refused, and none replaces the binary.
+    /// Every shape is checked before the verdict.
+    #[test]
+    fn a_build_that_names_another_release_never_replaces_the_binary() {
+        let api = r#"{"tag_name":"v2.0.0"}"#;
+        let mut failures = Vec::new();
+        for (shape, fetched_for, reports) in [
+            ("a build from source", "latest", "sbx 0.1.0"),
+            (
+                "another rolling tag",
+                "latest",
+                "sbx 0.1.0 (nightly, 1111111)",
+            ),
+            ("an older version", "v1.9.0", "sbx 0.1.0 (v1.9.0, 2222222)"),
+            ("a longer tag", "v1.9.0", "sbx 0.1.0 (v2.0.0-rc1, 2222222)"),
+        ] {
+            let served = binary(reports, 0);
+            let bench = Bench::new(&served, &format!("{}  {}\n", sha256(&served), asset()), api);
+            let outcome = bench.run(fetched_for);
+            let kept = std::fs::read_to_string(&bench.target).unwrap();
+            let refused = matches!(&outcome, Err(why)
+                if why.contains("which is not a build published as") && why.contains("was left as it was"));
+            if !refused || kept != "the old binary" || left_alone(&bench) != ["sbx"] {
+                failures.push(format!("{shape}: {outcome:?}, the target holds {kept:?}"));
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");

@@ -81,8 +81,12 @@ const fn stamp(
 /// The line `sbx --version` prints: the crate's version, then the release's tag and commit when
 /// the build was published.
 pub(crate) fn version_line() -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    match PUBLISHED {
+    line_of(env!("CARGO_PKG_VERSION"), PUBLISHED)
+}
+
+/// The version line of a build of `version`, published as `release` or, for `None`, from source.
+fn line_of(version: &str, release: Option<Release>) -> String {
+    match release {
         Some(release) => format!(
             "sbx {version} ({}, {})",
             release.tag,
@@ -90,6 +94,15 @@ pub(crate) fn version_line() -> String {
         ),
         None => format!("sbx {version}"),
     }
+}
+
+/// The release tag a version line names, read back from the form [`version_line`] writes: `None`
+/// for a build from source, and for a line of any other shape.
+pub(crate) fn tag_of(line: &str) -> Option<&str> {
+    let (version, release) = line.strip_prefix("sbx ")?.split_once(" (")?;
+    let (tag, rev) = release.strip_suffix(')')?.split_once(", ")?;
+    let one_word = !version.is_empty() && !version.contains(' ');
+    (one_word && is_tag(tag) && is_hex(rev, 7)).then_some(tag)
 }
 
 /// A byte a tag or a repository name may carry, the set GitHub allows in both.
@@ -218,6 +231,32 @@ mod tests {
         assert_eq!(release("v2.0.0-rc1").channel(), Channel::Stable);
         assert_eq!(release("latest").channel(), Channel::Rolling("latest"));
         assert_eq!(release("nightly").channel(), Channel::Rolling("nightly"));
+    }
+
+    /// The tag is read back exactly from the line [`version_line`] writes, and from nothing else: a
+    /// build from source names none, and neither does a line of another shape.
+    #[test]
+    fn the_tag_is_read_back_from_the_version_line_and_from_nothing_else() {
+        let release = |tag| Release {
+            tag,
+            commit: COMMIT,
+            repo: "gigi206/ops-cli",
+        };
+        for tag in ["latest", "nightly", "v2.0.0", "v2.0.0-rc1"] {
+            assert_eq!(tag_of(&line_of("0.1.0", Some(release(tag)))), Some(tag));
+        }
+        assert_eq!(tag_of(&line_of("0.1.0", None)), None);
+        for line in [
+            "sbx 0.1.0 (latest, 0a9ad1c) and more",
+            "sbx 0.1.0 (latest)",
+            "sbx 0.1.0 (latest, 0a9ad1)",
+            "sbx 0.1.0 (../x, 0a9ad1c)",
+            "sbx (latest, 0a9ad1c)",
+            "sbx 0.1.0 and more (latest, 0a9ad1c)",
+            "other 0.1.0 (latest, 0a9ad1c)",
+        ] {
+            assert_eq!(tag_of(line), None, "{line}");
+        }
     }
 
     #[test]
