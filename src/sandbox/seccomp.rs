@@ -1388,7 +1388,13 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn run_probe(policy: &SeccompPolicy, probe: &str) -> Option<String> {
         use std::path::PathBuf;
-        let bwrap = sandbox_prereq()?;
+        // Every reason to skip is said here, where the four callers' bare `return` cannot.
+        let Some(bwrap) = sandbox_prereq() else {
+            skip_incapable!(
+                "skipping seccomp cage test: no bwrap or no capability-bearing user namespace"
+            );
+            return None;
+        };
         if !PathBuf::from("/usr/bin/python3").exists() {
             skip_incapable!("skipping seccomp cage test: no /usr/bin/python3 for the probe");
             return None;
