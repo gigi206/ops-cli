@@ -1983,11 +1983,11 @@ pub(super) const PAGES: &[Page] = &[
             one. The checksum published beside the binary is read first, and when it names the\n\
             binary running now nothing is downloaded. Otherwise the new binary is downloaded with\n\
             that digest enforced, run once with `--version`, and renamed over the old one only if\n\
-            it runs. The checksum comes from the same release, so it proves the download whole,\n\
-            not the release genuine. A build from source has no release and is refused, as is a\n\
-            binary in a directory you cannot write: replace that one the way it was installed.\n\
-            Sessions already running keep the sbx they started with until they end. `all` never\n\
-            includes `self`, and `self` takes neither `--app` nor `--project`.\n\
+            it runs within 30 seconds. The checksum comes from the same release, so it proves the\n\
+            download whole, not the release genuine. A build from source has no release and is\n\
+            refused, as is a binary in a directory you cannot write: replace that one the way it\n\
+            was installed. Sessions already running keep the sbx they started with until they\n\
+            end. `all` never includes `self`, and `self` takes neither `--app` nor `--project`.\n\
             \n\
             `-n, --dry-run` RESOLVES EVERY CHANNEL THE ROLL WOULD AND WRITES NO LOCK, and nothing\n\
             is installed or downloaded. It takes the same target, `--app` and\n\
