@@ -9,8 +9,9 @@
 //! past what this socket's send buffer lets one message hold, crosses instead in an anonymous
 //! in-memory file handed as the message's first descriptor: a message is bounded by that buffer, and
 //! the bound must not become one on a policy or a credential set. The descriptors the message hands
-//! over follow, and the proxy receives each close-on-exec. More than the kernel passes in one
-//! message is refused whole, never cut.
+//! over follow, and the proxy receives each close-on-exec. More than [`MAX_HANDED`], one fewer than
+//! the kernel passes in a message so that the file always has its place, are refused whole before
+//! anything is sent, never cut.
 //!
 //! **Up, from the proxy**: the document alone, at most [`MAX_UP`] bytes, and never a descriptor.
 //! Once the proxy runs apart it may be what an attacker controls, so the supervisor reads with no
@@ -38,6 +39,12 @@ pub(in crate::sandbox::proxy) const MAX_UP: usize = 192 * 1024;
 /// The most descriptors the kernel passes in one message (`SCM_MAX_FD`), and so the room the proxy
 /// keeps for them.
 const MAX_FDS: usize = 253;
+
+/// The most descriptors a message from the supervisor hands over, whichever way its document
+/// crosses: one fewer than the kernel passes, because a document the message cannot hold takes the
+/// first place for the file it crosses in. Held to on both paths, so whether a set of descriptors
+/// crosses never depends on how long the document beside it is.
+pub(in crate::sandbox::proxy) const MAX_HANDED: usize = MAX_FDS - 1;
 
 /// The tag of a message whose document follows it.
 const INLINE: u8 = 0;
@@ -145,12 +152,22 @@ impl Socket {
     }
 
     /// Send `doc` to the proxy, handing over `fds` with it: in the message itself when it fits, in a
-    /// file otherwise.
+    /// file otherwise. More than [`MAX_HANDED`] descriptors are refused before anything is sent.
     pub(in crate::sandbox::proxy) fn send_down(
         &self,
         doc: &[u8],
         fds: &[OwnedFd],
     ) -> io::Result<()> {
+        if fds.len() > MAX_HANDED {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "link: a message handing over {} descriptors, more than the {MAX_HANDED} the \
+                     link carries",
+                    fds.len()
+                ),
+            ));
+        }
         let handed: Vec<RawFd> = fds.iter().map(AsRawFd::as_raw_fd).collect();
         if doc.len() <= INLINE_MAX {
             match self.send(&[&[INLINE], doc], &handed) {
@@ -623,17 +640,34 @@ mod tests {
     }
 
     /// More descriptors than one message carries are refused whole, and nothing crosses: a set is
-    /// never handed over with part of its plugins.
+    /// never handed over with part of its plugins. The bound is the same whether the document rides
+    /// in the message or in a file: [`MAX_HANDED`] cross either way, and one more is refused either
+    /// way.
     #[test]
     fn more_descriptors_than_a_message_carries_are_refused_whole() {
         let (supervisor, proxy) = Socket::pair().unwrap();
         let (_read, write) = pipe();
-        let many: Vec<OwnedFd> = (0..=MAX_FDS).map(|_| write.try_clone().unwrap()).collect();
-        let e = supervisor.send_down(b"{}", &many).unwrap_err();
-        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
-        supervisor.send_down(b"{\"next\":1}", &many[..1]).unwrap();
-        let (doc, fds) = proxy.recv_down().unwrap().unwrap();
-        assert_eq!((doc.as_slice(), fds.len()), (&b"{\"next\":1}"[..], 1));
+        let many: Vec<OwnedFd> = (0..=MAX_HANDED)
+            .map(|_| write.try_clone().unwrap())
+            .collect();
+        let in_file = vec![b' '; INLINE_MAX + 1];
+        for doc in [&b"{}"[..], &in_file[..]] {
+            let e = supervisor.send_down(doc, &many).unwrap_err();
+            assert_eq!(
+                e.kind(),
+                io::ErrorKind::InvalidInput,
+                "{} bytes: {e}",
+                doc.len()
+            );
+            supervisor.send_down(doc, &many[..MAX_HANDED]).unwrap();
+            let (got, fds) = proxy.recv_down().unwrap().unwrap();
+            assert_eq!(
+                (got.len(), fds.len()),
+                (doc.len(), MAX_HANDED),
+                "{} bytes",
+                doc.len()
+            );
+        }
     }
 
     /// A send that finds no room within its wait fails rather than blocks: the supervisor is not held

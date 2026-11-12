@@ -1209,6 +1209,9 @@ pub(crate) struct CredentialRefresh {
     /// How long a signer plugin a re-resolution replaced is kept: [`RETIRE_AFTER`], shorter only in
     /// a test that waits for one to go.
     retire_after: std::time::Duration,
+    /// The most signers a set may name and still cross to the proxy: what one message of the link
+    /// hands over ([`super::link::wire::MAX_HANDED`]), lower only in a test.
+    handed_max: usize,
 }
 
 /// How long a signer plugin a re-resolution replaced is kept alive after it.
@@ -1250,6 +1253,7 @@ impl CredentialRefresh {
             needles: None,
             gap: MIN_REFRESH_GAP,
             retire_after: RETIRE_AFTER,
+            handed_max: super::link::wire::MAX_HANDED,
         }
     }
 
@@ -1322,11 +1326,12 @@ impl CredentialRefresh {
         if let Some(shared) = &self.needles {
             crate::sandbox::notify_sink::publish_needles(shared, &needles);
         }
-        // Installed only once it is known to make the crossing the proxy's copy makes: a set that
-        // cannot cross is installed in neither copy, and the one in force stays, which is the
-        // direction a failing source already takes. The supervisor keeps the set itself, not the
-        // crossed one: its signers are the running plugins, and the crossed set holds conversations
-        // with them, which would leave nothing keeping a plugin alive.
+        // Installed only once it is known to make the crossing the proxy's copy makes, in the one
+        // message of the link that carries it: a set that cannot cross is installed in neither
+        // copy, and the one in force stays, which is the direction a failing source already takes.
+        // The supervisor keeps the set itself, not the crossed one: its signers are the running
+        // plugins, and the crossed set holds conversations with them, which would leave nothing
+        // keeping a plugin alive.
         let set = CredentialSet {
             injections,
             needles,
@@ -1334,7 +1339,19 @@ impl CredentialRefresh {
         let handed = match set
             .encode()
             .and_then(|handed| set.encode().and_then(CredentialSet::decode).map(|_| handed))
-        {
+            .and_then(|handed| {
+                if handed.handed() > self.handed_max {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "the set names {} signers, more than the {} one message hands over",
+                            handed.handed(),
+                            self.handed_max
+                        ),
+                    ));
+                }
+                Ok(handed)
+            }) {
             Ok(handed) => handed,
             Err(e) => {
                 // Redacted against the values just resolved as well as the ones in force: the
@@ -1386,6 +1403,14 @@ impl CredentialRefresh {
     #[cfg(test)]
     pub(crate) fn with_retire_after(mut self, after: std::time::Duration) -> Self {
         self.retire_after = after;
+        self
+    }
+
+    /// Lower how many signers a set may name and still cross, so a test can pass the bound with a
+    /// few plugins rather than the hundreds a message carries.
+    #[cfg(test)]
+    pub(crate) fn with_handed_max(mut self, max: usize) -> Self {
+        self.handed_max = max;
         self
     }
 }
@@ -2855,6 +2880,42 @@ mod tests {
     ) {
         let (process, plugin) = crate::sandbox::signer::SignerProcess::stand_in(&["Authorization"]);
         (Arc::new(process), plugin)
+    }
+
+    /// A re-resolved set naming more signers than one message of the link hands over is installed
+    /// in neither copy: the set in force stays, as it does for a set that does not encode, rather
+    /// than be replaced in the supervisor's copy while the proxy, answered with nothing, keeps the
+    /// one it has. The same set within the bound is installed, so the bound is what refused it.
+    #[test]
+    fn a_re_resolved_set_too_many_signers_to_cross_is_installed_in_neither_copy() {
+        // A launch's refresh is held to the link's own bound; the knob below only lowers it.
+        let launched = CredentialRefresh::new(
+            Arc::new(default_creds(Vec::new(), Vec::new())),
+            Box::new(|_| Ok((vec![injection("Bearer new")], Vec::new()))),
+        );
+        assert_eq!(launched.handed_max, super::super::link::wire::MAX_HANDED);
+        let (process, _plugin) = stand_in();
+        for (max, crosses) in [(0, false), (1, true)] {
+            let creds = Arc::new(default_creds(vec![injection("Bearer old")], Vec::new()));
+            let signer = Arc::clone(&process);
+            let refresh = CredentialRefresh::new(
+                creds.clone(),
+                Box::new(move |_| {
+                    Ok((
+                        vec![injection("Bearer new"), signed_by(&signer, "the-key")],
+                        Vec::new(),
+                    ))
+                }),
+            )
+            .with_handed_max(max);
+            assert_eq!(refresh.on_refusal(), crosses, "a bound of {max}");
+            let kept = if crosses { "Bearer new" } else { "Bearer old" };
+            assert_eq!(
+                creds.snapshot().injections[0].value(),
+                kept,
+                "a bound of {max}"
+            );
+        }
     }
 
     /// A re-resolution that rotates one credential and keeps a signer keeps the signer's running

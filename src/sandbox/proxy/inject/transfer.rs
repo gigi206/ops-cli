@@ -45,6 +45,11 @@ impl Transfer {
     pub(in crate::sandbox::proxy) fn from_parts(bytes: Vec<u8>, signers: Vec<OwnedFd>) -> Self {
         Transfer { bytes, signers }
     }
+
+    /// How many descriptors this state hands over: one per running signer.
+    pub(in crate::sandbox::proxy) fn handed(&self) -> usize {
+        self.signers.len()
+    }
 }
 
 impl CredentialSet {
