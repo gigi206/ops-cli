@@ -94,17 +94,106 @@ pub(crate) fn home_src(data_dir: &Path, cwd: &Path, runtime: Runtime) -> io::Res
     Ok(project_runtime(data_dir, &project, runtime).home_src)
 }
 
-/// A collision-resistant directory name for a canonical project path, stable within a given binary
-/// build. Housekeeping hashes a running session's recorded canonical path with this to match it
-/// against a runtime tree's id, so it can skip a tree a live session still holds. The hash is
-/// `DefaultHasher`, whose output std does not guarantee equal across toolchain/std versions, so a
-/// future build could re-key a project's trees (GC/re-seed heals the orphaned ones); switch to a
-/// specified hash here if cross-build stability is ever required.
+/// A collision-resistant directory name for a canonical project path. A project's runtime tree —
+/// its home, its store, its pin locks — sits under `<data>/projects/<id>/`, and housekeeping hashes
+/// a running session's recorded canonical path with this to match it against a tree, so it can skip
+/// a tree a live session still holds.
+///
+/// Both need the same id from every build of sbx. An id that moved would leave each project's home
+/// and store behind under the old one, and would read a session a previous binary started as holding
+/// no tree: `sbx projects rm` would remove the tree it runs in, and `sbx gc --all` would no longer
+/// count it among the holders of the distribution tree it runs from. The
+/// derivation is therefore written out here rather than taken from `DefaultHasher`, whose algorithm
+/// std leaves unspecified and whose hashes it says not to rely on across releases: SipHash-1-3 under
+/// the zero key ([`siphash13`]) over the bytes std's `impl Hash for Path` hands a hasher on Unix
+/// ([`path_hash_input`]), which is the derivation the existing trees are keyed by.
 pub(crate) fn project_id(project: &Path) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    project.hash(&mut h);
-    format!("{:016x}", h.finish())
+    use std::os::unix::ffi::OsStrExt;
+    format!(
+        "{:016x}",
+        siphash13(&path_hash_input(project.as_os_str().as_bytes()))
+    )
+}
+
+/// The bytes std's `impl Hash for Path` writes to a hasher on Unix, in order: each component between
+/// separators — leaving out a `.` that follows a separator, as [`Path::components`] does — and then
+/// a mix of the components' lengths, as eight little-endian bytes. A hasher that streams, as SipHash
+/// does, gives the same value for those writes as for their concatenation, so one buffer stands for
+/// them.
+fn path_hash_input(bytes: &[u8]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(bytes.len() + 8);
+    // Mixed in after the components so that `["foo", "bar"]` and `["foobar"]`, which write the same
+    // bytes, still hash apart.
+    let mut lengths: u64 = 0;
+    let mut take = |piece: &[u8], input: &mut Vec<u8>| {
+        lengths = lengths.wrapping_add(piece.len() as u64).rotate_right(2);
+        input.extend_from_slice(piece);
+    };
+    let mut start = 0;
+    for (at, &byte) in bytes.iter().enumerate() {
+        if byte != b'/' {
+            continue;
+        }
+        if at > start {
+            take(&bytes[start..at], &mut input);
+        }
+        start = at + 1;
+        if matches!(&bytes[start..], [b'.'] | [b'.', b'/', ..]) {
+            start += 1;
+        }
+    }
+    if start < bytes.len() {
+        take(&bytes[start..], &mut input);
+    }
+    input.extend_from_slice(&lengths.to_le_bytes());
+    input
+}
+
+/// SipHash-1-3 of `input` under the zero key: one round per eight-byte word, read little-endian,
+/// then a last word holding the remaining bytes with the input's length in its top byte, then three
+/// rounds to finish.
+fn siphash13(input: &[u8]) -> u64 {
+    // SipHash's initialisation constants, each XORed with a key half, which is zero here.
+    let mut v = [
+        0x736f_6d65_7073_6575_u64,
+        0x646f_7261_6e64_6f6d,
+        0x6c79_6765_6e65_7261,
+        0x7465_6462_7974_6573,
+    ];
+    let absorb = |v: &mut [u64; 4], word: u64| {
+        v[3] ^= word;
+        sip_round(v);
+        v[0] ^= word;
+    };
+    let (words, rest) = input.as_chunks::<8>();
+    for word in words {
+        absorb(&mut v, u64::from_le_bytes(*word));
+    }
+    let mut last = (input.len() as u64 & 0xff) << 56;
+    for (at, &byte) in rest.iter().enumerate() {
+        last |= u64::from(byte) << (8 * at);
+    }
+    absorb(&mut v, last);
+    v[2] ^= 0xff;
+    for _ in 0..3 {
+        sip_round(&mut v);
+    }
+    v[0] ^ v[1] ^ v[2] ^ v[3]
+}
+
+/// One SipRound over the state `v0, v1, v2, v3`.
+fn sip_round(v: &mut [u64; 4]) {
+    let [v0, v1, v2, v3] = v;
+    *v0 = v0.wrapping_add(*v1);
+    *v2 = v2.wrapping_add(*v3);
+    *v1 = v1.rotate_left(13) ^ *v0;
+    *v3 = v3.rotate_left(16) ^ *v2;
+    *v0 = v0.rotate_left(32);
+    *v2 = v2.wrapping_add(*v1);
+    *v0 = v0.wrapping_add(*v3);
+    *v1 = v1.rotate_left(17) ^ *v2;
+    *v3 = v3.rotate_left(21) ^ *v0;
+    *v2 = v2.rotate_left(32);
 }
 
 /// The stable per-project identity sbx keys runtime state on. The writable home,

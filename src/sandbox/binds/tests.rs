@@ -3738,3 +3738,52 @@ fn an_image_link_is_read_inside_the_image_not_followed_onto_the_host() {
         0
     );
 }
+
+/// A project's id is the one its runtime trees are keyed by, from every build of sbx: each value here
+/// is the id of that path, and an id that moved would leave the project's home and store behind under
+/// the old one. The shapes reach every branch of the derivation: no component at all; a component
+/// shorter than, as long as and longer than a word; the separators and `.` components
+/// [`Path::components`] normalises away, so those paths take their normal form's id; a leading `.`
+/// and a `..`, which it keeps; bytes that are not UTF-8; and inputs leaving each remainder of the
+/// last word.
+#[test]
+fn a_project_id_is_the_one_its_trees_are_keyed_by() {
+    use std::os::unix::ffi::OsStrExt;
+    let ids: [(&[u8], &str); 21] = [
+        (b"", "bd60acb658c79e45"),
+        (b"/", "bd60acb658c79e45"),
+        (b"/./", "bd60acb658c79e45"),
+        (b"/a", "5efaa56e1b6d9df7"),
+        (b"/abc", "fcf027d6dad579dd"),
+        (b"/abcd", "1f2f7f9cbe7e67b6"),
+        (b"/abcdef", "e2d8f41960b63de1"),
+        (b"/abcdefg", "0c656aa45f549da6"),
+        (b"/abcdefgh", "96cad2b25f415214"),
+        (b"/home/user/work/app", "196dfc327e55d48e"),
+        (b"/home/user/work/app/", "196dfc327e55d48e"),
+        (b"//home//user/work//app", "196dfc327e55d48e"),
+        (b"/home/./user/work/app/.", "196dfc327e55d48e"),
+        (b"./home", "42edd1f794638dd0"),
+        (b"home/user", "286a00f6fcc9175b"),
+        (b"/home/../user", "4b9966bc916c0470"),
+        (b"/..", "194f230b041e7602"),
+        (b"/srv/caf\xe9/\xff\xfe", "00412b0861471e02"),
+        (
+            b"/a/bb/ccc/dddd/eeeee/ffffff/ggggggg/hhhhhhhh/iiiiiiiii",
+            "e531f199a736d641",
+        ),
+        (b"/x/.hidden/..dots/.../y", "e4151b36e6dc7972"),
+        (
+            b"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-some-package-with-a-long-name-1.2.3/share",
+            "3e7d702b9c314d05",
+        ),
+    ];
+    for (path, id) in ids {
+        assert_eq!(
+            project_id(Path::new(std::ffi::OsStr::from_bytes(path))),
+            id,
+            "the id of `{}` moved",
+            String::from_utf8_lossy(path)
+        );
+    }
+}
