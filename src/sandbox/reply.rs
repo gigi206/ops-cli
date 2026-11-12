@@ -17,8 +17,9 @@
 //!
 //! The verbs that act (an answer to a parked request, a remembered rule, a stop) may already have
 //! landed by the time their answer is cut, so each of their readers says what it makes of a missing
-//! reply. The exec plane's `ALLOW *` and `DENY *` read their many-line answer through [`answer`] all
-//! the same, and take the cut as the error that says what was decided is not known.
+//! reply. The `ALLOW *` and `DENY *` of the exec plane and of the egress plane read their many-line
+//! answer through [`answer`] all the same, and take the cut as the error that says what was decided
+//! is not known.
 
 use std::io::{self, BufRead};
 

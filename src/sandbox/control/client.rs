@@ -726,6 +726,8 @@ fn parse_answer_reply(line: &str) -> AnswerOutcome {
 /// verdict. With `remember`, a trailing `session` token also records the decision as a live manual
 /// rule (so the same request is not re-asked this session). A missing socket / dead session surfaces
 /// as a connect error; a live session that has no such request returns [`AnswerOutcome::NotFound`].
+/// One whose answer ends before it is given is an [`io::ErrorKind::UnexpectedEof`] error, since
+/// the verdict may have landed by then.
 ///
 /// `incarnation` is the tag the id carried, sent on as `inc=<ticks>`. The server answers nothing
 /// but [`AnswerOutcome::NotFound`] when it is not its own, which is what stops a verdict aimed at a
@@ -757,6 +759,15 @@ pub(crate) fn answer_request(
     (&stream).flush()?;
     let mut response = String::new();
     let n = BufReader::new((&stream).take(REPLY_MAX)).read_line(&mut response)?;
+    // A server writes a line for every answer it gives, so a stream that ends before one is an
+    // answer cut short ([`crate::sandbox::reply`]): the verdict may have landed, and a request it
+    // does not have is not what the caller can be told.
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the session's answer ended before it was given",
+        ));
+    }
     // If the reply filled the bound with no terminating newline it was truncated — refuse to parse a
     // partial host (which `--save` would persist as a wrong rule) and report it as not answered.
     if n as u64 >= REPLY_MAX && !response.ends_with('\n') {
@@ -786,7 +797,8 @@ pub(crate) enum DrainOutcome {
 /// also records each as a live manual rule. An empty queue is `Drained(vec![])`; a control server too
 /// old to know `ALLOW *` (it replies `err …`) is `Unsupported` — distinct from a clean empty drain,
 /// so the caller can tell "nothing parked" from "this session predates --all". A connect error (the
-/// session is gone, or a stale socket) propagates so the caller skips that session.
+/// session is gone, or a stale socket) propagates, and so does an answer cut before its `ok`, after
+/// which what the session answered is not known.
 pub(crate) fn drain_session(
     data_dir: &Path,
     pid: u32,
@@ -806,11 +818,12 @@ pub(crate) fn drain_session(
     (&stream).write_all(cmd.as_bytes())?;
     (&stream).flush()?;
     let mut hosts = Vec::new();
-    for line in BufReader::new(&stream).lines() {
+    // Read whole or not at all ([`crate::sandbox::reply::answer`]): an answer that ends before its
+    // `ok` was cut, and some of the parked requests may have been answered by then, so the cut is
+    // the error that says what was answered is not known rather than a short list read as all there
+    // was.
+    for line in crate::sandbox::reply::answer(BufReader::new(&stream)) {
         let line = line?;
-        if line == "ok" {
-            return Ok(DrainOutcome::Drained(hosts));
-        }
         if let Some(host) = line.strip_prefix("answered host=") {
             hosts.push(host.to_string());
         } else if line == super::UNCONFIRMED {
@@ -821,8 +834,6 @@ pub(crate) fn drain_session(
             return Ok(DrainOutcome::Unsupported);
         }
     }
-    // EOF without a terminating `ok` (defensive — a current server always closes with `ok`): report
-    // what we collected rather than inventing an error.
     Ok(DrainOutcome::Drained(hosts))
 }
 
@@ -1061,6 +1072,58 @@ mod tests {
         std::fs::write(control_socket(data.path(), 7), b"").unwrap();
         let _listener = UnixListener::bind(control_socket(data.path(), 9)).unwrap();
         assert_eq!(session_pids(data.path()), vec![9]);
+    }
+
+    /// A verdict whose answer ends before it is complete is an error that says the session did not
+    /// answer in full, never an answer: a drain cut before its `ok` may have answered more than
+    /// arrived, and an answer by id that ends before its line would read as a request the session
+    /// does not have. A drain cut inside a character is that cut too.
+    #[test]
+    fn a_verdict_answer_cut_short_is_an_error_and_not_an_answer() {
+        let data = crate::testutil::TmpDir::new();
+        std::fs::create_dir(control_dir(data.path())).unwrap();
+        // One connection to `pid`, answered with `reply` once its command is read, then closed.
+        let serve = |pid: u32, reply: &'static [u8]| {
+            let listener = UnixListener::bind(control_socket(data.path(), pid)).unwrap();
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                (&stream).write_all(reply).unwrap();
+            })
+        };
+        let mut taken_as_answers = Vec::new();
+        for (pid, reply) in [
+            (11, &b"answered host=a.test\n"[..]),
+            (12, &b"answered host=a.test\nanswered host=b.t\xc3"[..]),
+        ] {
+            let server = serve(pid, reply);
+            let reply = String::from_utf8_lossy(reply);
+            let drained = drain_session(data.path(), pid, Verdict::Allow, false);
+            server.join().unwrap();
+            match drained {
+                Err(e) if crate::sandbox::reply::unanswered(&e) => {}
+                Err(e) => taken_as_answers.push(format!("drain {reply:?}: {e} ({:?})", e.kind())),
+                Ok(DrainOutcome::Drained(hosts)) => {
+                    taken_as_answers.push(format!("drain {reply:?}: drained {hosts:?}"))
+                }
+                Ok(_) => taken_as_answers.push(format!("drain {reply:?}: another outcome")),
+            }
+        }
+        let server = serve(13, b"");
+        let answered = answer_request(data.path(), 13, 1, None, Verdict::Allow, false);
+        server.join().unwrap();
+        match answered {
+            Err(e) if crate::sandbox::reply::unanswered(&e) => {}
+            Err(e) => taken_as_answers.push(format!("by id: {e} ({:?})", e.kind())),
+            Ok(AnswerOutcome::NotFound) => taken_as_answers.push("by id: not found".into()),
+            Ok(_) => taken_as_answers.push("by id: another outcome".into()),
+        }
+        assert!(
+            taken_as_answers.is_empty(),
+            "an answer cut short must be the error that says so:\n{}",
+            taken_as_answers.join("\n")
+        );
     }
 
     /// A `LOG` answered with an `err` line is an error, never an empty log whose `head` of 0 would
