@@ -3235,6 +3235,67 @@ fn a_one_request_leg_states_its_own_close_over_an_upstream_that_offered_reuse() 
     );
 }
 
+/// A status line with no status code the grammar reads leaves neither leg reusable.
+///
+/// The code is what says whether a response has a body at all, so without one sbx frames the
+/// message by its headers alone, while a client reading the grammar refuses the line. Each shape
+/// below frames by its `Content-Length` and is offered for nothing more; the well-formed line beside
+/// them still is, so what refuses them is the status code and nothing else.
+#[test]
+fn a_status_line_without_a_readable_code_is_not_offered_for_another_request() {
+    let relayed = |status_line: &str| {
+        let wire = format!("{status_line}\r\nContent-Length: 2\r\n\r\nok");
+        let mut up = io::BufReader::new(io::Cursor::new(wire.into_bytes()));
+        let mut client = Vec::new();
+        let down = Arc::new(AtomicU64::new(0));
+        let relayed = relay_response_head(
+            &mut up,
+            &mut client,
+            &down,
+            None,
+            &[],
+            "GET",
+            &ClientLeg::MayReuse {
+                idle: Duration::from_secs(30),
+            },
+        )
+        .unwrap();
+        (
+            relayed,
+            String::from_utf8_lossy(&client).to_ascii_lowercase(),
+        )
+    };
+    let (well_formed, _) = relayed("HTTP/1.1 200 OK");
+    assert!(
+        well_formed.persistent,
+        "a well-formed line is offered for another request"
+    );
+    for status_line in [
+        "HTTP/1.1",
+        "HTTP/1.1 ",
+        "HTTP/1.1 +20 OK",
+        "HTTP/1.1 2000 OK",
+    ] {
+        let (head, written) = relayed(status_line);
+        assert!(
+            matches!(head.framing, BodyFraming::Length(2)),
+            "{status_line:?}: framed by its length"
+        );
+        assert!(
+            !head.persistent,
+            "{status_line:?}: the client leg is offered for another request"
+        );
+        assert!(
+            !response_keeps_alive(&head.head),
+            "{status_line:?}: the upstream leg is parked"
+        );
+        assert!(
+            written.contains("connection: close"),
+            "{status_line:?}: the client is not told close: {written:?}"
+        );
+    }
+}
+
 /// The `down` byte total for `sbx net live` must equal what actually crossed to the cage — every
 /// head, not just the last one. An interim `1xx` is the case that could drift: it is relayed but
 /// then read past, so a counter placed only on the returned head would under-report it. Masking

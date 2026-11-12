@@ -749,8 +749,14 @@ pub(crate) fn response_framing(head: &[u8], request_method: &str) -> BodyFraming
 ///     credentials of its own has no business blurring that line.
 ///
 /// A head that will not parse is not reusable either: an unreadable head is exactly the case where
-/// nothing about the connection's state is known.
+/// nothing about the connection's state is known. Nor is one whose status line carries no status
+/// code the grammar reads ([`parse_status_code`]): the code is what says whether the response has a
+/// body at all, so without one where the message ends is a guess, and a client reading the grammar
+/// refuses the line sbx would otherwise have framed by its headers.
 pub(super) fn response_keeps_alive(head: &[u8]) -> bool {
+    if parse_status_code(head).is_none() {
+        return false;
+    }
     let Ok(parsed) = parse_head(head) else {
         return false;
     };
