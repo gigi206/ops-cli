@@ -288,8 +288,9 @@ fn upgrade(run: &Upgrade) -> Result<Outcome, String> {
         .map_err(|e| format!("cannot read the downloaded {asset}: {e}"))?;
     // The mode the binary was installed with, its special bits aside; executable by its owner
     // whatever it was, since the run below proves the new one through that bit. Read after the
-    // download, as close to the rename as it can be: a binary removed while the download ran is
-    // not there to replace, and the rename would put one back where its user took it away.
+    // download and before the write, so a binary removed while the download ran is not put back
+    // where its user took it away. One removed during the write itself, its sync and the
+    // `--version` run that follow is still put back by the rename.
     let mode = {
         use std::os::unix::fs::PermissionsExt as _;
         let installed = std::fs::metadata(run.target).map_err(|e| {
