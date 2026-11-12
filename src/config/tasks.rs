@@ -342,6 +342,14 @@ const OPEN_ENDED: &[&str] = &[
     "awk", "gawk", "xargs",
 ];
 
+/// Whether the program `base` names is one of [`OPEN_ENDED`], read with any version suffix off as
+/// well: a distribution installs `python3.14`, `perl5.40.1` and `ruby3.3` under those names, and
+/// each runs as the interpreter its stem names.
+fn names_an_interpreter(base: &str) -> bool {
+    let stem = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    OPEN_ENDED.contains(&base) || OPEN_ENDED.contains(&stem)
+}
+
 /// Read the entries out of one `spawn` declaration, refusing the shapes that are not the field, and
 /// return them **unvalidated** — [`validate_spawn_entries`] is what judges them, and it needs to
 /// know which list it is naming.
@@ -395,7 +403,7 @@ fn validate_spawn_entries(
             ));
         }
         let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
-        if OPEN_ENDED.contains(&base) {
+        if names_an_interpreter(base) {
             crate::diag::warn(&format!(
                 "task `{name}`: {whose} lists `{base}` — an interpreter concedes most of this \
                  guard, since what it does with its own builtins never reaches an `execve` to \
@@ -1271,6 +1279,26 @@ mod tests {
             })
             .collect();
         assert!(missed.is_empty(), "a NUL passes in cmd{missed:?}");
+    }
+
+    /// The warning that an interpreter concedes the exec guard knows an interpreter by its versioned
+    /// names too. Every name it misses, and every program it takes for one, is reported together.
+    #[test]
+    fn a_versioned_interpreter_is_known_as_the_interpreter() {
+        assert!(
+            names_an_interpreter("python3"),
+            "calibration: a listed name is an interpreter"
+        );
+        let mut wrong: Vec<&str> = ["python3.14", "perl5.40.1", "ruby3.3", "node18", "bash5.2"]
+            .into_iter()
+            .filter(|name| !names_an_interpreter(name))
+            .collect();
+        wrong.extend(
+            ["make", "gcc12", "git", "3"]
+                .into_iter()
+                .filter(|name| names_an_interpreter(name)),
+        );
+        assert!(wrong.is_empty(), "misread: {wrong:?}");
     }
 
     /// A fixed `env` value carrying a NUL is refused when the declaration is read, naming the
