@@ -594,7 +594,18 @@ fn install_spec(
     pool: &Path,
     tokens: &[String],
 ) -> io::Result<SandboxSpec> {
-    let mut mounts = base_mounts.to_vec();
+    // The task cage's skeleton, read-only. It comes demoted already (`task_mounts` in the task
+    // engine turns every writable bind it keeps into a read-only one), and is demoted again here,
+    // where it matters most: this cage runs the backends' install scripts with the host network,
+    // and a writable host path inherited from the skeleton would be one they could write.
+    let mut mounts: Vec<Mount> = base_mounts
+        .iter()
+        .cloned()
+        .map(|mount| match mount {
+            Mount::Bind { src, dest } => Mount::RoBind { src, dest },
+            other => other,
+        })
+        .collect();
     // The pool, read-write — the only writable mount that is not a tmpfs, and the whole reason this
     // cage exists.
     mounts.push(Mount::Bind {
@@ -1197,6 +1208,52 @@ mod tests {
         assert!(
             !base.join("task-mise").exists(),
             "a project with no task tools must not materialize a pool at all"
+        );
+    }
+
+    /// The skeleton an install cage inherits is held read-only by the install cage itself, not
+    /// only by the task engine that hands it over: this cage runs the backends' install scripts
+    /// with the host network, so a writable bind in what it is handed is read-only there.
+    #[test]
+    fn a_writable_bind_the_install_cage_inherits_is_read_only_there() {
+        let skeleton = vec![
+            Mount::RoBind {
+                src: PathBuf::from("/data/shared/store/nix"),
+                dest: PathBuf::from("/nix"),
+            },
+            Mount::Bind {
+                src: PathBuf::from("/host/etc/hosts"),
+                dest: PathBuf::from("/etc/hosts"),
+            },
+        ];
+        let spec = install_spec(
+            &skeleton,
+            &[],
+            Path::new("/nix/store/abc-mise/bin/mise"),
+            Path::new("/data/projects/abc/task-mise"),
+            &["jq".to_string()],
+        )
+        .unwrap();
+        let writable: Vec<&PathBuf> = spec
+            .mounts()
+            .iter()
+            .filter_map(|m| match m {
+                Mount::Bind { dest, .. } => Some(dest),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            writable,
+            vec![&PathBuf::from(POOL_INCAGE)],
+            "only the pool is writable"
+        );
+        assert!(
+            spec.mounts().contains(&Mount::RoBind {
+                src: PathBuf::from("/host/etc/hosts"),
+                dest: PathBuf::from("/etc/hosts"),
+            }),
+            "the inherited bind is kept, read-only: {:?}",
+            spec.mounts()
         );
     }
 
