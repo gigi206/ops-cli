@@ -1104,7 +1104,9 @@ impl Http2Host {
             Some((h, p))
                 if !h.is_empty() && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) =>
             {
-                (h, Some(p.parse::<u16>().ok()?))
+                // Port 0 is no port a CONNECT can name, so an entry for it could never match:
+                // malformed, as the rule grammar has it.
+                (h, Some(p.parse::<u16>().ok().filter(|&p| p != 0)?))
             }
             _ => (entry, None),
         };

@@ -10235,6 +10235,39 @@ fn a_mode_less_one_shot_network_table_adds_to_the_policy_rather_than_replacing_i
     );
 }
 
+/// An `http2` entry for port 0, plain or wildcard, is malformed: no CONNECT names that port, so the
+/// entry is dropped with the warning the field promises rather than kept as one that matches
+/// nothing. Every entry misread is reported together.
+#[test]
+fn an_http2_entry_for_port_zero_is_dropped_with_a_warning() {
+    let r = resolve_no_plugins(
+        toml::from_str(
+            "[network]\nmode = \"deny\"\nhttp2 = [\"h.example.test:0\", \"*.w.example.test:0\", \
+             \"ok.example.test:443\"]\n",
+        )
+        .expect("the layer parses"),
+        None,
+    );
+    let NetworkPolicy::Allowlist(policy) = &r.network else {
+        panic!("a filtering posture: {:?}", r.network);
+    };
+    let kept: Vec<String> = policy.http2_hosts().iter().map(|h| h.display()).collect();
+    let mut wrong = Vec::new();
+    if kept != ["ok.example.test:443"] {
+        wrong.push(format!("kept {kept:?}"));
+    }
+    for entry in ["h.example.test:0", "*.w.example.test:0"] {
+        if !r
+            .warnings
+            .iter()
+            .any(|w| w.contains("malformed `http2` entry") && w.contains(entry))
+        {
+            wrong.push(format!("no warning for `{entry}`"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}: {:?}", wrong.join("; "), r.warnings);
+}
+
 /// A table that amends adds its lists to the ones below, the groups and `http2` hosts included.
 /// Those two were set rather than extended, so a layer naming one group of its own dropped the
 /// groups of the bundle it was laid over, and the app's sign-in broke at its next request.
