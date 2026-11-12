@@ -78,6 +78,11 @@ Reading `/proc` needs **no privilege**: unlike kernel-tracing observability it r
 `CAP_BPF` or root. `ls` is a **snapshot**; for a continuously updating view use
 [`live`](#live). The pids shown are host-side.
 
+A project directory can be named anything. The heading writes its path as
+[`sbx projects list`](projects) does, and so does the frame of [`live`](#live): a control
+character or a character that reorders a line is written out as an escape (`\x1b`, `\u{202e}`).
+`--json` keeps the path as it is.
+
 ## `live`
 
 ```

@@ -703,11 +703,13 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, r) = (pal.head, pal.reset);
+    // The project as text: a directory name can carry a sequence that paints over the terminal of
+    // whoever reads the tree. `--json` above keeps the path as it is.
     outln!(
         "{h}process tree — session {} [{}] {}{r}",
         target.pid,
         target.label(),
-        target.project.display()
+        diag::visible(&target.project.display().to_string())
     );
     crate::cli::print_document(&observe::render_human(&tree));
     ExitCode::SUCCESS
@@ -789,6 +791,8 @@ fn proc_live(args: &[OsString]) -> ExitCode {
     // Resolve once, then poll `/proc` by pid — the record is not needed again. When the pid's tree
     // vanishes the session has ended, so the loop exits cleanly.
     let (pid, label, project) = (target.pid, target.label(), target.project.clone());
+    // The frame's project line, as text, as `proc ls` writes it; the JSON keeps the path itself.
+    let shown = diag::visible(&project.display().to_string());
     let pal = style::Palette::for_stream(is_tty);
     let (dim, r) = (pal.dim, pal.reset);
     let secs = parsed.interval.as_secs();
@@ -812,8 +816,7 @@ fn proc_live(args: &[OsString]) -> ExitCode {
                 let body = observe::render_human(tree);
                 write!(
                     out,
-                    "\x1b[H{dim}live process tree · session {pid} [{label}] · refresh {secs}s · Ctrl-C to quit{r}\n{project}\n{body}\x1b[J",
-                    project = project.display()
+                    "\x1b[H{dim}live process tree · session {pid} [{label}] · refresh {secs}s · Ctrl-C to quit{r}\n{shown}\n{body}\x1b[J"
                 )
                 .and_then(|_| out.flush())
             }

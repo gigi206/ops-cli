@@ -155,6 +155,49 @@ fn proc_live_rejects_a_zero_interval() {
     assert!(err.contains("at least 1 second"), "got: {err}");
 }
 
+/// `sbx proc ls` writes the session's project as text: a directory named with a terminal sequence
+/// or a character that reorders a line is shown as an escape, as `sbx session ls` shows it, and
+/// `--json` keeps the path as it is. The session is this test's own process, so it has a tree.
+#[test]
+fn proc_ls_writes_the_sessions_project_as_text() {
+    let id = std::process::id().to_string();
+    let mut painted = Vec::new();
+    for (shape, name, escaped) in [
+        ("a screen clear", "proj\u{1b}[2J", "proj\\x1b[2J"),
+        (
+            "a right-to-left override",
+            "proj\u{202e}txt",
+            "proj\\u{202e}txt",
+        ),
+    ] {
+        let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
+        let project = proj.path().join(name);
+        std::fs::create_dir(&project).expect("the project directory");
+        common::write_session_record(data.path(), std::process::id(), "project", &project);
+        let out = sbx(&["proc", "ls", &id], data.path(), proj.path());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let raw = name.chars().nth(4).expect("the shape's character");
+        if !out.status.success() || stdout.contains(raw) || !stdout.contains(escaped) {
+            painted.push(format!(
+                "{shape}: exit {}, {stdout:?} {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        let listed = sbx(&["proc", "ls", &id, "--json"], data.path(), proj.path());
+        let doc: serde_json::Value =
+            serde_json::from_slice(&listed.stdout).expect("`proc ls --json` is JSON");
+        if doc["session"]["project"].as_str() != project.to_str() {
+            painted.push(format!("{shape}, --json: {:?}", doc["session"]["project"]));
+        }
+    }
+    assert!(
+        painted.is_empty(),
+        "the project must be written as text, and kept as itself in JSON:\n{}",
+        painted.join("\n")
+    );
+}
+
 /// `sbx proc live --json` whose snapshot cannot be written fails, said once, and one whose reader
 /// has gone does not. A full disk under `> file` leaves a stream cut short there, which a script
 /// reading the exit code has to learn; a reader gone, `… | head`, is the end of a pipeline the
