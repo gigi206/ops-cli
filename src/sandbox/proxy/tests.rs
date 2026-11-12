@@ -2845,6 +2845,72 @@ fn a_learned_needle_masks_a_logged_path_for_its_own_service_only() {
     );
 }
 
+/// A logged or parked path is masked with every value the launch has carried, as a capture is, not
+/// with the live set alone: a declared value a re-resolution replaced, and a learned one that newer
+/// learned values pushed out, are still values the cage may send. Both shapes are checked before
+/// the verdict.
+#[test]
+fn a_value_retired_from_the_live_set_is_still_masked_in_a_logged_path() {
+    const DECLARED: &str = "declared-old-value-0123456789";
+    const LEARNED: &str = "learned-first-token-abcdef";
+    let credentials = Arc::new(Credentials::new(
+        Vec::new(),
+        vec![SecretNeedle::named("token", DECLARED.as_bytes().to_vec())],
+        crate::sandbox::redact::MIN_LEN_DEFAULT,
+        Vec::new(),
+    ));
+    assert!(
+        credentials.observe("Authorization", &format!("Bearer {LEARNED}"), "api.test"),
+        "the learned needle is the premise of this test"
+    );
+    credentials.replace(CredentialSet {
+        injections: Vec::new(),
+        needles: vec![SecretNeedle::named(
+            "token",
+            b"declared-new-value-0123456789".to_vec(),
+        )],
+    });
+    let live = |value: &str| {
+        credentials
+            .snapshot()
+            .needles
+            .iter()
+            .any(|n| n.as_bytes() == value.as_bytes())
+    };
+    let mut later = 0;
+    while live(LEARNED) {
+        assert!(
+            later < 64,
+            "the first learned value never left the live set"
+        );
+        credentials.observe(
+            "Authorization",
+            &format!("Bearer later-token-{later:04}-abcdefgh"),
+            "api.test",
+        );
+        later += 1;
+    }
+    assert!(
+        !live(DECLARED),
+        "the re-resolution retired the declared value"
+    );
+    let ctx = ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), EgressPolicy::default())
+        .unwrap()
+        .with_shared_credentials(credentials);
+    let mut failures = Vec::new();
+    for (shape, value) in [
+        ("a declared value re-resolved away", DECLARED),
+        ("a learned value pushed out", LEARNED),
+    ] {
+        let path = format!("/v1/x?token={value}&page=2");
+        let logged = ctx.redact_query("api.test", &path);
+        if logged != format!("/v1/x?token={}&page=2", "*".repeat(value.len())) {
+            failures.push(format!("{shape}: {logged}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 /// A parked request reaches a person's terminal — `sbx net pending`, its `--json` form, and the
 /// park notice all print the path — so it gets the same masking the event ring gets. The needle
 /// here is one the cage's own sign-in taught the proxy for this very host, which is exactly the

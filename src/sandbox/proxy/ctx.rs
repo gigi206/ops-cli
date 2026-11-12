@@ -597,21 +597,27 @@ impl ProxyCtx {
     }
 
     /// Mask any configured secret value occurring verbatim in `path` with an equal-length run of
-    /// `*`, so a token that rode in a query string never enters the event ring in the clear. Reuses
-    /// the same needle set and masking as the outbound/response redaction; `*` is ASCII and
-    /// same-length, so the result stays valid UTF-8.
+    /// `*`, so a token that rode in a query string never enters the event ring in the clear. `*` is
+    /// ASCII and same-length, so the result stays valid UTF-8.
+    ///
+    /// The needles are the ones a capture is masked with ([`Credentials::masking_needles`]): every
+    /// value the launch has carried, not only the live ones. A declared value a re-resolution
+    /// replaced, or a learned one that newer learned values pushed out of the live set, is still a
+    /// value the cage may send, and the record that shows it is the same operator surface.
     ///
     /// Reached from the **park** as well as the log ([`super::decide_https`]): a parked request is
     /// printed by `sbx net pending` and by the park notice, so a path that is masked on its way into
     /// the ring and unmasked on its way into the pending queue is the same token in the same
     /// terminal by another route.
+    ///
+    /// [`Credentials::masking_needles`]: super::inject::Credentials::masking_needles
     pub(super) fn redact_query(&self, host: &str, path: &str) -> String {
-        let creds = self.credentials.snapshot();
-        if creds.needles.is_empty() {
+        let needles = self.credentials.masking_needles();
+        if needles.is_empty() {
             return path.to_string();
         }
         let mut bytes = path.as_bytes().to_vec();
-        redact_record_in_place(&mut bytes, &creds.needles, host);
+        redact_record_in_place(&mut bytes, &needles, host);
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
