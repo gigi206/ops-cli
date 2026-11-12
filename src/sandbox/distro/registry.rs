@@ -461,19 +461,31 @@ fn blob_cap(size: u64) -> u64 {
 /// The digest is verified over the bytes as they are written, so a blob that is not what was asked
 /// for never becomes a file the applier reads: the partial download is removed and the fetch fails
 /// naming both digests.
+///
+/// Every call fetches. A file already under the digest's name is one this call has not checked, so
+/// it is replaced rather than handed back as the layer.
 pub(super) fn fetch_layer(
     image: &ImageRef,
     layer: &Layer,
     dir: &Path,
     credential: Option<&Credential>,
 ) -> io::Result<PathBuf> {
+    let url = v2_url(image, "blobs", &layer.digest);
+    fetch_layer_with(layer, dir, |mut sink, cap| {
+        get_authenticated_to_writer(&url, credential, &mut sink, cap)
+    })
+}
+
+/// [`fetch_layer`], with the body written by `fetch` into the sink it is handed, held to the cap it
+/// is handed: the transport is the caller's, and what the bytes must be is decided here.
+fn fetch_layer_with(
+    layer: &Layer,
+    dir: &Path,
+    fetch: impl FnOnce(&mut dyn io::Write, u64) -> io::Result<u64>,
+) -> io::Result<PathBuf> {
     let name = layer.digest.replace(':', "-");
     let path = dir.join(&name);
-    if path.exists() {
-        return Ok(path);
-    }
     let partial = dir.join(format!("{name}.partial"));
-    let url = v2_url(image, "blobs", &layer.digest);
     let mut sink = HashingWriter {
         inner: std::fs::File::create(&partial)?,
         hasher: Sha256::new(),
@@ -482,7 +494,7 @@ pub(super) fn fetch_layer(
     // Any failure removes the partial file, not only a digest mismatch: a fetch that stopped
     // halfway leaves bytes that are not a layer, and a later run must not find them and take them
     // for one.
-    let written = match get_authenticated_to_writer(&url, credential, &mut sink, cap) {
+    let written = match fetch(&mut sink, cap) {
         Ok(written) => written,
         Err(e) => {
             let _ = std::fs::remove_file(&partial);

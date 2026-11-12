@@ -313,7 +313,7 @@ fn a_layer_is_verified_against_its_digest_as_it_lands() {
         "{err}"
     );
     // Nothing is left of the refused blob: not its partial download, and not a file under its
-    // digest, which a later `fetch_layer` would hand back as the layer without fetching it.
+    // digest that a reader of the directory could take for the layer.
     let left: Vec<_> = std::fs::read_dir(dir.path())
         .expect("the layer directory")
         .map(|entry| entry.expect("a directory entry").file_name())
@@ -675,5 +675,32 @@ fn an_index_of_one_entry_without_a_platform_is_taken_as_its_manifest() {
             named.clone(),
         ],
         "an entry stating no platform beside one that states another is refused",
+    );
+}
+
+/// A file already under a layer's name is not handed back as the layer. Nothing checked it, and
+/// the fetch replaces it with the bytes that hash to the digest.
+#[test]
+fn a_file_already_under_the_layers_name_is_not_taken_for_the_layer() {
+    let dir = crate::testutil::TmpDir::new();
+    let body = b"the layer's own bytes";
+    let layer = Layer {
+        digest: digest_of(body),
+        media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+        size: body.len() as u64,
+    };
+    let planted = dir.path().join(layer.digest.replace(':', "-"));
+    std::fs::write(&planted, b"bytes nothing checked").expect("plant a file under the name");
+
+    let path = fetch_layer_with(&layer, dir.path(), |sink, _| {
+        sink.write_all(body)?;
+        Ok(body.len() as u64)
+    })
+    .expect("the layer is fetched over the planted file");
+    assert_eq!(path, planted, "the layer lands under its digest");
+    assert_eq!(
+        std::fs::read(&path).expect("the layer"),
+        body,
+        "and holds the bytes that hash to the digest, not the ones planted"
     );
 }
