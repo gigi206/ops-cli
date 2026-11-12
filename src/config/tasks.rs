@@ -229,6 +229,17 @@ pub(super) fn validate_task(
              rule admits, so as written the credential is resolved and never sent"
         ));
     }
+    // A NUL cannot be part of an environment entry, so a fixed value carrying one could never be
+    // set: refused with the declaration, which names it, rather than when an invocation starts.
+    if let Some(var) = raw
+        .env
+        .iter()
+        .find_map(|(var, value)| value.contains('\0').then_some(var))
+    {
+        return Err(format!(
+            "the fixed `env` value of `{var}` contains a NUL byte"
+        ));
+    }
     for var in raw.env.keys().chain(raw.env_allow.iter()) {
         validate_env_name(var)?;
         if secrets.iter().any(|s| &s.var == var) {
@@ -1239,6 +1250,25 @@ mod tests {
             })
             .collect();
         assert!(missed.is_empty(), "a blank program passes: {missed:?}");
+    }
+
+    /// A fixed `env` value carrying a NUL is refused when the declaration is read, naming the
+    /// variable, rather than when an invocation could not set it.
+    #[test]
+    fn a_fixed_env_value_with_a_nul_is_refused() {
+        let with = |value: &str| {
+            let mut raw = raw_task();
+            raw.env = [("GREETING".to_string(), value.to_string())]
+                .into_iter()
+                .collect();
+            validate(raw)
+        };
+        assert!(with("hello").is_ok(), "calibration: a plain value is fixed");
+        let e = with("hel\0lo").expect_err("a NUL in a fixed value is refused");
+        assert!(
+            e.contains("GREETING") && e.contains("NUL"),
+            "the refusal names the variable and the byte: {e}"
+        );
     }
 
     #[test]
