@@ -381,16 +381,30 @@ fn checked_manifest(
 }
 
 /// The digest of the `linux/amd64` entry among an index's `manifests`.
+///
+/// `platform` is optional on an index entry, and an index of one entry that states none says no
+/// more about the platform than the manifest it names, which is taken as it is when a registry
+/// serves it on its own. That one entry is taken too. An entry that states another platform is
+/// never a fallback, and neither is one that states none beside entries that do: nothing says it
+/// is the `linux/amd64` one.
 fn platform_entry<'a>(manifests: &'a [serde_json::Value], image: &ImageRef) -> io::Result<&'a str> {
+    // A `null` is read as the field left out, as a decoder into an optional field reads it.
+    fn stated(entry: &serde_json::Value) -> Option<&serde_json::Value> {
+        entry.get("platform").filter(|platform| !platform.is_null())
+    }
     let picked = manifests
         .iter()
         .find(|entry| {
-            let platform = entry.get("platform");
+            let platform = stated(entry);
             let os = platform.and_then(|p| p.get("os")).and_then(|v| v.as_str());
             let arch = platform
                 .and_then(|p| p.get("architecture"))
                 .and_then(|v| v.as_str());
             os == Some(OS) && arch == Some(ARCH)
+        })
+        .or(match manifests {
+            [only] if stated(only).is_none() => Some(only),
+            _ => None,
         })
         .and_then(|entry| entry.get("digest"))
         .and_then(|v| v.as_str())

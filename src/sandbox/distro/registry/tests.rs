@@ -515,17 +515,32 @@ fn manifest_naming(layer: &str) -> Vec<u8> {
     .expect("a manifest serializes")
 }
 
+/// The platform an index entry states, as its `os` and `architecture`, or `None` for an entry
+/// that states none.
+type Stated<'a> = Option<(&'a str, &'a str)>;
+
 /// An index whose one entry names the document `below`, for `platform` when one is given.
-fn index_naming(below: &[u8], platform: Option<(&str, &str)>) -> Vec<u8> {
-    let mut entry = serde_json::json!({
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "digest": digest_of(below),
-        "size": below.len(),
-    });
-    if let Some((os, architecture)) = platform {
-        entry["platform"] = serde_json::json!({ "os": os, "architecture": architecture });
-    }
-    serde_json::to_vec(&serde_json::json!({ "schemaVersion": 2, "manifests": [entry] }))
+fn index_naming(below: &[u8], platform: Stated<'_>) -> Vec<u8> {
+    index_of(&[(below, platform)])
+}
+
+/// An index of `entries`, each the document it names and the platform it states, if any.
+fn index_of(entries: &[(&[u8], Stated<'_>)]) -> Vec<u8> {
+    let manifests: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(below, platform)| {
+            let mut entry = serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": digest_of(below),
+                "size": below.len(),
+            });
+            if let Some((os, architecture)) = platform {
+                entry["platform"] = serde_json::json!({ "os": os, "architecture": architecture });
+            }
+            entry
+        })
+        .collect();
+    serde_json::to_vec(&serde_json::json!({ "schemaVersion": 2, "manifests": manifests }))
         .expect("an index serializes")
 }
 
@@ -605,5 +620,60 @@ fn a_platform_manifest_is_checked_against_the_digest_its_index_names() {
     assert!(
         err.to_string().contains("served a manifest hashing to"),
         "{err}"
+    );
+}
+
+/// An index of one entry that states no platform is taken as the manifest it names, which is how
+/// that manifest is taken when a registry serves it on its own. Nothing looser: an entry that
+/// states another platform is not a fallback, and neither is one that states none beside an entry
+/// that does.
+#[test]
+fn an_index_of_one_entry_without_a_platform_is_taken_as_its_manifest() {
+    let image = reference::parse("oci:registry.example/team/app:1").expect("a valid reference");
+    let named = manifest_naming(LAYER);
+    let elsewhere = manifest_naming(&format!("sha256:{}", "3".repeat(64)));
+
+    let lone = index_of(&[(&named, None)]);
+    let resolved = resolve_with(&image, serving(&[lone.clone(), named.clone()]))
+        .expect("an index of one entry stating no platform resolves");
+    assert_eq!(resolved.digest, digest_of(&lone), "pinned to the index");
+    let layers: Vec<&str> = resolved.layers.iter().map(|l| l.digest.as_str()).collect();
+    assert_eq!(
+        layers,
+        [LAYER],
+        "the layers of the manifest the entry names"
+    );
+    // A `null` platform is the field left out, written by hand since the builder cannot say it.
+    let null = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": digest_of(&named),
+            "size": named.len(),
+            "platform": null,
+        }],
+    }))
+    .expect("an index serializes");
+    resolve_with(&image, serving(&[null, named.clone()]))
+        .expect("an entry whose platform is null states none, and is taken alone");
+
+    let refused = |documents: &[Vec<u8>], shape: &str| {
+        let err = resolve_with(&image, serving(documents)).expect_err(shape);
+        assert!(
+            err.to_string().contains("carries no linux/amd64 image"),
+            "{shape}: {err}"
+        );
+    };
+    refused(
+        &[index_of(&[(&named, Some((OS, "arm64")))]), named.clone()],
+        "a lone entry stating another platform is refused",
+    );
+    refused(
+        &[
+            index_of(&[(&elsewhere, Some((OS, "arm64"))), (&named, None)]),
+            elsewhere.clone(),
+            named.clone(),
+        ],
+        "an entry stating no platform beside one that states another is refused",
     );
 }
