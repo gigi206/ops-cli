@@ -177,8 +177,9 @@ impl Project {
     }
 
     /// Write an egress group at [`Project::group_path`], from its entries — the artifact
-    /// `sbx net groups import` produces. `entries` are written verbatim into the `entries` array,
-    /// so a test states them exactly as an author would.
+    /// `sbx net groups import` produces. Each entry lands in the `entries` array as the TOML string
+    /// that holds it, quoted and escaped by [`super::toml_text`], so a test states them exactly as
+    /// an author would, whatever characters they carry.
     pub fn write_group(&self, name: &str, entries: &[&str]) {
         let path = self.group_path(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -186,7 +187,7 @@ impl Project {
             "entries = [{}]\n",
             entries
                 .iter()
-                .map(|e| format!("{e:?}"))
+                .map(|e| super::toml_text(e))
                 .collect::<Vec<_>>()
                 .join(", ")
         );

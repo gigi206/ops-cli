@@ -786,6 +786,41 @@ fn a_net_table_defines_no_group_and_is_named_as_an_unknown_section() {
     );
 }
 
+/// A group written by the fixture holds each entry as the test gave it, whatever its characters.
+/// Rust's `{:?}` writes NUL as `\0`, and another control character, a zero-width space or a
+/// combining mark as `\u{…}`, escapes TOML refuses: a group so written does not parse, and a test
+/// asserting about its entry would be asserting about a file sbx cannot parse.
+#[test]
+fn a_group_written_by_the_fixture_holds_its_entries_as_given() {
+    let fx = Project::new("net");
+    let mut not_held = Vec::new();
+    for (i, entry) in ["a\u{1b}b", "a\u{0}b", "a\u{7f}b", "a\u{200b}b", "a\u{301}b"]
+        .into_iter()
+        .enumerate()
+    {
+        let name = format!("shape{i}");
+        fx.write_group(&name, &[entry]);
+        let body = std::fs::read_to_string(fx.group_path(&name)).unwrap();
+        let held = toml::from_str::<toml::Table>(&body)
+            .ok()
+            .and_then(|t| t.get("entries").cloned())
+            .and_then(|v| v.as_array().cloned())
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            });
+        if held != Some(vec![Some(entry.to_owned())]) {
+            not_held.push(format!("{entry:?}: {body:?}"));
+        }
+    }
+    assert!(
+        not_held.is_empty(),
+        "each entry must read back as written:\n{}",
+        not_held.join("\n")
+    );
+}
+
 #[test]
 fn net_groups_lists_resolves_and_errors_on_unknown() {
     let fx = Project::new("net");
