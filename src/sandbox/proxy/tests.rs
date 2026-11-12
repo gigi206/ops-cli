@@ -3296,6 +3296,85 @@ fn a_status_line_without_a_readable_code_is_not_offered_for_another_request() {
     }
 }
 
+/// A response head carrying a control byte is framed by nothing and offered for nothing.
+///
+/// The head crosses to the cage as it arrived, so a bare CR, a NUL or a DEL inside it is where the
+/// cage's client and sbx may read two different heads: the bytes an inspected request is refused
+/// for. The response is still relayed, to the close and on a leg told it ends there. A `204` has no
+/// body whatever its fields say, so its framing stays empty, and what keeps its connection from
+/// being offered again is the reuse decision alone.
+#[test]
+fn a_response_head_carrying_a_control_byte_is_neither_framed_nor_offered_again() {
+    let relayed = |wire: String| {
+        let mut up = io::BufReader::new(io::Cursor::new(wire.into_bytes()));
+        let mut client = Vec::new();
+        let down = Arc::new(AtomicU64::new(0));
+        let relayed = relay_response_head(
+            &mut up,
+            &mut client,
+            &down,
+            None,
+            &[],
+            "GET",
+            &ClientLeg::MayReuse {
+                idle: Duration::from_secs(30),
+            },
+        )
+        .unwrap();
+        (
+            relayed,
+            String::from_utf8_lossy(&client).to_ascii_lowercase(),
+        )
+    };
+    let ok =
+        |note: &str| format!("HTTP/1.1 200 OK\r\nX-Note: {note}\r\nContent-Length: 2\r\n\r\nok");
+    let no_content = |note: &str| format!("HTTP/1.1 204 No Content\r\nX-Note: {note}\r\n\r\n");
+    for clean in [ok("ab"), no_content("ab")] {
+        let (head, _) = relayed(clean.clone());
+        assert!(
+            head.persistent,
+            "{clean:?}: a head without one is offered for another request"
+        );
+    }
+    for control in ['\r', '\0', '\u{7f}'] {
+        let note = format!("a{control}b");
+        let (head, written) = relayed(ok(&note));
+        assert!(
+            matches!(head.framing, BodyFraming::ToEof),
+            "{note:?} in a 200: framed by a length only sbx may read"
+        );
+        assert!(
+            !head.persistent,
+            "{note:?} in a 200: the client leg is offered for another request"
+        );
+        assert!(
+            !response_keeps_alive(&head.head),
+            "{note:?} in a 200: the upstream leg is parked"
+        );
+        assert!(
+            written.contains("connection: close"),
+            "{note:?} in a 200: the client is not told close: {written:?}"
+        );
+        let (head, written) = relayed(no_content(&note));
+        assert!(
+            matches!(head.framing, BodyFraming::Empty),
+            "{note:?} in a 204: a bodiless status has no body"
+        );
+        assert!(
+            !head.persistent,
+            "{note:?} in a 204: the client leg is offered for another request"
+        );
+        assert!(
+            !response_keeps_alive(&head.head),
+            "{note:?} in a 204: the upstream leg is parked"
+        );
+        assert!(
+            written.contains("connection: close"),
+            "{note:?} in a 204: the client is not told close: {written:?}"
+        );
+    }
+}
+
 /// The `down` byte total for `sbx net live` must equal what actually crossed to the cage — every
 /// head, not just the last one. An interim `1xx` is the case that could drift: it is relayed but
 /// then read past, so a counter placed only on the returned head would under-report it. Masking

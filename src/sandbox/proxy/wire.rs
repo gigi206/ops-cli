@@ -121,7 +121,8 @@ pub(super) fn list_names(value: &str, token: &str) -> bool {
         .any(|element| trim_ows(element).eq_ignore_ascii_case(token))
 }
 
-/// Whether a parsed request head carries a byte another parser could frame the message by.
+/// Whether a parsed head, a request's or a response's, carries a byte another parser could frame
+/// the message by.
 ///
 /// [`parse_head`] splits on CRLF *and* on a bare LF, so no LF survives into a name or a value. A lone
 /// CR does — the trim only reaches the ends — and so does a NUL. Every inspected request is then
@@ -137,6 +138,11 @@ pub(super) fn list_names(value: &str, token: &str) -> bool {
 /// The rule is the one the HTTP/2 plane already gets for free, HPACK decoding into
 /// `http::HeaderValue`: a byte must be HTAB, visible ASCII, or `obs-text`. Adopting it here is what
 /// makes the same request refused on every plane rather than on one of the three.
+///
+/// A response head is not written out again: it crosses to the cage as it arrived, so the same
+/// byte is where the cage's client and sbx would read two different heads. A response is relayed
+/// rather than refused, so its two readers ([`response_framing`], [`response_keeps_alive`]) do not
+/// refuse it: neither frames it, and neither offers its connection for another request.
 pub(super) fn head_carries_control_byte(head: &Head) -> bool {
     carries_control_byte(&head.request_line)
         || head
@@ -685,10 +691,11 @@ pub(crate) enum BodyFraming {
     /// The end of the message cannot be determined from the head, so relay until the upstream
     /// closes. Either the head genuinely delimits by close (no length, no coding), or it is
     /// ambiguous: a duplicated or unparsable `Content-Length`, a final coding other than `chunked`,
-    /// or both framings at once. Ambiguity **degrades to this rather than failing** — the forced
-    /// `Connection: close` makes a close-delimited relay correct, and it is exactly what this path
-    /// did before it framed anything, so framing can shorten the wait but never truncate a response
-    /// it merely failed to understand.
+    /// both framings at once, or a control byte the cage's client may split the head by
+    /// ([`head_carries_control_byte`]). Ambiguity **degrades to this rather than failing** — the
+    /// forced `Connection: close` makes a close-delimited relay correct, and it is exactly what this
+    /// path did before it framed anything, so framing can shorten the wait but never truncate a
+    /// response it merely failed to understand.
     ToEof,
 }
 
@@ -696,8 +703,9 @@ pub(crate) enum BodyFraming {
 ///
 /// The order is the specification's and the first match wins: a bodiless status, then
 /// `Transfer-Encoding`, then `Content-Length`, then close-delimited. Anything unparsable or
-/// ambiguous yields [`BodyFraming::ToEof`] — this decides how long to *read*, never what to
-/// forward, so an undecidable head costs a close-delimited relay and not a refusal.
+/// ambiguous, a head carrying a control byte included, yields [`BodyFraming::ToEof`] — this
+/// decides how long to *read*, never what to forward, so an undecidable head costs a
+/// close-delimited relay and not a refusal.
 pub(crate) fn response_framing(head: &[u8], request_method: &str) -> BodyFraming {
     let status = parse_status_code(head);
     if request_method.eq_ignore_ascii_case("head")
@@ -709,6 +717,12 @@ pub(crate) fn response_framing(head: &[u8], request_method: &str) -> BodyFraming
     let Ok(parsed) = parse_head(head) else {
         return BodyFraming::ToEof;
     };
+    // The head crosses to the cage as it arrived, and a bare CR or a NUL inside it is where the
+    // cage's client and this reader may part ways on which fields it holds: the bytes an inspected
+    // request is refused for ([`inspect_framing`]). Undecidable, so delimited by the close.
+    if head_carries_control_byte(&parsed) {
+        return BodyFraming::ToEof;
+    }
     let te = parsed.count("transfer-encoding");
     let cl = parsed.count("content-length");
     if te > 0 {
@@ -737,7 +751,7 @@ pub(crate) fn response_framing(head: &[u8], request_method: &str) -> BodyFraming
 }
 
 /// Whether a relayed response leaves its connection able to carry a further request. Read entirely
-/// off the head the upstream sent, and false unless every one of three conditions holds:
+/// off the head the upstream sent, and false unless every one of four conditions holds:
 ///
 ///   - the protocol version persists: HTTP/1.1 does by default, HTTP/1.0 only when it asks to;
 ///   - no `close` token in `Connection` — that token is the upstream announcing this is the last
@@ -746,7 +760,10 @@ pub(crate) fn response_framing(head: &[u8], request_method: &str) -> BodyFraming
 ///     ([`is_connection_bound_challenge`]). Those bind an authenticated identity to the TCP
 ///     connection rather than to the request, so handing the connection to a later request would
 ///     hand it an authentication state it never asked for and cannot see. A proxy that injects
-///     credentials of its own has no business blurring that line.
+///     credentials of its own has no business blurring that line;
+///   - no control byte anywhere in the head ([`head_carries_control_byte`]). The head crosses to
+///     the cage as it arrived, and such a byte is where the cage's client and sbx may read two
+///     different heads, so where the message ends is not known on the client's side.
 ///
 /// A head that will not parse is not reusable either: an unreadable head is exactly the case where
 /// nothing about the connection's state is known. Nor is one whose status line carries no status
@@ -760,6 +777,9 @@ pub(super) fn response_keeps_alive(head: &[u8]) -> bool {
     let Ok(parsed) = parse_head(head) else {
         return false;
     };
+    if head_carries_control_byte(&parsed) {
+        return false;
+    }
     // A repeated `Connection` is legal (each carries its own token list), so every one is read.
     let connection_token = |tok: &str| {
         parsed
@@ -2766,6 +2786,15 @@ mod tests {
             .eq_ignore_ascii_case("chunked")
     }
 
+    /// Whether any field, by its name or its value, holds a byte below 0x20 other than HTAB, or DEL:
+    /// the rule both framing readers apply, written out here rather than borrowed from them.
+    fn a_field_carries_a_control_byte(fields: &[(String, String)]) -> bool {
+        let control = |text: &str| text.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f);
+        fields
+            .iter()
+            .any(|(name, value)| control(name) || control(value))
+    }
+
     /// What a request's framing is, by the rules [`inspect_framing`] states, applied to the fields
     /// as they were written rather than to a parse of them: `(chunked, length)`, or the reason the
     /// framing is refused.
@@ -2773,11 +2802,7 @@ mod tests {
         fields: &[(String, String)],
         forwards_chunked: bool,
     ) -> Result<(bool, u64), &'static str> {
-        let control = |text: &str| text.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f);
-        if fields
-            .iter()
-            .any(|(name, value)| control(name) || control(value))
-        {
+        if a_field_carries_a_control_byte(fields) {
             return Err("bad-request:control-char");
         }
         let codings = values_named(fields, "transfer-encoding");
@@ -2814,6 +2839,9 @@ mod tests {
         let bodiless = |code: u16| (100..200).contains(&code) || code == 204 || code == 304;
         if method.eq_ignore_ascii_case("head") || status.is_some_and(bodiless) {
             return BodyFraming::Empty;
+        }
+        if a_field_carries_a_control_byte(fields) {
+            return BodyFraming::ToEof;
         }
         let codings = values_named(fields, "transfer-encoding");
         let lengths = values_named(fields, "content-length");

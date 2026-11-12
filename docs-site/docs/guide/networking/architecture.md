@@ -392,6 +392,12 @@ ambiguous *response* is relayed to the close. Cutting it would turn an upstream'
 framing bug into a truncation the tool in the cage would blame on sbx. Framing can
 shorten the wait; it never shortens a response.
 
+A head carrying a control byte falls to that last row as well, whatever its fields
+declare. It crosses to the cage exactly as it arrived, and a carriage return or a NUL
+inside a header is where the tool in the cage and the proxy may read two different heads:
+these are the bytes an inspected request is refused for. A response that has no body at
+all, by its status or because it answers a `HEAD`, keeps the first row.
+
 A chunked response reaches the cage **verbatim**, size lines and trailers included. The
 proxy learns where the body ends without rewriting a byte of it. It reads the head the way
 the cage's client does: the status is the three digits after the version and one space,
@@ -435,7 +441,7 @@ hold:
 | same injected credentials | a connection that carried a secret is never given to a request that does not receive the same one |
 | the body ended where its framing said | a truncated message leaves the connection at an unknown position |
 | nothing arrived after it | anything else means the connection has moved past that message |
-| the response's status line carries a code | without one, whether the response has a body at all is not known |
+| the response's status line carries a code, and its head no control byte | without a code, whether the response has a body at all is not known; a control byte is where the cage's client may read another head |
 | the response announced no close, and no `NTLM`/`Negotiate` | those bind an identity to the connection itself |
 
 Anything else closes. What is held is bounded by **count**, not by a clock: 64 waiting
@@ -489,7 +495,7 @@ The tunnel is offered another request only when all of these hold:
 | the client's own request left it open | an `HTTP/1.0` request, or one carrying `Connection: close`, said this was its last |
 | the response is delimited by a length or by chunks | a body the client finds the end of by watching for the close cannot be followed by anything |
 | the body ended where its framing said, with nothing after it | the same rule as the upstream leg, and for the same reason |
-| the response's status line carries a code | the same rule as the upstream leg, and for the same reason |
+| the response's status line carries a code, and its head no control byte | the same rule as the upstream leg, and for the same reason |
 | the upstream announced no close, and no `NTLM`/`Negotiate` | a response that ends its own leg ends this one |
 
 What the client is told is sbx's own answer, never the upstream's: the `Connection` and
