@@ -743,8 +743,8 @@ fn what_the_projects_git_reads_in_a_read_write_bind_is_read_only_in_a_real_cage(
     std::fs::write(
         root.join(".sbx.toml"),
         format!(
-            "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
-            shared.display()
+            "binds = [{{ path = {}, mode = \"rw\" }}]\n",
+            common::toml_str(&shared)
         ),
     )
     .unwrap();
@@ -869,8 +869,8 @@ fn a_linked_worktrees_repository_is_held_in_a_real_cage() {
     std::fs::write(
         root.join(".sbx.toml"),
         format!(
-            "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
-            main.display()
+            "binds = [{{ path = {}, mode = \"rw\" }}]\n",
+            common::toml_str(&main)
         ),
     )
     .unwrap();
@@ -1784,8 +1784,8 @@ fn test_fs_answers_for_what_git_reads_in_a_read_write_bind() {
     let hooks = shared.join("hooks");
     assert!(git(&["config", "core.hooksPath", hooks.to_str().unwrap()]));
     p.write_project(&format!(
-        "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
-        shared.display()
+        "binds = [{{ path = {}, mode = \"rw\" }}]\n",
+        common::toml_str(&shared)
     ));
     assert!(
         p.run(&["trust", "--yes"]).status.success(),
@@ -1850,8 +1850,8 @@ fn test_fs_holds_nothing_in_a_bind_that_holds_the_global_git_configuration() {
         return;
     }
     p.write_project(&format!(
-        "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
-        home.display()
+        "binds = [{{ path = {}, mode = \"rw\" }}]\n",
+        common::toml_str(&home)
     ));
     assert!(in_home(&["trust", "--yes"]).status.success(), "trust");
 
