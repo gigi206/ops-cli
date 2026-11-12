@@ -1145,8 +1145,7 @@ mod tests {
         if pid == 0 {
             unsafe { libc::_exit(i32::from(!drop_all_capabilities())) };
         }
-        let mut status = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let status = crate::testutil::reap(pid);
         assert!(
             libc::WIFEXITED(status),
             "the probe child did not exit normally"

@@ -269,9 +269,7 @@ mod tests {
                 libc::_exit(code);
             }
         }
-        let mut status = 0;
-        // SAFETY: the child forked above, reaped once.
-        unsafe { libc::waitpid(child, &mut status, 0) };
+        let status = crate::testutil::reap(child);
         assert!(libc::WIFEXITED(status), "the child did not exit normally");
         assert_eq!(
             libc::WEXITSTATUS(status),
