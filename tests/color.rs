@@ -1,7 +1,7 @@
 //! Integration guard for the auto-gated terminal color: a captured (non-terminal) stream must be
 //! byte-for-byte plain text. Every human-facing renderer decides its palette with
-//! `Palette::for_stream(stdout().is_terminal())`, so a pipe is always plain — which is also why
-//! every other integration test can assert exact substrings. This file is the end-to-end proof
+//! `Palette::for_stream(<stream>.is_terminal())`, asked of the stream it writes to, so a pipe is
+//! always plain — which is also why every other integration test can assert exact substrings. This file is the end-to-end proof
 //! that the commands actually take that path (not an accidental `colored()`), across the surface
 //! the color pass touched. It exercises only the cheap, side-effect-free commands (no sandbox, no
 //! nix, no network) so it runs everywhere and fast.
@@ -9,25 +9,34 @@
 #[macro_use]
 mod common;
 use common::fixture::TmpDir;
+use common::pty::Pty;
 
 use std::path::Path;
 use std::process::Command;
 
-/// Run `sbx <args>` with a throwaway home (data, state, config all redirected) and a clean cwd,
-/// capturing stdout (a pipe — so color must be off). `NO_COLOR`/`TERM` are also neutralised so the
-/// result does not depend on the host's environment leaking in.
-fn run(args: &[&str], home: &Path, cwd: &Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_sbx"))
-        .args(args)
+/// `sbx <args>` with a throwaway home (data, state, config all redirected) and a clean cwd.
+///
+/// `NO_COLOR` and `TERM`, which the palette reads besides the stream itself, are removed so the
+/// result does not depend on the host's environment leaking in. So is `SBX_DATA_DIR`, which
+/// outranks `XDG_DATA_HOME`: inherited, it would hand these verbs the host's own data directory,
+/// its plugins and its sessions, and `session stop --all` would stop every session running there.
+fn command(args: &[&str], home: &Path, cwd: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
+    cmd.args(args)
         .current_dir(cwd)
         .env("HOME", home)
         .env("XDG_DATA_HOME", home)
         .env("XDG_STATE_HOME", home)
         .env("XDG_CONFIG_HOME", home)
+        .env_remove("SBX_DATA_DIR")
         .env_remove("NO_COLOR")
-        .env_remove("TERM")
-        .output()
-        .expect("spawn sbx")
+        .env_remove("TERM");
+    cmd
+}
+
+/// Run [`command`] to completion with both streams captured: pipes, so color must be off on each.
+fn run(args: &[&str], home: &Path, cwd: &Path) -> std::process::Output {
+    command(args, home, cwd).output().expect("spawn sbx")
 }
 
 /// Assert a captured invocation carries no ANSI escape on either stream.
@@ -55,47 +64,56 @@ fn captured_output_carries_no_ansi_escapes() {
     // Each is a renderer the color pass touched; all are cheap and host-agnostic. `doctor` is
     // included even though it probes the host — its output is captured, so it too must be plain.
     // `trust` precedes `untrust` so the revoke finds the marker it recorded (the `existed` path).
-    let invocations: &[&[&str]] = &[
-        &["config", "show"],
+    //
+    // Each comes with the exit it gives here, and must have printed something: a verb that stopped
+    // before its renderer, or ended with nothing written, would otherwise pass as plain. `doctor`
+    // answers for the host, so its exit is not pinned. The trust store records a project by a path
+    // that is text: under a fixture root outside UTF-8, `trust` refuses the project (exit 1), and
+    // its refusal is the line held to plain there.
+    let trusted = if cwd.path().to_str().is_some() { 0 } else { 1 };
+    let invocations: &[(&[&str], Option<i32>)] = &[
+        (&["config", "show"], Some(0)),
         // The resolution overview (no scope flag) colors its layer labels and present/absent
         // markers — captured here with a present project config and an absent global, so it must
         // be plain.
-        &["config", "path"],
+        (&["config", "path"], Some(0)),
         // Bare `config` prints its page to stderr (a no-subcommand usage error) — captured, so it
         // too must be plain.
-        &["config"],
-        &["session", "ls"],
-        &["app", "list"],
-        &["plugins", "list"],
-        &["plugins", "store", "list"],
-        &["test", "net", "https://example.com/x"],
-        &["net", "rules"],
-        &["net", "rules", "--source", "session"],
-        &["net", "pending"],
+        (&["config"], Some(2)),
+        (&["session", "ls"], Some(0)),
+        (&["app", "list"], Some(0)),
+        (&["plugins", "list"], Some(0)),
+        (&["plugins", "store", "list"], Some(0)),
+        (&["test", "net", "https://example.com/x"], Some(0)),
+        (&["net", "rules"], Some(0)),
+        (&["net", "rules", "--source", "session"], Some(0)),
+        (&["net", "pending"], Some(0)),
         // The bulk-drain presenter (`--all`) — a no-op with no live session, but it must still build
         // its "no pending requests" line from the captured-stream palette.
-        &["net", "pending", "allow", "--all"],
+        (&["net", "pending", "allow", "--all"], Some(0)),
         // The egress-stats table (empty here) — its header + "nothing recorded" line must be plain.
-        &["net", "stats"],
-        &["trust", "--show"],
-        &["trust", "--yes", ".sbx.toml"],
-        &["untrust", ".sbx.toml"],
-        &["doctor"],
+        (&["net", "stats"], Some(0)),
+        (&["trust", "--show"], Some(0)),
+        (&["trust", "--yes", ".sbx.toml"], Some(trusted)),
+        (&["untrust", ".sbx.toml"], Some(0)),
+        (&["doctor"], None),
     ];
-    for args in invocations {
+    for (args, code) in invocations {
         let out = run(args, home.path(), cwd.path());
+        let label = format!("sbx {}", args.join(" "));
+        if let Some(code) = code {
+            assert_eq!(
+                out.status.code(),
+                Some(*code),
+                "`{label}`:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
         assert!(
-            !out.stdout.contains(&0x1b),
-            "`sbx {}` emitted an ANSI escape on a captured stream:\n{}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stdout)
+            !out.stdout.is_empty() || !out.stderr.is_empty(),
+            "`{label}` printed nothing"
         );
-        assert!(
-            !out.stderr.contains(&0x1b),
-            "`sbx {}` emitted an ANSI escape on captured stderr:\n{}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert_no_ansi(&out, &label);
     }
 }
 
@@ -104,8 +122,9 @@ fn transactional_confirmations_are_plain_when_captured() {
     // The read commands above are stateless; the *transactional* confirmations (import, install,
     // …) only take their colored path after a side effect, so the flat loop cannot reach them.
     // Drive each cheap, host-agnostic one end to end (no nix, no network) so a miswired caller —
-    // one that prints raw ANSI, or derives a stderr line's palette from the wrong stream — cannot
-    // slip past with the presenter unit tests alone.
+    // one that prints raw ANSI — cannot slip past with the presenter unit tests alone. Both streams
+    // are pipes here, so a line that takes its palette from the other stream is plain as well:
+    // `a_line_takes_its_palette_from_the_stream_it_is_written_to` is where that one shows.
     let home = TmpDir::new("color");
     let cwd = TmpDir::new("color");
     // A minimal importable profile: a top-level app with a command.
@@ -120,18 +139,17 @@ fn transactional_confirmations_are_plain_when_captured() {
     );
     assert_no_ansi(&imported, "app import");
 
+    // The fixture paths go to the verb as the OS strings they are: the fixture root comes from the
+    // environment and may hold bytes outside UTF-8, which a `&str` could not carry.
     let out_file = cwd.path().join("exported.toml");
-    let exported = run(
-        &[
-            "app",
-            "export",
-            "probe",
-            "--out",
-            out_file.to_str().unwrap(),
-        ],
+    let exported = command(
+        &["app", "export", "probe", "--out"],
         home.path(),
         cwd.path(),
-    );
+    )
+    .arg(&out_file)
+    .output()
+    .expect("spawn sbx");
     assert!(
         exported.status.success(),
         "export must succeed:\n{}",
@@ -161,11 +179,10 @@ fn transactional_confirmations_are_plain_when_captured() {
         std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let pinstall = run(
-        &["plugins", "install", plugin_dir.to_str().unwrap()],
-        home.path(),
-        cwd.path(),
-    );
+    let pinstall = command(&["plugins", "install"], home.path(), cwd.path())
+        .arg(&plugin_dir)
+        .output()
+        .expect("spawn sbx");
     assert!(
         pinstall.status.success(),
         "plugin install must succeed:\n{}",
@@ -178,8 +195,16 @@ fn transactional_confirmations_are_plain_when_captured() {
     assert_no_ansi(&prm, "plugins rm demo-resolver");
 
     // plugins store update with nothing configured: the dimmed "no stores" message. Exit status
-    // depends on whether git is on PATH (host-dependent), so only the no-ANSI invariant is pinned.
+    // depends on whether git is on PATH (host-dependent), so the invariant is pinned on whichever
+    // of its two answers came back.
     let update = run(&["plugins", "store", "update"], home.path(), cwd.path());
+    let answered = String::from_utf8_lossy(&update.stdout).contains("no remote stores")
+        || String::from_utf8_lossy(&update.stderr).contains("git is not on PATH");
+    assert!(
+        answered,
+        "plugins store update gave neither answer:\n{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
     assert_no_ansi(&update, "plugins store update");
 
     // config writes: set (creates the local .sbx.toml), then unset (removes the key). Both print a
@@ -212,6 +237,70 @@ fn transactional_confirmations_are_plain_when_captured() {
         String::from_utf8_lossy(&stop_all.stderr)
     );
     assert_no_ansi(&stop_all, "stop --all");
+}
+
+/// A line takes its palette from the stream it is written to. With one stream on a terminal and the
+/// other captured, the captured one stays plain: the confirmation `app export --out` writes on
+/// stderr while stdout is a terminal, and the one `config set` writes on stdout while stderr is.
+///
+/// With both streams captured, as in the tests above, a line painted for the other stream's
+/// terminal is plain too, and nothing there can tell the two apart.
+#[test]
+fn a_line_takes_its_palette_from_the_stream_it_is_written_to() {
+    let home = TmpDir::new("color");
+    let cwd = TmpDir::new("color");
+    std::fs::write(cwd.path().join("probe.toml"), "cmd = \"true\"\n").unwrap();
+    let imported = run(&["app", "import", "./probe.toml"], home.path(), cwd.path());
+    assert!(
+        imported.status.success(),
+        "import must succeed:\n{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+
+    let terminal = Pty::open(None);
+    let exported = command(
+        &["app", "export", "probe", "--out"],
+        home.path(),
+        cwd.path(),
+    )
+    .arg(cwd.path().join("exported.toml"))
+    .stdout(terminal.stdio())
+    .output()
+    .expect("spawn sbx");
+    let said = String::from_utf8_lossy(&exported.stderr);
+    assert!(exported.status.success(), "export must succeed:\n{said}");
+    assert!(
+        said.contains("exported"),
+        "the export confirms on stderr:\n{said}"
+    );
+    assert!(
+        !exported.stderr.contains(&0x1b),
+        "the stderr line was painted for the terminal on stdout:\n{said}"
+    );
+
+    let terminal = Pty::open(None);
+    let set = command(
+        &["config", "set", "env.FOO", "bar"],
+        home.path(),
+        cwd.path(),
+    )
+    .stderr(terminal.stdio())
+    .output()
+    .expect("spawn sbx");
+    let said = String::from_utf8_lossy(&set.stdout);
+    assert!(
+        set.status.success(),
+        "config set must succeed:\n{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    assert!(
+        said.contains("env.FOO"),
+        "config set confirms on stdout:\n{said}"
+    );
+    assert!(
+        !set.stdout.contains(&0x1b),
+        "the stdout line was painted for the terminal on stderr:\n{said}"
+    );
 }
 
 #[test]
