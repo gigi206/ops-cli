@@ -51,12 +51,20 @@ impl Project {
         }
     }
 
-    /// An `sbx` invocation from `dir`, with the three homes redirected.
+    /// An `sbx` invocation from `dir`, with the three homes redirected and the host's git held to
+    /// the global configuration under the redirected config home.
     ///
     /// The locale is pinned rather than inherited. The cage honors the host's locale, so a
     /// provisioned tool's output is translated on a developer machine that is not set to English,
     /// and an assertion on that output then fails for a reason that has nothing to do with sbx.
     /// `C.UTF-8` keeps messages English while staying UTF-8-clean.
+    ///
+    /// `GIT_CONFIG_GLOBAL` names `git/config` under the config home, the file git reads there
+    /// anyway, and so leaves out the `~/.gitconfig` of whoever runs the suite. sbx asks the host's
+    /// git what it reads in a project's repository, and that git finds `~/.gitconfig` through the
+    /// inherited `HOME`: a global `core.hooksPath` there turns a path of the project read-only,
+    /// and a test of the mask would then pass or fail on that machine's configuration. `HOME`
+    /// itself stays inherited, since a `~` in a bind expands against it.
     pub fn cmd_in(&self, dir: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
         cmd.args(args)
@@ -64,6 +72,10 @@ impl Project {
             .env("XDG_CONFIG_HOME", self.config_home.path())
             .env("XDG_STATE_HOME", self.state_home.path())
             .env("XDG_DATA_HOME", self.data_home.path())
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                self.config_home.path().join("git/config"),
+            )
             .env("LC_ALL", "C.UTF-8")
             .env_remove("LANG");
         cmd

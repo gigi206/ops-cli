@@ -1874,6 +1874,66 @@ fn test_fs_holds_nothing_in_a_bind_that_holds_the_global_git_configuration() {
     );
 }
 
+/// What the mask holds in a project does not depend on the `~/.gitconfig` of whoever runs the
+/// suite: the fixture holds the host's git to the global configuration under its config home.
+///
+/// A home whose `.gitconfig` points `core.hooksPath` at a directory of the project makes the
+/// host's git name that directory, and sbx holds it read-only: the run that lets git read that
+/// home shows it. The fixture's own run over the same home leaves the directory open.
+#[test]
+fn test_fs_reads_no_global_git_configuration_from_the_runners_home() {
+    let p = Project::new("tfs");
+    let root = p.proj.path();
+    let home = p.scratch().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(root)
+        .env("HOME", &home)
+        .output();
+    if !git.is_ok_and(|o| o.status.success()) {
+        skip_incapable!("git is not installed on this host");
+        return;
+    }
+    // Relative, so it names `myhooks` at the top of the work tree whatever bytes the root holds.
+    std::fs::write(home.join(".gitconfig"), "[core]\n\thooksPath = myhooks\n").unwrap();
+    std::fs::create_dir_all(root.join("myhooks")).unwrap();
+    let hook = root.join("myhooks/pre-commit");
+
+    let verdict = |reads_home: bool| {
+        let mut cmd = p.cmd(&["test", "fs"]);
+        cmd.arg(&hook).env("HOME", &home);
+        if reads_home {
+            cmd.env_remove("GIT_CONFIG_GLOBAL");
+        }
+        let out = cmd.output().expect("spawn sbx");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let word = stdout
+            .lines()
+            .nth(1)
+            .and_then(|l| l.split_whitespace().next())
+            .map(str::to_owned);
+        (word, stdout)
+    };
+    let (word, stdout) = verdict(true);
+    assert_eq!(
+        word.as_deref(),
+        Some("READ-ONLY"),
+        "a git that reads the home names the directory:\n{stdout}"
+    );
+    let (word, stdout) = verdict(false);
+    assert_eq!(
+        word.as_deref(),
+        Some("OPEN"),
+        "the fixture's run reads no `.gitconfig` from the home:\n{stdout}"
+    );
+}
+
 /// A path the **project** chose reaches this terminal through the verdict, and it must arrive as
 /// text rather than as instructions.
 ///
