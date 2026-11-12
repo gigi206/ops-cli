@@ -85,6 +85,11 @@ pub(crate) fn version_line() -> String {
 }
 
 /// The version line of a build of `version`, published as `release` or, for `None`, from source.
+///
+/// A build already installed reads this line back from the next one with its own [`tag_of`],
+/// before `sbx upgrade self` lets the next one replace it. Its head, `sbx <version> (<tag>, `, is
+/// therefore read by builds published before this one: changing it would make every one of them
+/// refuse the build that changed it.
 fn line_of(version: &str, release: Option<Release>) -> String {
     match release {
         Some(release) => format!(
@@ -96,13 +101,14 @@ fn line_of(version: &str, release: Option<Release>) -> String {
     }
 }
 
-/// The release tag a version line names, read back from the form [`version_line`] writes: `None`
-/// for a build from source, and for a line of any other shape.
+/// The release tag a version line names: the tag in the head `sbx <version> (<tag>, ` that
+/// [`line_of`] writes. `None` for a build from source, and for a line without that head. What
+/// follows the tag is not read, so a later build may write more there and still be read by this
+/// one.
 pub(crate) fn tag_of(line: &str) -> Option<&str> {
-    let (version, release) = line.strip_prefix("sbx ")?.split_once(" (")?;
-    let (tag, rev) = release.strip_suffix(')')?.split_once(", ")?;
-    let one_word = !version.is_empty() && !version.contains(' ');
-    (one_word && is_tag(tag) && is_hex(rev, 7)).then_some(tag)
+    let (_version, release) = line.strip_prefix("sbx ")?.split_once(" (")?;
+    let (tag, _rest) = release.split_once(", ")?;
+    is_tag(tag).then_some(tag)
 }
 
 /// A byte a tag or a repository name may carry, the set GitHub allows in both.
@@ -233,10 +239,11 @@ mod tests {
         assert_eq!(release("nightly").channel(), Channel::Rolling("nightly"));
     }
 
-    /// The tag is read back exactly from the line [`version_line`] writes, and from nothing else: a
-    /// build from source names none, and neither does a line of another shape.
+    /// The tag is read back from the head every published line opens with, `sbx <version> (<tag>, `,
+    /// whatever the build writes after it: a build from source names none, and neither does a line
+    /// without that head.
     #[test]
-    fn the_tag_is_read_back_from_the_version_line_and_from_nothing_else() {
+    fn the_tag_is_read_back_from_the_head_of_the_version_line() {
         let release = |tag| Release {
             tag,
             commit: COMMIT,
@@ -246,13 +253,16 @@ mod tests {
             assert_eq!(tag_of(&line_of("0.1.0", Some(release(tag)))), Some(tag));
         }
         assert_eq!(tag_of(&line_of("0.1.0", None)), None);
+        // What a later build may write after the tag is not read.
         for line in [
-            "sbx 0.1.0 (latest, 0a9ad1c) and more",
+            "sbx 0.2.0 (latest, 0a9ad1c) and more",
+            "sbx 0.2.0 (latest, 0a9ad1c73748cfa9b09d1994ece8a2aaa4ed8fe5)",
+        ] {
+            assert_eq!(tag_of(line), Some("latest"), "{line}");
+        }
+        for line in [
             "sbx 0.1.0 (latest)",
-            "sbx 0.1.0 (latest, 0a9ad1)",
             "sbx 0.1.0 (../x, 0a9ad1c)",
-            "sbx (latest, 0a9ad1c)",
-            "sbx 0.1.0 and more (latest, 0a9ad1c)",
             "other 0.1.0 (latest, 0a9ad1c)",
         ] {
             assert_eq!(tag_of(line), None, "{line}");
