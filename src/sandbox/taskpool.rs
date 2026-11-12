@@ -555,9 +555,9 @@ pub(crate) fn upgrade(
 ///
 /// Stripping is also what the dedup runs on, and that is wider than dropping repeats of one spec:
 /// [`super::task::TaskEngine::declared_packages`] dedups by the whole token, so two tasks naming
-/// the same tool at different versions both reach here and the pool holds both, while the roll
-/// leaves as a single argument naming the tool. The argv is therefore not a picture of the pool,
-/// which is worth saying where the two stop matching.
+/// the same tool at different versions both reach here. The pool holds one entry for that tool,
+/// the one the fill kept ([`one_spec_per_tool`]), and the roll names the tool once: mise moves
+/// that entry within the spec it records, whichever spelling the argument came from.
 fn upgrade_argv(mise_bin: &Path, tokens: &[String]) -> Vec<OsString> {
     // After `--`, as the install's are: a tool is never read as an option.
     let mut argv = vec![
@@ -1380,7 +1380,8 @@ mod tests {
     fn a_token_with_options_is_found_by_the_key_mise_files_it_under() {
         let base = TmpDir::new();
         let pool = base.join("task-mise");
-        // What `mise use -g -- 'ubi:owner/tool[exe=tool,matching=musl]@1.0.0'` leaves behind.
+        // The config line is the one `mise use -g -- 'ubi:owner/tool[exe=tool,matching=musl]@1.0.0'`
+        // writes; the install's metadata has the shape mise gives a tool installed with options.
         let dir = installs_dir(&pool).join("ubi-owner-tool");
         std::fs::create_dir_all(dir.join("1.0.0/bin")).unwrap();
         std::fs::write(
