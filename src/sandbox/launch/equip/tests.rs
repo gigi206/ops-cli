@@ -420,7 +420,7 @@ fn running_the_equip_script_reinstalls_a_pipx_tool_whose_python_is_gone() {
         assert_eq!(
             calls,
             "mise -C / install --force pipx:broken-tool@1.2.0\n\
-             mise -C / use -g --pin pipx:broken-tool pipx:healthy-tool@3.0 pipx:absent-tool \
+             mise -C / use -g --pin -- pipx:broken-tool pipx:healthy-tool@3.0 pipx:absent-tool \
              aqua:example/demo-tool\n",
             "exactly the broken pipx install is repaired, then the equip runs (pin {pin:?})"
         );
@@ -480,7 +480,7 @@ fn running_the_equip_script_repairs_a_pipx_tool_whose_directory_mise_named_from_
         std::fs::read_to_string(&record).expect("the stub recorded its calls"),
         "mise -C / install --force pipx:Broken-Caps@2.0\n\
          mise -C / install --force pipx:Kept-Caps@1.0\n\
-         mise -C / use -g --pin pipx:Broken-Caps pipx:Kept-Caps\n"
+         mise -C / use -g --pin -- pipx:Broken-Caps pipx:Kept-Caps\n"
     );
 }
 
@@ -488,6 +488,7 @@ fn running_the_equip_script_repairs_a_pipx_tool_whose_directory_mise_named_from_
 /// tool and never as an option. The project's lane takes its tokens from the project's own
 /// `.mise.toml`, which no declaration check has seen, and a word starting with `-` there would
 /// otherwise reach mise as a flag: `use -g --pin --help` prints the help and installs nothing.
+///
 /// Run, rather than read off the script text, with a stand-in mise that records its argv.
 #[test]
 fn every_mise_script_ends_the_options_before_its_tokens() {
