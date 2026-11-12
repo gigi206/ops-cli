@@ -979,6 +979,9 @@ impl RuleKind {
     /// Render the kind, omitting the single-port default `omit_default` from the `:port` suffix (443
     /// for `https`, 80 for `http`) so a scheme-default host renders compact; `None` forces the port
     /// explicit (L4, so `tcp://host:443` round-trips).
+    ///
+    /// A kind has no `Display` of its own: which port is the default depends on the layer, which
+    /// only the [`Rule`] carries, so a kind is rendered through its rule.
     fn render(&self, omit_default: Option<u16>) -> String {
         let suffix = |ports: &Ports| ports.render_suffix(omit_default);
         match self {
@@ -998,12 +1001,6 @@ impl RuleKind {
             } => format!("{}{}{path}", display_host(host), suffix(ports)),
             RuleKind::Regex { pattern, .. } => format!("re:{pattern}"),
         }
-    }
-}
-
-impl fmt::Display for RuleKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.render(Some(443)))
     }
 }
 
