@@ -37,17 +37,32 @@ fn top_level_help_lists_every_command() {
         let out = sbx(invocation);
         assert!(out.status.success(), "`sbx {invocation:?}` should exit 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            stdout.contains("Commands:"),
-            "missing the command list for {invocation:?}"
-        );
+        let listed = listed_under(&stdout, "Commands:");
         for cmd in &top {
             assert!(
-                stdout.contains(cmd),
-                "`sbx {invocation:?}` did not list '{cmd}'"
+                listed.contains(cmd),
+                "`sbx {invocation:?}` did not list '{cmd}': {listed:?}"
             );
         }
     }
+}
+
+/// The names a help page lists under `heading` (`Commands:`, `Subcommands:`): the first word of
+/// each line of that section, which ends at the first blank line.
+///
+/// A name is read as the word it is. Searched as a substring of the page, a command dropped from
+/// the list would still be found inside another word or a summary: `run` in "a running sandbox",
+/// `store` in "plugin stores", `trust` in `untrust`.
+#[track_caller]
+fn listed_under<'a>(page: &'a str, heading: &str) -> Vec<&'a str> {
+    let Some((_, section)) = page.split_once(&format!("{heading}\n")) else {
+        panic!("no `{heading}` section in:\n{page}");
+    };
+    section
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_whitespace().next())
+        .collect()
 }
 
 #[test]
@@ -83,6 +98,10 @@ fn every_command_and_verb_has_a_page() {
             stdout.contains("Usage:"),
             "`sbx help {path:?}` had no Usage line"
         );
+        assert!(
+            !out.stdout.contains(&0x1b),
+            "`sbx help {path:?}` emitted an ANSI escape on a captured stream"
+        );
 
         let mut via_flag = path.to_vec();
         via_flag.push("--help");
@@ -91,6 +110,10 @@ fn every_command_and_verb_has_a_page() {
         assert!(
             String::from_utf8_lossy(&out.stdout).contains(&header),
             "`sbx {path:?} --help` did not render the page"
+        );
+        assert!(
+            !out.stdout.contains(&0x1b),
+            "`sbx {path:?} --help` emitted an ANSI escape on a captured stream"
         );
     }
 }
@@ -253,21 +276,22 @@ fn subcommands_are_listed_alphabetically() {
     let out = sbx(&["app", "--help"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Within the Subcommands section, the verbs are sorted: export, import, list, rm.
-    let section = stdout
-        .split("Subcommands:")
-        .nth(1)
-        .and_then(|s| s.split("Run `sbx help").next())
-        .expect("an app page has a Subcommands section");
-    assert!(
-        section.find("export") < section.find("import"),
-        "export before import"
+    // The verbs of the Subcommands section, read as words: the ones named here are there, and the
+    // whole column is in order. They are not compared by where `find` lands, because a verb missing
+    // from the column is `None` there, and `None` orders before every `Some`.
+    let verbs = listed_under(&stdout, "Subcommands:");
+    for verb in ["export", "import", "list", "rm"] {
+        assert!(
+            verbs.contains(&verb),
+            "the app page does not list `{verb}`: {verbs:?}"
+        );
+    }
+    let mut sorted = verbs.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        verbs, sorted,
+        "the app page lists its subcommands out of order"
     );
-    assert!(
-        section.find("import") < section.find("list"),
-        "import before list"
-    );
-    assert!(section.find("list") < section.find("rm"), "list before rm");
 }
 
 #[test]
@@ -284,13 +308,15 @@ fn a_double_dash_passes_help_flags_through_to_the_app_command() {
     // The converse of the test above: `sbx app run <name> -- --help` must NOT show sbx's app-run
     // page — the `--help` after `--` belongs to the launched command (a program's own `--help`, or a
     // resume flag like `-- -c`), not to sbx. The launch path is short-circuited without a sandbox
-    // by removing the data-dir env, so it fails fast *after* routing; the point is only that sbx
-    // did not intercept the help flag. (The routing itself is unit-tested in help.rs by
-    // `maybe_help_stops_at_a_double_dash`.)
+    // by removing the three variables a data directory is resolved from, so it fails fast *after*
+    // routing, and that failure is the witness that the verb ran: an exit before it, a usage error
+    // or nothing at all, would show no help page either. (The routing itself is unit-tested in
+    // help.rs by `maybe_help_stops_at_a_double_dash`.)
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(["app", "run", "demo", "--", "--help"])
         .env_remove("HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("SBX_DATA_DIR")
         .output()
         .expect("spawn sbx");
     let text =
@@ -300,14 +326,28 @@ fn a_double_dash_passes_help_flags_through_to_the_app_command() {
         "`sbx app run <name> -- --help` was intercepted as sbx's help page instead of passing \
          `--help` through to the command: {text}"
     );
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot resolve the data directory"),
+        "the launch should stop at the data directory it cannot resolve: {text}"
+    );
 }
 
 #[test]
 fn piped_help_has_no_ansi_escapes() {
     // Color is auto-gated: a captured (non-terminal) stream is plain text — which is also why the
-    // substring assertions above hold.
-    for args in [&["--help"][..], &["app", "import", "--help"][..]] {
+    // substring assertions above hold. The page is asserted to be there first, so an empty stream
+    // does not pass for a plain one. Every other page is held to the same in the walk above.
+    for (args, page) in [
+        (&["--help"][..], "Commands:"),
+        (&["app", "import", "--help"][..], "sbx app import —"),
+    ] {
         let out = sbx(args);
+        assert!(out.status.success(), "`sbx {args:?}` should exit 0");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(page),
+            "`sbx {args:?}` did not print its page on stdout"
+        );
         assert!(
             !out.stdout.contains(&0x1b),
             "piped `sbx {args:?}` must not emit ANSI escapes"
