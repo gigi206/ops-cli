@@ -1137,7 +1137,7 @@ fn read_head_raw<R: Read>(
             return Ok(());
         }
         if buf.len() > max {
-            return Err(invalid("request head too large"));
+            return Err(oversized_head());
         }
     }
 }
@@ -1161,7 +1161,7 @@ fn read_head_buffered<R: BufRead>(r: &mut R, max: usize, deadline: Instant) -> i
             ));
         }
         if buf.len() > max {
-            return Err(invalid("request head too large"));
+            return Err(oversized_head());
         }
         if matches!(&buf[start..], b"\r\n" | b"\n") {
             return Ok(buf);
@@ -2662,6 +2662,30 @@ fn admit_absolute_form(
 /// An `InvalidData` error with a static cause, for the proxy's fail-closed paths.
 fn invalid(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+/// The cause a head reader gives a head that runs past its budget without ending: a type of its
+/// own, so a caller answering for an upstream can tell it from a connection that closed or timed
+/// out mid-head without comparing messages. [`read_head_buffered`] and [`read_head_raw`] give it.
+#[derive(Debug)]
+struct OversizedHead;
+
+impl std::fmt::Display for OversizedHead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request head too large")
+    }
+}
+
+impl std::error::Error for OversizedHead {}
+
+/// The `InvalidData` error a head reader returns for an [`OversizedHead`].
+fn oversized_head() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, OversizedHead)
+}
+
+/// Whether `e` is a head reader's [`OversizedHead`].
+fn is_oversized_head(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|cause| cause.is::<OversizedHead>())
 }
 
 /// Tests for the accept loop's own bookkeeping, kept beside it rather than in [`tests`] because

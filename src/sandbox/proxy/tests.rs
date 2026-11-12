@@ -1328,11 +1328,12 @@ fn an_interim_head_before_the_101_does_not_decline_the_upgrade() {
 
 /// The WebSocket plane answers an upgrade the upstream never resolved, like the other three.
 ///
-/// Two shapes with one answer. An upstream that floods interim heads holds a proxy thread and
-/// pours bytes into the cage: this plane relayed them without a ceiling while the other three stop
-/// at `INTERIM_HEAD_MAX`. An upstream that closes without answering left the tunnel dying with the
-/// error propagated and nothing said, where the request planes write a `502` naming the cause. A
-/// client waiting on an upgrade cannot tell either from a hang.
+/// Three shapes, each answered with a `502` naming its own cause, as the request planes name it. An
+/// upstream that floods interim heads holds a proxy thread and pours bytes into the cage, so the
+/// flood stops at `INTERIM_HEAD_MAX`. An upstream that closes without answering is
+/// `upstream-closed`. A head that runs past `HEAD_MAX` without ending is
+/// `upstream-head-too-large`, not a close: the upstream did answer, with more than a head may
+/// hold. A client waiting on an upgrade cannot tell any of them from a hang without the answer.
 ///
 /// The record is the other half of the answer. The allow was recorded before the relay was entered
 /// and its status never arrives, so the `error` line naming the upstream is the only thing that
@@ -1350,6 +1351,18 @@ fn an_upgrade_the_upstream_never_answers_is_refused_rather_than_dropped() {
             "interim-head-cap",
         ),
         ("a close before any answer", b"", "upstream-closed"),
+        (
+            "a head past the budget",
+            Box::leak(
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nX-Pad: {}",
+                    "a".repeat(HEAD_MAX + 1)
+                )
+                .into_bytes()
+                .into_boxed_slice(),
+            ) as &'static [u8],
+            "upstream-head-too-large",
+        ),
     ] {
         // The second arm's upstream sends its prefix and nothing else: `spawn_ws_upstream_closing`
         // shuts the connection down where the handshake response would go.
@@ -6349,12 +6362,27 @@ fn a_denied_host_is_refused_with_403() {
     );
 }
 
+/// Both head readers bound a head that never ends, and give that bound a cause of its own: an
+/// [`OversizedHead`] is what the upgrade plane answers `upstream-head-too-large` for, and a head
+/// the connection closed on is not one.
 #[test]
 fn read_head_buffered_bounds_a_line_with_no_terminator() {
     // a single oversized line with no terminator must error (bounded), not buffer unboundedly
     let mut flood = std::io::Cursor::new(vec![b'a'; 64 * 1024]);
     let err = read_head_buffered(&mut flood, 16 * 1024, far_deadline()).unwrap_err();
     assert!(err.to_string().contains("request head too large"), "{err}");
+    assert!(is_oversized_head(&err), "{err:?}");
+    let mut flood = std::io::Cursor::new(vec![b'a'; 64 * 1024]);
+    let err = read_head_raw(&mut flood, 16 * 1024, far_deadline(), &mut Vec::new()).unwrap_err();
+    assert!(is_oversized_head(&err), "{err:?}");
+    // Cut short by a close, on either reader, the head is not an oversized one.
+    let cut = b"GET / HTTP/1.1\r\nHost: x\r\n";
+    let mut closed = std::io::Cursor::new(cut.to_vec());
+    let err = read_head_buffered(&mut closed, 16 * 1024, far_deadline()).unwrap_err();
+    assert!(!is_oversized_head(&err), "{err:?}");
+    let mut closed = std::io::Cursor::new(cut.to_vec());
+    let err = read_head_raw(&mut closed, 16 * 1024, far_deadline(), &mut Vec::new()).unwrap_err();
+    assert!(!is_oversized_head(&err), "{err:?}");
     // a normal head within the bound still parses
     let mut ok = std::io::Cursor::new(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec());
     assert!(read_head_buffered(&mut ok, 16 * 1024, far_deadline()).is_ok());

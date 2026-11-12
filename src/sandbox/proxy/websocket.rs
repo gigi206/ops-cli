@@ -205,9 +205,10 @@ impl Unresolved {
 ///
 /// The same `502`, the same reason token and the same `error` log line the three request planes
 /// give when the upstream gave no final head, because they are the same fact about the server: it
-/// was reached and it did not answer. A refusal after interim heads have already crossed is a legal
-/// response, and it is the shape `relay_response_head` produces. A `101` that is not a WebSocket's
-/// is answered the same way, before anything of it reaches the client.
+/// was reached and sent no head that can be relayed as its answer. A refusal after interim heads
+/// have already crossed is a legal response, and it is the shape `relay_response_head` produces. A
+/// `101` that is not a WebSocket's is answered the same way, before anything of it reaches the
+/// client.
 ///
 /// The line is what makes the exchange readable. The `allow` was recorded before this plane was
 /// entered and it stands — policy did permit the upgrade — but its status never arrives, so without
@@ -265,7 +266,7 @@ fn refuse_upgrade(
 /// upgrade's body reaches the mask uncompressed — the invariant every other plane keeps.
 ///
 /// `port` and `target` are the exchange's own, carried in for one purpose: naming the `error` line
-/// [`refuse_upgrade`] pushes when the upstream produces no head at all.
+/// [`refuse_upgrade`] pushes when the upstream gives no final head this plane can relay.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn relay_upgrade(
     mut br: BufReader<StreamOwned<ServerConnection, UnixStream>>,
@@ -309,20 +310,20 @@ pub(super) fn relay_upgrade(
     let mut interim_seen = 0usize;
     let resp_head = loop {
         // An upstream that closes, resets or runs past the head budget leaves this plane with
-        // nothing to relay. The three request planes answer that with a `502` naming the reason;
-        // this one propagated the error and the tunnel died with the client holding an upgrade
-        // that never resolved and no line saying why. The same answer is given here.
+        // nothing to relay, and it is answered as the three request planes answer it: a `502`
+        // naming the reason, rather than a tunnel that dies with the client holding an upgrade
+        // that never resolved. A head past `HEAD_MAX` is refused under its own reason, as
+        // `relay_response_head` refuses it; a close, a reset or the deadline is an upstream that
+        // closed.
         let head = match read_head_buffered(&mut up_br, HEAD_MAX, deadline) {
             Ok(head) => head,
-            Err(_) => {
-                return refuse_upgrade(
-                    &mut br,
-                    NoFinalHead::UpstreamClosed.into(),
-                    &host,
-                    ctx,
-                    port,
-                    target,
-                );
+            Err(e) => {
+                let why = if is_oversized_head(&e) {
+                    NoFinalHead::HeadTooLarge
+                } else {
+                    NoFinalHead::UpstreamClosed
+                };
+                return refuse_upgrade(&mut br, why.into(), &host, ctx, port, target);
             }
         };
         match parse_status_code(&head) {
