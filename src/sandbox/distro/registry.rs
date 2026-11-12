@@ -115,39 +115,162 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// One challenge of a `WWW-Authenticate` field: its scheme, and the parameters it names, their
+/// names lowercased since RFC 7235 compares those without case.
+#[derive(Debug, PartialEq, Eq)]
+struct Challenge {
+    scheme: String,
+    params: Vec<(String, String)>,
+}
+
+impl Challenge {
+    /// Whether this challenge is of `scheme`, compared without case as RFC 7235 asks.
+    fn is(&self, scheme: &str) -> bool {
+        self.scheme.eq_ignore_ascii_case(scheme)
+    }
+
+    /// The value of the parameter `name`, written lowercase: the last one when it is named twice.
+    fn param(&self, name: &str) -> Option<&str> {
+        self.params
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// The challenges a `WWW-Authenticate` field carries, read with RFC 7235's grammar.
+///
+/// One field may carry several challenges, separated by the same commas that separate a
+/// challenge's parameters, so a comma alone does not end a challenge: a new one starts at a token
+/// no `=` follows. A quoted value may hold a comma, and a quote or a backslash behind a backslash.
+/// An unquoted value runs to the next comma or space, wider than the grammar's token: a realm
+/// written unquoted is a URL, and the token would stop at its `:`. A scheme may carry one
+/// `token68` instead of parameters, which is read past.
+///
+/// The field is the registry's to write, so nothing in it may keep the reading from ending: every
+/// step consumes what it read or ends the reading, keeping the challenges read before it.
+fn challenges(field: &str) -> Vec<Challenge> {
+    const SPACE: [char; 2] = [' ', '\t'];
+    let mut read: Vec<Challenge> = Vec::new();
+    let mut rest = field;
+    loop {
+        rest = rest.trim_start_matches([' ', '\t', ',']);
+        let (name, after) = split_token(rest);
+        if name.is_empty() {
+            break;
+        }
+        let parameter = after.trim_start_matches(SPACE).strip_prefix('=');
+        match (parameter, read.last_mut()) {
+            // `name=` and a value: a parameter of the challenge being read.
+            (Some(value), Some(challenge)) if !value.starts_with('=') => {
+                let value = value.trim_start_matches(SPACE);
+                let read_value = match value.strip_prefix('"') {
+                    Some(quoted) => unquote(quoted),
+                    None => {
+                        let end = value.find([',', ' ', '\t']).unwrap_or(value.len());
+                        Some((value[..end].to_string(), &value[end..]))
+                    }
+                };
+                let Some((value, tail)) = read_value else {
+                    break;
+                };
+                challenge.params.push((name.to_ascii_lowercase(), value));
+                rest = tail;
+            }
+            // A parameter before any scheme: the field does not start where the grammar does.
+            (Some(_), None) => break,
+            // Anything else after a token makes the token a scheme.
+            _ => {
+                read.push(Challenge {
+                    scheme: name.to_string(),
+                    params: Vec::new(),
+                });
+                rest = past_token68(after);
+            }
+        }
+    }
+    read
+}
+
+/// The RFC 7230 token at the start of `s`, and what follows it.
+fn split_token(s: &str) -> (&str, &str) {
+    let end = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)))
+        .unwrap_or(s.len());
+    s.split_at(end)
+}
+
+/// A quoted-string whose opening quote has been read, unescaped, and what follows its closing
+/// quote: `None` when it is never closed.
+fn unquote(s: &str) -> Option<(String, &str)> {
+    let mut value = String::new();
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return Some((value, &s[i + 1..])),
+            '\\' => value.push(chars.next()?.1),
+            c => value.push(c),
+        }
+    }
+    None
+}
+
+/// What follows the `token68` a scheme may carry at the start of `s`, or `s` itself when what is
+/// there is not one: a run of its characters and its `=` padding, then the end or a comma.
+fn past_token68(s: &str) -> &str {
+    let token = s.trim_start_matches([' ', '\t']);
+    let body =
+        token.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || "-._~+/".contains(c));
+    if body.len() == token.len() {
+        return s;
+    }
+    let tail = body.trim_start_matches('=');
+    let next = tail.trim_start_matches([' ', '\t']);
+    if next.is_empty() || next.starts_with(',') {
+        tail
+    } else {
+        s
+    }
+}
+
+/// Where to ask for a token, for the challenges in `field`: the token service its `Bearer`
+/// challenge names, with the `service` and `scope` it names, or `None` when it offers no `Bearer`
+/// challenge. One with no realm names nowhere to go, which is an error rather than a silent
+/// unauthenticated retry.
+fn bearer_request(field: &str) -> io::Result<Option<String>> {
+    let offered = challenges(field);
+    let Some(bearer) = offered.iter().find(|c| c.is("bearer")) else {
+        return Ok(None);
+    };
+    let realm = bearer
+        .param("realm")
+        .ok_or_else(|| io::Error::other(format!("registry challenge names no realm: {field}")))?;
+    let params: Vec<(String, String)> = bearer
+        .params
+        .iter()
+        .filter(|(k, _)| k == "service" || k == "scope")
+        .cloned()
+        .collect();
+    Ok(Some(token_url(realm.to_string(), &params)))
+}
+
 /// A bearer token for `image`, or `None` when the registry answered without asking for one.
 ///
-/// `challenge` is the `WWW-Authenticate` value the registry sent with its `401`. Only the `Bearer`
-/// scheme is followed here; a `Basic` challenge is answered by the caller, which has the credential
-/// and the original request to repeat.
+/// `challenge` is the `WWW-Authenticate` value the registry sent with its `401`, read by
+/// [`challenges`]. Only its `Bearer` challenge is followed here; a `Basic` one is answered by the
+/// caller, which has the credential and the original request to repeat.
 ///
 /// `credential` goes on **this** request and nowhere else. It is what the registry's token service
 /// exchanges for a token scoped to one repository, and once that token exists it is what every
 /// later request carries — so the credential itself never reaches the registry's blob storage, its
 /// CDN, or whatever host a redirect names.
 fn token(challenge: &str, credential: Option<&Credential>) -> io::Result<Option<String>> {
-    let Some(params) = challenge.trim().strip_prefix("Bearer ") else {
-        return Ok(None);
-    };
-    let mut realm = None;
-    let mut extra: Vec<(String, String)> = Vec::new();
-    for part in params.split(',') {
-        let Some((key, value)) = part.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"').to_string();
-        match key.trim() {
-            "realm" => realm = Some(value),
-            "service" | "scope" => extra.push((key.trim().to_string(), value)),
-            _ => {}
-        }
-    }
-    let realm = realm.ok_or_else(|| {
-        io::Error::other(format!("registry challenge names no realm: {challenge}"))
-    })?;
     // The realm is a URL the registry chose, so it goes through the same https-only gate every
     // other hop does; `http::get` refuses anything else.
-    let url = token_url(realm, &extra);
+    let Some(url) = bearer_request(challenge)? else {
+        return Ok(None);
+    };
     let headers: Vec<(&str, &str)> = credential
         .map(|c| vec![("Authorization", c.header())])
         .unwrap_or_default();

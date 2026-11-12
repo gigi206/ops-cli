@@ -866,3 +866,131 @@ fn a_realm_with_a_query_of_its_own_keeps_the_token_parameters_apart() {
         "a second `?` would make the first parameter part of the realm's last value"
     );
 }
+
+/// A `Bearer` challenge is read with the authentication grammar, not by splitting on commas: a
+/// quoted value keeps its commas and its escaped quotes, the scheme and the parameter names are
+/// read without case, and a `Bearer` challenge is found behind another in the same field. An
+/// unquoted realm, a URL the grammar's token would cut at its `:`, still reads whole.
+///
+/// Every shape runs before any is asserted, so a reading that fails names each shape it fails.
+#[test]
+fn a_bearer_challenge_is_read_with_the_authentication_grammar() {
+    let shapes = [
+        (
+            "the form registries send",
+            r#"Bearer realm="https://auth.example/token",service="registry.example",scope="repository:team/app:pull""#,
+            "https://auth.example/token?service=registry.example&scope=repository%3Ateam%2Fapp%3Apull",
+        ),
+        (
+            "an unquoted realm",
+            "Bearer realm=https://auth.example/token,service=registry.example",
+            "https://auth.example/token?service=registry.example",
+        ),
+        (
+            "a scope with a comma inside its quotes",
+            r#"Bearer realm="https://auth.example/token",scope="repository:team/app:pull,push""#,
+            "https://auth.example/token?scope=repository%3Ateam%2Fapp%3Apull%2Cpush",
+        ),
+        (
+            "a realm with a comma inside its quotes",
+            r#"Bearer realm="https://auth.example/token,v2",service="registry.example""#,
+            "https://auth.example/token,v2?service=registry.example",
+        ),
+        (
+            "an escaped quote",
+            r#"Bearer realm="https://auth.example/token",service="a\"b""#,
+            "https://auth.example/token?service=a%22b",
+        ),
+        (
+            "the scheme in another case",
+            r#"bearer realm="https://auth.example/token""#,
+            "https://auth.example/token",
+        ),
+        (
+            "a parameter name in another case",
+            r#"Bearer REALM="https://auth.example/token""#,
+            "https://auth.example/token",
+        ),
+        (
+            "a realm named twice, the last one read",
+            r#"Bearer realm="https://first.example/token",realm="https://auth.example/token""#,
+            "https://auth.example/token",
+        ),
+        (
+            "a Bearer challenge behind a Basic one",
+            r#"Basic realm="private", Bearer realm="https://auth.example/token""#,
+            "https://auth.example/token",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (shape, field, url) in shapes {
+        match bearer_request(field) {
+            Ok(Some(read)) if read == url => {}
+            other => failures.push(format!("{shape}: {other:?}, wanted {url}")),
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A field the grammar cannot read is read no further, and never panics or loops on the way: the
+/// field is the registry's to write. The reading runs on a thread of its own, so a loop fails the
+/// test at its deadline rather than holding the run.
+#[test]
+fn a_challenge_field_the_grammar_cannot_read_ends_the_reading() {
+    let challenge = |scheme: &str, params: &[(&str, &str)]| Challenge {
+        scheme: scheme.to_string(),
+        params: params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    };
+    let fields = [
+        "",
+        "=",
+        ",",
+        ",,,",
+        "\"",
+        "é",
+        "realm=\"x\"",
+        "Bearer realm=\"https://auth.example/token",
+        "Bearer realm=\"a\\",
+        "Bearer realm",
+        "Bearer =x",
+        "Bearer realm=é",
+        "Bearer realm=\"é\",scope=\"ü\"",
+        "Negotiate YIIF==, Bearer realm=\"https://auth.example/token\"",
+    ];
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let read: Vec<Vec<Challenge>> = fields.iter().map(|field| challenges(field)).collect();
+        let _ = tx.send(read);
+    });
+    let read = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("every field is read to an end, without a panic, inside the deadline");
+    let bearer = || challenge("Bearer", &[]);
+    let expected: Vec<Vec<Challenge>> = vec![
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![bearer()],
+        vec![bearer()],
+        vec![bearer()],
+        // The grammar lets space stand before a parameter's `=`, so this is a parameter named
+        // `Bearer`, which a field cannot start with.
+        vec![],
+        vec![challenge("Bearer", &[("realm", "é")])],
+        vec![challenge("Bearer", &[("realm", "é"), ("scope", "ü")])],
+        vec![
+            challenge("Negotiate", &[]),
+            challenge("Bearer", &[("realm", "https://auth.example/token")]),
+        ],
+    ];
+    for ((field, read), expected) in fields.iter().zip(read).zip(expected) {
+        assert_eq!(read, expected, "`{field}`");
+    }
+}
