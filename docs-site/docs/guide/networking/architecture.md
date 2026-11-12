@@ -341,6 +341,13 @@ the next response. So the head is refused wherever it is read: outbound as `400
 bad-request:head`, inbound by falling to the last row of the table below -- relayed to the
 close, on a connection announced as ending here.
 
+Two more spellings are refused the same way: a field line with no colon at all, and a
+field whose name is empty. The first is where a client may stop reading fields.
+Python's `http.client` sees no field after such a line, so a `Content-Length` below it
+frames nothing there and the client reads to the close, while a proxy that skipped the
+line would have framed the body by that length and offered the connection again. An
+empty name is no header any two parsers read alike.
+
 **Where a head ends, and how long it may take to get there.** A head ends at a blank
 line, and a recipient accepts a bare line feed as a line terminator, so that blank line
 has four spellings. All four end a head, on every plane that reads one. That matters most
@@ -658,7 +665,8 @@ would stall its siblings), `ssrf-blocked`, `supervisor-denied` (the supervisor's
 copy of the policy refused a connection the proxy had admitted, described under
 [the SSRF guard](#the-ssrf-guard)), `host-mismatch`, `ip-literal`,
 `method-not-allowed` (a request naming no destination the proxy can route),
-`bad-request` (including `bad-request:head`, a head that never arrived whole),
+`bad-request` (including `bad-request:head`, a head that never arrived whole or does
+not read as one),
 `outbound-secret`, `signer-refused`, `by-mismatch` (a credential
 [held for other programs](../configuration/secret#held-for-named-programs-by) under
 `by_other = "deny"`, or a destination

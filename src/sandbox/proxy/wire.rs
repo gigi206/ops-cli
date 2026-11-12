@@ -38,8 +38,9 @@ pub(crate) fn header_name_eq(a: &str, b: &str) -> bool {
 }
 
 /// Parse a head's bytes into its request (or status) line and headers. A non-UTF-8 or empty head is
-/// an error, and so is a head that opens with an obsolete line fold, or one whose field name is
-/// separated from its colon by whitespace.
+/// an error, and so is a head that opens with an obsolete line fold, one carrying a line with no
+/// colon or a field with no name, or one whose field name is separated from its colon by
+/// whitespace.
 ///
 /// A line beginning with SP or HTAB is a **continuation** of the header above it (the obsolete line
 /// folding of RFC 9112 §5.2), not a header of its own. Splitting it on `:` like any other line —
@@ -76,19 +77,29 @@ pub(super) fn parse_head(bytes: &[u8]) -> io::Result<Head> {
             value.push_str(trim_ows(line));
             continue;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            // Whitespace between the field name and the colon is malformed (RFC 9112 §5.1), and
-            // trimming it away — which is what this did — is what gives sbx a reading nobody else
-            // owes it. On the request side that was harmless, since the head is written out again
-            // from what was parsed; on the response side the head crosses to the cage as it
-            // arrived, so sbx would frame the body by a `Content-Length` the cage's client reads as
-            // something else, and then offer the connection for another request. Refused rather
-            // than normalized, so both planes answer one head the same way.
-            if k.ends_with([' ', '\t']) {
-                return Err(invalid("whitespace before the field colon"));
-            }
-            headers.push((trim_ows(k).to_string(), trim_ows(v).to_string()));
+        // A field line is a name, a colon and a value (RFC 9112 §5). A line with no colon is where
+        // a client's parser may stop reading fields — Python's `http.client` sees no field after
+        // it — while a reader that skips it reads on, so the two would frame one response by
+        // different fields. Refused, as the spellings below are.
+        let Some((k, v)) = line.split_once(':') else {
+            return Err(invalid("header line without a colon"));
+        };
+        // Whitespace between the field name and the colon is malformed (RFC 9112 §5.1), and
+        // trimming it away — which is what this did — is what gives sbx a reading nobody else
+        // owes it. On the request side that was harmless, since the head is written out again
+        // from what was parsed; on the response side the head crosses to the cage as it
+        // arrived, so sbx would frame the body by a `Content-Length` the cage's client reads as
+        // something else, and then offer the connection for another request. Refused rather
+        // than normalized, so both planes answer one head the same way.
+        if k.ends_with([' ', '\t']) {
+            return Err(invalid("whitespace before the field colon"));
         }
+        // A name is a `token`, one character at least (RFC 9110 §5.1). An empty one is no header
+        // a parser reads alike, and a request would carry it upstream written out again as such.
+        if k.is_empty() {
+            return Err(invalid("empty field name before the colon"));
+        }
+        headers.push((trim_ows(k).to_string(), trim_ows(v).to_string()));
     }
     Ok(Head {
         request_line,
@@ -1352,6 +1363,48 @@ mod tests {
         );
     }
 
+    /// A line with no colon, and a field with no name, are refused like the spelling above.
+    ///
+    /// A field line is a name, a colon and a value. A client may stop reading fields at a line with
+    /// no colon: Python's `http.client` sees no field after it, so a `Content-Length` below it
+    /// frames nothing there and the client reads to the close, while a reader that skipped the line
+    /// framed the body by that length and offered the connection for another request. An empty name
+    /// is no token either, and a request would carry it upstream written out again.
+    #[test]
+    fn a_field_line_without_a_colon_or_a_name_is_refused() {
+        let response =
+            |line: &str| format!("HTTP/1.1 200 OK\r\n{line}\r\nContent-Length: 5\r\n\r\n");
+        let request = |line: &str| {
+            format!("POST / HTTP/1.1\r\nHost: h\r\n{line}\r\nContent-Length: 5\r\n\r\n")
+        };
+        let well_formed = response("X-Note: v");
+        assert!(matches!(
+            response_framing(well_formed.as_bytes(), "GET"),
+            BodyFraming::Length(5)
+        ));
+        assert!(response_keeps_alive(well_formed.as_bytes()));
+        assert!(parse_head(request("X-Note: v").as_bytes()).is_ok());
+        for line in ["nonsense", ": v", ":v"] {
+            let head = response(line);
+            assert!(
+                parse_head(head.as_bytes()).is_err(),
+                "{line:?}: a response head carrying it is read"
+            );
+            assert!(
+                matches!(response_framing(head.as_bytes(), "GET"), BodyFraming::ToEof),
+                "{line:?}: the body is framed by a length the cage's client may not read"
+            );
+            assert!(
+                !response_keeps_alive(head.as_bytes()),
+                "{line:?}: the connection is offered for another request"
+            );
+            assert!(
+                parse_head(request(line).as_bytes()).is_err(),
+                "{line:?}: a request head carrying it is read"
+            );
+        }
+    }
+
     #[test]
     fn a_folded_header_is_unfolded_rather_than_read_as_a_header_of_its_own() {
         // The two readers of one head have to agree. `rewrite_client_connection` reads a leading
@@ -1783,11 +1836,11 @@ mod tests {
         let head = parse_head(b"GET / HTTP/1.1\r\nHost: h\r\nX: y\r\n\r\n").unwrap();
         assert_eq!(head.request_line, "GET / HTTP/1.1");
         assert!(head.headers.iter().any(|(k, v)| k == "Host" && v == "h"));
-        // a header line without a colon is skipped (not fatal), and LF-only endings parse too.
-        let head = parse_head(b"POST /x HTTP/1.1\nHost: h\nnonsense\n\n").unwrap();
+        // LF-only endings parse too.
+        let head = parse_head(b"POST /x HTTP/1.1\nHost: h\nX: y\n\n").unwrap();
         assert_eq!(head.request_line, "POST /x HTTP/1.1");
         assert!(head.headers.iter().any(|(k, _)| k == "Host"));
-        assert!(!head.headers.iter().any(|(k, _)| k == "nonsense"));
+        assert!(head.headers.iter().any(|(k, v)| k == "X" && v == "y"));
     }
 
     /// The version token decides whether a connection may be reused, and it has to be read the way
