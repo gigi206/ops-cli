@@ -118,6 +118,11 @@ mod tests {
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut out = Vec::new();
         out.push(("confine", done(confine())));
+        // The bounds the tap sets through the standard library on the sockets it serves, without
+        // checking the result (`nettap`): set the same way here.
+        let bound = Some(std::time::Duration::from_secs(1));
+        out.push(("read timeout", done(socket.set_read_timeout(bound))));
+        out.push(("write timeout", done(socket.set_write_timeout(bound))));
         let s = socket.as_raw_fd() as libc::c_long;
         let path = c"/dev/null".as_ptr() as libc::c_long;
         let int = size_of::<libc::c_int>() as libc::c_long;
@@ -224,7 +229,9 @@ mod tests {
 
     /// The tap's filters, in a process of their own: the calls that would reach past its cage are
     /// refused, `clone3` is answered `ENOSYS` so the fallback is taken, and the calls the tap makes
-    /// still work, a thread started among them.
+    /// still work, a thread started among them. Among those are the read and write bounds the tap
+    /// sets on its sockets and does not check: a filter that refused one would leave that socket
+    /// unbounded without a word, so the test is where the refusal shows.
     #[test]
     fn the_taps_filters_refuse_what_its_work_does_not_make() {
         let outcomes = in_a_process(concat!(module_path!(), "::the_probes_process"));
@@ -258,6 +265,8 @@ mod tests {
             "socket unix",
             "fcntl F_DUPFD_CLOEXEC",
             "setsockopt SO_SNDTIMEO",
+            "read timeout",
+            "write timeout",
         ] {
             assert!(got(name).is_ok(), "{name} is allowed: {:?}", got(name));
         }
