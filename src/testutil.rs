@@ -265,6 +265,28 @@ pub(crate) fn output_past_etxtbsy(cmd: &mut std::process::Command) -> std::proce
     past_etxtbsy("run", || cmd.output())
 }
 
+/// Wait for `pid`, a child the test forked, and return its wait status: a wait a signal
+/// interrupted is retried, and any other failure fails the test.
+///
+/// A test that read the status a bare `waitpid` left read its initial value when the wait failed:
+/// `0`, which is a child that exited normally with code 0, so a test asserting success passed
+/// whatever its child did.
+pub(crate) fn reap(pid: libc::pid_t) -> libc::c_int {
+    let mut status = 0;
+    loop {
+        // SAFETY: `status` is a live local for the kernel to fill.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } == pid {
+            return status;
+        }
+        let e = std::io::Error::last_os_error();
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::Interrupted,
+            "waitpid({pid}) failed: {e}"
+        );
+    }
+}
+
 /// Create a FIFO at `path`, with no writer: a reader that opens it without `O_NONBLOCK` waits for
 /// one for good.
 pub(crate) fn make_fifo(path: &Path) {
@@ -1974,6 +1996,15 @@ mod helper_tests {
             production_half(gated_items),
             "#[cfg(test)]\nuse x::y;\nfn a() {}\n"
         );
+    }
+
+    /// A wait that fails is a failed test, never a child that exited 0: `waitpid` on a process the
+    /// test did not fork answers `ECHILD`, and a status left at its initial `0` reads as a clean
+    /// exit.
+    #[test]
+    #[should_panic(expected = "failed")]
+    fn a_wait_that_fails_fails_the_test() {
+        reap(std::process::id() as libc::pid_t);
     }
 
     /// A parenthesis is closed by the one that matches it, counted like a brace: a `)` inside a

@@ -1325,8 +1325,7 @@ mod tests {
                 libc::_exit(if blocked && allowed_ok { 0 } else { 1 });
             }
         }
-        let mut status = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let status = crate::testutil::reap(pid);
         assert!(
             libc::WIFEXITED(status),
             "the probe child did not exit normally"
@@ -1459,9 +1458,7 @@ mod tests {
                 }
                 libc::_exit(REFUSED_ALL);
             }
-            let mut status = 0;
-            libc::waitpid(pid, &mut status, 0);
-            libc::WEXITSTATUS(status)
+            libc::WEXITSTATUS(crate::testutil::reap(pid))
         };
         assert_ne!(status, 90, "the child could not set no_new_privs");
         assert_ne!(status, 91, "the child could not install the denylist");
