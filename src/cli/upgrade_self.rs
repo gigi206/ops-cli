@@ -377,7 +377,9 @@ fn version_of(path: &Path, deadline: std::time::Duration) -> io::Result<String> 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let line = stdout.lines().next().unwrap_or_default().trim();
     if out.status.success() && line.starts_with("sbx ") {
-        Ok(line.to_string())
+        // Folded as the failure below is: the line is the download's to choose, and it reaches the
+        // terminal in the refusal or the report of the replacement.
+        Ok(diag::one_line(line))
     } else {
         Err(io::Error::other(format!(
             "the downloaded binary does not run here (`--version` ended with {}: {})",
@@ -717,7 +719,8 @@ mod tests {
     /// The new binary must name the release it was fetched from, exactly, since the next upgrade
     /// follows the release it names. A build from source, another rolling tag, an older version and
     /// a tag that only begins with the one fetched are each refused, and none replaces the binary.
-    /// Every shape is checked before the verdict.
+    /// The refusal quotes the line folded, without the escapes it carried. Every shape is checked
+    /// before the verdict.
     #[test]
     fn a_build_that_names_another_release_never_replaces_the_binary() {
         let api = r#"{"tag_name":"v2.0.0"}"#;
@@ -731,13 +734,20 @@ mod tests {
             ),
             ("an older version", "v1.9.0", "sbx 0.1.0 (v1.9.0, 2222222)"),
             ("a longer tag", "v1.9.0", "sbx 0.1.0 (v2.0.0-rc1, 2222222)"),
+            (
+                "a line that drives the terminal",
+                "latest",
+                "sbx 0.1.0\u{1b}[2J (nightly, 1111111)",
+            ),
         ] {
             let served = binary(reports, 0);
             let bench = Bench::new(&served, &format!("{}  {}\n", sha256(&served), asset()), api);
             let outcome = bench.run(fetched_for);
             let kept = std::fs::read_to_string(&bench.target).unwrap();
             let refused = matches!(&outcome, Err(why)
-                if why.contains("which is not a build published as") && why.contains("was left as it was"));
+                if why.contains("which is not a build published as")
+                    && why.contains("was left as it was")
+                    && !why.contains('\u{1b}'));
             if !refused || kept != "the old binary" || left_alone(&bench) != ["sbx"] {
                 failures.push(format!("{shape}: {outcome:?}, the target holds {kept:?}"));
             }
