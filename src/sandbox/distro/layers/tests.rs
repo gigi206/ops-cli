@@ -1440,31 +1440,36 @@ impl Ground {
 
 /// Every entry under `dir` but the trees at `skip`, by path: its kind, its mode, and its contents
 /// or its link's target. A link is read, never followed.
+///
+/// An entry that cannot be read fails the test by its path. Passed over, it would take whatever
+/// lies beneath it out of every check the properties make, and a tree that cannot be listed at
+/// all would read as an empty one, with nothing linked out of it and nothing locked in it.
 fn snapshot(dir: &Path, skip: &[PathBuf]) -> BTreeMap<PathBuf, (&'static str, u32, Vec<u8>)> {
     use std::os::unix::ffi::OsStrExt;
+    fn unreadable(path: &Path, e: io::Error) -> ! {
+        panic!("the snapshot cannot read {}: {e}", path.display())
+    }
     let mut seen = BTreeMap::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(at) = pending.pop() {
-        let Ok(entries) = fs::read_dir(&at) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        for entry in fs::read_dir(&at).unwrap_or_else(|e| unreadable(&at, e)) {
+            let path = entry.unwrap_or_else(|e| unreadable(&at, e)).path();
             if skip.contains(&path) {
                 continue;
             }
-            let Ok(meta) = path.symlink_metadata() else {
-                continue;
-            };
+            let meta = path
+                .symlink_metadata()
+                .unwrap_or_else(|e| unreadable(&path, e));
             let mode = meta.permissions().mode();
             let what = if meta.file_type().is_symlink() {
-                let target = fs::read_link(&path).unwrap_or_default();
+                let target = fs::read_link(&path).unwrap_or_else(|e| unreadable(&path, e));
                 ("link", mode, target.as_os_str().as_bytes().to_vec())
             } else if meta.is_dir() {
                 pending.push(path.clone());
                 ("dir", mode, Vec::new())
             } else if meta.is_file() {
-                ("file", mode, fs::read(&path).unwrap_or_default())
+                let data = fs::read(&path).unwrap_or_else(|e| unreadable(&path, e));
+                ("file", mode, data)
             } else {
                 ("other", mode, Vec::new())
             };
@@ -1475,8 +1480,20 @@ fn snapshot(dir: &Path, skip: &[PathBuf]) -> BTreeMap<PathBuf, (&'static str, u3
 }
 
 /// Every entry under the root that carries a set-user-ID, set-group-ID or sticky bit, or that its
-/// owner cannot read and write (search, too, on a directory).
+/// owner cannot read and write (search, too, on a directory). The root alone, when it carries such
+/// a bit, is locked that way, or is not a directory.
+///
+/// The root is looked at first because every other check reads below it: its own mode is in no
+/// snapshot, and a root left locked or swapped for a link hides whatever it holds.
 fn privileged_or_locked(root: &Path) -> Vec<(PathBuf, u32)> {
+    let meta = root
+        .symlink_metadata()
+        .unwrap_or_else(|e| panic!("the root {}: {e}", root.display()));
+    let mode = meta.permissions().mode();
+    if !meta.is_dir() || mode & 0o7000 != 0 || mode & 0o700 != 0o700 {
+        // The whole mode, its file type included, so a root that is a link reads as one.
+        return vec![(root.to_path_buf(), mode)];
+    }
     snapshot(root, &[])
         .into_iter()
         .filter(|(_, (kind, mode, _))| {
@@ -1485,6 +1502,66 @@ fn privileged_or_locked(root: &Path) -> Vec<(PathBuf, u32)> {
         })
         .map(|(path, (_, mode, _))| (path, mode & 0o7777))
         .collect()
+}
+
+/// The snapshot fails on an entry it cannot read, naming it, rather than pass over it: a directory
+/// it cannot list, one it can list but not look into, a file it cannot read.
+#[test]
+fn the_snapshot_fails_on_an_entry_it_cannot_read_by_its_path() {
+    // SAFETY: `geteuid` reads the caller's effective uid and touches no memory.
+    if unsafe { libc::geteuid() } == 0 {
+        skip_incapable!("skipping an unreadable entry: root reads any");
+        return;
+    }
+    for (shut, mode, named) in [
+        ("d", 0o000, "d"),
+        ("d", 0o600, "d/f"),
+        ("d/f", 0o000, "d/f"),
+    ] {
+        let tmp = crate::testutil::TmpDir::new();
+        fs::create_dir(tmp.join("d")).unwrap();
+        fs::write(tmp.join("d/f"), "f").unwrap();
+        fs::set_permissions(tmp.join(shut), fs::Permissions::from_mode(mode)).unwrap();
+        let read = std::panic::catch_unwind(|| drop(snapshot(tmp.path(), &[])));
+        let payload = read.expect_err(&format!("{shut} at {mode:o} was passed over"));
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains(&format!("cannot read {}:", tmp.join(named).display())),
+            "{shut} at {mode:o}: {message}"
+        );
+    }
+}
+
+/// A root a layer left locked, privileged, or swapped for a link is reported by itself. Every
+/// other check reads below the root, so any of the three would pass them all whatever it held.
+///
+/// Each state is the root's mode, or no mode for a link to an empty directory beside it.
+#[test]
+fn a_root_left_locked_privileged_or_a_link_is_reported() {
+    let states = [
+        ("locked", Some(0o000)),
+        ("set-user-ID", Some(0o4755)),
+        ("a link", None),
+    ];
+    for (state, mode) in states {
+        let ground = Ground::new();
+        if let Some(mode) = mode {
+            fs::create_dir(&ground.root).unwrap();
+            fs::set_permissions(&ground.root, fs::Permissions::from_mode(mode)).unwrap();
+        } else {
+            let elsewhere = ground.tmp.join("elsewhere");
+            fs::create_dir(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &ground.root).unwrap();
+        }
+        let wrong = privileged_or_locked(&ground.root);
+        assert!(
+            wrong.iter().any(|(path, _)| *path == ground.root),
+            "a root left {state} went unreported: {wrong:?}"
+        );
+    }
 }
 
 /// `bytes` as one gzip member, the trailer left as zeros: the unpacker does not check it.
