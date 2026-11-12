@@ -623,10 +623,22 @@ fn extract_u32(value: &Variant) -> Option<u32> {
     }
 }
 
-/// The temp sibling the rewrite lands on before it is renamed into place. Fixed rather than unique:
-/// one relay per launch owns this directory chain, and [`write_keyfile`] refuses to reuse an entry
-/// that is already there, so a name the cage can predict buys it nothing.
-const TMP_NAME: &str = "keyfile.sbx-tmp";
+/// The temp sibling one rewrite lands on before it is renamed into place, unique to this process
+/// and this write.
+///
+/// Two launches of one app in one project share a home, so their relays share this directory, and
+/// both answer the same host signal at the same moment. Under one fixed name each removed the
+/// other's temp on its way in: one rename then published a file still being written, and the other
+/// found nothing to rename. The pid separates two processes and the sequence two writes of one, as
+/// for a config file ([`crate::sandbox::atomicfile::unique`]). A name the cage can predict buys it
+/// nothing: [`write_keyfile_through`] refuses to follow an entry already there.
+fn tmp_name() -> String {
+    format!(
+        "keyfile.sbx-tmp.{}.{}",
+        std::process::id(),
+        super::atomicfile::unique()
+    )
+}
 
 /// Rewrite the in-cage keyfile atomically (temp + rename) with `scheme`'s GSettings body. Atomic so
 /// the cage never reads a half-written file; the in-cage GSettings keyfile backend watches the parent
@@ -655,10 +667,16 @@ fn write_keyfile(home: &Path, scheme: &str) {
 
 /// The fallible body of [`write_keyfile`], split out so every step's error can propagate with `?`
 /// while the caller stays best-effort.
+fn write_keyfile_confined(home: &Path, scheme: &str) -> std::io::Result<()> {
+    write_keyfile_through(home, scheme, &tmp_name())
+}
+
+/// [`write_keyfile_confined`] through the temp `tmp`, named by the caller so a test can plant
+/// something at it.
 ///
 /// A scheme outside the names [`super::portal::keyfile_body`] writes is refused before anything is
 /// created: written as found, it would add keys of its own to the keyfile.
-fn write_keyfile_confined(home: &Path, scheme: &str) -> std::io::Result<()> {
+fn write_keyfile_through(home: &Path, scheme: &str, tmp: &str) -> std::io::Result<()> {
     use std::ffi::OsStr;
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -685,8 +703,8 @@ fn write_keyfile_confined(home: &Path, scheme: &str) -> std::io::Result<()> {
     // directory is refused.
     let dir = super::cagedir::hold_under(home, dirs, 0o700)?;
 
-    let tmp = super::cagedir::entry(&dir, OsStr::new(TMP_NAME))?;
-    // A leftover temp from a killed run would fail the exclusive create below forever, so clear it
+    let tmp = super::cagedir::entry(&dir, OsStr::new(tmp))?;
+    // Whatever already sits at this name would fail the exclusive create below, so it is cleared
     // first. Removing it unlinks the entry itself and never follows it, so this cannot reach out of
     // the directory even when what sits there is a symlink the cage planted.
     let _ = std::fs::remove_file(&tmp);
@@ -784,7 +802,42 @@ mod tests {
             std::fs::read_to_string(&keyfile).unwrap(),
             super::super::portal::keyfile_body("prefer-light").expect("a scheme name")
         );
-        assert!(!keyfile.parent().unwrap().join(TMP_NAME).exists());
+        let temps: Vec<_> = std::fs::read_dir(keyfile.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("keyfile.sbx-tmp")
+            })
+            .collect();
+        assert!(temps.is_empty(), "a temp was left behind: {temps:?}");
+    }
+
+    /// A write touches its own temp and no other: two launches of one app in one project share a
+    /// home, and their relays answer the same host signal at once. A temp another writer holds is
+    /// left where it is; under one shared name each relay removed the other's on its way in, and a
+    /// rename then published a file still being written.
+    #[test]
+    fn a_write_leaves_another_writers_temp_alone() {
+        let tmp = crate::testutil::TmpDir::new();
+        let home = tmp.path().to_path_buf();
+        let settings = home.join(".config/glib-2.0/settings");
+        std::fs::create_dir_all(&settings).unwrap();
+        let theirs = settings.join("keyfile.sbx-tmp");
+        std::fs::write(&theirs, "another relay's half-written keyfile").unwrap();
+
+        write_keyfile(&home, super::super::portal::color_scheme_name(1));
+
+        assert_eq!(
+            std::fs::read_to_string(&theirs).ok().as_deref(),
+            Some("another relay's half-written keyfile"),
+            "the write removed or replaced a temp it does not own"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join(super::super::portal::KEYFILE_REL)).unwrap(),
+            super::super::portal::keyfile_body("prefer-dark").expect("a scheme name")
+        );
     }
 
     /// The keyfile is written only for one of the three scheme names. Any other value would land
@@ -818,13 +871,14 @@ mod tests {
 
         // 1. A link at the temp name, pointing at a host file. The old path-based `fs::write` opened
         //    it `O_CREAT|O_TRUNC` and followed it, which truncated the target. The temp name is one
-        //    this function owns, so the link is *unlinked* rather than followed — which is also how
-        //    a temp left behind by a killed run is recovered — and the write then goes on normally.
+        //    this write owns, so the link is *unlinked* rather than followed, and the write then goes
+        //    on normally. Planted at the name the write is handed, since the cage could guess it.
         std::fs::write(&outside, untouched).unwrap();
         std::fs::create_dir_all(&settings).unwrap();
-        std::os::unix::fs::symlink(&outside, settings.join(TMP_NAME)).unwrap();
+        let planted = "keyfile.sbx-tmp.1.0";
+        std::os::unix::fs::symlink(&outside, settings.join(planted)).unwrap();
 
-        write_keyfile(&home, super::super::portal::color_scheme_name(1));
+        let _ = write_keyfile_through(&home, super::super::portal::color_scheme_name(1), planted);
 
         assert_eq!(
             std::fs::read_to_string(&outside).unwrap(),
