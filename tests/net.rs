@@ -2020,6 +2020,44 @@ fn a_session_header_writes_its_project_as_text() {
     );
 }
 
+/// `sbx session ls` writes a session's project as text, the way the session header above writes
+/// it: a directory name is any bytes, and one carrying an escape would otherwise paint over the
+/// terminal of whoever lists the live sessions. The same two shapes, each its own session. The
+/// `--json` form keeps the path itself, which a JSON string carries escaped on its own.
+#[test]
+fn a_session_listing_writes_its_project_as_text() {
+    let mut painted = Vec::new();
+    for (shape, name, escaped) in [
+        ("a screen clear", "proj\u{1b}[2J", "proj\\x1b[2J"),
+        (
+            "a right-to-left override",
+            "proj\u{202e}txt",
+            "proj\\u{202e}txt",
+        ),
+    ] {
+        let fx = Project::new("sessls");
+        let project = fx.proj.path().join(name);
+        std::fs::create_dir(&project).unwrap();
+        common::write_session_record(fx.data_home.path(), std::process::id(), "project", &project);
+        let out = fx.run_ok(&["session", "ls"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let raw = name.chars().nth(4).expect("the shape's character");
+        if stdout.contains(raw) || !stdout.contains(escaped) {
+            painted.push(format!("{shape}: {stdout:?}"));
+        }
+        let listed = common::json_of(&fx.run_ok(&["session", "ls", "--json"]));
+        let kept = listed["sessions"][0]["project"].as_str();
+        if kept != project.to_str() {
+            painted.push(format!("{shape}, --json: {kept:?}"));
+        }
+    }
+    assert!(
+        painted.is_empty(),
+        "the project must be written as text, and kept as itself in JSON:\n{}",
+        painted.join("\n")
+    );
+}
+
 #[test]
 fn net_pending_all_save_global_drains_and_persists_each_host() {
     let fx = Project::new("net");

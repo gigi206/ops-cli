@@ -87,6 +87,10 @@ first; a PID is what a script already holds, and it is the id that is never
 [ambiguous](#which-session-a-command-acts-on). `sbx session logs <id>` is the exception among the
 three: it takes the PID alone (see [`logs`](#logs)).
 
+A project directory can be named anything. The table writes its path as
+[`sbx projects list`](projects) does: a control character or a character that reorders a line is
+written out as an escape (`\x1b`, `\u{202e}`). `--json` keeps the path as it is.
+
 `--json` emits the same listing as a document, which is what a script wants: it carries the
 registry's own values rather than this table's, so the age is a number of seconds instead of `2m`
 and an unknowable one is `null` instead of `?`. With no live session it is an empty array, never

@@ -143,7 +143,8 @@ fn list_sessions(json: bool) -> ExitCode {
                 mode: session_mode(s).to_string(),
                 pid: s.pid.to_string(),
                 age,
-                project: s.project.display().to_string(),
+                // As text: a directory name is any bytes, and the table is read on a terminal.
+                project: diag::visible(&s.project.display().to_string()),
             }
         })
         .collect();
