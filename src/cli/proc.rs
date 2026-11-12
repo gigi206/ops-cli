@@ -827,8 +827,11 @@ fn proc_live(args: &[OsString]) -> ExitCode {
             }
         };
         drop(out);
-        if wrote.is_err() {
-            // A broken downstream pipe (`… | head`) ends the view cleanly.
+        // What the failure makes of the exit code is decided where every verb's output failure is
+        // (`note_output_failure`): 0 for a reader gone from a pipe, 1 for anything else, since what
+        // reached the destination is not the view.
+        if let Err(e) = wrote {
+            crate::cli::note_output_failure(&e);
             return ExitCode::SUCCESS;
         }
         std::thread::sleep(parsed.interval);

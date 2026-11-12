@@ -155,6 +155,70 @@ fn proc_live_rejects_a_zero_interval() {
     assert!(err.contains("at least 1 second"), "got: {err}");
 }
 
+/// `sbx proc live --json` whose snapshot cannot be written fails, said once, and one whose reader
+/// has gone does not. A full disk under `> file` leaves a stream cut short there, which a script
+/// reading the exit code has to learn; a reader gone, `… | head`, is the end of a pipeline the
+/// shell reports as fine. The session is this test's own process, registered as running, so the
+/// view has a tree to write on its first tick.
+#[test]
+fn proc_live_that_cannot_write_fails_once_and_a_reader_gone_does_not() {
+    let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+        skip_incapable!(
+            "skipping proc_live_that_cannot_write_fails_once_and_a_reader_gone_does_not: no /dev/full here"
+        );
+        return;
+    };
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
+    let pid = std::process::id();
+    common::write_session_record(data.path(), pid, "project", proj.path());
+    let id = pid.to_string();
+    let said = data.path().join("stderr");
+
+    let mut failed = Vec::new();
+    for (onto, stdout, code, told) in [
+        (
+            "a full disk",
+            Stdio::from(full.try_clone().expect("reopen /dev/full")),
+            1,
+            1,
+        ),
+        ("a closed pipe", common::procs::closed_pipe(), 0, 0),
+    ] {
+        let stderr = std::fs::File::create(&said).expect("the stderr file");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(["proc", "live", &id, "--json"])
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", data.path())
+            .env_remove("SBX_DATA_DIR")
+            .env("LC_ALL", "C.UTF-8")
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .expect("run sbx");
+        let mut status = None;
+        let ended = common::procs::wait_until(Instant::now() + Duration::from_secs(60), || {
+            status = child.try_wait().expect("wait for sbx");
+            status.is_some()
+        });
+        if !ended {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("`sbx proc live` onto {onto} still runs 60 s on");
+        }
+        let status = status.expect("an ended child has a status");
+        let stderr = std::fs::read_to_string(&said).expect("read stderr");
+        let says = stderr.matches("cannot write to standard output").count();
+        if status.code() != Some(code) || says != told {
+            failed.push(format!(
+                "onto {onto}: exit {status}, said {says} time(s), want exit {code} said {told}:\n\
+                 {stderr}"
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// A `Command` for the built binary with this suite's isolated global config and trust store
 /// ([`common::isolated_sbx`]), so the cage-launching e2e never depends on the developer's
 /// `~/.config/sbx` or `~/.local/state/sbx`.
