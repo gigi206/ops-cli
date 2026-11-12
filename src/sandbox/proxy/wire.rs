@@ -596,12 +596,15 @@ pub(crate) fn read_chunked_trailers<R: BufRead>(r: &mut R) -> io::Result<()> {
     Err(invalid("chunked trailer section too long"))
 }
 
-/// Read one `\n`-terminated line, bounded to `max` bytes (a no-newline flood over the bound is a
-/// hard error, not unbounded buffering — mirrors `read_head_buffered`). Returns the line including
-/// its terminator; an empty return means EOF before any byte.
+/// Read one `\n`-terminated line, bounded to `max` bytes, its terminator counted (a no-newline
+/// flood over the bound is a hard error, not unbounded buffering — mirrors `read_head_buffered`).
+/// Returns the line including its terminator; an empty return means EOF before any byte.
+///
+/// The terminator counts toward `max` here as it does in [`FramedBody`]'s own line reader, so the
+/// two readers of a chunked body's lines refuse one at the same length.
 pub(super) fn read_line_bounded<R: BufRead>(r: &mut R, max: u64) -> io::Result<Vec<u8>> {
     let mut line = Vec::new();
-    // +1 so a line of exactly `max` bytes plus its terminator is distinguishable from an overflow.
+    // +1 so a line of exactly `max` bytes, its terminator included, is told from a longer one.
     let n = r.take(max + 1).read_until(b'\n', &mut line)?;
     if n == 0 {
         return Ok(line);
