@@ -415,10 +415,9 @@ pub(crate) struct Request {
     /// The request as sent, decoded: `https://host[:port]<decoded-target>` (the port shown only
     /// when it is not 443, an IPv6 host bracketed). Egress is HTTPS, so the scheme is always
     /// `https`. Decoded so a regex deny is not dodged by encoding — but `.`/`..` are **not**
-    /// resolved here and the query is still attached, because this is the string the request
-    /// actually carried. A raw `#` and what follows it is not: that is the fragment, which no origin
-    /// server is given, so it is cut before decoding, and an encoded `%23` stays part of the path.
-    /// Kept, it was text a cage could add to satisfy a `re:` allow without sending any of it.
+    /// resolved here and the query and any fragment are still attached, because this is the string
+    /// the request actually carried: the tunneled plane relays the request line as the cage wrote
+    /// it, `#` included, so a regex deny written for what follows one must still see it.
     url: String,
     /// The same URL rebuilt from [`Self::segs`]: `.`/`..` resolved, empty segments dropped, query
     /// removed. A `re:` rule is matched against **both** this and [`Self::url`], and matching
@@ -452,8 +451,9 @@ impl Request {
         // A target that does not start with `/` is read under the root, as the segments read it.
         // Glued to the authority as written, `.evil.com/` sent to `x.test` read as
         // `https://x.test.evil.com/`, a URL for another host that a `re:` rule written for that
-        // host admits. The tunneled plane refuses such a target and the h2 one cannot carry it, so
-        // this keeps the matcher true whichever caller hands it one.
+        // host admits. The tunneled HTTP/1.1 plane refuses such a target, and the `http` crate
+        // builds no request URI whose path is neither `/…` nor `*`; this keeps the matcher true
+        // whichever caller hands it one.
         let rooted;
         let target = if target.starts_with('/') {
             target
@@ -461,8 +461,7 @@ impl Request {
             rooted = format!("/{target}");
             &rooted
         };
-        let sent = target.split('#').next().unwrap_or("");
-        let decoded = percent_decode(sent);
+        let decoded = percent_decode(target);
         let authority = if port == 443 {
             display_host(&host)
         } else {
@@ -708,8 +707,10 @@ fn path_matches(req_segs: &[String], rule_path: &str, subtree: bool) -> bool {
 ///
 /// `;parameters` are dropped because they name no resource of their own: a servlet container
 /// serves `/secret;jsessionid=…` as `/secret`, so a `deny host/secret` that compared the raw
-/// spelling refused nothing. The fragment is dropped for the same reason — no origin server is
-/// given one, so a target carrying it names the resource before it.
+/// spelling refused nothing. The fragment is dropped for the same reason: a target carrying one is
+/// read as the resource before it, so a deny of that resource is not dodged by appending one. The
+/// form a request is sent in ([`Request`]'s `url`) keeps it, since the tunneled plane relays the
+/// request line as written.
 ///
 /// **Both cuts happen after decoding, and that is a deliberate over-normalization.** A literal
 /// `%23` or `%3B` in a path decodes to a character this function then treats as a delimiter, so

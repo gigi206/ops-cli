@@ -3546,27 +3546,6 @@ fn a_rule_names_a_destination_whatever_path_it_is_scoped_to() {
     );
 }
 
-/// A fragment is never sent to the origin, so it cannot satisfy a `re:` allow: a pattern that
-/// admits a path ending in `t` and refuses a query admits `/at`, and refuses `/a?t` and `/a#t`
-/// alike.
-#[test]
-fn a_fragment_never_sent_cannot_satisfy_a_regex_allow() {
-    let p = allow(&["re:^https://x\\.test/[^?]*t$"]);
-    let verdict = |target: &str| p.explain("x.test", 443, target, "GET");
-    assert!(
-        matches!(verdict("/at"), Decision::AllowedBy(_)),
-        "calibration: the pattern admits a path ending in `t`"
-    );
-    assert!(
-        matches!(verdict("/a?t"), Decision::DeniedDefault),
-        "calibration: the pattern refuses a query"
-    );
-    assert!(
-        matches!(verdict("/a#t"), Decision::DeniedDefault),
-        "a fragment admits nothing the request does not send"
-    );
-}
-
 /// A target that does not start with `/` is read under the root, so the URL a `re:` rule reads
 /// names the request's own host: `.evil.com/` sent to `x.test` is not `https://x.test.evil.com/`,
 /// and an empty target is the root rather than a URL with no path. Every shape misread is reported
@@ -3621,4 +3600,27 @@ fn an_allow_path_that_does_not_decode_to_text_is_refused() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("; "));
+}
+
+/// A regex deny reads the fragment a request carries: the tunneled plane relays the request line
+/// as written, `#` included, so `re:\.exe$` refuses `/file#.exe` as it refuses `/file.exe`.
+#[test]
+fn a_regex_deny_reads_the_fragment_the_request_carries() {
+    let p = EgressPolicy::new(
+        vec![classify("x.test").unwrap()],
+        vec![classify("re:\\.exe$").unwrap()],
+    );
+    let verdict = |target: &str| p.explain("x.test", 443, target, "GET");
+    assert!(
+        matches!(verdict("/file.txt"), Decision::AllowedBy(_)),
+        "calibration: the host is allowed"
+    );
+    assert!(
+        matches!(verdict("/file.exe"), Decision::DeniedBy(_)),
+        "calibration: the pattern refuses the path"
+    );
+    assert!(
+        matches!(verdict("/file#.exe"), Decision::DeniedBy(_)),
+        "a fragment the request carries is read by the deny"
+    );
 }
