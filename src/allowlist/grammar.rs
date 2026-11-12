@@ -832,7 +832,8 @@ fn parse_path_rule(
     // U+FFFD, so an allow written for `/a%FF` admitted `/a%FE`, `/a%80` and every other such byte in
     // that place, and one holding a literal U+FFFD admitted them all. Refused on the allow side,
     // where that widening opens; a deny keeps its wider match, since what it widens is what it
-    // closes, and a mute changes no verdict.
+    // closes, and a mute changes no verdict. A net group's member is read as an allow, since the
+    // group may be expanded into either list.
     if slot == Slot::Allow && !super::decodes_to_text(path) {
         return Err(format!(
             "entry `{s}` writes a path that does not decode to text — a request path is compared \
