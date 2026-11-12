@@ -6963,6 +6963,60 @@ fn an_answer_that_cannot_be_written_is_a_failure() {
     }
 }
 
+/// A view that redraws on its own ends on the first frame it cannot write, on the same terms as a
+/// document: `sbx net live --json` onto a full disk exits 1 and says so once, and into a pipe whose
+/// reader has gone it ends at 0 in silence. Each run is waited on for a bounded time, since a view
+/// that took the failure for nothing would go on drawing until killed.
+#[test]
+fn a_view_that_redraws_ends_on_the_first_frame_it_cannot_write() {
+    use std::time::{Duration, Instant};
+    let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+        skip_incapable!(
+            "skipping a_view_that_redraws_ends_on_the_first_frame_it_cannot_write: no /dev/full here"
+        );
+        return;
+    };
+    let p = Project::new("liveout");
+    let ended = |stdout: std::process::Stdio| {
+        let mut child = p
+            .cmd(&["net", "live", "--json"])
+            .stdout(stdout)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sbx");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().expect("wait for sbx").is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let out = child.wait_with_output().expect("reap sbx");
+                panic!(
+                    "`sbx net live --json` still draws 10 s after its first frame failed:\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child.wait_with_output().expect("collect sbx")
+    };
+
+    let out = ended(full.into());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "onto a full disk: {stderr}");
+    assert_eq!(
+        stderr.matches("cannot write to standard output").count(),
+        1,
+        "said once: {stderr}"
+    );
+
+    let out = ended(closed_pipe());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stderr.is_empty(),
+        "into a closed pipe, ended with {}:\n{stderr}",
+        out.status
+    );
+}
+
 /// A diagnostic that cannot be written leaves the verb's answer alone. stderr is where a failure
 /// is said, so a write to it that fails has nowhere left to go, and the exit code is what a script
 /// reads. A bare `eprintln!` panicked there instead: with stderr on `/dev/full` or on a pipe whose

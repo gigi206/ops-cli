@@ -25,7 +25,9 @@ See also: [`sbx run`](../cli/run) · [One-shot overrides](../configuration/overr
 
 An answer that cannot be written to standard output turns a success into `1`, said once on
 standard error: what reached a full disk under `> file` is not what the verb produced. A reader
-that has gone away, the end of `sbx … | head`, is not a failure and changes nothing.
+that has gone away, the end of `sbx … | head`, is not a failure and changes nothing. A view that
+redraws on its own, `sbx net live` or `sbx net pending watch`, ends at the first frame it cannot
+write, on the same terms.
 
 A diagnostic that cannot be written to standard error changes nothing either, whatever the
 cause: standard error is where a failure would be reported, and the exit code is the answer.

@@ -248,8 +248,9 @@ pub(super) fn net_live(args: &[OsString]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        // Build this tick's frame, then write it once — a broken downstream pipe (`… | head`) is
-        // detected on the single write and ends the view cleanly (Rust ignores SIGPIPE).
+        // Build this tick's frame, then write it once, so the first write that fails ends the view
+        // (Rust ignores SIGPIPE): a reader gone from a pipe (`… | head`), a full disk under
+        // `> file`, a terminal gone.
         let mut out = std::io::stdout().lock();
         let wrote = if parsed.json {
             // One snapshot object per tick (NDJSON) — a live state, not a per-flow event stream.
@@ -272,7 +273,11 @@ pub(super) fn net_live(args: &[OsString]) -> ExitCode {
             .and_then(|_| out.flush())
         };
         drop(out);
-        if wrote.is_err() {
+        // What the failure makes of the exit code is decided where every verb's output failure is
+        // (`note_output_failure`): 0 for a reader gone from a pipe, 1 for anything else, since what
+        // reached the destination is not the view.
+        if let Err(e) = wrote {
+            crate::cli::note_output_failure(&e);
             return ExitCode::SUCCESS;
         }
         std::thread::sleep(parsed.interval);
