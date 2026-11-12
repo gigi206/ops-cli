@@ -547,6 +547,29 @@ mod tests {
         );
     }
 
+    /// The probe's readers are joined once the wait returns, a timeout included, and that cannot
+    /// hang only because the cage dies with its `bwrap`: the pid namespace is unshared and
+    /// `--die-with-parent` is armed. Both are asserted on the argument list the probe launches with,
+    /// so a probe spec that came to outlive its launcher fails here rather than leaving `doctor`
+    /// stuck past its ceiling.
+    #[test]
+    fn the_probe_cage_dies_with_its_bwrap() {
+        let spec = probe_spec(
+            Path::new("/tmp/w"),
+            None,
+            probe_argv(Path::new("/bin/sh"), None),
+        )
+        .expect("the probe spec is valid");
+        let command = crate::sandbox::argv::compose(Path::new("/usr/bin/bwrap"), &spec)
+            .expect("the probe's command composes");
+        for flag in ["--unshare-pid", "--die-with-parent"] {
+            assert!(
+                command.args().iter().any(|a| a.to_str() == Some(flag)),
+                "the probe launches with {flag}"
+            );
+        }
+    }
+
     /// What a hardened probe prints, as `printf` words.
     const HARDENED: &str = r"NoNewPrivs:\t1\nCapEff:\t0000000000000000\nHOSTHOME=ABSENT\n";
 

@@ -12,6 +12,10 @@
 //! the same wait, and folding them onto one pair of constants would be a change of behaviour
 //! wearing a refactor's clothes.
 //!
+//! What a runner keeps of a cage's output is read here too, while the wait runs and under a cap of
+//! the caller's ([`drain_capped`]), since a cage blocked on a pipe nobody reads would otherwise meet
+//! the ceiling for a reason that is not its own.
+//!
 //! The task engine keeps a loop of its own, and that is not an oversight: a task can also be
 //! stopped by hand, and that answer stays distinct from the ceiling firing — one is the
 //! declaration's limit, the other is someone deciding, and a caller that cannot tell them apart
