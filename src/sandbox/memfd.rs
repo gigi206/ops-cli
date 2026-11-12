@@ -157,16 +157,8 @@ pub(crate) fn adopt_socket(
 /// and an exec, so it reads no directory and allocates nothing: a number that is not open answers
 /// `EBADF`.
 fn mark_close_on_exec_past_the_standard_three() {
-    // SAFETY: `close_range` takes no pointer.
-    let marked = unsafe {
-        libc::syscall(
-            libc::SYS_close_range,
-            3u32,
-            u32::MAX,
-            libc::CLOSE_RANGE_CLOEXEC,
-        )
-    };
-    if marked == 0 {
+    // SAFETY: with `CLOSE_RANGE_CLOEXEC` the call closes nothing, it only sets the flag.
+    if unsafe { close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC) } {
         return;
     }
     let mut limit = libc::rlimit {
@@ -181,6 +173,31 @@ fn mark_close_on_exec_past_the_standard_three() {
     for fd in 3..top as libc::c_int {
         // SAFETY: `fcntl` with `F_SETFD` on a number this child holds, or `EBADF`.
         unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+}
+
+/// `close_range(first, last, flags)`, answering whether the kernel took it: a kernel older than
+/// 5.9, or 5.11 for `CLOSE_RANGE_CLOEXEC`, refuses it, and so may a filter.
+///
+/// Each argument is widened to the `long` the variadic `syscall` reads, rather than handed over as
+/// a 32-bit value whose upper half the calling convention leaves unspecified; the kernel narrows
+/// them back to `unsigned int`. A system call that takes no lock and allocates nothing, so a child
+/// may make it between a fork and an exec.
+///
+/// # Safety
+///
+/// Without `CLOSE_RANGE_CLOEXEC` it closes every descriptor numbered `first..=last`, so none of them
+/// may be one that something in this process still owns.
+pub(crate) unsafe fn close_range(first: u32, last: u32, flags: u32) -> bool {
+    use libc::c_long;
+    // SAFETY: `close_range` takes no pointer; what it closes is the caller's to answer for.
+    unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            c_long::from(first),
+            c_long::from(last),
+            c_long::from(flags),
+        ) == 0
     }
 }
 
@@ -467,5 +484,34 @@ mod tests {
         super::inherit_only(&mut only, vec![handed_only]);
         let out = only.output().expect("the child runs");
         assert_eq!(out.stdout, b"handed");
+    }
+    /// [`super::close_range`] marks the range it is given and nothing past it: the descriptor in the
+    /// range comes out close-on-exec and still open, and the one above it keeps its flag clear.
+    #[test]
+    fn close_range_marks_the_range_it_is_given_and_nothing_past_it() {
+        use std::os::fd::AsRawFd;
+        let files = [
+            std::fs::File::open("/dev/null").expect("a file"),
+            std::fs::File::open("/dev/null").expect("a file"),
+        ];
+        let (one, two) = (files[0].as_raw_fd(), files[1].as_raw_fd());
+        let (low, high) = (one.min(two), one.max(two));
+        // SAFETY: `F_GETFD` and `F_SETFD` on descriptors this test owns.
+        let flags = |fd| unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        for fd in [low, high] {
+            // SAFETY: as above.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+        }
+        let first = u32::try_from(low).expect("a descriptor number");
+        // SAFETY: with `CLOSE_RANGE_CLOEXEC` nothing is closed.
+        let took = unsafe { super::close_range(first, first, libc::CLOSE_RANGE_CLOEXEC) };
+        assert!(took, "the kernel took the call");
+        assert!(flags(low) >= 0, "the descriptor in the range is still open");
+        assert_eq!(
+            flags(low) & libc::FD_CLOEXEC,
+            libc::FD_CLOEXEC,
+            "the descriptor in the range is close-on-exec"
+        );
+        assert_eq!(flags(high), 0, "the one above it is left as it was");
     }
 }

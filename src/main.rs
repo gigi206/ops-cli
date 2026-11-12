@@ -181,13 +181,8 @@ fn restore_child_reaping() {
 /// tap, which the holder's configurer starts once it has closed the cage's descriptors, and which
 /// is handed its own alone ([`sandbox::memfd::inherit_only`]).
 fn close_inherited_descriptors() {
-    // Each argument is widened to the `long` the variadic `syscall` reads, rather than handed over
-    // as a 32-bit value whose upper half the calling convention leaves unspecified; the kernel
-    // narrows them back to `unsigned int`.
-    let (first, last) = (libc::c_long::from(3u32), libc::c_long::from(u32::MAX));
-    // SAFETY: `close_range` takes no pointer, and nothing this process owns is open past the
-    // standard three yet.
-    if unsafe { libc::syscall(libc::SYS_close_range, first, last, 0 as libc::c_long) } == 0 {
+    // SAFETY: nothing this process owns is open past the standard three yet.
+    if unsafe { sandbox::memfd::close_range(3, u32::MAX, 0) } {
         return;
     }
     // A kernel older than 5.9, or a filter that refuses the call: one at a time, the ones the
