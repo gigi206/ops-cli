@@ -773,7 +773,7 @@ pub(crate) fn lexical_path(path: &str) -> std::borrow::Cow<'_, str> {
 ///
 /// Walked in place by byte offset, one character decoded at a time, so the match allocates nothing:
 /// it runs once per rule for every notified `execve`.
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     let at = |s: &str, i: usize| s[i..].chars().next();
     let (mut pi, mut ti) = (0usize, 0usize);
     // The last `*` seen and the text position to resume from if a later mismatch forces backtracking.

@@ -77,8 +77,9 @@ running*, which is what the next section is about.
 and the like can take a credential apart and put it back together with builtins alone, and nothing
 they do that way is an `execve` to decide. The same is true if `cmd` is itself a shell script.
 (The warned set is `sh`, `bash`, `dash`, `zsh`, `ksh`, `fish`, `env`, `python`, `python3`,
-`perl`, `ruby`, `node`, `awk`, `gawk`, `xargs`, each under a versioned name too: `python3.14`,
-`perl5.40.1` and `ruby3.3` are warned about as `python`, `perl` and `ruby`.)
+`perl`, `ruby`, `node`, `awk`, `gawk`, `xargs`, each under a versioned name too, such as
+`python3.14`, `perl5.40.1` or `ruby3.3`, and a pattern that admits one, such as `python3.*` or
+`py*`.)
 
 ## What each program may run in turn: `[exec.<program>]`
 

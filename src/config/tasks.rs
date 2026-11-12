@@ -345,9 +345,25 @@ const OPEN_ENDED: &[&str] = &[
 /// Whether the program `base` names is one of [`OPEN_ENDED`], read with any version suffix off as
 /// well: a distribution installs `python3.14`, `perl5.40.1` and `ruby3.3` under those names, and
 /// each runs as the interpreter its stem names.
+///
+/// A `spawn` entry may be a pattern, which admits an interpreter when it matches one's name
+/// ([`crate::proc_policy::glob_match`], the matcher the entry is enforced with) or when the text
+/// before its first wildcard is one's name, versioned or not: `py*` admits `python`, and
+/// `python3.*` admits `python3.14`.
 fn names_an_interpreter(base: &str) -> bool {
-    let stem = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-    OPEN_ENDED.contains(&base) || OPEN_ENDED.contains(&stem)
+    let is_one = |name: &str| {
+        let stem = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+        OPEN_ENDED.contains(&name) || OPEN_ENDED.contains(&stem)
+    };
+    match base.split(['*', '?']).next() {
+        Some(literal) if literal.len() < base.len() => {
+            is_one(literal)
+                || OPEN_ENDED
+                    .iter()
+                    .any(|name| crate::proc_policy::glob_match(base, name))
+        }
+        _ => is_one(base),
+    }
 }
 
 /// Read the entries out of one `spawn` declaration, refusing the shapes that are not the field, and
@@ -1297,6 +1313,23 @@ mod tests {
             ["make", "gcc12", "git", "3"]
                 .into_iter()
                 .filter(|name| names_an_interpreter(name)),
+        );
+        assert!(wrong.is_empty(), "misread: {wrong:?}");
+    }
+
+    /// A `spawn` pattern that admits an interpreter is known as one, by what it matches or by the
+    /// name before its wildcard, and a pattern that admits none is not. Every pattern misread is
+    /// reported together.
+    #[test]
+    fn a_pattern_that_admits_an_interpreter_is_known_as_one() {
+        let mut wrong: Vec<&str> = ["python3.*", "python*", "py*", "node1?", "*thon"]
+            .into_iter()
+            .filter(|pattern| !names_an_interpreter(pattern))
+            .collect();
+        wrong.extend(
+            ["*.sh", "gcc1*", "mak?"]
+                .into_iter()
+                .filter(|pattern| names_an_interpreter(pattern)),
         );
         assert!(wrong.is_empty(), "misread: {wrong:?}");
     }
