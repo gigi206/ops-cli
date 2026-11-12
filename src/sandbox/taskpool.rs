@@ -370,8 +370,9 @@ pub(crate) fn ensure(
     // One filler at a time. Two sessions launched cold on the same project would otherwise run two
     // `mise install`s into the same tree, and mise gives no cross-process guarantee about that. The
     // lock is taken *before* the missing set is recomputed below, so the second session sees what
-    // the first installed and does nothing rather than redoing it.
-    let _lock = lock_pool(pool)?;
+    // the first installed and does nothing rather than redoing it. The second says that it waits
+    // before it does: the first one's install can take minutes.
+    let _lock = lock_pool(pool, &announce_pool_wait)?;
     let missing = bins_for(pool, &fillable).missing;
     if missing.is_empty() {
         return Ok(PoolOutcome::Warm);
@@ -407,23 +408,23 @@ struct PoolLock(#[allow(dead_code)] std::fs::File);
 /// Take the pool's fill lock, exclusive, blocking until it is granted. The lock file is a **sibling**
 /// of the pool rather than a file inside it, so it never appears among the installs the resolver
 /// enumerates and never travels into a cage.
-fn lock_pool(pool: &Path) -> io::Result<PoolLock> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
+///
+/// When another sbx holds it, `waiting` is told the file before the wait. That one is filling or
+/// rolling the pool, for as long as an install may run ([`INSTALL_TIMEOUT`]), and a launch that
+/// waited without a word for that long would read as a hang.
+fn lock_pool(pool: &Path, waiting: &dyn Fn(&Path)) -> io::Result<PoolLock> {
     let mut path = pool.as_os_str().to_os_string();
     path.push(".lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(PathBuf::from(path))?;
-    // SAFETY: `flock` on a valid owned fd; it blocks until the lock is granted and returns 0 on
-    // success. The fd lives in the returned guard, so the lock is held until the guard drops.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(PoolLock(file))
+    super::flock_at(Path::new(&path), true, Some(waiting)).map(PoolLock)
+}
+
+/// What a fill or a roll says when another sbx holds the pool's lock `lock`.
+fn announce_pool_wait(lock: &Path) {
+    crate::diag::note(&format!(
+        "waiting for the task tool pool's lock `{}`, which another sbx holds while it installs or \
+         rolls this project's task tools",
+        lock.display()
+    ));
 }
 
 /// Roll the pool's tools forward: `mise upgrade <tokens>` in the same install cage [`ensure`] uses.
@@ -448,7 +449,7 @@ pub(crate) fn upgrade(
     if tokens.is_empty() || !pool.is_dir() {
         return Ok(None);
     }
-    let _lock = lock_pool(pool)?;
+    let _lock = lock_pool(pool, &announce_pool_wait)?;
     let mut spec = install_spec(base_mounts, base_env, mise_bin, pool, tokens)?;
     spec.cmd = upgrade_argv(mise_bin, tokens);
     Ok(Some(run(bwrap, &spec, limits, slug)?))
@@ -1377,5 +1378,43 @@ mod tests {
         let line = installing_line(&["npm:T01\u{202e}X".to_string(), "jq".to_string()]);
         assert!(!line.chars().any(crate::diag::reorders), "{line:?}");
         assert!(line.contains("T01") && line.ends_with(", jq"), "{line:?}");
+    }
+
+    /// A fill that finds another sbx at work on the pool is told the lock file before it waits,
+    /// and takes the lock once the other lets it go; one that finds it free waits for nothing and
+    /// is told nothing. The other can hold it for as long as an install runs, and a launch that
+    /// waits that long without a word reads as a hang.
+    #[test]
+    fn a_fill_that_waits_for_another_is_told_the_lock_before_it_waits() {
+        use std::sync::mpsc;
+        let base = TmpDir::new();
+        let pool = base.join("task-mise");
+        let held = lock_pool(&pool, &|_| panic!("nothing else holds the pool's lock")).unwrap();
+
+        let (said, waiting) = mpsc::channel();
+        let (took, taken) = mpsc::channel();
+        let contender = pool.clone();
+        let handle = std::thread::spawn(move || {
+            let lock =
+                lock_pool(&contender, &|lock| said.send(lock.to_path_buf()).unwrap()).unwrap();
+            took.send(()).unwrap();
+            drop(lock);
+        });
+
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).ok(),
+            Some(base.join("task-mise.lock")),
+            "the second fill waited without being told the lock it waits for"
+        );
+        assert!(
+            taken.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the second fill took the lock while the first still held it"
+        );
+        drop(held);
+        assert!(
+            taken.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the second fill did not take the lock once the first let it go"
+        );
+        handle.join().unwrap();
     }
 }

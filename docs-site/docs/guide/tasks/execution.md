@@ -241,6 +241,10 @@ still on disk, so what runs is always what the declaration says. A tool whose ru
 `sbx upgrade mise` rolls the pool forward with everything else, under a `task pool` line. A pinned
 `mise:node@22` stays where you pinned it; a bare `mise:node` moves to the current release.
 
+Two sbx never work on one pool at once. A launch or `sbx upgrade` that finds another one filling or
+rolling the pool says so on stderr, naming the lock file, and waits for it; a launch that waited
+then installs only what the other left missing.
+
 Three things to know:
 
 - **The pool is per project**, under its runtime tree, so `sbx projects rm` and the dead-tree sweep
