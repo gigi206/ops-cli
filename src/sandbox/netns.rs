@@ -177,9 +177,10 @@ fn release_exe_fd(fd: RawFd) -> Option<()> {
 /// here: this process cleared the flag for its own exec, and what it becomes is the cage's bwrap,
 /// which hands the cage every descriptor left without it. Adopted before the redirect starts its
 /// `nft`, a plain spawn, it reaches none, and only the tap is handed a copy ([`start_tap`]). One
-/// that is not the end of a report channel, or one of the standard three, refuses the whole list:
-/// the launcher hands over nothing else, and a descriptor the holder cannot account for is one it
-/// must not leave open for the cage. A refusal ends the holder, which closes the rest.
+/// that is not the end of a report channel, one of the standard three, or a second `--report-fd`
+/// refuses the whole list: the launcher hands over one channel and nothing else, and a descriptor
+/// the holder cannot account for is one it must not leave open for the cage. A refusal ends the
+/// holder, which closes the rest.
 fn split_holder_args(argv: &[OsString]) -> Option<(Option<TapWiring>, &[OsString])> {
     let sep = argv.iter().position(|a| a == "--")?;
     let (opts, rest) = argv.split_at(sep);
@@ -196,7 +197,10 @@ fn split_holder_args(argv: &[OsString]) -> Option<(Option<TapWiring>, &[OsString
             Some("--nft") => nft = opts.get(i + 1).map(PathBuf::from),
             Some("--report-fd") => {
                 let fd = opts.get(i + 1)?.to_str()?.parse::<RawFd>().ok()?;
-                if fd <= 2 {
+                // One channel, adopted once: a second adoption of the same number would close it as
+                // it replaced the first, and leave the holder owning a number that is no longer the
+                // channel's.
+                if fd <= 2 || report.is_some() {
                     return None;
                 }
                 let end = super::nettap::adopt_report_end(fd).ok()?;
@@ -2117,6 +2121,34 @@ mod tests {
                 "descriptor {fd} is refused"
             );
         }
+    }
+
+    /// The report channel is one descriptor, adopted once. Named twice, the holder would adopt the
+    /// number twice, close it as the second adoption replaced the first, and go on owning a number
+    /// that is no longer the channel's, so the list is refused instead.
+    #[test]
+    fn a_report_descriptor_named_twice_refuses_the_list() {
+        let (end, _peer) = std::os::unix::net::UnixDatagram::pair().expect("a datagram pair");
+        let fd = std::os::fd::IntoRawFd::into_raw_fd(end).to_string();
+        let argv = [
+            "--tap",
+            "/run/s.sock",
+            "--bwrap",
+            "/usr/bin/bwrap",
+            "--nft",
+            "/usr/sbin/nft",
+            "--report-fd",
+            &fd,
+            "--report-fd",
+            &fd,
+            "--",
+            "/usr/bin/bwrap",
+        ]
+        .map(OsString::from);
+        assert!(
+            split_holder_args(&argv).is_none(),
+            "a channel named twice is refused"
+        );
     }
 
     /// The tap's own cage names its end of the channel by number and binds no report socket: the
