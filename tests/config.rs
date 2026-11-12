@@ -7009,6 +7009,132 @@ fn a_view_that_redraws_ends_on_the_first_frame_it_cannot_write() {
     );
 }
 
+/// Start `sbx <args>` from `p` with standard output on `stdout`, and standard error into the file
+/// `said`, which a test can read while the command runs.
+fn spawn_onto(
+    p: &Project,
+    args: &[&str],
+    stdout: std::process::Stdio,
+    said: &std::path::Path,
+) -> std::process::Child {
+    let said =
+        std::fs::File::create(said).unwrap_or_else(|e| panic!("create {}: {e}", said.display()));
+    p.cmd(args)
+        .env_remove("SBX_DATA_DIR")
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .stderr(said)
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn `sbx {}`: {e}", args.join(" ")))
+}
+
+/// `child`'s exit status once it ends, or a failure naming `args` when it is still running 60 s on:
+/// a command that goes on writing into an output that refuses it would otherwise hold the suite.
+fn reaped(mut child: std::process::Child, args: &[&str]) -> std::process::ExitStatus {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut status = None;
+    let ended = common::procs::wait_until(deadline, || {
+        status = child.try_wait().expect("wait for sbx");
+        status.is_some()
+    });
+    if !ended {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("`sbx {}` still runs 60 s on", args.join(" "));
+    }
+    status.expect("an ended child has a status")
+}
+
+/// `sbx session logs` whose output cannot be written fails, said once, and one whose reader has
+/// gone does not, for each way the log reaches standard output: a copy of the file (`--all`), the
+/// window a plain reading prints, and a follow's drains. A full disk under `> file` leaves an
+/// incomplete log there, which a script reading the exit code has to learn; a reader gone, `… |
+/// head`, is the end of a pipeline the shell reports as fine. Every shape is run and the ones that
+/// fail are listed together, so each is held to its own write.
+///
+/// The follow's log holds only the header, so the reading before the follow writes nothing, and the
+/// line appended once the note is out reaches standard output through the follow alone: the note is
+/// said after the reading has fixed where the follow resumes. The session is this test's process,
+/// registered as running, so the follow does not end on an exited session before it writes.
+#[test]
+fn a_reading_it_cannot_write_fails_once_and_a_reader_gone_does_not() {
+    use std::time::{Duration, Instant};
+    let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+        skip_incapable!(
+            "skipping a_reading_it_cannot_write_fails_once_and_a_reader_gone_does_not: no /dev/full here"
+        );
+        return;
+    };
+    let p = Project::new("unwritten");
+    let data = p.data_home.join("sbx");
+    std::fs::create_dir_all(data.join("logs")).expect("make the log directory");
+    let pid = std::process::id();
+    common::write_session_record(
+        p.data_home.path(),
+        pid,
+        "project",
+        std::path::Path::new("/p"),
+    );
+    let log = data.join("logs").join(format!("{pid}.log"));
+    let header = format!("=== sbx session {pid} started=1700000100 ===\n");
+    let said = p.data_home.join("stderr");
+    let id = pid.to_string();
+
+    let mut failed = Vec::new();
+    for (shape, args) in [
+        ("a copy of the file", vec!["session", "logs", &id, "--all"]),
+        ("the window", vec!["session", "logs", &id]),
+        ("a follow", vec!["session", "logs", &id, "-f"]),
+    ] {
+        let follow = args.contains(&"-f");
+        for (onto, stdout, code, told) in [
+            (
+                "a full disk",
+                std::process::Stdio::from(full.try_clone().expect("reopen /dev/full")),
+                1,
+                1,
+            ),
+            ("a closed pipe", closed_pipe(), 0, 0),
+        ] {
+            let body = if follow { "" } else { "new-1\nnew-2\nnew-3\n" };
+            std::fs::write(&log, format!("{header}{body}")).expect("write the log");
+            let mut child = spawn_onto(&p, &args, stdout, &said);
+            if follow {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let noted = common::procs::wait_until(deadline, || {
+                    std::fs::read_to_string(&said).is_ok_and(|s| {
+                        s.split_inclusive('\n')
+                            .any(|l| l.starts_with("sbx: note: session") && l.ends_with('\n'))
+                    })
+                });
+                let note = std::fs::read_to_string(&said).unwrap_or_default();
+                if !noted || !note.contains(&format!("session {pid} — running")) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{shape} onto {onto} is not the follow of a running session: {note}");
+                }
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&log)
+                    .and_then(|mut f| f.write_all(b"after the note\n"))
+                    .expect("append to the log");
+            }
+            let status = reaped(child, &args);
+            let stderr = std::fs::read_to_string(&said).expect("read stderr");
+            let says = stderr.matches("cannot write to standard output").count();
+            if status.code() != Some(code) || says != told {
+                failed.push(format!(
+                    "{shape} onto {onto}: exit {status}, said {says} time(s), want exit {code} \
+                     said {told}:\n{stderr}"
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// A diagnostic that cannot be written leaves the verb's answer alone. stderr is where a failure
 /// is said, so a write to it that fails has nowhere left to go, and the exit code is what a script
 /// reads. A bare `eprintln!` panicked there instead: with stderr on `/dev/full` or on a pipe whose
