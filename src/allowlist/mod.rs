@@ -1250,6 +1250,23 @@ impl Reservation {
     pub(crate) fn covers(&self, host: &str, port: u16) -> bool {
         rule_matches(&self.rule, host, port, "/")
     }
+
+    /// Whether `allow` admits a request to some destination this reservation covers, whatever the
+    /// verbs, the path or the plane it is written for: with the reservation lifted, that part of
+    /// the destination is open to every program. The hosts overlap when either reach takes in the
+    /// other, and the ports when the two sets share one. A `re:` rule's reach is not readable off
+    /// its text, so it is taken to open the destination, which over-asks rather than under-asks.
+    pub(crate) fn opened_by(&self, allow: &Rule) -> bool {
+        if matches!(allow.kind, RuleKind::Regex { .. }) {
+            return true;
+        }
+        let (Some((mine, my_ports)), Some((theirs, their_ports))) =
+            (self.rule.kind.host_reach(), allow.kind.host_reach())
+        else {
+            return false;
+        };
+        (mine.takes_in(&theirs) || theirs.takes_in(&mine)) && my_ports.intersects(their_ports)
+    }
 }
 
 /// A classified egress policy: an allow list, a deny list, and a default action for a request

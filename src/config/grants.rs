@@ -638,9 +638,10 @@ fn policy_grants(
         for was in before.reserved() {
             let rule = was.rule();
             match reservation_of(after, rule) {
-                // Lifted while an `allow` rule still opens the destination: it opens to everyone.
-                // Lifted with its destination closed, it grants nothing.
-                None if after.allow_rules().iter().any(|r| r.covers(rule)) => push(
+                // Lifted while an `allow` rule still reaches some of the destination, for any verb,
+                // path or plane: that part opens to everyone. Lifted with its destination closed,
+                // it grants nothing.
+                None if after.allow_rules().iter().any(|r| was.opened_by(r)) => push(
                     "network",
                     format!("reserve {rule}"),
                     Risk::High,
@@ -1087,6 +1088,49 @@ mod tests {
                 Risk::Notable
             )]
         );
+    }
+
+    /// A lifted reservation is a grant whatever shape the `allow` that still reaches it has: a verb
+    /// set, `WS`, a path, a raw splice, the clear or a pattern each opens the destination to every
+    /// program. An `allow` for another host leaves nothing to report. Every shape misread is
+    /// reported together.
+    #[test]
+    fn a_lifted_reservation_is_a_grant_whatever_shape_the_allow_has() {
+        let lifted = |allow: &str| {
+            let base = format!("[network]\nmode = \"deny\"\nallow = [\"{allow}\"]\n");
+            let reserved =
+                format!("{base}\n[network.reserve.\"codeload.github.com\"]\nby = [\"git\"]\n");
+            seen(&over(&reserved, &base))
+                .into_iter()
+                .map(|(field, what, risk)| (field, what.to_string(), risk))
+                .collect::<Vec<_>>()
+        };
+        let high = vec![(
+            "network",
+            "reserve https://codeload.github.com".to_string(),
+            Risk::High,
+        )];
+        assert_eq!(
+            lifted("*.github.com"),
+            high,
+            "calibration: a wildcard over the host"
+        );
+        let mut wrong: Vec<String> = [
+            "{GET} https://codeload.github.com",
+            "{*,WS} https://codeload.github.com",
+            "https://codeload.github.com/v1",
+            "tcp://codeload.github.com:443",
+            "http://codeload.github.com:443",
+            "re:^https://codeload\\\\.github\\\\.com/",
+        ]
+        .into_iter()
+        .filter(|allow| lifted(allow) != high)
+        .map(|allow| format!("`{allow}` reports nothing"))
+        .collect();
+        if !lifted("https://other.test").is_empty() {
+            wrong.push("an allow for another host reports a grant".to_string());
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     #[test]
