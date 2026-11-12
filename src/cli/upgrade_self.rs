@@ -287,10 +287,18 @@ fn upgrade(run: &Upgrade) -> Result<Outcome, String> {
     let bytes = std::fs::read(store::physical_path(run.layout, &fetched.store_path))
         .map_err(|e| format!("cannot read the downloaded {asset}: {e}"))?;
     // The mode the binary was installed with, its special bits aside; executable by its owner
-    // whatever it was, since the run below proves the new one through that bit.
+    // whatever it was, since the run below proves the new one through that bit. Read after the
+    // download, as close to the rename as it can be: a binary removed while the download ran is
+    // not there to replace, and the rename would put one back where its user took it away.
     let mode = {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::metadata(run.target).map_or(0o755, |m| m.permissions().mode() & 0o777) | 0o100
+        let installed = std::fs::metadata(run.target).map_err(|e| {
+            format!(
+                "cannot read {}, the binary to replace: {e}; nothing was written in its place",
+                run.target.display()
+            )
+        })?;
+        installed.permissions().mode() & 0o777 | 0o100
     };
     let mut to = String::new();
     atomicfile::write_atomic_checked(run.target, &bytes, Some(mode), |staged| {
@@ -659,6 +667,36 @@ mod tests {
                 if why.contains(expected) && why.contains("was left as it was"));
             if !refused || kept != "the old binary" || left_alone(&bench) != ["sbx"] {
                 failures.push(format!("{shape}: {outcome:?}, the target holds {kept:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A binary removed while the upgrade runs is not put back: the mode it was installed with is
+    /// read before the write, and its absence ends the run with nothing written, whether the file
+    /// went alone or with its directory. Every shape is checked before the verdict.
+    #[test]
+    fn a_binary_removed_while_the_upgrade_runs_is_not_put_back() {
+        let served = binary("sbx 0.1.0 (latest, 1111111)", 0);
+        let sums = format!("{}  {}\n", sha256(&served), asset());
+        let mut failures = Vec::new();
+        for (shape, remove_dir) in [("the file", false), ("its directory", true)] {
+            let bench = Bench::new(&served, &sums, "{}");
+            let dir = bench.target.parent().unwrap();
+            if remove_dir {
+                std::fs::remove_dir_all(dir).unwrap();
+            } else {
+                std::fs::remove_file(&bench.target).unwrap();
+            }
+            let outcome = bench.run("latest");
+            let refused = matches!(&outcome, Err(why)
+                if why.contains("the binary to replace") && why.contains("nothing was written"));
+            let put_back = std::fs::symlink_metadata(&bench.target).is_ok();
+            let dir_back = remove_dir && std::fs::symlink_metadata(dir).is_ok();
+            if !refused || put_back || dir_back {
+                failures.push(format!(
+                    "{shape} removed: {outcome:?}, file back: {put_back}, directory back: {dir_back}"
+                ));
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
