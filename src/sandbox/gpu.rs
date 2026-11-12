@@ -321,8 +321,9 @@ pub(crate) struct NvidiaBridge {
     pub(crate) platforms: Vec<(PathBuf, PathBuf)>,
     /// The Vulkan driver manifest, so a Vulkan client sees the card and not only mesa's devices.
     pub(crate) icd: Option<(PathBuf, PathBuf)>,
-    /// The character devices the driver reaches the card through. Never a DRM `card*` node: the
-    /// reason [`render_nodes`] gives holds here too.
+    /// The character devices the driver reaches the card through. Never a DRM `card*` node, nor
+    /// the driver's own modesetting node: the reason [`render_nodes`] gives holds for both (see
+    /// [`nvidia_nodes_in`]).
     pub(crate) devices: Vec<PathBuf>,
     /// The driver version, read off the versioned file the vendor soname resolves to, so a skew
     /// against the loaded kernel module can be named rather than left to fail silently.
@@ -414,6 +415,11 @@ pub(crate) fn nvidia_bridge_in(root: &Path) -> Option<NvidiaBridge> {
 /// The NVIDIA character devices under a named root: the control and memory nodes plus every
 /// numbered card, enumerated rather than assumed — a second card is `nvidia1`, and a host with the
 /// libraries but no card at all yields the control nodes only.
+///
+/// Never `nvidia-modeset`, the driver's kernel modesetting interface: it is the NVIDIA counterpart
+/// of a DRM `card*` primary node, and the bridge serves compute and offscreen rendering, neither of
+/// which opens it. CUDA, EGL without a window system and Vulkan all reach the card without it, and
+/// NVIDIA's own container library grants it only to a container that runs a display.
 fn nvidia_nodes_in(root: &Path) -> Vec<PathBuf> {
     let dev = root.join("dev");
     let mut nodes: Vec<PathBuf> = Vec::new();
@@ -423,10 +429,8 @@ fn nvidia_nodes_in(root: &Path) -> Vec<PathBuf> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let wanted = matches!(
-            name,
-            "nvidiactl" | "nvidia-uvm" | "nvidia-uvm-tools" | "nvidia-modeset"
-        ) || numbered_node(name, "nvidia");
+        let wanted = matches!(name, "nvidiactl" | "nvidia-uvm" | "nvidia-uvm-tools")
+            || numbered_node(name, "nvidia");
         if wanted {
             nodes.push(entry.path());
         }
@@ -915,15 +919,10 @@ mod tests {
 
         assert_eq!(
             nodes,
-            [
-                "nvidia-modeset",
-                "nvidia-uvm",
-                "nvidia0",
-                "nvidia1",
-                "nvidiactl"
-            ],
+            ["nvidia-uvm", "nvidia0", "nvidia1", "nvidiactl"],
             "every numbered card is enumerated rather than assumed, the control nodes come along, \
-             and neither a DRM primary node nor the `nvidia-caps` directory does"
+             and neither a DRM primary node, nor the driver's modesetting node, nor the \
+             `nvidia-caps` directory does"
         );
     }
 

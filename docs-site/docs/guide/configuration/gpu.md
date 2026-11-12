@@ -109,9 +109,11 @@ version-locked to the host's kernel module, so it has to come from the host. Und
    Each of those is a union with mesa's, never a replacement: the cage carries both vendors
    and each platform gets the one that drives it.
 6. **The driver's character devices** (`/dev/nvidiactl`, `/dev/nvidia<N>`, `/dev/nvidia-uvm`,
-   `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset`), granted through the same device-bind
-   mechanism as the render nodes and enumerated rather than assumed, so a second card comes
-   along. Never a DRM `card*` primary node, for the reason the render nodes are granted alone.
+   `/dev/nvidia-uvm-tools`), granted through the same device-bind mechanism as the render nodes
+   and enumerated rather than assumed, so a second card comes along. Never a DRM `card*`
+   primary node, for the reason the render nodes are granted alone, and never
+   `/dev/nvidia-modeset`, the driver's modesetting interface, for the same reason: CUDA, EGL
+   without a window system and Vulkan all reach the card without it.
 
 ### Prerequisites
 
