@@ -11,7 +11,7 @@
 //! content changes. When it names the bytes running now, nothing is downloaded. Otherwise the asset
 //! is fetched into sbx's store with that digest handed to nix, so a mismatched download never lands.
 //! Its copy is written beside the binary, run once with `--version`, and renamed over it only if
-//! that run succeeds: a binary that cannot run here never replaces one that can.
+//! that run succeeds within a deadline: a binary that cannot run here never replaces one that can.
 //!
 //! What the checksum proves is integrity, not authenticity. It comes from the same release as the
 //! binary, so it catches a download corrupted or cut short, not a release that was tampered with,
@@ -79,7 +79,14 @@ struct Upgrade<'a> {
     running: &'a Path,
     /// Whether to replace the binary, or stop at saying a newer one is served.
     mode: crate::sandbox::RollMode,
+    /// How long the new binary's `--version` run may take: [`VERSION_DEADLINE`].
+    version_deadline: std::time::Duration,
 }
+
+/// How long the downloaded binary may take to answer `--version` before it is killed and the
+/// upgrade refused. The run prints one line from a file written a moment before, so an answer
+/// comes far inside it; a binary that does not answer leaves the command waiting on nothing.
+const VERSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `sbx upgrade self`: find the binary to replace, then fetch and install what its release serves.
 ///
@@ -127,6 +134,7 @@ pub(crate) fn upgrade_self_cmd(mode: crate::sandbox::RollMode) -> ExitCode {
         target: &target,
         running: Path::new("/proc/self/exe"),
         mode,
+        version_deadline: VERSION_DEADLINE,
     };
     match upgrade(&run) {
         Ok(Outcome::Current) => {
@@ -286,7 +294,7 @@ fn upgrade(run: &Upgrade) -> Result<Outcome, String> {
     };
     let mut to = String::new();
     atomicfile::write_atomic_checked(run.target, &bytes, Some(mode), |staged| {
-        to = version_of(staged)?;
+        to = version_of(staged, run.version_deadline)?;
         Ok(())
     })
     .map_err(|e| format!("{} was left as it was: {e}", run.target.display()))?;
@@ -320,20 +328,25 @@ fn parse_checksum<'a>(text: &'a str, asset: &str) -> Option<&'a str> {
 }
 
 /// What the binary at `path` reports as its version, which is also the proof that it runs here.
-fn version_of(path: &Path) -> io::Result<String> {
+///
+/// The run goes through the bounded wait host-side steps share
+/// ([`crate::sandbox::resolver::output_within`]): past `deadline` the binary is killed, and an
+/// answer longer than that wait's ceiling is refused rather than read to its end, since what runs
+/// here is a download sbx has not yet seen run.
+fn version_of(path: &Path, deadline: std::time::Duration) -> io::Result<String> {
     let mut command = std::process::Command::new(path);
-    command
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    command.arg("--version");
     // The file was written a moment ago, and a child forked by another thread in that window holds
     // it open for writing until its own `exec`, which makes this one fail with ETXTBSY until then.
     // sbx forks nothing else here, so the loop runs once; a multi-threaded test binary is where it
-    // waits.
+    // waits. The bounded wait hands a spawn failure back untouched, so its errno still reads.
     let mut tries = 0;
     let out = loop {
-        match command.output() {
+        match crate::sandbox::resolver::output_within(
+            &mut command,
+            deadline,
+            "the downloaded binary, run with `--version`,",
+        ) {
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 100 => {
                 tries += 1;
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -400,6 +413,7 @@ mod tests {
         target: PathBuf,
         running: PathBuf,
         mode: crate::sandbox::RollMode,
+        version_deadline: std::time::Duration,
     }
 
     impl Bench {
@@ -446,6 +460,7 @@ mod tests {
                 target,
                 running,
                 mode: crate::sandbox::RollMode::Apply,
+                version_deadline: VERSION_DEADLINE,
             }
         }
 
@@ -462,6 +477,7 @@ mod tests {
                 target: &self.target,
                 running: &self.running,
                 mode: self.mode,
+                version_deadline: self.version_deadline,
             })
         }
 
@@ -608,6 +624,46 @@ mod tests {
         assert_eq!(left_alone(&bench), ["sbx"]);
     }
 
+    /// The new binary's `--version` run is bounded like every host-side step sbx waits on: a run
+    /// that has not answered by the deadline is killed, an answer past the ceiling is refused, and
+    /// neither replaces the binary. Each stand-in ends on its own and prints a version line that
+    /// passes, so an unbounded run takes both; every shape is checked before the verdict, so each
+    /// one fails on its own.
+    #[test]
+    fn a_version_run_that_does_not_answer_in_time_or_floods_never_replaces_the_binary() {
+        let line = "sbx 0.1.0 (latest, 1111111)";
+        let mut failures = Vec::new();
+        for (shape, served, deadline, expected) in [
+            (
+                "silent past the deadline",
+                format!("#!/bin/sh\nsleep 5\necho '{line}'\n"),
+                std::time::Duration::from_millis(500),
+                "did not answer within",
+            ),
+            (
+                "a flood after the version line",
+                format!("#!/bin/sh\necho '{line}'\nhead -c 1000000 /dev/zero\nexit 0\n"),
+                VERSION_DEADLINE,
+                "answered with more than",
+            ),
+        ] {
+            let mut bench = Bench::new(
+                &served,
+                &format!("{}  {}\n", sha256(&served), asset()),
+                "{}",
+            );
+            bench.version_deadline = deadline;
+            let outcome = bench.run("latest");
+            let kept = std::fs::read_to_string(&bench.target).unwrap();
+            let refused = matches!(&outcome, Err(why)
+                if why.contains(expected) && why.contains("was left as it was"));
+            if !refused || kept != "the old binary" || left_alone(&bench) != ["sbx"] {
+                failures.push(format!("{shape}: {outcome:?}, the target holds {kept:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
     #[test]
     fn a_checksum_that_is_not_one_stops_before_the_download() {
         let bench = Bench::new("unused", "<html>Not Found</html>", "{}");
@@ -698,6 +754,7 @@ mod tests {
                 target: &target,
                 running: &running,
                 mode: crate::sandbox::RollMode::Apply,
+                version_deadline: VERSION_DEADLINE,
             })
         };
 
