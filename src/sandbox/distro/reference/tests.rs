@@ -35,16 +35,56 @@ fn a_port_is_part_of_the_registry_not_a_tag_separator() {
     assert_eq!(parse("oci:localhost:5000/img"), None);
     let parsed = parse("oci:localhost:5000/img:tag").expect("valid");
     assert_eq!(parsed.registry, "localhost:5000");
+    // Rebuilt with its port, as it was written.
+    let written = "oci:registry.example.com:8443/team/base:2024a";
+    assert_eq!(parse(written).expect("valid").locator(), written);
+    // A port is digits, and there is one.
+    for bad in [
+        "oci:localhost:abc/img:1",
+        "oci:registry.example.com:5000:1/img:1",
+    ] {
+        assert_eq!(parse(bad), None, "`{bad}` must not parse");
+    }
 }
 
 #[test]
 fn docker_hub_is_addressed_at_the_host_that_serves_its_api() {
     // The published name and the serving name differ, and a fetcher that used the published one
     // would be following a redirect to a host it never checked.
-    let parsed = parse("oci:docker.io/library/debian:10").expect("valid");
-    assert_eq!(parsed.api_host(), "registry-1.docker.io");
+    for published in ["docker.io", "index.docker.io"] {
+        let parsed = parse(&format!("oci:{published}/library/debian:10")).expect("valid");
+        assert_eq!(parsed.api_host(), "registry-1.docker.io", "{published}");
+    }
     let parsed = parse("oci:ghcr.io/owner/image:1").expect("valid");
     assert_eq!(parsed.api_host(), "ghcr.io");
+}
+
+/// A tag is the shape a registry accepts: up to 128 characters, opening on a letter, a digit or
+/// `_`, then those and `.` and `-`.
+#[test]
+fn a_tag_is_held_to_the_shape_a_registry_accepts() {
+    let tagged = |tag: &str| parse(&format!("oci:docker.io/library/debian:{tag}"));
+    for good in ["10", "_edge", "v1.2-rc_3", &"a".repeat(128)] {
+        let parsed = tagged(good).unwrap_or_else(|| panic!("`{good}` is a tag"));
+        assert_eq!(parsed.reference, Reference::Tag(good.to_string()));
+    }
+    for bad in [&"a".repeat(129), ".hidden", "-flag", "a b", "a;b"] {
+        assert_eq!(tagged(bad), None, "`{bad}` is not a tag");
+    }
+}
+
+/// A repository may be a single segment, and every segment is a name: neither `.` nor empty.
+#[test]
+fn a_repository_is_one_or_more_named_segments() {
+    let parsed = parse("oci:docker.io/debian:10").expect("valid");
+    assert_eq!(parsed.repository, "debian");
+    for bad in [
+        "oci:docker.io/library/./debian:10",
+        "oci:docker.io/./debian:10",
+        "oci:docker.io/library/debian/:10",
+    ] {
+        assert_eq!(parse(bad), None, "`{bad}` must not parse");
+    }
 }
 
 #[test]
@@ -76,8 +116,11 @@ fn the_grammar_refuses_what_would_reach_a_registry_as_something_else() {
         "oci:docker.io/library/debian@sha256:short",
         "oci:docker.io/library/debian@md5:0123",
         &format!("oci:docker.io/library/debian@SHA256:{}", "A".repeat(64)),
-        // a tag and a digest at once: the digest alone pins
+        // a tag and a digest at once: the digest alone pins; two digests do not pin either
         &format!("oci:docker.io/library/debian:10@{d}"),
+        &format!("oci:docker.io/library/debian@{d}@{d}"),
+        // the scheme as it is spelled, not in another case
+        "OCI:docker.io/library/debian:10",
         // an empty or unhostlike registry, an uppercase repository, and bytes a URL must not see
         "oci:/library/debian:10",
         "oci:registry/library/debian:10",
