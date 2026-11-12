@@ -159,6 +159,12 @@ mod tests {
         let (pipe_r, pipe_w) =
             unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // A loopback connection, opened before the filters, for the options the proxy sets on each
+        // upstream socket it is handed (`ProxyCtx::connect`): set below through the same calls of
+        // the standard library, on a TCP socket as there, since a refusal is the only way they fail.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _accepted = listener.accept().unwrap();
         let mut file = crate::sandbox::memfd::write(c"sbx-probe", b"handed over").unwrap();
         // The size `read_to_end` asks for first is refused under the filters, which it survives.
         // Asked once out here, before them, so a choice the standard library makes once per
@@ -167,6 +173,16 @@ mod tests {
 
         let mut out = Vec::new();
         out.push(("confine", done(confine())));
+        let bound = Some(std::time::Duration::from_secs(1));
+        out.push((
+            "upstream read timeout",
+            done(upstream.set_read_timeout(bound)),
+        ));
+        out.push((
+            "upstream write timeout",
+            done(upstream.set_write_timeout(bound)),
+        ));
+        out.push(("upstream nodelay", done(upstream.set_nodelay(true))));
         let (r, w, s) = (
             pipe_r.as_raw_fd() as libc::c_long,
             pipe_w.as_raw_fd() as libc::c_long,
@@ -344,7 +360,9 @@ mod tests {
     /// The proxy's filters, in a process of their own: the calls that would reach past its cage
     /// are refused, `clone3` and the x32 ABI are answered `ENOSYS` so a fallback is taken, and the
     /// calls the proxy makes still work, starting a thread and reading a document handed over in a
-    /// file among them.
+    /// file among them. Among those are the read and write bounds and `TCP_NODELAY` the proxy sets
+    /// on each upstream socket and does not check: a filter that refused one would leave that
+    /// socket unbounded without a word, so the test is where the refusal shows.
     #[test]
     fn the_proxys_filters_refuse_what_its_work_does_not_make() {
         let outcomes = in_a_process(concat!(module_path!(), "::the_probes_process"));
@@ -397,6 +415,9 @@ mod tests {
             "fcntl F_GETFL",
             "fcntl F_DUPFD_CLOEXEC",
             "setsockopt SO_SNDTIMEO",
+            "upstream read timeout",
+            "upstream write timeout",
+            "upstream nodelay",
         ] {
             assert!(got(name).is_ok(), "{name} is allowed: {:?}", got(name));
         }
