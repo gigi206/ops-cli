@@ -3566,3 +3566,34 @@ fn a_fragment_never_sent_cannot_satisfy_a_regex_allow() {
         "a fragment admits nothing the request does not send"
     );
 }
+
+/// A target that does not start with `/` is read under the root, so the URL a `re:` rule reads
+/// names the request's own host: `.evil.com/` sent to `x.test` is not `https://x.test.evil.com/`,
+/// and an empty target is the root rather than a URL with no path. Every shape misread is reported
+/// together.
+#[test]
+fn a_target_without_a_leading_slash_is_read_under_the_root() {
+    let other = allow(&["re:^https://x\\.test\\.evil\\.com/"]);
+    assert!(
+        matches!(
+            other.explain("x.test.evil.com", 443, "/", "GET"),
+            Decision::AllowedBy(_)
+        ),
+        "calibration: the pattern admits its own host"
+    );
+    let bare = allow(&["re:^https://x\\.test$"]);
+    let mut wrong = Vec::new();
+    if !matches!(
+        other.explain("x.test", 443, ".evil.com/", "GET"),
+        Decision::DeniedDefault
+    ) {
+        wrong.push("`.evil.com/` sent to `x.test` reads as another host");
+    }
+    if !matches!(
+        bare.explain("x.test", 443, "", "GET"),
+        Decision::DeniedDefault
+    ) {
+        wrong.push("an empty target reads as a URL with no path");
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("; "));
+}

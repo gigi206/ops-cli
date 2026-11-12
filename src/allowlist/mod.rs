@@ -449,6 +449,18 @@ impl Request {
     pub(crate) fn new(host: &str, port: u16, target: &str) -> Self {
         let host = canonical_host(host);
         let segs = canonical_segments(target);
+        // A target that does not start with `/` is read under the root, as the segments read it.
+        // Glued to the authority as written, `.evil.com/` sent to `x.test` read as
+        // `https://x.test.evil.com/`, a URL for another host that a `re:` rule written for that
+        // host admits. The tunneled plane refuses such a target and the h2 one cannot carry it, so
+        // this keeps the matcher true whichever caller hands it one.
+        let rooted;
+        let target = if target.starts_with('/') {
+            target
+        } else {
+            rooted = format!("/{target}");
+            &rooted
+        };
         let sent = target.split('#').next().unwrap_or("");
         let decoded = percent_decode(sent);
         let authority = if port == 443 {
