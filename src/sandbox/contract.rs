@@ -144,7 +144,7 @@ impl TextDelivery {
 /// credential did not resolve ([`crate::sandbox::egress::Wiring::withdrawn`]). It is not a rule the
 /// cage cannot read but a consequence of this launch, one request away from being discovered, and
 /// left out it would stay listed as reachable in the document of the cage it was closed to.
-fn egress_contract(policy: &NetworkPolicy, withdrawn: &[String]) -> String {
+fn egress_contract(policy: &NetworkPolicy, withdrawn: &[Rule]) -> String {
     match policy {
         NetworkPolicy::Isolated => ISOLATED.to_string(),
         NetworkPolicy::Shared => SHARED.to_string(),
@@ -217,9 +217,10 @@ pub(crate) struct CageFacts<'a> {
     pub(crate) project: Option<&'a Path>,
     /// The resolved egress posture.
     pub(crate) policy: &'a NetworkPolicy,
-    /// The destinations denied for this run because their credential did not resolve, rendered
-    /// ([`crate::sandbox::egress::Wiring::withdrawn`]). Empty under a non-filtering posture.
-    pub(crate) withdrawn: &'a [String],
+    /// The destinations denied for this run because their credential did not resolve, as the rules
+    /// the proxy denies ([`crate::sandbox::egress::Wiring::withdrawn`]). Empty under a non-filtering
+    /// posture.
+    pub(crate) withdrawn: &'a [Rule],
     /// The gated tasks this session offers, the same list the task plane serves.
     pub(crate) tasks: &'a [TaskSpec],
     /// The expanded `[fs]` masks.
@@ -458,7 +459,7 @@ fn exec_section(proc: &ProcPolicy) -> String {
 /// A destination this run `withdrew` is taken out of the listing when a rule renders exactly as it
 /// does, and named under a heading of its own either way: a narrower denial (one path of an allowed
 /// host) leaves the host listed and still has to be said.
-fn allowlist_contract(policy: &EgressPolicy, withdrawn: &[String]) -> String {
+fn allowlist_contract(policy: &EgressPolicy, withdrawn: &[Rule]) -> String {
     let (mut inspected, mut cleartext, mut raw) = (Vec::new(), Vec::new(), Vec::new());
     for rule in listed_rules(policy, withdrawn) {
         // Flattened like every other config-sourced value in this file: a rule's rendering carries
@@ -496,7 +497,7 @@ fn allowlist_contract(policy: &EgressPolicy, withdrawn: &[String]) -> String {
     if !withdrawn.is_empty() {
         let lines = withdrawn
             .iter()
-            .map(|to| format!("- {}", one_line(to)))
+            .map(|to| format!("- {}", one_line(&to.to_string())))
             .collect();
         out.push_str(&format!("\n{WITHDRAWN_HEAD}\n{}", sorted_list(lines)));
     }
@@ -512,7 +513,12 @@ fn allowlist_contract(policy: &EgressPolicy, withdrawn: &[String]) -> String {
 /// says nothing a rule for the same destination with no restriction does not already say, since an
 /// allowlist is a union: `{GET,HEAD} https://x` next to `https://x` reads as two grants where there
 /// is one, so the narrower one is left out.
-fn listed_rules(policy: &EgressPolicy, withdrawn: &[String]) -> Vec<Rule> {
+///
+/// A rule is left out for a withdrawn destination when that denial refuses every request the rule
+/// admits ([`withdrawn_refuses`]), not only when the two read the same: the denial carries no verb,
+/// so `{GET,HEAD} https://x` under a withdrawn `https://x` admits nothing, and nor does a path or a
+/// raw splice to that host.
+fn listed_rules(policy: &EgressPolicy, withdrawn: &[Rule]) -> Vec<Rule> {
     let wire = super::union_with_builtin(policy.clone());
     let rules = wire.allow_rules();
     let every_verb = |r: &Rule| matches!(r.methods, Methods::Unspecified | Methods::Any);
@@ -524,9 +530,33 @@ fn listed_rules(policy: &EgressPolicy, withdrawn: &[String]) -> Vec<Rule> {
     };
     rules
         .iter()
-        .filter(|rule| !withdrawn.contains(&rule.to_string()) && !subsumed(rule))
+        .filter(|rule| {
+            !withdrawn.iter().any(|gone| withdrawn_refuses(gone, rule)) && !subsumed(rule)
+        })
         .cloned()
         .collect()
+}
+
+/// Whether the withdrawn destination `gone` refuses every request `rule` admits, as the proxy
+/// decides it.
+///
+/// A withdrawn destination is a credential's `to`, which is held to a denial with no verb on the
+/// inspected layer, and a denial with no verb refuses every verb, `WS` included
+/// ([`crate::allowlist`]'s `admits_deny`). The inspected plane weighs the denials of that layer,
+/// and the cleartext verdict and the raw splice give way to a denial on any layer whose hosts and
+/// ports match. So the question is whether `gone` reaches every host, port and path `rule` does,
+/// asked on `rule`'s own layer; what cannot be read off the two rules, a path under another or a
+/// pattern, answers no, and the rule stays listed with the exception named below it.
+fn withdrawn_refuses(gone: &Rule, rule: &Rule) -> bool {
+    let on_rules_layer = Rule {
+        layer: rule.layer,
+        ..gone.clone()
+    };
+    let any_verb = Rule {
+        methods: Methods::Unspecified,
+        ..rule.clone()
+    };
+    on_rules_layer.covers(&any_verb)
 }
 
 /// What an HTTPS request no rule admits meets, worded by the default action. Shared by both
@@ -698,7 +728,7 @@ pub(crate) fn cage_summary(facts: &CageFacts<'_>) -> String {
 }
 
 /// The network plane of the summary, by posture.
-fn summary_network(policy: &NetworkPolicy, withdrawn: &[String]) -> String {
+fn summary_network(policy: &NetworkPolicy, withdrawn: &[Rule]) -> String {
     let policy = match policy {
         NetworkPolicy::Isolated => return SUMMARY_ISOLATED.to_string(),
         NetworkPolicy::Shared => return SUMMARY_SHARED.to_string(),
@@ -1189,6 +1219,14 @@ mod tests {
     use crate::allowlist::{DefaultAction, EgressPolicy};
     use crate::config::NetworkPolicy;
     use std::path::PathBuf;
+
+    /// Rules as a configuration writes them, for the destinations a run withdrew.
+    fn rules(texts: &[&str]) -> Vec<Rule> {
+        texts
+            .iter()
+            .map(|s| crate::allowlist::classify(s).expect("a valid rule"))
+            .collect()
+    }
 
     fn policy_from(allow: &[&str], deny: &[&str]) -> EgressPolicy {
         let allow = allow
@@ -1754,10 +1792,7 @@ mod tests {
     #[test]
     fn a_destination_withdrawn_for_the_run_is_not_listed_as_reachable() {
         let policy = policy_from(&["api.absent.test", "registry.demo.test"], &[]);
-        let withdrawn = [
-            "https://api.absent.test".to_string(),
-            "https://registry.demo.test/v2".to_string(),
-        ];
+        let withdrawn = rules(&["https://api.absent.test", "https://registry.demo.test/v2"]);
         let text = egress_contract(&NetworkPolicy::Allowlist(Box::new(policy)), &withdrawn);
         let (reachable, refused) = text
             .split_once("Refused for this run")
@@ -1810,13 +1845,156 @@ mod tests {
     #[test]
     fn a_wider_rule_over_a_withdrawn_destination_stays_listed_with_the_exception_named() {
         let policy = policy_from(&["*.absent.test"], &[]);
-        let withdrawn = ["https://api.absent.test".to_string()];
+        let withdrawn = rules(&["https://api.absent.test"]);
         let text = egress_contract(&NetworkPolicy::Allowlist(Box::new(policy)), &withdrawn);
         let (reachable, refused) = text
             .split_once("Refused for this run")
             .unwrap_or_else(|| panic!("the exception is named: {text}"));
         assert!(reachable.contains("*.absent.test"), "{text}");
         assert!(refused.contains("- https://api.absent.test"), "{text}");
+    }
+
+    /// The reachable listing agrees with the proxy's verdict under a withdrawn destination, rule by
+    /// rule: one the denial leaves admitting nothing is left out, however it reads (a verb set, a
+    /// `{WS}` grant, a path, a raw splice, a built-in grant, a withdrawn path), and one it does not
+    /// reach stays (a cleartext grant on another port, another host). Each shape is put to the
+    /// proxy first and the listing is held to that answer, and every disagreement is reported
+    /// together, so each shape is seen to fail on its own.
+    #[test]
+    fn a_rule_the_withdrawal_leaves_admitting_nothing_is_not_listed() {
+        use crate::allowlist::{Decision, L4Decision};
+        enum Ask {
+            Inspected(&'static str, &'static str),
+            Clear(u16, &'static str),
+            Raw(u16),
+        }
+        let mut wrong = Vec::new();
+        let mut check = |allow: &str, gone: &str, host: &str, ask: Ask| {
+            let withdrawn = rules(&[gone]);
+            let mut proxy = crate::sandbox::union_with_builtin(policy_from(&[allow], &[]));
+            proxy.deny_also(withdrawn.clone());
+            let refused = match ask {
+                Ask::Inspected(path, verb) => {
+                    matches!(proxy.explain(host, 443, path, verb), Decision::DeniedBy(_))
+                }
+                Ask::Clear(port, path) => matches!(
+                    proxy.explain_clear(host, port, path, "GET"),
+                    Decision::DeniedBy(_)
+                ),
+                Ask::Raw(port) => {
+                    matches!(proxy.l4_decision(host, port), L4Decision::Suppressed(_))
+                }
+            };
+            let text = egress_contract(
+                &NetworkPolicy::Allowlist(Box::new(policy_from(&[allow], &[]))),
+                &withdrawn,
+            );
+            let rendered = format!(
+                "- {}",
+                crate::allowlist::classify(allow).expect("a valid rule")
+            );
+            let listed = text
+                .split_once("Refused for this run")
+                .map_or(text.as_str(), |(reachable, _)| reachable)
+                .lines()
+                .any(|line| line == rendered);
+            if listed == refused {
+                wrong.push(format!(
+                    "`{allow}` under a withdrawn `{gone}`: the proxy {} it, the listing {}",
+                    if refused { "refuses" } else { "admits" },
+                    if listed { "names it" } else { "leaves it out" }
+                ));
+            }
+        };
+        let gone = "https://api.absent.test";
+        let host = "api.absent.test";
+        check(
+            "{GET} https://api.absent.test",
+            gone,
+            host,
+            Ask::Inspected("/", "GET"),
+        );
+        check(
+            "{WS} https://api.absent.test",
+            gone,
+            host,
+            Ask::Inspected("/", "WS"),
+        );
+        check(
+            "https://api.absent.test/v1",
+            gone,
+            host,
+            Ask::Inspected("/v1", "GET"),
+        );
+        check("tcp://api.absent.test:443", gone, host, Ask::Raw(443));
+        check("http://api.absent.test", gone, host, Ask::Clear(80, "/"));
+        check(
+            "http://api.absent.test:443",
+            gone,
+            host,
+            Ask::Clear(443, "/"),
+        );
+        check(
+            "https://other.absent.test",
+            gone,
+            "other.absent.test",
+            Ask::Inspected("/", "GET"),
+        );
+        check(
+            "{GET} https://registry.demo.test/v2",
+            "https://registry.demo.test/v2",
+            "registry.demo.test",
+            Ask::Inspected("/v2", "GET"),
+        );
+
+        // A built-in grant is withdrawn like a written one.
+        let builtin = rules(&["https://github.com"]);
+        let mut proxy = crate::sandbox::union_with_builtin(policy_from(&[], &[]));
+        proxy.deny_also(builtin.clone());
+        assert!(
+            matches!(
+                proxy.explain("github.com", 443, "/", "GET"),
+                Decision::DeniedBy(_)
+            ),
+            "the proxy refuses the built-in host once it is withdrawn"
+        );
+        let builtin_listing = |withdrawn: &[Rule]| {
+            let text = egress_contract(
+                &NetworkPolicy::Allowlist(Box::new(policy_from(&[], &[]))),
+                withdrawn,
+            );
+            text.split_once("Refused for this run")
+                .map_or(text.as_str(), |(reachable, _)| reachable)
+                .contains("{GET,HEAD} https://github.com\n")
+        };
+        assert!(
+            builtin_listing(&[]),
+            "calibration: the built-in grant is listed"
+        );
+        if builtin_listing(&builtin) {
+            wrong.push("the built-in grant for a withdrawn host is listed".to_string());
+        }
+
+        // The summary takes its listing from the same place.
+        let summary = |withdrawn: &[Rule]| {
+            summary_network(
+                &NetworkPolicy::Allowlist(Box::new(policy_from(
+                    &["{GET} https://api.absent.test"],
+                    &[],
+                ))),
+                withdrawn,
+            )
+        };
+        assert!(
+            summary(&[]).contains("api.absent.test"),
+            "calibration: the summary names the host when nothing is withdrawn"
+        );
+        if summary(&rules(&[gone])).contains("api.absent.test") {
+            wrong.push(
+                "the summary lists a grant the withdrawal leaves admitting nothing".to_string(),
+            );
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     #[test]
@@ -2050,7 +2228,7 @@ mod tests {
             &[],
         );
         let network = NetworkPolicy::Allowlist(Box::new(policy));
-        let withdrawn = ["https://gone.demo.test/WITHDRAWN-INSTRUCTION".to_string()];
+        let withdrawn = rules(&["https://gone.demo.test/WITHDRAWN-INSTRUCTION"]);
         let authenticated = ["https://api.demo.test/AUTH-INSTRUCTION".to_string()];
         let tasks = [hostile_task()];
         let facts = CageFacts {

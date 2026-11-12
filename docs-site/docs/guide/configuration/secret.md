@@ -40,7 +40,9 @@ those three changes that.
 The list is of the credentials that **resolved**. One that did not had its destination
 [denied for the run](#optional-what-an-unresolvable-credential-costs) as the proxy started, so it
 is absent from that list rather than promised in it. The same destination is taken out of the
-reachable hosts, and named under a heading of its own, **Refused for this run**, so that the `403`
+reachable hosts, together with every grant the denial leaves admitting nothing (a rule for some
+verbs, a path, or a raw `tcp://` splice to that host), and named under a heading of its own,
+**Refused for this run**, so that the `403`
 a request to it meets reads as this launch's decision rather than as a network fault. That is the
 one denial the document names: unlike a deny rule, it is a consequence of this launch, which one
 request would discover anyway.

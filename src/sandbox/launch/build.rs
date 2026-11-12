@@ -2642,7 +2642,7 @@ pub(super) fn build(
     let mut authenticated: Vec<String> = Vec::new();
     // The destinations the proxy denied for this run because their credential did not resolve, for
     // the in-cage contract to take out of the reachable listing. Empty under the same postures.
-    let mut withdrawn: Vec<String> = Vec::new();
+    let mut withdrawn: Vec<crate::allowlist::Rule> = Vec::new();
     // The host-side egress socket, carried out of the block for the netns holder: the
     // transparent-capture tap dials it from *outside* the cage, so it needs the real path, not the
     // bind's in-cage name. `None` under any posture that stands no proxy up.

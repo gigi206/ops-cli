@@ -288,13 +288,13 @@ pub(crate) struct Wiring {
     /// document that named it would hand the cage an access it does not have. Destinations only —
     /// never a credential's name, its header or where it was read from.
     pub(crate) authenticated: Vec<String>,
-    /// The destinations denied for this run because their credential did not resolve, rendered,
-    /// for the in-cage contract to take out of its reachable listing.
+    /// The destinations denied for this run because their credential did not resolve, as the rules
+    /// the proxy denies, for the in-cage contract to take out of its reachable listing.
     ///
     /// The contract is rendered from the configured policy, and this deny is added to the proxy's
     /// own copy as it starts, so without it the document would list as reachable a destination
     /// every request to which is refused.
-    pub(crate) withdrawn: Vec<String>,
+    pub(crate) withdrawn: Vec<crate::allowlist::Rule>,
 }
 
 /// Wrap `cmd` so the cage starts the forwarder before running it: a static bash that
@@ -948,7 +948,7 @@ pub(crate) fn start(
         // Applied before the proxy is built, so no request is ever served against the policy as it
         // stood while a credential was still expected to resolve. Empty under an aborting launch
         // whose declarations are all required — the case that used to have its own branch here.
-        let withdrawn = kept.denied.iter().map(ToString::to_string).collect();
+        let withdrawn = kept.denied.clone();
         policy.deny_also(kept.denied);
         (
             kept.injections,
