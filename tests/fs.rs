@@ -178,7 +178,9 @@ fn detached_observe_records_fs_writes_for_fs_logs() {
     // the ONLY channel for a detached session. A stunted watcher never converges and the assertion
     // below fires with the last output.
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut last = String::new();
+    // Both streams of the last read are kept, stdout alone searched: an error that names the file
+    // on stderr is no write recorded in the ring.
+    let (mut last, mut last_err) = (String::new(), String::new());
     let mut ok = false;
     while Instant::now() < deadline {
         let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
@@ -187,6 +189,7 @@ fn detached_observe_records_fs_writes_for_fs_logs() {
             .output()
             .expect("run sbx fs logs");
         last = String::from_utf8_lossy(&out.stdout).into_owned();
+        last_err = String::from_utf8_lossy(&out.stderr).into_owned();
         if out.status.code() == Some(0) && last.contains("marker.txt") {
             ok = true;
             break;
@@ -203,7 +206,8 @@ fn detached_observe_records_fs_writes_for_fs_logs() {
     assert!(
         ok,
         "the detached observed session's write to `marker.txt` must appear in `sbx fs logs` (read over \
-         the control socket — a detached session has no inline feed). Last output:\n{last}"
+         the control socket — a detached session has no inline feed). Last output:\n{last}\n\
+         stderr:\n{last_err}"
     );
 }
 
