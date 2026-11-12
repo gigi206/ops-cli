@@ -391,8 +391,8 @@ pub(crate) fn nvidia_bridge_in(root: &Path) -> Option<NvidiaBridge> {
     let version = libs
         .iter()
         .find(|(_, dest)| dest.file_name().is_some_and(|n| n == NVIDIA_VENDOR_LIB))
-        .and_then(|(src, _)| src.file_name()?.to_str()?.rsplit_once(".so."))
-        .map(|(_, v)| v.to_string());
+        .and_then(|(src, _)| driver_version(src.file_name()?.to_str()?))
+        .map(str::to_string);
 
     let icd_src = root.join("usr/share/vulkan/icd.d/nvidia_icd.json");
     let icd = icd_src.exists().then(|| {
@@ -410,6 +410,19 @@ pub(crate) fn nvidia_bridge_in(root: &Path) -> Option<NvidiaBridge> {
         devices: nvidia_nodes_in(root),
         version,
     })
+}
+
+/// The driver version a library's versioned file name carries (`libEGL_nvidia.so.580.178.04` gives
+/// `580.178.04`), or `None` when it carries none. A soname shipped as a real file
+/// (`libEGL_nvidia.so.0`) ends in its ABI number, which is no driver version: read as one, it would
+/// be compared with the kernel module's and warn of a skew that does not exist. Pure.
+fn driver_version(file_name: &str) -> Option<&str> {
+    let (_, version) = file_name.rsplit_once(".so.")?;
+    let dotted = version.contains('.')
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+    dotted.then_some(version)
 }
 
 /// The NVIDIA character devices under a named root: the control and memory nodes plus every
@@ -892,6 +905,39 @@ mod tests {
                 "/run/sbx-nvidia/vulkan/icd.d/nvidia_icd.json"
             )),
             "and it is carried once it is there, so a Vulkan client sees the card beside mesa"
+        );
+    }
+
+    /// A vendor library the packaging ships as a real file under its soname carries its ABI
+    /// number, not the driver's version: read as one, `libEGL_nvidia.so.0` gave `0`, and the launch
+    /// warned of a skew against the loaded module that does not exist. The version is then unknown,
+    /// which never warns.
+    #[test]
+    fn a_soname_shipped_as_a_real_file_names_no_driver_version() {
+        let root = crate::testutil::TmpDir::new();
+        let dir = root.join("usr/lib/x86_64-linux-gnu");
+        std::fs::create_dir_all(&dir).expect("stage the driver directory");
+        std::fs::write(dir.join("libEGL_nvidia.so.0"), b"").expect("stage the vendor, unversioned");
+        let bridge = nvidia_bridge_in(root.path()).expect("the vendor library makes it a bridge");
+        assert_eq!(
+            bridge.version, None,
+            "an ABI number is not a driver version"
+        );
+        assert_eq!(
+            driver_version("libEGL_nvidia.so.580.178.04"),
+            Some("580.178.04")
+        );
+        assert_eq!(
+            driver_version("libEGL_nvidia.so.580.178.04.dpkg-new"),
+            None,
+            "a suffix after the version is not part of it"
+        );
+
+        let mut warnings = Vec::new();
+        nvidia_wiring(&bridge, &[], None, Some("580.178.04"), &mut warnings);
+        assert!(
+            !warnings.iter().any(|w| w.contains("kernel module")),
+            "no skew is claimed against a version that was never read: {warnings:?}"
         );
     }
 
