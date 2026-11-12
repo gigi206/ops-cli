@@ -7345,7 +7345,8 @@ fn package_name_and_attribute_validators() {
     ] {
         assert!(is_valid_mise_token(t), "{t} should be a valid mise token");
     }
-    for t in ["", "a b", "a$b", "a\"b", "a;b", "a\0b"] {
+    // A leading `-` too: the token is a word of mise's argv, where it would read as an option.
+    for t in ["", "a b", "a$b", "a\"b", "a;b", "a\0b", "--help", "-y"] {
         assert!(!is_valid_mise_token(t), "{t} should be rejected");
     }
 }

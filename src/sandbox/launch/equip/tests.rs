@@ -133,7 +133,7 @@ fn wrap_autoequip_passes_tokens_and_command_positionally() {
     let script = argv[2].to_string_lossy();
     // mise by absolute path; the slice/shift use the count, not the tokens; the command
     // is exec'd (so it stays the cage's main process) after the tokens are shifted off.
-    assert!(script.contains("'/nix/store/mise/bin/mise' install \"${@:1:2}\""));
+    assert!(script.contains("'/nix/store/mise/bin/mise' install -- \"${@:1:2}\""));
     // The project's lane equips the project's own mise file, so it runs where that file is.
     assert!(!script.contains(MISE_OUTSIDE_PROJECT), "{script}");
     assert!(script.contains("shift 2;"));
@@ -163,7 +163,7 @@ fn wrap_mise_equip_uses_the_global_verb_for_app_packages() {
     let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, None, true, cmd);
 
     let script = argv[2].to_string_lossy();
-    assert!(script.contains("'/nix/store/mise/bin/mise' -C / use -g \"${@:1:1}\""));
+    assert!(script.contains("'/nix/store/mise/bin/mise' -C / use -g -- \"${@:1:1}\""));
     assert!(script.contains("shift 1;"));
     // no data-dir override: the equip runs under the ambient primary
     assert!(!script.contains("MISE_DATA_DIR="));
@@ -202,7 +202,7 @@ fn a_mise_package_is_pinned_at_equip_and_only_a_bump_roll_moves_it() {
         let cmd = mise_upgrade_cmd(rt, &mise, &bash, &tokens);
         let script = cmd[2].to_string_lossy();
         assert!(
-            script.contains("'/nix/store/mise/bin/mise' -C / upgrade --bump \"$@\""),
+            script.contains("'/nix/store/mise/bin/mise' -C / upgrade --bump -- \"$@\""),
             "a pinned tool only advances with --bump: {script}"
         );
     }
@@ -484,6 +484,67 @@ fn running_the_equip_script_repairs_a_pipx_tool_whose_directory_mise_named_from_
     );
 }
 
+/// Every script that hands mise a token ends mise's options before it, so a token is read as a
+/// tool and never as an option. The project's lane takes its tokens from the project's own
+/// `.mise.toml`, which no declaration check has seen, and a word starting with `-` there would
+/// otherwise reach mise as a flag: `use -g --pin --help` prints the help and installs nothing.
+/// Run, rather than read off the script text, with a stand-in mise that records its argv.
+#[test]
+fn every_mise_script_ends_the_options_before_its_tokens() {
+    let bash = PathBuf::from("/bin/bash");
+    if !bash.is_file() {
+        skip_incapable!("skipping mise-script run: no /bin/bash on this host");
+        return;
+    }
+    let dir = crate::testutil::TmpDir::new();
+    argv_recording_stub(&dir.path().join("mise"));
+    let tokens = vec!["--help".to_string()];
+    let then = || vec![OsString::from("/bin/true")];
+    // `mise` is named from the fixture the script runs in, as the other runs here name it.
+    let mise = Path::new("./mise");
+    for (what, argv, called) in [
+        (
+            "the project's lane",
+            wrap_mise_equip(mise, &bash, "install", &tokens, None, false, then()),
+            "mise install -- --help",
+        ),
+        (
+            "the app's lane",
+            wrap_mise_equip(mise, &bash, MISE_EQUIP_VERB, &tokens, None, true, then()),
+            "mise -C / use -g --pin -- --help",
+        ),
+        (
+            "the roll",
+            mise_upgrade_cmd(binds::Runtime::ProjectDefault, mise, &bash, &tokens),
+            "mise -C / upgrade --bump -- --help",
+        ),
+        (
+            "the roll's question",
+            mise_state_cmd(binds::Runtime::ProjectDefault, mise, &bash, &tokens),
+            "mise -C / outdated --bump --json -- --help",
+        ),
+    ] {
+        let record = dir.path().join("record");
+        let _ = std::fs::remove_file(&record);
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(dir.path())
+            .env("SBX_TEST_RECORD", &record)
+            .output()
+            .expect("run the generated script");
+        assert!(
+            out.status.success(),
+            "{what}: the script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let seen = std::fs::read_to_string(&record).expect("the stand-in recorded its argv");
+        assert!(
+            seen.lines().any(|line| line == called),
+            "{what}: mise was not called as `{called}`: {seen}"
+        );
+    }
+}
+
 #[test]
 fn mise_upgrade_cmd_pins_the_app_global_pool_only_for_a_global_app() {
     // `sbx upgrade mise` rolls `[packages] mise:` tools, which for a global app live in the
@@ -519,7 +580,7 @@ fn mise_upgrade_cmd_pins_the_app_global_pool_only_for_a_global_app() {
         );
         // The pool's listing follows the upgrade, so the roll can tell a current tool from one the
         // equip never installed.
-        let upgrade = script.find("upgrade --bump \"$@\"").expect("the roll");
+        let upgrade = script.find("upgrade --bump -- \"$@\"").expect("the roll");
         let report = script.find(MISE_STATE_MARKER).expect("the report");
         assert!(upgrade < report, "{script}");
         // And one precedes it, so a move mise does not name can still be read off the two.
@@ -862,7 +923,9 @@ fn mise_state_cmd_asks_both_questions_in_the_pool_the_roll_advances() {
         assert!(script.contains(MISE_STATE_MARKER));
         assert!(script.contains("'/nix/store/mise/bin/mise' -C / ls --global --json"));
         // The roll's own flag, so the target `outdated` names is the one the roll would write.
-        assert!(script.contains("'/nix/store/mise/bin/mise' -C / outdated --bump --json \"$@\""));
+        assert!(
+            script.contains("'/nix/store/mise/bin/mise' -C / outdated --bump --json -- \"$@\"")
+        );
         // The tokens are data: positional, never in the script.
         assert!(!script.contains("rm -rf"));
         assert_eq!(

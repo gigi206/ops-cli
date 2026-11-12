@@ -986,8 +986,14 @@ pub(crate) fn is_bare_nix_attr(attr: &str) -> bool {
 /// positional argv to mise, and the equip never interpolates it into a nix expression or a
 /// shell string), so admitting them adds no injection surface; a backend that does not
 /// understand them simply rejects the token.
+///
+/// Positional is not the same as a tool, though: a word that starts with `-` reads as an option to
+/// the `mise` it reaches (`mise use -g --pin --help` prints the help and installs nothing), and no
+/// tool is named that way. So a leading `-` is refused here, and the scripts that hand tokens to
+/// mise end its options with `--` before them as well.
 pub(super) fn is_valid_mise_token(token: &str) -> bool {
     !token.is_empty()
+        && !token.starts_with('-')
         && token.chars().all(|c| {
             c.is_ascii_alphanumeric()
                 || matches!(

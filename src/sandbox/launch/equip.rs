@@ -59,7 +59,8 @@ pub(super) fn equip_announcement(tokens: &[String]) -> String {
 /// roll nothing — a regression of a shipped command. So for a global app the roll is pinned to the
 /// app-global pool via an exported `MISE_DATA_DIR=<app-global>`; other runtimes have a single pool
 /// (the home), already the ambient primary. The tokens ride `"$@"` positionally and the two
-/// interpolated values go through [`shell_quote`]. Both values are sbx's own — the mise path it
+/// interpolated values go through [`shell_quote`], and the tokens follow a `--` so none reads as an
+/// option to mise. Both values are sbx's own — the mise path it
 /// resolved and a fixed cage path — so nothing untrusted reaches the script either way; quoting them
 /// makes that a property of how the line is built rather than of what the values happen to contain,
 /// which is the form that survives a path acquiring a space.
@@ -89,7 +90,7 @@ pub(super) fn mise_upgrade_cmd(
     let mise = mise_outside_project(mise);
     let script = format!(
         "set -e; {pin}printf '%s\\n' '{MISE_BEFORE_MARKER}'; {mise} ls --global --json; \
-         {mise} upgrade {MISE_ROLL_FLAG} \"$@\"; {report}; printf '{{}}}}\\n'",
+         {mise} upgrade {MISE_ROLL_FLAG} -- \"$@\"; {report}; printf '{{}}}}\\n'",
         pin = mise_pool_pin(runtime),
         report = mise_ls_report(&mise),
     );
@@ -156,8 +157,8 @@ pub(super) const MISE_STATE_MARKER: &str = "@@sbx-mise-state@@";
 /// Run through bash in every runtime, with the same `MISE_DATA_DIR` pin and the same
 /// [`MISE_OUTSIDE_PROJECT`] [`mise_upgrade_cmd`] takes, so `ls` reads the installs the roll would
 /// advance and `outdated` answers for the roll's own configuration. `set -e` makes a failing
-/// mise the cage's exit status. The tokens ride `"$@"` positionally and the two interpolated values
-/// go through [`shell_quote`], for the reasons given there.
+/// mise the cage's exit status. The tokens ride `"$@"` positionally after a `--` and the two
+/// interpolated values go through [`shell_quote`], for the reasons given there.
 pub(super) fn mise_state_cmd(
     runtime: binds::Runtime,
     mise: &Path,
@@ -166,7 +167,7 @@ pub(super) fn mise_state_cmd(
 ) -> Vec<OsString> {
     let mise = mise_outside_project(mise);
     let script = format!(
-        "set -e; {pin}{report}; {mise} outdated {MISE_ROLL_FLAG} --json \"$@\"; printf '}}\\n'",
+        "set -e; {pin}{report}; {mise} outdated {MISE_ROLL_FLAG} --json -- \"$@\"; printf '}}\\n'",
         pin = mise_pool_pin(runtime),
         report = mise_ls_report(&mise),
     );
@@ -251,7 +252,9 @@ fn disabled_mise_tools(env: &[(String, String)]) -> Vec<&str> {
 /// (`install` for the project's local `.mise.toml` tools, `use -g` for the app's `[packages]
 /// mise:` ones) and is interpolated **unquoted**, because `use -g` has to reach mise as two words;
 /// the tokens and the command ride `"$@"` positionally, and the mise path goes through
-/// [`shell_quote`], so a token from an untrusted config can never inject shell. Best-effort: a
+/// [`shell_quote`], so a token from an untrusted config can never inject shell. The tokens follow a
+/// `--`, so none of them can read as an option to mise either: the project's lane takes its tokens
+/// from the project's own `.mise.toml`, which no declaration check has seen. Best-effort: a
 /// failed equip does not abort the command (the missing tool surfaces when it is used), matching
 /// the self-equip posture rather than the host `nix:` hard-fail guarantee.
 ///
@@ -351,7 +354,7 @@ pub(super) fn wrap_mise_equip(
         )
     };
     let script = format!(
-        "{repair}{data_dir_prefix}{mise} {verb} \"${{@:1:{n}}}\" 1>&2; shift {shifted}; exec \"$@\"",
+        "{repair}{data_dir_prefix}{mise} {verb} -- \"${{@:1:{n}}}\" 1>&2; shift {shifted}; exec \"$@\"",
         shifted = n + 3 * m,
     );
     let mut out = vec![
