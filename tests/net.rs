@@ -1936,6 +1936,49 @@ fn net_pending_allow_by_id_says_a_session_that_did_not_answer_in_full_is_not_kno
     assert!(stderr.contains("no live session for '46012.1'"), "{stderr}");
 }
 
+/// `watch` ends once the terminal it draws on is gone, as `net live` does, rather than polling every
+/// session and drawing into nothing until it is killed. A terminal that closes hangs up the
+/// processes it controls, and the one here does not control the watch: nothing but its failed
+/// redraws tells it the terminal is gone, as for a watch the hangup does not reach or that ignores
+/// it. The frame it could not write is output that could not be written, which exits 1 as it does
+/// for any verb (only a reader gone from a pipe, `EPIPE`, is not a failure).
+#[test]
+fn net_pending_watch_ends_once_its_terminal_is_gone() {
+    use std::time::{Duration, Instant};
+    let fx = Project::new("net");
+    let mut pty = common::pty::Pty::open(None);
+    let mut cmd = fx.cmd(&["net", "pending", "watch", "-i", "1"]);
+    cmd.stdin(pty.stdio())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio());
+    let mut watch = common::pty::Reaped(cmd.spawn().expect("spawn sbx"));
+    pty.release_slave();
+    let mut frame = Vec::new();
+    // Two frames, a second apart: a watch that ended after its first, whatever the reason, does not
+    // draw the second, and the end this test is about is the one the closed terminal brings.
+    let drawn = pty.read_until(&mut frame, Instant::now() + Duration::from_secs(10), |o| {
+        String::from_utf8_lossy(o).matches("watching").count() >= 2
+    });
+    assert!(drawn, "two frames:\n{}", String::from_utf8_lossy(&frame));
+    drop(pty);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = watch.0.try_wait().expect("wait for the watch") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let status = status.expect("the watch is still running 10 s after its terminal closed");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a frame that could not be written exits as an answer that could not be: {status:?}"
+    );
+}
+
 #[test]
 fn net_pending_all_save_global_drains_and_persists_each_host() {
     let fx = Project::new("net");

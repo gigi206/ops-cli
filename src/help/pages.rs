@@ -3166,7 +3166,8 @@ pub(super) const PAGES: &[Page] = &[
             place every few seconds (top-style — the terminal scrollback is preserved), so a parked\n\
             request appears as soon as an agent triggers it. Answer it from another shell with\n\
             `sbx net pending allow|deny <id>`; the watch picks up the change on the next refresh.\n\
-            Ctrl-C quits. Needs a terminal — for a pipe or a script use the one-shot listing (`--json`).\n\
+            Ctrl-C quits, and the watch ends on its own once its terminal is gone. Needs a terminal —\n\
+            for a pipe or a script use the one-shot listing (`--json`).\n\
             A session that was reached and did not answer in full is named in the frame, for as long\n\
             as it does not answer, so it is not read as one with nothing parked. No launch, no nix,\n\
             no network.",

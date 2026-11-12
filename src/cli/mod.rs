@@ -75,7 +75,11 @@ static OUTPUT_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// on stderr, and [`output_verdict`] turns the verb's success into a failure. The panic a bare
 /// `println!` raised there had at least ended the process non-zero, and a script testing the exit
 /// code must still learn that its file is incomplete.
-fn note_output_failure(e: &std::io::Error) {
+///
+/// A view that redraws or streams on its own (`sbx net live`, `sbx net pending watch`) writes its
+/// frames itself, and hands the first write that fails here before it ends, so its exit code is
+/// decided on the same terms as a document's.
+pub(crate) fn note_output_failure(e: &std::io::Error) {
     use std::sync::atomic::Ordering;
     if e.kind() == std::io::ErrorKind::BrokenPipe {
         return;

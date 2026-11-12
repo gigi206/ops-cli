@@ -269,11 +269,21 @@ pub(super) fn net_pending_watch(args: &[OsString]) -> ExitCode {
         // erases any trailing lines a shorter frame leaves behind, with no full-screen blank flicker.
         // Interrupting mid-watch just leaves the last frame on screen — no cleanup is owed.
         let mut out = std::io::stdout().lock();
-        let _ = write!(
+        let wrote = write!(
             out,
             "\x1b[H{dim}watching · refresh {secs}s · Ctrl-C to quit{r}\n{body}\x1b[J"
-        );
-        let _ = out.flush();
+        )
+        .and_then(|()| out.flush());
+        drop(out);
+        // A frame that cannot be written ends the watch. A terminal that closes hangs up the
+        // processes it controls, but a watch the hangup does not reach, or that ignores it, learns
+        // the terminal is gone only from this failure, and would otherwise go on polling every
+        // session and drawing into nothing. What the failure makes of the exit code is decided where
+        // every verb's output failure is (`note_output_failure`).
+        if let Err(e) = wrote {
+            crate::cli::note_output_failure(&e);
+            return ExitCode::SUCCESS;
+        }
         std::thread::sleep(parsed.interval);
     }
 }
