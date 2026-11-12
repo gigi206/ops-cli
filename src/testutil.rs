@@ -730,7 +730,7 @@ pub(crate) fn production_half(text: &str) -> Cow<'_, str> {
             continue;
         }
         let open = starts[module.item] + lines[module.item].rfind('{').unwrap_or(0);
-        let close = closing_brace(text.as_bytes(), open)
+        let close = closing_delimiter(text.as_bytes(), open)
             .map_or(lines.len(), |at| starts.partition_point(|&s| s <= at) - 1);
         cuts.push((module.attribute, close));
     }
@@ -749,11 +749,16 @@ pub(crate) fn production_half(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Where the brace that `text[open]` opens is closed, counting only the braces that are code: a
-/// brace inside a string, a raw string, a character literal or a comment — a fixture's JSON, a
-/// shell function a test runs — opens nothing.
-pub(crate) fn closing_brace(text: &[u8], open: usize) -> Option<usize> {
+/// Where the delimiter that `text[open]` opens is closed — a parenthesis when it is `(`, a brace
+/// otherwise — counting only the delimiters that are code: one inside a string, a raw string, a
+/// character literal or a comment — a fixture's JSON, a shell function a test runs, the `{}` of a
+/// format string — opens nothing.
+pub(crate) fn closing_delimiter(text: &[u8], open: usize) -> Option<usize> {
     let ident = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
+    let (opens, closes) = match text.get(open) {
+        Some(b'(') => (b'(', b')'),
+        _ => (b'{', b'}'),
+    };
     let mut depth = 0usize;
     let mut i = open;
     while i < text.len() {
@@ -827,8 +832,8 @@ pub(crate) fn closing_brace(text: &[u8], open: usize) -> Option<usize> {
                 };
                 i += width.unwrap_or(0);
             }
-            b'{' => depth += 1,
-            b'}' => {
+            b if b == opens => depth += 1,
+            b if b == closes => {
                 depth = depth.checked_sub(1)?;
                 if depth == 0 {
                     return Some(i);
@@ -845,13 +850,13 @@ pub(crate) fn closing_brace(text: &[u8], open: usize) -> Option<usize> {
 /// brace that opens it to the one that closes it, both included; `None` when the source has no such
 /// function or it never closes.
 ///
-/// Closed by [`closing_brace`], so a brace inside a string or a comment in the body, or a line that
+/// Closed by [`closing_delimiter`], so a brace inside a string or a comment in the body, or a line that
 /// holds a lone `}` in a multi-line string, neither ends the body early nor holds it open: a guard
 /// that reads one function reads all of it and nothing past it.
 pub(crate) fn function_body<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
     let at = source.find(signature)?;
     let open = at + source[at..].find('{')?;
-    let close = closing_brace(source.as_bytes(), open)?;
+    let close = closing_delimiter(source.as_bytes(), open)?;
     Some(&source[open..=close])
 }
 
@@ -1969,6 +1974,15 @@ mod helper_tests {
             production_half(gated_items),
             "#[cfg(test)]\nuse x::y;\nfn a() {}\n"
         );
+    }
+
+    /// A parenthesis is closed by the one that matches it, counted like a brace: a `)` inside a
+    /// string or a character literal closes nothing, and a nested call is passed over whole.
+    #[test]
+    fn a_parenthesis_is_closed_by_the_one_that_matches_it() {
+        let text = "call(\"a ) b\", g(1), ')') tail";
+        let close = closing_delimiter(text.as_bytes(), text.find('(').unwrap());
+        assert_eq!(close.map(|at| &text[at..]), Some(") tail"));
     }
 
     /// A function's body runs to the brace that closes its own. A line holding a lone `}` inside a

@@ -371,8 +371,9 @@ fn the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag() {
 /// where whatever it turns out to carry is styled. That is decidable by reading, which the previous
 /// rule was not.
 ///
-/// The window runs to the call's closing `);` rather than one line, since a format string may be
-/// spelled below the macro name.
+/// The window runs to the parenthesis that closes the call rather than one line, since a format
+/// string may be spelled below the macro name and an interpolation many lines below it. A call is
+/// found wherever it stands on its line — a match arm, the tail of a closure — but not in a comment.
 ///
 /// Two residuals, named rather than implied. This reads **six files by name**, so the same shape in
 /// another module is not covered; the producers that embed backticks (`resolver`, `egress`,
@@ -391,25 +392,29 @@ fn no_raw_diagnostic_names_an_identifier_it_cannot_style() {
         ("launch/detach.rs", include_str!("detach.rs")),
     ] {
         let production = crate::testutil::production_half(source);
-        let lines: Vec<&str> = production.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            if !line.trim_start().starts_with("errln!(") {
+        for (at, _) in production.match_indices("errln!(") {
+            let line_start = production[..at].rfind('\n').map_or(0, |n| n + 1);
+            let named = production[..at]
+                .bytes()
+                .last()
+                .is_some_and(|b| b == b'_' || b.is_ascii_alphanumeric());
+            if named || production[line_start..at].contains("//") {
                 continue;
             }
-            let mut call = String::new();
-            for l in lines[i..].iter().take(8) {
-                call.push_str(l);
-                call.push(' ');
-                if l.trim_end().ends_with(");") {
-                    break;
-                }
-            }
+            let line = production[..at].matches('\n').count() + 1;
+            let open = at + "errln!".len();
+            let close = crate::testutil::closing_delimiter(production.as_bytes(), open)
+                .unwrap_or_else(|| panic!("{name}:{line}: an `errln!` call never closes"));
+            let call = &production[at..=close];
             assert!(
                 !(call.contains("\"sbx") && call.contains('{')),
-                "{name}:{} interpolates into a raw `errln!`, so whatever the value turns out to \
-                 name reaches the terminal unstyled; use `diag::error` — {}",
-                i + 1,
-                line.trim()
+                "{name}:{line} interpolates into a raw `errln!`, so whatever the value turns out \
+                 to name reaches the terminal unstyled; use `diag::error` — {}",
+                production[line_start..]
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
             );
         }
     }

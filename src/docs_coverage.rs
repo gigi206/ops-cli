@@ -1683,7 +1683,7 @@ fn items_in(text: &str, file: &str, patterns: &ItemPatterns) -> Vec<ItemDoc> {
         {
             let open = starts[i] + line.rfind('{').unwrap_or(0);
             skip_until = Some(
-                crate::testutil::closing_brace(text.as_bytes(), open)
+                crate::testutil::closing_delimiter(text.as_bytes(), open)
                     .map_or(lines.len(), |at| starts.partition_point(|&s| s <= at) - 1),
             );
         }
