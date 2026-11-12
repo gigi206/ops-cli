@@ -509,10 +509,12 @@ fn allowlist_contract(policy: &EgressPolicy, withdrawn: &[Rule]) -> String {
 /// this run withdrew and those another rule already says.
 ///
 /// Mirrors the wire: the proxy unions the built-in self-equip allow set into the user's policy, so
-/// a listing must too, or it would understate what is reachable. A rule restricted to some methods
-/// says nothing a rule for the same destination with no restriction does not already say, since an
-/// allowlist is a union: `{GET,HEAD} https://x` next to `https://x` reads as two grants where there
-/// is one, so the narrower one is left out.
+/// a listing must too, or it would understate what is reachable. A rule restricted to some HTTP
+/// methods says nothing a rule for the same destination with no restriction does not already say,
+/// since an allowlist is a union: `{GET,HEAD} https://x` next to `https://x` reads as two grants
+/// where there is one, so the narrower one is left out. A rule that names `WS` does say more: no
+/// rule admitting every verb opens a WebSocket ([`Methods::admits`]), so `{WS} https://x` next to
+/// `https://x` is the only grant of that upgrade and stays listed.
 ///
 /// A rule is left out for a withdrawn destination when that denial refuses every request the rule
 /// admits ([`withdrawn_refuses`]), not only when the two read the same: the denial carries no verb,
@@ -524,6 +526,7 @@ fn listed_rules(policy: &EgressPolicy, withdrawn: &[Rule]) -> Vec<Rule> {
     let every_verb = |r: &Rule| matches!(r.methods, Methods::Unspecified | Methods::Any);
     let subsumed = |r: &Rule| {
         !every_verb(r)
+            && !r.methods.admits("WS")
             && rules
                 .iter()
                 .any(|o| every_verb(o) && o.layer == r.layer && o.kind == r.kind)
@@ -1840,6 +1843,47 @@ mod tests {
             text.contains("{GET,HEAD} https://github.com"),
             "a restricted rule with no wider twin stays: {text}"
         );
+    }
+
+    /// A grant naming `WS` is listed beside a rule for the same destination that admits every
+    /// verb, in both documents, because that rule opens no WebSocket and the proxy admits the
+    /// upgrade on the `WS` grant alone. Each pairing is put to the proxy first, and every
+    /// disagreement is reported together, so each pairing is seen to fail on its own.
+    #[test]
+    fn a_websocket_grant_beside_an_unrestricted_rule_stays_listed() {
+        use crate::allowlist::Decision;
+        let mut wrong = Vec::new();
+        for wide in ["https://x.test", "{*} https://x.test"] {
+            assert!(
+                matches!(
+                    policy_from(&[wide], &[]).explain("x.test", 443, "/", "WS"),
+                    Decision::DeniedDefault
+                ),
+                "calibration: `{wide}` alone opens no WebSocket"
+            );
+            for ws in ["{WS} https://x.test", "{*,WS} https://x.test"] {
+                let policy = policy_from(&[wide, ws], &[]);
+                assert!(
+                    matches!(
+                        policy.explain("x.test", 443, "/", "WS"),
+                        Decision::AllowedBy(_)
+                    ),
+                    "calibration: the proxy opens a WebSocket under `{ws}` beside `{wide}`"
+                );
+                let line = format!(
+                    "- {}",
+                    crate::allowlist::classify(ws).expect("a valid rule")
+                );
+                let net = NetworkPolicy::Allowlist(Box::new(policy));
+                if !egress_contract(&net, &[]).lines().any(|l| l == line) {
+                    wrong.push(format!("the contract leaves out `{ws}` beside `{wide}`"));
+                }
+                if !summary_network(&net, &[]).lines().any(|l| l == line) {
+                    wrong.push(format!("the summary leaves out `{ws}` beside `{wide}`"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// A wider rule stays listed while the one destination under it is named apart. A secret's

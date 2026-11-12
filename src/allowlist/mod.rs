@@ -264,7 +264,7 @@ impl Methods {
     /// still needs an explicit `WS`), so `{*}`-widening a host and `WS`-opting it stay separate choices.
     /// This is the **allow** side's question, and the `WS` carve-out belongs only to it. See
     /// [`Self::admits_deny`] for why asking it of a deny rule inverts what it is for.
-    fn admits(&self, method: &str) -> bool {
+    pub(crate) fn admits(&self, method: &str) -> bool {
         if method == "WS" {
             return matches!(self, Methods::Only(ms) if ms.iter().any(|m| m == "WS"));
         }
