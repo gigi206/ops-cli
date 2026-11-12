@@ -1757,6 +1757,30 @@ fn the_global_config_reads_back_empty_only_when_there_is_none() {
     );
 }
 
+/// The scratch directory carries the label of the four beside it, so a leftover of it still names
+/// the suite that left it.
+#[test]
+fn the_scratch_directory_carries_the_fixture_label() {
+    let fx = Project::new("app");
+    // A fixture is named `<label>-<pid>-<n>`: the label is what precedes the last two fields.
+    let label = |dir: &Path| {
+        let name = dir.file_name().and_then(|n| n.to_str());
+        name.and_then(|n| n.rsplitn(3, '-').nth(2))
+            .map(str::to_owned)
+    };
+    assert!(
+        label(fx.proj.path()).is_some(),
+        "{}",
+        fx.proj.path().display()
+    );
+    assert_eq!(
+        label(fx.scratch()),
+        label(fx.proj.path()),
+        "{}",
+        fx.scratch().display()
+    );
+}
+
 #[test]
 fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
     let fx = Project::new("app");

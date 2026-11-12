@@ -33,10 +33,13 @@ pub struct Project {
     pub data_home: TmpDir,
     /// Created on first call to [`Project::scratch`], since most suites never ask for one.
     scratch: OnceLock<TmpDir>,
+    /// The label the four directories carry, kept for the scratch directory made later.
+    tag: String,
 }
 
 impl Project {
-    /// Four fresh directories, each labelled `tag` so a leftover names the suite that left it.
+    /// Four fresh directories, each labelled `tag` so a leftover names the suite that left it. The
+    /// scratch directory, made on demand, carries the same label.
     pub fn new(tag: &str) -> Self {
         Project {
             proj: TmpDir::new(tag),
@@ -44,6 +47,7 @@ impl Project {
             state_home: TmpDir::new(tag),
             data_home: TmpDir::new(tag),
             scratch: OnceLock::new(),
+            tag: tag.to_owned(),
         }
     }
 
@@ -111,7 +115,7 @@ impl Project {
     /// Outside on purpose: an install that is meant to copy its source in has to be given a source
     /// the destination does not already contain, or the test proves nothing.
     pub fn scratch(&self) -> &Path {
-        self.scratch.get_or_init(|| TmpDir::new("scratch")).path()
+        self.scratch.get_or_init(|| TmpDir::new(&self.tag)).path()
     }
 
     /// Write the global `<config>/sbx/sbx.toml`.
