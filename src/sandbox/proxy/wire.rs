@@ -471,11 +471,21 @@ pub(super) const RELAY_CHUNK: usize = 64 * 1024;
 /// each timeout holds this thread, and its connection slot, for as long as it keeps sending. The
 /// slots are the launch's own (`[network] max_connections`), so what a slow body exhausts is its
 /// own session's proxy. The chunked path has the same property, said at [`TRAILER_LINES_MAX`].
+///
+/// An interrupted read is taken again, as [`read_full`] and `read_exact` take one: it moved no
+/// byte. The cleartext and absolute-form planes hand in their client socket itself, which carries a
+/// read timeout, and a read on such a socket fails with `EINTR` when the process is stopped and
+/// continued, with no signal handler installed (signal(7)); handed back, it would end the copy with
+/// the body cut short. A reader behind rustls never hands one back, rustls taking the read again.
 pub(crate) fn copy_exact<R: Read, W: Write>(r: &mut R, w: &mut W, mut n: u64) -> io::Result<()> {
     let mut buf = vec![0u8; RELAY_CHUNK];
     while n > 0 {
         let want = n.min(buf.len() as u64) as usize;
-        let got = r.read(&mut buf[..want])?;
+        let got = match r.read(&mut buf[..want]) {
+            Ok(got) => got,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         if got == 0 {
             return Err(invalid("request body shorter than Content-Length"));
         }
@@ -2229,6 +2239,19 @@ mod tests {
             copy_exact(&mut src, &mut dst, 5).is_err(),
             "fewer bytes than the declared length is a truncated-body error"
         );
+    }
+
+    /// An interrupted read moved no byte, so the copy takes it again rather than ending the body
+    /// there: a socket with a read timeout fails a read with `EINTR` when the process is stopped
+    /// and continued, whatever its signal handlers.
+    #[test]
+    fn copy_exact_takes_an_interrupted_read_again() {
+        let body = b"abcdef";
+        let mut src = crate::testutil::Trickle::new(body, vec![2], vec![true, false]);
+        let mut dst = Vec::new();
+        copy_exact(&mut src, &mut dst, body.len() as u64)
+            .expect("an interrupted read is taken again");
+        assert_eq!(dst, body);
     }
 
     /// RFC 3986's `authority` without userinfo (§3.2.2, §3.2.3), recognized from its character
