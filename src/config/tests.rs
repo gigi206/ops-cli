@@ -5635,6 +5635,7 @@ fn an_untrusted_project_cannot_set_a_key_that_runs_code_without_naming_a_startup
         // A runtime that loads a hook from its options.
         "JAVA_TOOL_OPTIONS",
         "_JAVA_OPTIONS",
+        "JDK_JAVA_OPTIONS",
         "DOTNET_STARTUP_HOOKS",
         // A shell startup file by another name, and the shell itself.
         "ZDOTDIR",

@@ -1036,12 +1036,13 @@ pub(crate) fn is_env_name(name: &str) -> bool {
 /// caller reaching in over the control socket is a different actor entirely.
 ///
 /// The list here and [`crate::config::is_reserved_env_key`]'s are not meant to match: they answer
-/// different questions about different populations. They share one fact, written once in
-/// [`super::INTERPRETER_IMPORT_PATHS`]: a search path an interpreter imports from runs code the
+/// different questions about different populations. They share two facts, each written once: a
+/// search path an interpreter imports from ([`super::INTERPRETER_IMPORT_PATHS`]) runs code the
 /// value chose before the program's own, `NODE_PATH` for a module absent from `node_modules` and
-/// `CLASSPATH` for a `java` given no `-cp`. A name the declaration lists in `env_allow` is one whose
-/// value the caller supplies, so a declaration trusted by location still cannot hand that choice to
-/// the caller.
+/// `CLASSPATH` for a `java` given no `-cp`, and so does a runtime's options variable that can name
+/// an agent ([`super::RUNTIME_OPTION_HOOKS`]). A name the declaration lists in `env_allow` is one
+/// whose value the caller supplies, so a declaration trusted by location still cannot hand that
+/// choice to the caller.
 pub(super) fn validate_env_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("an environment variable name is empty".to_string());
@@ -1095,6 +1096,7 @@ pub(super) fn validate_env_name(name: &str) -> Result<(), String> {
         || REFUSED.contains(&upper.as_str())
         || super::INTERPRETER_IMPORT_PATHS
             .iter()
+            .chain(super::RUNTIME_OPTION_HOOKS)
             .any(|k| k.eq_ignore_ascii_case(name))
     {
         return Err(format!(
@@ -1466,6 +1468,33 @@ mod tests {
             "JULIA_LOAD_PATH",
             "PSModulePath",
             "PSMODULEPATH",
+        ]
+        .into_iter()
+        .filter(|var| !refused(var))
+        .collect();
+        assert!(missed.is_empty(), "settable for a task: {missed:?}");
+    }
+
+    /// A runtime's options variable that can name an agent or a startup hook is refused for a task,
+    /// whatever its case: a `-javaagent:` in any of the JVM's three spellings loads the agent before
+    /// `main`. Every name the refusal misses is reported together.
+    #[test]
+    fn a_runtime_option_hook_is_refused_for_a_task() {
+        let refused = |var: &str| {
+            let mut raw = raw_task();
+            raw.env_allow = vec![var.to_string()];
+            validate(raw).is_err_and(|e| e.contains("steers how a program loads"))
+        };
+        assert!(
+            refused("NODE_OPTIONS"),
+            "calibration: `NODE_OPTIONS` is refused"
+        );
+        let missed: Vec<&str> = [
+            "JAVA_TOOL_OPTIONS",
+            "java_tool_options",
+            "_JAVA_OPTIONS",
+            "JDK_JAVA_OPTIONS",
+            "DOTNET_STARTUP_HOOKS",
         ]
         .into_iter()
         .filter(|var| !refused(var))

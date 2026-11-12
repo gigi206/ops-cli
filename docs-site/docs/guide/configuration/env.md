@@ -96,7 +96,7 @@ few structural keys:
   directory the value chose (a `sitecustomize.py` on `PYTHONPATH` runs before the
   program's first line).
 - A runtime that loads a hook from its options: `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`,
-  `DOTNET_STARTUP_HOOKS`, each honored before `main`.
+  `JDK_JAVA_OPTIONS`, `DOTNET_STARTUP_HOOKS`, each honored before `main`.
 - A shell startup file by another name, and the shell itself: `ZDOTDIR` (the directory
   zsh reads its startup files from), `KSH_ENV` (ksh's `ENV`), and `SHELL`.
 - The directory half of OpenSSL's trust anchors: `SSL_CERT_DIR`. The file-valued names

@@ -191,6 +191,19 @@ const INTERPRETER_IMPORT_PATHS: &[&str] = &[
     "PSModulePath",
 ];
 
+/// The runtimes that read their **options** from the environment, where those options include
+/// loading an agent or a startup hook honored before `main`: the JVM through three spellings (a
+/// `-javaagent:` in any of them loads the agent before the program) and .NET through its startup
+/// hooks.
+///
+/// Read by the same two gates as [`INTERPRETER_IMPORT_PATHS`], in the same two ways.
+const RUNTIME_OPTION_HOOKS: &[&str] = &[
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "DOTNET_STARTUP_HOOKS",
+];
+
 /// Environment keys an *untrusted or changed* project may not set. The point is
 /// not to contain the agent — in Mode B it already runs arbitrary code inside the
 /// cage, so a config-set `LD_PRELOAD` grants it nothing new. It is to stop an
@@ -237,6 +250,7 @@ pub(crate) fn is_reserved_env_key(key: &str) -> bool {
         // A search path an interpreter imports from reaches the code-load hooks below by a third
         // route, with no file named and no command given.
         || INTERPRETER_IMPORT_PATHS.contains(&key)
+        || RUNTIME_OPTION_HOOKS.contains(&key)
         // The CA-bundle keys are matched case-insensitively: env names are case-sensitive, but a
         // nonstandard tool reading a lowercase variant must not slip a swapped CA past the gate.
         || crate::sandbox::egress::CA_FILE_ENV_KEYS
@@ -335,12 +349,6 @@ pub(crate) fn is_reserved_env_key(key: &str) -> bool {
                 | "LESSCLOSE"
                 | "SSH_ASKPASS"
                 | "SUDO_ASKPASS"
-                // A runtime that reads its **options** from the environment, where those options
-                // include loading an agent or a startup hook — the JVM and .NET each ship one, and
-                // both are honored before `main`.
-                | "JAVA_TOOL_OPTIONS"
-                | "_JAVA_OPTIONS"
-                | "DOTNET_STARTUP_HOOKS"
                 // A shell's startup file by another name. `BASH_ENV` and `ENV` are above; `ZDOTDIR`
                 // moves the whole directory zsh reads its startup files from, and `KSH_ENV` is
                 // ksh's `ENV`. Reserving one shell's spelling and not another's would leave the
