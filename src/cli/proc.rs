@@ -524,9 +524,17 @@ fn proc_pending_list(args: &[OsString]) -> ExitCode {
 
 /// Decide one (or, with `*`, all) parked `execve` by id `<session-pid>.<notif-id>`.
 fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
-    let Some(id) = args.first().and_then(|a| a.to_str()) else {
+    let Some(first) = args.first() else {
         diag::error(&format!(
             "sbx: proc pending {}: an id is required (`<session-pid>.<notif-id>`, or `<session-pid>.*`)",
+            if allow { "allow" } else { "deny" }
+        ));
+        return ExitCode::from(2);
+    };
+    // A token that is not UTF-8 was typed, so it is named rather than reported as missing.
+    let Some(id) = first.to_str() else {
+        diag::error(&format!(
+            "sbx: proc pending {}: {first:?} is not an id (`<session-pid>.<notif-id>`, or `<session-pid>.*`)",
             if allow { "allow" } else { "deny" }
         ));
         return ExitCode::from(2);
@@ -651,11 +659,9 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
                 }
                 id = Some(s);
             }
-            other => {
-                diag::error(&format!(
-                    "sbx: proc ls: unexpected argument {:?}",
-                    other.unwrap_or_default()
-                ));
+            // The token itself, not its UTF-8 reading: one that has none would be named `""`.
+            _ => {
+                diag::error(&format!("sbx: proc ls: unexpected argument {a:?}"));
                 err!("{}", help::page_usage(&["proc", "ls"]).unwrap_or_default());
                 return ExitCode::from(2);
             }

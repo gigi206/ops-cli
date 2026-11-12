@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 /// Run `sbx <args>` with an isolated, empty data directory so the session registry is empty and
 /// the outcome is deterministic regardless of the host's real sessions.
-fn sbx(args: &[&str], data: &Path, cwd: &Path) -> Output {
+fn sbx(args: &[impl AsRef<std::ffi::OsStr>], data: &Path, cwd: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(args)
         .current_dir(cwd)
@@ -96,6 +96,32 @@ fn proc_ls_rejects_a_second_id() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
     assert!(err.contains("at most one session id"), "got: {err}");
+}
+
+/// A token that is not UTF-8 is named in the refusal rather than read as nothing.
+///
+/// Read through its UTF-8 form, such a token is `""` to `proc ls` and nothing at all to
+/// `proc pending allow|deny`, which would then ask for an id that was typed.
+#[test]
+fn an_argument_that_is_not_utf8_is_named_in_the_refusal() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
+    for verb in [
+        &["proc", "ls"][..],
+        &["proc", "pending", "allow"],
+        &["proc", "pending", "deny"],
+    ] {
+        let mut args: Vec<OsString> = verb.iter().map(OsString::from).collect();
+        args.push(OsString::from_vec(b"caf\xe9".to_vec()));
+        let out = sbx(&args, data.path(), proj.path());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{verb:?}: {err}");
+        assert!(
+            err.contains(r#""caf\xE9""#),
+            "{verb:?} names the token it refuses: {err}"
+        );
+    }
 }
 
 #[test]
