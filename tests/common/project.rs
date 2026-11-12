@@ -123,8 +123,18 @@ impl Project {
 
     /// Read the global config back, or the empty string when nothing has written it — the shape a
     /// test wants when asking what a management verb merged into it.
+    ///
+    /// Only an absent file reads as empty. One that is there and cannot be read — a directory in
+    /// its place, bytes that are not UTF-8 — fails the test at the line that asked, since the empty
+    /// string would satisfy an assertion that a verb left the global config alone.
+    #[track_caller]
     pub fn global_config(&self) -> String {
-        std::fs::read_to_string(self.config_home.path().join("sbx/sbx.toml")).unwrap_or_default()
+        let path = self.config_home.path().join("sbx/sbx.toml");
+        match std::fs::read_to_string(&path) {
+            Ok(body) => body,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => panic!("the global config {}: {e}", path.display()),
+        }
     }
 
     /// Write the project's `.sbx.toml`.

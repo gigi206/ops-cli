@@ -1721,6 +1721,42 @@ fn with_deps_writes_nothing_at_all_when_a_reference_has_no_file() {
     );
 }
 
+/// The global config reads back as the empty string only when there is none: an assertion that a
+/// verb left it alone would otherwise hold just as well over a file that could not be read. A
+/// directory in its place and bytes that are not UTF-8 each fail the read instead.
+#[test]
+fn the_global_config_reads_back_empty_only_when_there_is_none() {
+    let absent = Project::new("app");
+    assert_eq!(absent.global_config(), "", "no file reads as empty");
+
+    let in_the_way = Project::new("app");
+    std::fs::create_dir_all(in_the_way.config_home.path().join("sbx/sbx.toml")).unwrap();
+    let not_utf8 = Project::new("app");
+    std::fs::create_dir_all(not_utf8.config_home.path().join("sbx")).unwrap();
+    std::fs::write(
+        not_utf8.config_home.path().join("sbx/sbx.toml"),
+        b"\xff\xfe\n",
+    )
+    .unwrap();
+
+    let read_as_text: Vec<String> = [
+        ("a directory in its place", &in_the_way),
+        ("bytes that are not UTF-8", &not_utf8),
+    ]
+    .into_iter()
+    .filter_map(|(shape, fx)| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fx.global_config()))
+            .ok()
+            .map(|body| format!("{shape}: read as {body:?}"))
+    })
+    .collect();
+    assert!(
+        read_as_text.is_empty(),
+        "a global config that cannot be read must not read as text:\n{}",
+        read_as_text.join("\n")
+    );
+}
+
 #[test]
 fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
     let fx = Project::new("app");
