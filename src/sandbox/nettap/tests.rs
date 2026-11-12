@@ -254,12 +254,15 @@ fn a_reclaimed_address_is_not_handed_out_again() {
     let mut t = FakeIps::new();
     let first = t.alloc("first.test").expect("allocated").0;
     for i in 0..FAKE_IP_CAP {
-        t.alloc(&format!("filler{i}.test"));
+        t.alloc(&format!("filler{i}.test")).expect("allocated");
     }
     assert_eq!(t.peek(first), None, "reclaimed");
+    // Every later name is given an address, each its own: a table that stopped allocating would
+    // otherwise leave nothing here for the check below to look at.
     let seen: std::collections::HashSet<_> = (0..64)
-        .filter_map(|i| t.alloc(&format!("later{i}.test")).map(|(ip, _)| ip))
+        .map(|i| t.alloc(&format!("later{i}.test")).expect("allocated").0)
         .collect();
+    assert_eq!(seen.len(), 64, "each later name has an address of its own");
     assert!(
         !seen.contains(&first),
         "an address must not be reused within a session"
@@ -769,6 +772,28 @@ fn channel() -> (UnixDatagram, UnixDatagram) {
     (tap, far)
 }
 
+/// The name [`reported_since`] reports last, under a top-level domain no host is ever given.
+const MARKER: &str = "marker.invalid";
+
+/// Every report `reporter` made since `lines` was last read, in order, up to a marker reported
+/// now. The reporter sends from one thread in the order the reports were made, so a report an
+/// action made arrives before the marker however late either thread runs, where a wait for silence
+/// passes on a report later than its window, and on a channel that has gone.
+fn reported_since(reporter: &Reporter, lines: &std::sync::mpsc::Receiver<String>) -> Vec<String> {
+    reporter.resolved(MARKER);
+    let marker = format!("RESOLVED {MARKER}");
+    let mut before = Vec::new();
+    loop {
+        let line = lines
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the marker is reported");
+        if line == marker {
+            return before;
+        }
+        before.push(line);
+    }
+}
+
 /// A stand-in for the far end of a report channel: collects each datagram the tap reports, as the
 /// launch's end reads it.
 fn stand_in_report_channel(far: UnixDatagram) -> std::sync::mpsc::Receiver<String> {
@@ -815,15 +840,8 @@ fn a_name_is_reported_once_however_often_it_is_asked_for() {
     answer_query(&query("cache.nixos.org", QTYPE_A), &table, &reporter).expect("answered");
 
     assert_eq!(
-        lines.recv_timeout(Duration::from_secs(5)).expect("first"),
-        "RESOLVED github.com"
-    );
-    assert_eq!(
-        lines.recv_timeout(Duration::from_secs(5)).expect("second"),
-        "RESOLVED cache.nixos.org"
-    );
-    assert!(
-        lines.recv_timeout(Duration::from_millis(300)).is_err(),
+        reported_since(&reporter, &lines),
+        ["RESOLVED github.com", "RESOLVED cache.nixos.org"],
         "a repeated query must not repeat the report"
     );
 }
@@ -847,11 +865,8 @@ fn a_name_asked_in_another_case_is_the_same_name() {
         "one host, one address"
     );
     assert_eq!(
-        lines.recv_timeout(Duration::from_secs(5)).expect("report"),
-        "RESOLVED github.com"
-    );
-    assert!(
-        lines.recv_timeout(Duration::from_millis(300)).is_err(),
+        reported_since(&reporter, &lines),
+        ["RESOLVED github.com"],
         "and one report"
     );
     assert_eq!(
@@ -871,7 +886,7 @@ fn a_question_that_gets_no_address_is_not_reported() {
     let table = Mutex::new(FakeIps::new());
 
     answer_query(&query("github.com", 28 /* AAAA */), &table, &reporter).expect("answered");
-    assert!(lines.recv_timeout(Duration::from_millis(300)).is_err());
+    assert_eq!(reported_since(&reporter, &lines), Vec::<String>::new());
 }
 
 /// Exactly one capture outcome is owed a line in the egress record, and this pins which.
@@ -903,8 +918,9 @@ fn only_the_address_with_no_name_is_reported_to_the_record() {
         Capture::Direct { port: TAP_PORT },
     ] {
         quiet.report(&reporter);
-        assert!(
-            lines.recv_timeout(Duration::from_millis(300)).is_err(),
+        assert_eq!(
+            reported_since(&reporter, &lines),
+            Vec::<String>::new(),
             "{} must not be reported: {}",
             quiet.describe(),
             "the proxy already holds it, or there is no record to add to"
@@ -916,10 +932,8 @@ fn only_the_address_with_no_name_is_reported_to_the_record() {
     }
     .report(&reporter);
     assert_eq!(
-        lines
-            .recv_timeout(Duration::from_secs(5))
-            .expect("reported"),
-        "BYPASSED 93.184.216.34 443"
+        reported_since(&reporter, &lines),
+        ["BYPASSED 93.184.216.34 443"]
     );
 }
 
