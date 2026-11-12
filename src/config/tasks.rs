@@ -1282,19 +1282,31 @@ mod tests {
     }
 
     /// A `cmd` element carrying a NUL is refused when the declaration is read, naming the element,
-    /// whether it is the program or an argument. Every element the refusal misses is reported
-    /// together.
+    /// whether it is the program or an argument, and whether it was built here or written in TOML
+    /// as `\u0000`. Every element the refusal misses is reported together.
     #[test]
     fn a_cmd_element_with_a_nul_is_refused() {
-        let missed: Vec<usize> = [0, 1]
+        let refused = |raw: RawTask, i: usize| {
+            validate(raw).is_err_and(|e| e.contains(&format!("cmd[{i}]")) && e.contains("NUL"))
+        };
+        let mut missed: Vec<String> = [0, 1]
             .into_iter()
             .filter(|&i| {
                 let mut raw = raw_task();
                 raw.cmd[i].insert(1, '\0');
-                !validate(raw).is_err_and(|e| e.contains(&format!("cmd[{i}]")) && e.contains("NUL"))
+                !refused(raw, i)
             })
+            .map(|i| format!("cmd[{i}]"))
             .collect();
-        assert!(missed.is_empty(), "a NUL passes in cmd{missed:?}");
+        for (i, text) in [
+            (0, "[task.t]\ncmd = [\"ma\\u0000ke\"]\n"),
+            (1, "[task.t]\ncmd = [\"make\", \"-\\u0000j\"]\n"),
+        ] {
+            if !refused(parsed_task(text), i) {
+                missed.push(format!("cmd[{i}] written in TOML"));
+            }
+        }
+        assert!(missed.is_empty(), "a NUL passes in {missed:?}");
     }
 
     /// The warning that an interpreter concedes the exec guard knows an interpreter by its versioned
@@ -1334,8 +1346,22 @@ mod tests {
         assert!(wrong.is_empty(), "misread: {wrong:?}");
     }
 
+    /// The task `t` of a layer written as TOML, read the way a config file is.
+    fn parsed_task(text: &str) -> RawTask {
+        let mut dropped = Vec::new();
+        let cfg = crate::config::schema::parse_layer(text.as_bytes(), &mut dropped)
+            .expect("the layer loads");
+        assert!(dropped.is_empty(), "{dropped:?}");
+        cfg.task
+            .expect("the task section")
+            .tasks
+            .remove("t")
+            .expect("the task")
+    }
+
     /// A fixed `env` value carrying a NUL is refused when the declaration is read, naming the
-    /// variable, rather than when an invocation could not set it.
+    /// variable, rather than when an invocation could not set it. TOML writes the byte as
+    /// `\u0000`, which is how one reaches a declaration.
     #[test]
     fn a_fixed_env_value_with_a_nul_is_refused() {
         let with = |value: &str| {
@@ -1346,10 +1372,21 @@ mod tests {
             validate(raw)
         };
         assert!(with("hello").is_ok(), "calibration: a plain value is fixed");
-        let e = with("hel\0lo").expect_err("a NUL in a fixed value is refused");
+        let names_it = |outcome: Result<TaskSpec, String>| {
+            outcome.is_err_and(|e| e.contains("GREETING") && e.contains("NUL"))
+        };
+        let mut missed = Vec::new();
+        if !names_it(with("hel\0lo")) {
+            missed.push("built");
+        }
+        let written =
+            parsed_task("[task.t]\ncmd = [\"make\"]\nenv = { GREETING = \"hel\\u0000lo\" }\n");
+        if !names_it(validate(written)) {
+            missed.push("written in TOML");
+        }
         assert!(
-            e.contains("GREETING") && e.contains("NUL"),
-            "the refusal names the variable and the byte: {e}"
+            missed.is_empty(),
+            "a NUL passes in a fixed value: {missed:?}"
         );
     }
 
