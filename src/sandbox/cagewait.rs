@@ -78,6 +78,40 @@ pub(in crate::sandbox) fn nap(poll: Duration, deadline: Instant) {
     std::thread::sleep(poll.min(deadline.saturating_duration_since(Instant::now())));
 }
 
+/// Read `pipe` to EOF keeping at most `cap` bytes, reporting whether anything was dropped.
+///
+/// Reading continues past the cap so the writer is never blocked on a full pipe — a cage held there
+/// would never exit, which is the hang the cap exists to prevent. Only the kept bytes are bounded.
+/// The runners that keep what a cage prints read it through this, a thread per stream, while
+/// [`wait_capped`] waits: read only after the wait, output past what a pipe holds would leave the
+/// cage blocked writing until the ceiling killed it. The task engine's own reader has the same shape
+/// plus a margin for its redaction scanner, which these readers have no use for: nothing they keep
+/// is scanned for credentials.
+pub(in crate::sandbox) fn drain_capped(pipe: &mut impl io::Read, cap: usize) -> (Vec<u8>, bool) {
+    let mut kept = Vec::new();
+    let mut cut = false;
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if kept.len() < cap {
+                    let take = (cap - kept.len()).min(n);
+                    kept.extend_from_slice(&buf[..take]);
+                    cut |= take < n;
+                } else {
+                    cut = true;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // A read error leaves what was already kept: the caller's report is better off with a
+            // partial capture than with none.
+            Err(_) => break,
+        }
+    }
+    (kept, cut)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

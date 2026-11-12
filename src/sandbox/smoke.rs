@@ -132,17 +132,27 @@ fn launch(
     // long as it is, because bwrap reads them at startup.
     let mut command = super::argv::compose(bwrap, &spec)?.into_command();
     // Spawned rather than run through `output()`, which waits without a deadline. The pipes are
-    // asked for explicitly because `spawn` does not inherit `output()`'s: the probe writes a few
-    // lines of `/proc` and never fills one.
+    // asked for explicitly because `spawn` does not inherit `output()`'s.
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = command.spawn()?;
+    // Both streams are read on threads of their own while the probe is waited on. Read after the
+    // wait, output past what a pipe holds would leave the cage blocked writing until the ceiling
+    // killed it, and a probe that had answered would be reported as stuck.
+    let out_reader = read_capped(child.stdout.take());
+    let err_reader = read_capped(child.stderr.take());
     let deadline = Instant::now() + PROBE_TIMEOUT;
-    let (_, timed_out) = super::cagewait::wait_capped(&mut child, deadline, PROBE_POLL)?;
+    let waited = super::cagewait::wait_capped(&mut child, deadline, PROBE_POLL);
+    // Joined before the wait's answer is read, a timeout or an error included, so neither reader
+    // outlives this call. The joins cannot hang: the wait returns once `bwrap` is dead, and the
+    // cage dies with it, since its pid namespace is unshared and `--die-with-parent` is armed
+    // ([`SandboxSpec::new`]), so nothing is left holding a pipe.
+    let stdout = joined(out_reader);
+    let stderr = joined(err_reader);
+    let (status, timed_out) = waited?;
     if timed_out {
-        drop(command);
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
@@ -151,17 +161,40 @@ fn launch(
             ),
         ));
     }
-    let out = child.wait_with_output()?;
-    drop(command);
-    let answers = read_answers(&String::from_utf8_lossy(&out.stdout));
+    let answers = read_answers(&String::from_utf8_lossy(&stdout));
 
     Ok(SmokeReport {
-        launched: out.status.success(),
+        launched: status.success(),
         no_new_privs: answers.no_new_privs,
         caps_dropped: answers.caps_dropped,
         host_home_absent: answers.host_home_absent,
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
     })
+}
+
+/// How much of each of the probe's streams is kept.
+///
+/// The probe prints `/proc/self/status` and one line of its own, a few kilobytes, and `doctor`
+/// shows at most three lines of what `bwrap` says when the launch fails; the ceiling is far past
+/// both. It is there because the bytes are the cage's, and a buffer grown to whatever the cage
+/// prints is not one the process reading it should hold.
+const PROBE_OUTPUT_CAP: usize = 64 * 1024;
+
+/// Read `pipe` to its end on a thread of its own, keeping at most [`PROBE_OUTPUT_CAP`] bytes.
+fn read_capped<R: io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+    pipe.map(|mut pipe| {
+        std::thread::spawn(move || super::cagewait::drain_capped(&mut pipe, PROBE_OUTPUT_CAP).0)
+    })
+}
+
+/// What a reader from [`read_capped`] kept: nothing for a pipe that was not there, or for a reader
+/// that panicked, which the answers then read as no.
+fn joined(reader: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default()
 }
 
 /// The probe's answers, as its script printed them.
@@ -493,7 +526,7 @@ mod tests {
         let report = |lines: &str| {
             launch_stand_in(&format!("printf '{lines}'")).expect("the stand-in bwrap runs")
         };
-        let canonical = report(r"NoNewPrivs:\t1\nCapEff:\t0000000000000000\nHOSTHOME=ABSENT\n");
+        let canonical = report(HARDENED);
         assert!(canonical.launched, "the stand-in exits 0");
         assert!(canonical.no_new_privs, "`NoNewPrivs: 1` is read");
         assert!(canonical.caps_dropped, "a zero `CapEff` is read");
@@ -511,6 +544,41 @@ mod tests {
             !report(r"Name:\tHOSTHOME=ABSENT\nNoNewPrivs:\t1\nCapEff:\t0000000000000000\nHOSTHOME=PRESENT\n")
                 .host_home_absent,
             "the home answer is the script's own line, not a match inside another one"
+        );
+    }
+
+    /// What a hardened probe prints, as `printf` words.
+    const HARDENED: &str = r"NoNewPrivs:\t1\nCapEff:\t0000000000000000\nHOSTHOME=ABSENT\n";
+
+    /// A shell function, `flood`, that writes 256 lines of a kilobyte each on builtins alone: four
+    /// times what a pipe holds, and four times [`PROBE_OUTPUT_CAP`].
+    const FLOOD: &str = "flood() { s=xxxxxxxxxxxxxxxx; for j in 1 2 3 4 5 6; do s=$s$s; done; \
+                         i=0; while [ $i -lt 256 ]; do echo \"$s\"; i=$((i + 1)); done; }";
+
+    /// A probe that says more on stderr than a pipe holds still answers within its ceiling: the
+    /// stream is read while it runs, and what is kept of it stops at the cap. Read only after the
+    /// wait, the stand-in would stay blocked writing until the ceiling killed it.
+    #[test]
+    fn a_probe_that_floods_its_stderr_is_read_while_it_runs() {
+        let report = launch_stand_in(&format!("{FLOOD}; flood >&2; printf '{HARDENED}'"))
+            .expect("the probe answers within its ceiling");
+        assert!(report.is_hardened(), "the answers after the flood are read");
+        assert_eq!(
+            report.stderr.len(),
+            PROBE_OUTPUT_CAP,
+            "what is kept of the stream stops at the cap"
+        );
+    }
+
+    /// The same for stdout, which carries the answers. A test of its own, because a probe left
+    /// blocked on the first stream would never reach the second.
+    #[test]
+    fn a_probe_that_floods_its_stdout_is_read_while_it_runs() {
+        let report = launch_stand_in(&format!("{FLOOD}; printf '{HARDENED}'; flood"))
+            .expect("the probe answers within its ceiling");
+        assert!(
+            report.is_hardened(),
+            "the answers before the flood are read"
         );
     }
 
