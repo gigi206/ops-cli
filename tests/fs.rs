@@ -232,11 +232,7 @@ fn fs_scan_lets_the_cage_make_files_inside_it_and_nowhere_else() {
     .expect("write the matching fixture");
     std::fs::create_dir(project.path().join("sub")).expect("make the subdirectory");
 
-    let elsewhere = outside
-        .path()
-        .to_str()
-        .expect("utf-8 fixture path")
-        .to_string();
+    let elsewhere = common::sh(outside.path());
     let script = format!(
         "echo un > made.txt; echo made=$?; cat made.txt; \
          echo deux >> made.txt; echo appended=$?; \
@@ -403,12 +399,7 @@ fn fs_scan_never_serves_the_cage_an_object_from_outside_it() {
     std::fs::write(project.path().join("ordinary.txt"), "no credential here\n")
         .expect("write the clean fixture");
 
-    let inside = project
-        .path()
-        .join("carries.txt")
-        .to_str()
-        .expect("utf-8 fixture path")
-        .to_string();
+    let inside = common::sh(&project.path().join("carries.txt"));
     let script = format!(
         "ln -s /proc/self/comm outside; cat outside; \
          ln -s {inside} named_absolutely; cat named_absolutely; \
@@ -772,10 +763,10 @@ fn what_the_projects_git_reads_in_a_read_write_bind_is_read_only_in_a_real_cage(
            && echo WROTE-INCLUDE || echo REFUSED-INCLUDE; \
          (printf x > {shared}/notes) 2>/dev/null && echo WROTE-OTHER || echo REFUSED-OTHER; \
          (mv {tools} {tools}.moved) 2>/dev/null && echo MOVED || echo HELD",
-        hooks = hooks.display(),
-        inc = inc.display(),
-        shared = shared.display(),
-        tools = tools.display(),
+        hooks = common::sh(&hooks),
+        inc = common::sh(&inc),
+        shared = common::sh(&shared),
+        tools = common::sh(&tools),
     );
     let out = sbx_isolated()
         .args(["run", "--", "sh", "-c", &script])
@@ -914,9 +905,9 @@ fn a_linked_worktrees_repository_is_held_in_a_real_cage() {
          g checkout -q -b b2 && echo CHECKOUT-OK; \
          g worktree list >/dev/null && echo LIST-OK; \
          echo AUTOSETUP-$(git config --get push.autoSetupRemote)",
-        common = common.display(),
-        main = main.display(),
-        sib = main.join(".wt/sib").display(),
+        common = common::sh(&common),
+        main = common::sh(&main),
+        sib = common::sh(&main.join(".wt/sib")),
     );
     let sib_git = std::fs::read(main.join(".wt/sib/.git")).unwrap();
     let out = run(&script);
