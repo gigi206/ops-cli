@@ -699,9 +699,11 @@ fn report_security_boundary(
         }
         Ok(report) => classify_launch_failure(rep, Some(&report.stderr), remediation),
         Err(e) => {
-            // The probe could not even spawn bwrap; surface why, then classify.
-            rep.note(&format!("could not run the launch probe: {e}"));
+            // The probe could not even spawn bwrap. Classified first and said why after, since a
+            // note lands under whichever check was recorded last: said first, the reason went
+            // under the engine's line, which had just reported the engine found.
             classify_launch_failure(rep, None, remediation);
+            rep.note(&format!("could not run the launch probe: {e}"));
         }
     }
 }
@@ -964,6 +966,36 @@ mod tests {
                 "no launch runs on this host: {note}"
             );
         }
+    }
+
+    /// When the launch probe cannot even start bubblewrap, the reason is said under the check the
+    /// classification records, the boundary's, and not under the engine's line before it, which
+    /// reported the engine found. A note lands under whichever check was recorded last, so the
+    /// order is the whole fix, and it holds whatever the host's namespaces answer: both
+    /// classifications record their check before anything is said under it.
+    #[test]
+    fn a_launch_probe_that_cannot_start_is_explained_under_the_boundary_it_failed() {
+        let engine = Path::new("/nonexistent/sbx-doctor-test/bwrap");
+        let pal = style::Palette::plain();
+        let mut rep = Report::new(true, &pal);
+        rep.check("ok", "bubblewrap", &engine.display().to_string());
+        let mut remediation = Vec::new();
+        report_security_boundary(&mut rep, Some(engine), &mut remediation);
+        assert!(
+            rep.checks[0].notes.is_empty(),
+            "the engine's line took a note: {:?}",
+            rep.checks[0].notes
+        );
+        let last = rep.checks.last().expect("the boundary's line");
+        assert!(
+            last.notes
+                .iter()
+                .any(|n| n.starts_with("could not run the launch probe")),
+            "[{}] {} took no reason: {:?}",
+            last.status,
+            last.name,
+            last.notes
+        );
     }
 
     #[test]
