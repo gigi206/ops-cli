@@ -6779,6 +6779,51 @@ fn raw_deb_libs(name: &str, locator: &str, libs: &[&str]) -> RawConfig {
     raw
 }
 
+/// A `[deb.<name>]` table that carries `resolve` beside `libs`, with no sentinel for it, has its
+/// `resolve` ignored and nothing else: the `libs` are the decoration pass's to read, and they still
+/// decorate a package declared with a fixed URL. The warning names that one field. Naming the whole
+/// table said it was ignored while its `libs` were applied, and for a table no package matches it
+/// said so beside the decoration pass's own word about the `libs`.
+#[test]
+fn a_resolve_with_no_sentinel_is_the_one_field_its_table_loses() {
+    for (declared, libs) in [
+        (
+            Some("deb:https://example.com/x.deb"),
+            Some(vec!["webkitgtk_4_1".to_string()]),
+        ),
+        (None, None),
+    ] {
+        let mut raw = match declared {
+            Some(locator) => raw_deb_libs("x", locator, &["webkitgtk_4_1"]),
+            None => {
+                let mut raw = raw_deb_libs("x", "nix:hello", &["webkitgtk_4_1"]);
+                raw.packages.clear();
+                raw
+            }
+        };
+        raw.deb.get_mut("x").unwrap().resolve = CMD.iter().map(|s| s.to_string()).collect();
+        let r = resolve_no_plugins(raw, None);
+        assert_eq!(
+            pkg(&r.packages, "x").map(|p| p.libs.clone()),
+            libs,
+            "{declared:?}: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("ignoring `resolve` in [deb.x] — no matching")),
+            "{declared:?}: the field ignored is not named: {:?}",
+            r.warnings
+        );
+        assert!(
+            !r.warnings.iter().any(|w| w.contains("ignoring [deb.x]")),
+            "{declared:?}: the whole table is said to be ignored: {:?}",
+            r.warnings
+        );
+    }
+}
+
 /// The **baseline** half of the guard `an_untrusted_project_cannot_repatch_a_trusted_apps_package`
 /// pins for `[app.*]`. The two baseline `apply_tools` call sites pass `protect_trusted = false`,
 /// because a baseline layer may legitimately decorate a package a layer below it declared — so that

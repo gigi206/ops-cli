@@ -459,9 +459,18 @@ pub(super) fn apply_resolvers(
             // a package declared with a fixed URL or a `github:` locator, and `apply_prebuilt_decor`
             // is what reads it. Only a table that meant to resolve is a mistake here.
             if !raw.resolve.is_empty() || (raw.libs.is_empty() && raw.main.is_empty()) {
+                // A table that carries a decoration beside `resolve` keeps it: `libs` and `main`
+                // are `apply_prebuilt_decor`'s to read, and it says itself what becomes of them.
+                // So the warning names the one field ignored here, rather than the whole table
+                // while its `libs` decorate a package declared with a fixed URL.
+                let what = if raw.libs.is_empty() && raw.main.is_empty() {
+                    format!("[{label}.{name}]")
+                } else {
+                    format!("`resolve` in [{label}.{name}]")
+                };
                 warnings.push(format!(
-                    "{source}: ignoring [{label}.{name}] — no matching `{name} = \
-                     \"{sentinel}\"` in [packages]"
+                    "{source}: ignoring {what} — no matching `{name} = \"{sentinel}\"` in \
+                     [packages]"
                 ));
             }
             continue;
