@@ -734,10 +734,14 @@ const BINARY_RESOLVE_SENTINEL: &str = "binary:resolve";
 ///
 /// `+` and `=` are in the set for the same reason `%` is: they appear in real release URLs and
 /// neither ends a shell word nor a nix string. A semver build metadata suffix is spelled with a
-/// `+` (`app_1.2.3+build.1_amd64.deb`), and `=` closes a percent-free query parameter, so a
-/// project whose upstream publishes either had no way to name the artifact at all — not in a
-/// declared URL and not through the asset a `github:` release selects. The store name a
-/// `prefetch` derives replaces whatever is not a store-name character, and `+` is one.
+/// `+` (`app_1.2.3+build.1_amd64.deb`), so a project whose upstream publishes one had no way to
+/// name the artifact at all — not in a declared URL and not through the asset a `github:` release
+/// selects — and `=` joined it on the same grounds. The store name a `prefetch` derives replaces
+/// whatever is not a store-name character, and `+` is one.
+///
+/// A query string stays outside, on purpose: `?` is a glob character to a shell, `&` ends a shell
+/// command and `#` opens a comment, and widening the set is a decision taken one character at a
+/// time rather than a whole URL grammar at once.
 fn is_injection_free_url(url: &str) -> bool {
     url.chars().all(|c| {
         c.is_ascii_alphanumeric()
