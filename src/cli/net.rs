@@ -124,6 +124,10 @@ type Gathered<T> = (sandbox::control::Swept<T>, Vec<(u32, PathBuf, String)>);
 /// of them — it is what tells the user which agent a flow, a parked request or a grant belongs to,
 /// which is the literal reason the control plane is multi-session. Written once so the six listings
 /// cannot come to disagree about the shape of the identifier they share.
+///
+/// The project is a directory name, which is any bytes, so it is written escaped
+/// ([`crate::diag::visible`]), as `sbx projects list` writes the same path; the label is escaped
+/// the same way, whatever it holds.
 fn write_session_header_line(
     o: &mut String,
     pid: u32,
@@ -134,6 +138,7 @@ fn write_session_header_line(
     let (dim, r) = (pal.dim, pal.reset);
     match ctx {
         Some((label, project)) => {
+            let (label, project) = (crate::diag::visible(label), crate::diag::visible(project));
             let _ = writeln!(o, "  {dim}session {pid} [{label}] {project}{r}");
         }
         None => {

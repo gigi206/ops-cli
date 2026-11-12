@@ -1979,6 +1979,47 @@ fn net_pending_watch_ends_once_its_terminal_is_gone() {
     );
 }
 
+/// The session header every cross-session listing writes shows the project as text: a directory
+/// name is any bytes, and one carrying an escape would otherwise paint over the terminal of whoever
+/// lists what that session holds. Written escaped, as `sbx projects list` writes the same path.
+/// Two shapes, each its own session: an ESC that clears the screen, and a mark that reverses the
+/// text after it.
+#[test]
+fn a_session_header_writes_its_project_as_text() {
+    let mut painted = Vec::new();
+    for (shape, name, escaped) in [
+        ("a screen clear", "proj\u{1b}[2J", "proj\\x1b[2J"),
+        (
+            "a right-to-left override",
+            "proj\u{202e}txt",
+            "proj\\u{202e}txt",
+        ),
+    ] {
+        let fx = Project::new("net");
+        let project = fx.proj.path().join(name);
+        std::fs::create_dir(&project).unwrap();
+        let pid = std::process::id();
+        common::write_session_record(fx.data_home.path(), pid, "project", &project);
+        let session = StandIn::serve(
+            &fx,
+            pid,
+            &["pending seq=1 port=443 waiting=1 host=api.test path=/\nok\n"],
+        );
+        let out = fx.run(&["net", "pending"]);
+        session.asked();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let raw = name.chars().nth(4).expect("the shape's character");
+        if stdout.contains(raw) || !stdout.contains(escaped) {
+            painted.push(format!("{shape}: {stdout:?}"));
+        }
+    }
+    assert!(
+        painted.is_empty(),
+        "the project must be written as text:\n{}",
+        painted.join("\n")
+    );
+}
+
 #[test]
 fn net_pending_all_save_global_drains_and_persists_each_host() {
     let fx = Project::new("net");
