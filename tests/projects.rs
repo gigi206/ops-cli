@@ -192,8 +192,8 @@ fn show_reports_store_roots_and_declared_but_not_built() {
     );
 
     // --json carries the same distinction.
-    let out = fx.run(&["projects", "show", tree, "--json"]);
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let out = fx.run_ok(&["projects", "show", tree, "--json"]);
+    let v = common::json_of(&out);
     assert!(
         v["store_roots"]["nix"]
             .as_array()
@@ -212,8 +212,8 @@ fn show_reports_store_roots_and_declared_but_not_built() {
     // declare.
     fx.make_gcroot(tree, "tarball-rolled");
     fx.make_gcroot(tree, "binary-shipped");
-    let out = fx.run(&["projects", "show", tree, "--json"]);
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let out = fx.run_ok(&["projects", "show", tree, "--json"]);
+    let v = common::json_of(&out);
     let bucket = |kind: &str| -> Vec<String> {
         v["store_roots"][kind]
             .as_array()
@@ -280,7 +280,7 @@ fn show_counts_a_remote_flake_built_into_the_store_as_realized() {
 
     let out = fx.run(&["projects", "show", tree, "--json"]);
     assert!(out.status.success(), "projects show failed: {}", text(&out));
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let v = common::json_of(&out);
     // The flake is realized (its per-project store gcroot), so it is NOT in the "declared but not
     // built" set.
     assert!(
@@ -330,8 +330,8 @@ fn show_of_a_dead_tree_reports_realized_state_only() {
         "a dead tree shows realized state only:\n{s}"
     );
 
-    let out = fx.run(&["projects", "show", tree, "--json"]);
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let out = fx.run_ok(&["projects", "show", tree, "--json"]);
+    let v = common::json_of(&out);
     assert_eq!(v["config_available"], false);
     assert!(v["unbuilt"].as_array().unwrap().is_empty());
 }
@@ -413,7 +413,7 @@ fn list_json_is_an_array_carrying_state_and_size() {
         "sbx projects --json failed: {}",
         text(&out)
     );
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let v = common::json_of(&out);
     let rows = v.as_array().expect("a JSON array");
     let row = rows
         .iter()
@@ -691,7 +691,7 @@ fn a_listing_reports_liveness_as_unknown_when_the_registry_cannot_be_read() {
         "the listing must still answer: {}",
         text(&out)
     );
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let v = common::json_of(&out);
     let row = v
         .as_array()
         .expect("a JSON array")
