@@ -453,10 +453,18 @@ fn nvidia_nodes_in(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Whether a file in the host's driver directory belongs to the NVIDIA driver's userspace. Pure.
+///
+/// The directory is shared, and two neighbours match the driver's prefixes without being its own:
+/// the container toolkit's `libnvidia-container*`, and the CUDA toolkit's runtime, `libcudart*`,
+/// which a distribution packages apart from the driver (Ubuntu's `libcudart12`). Both version on
+/// their own schedule, and the runtime would land on the cage's loader path ahead of the one an
+/// app ships for itself. Only shared objects are carried: a static archive (`libcudadevrt.a`,
+/// from the toolkit's development package) is never loaded.
 fn is_nvidia_driver_lib(name: &str) -> bool {
-    // The container toolkit installs `libnvidia-container*` in the same directory. It is not part
-    // of the driver's userspace, versions on its own schedule, and a cage has no use for it.
-    if name.starts_with("libnvidia-container") {
+    if name.starts_with("libnvidia-container")
+        || name.starts_with("libcudart")
+        || !name.contains(".so")
+    {
         return false;
     }
     [
@@ -938,6 +946,46 @@ mod tests {
         assert!(
             !warnings.iter().any(|w| w.contains("kernel module")),
             "no skew is claimed against a version that was never read: {warnings:?}"
+        );
+    }
+
+    /// The driver directory is shared with the CUDA toolkit, whose runtime and static archives
+    /// match the driver's `libcuda` prefix: they are not carried into the cage. The names are this
+    /// host's, where `libcudart.so.12` is the `libcudart12` package's and `libcudadevrt.a`
+    /// `nvidia-cuda-dev`'s, while `libcudadebugger`, NVML and the PTX compiler are the driver's.
+    #[test]
+    fn the_nvidia_bridge_carries_the_drivers_libraries_and_not_the_cuda_toolkits() {
+        let root = crate::testutil::TmpDir::new();
+        let dir = root.join("usr/lib/x86_64-linux-gnu");
+        std::fs::create_dir_all(&dir).expect("stage the driver directory");
+        for name in [
+            "libEGL_nvidia.so.0",
+            "libcuda.so.1",
+            "libcudadebugger.so.1",
+            "libnvidia-ml.so.1",
+            "libnvidia-ptxjitcompiler.so.1",
+            "libcudart.so.12",
+            "libcudart_static.a",
+            "libcudadevrt.a",
+        ] {
+            std::fs::write(dir.join(name), b"").expect("stage a library");
+        }
+        let bridge = nvidia_bridge_in(root.path()).expect("the vendor library makes it a bridge");
+        let carried: Vec<String> = bridge
+            .libs
+            .iter()
+            .filter_map(|(_, dest)| dest.file_name()?.to_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            carried,
+            [
+                "libEGL_nvidia.so.0",
+                "libcuda.so.1",
+                "libcudadebugger.so.1",
+                "libnvidia-ml.so.1",
+                "libnvidia-ptxjitcompiler.so.1"
+            ],
+            "the driver's shared objects, and nothing the CUDA toolkit installed beside them"
         );
     }
 
