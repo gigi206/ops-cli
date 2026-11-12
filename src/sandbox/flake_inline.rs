@@ -28,12 +28,15 @@ pub(crate) fn staging_root(data_dir: &Path) -> PathBuf {
 /// place, so a concurrent launch of the same project never observes a half-written flake (a lost
 /// rename race just means the other launch wrote the identical bytes first). The `hash` keys the
 /// cage out-link, so an edited flake (a new hash) rebuilds at the next launch.
+///
+/// A directory already there is used only once it is seen to hold this source ([`holds`]), and one
+/// that holds another is an error.
 pub(crate) fn stage(data_dir: &Path, content: &str) -> io::Result<(PathBuf, String)> {
     let base = staging_root(data_dir);
     std::fs::create_dir_all(&base)?;
     let hash = content_hash(content);
     let dir = base.join(&hash);
-    if dir.join("flake.nix").is_file() {
+    if holds(&dir, content)? {
         return Ok((dir, hash));
     }
 
@@ -50,18 +53,50 @@ pub(crate) fn stage(data_dir: &Path, content: &str) -> io::Result<(PathBuf, Stri
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(e);
     }
-    match std::fs::rename(&tmp, &dir) {
-        Ok(()) => Ok((dir, hash)),
-        // Lost the race (another launch staged the identical flake first) or it already existed:
-        // discard the redundant temp and use the winner.
-        Err(_) if dir.join("flake.nix").is_file() => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            Ok((dir, hash))
-        }
+    settle(&tmp, &dir, content).map(|()| (dir, hash))
+}
+
+/// Move the assembled `tmp` into place at `dir`, or settle on the directory a concurrent launch put
+/// there first.
+///
+/// A lost race is taken only once `dir` is seen to hold this source ([`holds`]); any other failure
+/// is the rename's own. Either way `tmp` is gone afterwards.
+fn settle(tmp: &Path, dir: &Path, content: &str) -> io::Result<()> {
+    match std::fs::rename(tmp, dir) {
+        Ok(()) => Ok(()),
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            Err(e)
+            let _ = std::fs::remove_dir_all(tmp);
+            match holds(dir, content)? {
+                true => Ok(()),
+                false => Err(e),
+            }
         }
+    }
+}
+
+/// Whether `dir` already holds this flake: `true` when its `flake.nix` is these bytes, `false` when
+/// it has none, and an error when it holds other bytes.
+///
+/// The directory is named by a 64-bit prefix of the source's hash and shared by every project, so
+/// its name does not say whose source is in it. Reused unread, a directory a second source had
+/// taken under the same prefix, or a file changed since it was staged, would be built in this
+/// flake's place. Nothing removes a staged directory, so the refusal names the one to remove: the
+/// next launch stages this source there afresh.
+fn holds(dir: &Path, content: &str) -> io::Result<bool> {
+    let path = dir.join("flake.nix");
+    match std::fs::read(&path) {
+        Ok(found) if found == content.as_bytes() => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} holds another flake under this one's name, so it is not built in its place; \
+                 remove {} to stage this one",
+                path.display(),
+                dir.display()
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -128,5 +163,58 @@ mod tests {
             stage(data.path(), "{ outputs = { self }: { x = 1; }; }\n").unwrap();
         assert_ne!(edited_hash, hash);
         assert_ne!(edited, dir);
+    }
+
+    /// A staged directory is used only while it holds this source. One whose `flake.nix` holds
+    /// other bytes, a second source staged under the same name or a file changed since, is refused
+    /// rather than built in this flake's place, and is used again once it holds the source.
+    #[test]
+    fn a_staged_directory_holding_another_source_is_not_used() {
+        let data = TmpDir::new();
+        let content = "{ outputs = { self }: {}; }\n";
+        let (dir, _) = stage(data.path(), content).unwrap();
+
+        std::fs::write(
+            dir.join("flake.nix"),
+            "{ outputs = { self }: { x = 1; }; }\n",
+        )
+        .unwrap();
+        let refused = stage(data.path(), content).expect_err("another source is not used");
+        assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists, "{refused}");
+
+        std::fs::write(dir.join("flake.nix"), content).unwrap();
+        assert_eq!(stage(data.path(), content).unwrap().0, dir);
+    }
+
+    /// A rename that lost the race settles on the winner only once it holds this source: the same
+    /// bytes are used, other bytes are refused, and a directory with no `flake.nix` leaves the
+    /// rename's own error. The temp is gone in every case.
+    #[test]
+    fn a_lost_rename_settles_only_on_a_winner_holding_the_source() {
+        let content = "{ outputs = { self }: {}; }\n";
+        let other = "{ outputs = { self }: { x = 1; }; }\n";
+        let shapes = [
+            ("the same bytes", Some(content), Ok(())),
+            (
+                "other bytes",
+                Some(other),
+                Err(io::ErrorKind::AlreadyExists),
+            ),
+            ("no flake.nix", None, Err(io::ErrorKind::DirectoryNotEmpty)),
+        ];
+        for (shape, there, expected) in shapes {
+            let base = TmpDir::new();
+            let (tmp, dir) = (base.path().join(".tmp"), base.path().join("winner"));
+            std::fs::create_dir(&tmp).unwrap();
+            std::fs::write(tmp.join("flake.nix"), content).unwrap();
+            std::fs::create_dir(&dir).unwrap();
+            match there {
+                Some(bytes) => std::fs::write(dir.join("flake.nix"), bytes).unwrap(),
+                None => std::fs::write(dir.join("other"), "x").unwrap(),
+            }
+            let settled = settle(&tmp, &dir, content).map_err(|e| e.kind());
+            assert_eq!(settled, expected, "{shape}");
+            assert!(!tmp.exists(), "{shape}: the temp is gone");
+        }
     }
 }
