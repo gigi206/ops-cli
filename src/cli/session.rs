@@ -400,12 +400,14 @@ fn parse_logs_args(args: &[OsString]) -> Result<LogsArgs, String> {
     })
 }
 
-/// How much of a log is read from its end before falling back to a forward pass.
+/// How much of a log is read from its end before a reading is answered without holding it:
+/// streamed from the session's header ([`last_header_at`]) or counted back on disk
+/// ([`tail_start`]).
 ///
 /// A session's log is whatever the agent printed, which is not a size sbx chooses: a verbose build
-/// leaves hundreds of megabytes. `sbx session logs` used to `read` the whole file to print twenty
-/// lines of it, so the memory the command needed was the memory the agent had spent, and asking a
-/// question about a long-running agent cost as much as the agent's own output.
+/// leaves hundreds of megabytes. Reading the whole file to print twenty lines of it would make the
+/// memory the command needs the memory the agent spent, and a question about a long-running agent
+/// would cost as much as the agent's own output.
 ///
 /// This window is what a question is normally answered from. It is generous because the point is
 /// not to be small, it is to be **bounded**: a log ten times this size costs the same here.
@@ -440,10 +442,12 @@ fn tail_bytes(path: &Path, want: u64) -> std::io::Result<(Vec<u8>, bool, u64)> {
 /// session's header also ends the search — true for the ordinary reading, which is about that
 /// session alone, and false under `--all`, where a line limit counts back across every session.
 ///
-/// Returns the window and whether it is a **complete** answer: it reached the start of the file, or
-/// it holds the header the reading is bounded by. A `false` there is not a failure. It says the
-/// last session is longer than [`TAIL_WINDOW_MAX`], and the caller answers that by streaming from
-/// the header rather than holding the file.
+/// Returns the window and whether it is **complete**: it reached the start of the file, or it holds
+/// the header the reading is bounded by. A `false` there is not a failure. A window that holds the
+/// start of the lines a line limit counts back over still holds the answer. Otherwise the reading
+/// reaches past [`TAIL_WINDOW_MAX`], and the caller answers it without holding the file: an
+/// unlimited reading is streamed from the header, and a line limit is counted back on disk
+/// ([`tail_start`]).
 fn tail_window(
     path: &Path,
     want_lines: Option<usize>,
@@ -467,10 +471,11 @@ fn tail_window(
 /// Where the last session's body starts in `path`, and the header that opens it — found by reading
 /// the file in fixed chunks rather than holding it.
 ///
-/// The fallback for a session whose output is longer than [`TAIL_WINDOW_MAX`]: the body being asked
-/// for is genuinely that long, so it is streamed from here rather than truncated or buffered. A
-/// line longer than [`LOG_CHUNK`] cannot be a header, so the carry is dropped and the scan picks up
-/// at the next break — which keeps this pass bounded whatever the log holds.
+/// The fallback for a session whose output is longer than [`TAIL_WINDOW_MAX`]: an unlimited reading
+/// is streamed from here, and a line limit counted back on disk ([`tail_start`]) stops here, rather
+/// than either being truncated or buffered. A line longer than [`LOG_CHUNK`] cannot be a header, so
+/// the carry is dropped and the scan picks up at the next break — which keeps this pass bounded
+/// whatever the log holds.
 fn last_header_at(path: &Path) -> std::io::Result<(Option<sandbox::SessionHeader>, u64)> {
     use std::io::Read as _;
     let mut file = std::fs::File::open(path)?;
@@ -533,28 +538,78 @@ fn last_session(log: &[u8]) -> (Option<sandbox::SessionHeader>, &[u8]) {
     }
 }
 
-/// The last `n` newline-delimited lines of `body`. A single trailing newline does not count as an
-/// empty final line, so `-n 1` on output ending in `\n` shows the last real line, not nothing.
-fn tail_lines(body: &[u8], n: usize) -> &[u8] {
-    if n == 0 {
-        return &body[..0];
-    }
-    let end = if body.ends_with(b"\n") {
-        body.len() - 1
-    } else {
-        body.len()
-    };
-    let (mut seen, mut i) = (0usize, end);
-    while i > 0 {
-        i -= 1;
-        if body[i] == b'\n' {
-            seen += 1;
-            if seen == n {
-                return &body[i + 1..];
-            }
+/// Where the last `n` newline-delimited lines of a text begin, counted back from its end over
+/// pieces handed over last first. A single trailing newline does not count as an empty final line,
+/// so `-n 1` on output ending in `\n` shows the last real line, not nothing.
+///
+/// The one definition of a line limit, for a body held in memory ([`tail_lines`]) and for one read
+/// back from disk a chunk at a time ([`tail_start`]).
+struct LinesBack {
+    n: usize,
+    seen: usize,
+    at_end: bool,
+}
+
+impl LinesBack {
+    fn new(n: usize) -> Self {
+        LinesBack {
+            n,
+            seen: 0,
+            at_end: true,
         }
     }
-    body
+
+    /// Count back over `piece`, the bytes just before every piece already counted: the index in it
+    /// where the last `n` lines begin, or `None` when they begin further back.
+    fn back_over(&mut self, piece: &[u8]) -> Option<usize> {
+        if self.n == 0 {
+            return Some(piece.len());
+        }
+        let mut rest = piece;
+        if self.at_end && !piece.is_empty() {
+            self.at_end = false;
+            rest = piece.strip_suffix(b"\n").unwrap_or(piece);
+        }
+        while let Some(i) = rest.iter().rposition(|&b| b == b'\n') {
+            self.seen += 1;
+            if self.seen == self.n {
+                return Some(i + 1);
+            }
+            rest = &rest[..i];
+        }
+        None
+    }
+}
+
+/// The last `n` lines of `body`, as [`LinesBack`] counts them.
+fn tail_lines(body: &[u8], n: usize) -> &[u8] {
+    match LinesBack::new(n).back_over(body) {
+        Some(at) => &body[at..],
+        None => body,
+    }
+}
+
+/// Where the last `n` lines of the bytes `[floor, end)` of `path` begin, as [`LinesBack`] counts
+/// them: the answer to a line limit no window holds.
+///
+/// Read back from `end` one [`LOG_CHUNK`] at a time, so what it holds is a chunk whatever the lines
+/// weigh. Nothing before `floor` is read, and lines that reach back past it begin at it.
+fn tail_start(path: &Path, n: usize, floor: u64, end: u64) -> std::io::Result<u64> {
+    use std::os::unix::fs::FileExt as _;
+    let file = std::fs::File::open(path)?;
+    let mut lines = LinesBack::new(n);
+    let mut chunk = vec![0u8; LOG_CHUNK as usize];
+    let mut at = end;
+    while at > floor {
+        let from = at.saturating_sub(LOG_CHUNK).max(floor);
+        let piece = &mut chunk[..(at - from) as usize];
+        file.read_exact_at(piece, from)?;
+        if let Some(i) = lines.back_over(piece) {
+            return Ok(from + i as u64);
+        }
+        at = from;
+    }
+    Ok(floor)
 }
 
 /// Whether the registry still holds a live record for `id`.
@@ -609,9 +664,10 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
     let path = sandbox::detach_log_path(data_dir, parsed.id);
 
     // What has to be held to answer is not what the file holds. A session's log is as long as its
-    // agent was talkative, so reading all of it to print twenty lines of it made the command cost
-    // whatever the agent had spent. Everything is answered from a window at the end of the file;
-    // the two cases a window cannot answer are streamed instead.
+    // agent was talkative, so reading all of it to print twenty lines of it would make the command
+    // cost whatever the agent spent. Everything is answered from a window at the end of the file;
+    // the three cases a window cannot answer are streamed instead: the whole file under `--all`, a
+    // session longer than the window, and a line limit whose lines begin before the window.
     // Copies `[at, until)`, and no further: the file is append-only and may be growing, so an
     // unbounded copy would print past the point a `--follow` then resumes from and repeat it.
     // `until` is the length the read that produced this answer saw, never a second `metadata` — two
@@ -727,6 +783,11 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
         if parsed.all { ", all sessions" } else { "" },
     ));
 
+    // Where the last session's body starts, for the two arms below that read past a window that did
+    // not hold its header: the offset the forward pass found, or 0 for a log holding no header at
+    // all, whose whole content is the one session there is to show. A pass that failed is fatal
+    // above, so a `None` here is a window that carried the header, which neither arm meets.
+    let session_start = fallback.as_ref().map_or(0, |(_, at)| *at);
     use std::io::Write as _;
     let printed = match (parsed.limit, parsed.all, complete) {
         // Every session, unlimited: the whole file is what was asked for, so it is copied rather
@@ -734,15 +795,19 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
         (None, true, _) => stream_range(0, end),
         // One session, unlimited, and longer than the window: stream it from its own header. The
         // forward pass that finds the header holds nothing either.
-        (None, false, false) => {
-            // A `None` here can no longer mean "the scan failed" — that is fatal above. It would
-            // mean the window carried the header, which `tail_window` does not report as an
-            // incomplete answer, so this arm does not meet it. What a 0 offset does mean is a log
-            // holding no header at all, whose whole content is the one session there is to show.
-            let at = fallback.as_ref().map(|(_, at)| *at).unwrap_or(0);
-            stream_range(at, end)
+        (None, false, false) => stream_range(session_start, end),
+        // A line limit the window does not answer: it stopped at its ceiling short of the header,
+        // and the lines the limit counts back over begin before it. They are counted back on disk,
+        // down to the session's header or to the start of the file under `--all`, and streamed.
+        (Some(n), all, false) if LinesBack::new(n).back_over(&window).is_none() => {
+            let floor = if all { 0 } else { session_start };
+            match tail_start(&path, n, floor, end) {
+                Ok(at) => stream_range(at, end),
+                Err(e) => Err(unreadable(e)),
+            }
         }
-        // Everything else fits in the window by construction.
+        // Everything else is answered from the window: it reached the start of the file, holds the
+        // session's header, or holds the start of the lines the limit counts back over.
         (limit, all, _) => {
             let body = if all { &window[..] } else { session_body };
             let body = match limit {
@@ -1124,6 +1189,57 @@ mod tests {
         assert_eq!(tail_lines(b"a\nb\n", 9), b"a\nb\n");
         assert_eq!(tail_lines(b"", 3), b"");
         assert_eq!(tail_lines(b"a\nb\n", 0), b"");
+    }
+
+    /// The lines found back on disk a chunk at a time are the ones [`tail_lines`] finds in the same
+    /// bytes held whole. A break on a chunk's last byte counts, only the file's own final newline
+    /// does not, and nothing before the floor is reached.
+    #[test]
+    fn lines_counted_back_on_disk_are_the_lines_of_the_bytes_held_whole() {
+        let dir = crate::testutil::TmpDir::new();
+        let chunk = LOG_CHUNK as usize;
+        let line = |len: usize| [vec![b'x'; len - 1], vec![b'\n']].concat();
+        // The last two lines weigh one chunk together, so the break that ends the third line from
+        // the end is the last byte of the second chunk read.
+        let sizes = [100, chunk + 5, 50, chunk / 2, chunk / 2];
+        let lined: Vec<u8> = sizes.iter().flat_map(|&len| line(len)).collect();
+        let starts: Vec<u64> = sizes
+            .iter()
+            .scan(0u64, |at, &len| {
+                let start = *at;
+                *at += len as u64;
+                Some(start)
+            })
+            .collect();
+        let path = dir.join("4242.log");
+
+        for trailing in [true, false] {
+            let mut full = lined.clone();
+            if !trailing {
+                full.pop();
+            }
+            std::fs::write(&path, &full).unwrap();
+            let end = full.len() as u64;
+            for floor in [0, starts[1], starts[1] + 7] {
+                for n in 0..=6 {
+                    let held = &full[floor as usize..];
+                    let want = end - tail_lines(held, n).len() as u64;
+                    assert_eq!(
+                        tail_start(&path, n, floor, end).unwrap(),
+                        want,
+                        "-n {n} over [{floor}, {end}), final newline {trailing}"
+                    );
+                }
+            }
+            // Written out, so the comparison above is not all that holds the count.
+            assert_eq!(tail_start(&path, 3, 0, end).unwrap(), starts[2]);
+            assert_eq!(tail_start(&path, 2, 0, end).unwrap(), starts[3]);
+            assert_eq!(tail_start(&path, 0, 0, end).unwrap(), end);
+            assert_eq!(
+                tail_start(&path, 6, starts[1] + 7, end).unwrap(),
+                starts[1] + 7
+            );
+        }
     }
 
     #[test]

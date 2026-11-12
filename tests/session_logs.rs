@@ -1,11 +1,11 @@
 //! `sbx session logs` end to end, one case per output shape the command can take.
 //!
-//! The reading was rewritten to answer from a bounded window at the end of the file instead of
-//! holding all of it, which turned one path into five: a window, a window with a line limit, a
-//! whole-file copy, a copy of one session from its own header, and the branch that explains a log
-//! that is not there. The unit tests cover the readers those shapes are built from; nothing covered
-//! the shapes. This does, against a log written by hand, with the expected bytes written out rather
-//! than recomputed by the same logic under test.
+//! The reading answers from a bounded window at the end of the file instead of holding all of it,
+//! which gives it six shapes: a window, a window with a line limit, a line limit counted back on
+//! disk past the window, a whole-file copy, a copy of one session from its own header, and the
+//! branch that explains a log that is not there. The unit tests cover the readers those shapes are
+//! built from, and this covers the shapes, against a log written by hand, with the expected bytes
+//! written out rather than recomputed by the same logic under test.
 //!
 //! The split the assertions rely on is the command's own: the body goes to stdout so a redirect
 //! gives exactly what the agent wrote, and the context line goes to stderr.
@@ -264,7 +264,7 @@ fn a_session_past_the_window_reads_the_same_and_still_names_its_date() {
     );
 }
 
-/// The one shape a window can never answer: a session longer than the window itself.
+/// An unlimited reading of a session longer than the window itself, which no window answers.
 ///
 /// Here the command stops trying to hold the answer and streams it from the session's own header,
 /// found by a forward pass. Nothing else reaches that arm — a session merely larger than a *read
@@ -451,6 +451,120 @@ fn a_reading_it_cannot_write_fails_once_and_a_reader_gone_does_not() {
                      said {told}:\n{stderr}"
                 ));
             }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A line `len` bytes long, newline included, that names `tag` at its start and is filled with
+/// `fill`: a reading that starts or stops anywhere but at a line's edge differs from it at a byte a
+/// comparison names.
+fn long_line(tag: &str, fill: u8, len: usize) -> Vec<u8> {
+    let mut line = format!("{tag} ").into_bytes();
+    line.resize(len - 1, fill);
+    line.push(b'\n');
+    line
+}
+
+/// A line limit counts back over whole lines however far past the read window they reach.
+///
+/// The window stops growing at its 8 MiB ceiling, and lines long enough leave it holding fewer
+/// breaks than the limit counts back over and not the header that bounds the session. The reading
+/// is then answered on disk: the lines are found back from the end, down to the session's own
+/// header (to the start of the file under `--all`), and streamed. Each shape is one a window cannot
+/// answer, so each prints its lines whole:
+///
+/// - more lines than the limit, all longer than the window can count;
+/// - as many breaks in the window as the limit, the last of them the final newline, which ends a
+///   line and does not start one;
+/// - a session with fewer lines than the limit, under an older session the limit must not reach
+///   into;
+/// - `--all` with a limit that crosses the header above the last session.
+///
+/// `-n 0` on a single line past the window prints nothing, as it does inside it. Every shape is run
+/// and the ones that fail are listed together. The two sizes are `LOG_CHUNK` and `TAIL_WINDOW_MAX`
+/// in `src/cli/session.rs`, out of an integration test's reach.
+#[test]
+fn a_line_limit_past_the_window_prints_whole_lines() {
+    const MIB: usize = 1024 * 1024;
+    let data = Data::new("longlines");
+    let lines = |tags: &[(&str, u8, usize)]| -> Vec<u8> {
+        tags.iter()
+            .flat_map(|&(tag, fill, len)| long_line(tag, fill, len))
+            .collect()
+    };
+    let two_sessions = |new: &[u8]| -> Vec<u8> {
+        [
+            HEAD_OLD.as_bytes(),
+            OLD_BODY.as_bytes(),
+            HEAD_NEW.as_bytes(),
+            new,
+        ]
+        .concat()
+    };
+
+    let five = lines(&[
+        ("one", b'a', 3 * MIB),
+        ("two", b'b', 3 * MIB),
+        ("three", b'c', 3 * MIB),
+        ("four", b'd', 3 * MIB),
+        ("five", b'e', 3 * MIB),
+    ]);
+    let three = lines(&[
+        ("one", b'a', 4 * MIB),
+        ("two", b'b', 4 * MIB),
+        ("three", b'c', 4 * MIB),
+    ]);
+    let two = lines(&[("one", b'a', 5 * MIB), ("two", b'b', 5 * MIB)]);
+    let mut unbroken = long_line("unbroken", b'u', 9 * MIB);
+    unbroken.pop();
+
+    let shapes = [
+        (
+            "more lines than the limit",
+            two_sessions(&five),
+            &["-n", "4"][..],
+            five[3 * MIB..].to_vec(),
+        ),
+        (
+            "as many breaks as the limit, the last the final newline",
+            two_sessions(&two),
+            &["-n", "2"],
+            two.clone(),
+        ),
+        (
+            "fewer lines than the limit, under an older session",
+            two_sessions(&three),
+            &["-n", "5"],
+            three.clone(),
+        ),
+        (
+            "--all crossing the header",
+            two_sessions(&two),
+            &["--all", "-n", "4"],
+            [b"old-2\n", HEAD_NEW.as_bytes(), &two[..]].concat(),
+        ),
+        (
+            "-n 0 on one line past the window",
+            [HEAD_NEW.as_bytes(), &unbroken[..]].concat(),
+            &["-n", "0"],
+            Vec::new(),
+        ),
+    ];
+    let mut failed = Vec::new();
+    for (shape, log, limit, want) in shapes {
+        std::fs::write(data.log(4242), &log).expect("write the log");
+        let mut args = vec!["session", "logs", "4242"];
+        args.extend_from_slice(limit);
+        let o = sbx_in(data.0.path(), &args);
+        if !o.status.success() {
+            failed.push(format!("{shape}: exit {}: {}", o.status, err(&o)));
+        } else if let Some(at) = first_difference(&o.stdout, &want) {
+            failed.push(format!(
+                "{shape}: {} bytes printed, {} wanted, first difference at byte {at}",
+                o.stdout.len(),
+                want.len()
+            ));
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
