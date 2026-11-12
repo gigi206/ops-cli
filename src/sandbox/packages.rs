@@ -172,13 +172,25 @@ pub(crate) fn provision(
 /// matches a `minimum_release_age_excludes` entry against this key alone: an entry that carries the
 /// options or a version matches nothing.
 pub(crate) fn mise_tool_key(token: &str) -> String {
-    let bare = match (token.find('['), token.rfind(']')) {
-        (Some(open), Some(close)) if open < close => {
-            format!("{}{}", &token[..open], &token[close + 1..])
-        }
-        _ => token.to_string(),
-    };
-    crate::sandbox::taskpool::split_version(&bare).0.to_string()
+    crate::sandbox::taskpool::split_version(&split_options(token).0)
+        .0
+        .to_string()
+}
+
+/// A declared token split from its `[options]`: the token without them, and what its brackets hold.
+/// `github:example/tool[version_prefix=v]@1.2` is `github:example/tool@1.2` and `version_prefix=v`;
+/// a token without brackets is itself, with no options.
+///
+/// The options come off before anything else is read from the token, since an option's value may
+/// hold the `@` or `/` that [`crate::sandbox::taskpool::split_version`] reads a version by.
+pub(crate) fn split_options(token: &str) -> (String, Option<&str>) {
+    match (token.find('['), token.rfind(']')) {
+        (Some(open), Some(close)) if open < close => (
+            format!("{}{}", &token[..open], &token[close + 1..]),
+            Some(&token[open + 1..close]),
+        ),
+        _ => (token.to_string(), None),
+    }
 }
 
 /// The keys mise exempts from its release-age delay for the packages a trusted layer named in

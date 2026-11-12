@@ -176,19 +176,32 @@ fn shims_incage() -> PathBuf {
     Path::new(POOL_INCAGE).join("shims")
 }
 
-/// The version spec the pool's global config records for each tool — `<pool>/config/config.toml`'s
-/// `[tools]` table, which the install's `mise use -g` writes and a shim then **resolves through**.
+/// What the pool's global config records for one tool: the version spec a shim resolves, and the
+/// options mise keeps beside it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Recorded {
+    spec: String,
+    options: std::collections::BTreeMap<String, String>,
+}
+
+/// What the pool's global config records for each tool, by the key mise files it under —
+/// `<pool>/config/config.toml`'s `[tools]` table, which the install's `mise use -g` writes and a
+/// shim then **resolves through**.
 ///
-/// Parsed line-wise (it is a tiny flat table), the same way the install metadata is read, so this
-/// needs no TOML dependency here. A bare request is recorded as `"latest"`, a pinned one as its
-/// version — `ripgrep = "latest"`, `"aqua:cli/gh" = "2.62.0"`.
+/// mise writes an entry in one of two forms. A token without options records a string, its version
+/// spec: a bare request as `"latest"`, a pinned one as its version — `ripgrep = "latest"`,
+/// `"aqua:cli/gh" = "2.62.0"`. A token with `[options]` is filed under its key without them, as an
+/// inline table holding the spec as `version` beside each option —
+/// `"ubi:owner/tool" = { version = "1.0.0", exe = "tool" }`. The file is read as TOML, as
+/// [`inspect`] reads the install metadata: read line by line, the second form gave a spec no
+/// declaration asks for, and the tool was installed again on every launch. An entry of any other
+/// shape records nothing.
 ///
 /// The install cage writes this file, so it is opened through [`inspect::read_cage_file`]: this
 /// runs on the launch path, where a file that blocks the open or has no end would hold the launch.
-/// Anything but a bounded regular file reads as no record, which [`bins_for`] answers by
-/// installing again.
-fn recorded_specs(pool: &Path) -> std::collections::BTreeMap<String, String> {
-    let mut out = std::collections::BTreeMap::new();
+/// Anything but a bounded regular file of valid TOML reads as no record, which [`bins_for`] answers
+/// by installing again.
+fn recorded_specs(pool: &Path) -> std::collections::BTreeMap<String, Recorded> {
     let Some(body) = inspect::read_cage_file(
         &pool.join("config/config.toml"),
         inspect::CAGE_MISE_CONFIG_CAP,
@@ -196,28 +209,42 @@ fn recorded_specs(pool: &Path) -> std::collections::BTreeMap<String, String> {
     .ok()
     .flatten()
     .and_then(|body| String::from_utf8(body).ok()) else {
-        return out;
+        return std::collections::BTreeMap::new();
     };
-    let mut in_tools = false;
-    for line in body.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_tools = line == "[tools]";
-            continue;
-        }
-        if !in_tools {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim().trim_matches('"');
-        let value = value.trim().trim_matches('"');
-        if !key.is_empty() && !value.is_empty() {
-            out.insert(key.to_string(), value.to_string());
-        }
-    }
-    out
+    let Some(tools) = body
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|mut doc| doc.remove("tools"))
+        .and_then(|tools| match tools {
+            toml::Value::Table(tools) => Some(tools),
+            _ => None,
+        })
+    else {
+        return std::collections::BTreeMap::new();
+    };
+    tools
+        .into_iter()
+        .filter_map(|(key, entry)| {
+            let recorded = match entry {
+                toml::Value::String(spec) => Recorded {
+                    spec,
+                    options: std::collections::BTreeMap::new(),
+                },
+                toml::Value::Table(table) => Recorded {
+                    spec: table.get("version")?.as_str()?.to_string(),
+                    options: table
+                        .iter()
+                        .filter(|(name, _)| *name != "version")
+                        .filter_map(|(name, value)| {
+                            Some((name.clone(), value.as_str()?.to_string()))
+                        })
+                        .collect(),
+                },
+                _ => return None,
+            };
+            (!recorded.spec.is_empty()).then_some((key, recorded))
+        })
+        .collect()
 }
 
 /// The version spec a declared token asks the pool to record. A bare token asks for whatever mise
@@ -226,14 +253,72 @@ fn wanted_spec(wanted: Option<&str>) -> &str {
     wanted.unwrap_or("latest")
 }
 
-/// Reduce `tokens` to one version spec per tool, and report the spellings that had to go as
+/// A declared token as the pool's config files it ([`recorded_specs`]): the tool's key, the version
+/// it asks for, and the options it sets.
+///
+/// Each is read from the token once its `[options]` are off ([`super::packages::split_options`]):
+/// an option's value may hold an `@` or a `/`, and read in place it would be taken for a version.
+#[derive(Debug, PartialEq, Eq)]
+struct Request<'a> {
+    key: String,
+    version: Option<String>,
+    options: std::collections::BTreeMap<&'a str, &'a str>,
+}
+
+impl<'a> Request<'a> {
+    fn of(token: &'a str) -> Self {
+        let (bare, options) = super::packages::split_options(token);
+        let (key, version) = split_version(&bare);
+        Request {
+            key: key.to_string(),
+            version: version.map(str::to_string),
+            // mise reads `[exe=tool,matching=musl]` as two options, each a `name=value` pair.
+            options: options
+                .into_iter()
+                .flat_map(|options| options.split(','))
+                .filter_map(|pair| pair.split_once('='))
+                .collect(),
+        }
+    }
+
+    /// The version spec this request asks the pool to record ([`wanted_spec`]).
+    fn spec(&self) -> &str {
+        wanted_spec(self.version.as_deref())
+    }
+
+    /// Whether the config's `entry` for this tool records this request: its spec, and each option
+    /// it sets.
+    ///
+    /// The options are held to the entry one by one rather than as a whole set, because mise merges
+    /// them: `mise use -g` of `tool[exe=b]` over an entry recorded for `tool[exe=a,matching=musl]`
+    /// writes `exe = "b"` and keeps `matching`. Asked to equal the declaration's set, that entry
+    /// never would, and the tool would be installed again on every launch.
+    fn recorded_in(&self, entry: &Recorded) -> bool {
+        entry.spec == self.spec()
+            && self.options.iter().all(|(name, value)| {
+                entry
+                    .options
+                    .get(*name)
+                    .is_some_and(|recorded| recorded == value)
+            })
+    }
+
+    /// Whether `other` asks the same of the pool as this request: the same spec and the same
+    /// options.
+    fn asks_as(&self, other: &Request<'_>) -> bool {
+        self.spec() == other.spec() && self.options == other.options
+    }
+}
+
+/// Reduce `tokens` to one request per tool, and report the spellings that had to go as
 /// `(dropped, kept)` pairs.
 ///
 /// One pool is one global mise config and one `shims/` directory. `mise use -g` writes a single
 /// `[tools]` entry per tool, [`recorded_specs`] reads back a single spec per tool, and mise cannot
 /// put two versions of one tool on one `PATH` either — so two tasks declaring `mise:node@22` and
 /// `mise:node@24` are not two installs. They are one entry, and whichever spelling the config does
-/// not hold can never satisfy [`bins_for`].
+/// not hold can never satisfy [`bins_for`]. A tool is the key mise files it under, so two spellings
+/// that set different `[options]` are one entry too.
 ///
 /// Left to run, that is not a token that merely fails: [`ensure`]'s warm short-circuit never fires,
 /// so every launch of the project pays a full bwrap + mise install-cage run before the agent starts,
@@ -242,21 +327,21 @@ fn wanted_spec(wanted: Option<&str>) -> &str {
 ///
 /// Declaration order decides: the first spelling of a tool is the one the pool is filled for. That
 /// is the half that stops the loop; naming the rest is the half the author can act on, since only a
-/// declaration change can actually resolve it. A repeat of the *same* spec is not a conflict — a
+/// declaration change can actually resolve it. A repeat of the *same* request is not a conflict — a
 /// bare token and an explicit `@latest` are one request, which is what [`wanted_spec`] says.
 fn one_spec_per_tool(tokens: &[String]) -> (Vec<String>, Vec<(String, String)>) {
     let mut kept: Vec<String> = Vec::new();
     let mut conflicting: Vec<(String, String)> = Vec::new();
     for token in tokens {
-        let (locator, wanted) = split_version(token);
+        let request = Request::of(token);
         // Taken by value rather than held as a reference: the `None` arm appends to the same vector
         // the search read.
         let first = kept
             .iter()
-            .find(|k| split_version(k.as_str()).0 == locator)
+            .find(|k| Request::of(k).key == request.key)
             .cloned();
         match first {
-            Some(first) if wanted_spec(split_version(&first).1) != wanted_spec(wanted) => {
+            Some(first) if !Request::of(&first).asks_as(&request) => {
                 conflicting.push((token.clone(), first));
             }
             Some(_) => {}
@@ -269,13 +354,18 @@ fn one_spec_per_tool(tokens: &[String]) -> (Vec<String>, Vec<(String, String)>) 
 /// Resolve `tokens` against the pool realized on disk. Pure filesystem reads; no mise, no network.
 ///
 /// A token counts as satisfied only when **both** halves agree: the tool is realized under
-/// `installs/`, *and* the pool's config records the version the declaration asks for. Checking only
-/// the installs would drift — the shim resolves through the config, not the directory, so a pool
-/// that still holds `node@24` from an earlier declaration would satisfy a re-declared `node@24`
-/// while the config, last written for `node@22`, kept running 22. Silently.
+/// `installs/`, *and* the pool's config records the version and the options the declaration asks
+/// for. Checking only the installs would drift — the shim resolves through the config, not the
+/// directory, so a pool that still holds `node@24` from an earlier declaration would satisfy a
+/// re-declared `node@24` while the config, last written for `node@22`, kept running 22. Silently.
 ///
 /// A mismatch costs one install-cage run that finds everything downloaded already and just rewrites
 /// the config, so failing *toward* re-running is cheap — and being wrong the other way is not.
+///
+/// Both halves are looked up by the key mise files the token under ([`Request`]), never by the token
+/// as written: mise records neither the `[options]` in the config's key nor in the install's
+/// metadata, so a token that carries them, compared whole, was never found and was installed again
+/// on every launch.
 ///
 /// Matching prefers the backend token mise recorded for each install over the directory name (see
 /// [`InstalledTool::is`]): the recorded token is what mise itself says the install is, and the name
@@ -286,12 +376,14 @@ pub(crate) fn bins_for(pool: &Path, tokens: &[String]) -> PoolBins {
     let mut out = PoolBins::default();
     let mut satisfied = false;
     for token in tokens {
-        let (locator, wanted) = split_version(token);
+        let request = Request::of(token);
         let realized = installed
             .iter()
-            .find(|t| t.is(locator))
-            .is_some_and(|t| realizes(t, wanted));
-        let pinned = recorded.get(locator).map(String::as_str) == Some(wanted_spec(wanted));
+            .find(|t| t.is(&request.key))
+            .is_some_and(|t| realizes(t, request.version.as_deref()));
+        let pinned = recorded
+            .get(&request.key)
+            .is_some_and(|entry| request.recorded_in(entry));
         if realized && pinned {
             satisfied = true;
         } else {
@@ -333,9 +425,10 @@ pub(crate) enum PoolOutcome {
 /// `base_mounts` and `base_env` are the task cage's, so the pool is built by the same userland that
 /// will run the tools — the one thing an install pool must not get wrong.
 ///
-/// Tokens naming two versions of one tool are reduced to one first (see [`one_spec_per_tool`]) and
-/// the rest reported: a pool cannot hold both, and filling it for the whole set would make the
-/// install cage run on every launch of the project without ever converging.
+/// Tokens naming two versions of one tool, or two sets of its options, are reduced to one first
+/// (see [`one_spec_per_tool`]) and the rest reported: a pool cannot hold both, and filling it for the
+/// whole set would make the install cage run on every launch of the project without ever
+/// converging.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ensure(
     bwrap: &Path,
@@ -351,14 +444,15 @@ pub(crate) fn ensure(
         return Ok(PoolOutcome::Warm);
     }
     // A tool the declarations disagree about is filled for one of them and reported for the rest:
-    // one pool records one version per tool, so carrying the conflict forward would run this install
+    // one pool records one entry per tool, so carrying the conflict forward would run this install
     // cage on every launch of the project without ever converging.
     let (fillable, conflicting) = one_spec_per_tool(tokens);
     for (dropped, kept) in &conflicting {
         crate::diag::warn(&format!(
-            "the task tool pool holds one version of each tool, so `{dropped}` cannot be installed \
-             beside `{kept}` — the pool is filled for `{kept}`, and every task declaring \
-             `{dropped}` will fail to find it until the declarations agree"
+            "the task tool pool holds one version and one set of options per tool, so \
+             `{dropped}` cannot be installed beside `{kept}` — the pool is filled for `{kept}`, \
+             and every task declaring `{dropped}` will fail to find it until the declarations \
+             agree"
         ));
     }
     let missing = bins_for(pool, &fillable).missing;
@@ -1263,13 +1357,91 @@ mod tests {
         )
         .unwrap();
         let specs = recorded_specs(&pool);
-        assert_eq!(specs.get("jq").map(String::as_str), Some("latest"));
-        assert_eq!(specs.get("aqua:cli/gh").map(String::as_str), Some("2.62.0"));
+        assert_eq!(specs.get("jq").map(|r| r.spec.as_str()), Some("latest"));
+        assert_eq!(
+            specs.get("aqua:cli/gh").map(|r| r.spec.as_str()),
+            Some("2.62.0")
+        );
         assert!(
             !specs.contains_key("FOO"),
             "only `[tools]` is read: {specs:?}"
         );
         assert!(!specs.contains_key("experimental"));
+    }
+
+    /// A token that carries mise's `[options]` is filed by mise under its key without them: the
+    /// config records an inline table, `"ubi:owner/tool" = { version = …, exe = … }`, and the
+    /// install's metadata names `ubi:owner/tool`. Both halves are looked up by that key, so a pool
+    /// filled for the token satisfies it; compared whole, it was never found, and every launch
+    /// installed it again. A version or an option declared differently since the fill is not
+    /// satisfied. An option mise kept from an earlier fill does not unsatisfy a declaration that no
+    /// longer sets it, since mise merges options and a new install would keep it too.
+    #[test]
+    fn a_token_with_options_is_found_by_the_key_mise_files_it_under() {
+        let base = TmpDir::new();
+        let pool = base.join("task-mise");
+        // What `mise use -g -- 'ubi:owner/tool[exe=tool,matching=musl]@1.0.0'` leaves behind.
+        let dir = installs_dir(&pool).join("ubi-owner-tool");
+        std::fs::create_dir_all(dir.join("1.0.0/bin")).unwrap();
+        std::fs::write(
+            dir.join(".mise.backend.toml"),
+            "short = \"ubi:owner/tool\"\nfull = \"ubi:owner/tool\"\nexplicit_backend = true\n\n\
+             [opts]\nexe = \"tool\"\nmatching = \"musl\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(pool.join("config")).unwrap();
+        std::fs::write(
+            pool.join("config/config.toml"),
+            "[tools]\n\"ubi:owner/tool\" = { version = \"1.0.0\", exe = \"tool\", matching = \"musl\" }\n",
+        )
+        .unwrap();
+
+        for satisfied in [
+            "ubi:owner/tool[exe=tool,matching=musl]@1.0.0",
+            "ubi:owner/tool[matching=musl,exe=tool]@1.0.0",
+            "ubi:owner/tool[exe=tool]@1.0.0",
+        ] {
+            assert!(
+                bins_for(&pool, &[satisfied.to_string()]).missing.is_empty(),
+                "a pool filled for `{satisfied}` must satisfy it"
+            );
+        }
+        for drifted in [
+            "ubi:owner/tool[exe=other]@1.0.0",
+            "ubi:owner/tool[exe=tool,matching=gnu]@1.0.0",
+            "ubi:owner/tool[exe=tool]@2.0.0",
+        ] {
+            assert_eq!(
+                bins_for(&pool, &[drifted.to_string()]).missing,
+                vec![drifted.to_string()],
+                "`{drifted}` asks for what the pool does not record"
+            );
+        }
+
+        // An option's value may hold the `@` and the `/` a version is read by: they come off with
+        // the options, before the version is looked for.
+        for (token, version) in [
+            ("ubi:owner/tool[url=git@host]@1.0.0", Some("1.0.0")),
+            ("ubi:owner/tool[url=git@host]", None),
+            ("ubi:owner/tool[matching=a@b/c]@1.0.0", Some("1.0.0")),
+        ] {
+            let request = Request::of(token);
+            assert_eq!(
+                (request.key.as_str(), request.version.as_deref()),
+                ("ubi:owner/tool", version),
+                "{token}"
+            );
+        }
+
+        // Two spellings of one tool that set different options are one entry: the second is
+        // reported rather than filled over the first on every launch.
+        let (kept, conflicting) =
+            one_spec_per_tool(&["x[exe=a]".to_string(), "x[exe=b]".to_string()]);
+        assert_eq!(kept, vec!["x[exe=a]".to_string()]);
+        assert_eq!(
+            conflicting,
+            vec![("x[exe=b]".to_string(), "x[exe=a]".to_string())]
+        );
     }
 
     /// The install cage writes the pool's config, and this is read on the launch path: an entry

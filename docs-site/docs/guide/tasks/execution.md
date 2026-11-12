@@ -221,6 +221,12 @@ error message says so if you write one. `mise:nix:…` is refused too: mise's `n
 into the store the cage writes, which is the very problem the pool exists to solve; declare it as
 `[packages] nix:…` instead.
 
+An entry may carry mise's own tool options in brackets, as a
+[`[packages]` one can](../configuration/packages#mise-a-mise-backend):
+`mise:ubi:owner/tool[exe=tool]@1.2`. The pool holds one entry per tool, so two tasks that ask for
+one tool with different versions or different options cannot both be served: the pool is filled
+for the first declared, and the launch names the other.
+
 What sbx does with it:
 
 - installs the tools **host-side at launch**, in a cage of its own: the task cage's skeleton with
