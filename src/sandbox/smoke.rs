@@ -61,7 +61,12 @@ impl SmokeReport {
 /// consequence was not a loud failure but a test run against some other path, answering `ABSENT`:
 /// this check reporting that the host home did not leak into the cage when it had not looked. A
 /// hardening probe that can be made to pass by the shape of a path is not one. As an argument the
-/// home reaches `[ -e ]` as the bytes it is. `/root` stands in only for a home that is not set.
+/// home reaches `[ -e ]` as the bytes it is.
+///
+/// `/root` stands in for a home that is not set, and for one that is not an absolute path, since
+/// neither names a host path to test. An empty home makes `[ -e "" ]`, false without looking at
+/// anything, and a relative one is looked for under the cage's working directory: either would
+/// answer `ABSENT` for a home it never tested.
 ///
 /// The script uses shell builtins alone, because the shell is all the probe is sure to have: a host
 /// whose userland lives in a store has no `cat` under `/usr`.
@@ -76,7 +81,10 @@ fn probe_argv(shell: &Path, host_home: Option<&OsStr>) -> Vec<OsString> {
         ),
         // `$0`, a label.
         OsString::from("sbx-probe"),
-        host_home.unwrap_or(OsStr::new("/root")).to_os_string(),
+        host_home
+            .filter(|home| Path::new(home).is_absolute())
+            .unwrap_or(OsStr::new("/root"))
+            .to_os_string(),
     ]
 }
 
@@ -295,13 +303,28 @@ mod tests {
         for name in [&b"no'such"[..], b"no\xffsuch"] {
             assert_eq!(runs(&dir.path().join(OsStr::from_bytes(name))), "ABSENT");
         }
-        // Unset is the one case answered by a stand-in.
+        // Unset is answered by a stand-in.
         assert_eq!(
             probe_argv(Path::new("/bin/sh"), None)
                 .last()
                 .map(OsString::as_os_str),
             Some(OsStr::new("/root"))
         );
+    }
+
+    /// A home that names no host path, empty or relative, is answered by the stand-in, as an unset
+    /// one is: passed as it is, `[ -e ]` would answer `ABSENT` without having looked at the host.
+    #[test]
+    fn a_home_that_is_not_an_absolute_path_is_answered_by_the_stand_in() {
+        for home in ["", "relative/home"] {
+            assert_eq!(
+                probe_argv(Path::new("/bin/sh"), Some(OsStr::new(home)))
+                    .last()
+                    .map(OsString::as_os_str),
+                Some(OsStr::new("/root")),
+                "{home:?} names no host path to test"
+            );
+        }
     }
 
     #[test]
