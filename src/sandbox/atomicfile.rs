@@ -16,10 +16,13 @@
 //! ([`crate::cli::keep_replaced_file`]), the profile an import writes ([`crate::cli::app`]) and the
 //! pointer to a storage volume ([`crate::storage::write_pointer`]). The last three arrived by
 //! deletion rather than by design: each had its own copy of this staging, and each named its temp
-//! from the pid alone.
+//! from the pid alone. The layer fetch of a distro image ([`super::distro`]) takes the temp's name
+//! and its open from here ([`temp_sibling`], [`create_temp`]) and nothing else: it streams the body
+//! and checks it as it lands, and the blob does not outlive the provision that fetched it, which
+//! removes it once it is applied, so the flush is no use to it.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Write `bytes` to `path` atomically: a temp sibling written, then renamed over `path`.
 ///
@@ -70,11 +73,10 @@ pub(crate) fn write_atomic_checked(
     check: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
     use std::fs::DirBuilder;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = dir.join(format!(".{name}.tmp.{}.{}", std::process::id(), unique()));
+    let tmp = temp_sibling(path);
     let staged = || -> io::Result<()> {
         // Written and flushed to the device before the rename, rather than through `fs::write`.
         // The rename orders itself against the data only if the data is already durable: without
@@ -84,29 +86,11 @@ pub(crate) fn write_atomic_checked(
         // the pin locks a launch resolves against, so an empty-but-present one is the shape that
         // costs most.
         //
-        // The mode rides the `open` as well as following it. `create` alone would leave the temp at
-        // the umask's mode for the whole write, and a caller asking for `0600` is asking that the
-        // bytes never exist more readable than that -- a profile carrying `[secret]` locators is
-        // staged in a directory that is not always owner-only. The `set_permissions` after it is
-        // not redundant: `open` masks its mode with the umask, so a `0755` router under a strict
-        // umask still has to be made what it must be, and doing it before the rename keeps the
-        // published path finished from its first instant.
-        //
-        // The open is `create_new` and `O_NOFOLLOW`. The temp name is this process's to make, so
-        // whatever else may be sitting there is not this write's business to open: a symlink left at
-        // the name would otherwise be followed, and the bytes would land wherever it points, with
-        // `mode` set on that file instead. Planting one takes a process of the same uid, which is
-        // inside sbx's trust domain and outside this function's assumptions — and the two flags cost
-        // nothing to hold, because a temp name is disposable: the write reports the collision, and
-        // the next attempt takes the next sequence number.
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW);
-        let file = match mode {
-            Some(mode) => opts.mode(mode).open(&tmp)?,
-            None => opts.open(&tmp)?,
-        };
+        // The `set_permissions` after the open is not redundant with the mode the open carries:
+        // `open` masks its mode with the umask, so a `0755` router under a strict umask still has
+        // to be made what it must be, and doing it before the rename keeps the published path
+        // finished from its first instant.
+        let file = create_temp(&tmp, mode)?;
         {
             use io::Write as _;
             let mut file = &file;
@@ -126,6 +110,41 @@ pub(crate) fn write_atomic_checked(
     })?;
     sync_dir(dir);
     Ok(())
+}
+
+/// The temp a staging of `path` writes before renaming it over `path`: a hidden sibling named for
+/// the target, this process and this staging ([`unique()`]). [`write_atomic`] says why each part is
+/// there.
+pub(crate) fn temp_sibling(path: &Path) -> PathBuf {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    dir.join(format!(".{name}.tmp.{}.{}", std::process::id(), unique()))
+}
+
+/// Create the temp `tmp` and open it for writing, with `mode` when one is given.
+///
+/// The mode rides the `open`. Set only after it, the temp would sit at the umask's mode for the
+/// whole write, and a caller asking for `0600` is asking that the bytes never exist more readable
+/// than that: a profile carrying `[secret]` locators is staged in a directory that is not always
+/// owner-only.
+///
+/// The open is `create_new` and `O_NOFOLLOW`. The temp name is this process's to make, so whatever
+/// else may be sitting there is not this write's business to open: a symlink left at the name would
+/// otherwise be followed, and the bytes would land wherever it points, with `mode` set on that file
+/// instead. Planting one takes a process of the same uid, which is inside sbx's trust domain and
+/// outside the callers' assumptions, and the two flags cost nothing to hold, because a temp name is
+/// disposable: the write reports the collision, and the next attempt takes the next sequence
+/// number.
+pub(crate) fn create_temp(tmp: &Path, mode: Option<u32>) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW);
+    match mode {
+        Some(mode) => opts.mode(mode).open(tmp),
+        None => opts.open(tmp),
+    }
 }
 
 /// Flush a directory's own entries to the device, after a `rename` published one of them.

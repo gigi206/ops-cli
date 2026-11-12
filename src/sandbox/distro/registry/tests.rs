@@ -704,3 +704,140 @@ fn a_file_already_under_the_layers_name_is_not_taken_for_the_layer() {
         "and holds the bytes that hash to the digest, not the ones planted"
     );
 }
+
+/// A layer's download is never written through a symlink left where it goes: not at
+/// `<digest>.partial`, a name that is the same for every fetch of the layer, and not at the names a
+/// fetch takes for a temp of its own.
+///
+/// The names are planted over a span because the sequence number is the process's, shared with
+/// whatever else stages a file while this runs. The refusal has to be the collision itself, which
+/// is what says a planted name was reached rather than one nobody tried.
+#[test]
+fn a_link_where_a_layer_downloads_is_refused_rather_than_written_through() {
+    let dir = crate::testutil::TmpDir::new();
+    let outside = crate::testutil::TmpDir::new();
+    let target = outside.path().join("elsewhere");
+    std::fs::write(&target, b"untouched").expect("the link's target");
+
+    let body: &[u8] = b"the layer's own bytes";
+    let layer = Layer {
+        digest: digest_of(body),
+        media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+        size: body.len() as u64,
+    };
+    let name = layer.digest.replace(':', "-");
+    let link = |at: std::path::PathBuf| {
+        std::os::unix::fs::symlink(&target, &at).expect("plant a link");
+    };
+    link(dir.path().join(format!("{name}.partial")));
+    let next = crate::sandbox::atomicfile::unique() + 1;
+    for n in next..next + 64 {
+        link(
+            dir.path()
+                .join(format!(".{name}.tmp.{}.{n}", std::process::id())),
+        );
+    }
+
+    let err = fetch_layer_with(&layer, dir.path(), |sink, _| {
+        sink.write_all(body)?;
+        Ok(body.len() as u64)
+    })
+    .expect_err("a name this fetch did not create is not one it may write through");
+    assert_eq!(
+        err.kind(),
+        io::ErrorKind::AlreadyExists,
+        "the refusal must be the collision itself: {err}"
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("the link's target"),
+        b"untouched",
+        "the link's target must not have been written through"
+    );
+    assert!(
+        !dir.path().join(&name).exists(),
+        "and nothing was published under the layer's name"
+    );
+}
+
+/// No way a layer fetch fails leaves its download behind: not the transport stopping, not a body
+/// that hashes to another digest, not one shorter than the manifest says, and not a rename the
+/// layer's name refuses.
+///
+/// Every shape runs before any is asserted, so a cleanup that misses names each exit it misses
+/// rather than only the first.
+#[test]
+fn no_failure_of_a_layer_fetch_leaves_its_download_behind() {
+    type Body = Box<dyn FnOnce(&mut dyn io::Write, u64) -> io::Result<u64>>;
+    const BODY: &[u8] = b"the layer's own bytes";
+    let whole = || -> Body {
+        Box::new(|sink, _| {
+            sink.write_all(BODY)?;
+            Ok(BODY.len() as u64)
+        })
+    };
+    let stated = BODY.len() as u64;
+    let shapes: Vec<(&str, u64, bool, Body)> = vec![
+        (
+            "the transport stopping",
+            stated,
+            false,
+            Box::new(move |sink, cap| {
+                assert_eq!(
+                    cap,
+                    blob_cap(stated),
+                    "the fetch is held to the layer's cap"
+                );
+                sink.write_all(&BODY[..4])?;
+                Err(io::Error::other("the connection closed"))
+            }),
+        ),
+        (
+            "a body hashing to another digest",
+            0,
+            false,
+            Box::new(|sink, cap| {
+                // A manifest that states no size holds the fetch to the absolute ceiling.
+                assert_eq!(cap, blob_cap(0), "the fetch is held to the layer's cap");
+                sink.write_all(b"other bytes")?;
+                Ok(11)
+            }),
+        ),
+        (
+            "a body shorter than the manifest says",
+            stated + 1,
+            false,
+            whole(),
+        ),
+        ("a rename the layer's name refuses", stated, true, whole()),
+    ];
+
+    let mut failures = Vec::new();
+    for (shape, size, planted, body) in shapes {
+        let dir = crate::testutil::TmpDir::new();
+        let layer = Layer {
+            digest: digest_of(BODY),
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            size,
+        };
+        let name = layer.digest.replace(':', "-");
+        if planted {
+            std::fs::create_dir(dir.path().join(&name)).expect("plant a directory at the name");
+        }
+        let result = fetch_layer_with(&layer, dir.path(), body);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("the layer directory")
+            .map(|e| {
+                e.expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        left.sort();
+        let expected: Vec<String> = if planted { vec![name] } else { Vec::new() };
+        if result.is_ok() || left != expected {
+            failures.push(format!("{shape}: {result:?}, leaving {left:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

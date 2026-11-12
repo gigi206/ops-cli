@@ -483,45 +483,43 @@ fn fetch_layer_with(
     dir: &Path,
     fetch: impl FnOnce(&mut dyn io::Write, u64) -> io::Result<u64>,
 ) -> io::Result<PathBuf> {
-    let name = layer.digest.replace(':', "-");
-    let path = dir.join(&name);
-    let partial = dir.join(format!("{name}.partial"));
-    let mut sink = HashingWriter {
-        inner: std::fs::File::create(&partial)?,
-        hasher: Sha256::new(),
-    };
-    let cap = blob_cap(layer.size);
-    // Any failure removes the partial file, not only a digest mismatch: a fetch that stopped
-    // halfway leaves bytes that are not a layer, and a later run must not find them and take them
-    // for one.
-    let written = match fetch(&mut sink, cap) {
-        Ok(written) => written,
-        Err(e) => {
-            let _ = std::fs::remove_file(&partial);
-            return Err(e);
+    let path = dir.join(layer.digest.replace(':', "-"));
+    // The download goes to a temp of this fetch's own, created rather than opened: two fetches of
+    // one layer never write into one file, and a symlink left at the name is refused rather than
+    // followed.
+    let partial = crate::sandbox::atomicfile::temp_sibling(&path);
+    let landed = (|| -> io::Result<()> {
+        let mut sink = HashingWriter {
+            inner: crate::sandbox::atomicfile::create_temp(&partial, None)?,
+            hasher: Sha256::new(),
+        };
+        let written = fetch(&mut sink, blob_cap(layer.size))?;
+        let got = format!(
+            "sha256:{}",
+            crate::plugins::catalogue::to_hex(&sink.hasher.finalize())
+        );
+        if got != layer.digest {
+            return Err(io::Error::other(format!(
+                "layer {} came back as {got}",
+                layer.digest
+            )));
         }
-    };
-    let got = format!(
-        "sha256:{}",
-        crate::plugins::catalogue::to_hex(&sink.hasher.finalize())
-    );
-    if got != layer.digest {
+        // A stated size is also checked exactly: the cap refuses a body that overruns it, this
+        // refuses one that stops short of it.
+        if layer.size > 0 && written != layer.size {
+            return Err(io::Error::other(format!(
+                "layer {} is {written} bytes, the manifest says {}",
+                layer.digest, layer.size
+            )));
+        }
+        std::fs::rename(&partial, &path)
+    })();
+    // Every failure removes the temp, not only a digest mismatch, and the rename's too: what a
+    // fetch that stopped leaves is not a layer, and the directory holds nothing but the layers this
+    // function returned.
+    landed.inspect_err(|_| {
         let _ = std::fs::remove_file(&partial);
-        return Err(io::Error::other(format!(
-            "layer {} came back as {got}",
-            layer.digest
-        )));
-    }
-    // A stated size is also checked exactly: the cap above refuses a body that overruns it, this
-    // refuses one that stops short of it.
-    if layer.size > 0 && written != layer.size {
-        let _ = std::fs::remove_file(&partial);
-        return Err(io::Error::other(format!(
-            "layer {} is {written} bytes, the manifest says {}",
-            layer.digest, layer.size
-        )));
-    }
-    std::fs::rename(&partial, &path)?;
+    })?;
     Ok(path)
 }
 
