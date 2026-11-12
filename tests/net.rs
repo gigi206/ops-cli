@@ -1897,6 +1897,45 @@ fn net_pending_all_names_a_session_that_did_not_answer_the_drain_in_full() {
     assert!(stdout.contains("no pending requests"), "{stdout}");
 }
 
+/// An answer by id that the session did not give in full says so, and not that the session is
+/// gone: the verdict may have landed before the cut, so whether the request was answered is not
+/// known. Two shapes, each its own run: a session that closes without reading the verdict, and an
+/// answer cut inside a character. A socket nobody serves any more is still a session gone.
+#[test]
+fn net_pending_allow_by_id_says_a_session_that_did_not_answer_in_full_is_not_known() {
+    let mut misreported = Vec::new();
+    for (shape, reply) in [
+        ("closed without reading the verdict", Reply::CloseUnread),
+        ("cut inside a character", Reply::Bytes(b"ok host=a.t\xc3")),
+    ] {
+        let fx = Project::new("net");
+        let pid = 46_011;
+        let session = StandIn::serve_with(&fx, pid, &[reply]);
+        let out = fx.run(&["net", "pending", "allow", &format!("{pid}.1")]);
+        session.asked();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.code() != Some(2)
+            || stderr.contains("no live session")
+            || !stderr.contains(&format!("session {pid} did not answer '{pid}.1' in full"))
+            || !stderr.contains("is not known")
+        {
+            misreported.push(format!("{shape}: exit {:?}\n{stderr}", out.status.code()));
+        }
+    }
+    assert!(
+        misreported.is_empty(),
+        "an answer not given in full must say it is not known:\n{}",
+        misreported.join("\n---\n")
+    );
+
+    let fx = Project::new("net");
+    StandIn::serve(&fx, 46_012, &[]).asked();
+    let out = fx.run(&["net", "pending", "allow", "46012.1"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("no live session for '46012.1'"), "{stderr}");
+}
+
 #[test]
 fn net_pending_all_save_global_drains_and_persists_each_host() {
     let fx = Project::new("net");

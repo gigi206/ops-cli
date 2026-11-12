@@ -97,9 +97,9 @@ none or a session refused the rule, since the rule is then not in force where it
 be, and when the session registry could not be read, since which sessions are in scope is then
 not known and nothing is loaded. A session whose proxy kept an egress rule without confirming
 it exits 2, as the [`sbx net pending`](../cli/net#sbx-net-pending) answers do, and so does one
-that could not be asked whether it took the rule. A `sbx net pending allow|deny --all` drain that
-reached a session and did not get its whole answer names it and exits 2 as well: some of its
-parked requests may have been answered before the cut, and which is not known.
+that could not be asked whether it took the rule. A `sbx net pending allow|deny` answer, by id or
+`--all`, that reached a session and did not get its whole answer names it and exits 2 as well:
+the verdict may have landed before the cut, and what was answered is not known.
 
 A view given no session id reads the session of the project it runs in: `sbx logs`, `sbx proc
 ls|live|logs`, `sbx fs logs` and `sbx ssh-agent logs`. When that project has no session to

@@ -702,10 +702,20 @@ pub(super) fn net_pending_answer(
             ));
             return ExitCode::from(2);
         }
-        Err(_) => {
+        Err(e) if sandbox::control::session_gone(&e) => {
             diag::error(&format!(
                 "sbx: no live session for '{id}' (the launch may have ended, or its socket is \
                  stale)"
+            ));
+            return ExitCode::from(2);
+        }
+        // Reached, and the answer did not arrive whole: cut, or closed before the verdict was read.
+        // The verdict may have landed, so neither "answered" nor "no such request" is true, and a
+        // `--save` has no host to write.
+        Err(e) => {
+            diag::error(&format!(
+                "sbx: session {pid} did not answer '{id}' in full ({e}), so whether it was \
+                 answered is not known — `sbx net pending` lists what is still parked"
             ));
             return ExitCode::from(2);
         }
