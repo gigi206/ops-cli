@@ -207,6 +207,8 @@ remembers for the live session; `--save` persists a rule; `watch` redraws live. 
 [Ask mode](../networking/ask). `watch` needs a terminal: in a pipe, use the one-shot
 listing or add `--json`. The listing names a session that does not answer in full and exits 1
 ([exit codes](../reference/exit-codes#a-listing-that-could-not-read-a-session-exits-1)); `watch` names it in its frame, for as long as it does not answer.
+A drain that a session did not answer in full names that session and exits 2, since what it
+answered there is not known.
 
 ## `sbx net stats`
 

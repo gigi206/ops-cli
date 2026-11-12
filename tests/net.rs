@@ -1752,6 +1752,13 @@ fn join_within<T>(thread: std::thread::JoinHandle<T>, what: impl FnOnce() -> Str
     thread.join().expect("the thread ended without panicking")
 }
 
+/// How a [`StandIn`] handles one connection: the bytes it writes once it has read the command, or a
+/// close before the command is read, which is what a server does to a peer it refuses.
+enum Reply<'a> {
+    Bytes(&'a [u8]),
+    CloseUnread,
+}
+
 /// A stand-in for session `pid`: its egress control socket under `fx`'s data directory answers one
 /// connection per entry of `replies`, in order, and keeps the command line each connection sent.
 ///
@@ -1766,6 +1773,13 @@ struct StandIn {
 
 impl StandIn {
     fn serve(fx: &Project, pid: u32, replies: &[&str]) -> StandIn {
+        let replies: Vec<Reply> = replies.iter().map(|r| Reply::Bytes(r.as_bytes())).collect();
+        Self::serve_with(fx, pid, &replies)
+    }
+
+    /// [`StandIn::serve`], with each connection handled as its [`Reply`] says. A connection closed
+    /// before its command is read leaves no command line behind.
+    fn serve_with(fx: &Project, pid: u32, replies: &[Reply]) -> StandIn {
         use std::io::{BufRead, BufReader, Write};
         let egress = fx.data_home.path().join("sbx").join("egress");
         std::fs::create_dir_all(&egress).unwrap();
@@ -1774,15 +1788,25 @@ impl StandIn {
                 .unwrap();
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = std::sync::Arc::clone(&asked);
-        let replies: Vec<String> = replies.iter().map(|r| r.to_string()).collect();
+        let replies: Vec<Option<Vec<u8>>> = replies
+            .iter()
+            .map(|r| match r {
+                Reply::Bytes(bytes) => Some(bytes.to_vec()),
+                Reply::CloseUnread => None,
+            })
+            .collect();
         let count = replies.len();
         let server = std::thread::spawn(move || {
             for reply in replies {
                 let (stream, _) = listener.accept().unwrap();
+                let Some(reply) = reply else {
+                    drop(stream);
+                    continue;
+                };
                 let mut cmd = String::new();
                 BufReader::new(&stream).read_line(&mut cmd).unwrap();
                 seen.lock().unwrap().push(cmd.trim_end().to_string());
-                (&stream).write_all(reply.as_bytes()).unwrap();
+                (&stream).write_all(&reply).unwrap();
             }
         });
         StandIn {
@@ -1811,6 +1835,66 @@ impl StandIn {
         });
         asked.lock().unwrap().clone()
     }
+}
+
+/// A drain that a session did not answer in full names that session and exits 2: some of its parked
+/// requests may have been answered before the cut, so "nothing parked" is not what the drain can
+/// say. Two shapes, each its own run: a session that closes without reading the drain, as a server
+/// refusing its peer does, and an answer cut inside a character.
+///
+/// The exit code holds where another session's hosts were answered and saved, and a socket nobody
+/// serves any more is still a session gone, passed over in silence.
+#[test]
+fn net_pending_all_names_a_session_that_did_not_answer_the_drain_in_full() {
+    let mut misreported = Vec::new();
+    for (shape, reply) in [
+        ("closed without reading the drain", Reply::CloseUnread),
+        (
+            "cut inside a character",
+            Reply::Bytes(b"answered host=a.test\nanswered host=b.t\xc3"),
+        ),
+    ] {
+        let fx = Project::new("net");
+        let pid = 46_001;
+        let session = StandIn::serve_with(&fx, pid, &[reply]);
+        let out = fx.run(&["net", "pending", "allow", "--all"]);
+        session.asked();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if out.status.code() != Some(2)
+            || stdout.contains("no pending requests")
+            || !stdout.contains(&format!("session {pid} did not answer the drain in full"))
+        {
+            misreported.push(format!("{shape}: exit {:?}\n{stdout}", out.status.code()));
+        }
+    }
+    assert!(
+        misreported.is_empty(),
+        "a drain not answered in full must name the session and exit 2:\n{}",
+        misreported.join("\n---\n")
+    );
+
+    // Beside a session whose host was answered and saved, the unanswered one still sets the code.
+    let fx = Project::new("net");
+    let answered = StandIn::serve(&fx, 46_002, &["answered host=saved.example\nok\n"]);
+    let cut = StandIn::serve_with(&fx, 46_003, &[Reply::CloseUnread]);
+    let out = fx.run(&["net", "pending", "allow", "--all", "--save", "--global"]);
+    answered.asked();
+    cut.asked();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("saved 1 allow rule(s)")
+            && stdout.contains("session 46003 did not answer the drain in full"),
+        "{stdout}"
+    );
+    assert_eq!(out.status.code(), Some(2), "{stdout}");
+
+    // A socket nobody serves any more: the session went away, and the drain says nothing of it.
+    let fx = Project::new("net");
+    StandIn::serve(&fx, 46_004, &[]).asked();
+    let out = fx.run(&["net", "pending", "allow", "--all"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("no pending requests"), "{stdout}");
 }
 
 #[test]

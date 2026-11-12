@@ -427,18 +427,23 @@ struct Drain {
     /// Sessions whose proxy did not confirm the `--session` rules. Nothing was answered there, and
     /// their requests stay parked.
     unconfirmed: Vec<u32>,
+    /// Sessions the drain reached that did not answer it in full, each with why: the answer was
+    /// cut, or the session closed without reading the drain. Some of their parked requests may have
+    /// been answered by then, so what was answered there is not known.
+    unread: Vec<(u32, std::io::Error)>,
 }
 
 impl Drain {
-    /// Whether some session in scope still has requests this drain did not answer.
+    /// Whether some session in scope may still have requests this drain did not answer.
     fn left_parked(&self) -> bool {
-        !self.unsupported.is_empty() || !self.unconfirmed.is_empty()
+        !self.unsupported.is_empty() || !self.unconfirmed.is_empty() || !self.unread.is_empty()
     }
 
-    /// 2 when a session's proxy did not confirm the `--session` rules, so a script does not go on
-    /// as if they decided its requests there; success otherwise.
+    /// 2 when a session's proxy did not confirm the `--session` rules, or a session did not answer
+    /// the drain in full, so a script does not go on as if its requests there were decided; success
+    /// otherwise.
     fn exit_code(&self) -> ExitCode {
-        match self.unconfirmed.is_empty() {
+        match self.unconfirmed.is_empty() && self.unread.is_empty() {
             true => ExitCode::SUCCESS,
             false => ExitCode::from(2),
         }
@@ -446,7 +451,8 @@ impl Drain {
 }
 
 /// Answer every parked request in each session `keep` accepts, and report what happened. A dead or
-/// stale socket is a session that went away and is skipped.
+/// stale socket is a session that went away and is skipped; any other failure is a session that was
+/// reached, and is reported with why.
 ///
 /// `keep` is evaluated **before** the drain, never after: this writes, and answering a parked
 /// request cannot be undone, so a session the caller meant to skip must not be drained first and
@@ -470,7 +476,8 @@ fn drain_sessions(
             Ok(sandbox::control::DrainOutcome::Drained(_)) => {}
             Ok(sandbox::control::DrainOutcome::Unsupported) => drain.unsupported.push(pid),
             Ok(sandbox::control::DrainOutcome::Unconfirmed) => drain.unconfirmed.push(pid),
-            Err(_) => {}
+            Err(e) if sandbox::control::session_gone(&e) => {}
+            Err(e) => drain.unread.push((pid, e)),
         }
     }
     drain
@@ -919,10 +926,35 @@ fn render_drain(
     o
 }
 
-/// Append to a drain report the sessions whose parked requests it left parked, each with why.
+/// Append to a drain report the sessions whose parked requests it left parked, or may have, each
+/// with why.
 fn write_left_parked_notes(o: &mut String, drain: &Drain, pal: &style::Palette) {
     write_unsupported_note(o, &drain.unsupported, pal);
     write_unconfirmed_note(o, &drain.unconfirmed, pal);
+    write_unread_note(o, &drain.unread, pal);
+}
+
+/// Append to a drain report the sessions it reached that did not answer it in full, each with why.
+/// Some of their parked requests may have been answered before the cut, so the report cannot say
+/// which, and points at the listing that can.
+fn write_unread_note(o: &mut String, unread: &[(u32, std::io::Error)], pal: &style::Palette) {
+    use std::fmt::Write as _;
+    if unread.is_empty() {
+        return;
+    }
+    let (warn, r) = (pal.warn, pal.reset);
+    for (pid, e) in unread {
+        let _ = writeln!(
+            o,
+            "{warn}session {pid} did not answer the drain in full ({e}), so what it answered there \
+             is not known.{r}"
+        );
+    }
+    let _ = writeln!(
+        o,
+        "  {}",
+        style::dim_prose("`sbx net pending` lists what is still parked.", pal)
+    );
 }
 
 /// Append the unconfirmed-rules warning to a drain report: name the sessions whose proxy did not

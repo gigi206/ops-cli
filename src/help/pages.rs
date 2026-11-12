@@ -3213,7 +3213,8 @@ pub(super) const PAGES: &[Page] = &[
             *current project's* sessions and saves each host to the project config — never machine-wide,\n\
             so one project's requests can never land in another's config; `--all --save --global` drains\n\
             across sessions and saves to the global config. A `--local` save pre-flights the trust gate\n\
-            before the (irreversible) drain.",
+            before the (irreversible) drain. A session the drain reached that did not answer it in full\n\
+            is named, and the drain exits 2: what it answered there is not known.",
     },
     Page {
         path: &["net", "pending", "deny"],
@@ -3256,7 +3257,8 @@ pub(super) const PAGES: &[Page] = &[
             `--save`: `--all --save` (default `--local`) drains only the *current project's* sessions\n\
             and saves each host to the project config; `--all --save --global` drains across sessions\n\
             and saves to the global config. A `--local` save pre-flights the trust gate before the\n\
-            (irreversible) drain.",
+            (irreversible) drain. A session the drain reached that did not answer it in full is named,\n\
+            and the drain exits 2: what it answered there is not known.",
     },
     Page {
         path: &["net", "stats"],
