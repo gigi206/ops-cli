@@ -37,7 +37,7 @@ See also: [Declared operations](../tasks/) · [`sbx task`](../cli/task) · [`[se
 | Field | Meaning |
 |---|---|
 | `description` | one line, listed to the caller: this is the operation's documentation |
-| `cmd` | the argv list; `{param}` substitutes **inside** one element, never into extra elements |
+| `cmd` | the argv list; `{param}` substitutes **inside** one element, never into extra elements; `cmd[0]`, the program, is neither blank nor a placeholder |
 | `params` | the caller-supplied values, each [bounded](../tasks/parameters) (`match` / `enum` / `default` per parameter) |
 | `env` | fixed environment for the command |
 | `env_allow` | the variable **names** a caller may set for one invocation, names only, [values are not bounded](../tasks/parameters#caller-set-variables) |

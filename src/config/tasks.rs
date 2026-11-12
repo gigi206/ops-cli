@@ -195,6 +195,11 @@ pub(super) fn validate_task(
     if raw.cmd.is_empty() {
         return Err("set `cmd` — the argv list sbx runs (never a shell string)".to_string());
     }
+    // A blank program names nothing to run, and left to the invocation it would surface as the
+    // cage's failed `execve` rather than as this declaration's mistake.
+    if raw.cmd[0].trim().is_empty() {
+        return Err("`cmd[0]` is blank — it names the program sbx runs".to_string());
+    }
     // The program must be sbx's choice alone: a placeholder in argv0 would let a caller steer which
     // binary runs, which is the one thing a declared task exists to prevent.
     if placeholders(&raw.cmd[0]).next().is_some() {
@@ -1214,6 +1219,26 @@ mod tests {
         raw.cmd[0] = "{sql}".into();
         let e = validate(raw).unwrap_err();
         assert!(e.contains("cmd[0]"), "the error names argv0: {e}");
+    }
+
+    /// A blank program is refused when the declaration is read, naming argv0, rather than left to
+    /// fail at the `execve` of an invocation. Every spelling the refusal misses is reported
+    /// together.
+    #[test]
+    fn a_blank_program_is_refused() {
+        assert!(
+            validate(raw_task()).is_ok(),
+            "calibration: `psql` is a program"
+        );
+        let missed: Vec<&str> = ["", " ", "\t"]
+            .into_iter()
+            .filter(|blank| {
+                let mut raw = raw_task();
+                raw.cmd[0] = (*blank).to_string();
+                !validate(raw).is_err_and(|e| e.contains("cmd[0]"))
+            })
+            .collect();
+        assert!(missed.is_empty(), "a blank program passes: {missed:?}");
     }
 
     #[test]
