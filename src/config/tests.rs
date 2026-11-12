@@ -5601,10 +5601,10 @@ fn an_untrusted_project_cannot_set_reserved_env_keys() {
 /// The three routes to running code that do not name a startup file: a command the tool runs, a
 /// search path an interpreter imports from, and a runtime that loads an agent from its options.
 ///
-/// Each is the same hole `BASH_ENV` is, reached by a different mechanism, and each is refused for a
-/// *task* by `config/tasks.rs` on reasoning this gate's own comment says holds here too. The list
-/// stayed shorter than that one, so an untrusted `[env]` could still set `GIT_SSH_COMMAND` — run at
-/// the first `git fetch`, which is the ordinary shape of the work a cage is stood up for.
+/// Each is the same hole `BASH_ENV` is, reached by a different mechanism, so an untrusted `[env]`
+/// sets none of them: `GIT_SSH_COMMAND` runs at the first `git fetch`, which is the ordinary shape
+/// of the work a cage is stood up for, and a search path is answered before the program's first
+/// line.
 #[test]
 fn an_untrusted_project_cannot_set_a_key_that_runs_code_without_naming_a_startup_file() {
     let keys = [

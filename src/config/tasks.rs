@@ -1036,12 +1036,12 @@ pub(crate) fn is_env_name(name: &str) -> bool {
 /// caller reaching in over the control socket is a different actor entirely.
 ///
 /// The list here and [`crate::config::is_reserved_env_key`]'s are not meant to match: they answer
-/// different questions about different populations. They do disagree on one *fact*, and this is the
-/// side that is behind — an interpreter's import path runs code before the program's first line,
-/// which is why `PYTHONPATH` is refused here while `NODE_PATH`, `CLASSPATH` and `PERL5LIB` are not.
-/// That costs nothing as it stands: a task declaration is trusted by location, and `env_allow` is
-/// validated by this same function, so no untrusted layer reaches either. It starts costing
-/// something the day `env_allow` can be widened by less than a trusted config.
+/// different questions about different populations. They share one fact, written once in
+/// [`super::INTERPRETER_IMPORT_PATHS`]: a search path an interpreter imports from runs code the
+/// value chose before the program's own, `NODE_PATH` for a module absent from `node_modules` and
+/// `CLASSPATH` for a `java` given no `-cp`. A name the declaration lists in `env_allow` is one whose
+/// value the caller supplies, so a declaration trusted by location still cannot hand that choice to
+/// the caller.
 pub(super) fn validate_env_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("an environment variable name is empty".to_string());
@@ -1069,7 +1069,6 @@ pub(super) fn validate_env_name(name: &str) -> Result<(), String> {
         "HOSTALIASES",
         "RESOLV_HOST_CONF",
         "PYTHONSTARTUP",
-        "PYTHONPATH",
         "NODE_OPTIONS",
         "PERL5OPT",
         "RUBYOPT",
@@ -1092,7 +1091,12 @@ pub(super) fn validate_env_name(name: &str) -> Result<(), String> {
         "NO_PROXY",
     ];
     let upper = name.to_ascii_uppercase();
-    if REFUSED_PREFIXES.iter().any(|p| upper.starts_with(p)) || REFUSED.contains(&upper.as_str()) {
+    if REFUSED_PREFIXES.iter().any(|p| upper.starts_with(p))
+        || REFUSED.contains(&upper.as_str())
+        || super::INTERPRETER_IMPORT_PATHS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(name))
+    {
         return Err(format!(
             "`{name}` steers how a program loads or connects, so it is never settable for a task \
              (the task's command and its trust anchors are sbx's choice)"
@@ -1424,6 +1428,48 @@ mod tests {
                 "`{var}` must never be settable for a task"
             );
         }
+    }
+
+    /// A search path an interpreter imports from is refused for a task as `PYTHONPATH` is, whatever
+    /// its case: the caller supplies the value of a name in `env_allow`, and the module that value
+    /// answers runs before the program's own code. Every name the refusal misses is reported
+    /// together.
+    #[test]
+    fn an_interpreter_import_path_is_refused_for_a_task() {
+        let refused = |var: &str| {
+            let mut raw = raw_task();
+            raw.env_allow = vec![var.to_string()];
+            validate(raw).is_err_and(|e| e.contains("steers how a program loads"))
+        };
+        assert!(
+            refused("PYTHONPATH"),
+            "calibration: `PYTHONPATH` is refused"
+        );
+        let mut raw = raw_task();
+        raw.env_allow = vec!["MAKEFLAGS".to_string()];
+        assert!(
+            validate(raw).is_ok(),
+            "calibration: an application's own variable is settable"
+        );
+        let missed: Vec<&str> = [
+            "PYTHONHOME",
+            "NODE_PATH",
+            "node_path",
+            "PERL5LIB",
+            "RUBYLIB",
+            "CLASSPATH",
+            "LUA_PATH",
+            "LUA_CPATH",
+            "GEM_PATH",
+            "R_LIBS",
+            "JULIA_LOAD_PATH",
+            "PSModulePath",
+            "PSMODULEPATH",
+        ]
+        .into_iter()
+        .filter(|var| !refused(var))
+        .collect();
+        assert!(missed.is_empty(), "settable for a task: {missed:?}");
     }
 
     /// A node's `spawn` written with the wrong type is dropped by the layer's recovery, and what is

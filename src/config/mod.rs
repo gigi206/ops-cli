@@ -166,6 +166,30 @@ const BUNDLES_DIR: &str = "bundles";
 /// `sbx.toml` is ignored, exactly like an inline bundle.
 const NET_GROUPS_DIR: &str = "net-groups";
 
+/// The search paths an interpreter imports from. No file is named and no command is given, but a
+/// module the interpreter was going to import anyway is answered from a directory the value
+/// chooses: a `sitecustomize.py` on `PYTHONPATH` runs before the program's first line, and each of
+/// the others is that language's spelling of it.
+///
+/// Read by both gates that keep a name of this kind away from a value someone else chose: an
+/// untrusted project's `[env]` ([`is_reserved_env_key`], as written) and a task's environment,
+/// whose caller-supplied values are the reason a task refuses them ([`tasks::validate_env_name`],
+/// without regard to case).
+const INTERPRETER_IMPORT_PATHS: &[&str] = &[
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "NODE_PATH",
+    "PERL5LIB",
+    "RUBYLIB",
+    "CLASSPATH",
+    "LUA_PATH",
+    "LUA_CPATH",
+    "GEM_PATH",
+    "R_LIBS",
+    "JULIA_LOAD_PATH",
+    "PSModulePath",
+];
+
 /// Environment keys an *untrusted or changed* project may not set. The point is
 /// not to contain the agent — in Mode B it already runs arbitrary code inside the
 /// cage, so a config-set `LD_PRELOAD` grants it nothing new. It is to stop an
@@ -209,6 +233,9 @@ const NET_GROUPS_DIR: &str = "net-groups";
 pub(crate) fn is_reserved_env_key(key: &str) -> bool {
     key.starts_with("LD_")
         || is_proxy_env_key(key)
+        // A search path an interpreter imports from reaches the code-load hooks below by a third
+        // route, with no file named and no command given.
+        || INTERPRETER_IMPORT_PATHS.contains(&key)
         // The CA-bundle keys are matched case-insensitively: env names are case-sensitive, but a
         // nonstandard tool reading a lowercase variant must not slip a swapped CA past the gate.
         || crate::sandbox::egress::CA_FILE_ENV_KEYS
@@ -307,25 +334,6 @@ pub(crate) fn is_reserved_env_key(key: &str) -> bool {
                 | "LESSCLOSE"
                 | "SSH_ASKPASS"
                 | "SUDO_ASKPASS"
-                // A **search path an interpreter imports from**, which reaches the same place by a
-                // third route: no file is named and no command is given, but a module the
-                // interpreter was going to import anyway is answered from a directory the value
-                // chooses. `PYTHONPATH` is the clearest — a `sitecustomize.py` there runs before
-                // the program's first line — and each of the others is that language's spelling of
-                // it. `config/tasks.rs` refuses `PYTHONPATH` for a task on this reasoning; it holds
-                // here for the same reason the hooks above do.
-                | "PYTHONPATH"
-                | "PYTHONHOME"
-                | "NODE_PATH"
-                | "PERL5LIB"
-                | "RUBYLIB"
-                | "CLASSPATH"
-                | "LUA_PATH"
-                | "LUA_CPATH"
-                | "GEM_PATH"
-                | "R_LIBS"
-                | "JULIA_LOAD_PATH"
-                | "PSModulePath"
                 // A runtime that reads its **options** from the environment, where those options
                 // include loading an agent or a startup hook — the JVM and .NET each ship one, and
                 // both are honored before `main`.
