@@ -218,8 +218,26 @@ impl ExecRing {
 /// Serve the control socket, answering `LOG` from the ring the observer pushes to. See
 /// [`super::lens::serve`].
 pub(crate) fn serve(listener: UnixListener, ring: Arc<ExecRing>) -> io::Result<()> {
-    super::lens::serve(listener, move |cmd| super::lens::dispatch_log(cmd, &ring.0))
+    super::lens::serve(listener, move |cmd| dispatch_observing(cmd, &ring))
 }
+
+/// What an observing session answers: its exec log, and to a rule load, that it enforces nothing.
+///
+/// The load is the one verb an observing session must answer in words of its own. `sbx proc
+/// allow|deny --session` asks every live session that has this socket, and an observing one is
+/// among them: told `err bad-request`, the caller read a refusal, from an older sbx or a rule the
+/// server could not load, when the session simply applies no `[proc]` rule
+/// ([`InjectOutcome::NotEnforcing`]). Every other verb an enforcing session serves is refused as
+/// before, which its readers already take for a session that decides nothing.
+fn dispatch_observing(cmd: &str, ring: &ExecRing) -> String {
+    match cmd.starts_with("REMEMBER ") {
+        true => format!("{NOT_ENFORCING}\n"),
+        false => super::lens::dispatch_log(cmd, &ring.0),
+    }
+}
+
+/// An observing session's answer to a rule load: it applies no `[proc]` rule to load one into.
+const NOT_ENFORCING: &str = "err not-enforcing";
 
 /// Serve the control socket for an **enforcing** session (`[proc] mode = enforce|ask`): like
 /// [`serve`], but the dispatch also answers the `ask` decision verbs (`LIST` the parked `execve`s,
@@ -414,6 +432,8 @@ pub(crate) enum InjectOutcome {
     Inert,
     /// The server refused the rule (a malformed rule, or a server without this verb).
     Refused,
+    /// The session observes and enforces nothing, so it holds no rule to load this one beside.
+    NotEnforcing,
 }
 
 /// Load a live `--session` rule into one session's overlay (`REMEMBER ALLOW|DENY <rule>`). A session
@@ -435,6 +455,8 @@ pub(crate) fn inject_proc_rule(
         InjectOutcome::Loaded
     } else if first == "err inert" {
         InjectOutcome::Inert
+    } else if first == NOT_ENFORCING {
+        InjectOutcome::NotEnforcing
     } else {
         InjectOutcome::Refused
     })
@@ -951,6 +973,27 @@ mod tests {
         }
     }
 
+    /// An observing session answers a rule load in words of its own, which the loader reads as a
+    /// session that enforces nothing rather than as a refusal of the rule.
+    #[test]
+    fn an_observing_session_answers_a_rule_load_that_it_enforces_nothing() {
+        use crate::testutil::TmpDir;
+        let dir = TmpDir::new();
+        let socket = dir.join("observe.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let ring = Arc::new(ExecRing::new(10));
+        std::thread::spawn(move || {
+            let _ = serve(listener, ring);
+        });
+        for verdict in [Verdict::Allow, Verdict::Deny] {
+            let got = inject_proc_rule(&socket, verdict, "curl").expect("a whole answer");
+            assert!(
+                matches!(got, InjectOutcome::NotEnforcing),
+                "{verdict:?}: {got:?}"
+            );
+        }
+    }
+
     /// A verb that acts may have acted by the time its answer is cut. Read at face value, a cut
     /// answer to `ALLOW <id>` would make the id unknown, one to `ALLOW *` would list the paths that
     /// happened to arrive as all there were, and one to `REMEMBER` would be a refusal: each a claim
@@ -973,6 +1016,7 @@ mod tests {
             (&b"ok\n"[..], load, "Loaded"),
             (&b"err inert\n"[..], load, "Inert"),
             (&b"err bad-request\n"[..], load, "Refused"),
+            (&b"err not-enforcing\n"[..], load, "NotEnforcing"),
         ] {
             let got = ask_once(&socket, wire, read);
             assert_eq!(

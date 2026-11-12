@@ -226,6 +226,9 @@ fn proc_inject_session(
             Ok(sandbox::proc_control::InjectOutcome::Loaded) => loaded.push(pid),
             Ok(sandbox::proc_control::InjectOutcome::Inert) => inert.push(pid),
             Ok(sandbox::proc_control::InjectOutcome::Refused) => refused.push(pid),
+            // An observing session applies no `[proc]` rule, so there is nothing to load into: it
+            // is passed over as one with no socket is, rather than named as a refusal.
+            Ok(sandbox::proc_control::InjectOutcome::NotEnforcing) => {}
             // A dead socket, or a session that does not enforce `[proc]`: nothing to load into.
             Err(e) if sandbox::control::session_gone(&e) => {}
             // Reached or not, it did not say whether it took the rule: named, so a load that may not

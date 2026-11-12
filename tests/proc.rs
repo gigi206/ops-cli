@@ -245,6 +245,59 @@ fn proc_live_ends_with_its_session_though_the_pid_lingers() {
     );
 }
 
+/// `sbx proc deny --session` passes over a session that only observes: it applies no `[proc]`
+/// rule, so there is nothing to load the rule into, and it is not named as having refused it. The
+/// session is a stand-in answering the load as an observing session does.
+#[test]
+fn a_session_load_passes_over_a_session_that_only_observes() {
+    use std::io::{BufRead, BufReader, Write};
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
+    let pid = std::process::id();
+    common::write_session_record(data.path(), pid, "project", proj.path());
+    let dir = data.path().join("sbx").join("proc");
+    std::fs::create_dir_all(&dir).expect("the control directory");
+    let listener = std::os::unix::net::UnixListener::bind(dir.join(format!("control-{pid}.sock")))
+        .expect("the stand-in socket");
+    listener
+        .set_nonblocking(true)
+        .expect("a listener that polls");
+    let session = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => return format!("never asked: {e}"),
+            }
+        };
+        stream.set_nonblocking(false).expect("a blocking stream");
+        let mut cmd = String::new();
+        BufReader::new(&stream)
+            .read_line(&mut cmd)
+            .expect("the command");
+        (&stream)
+            .write_all(b"err not-enforcing\n")
+            .expect("the answer");
+        cmd
+    });
+    let out = sbx(
+        &["proc", "deny", "curl", "--session", "--all"],
+        data.path(),
+        proj.path(),
+    );
+    let asked = session.join().expect("the stand-in session");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(asked.starts_with("REMEMBER DENY curl"), "asked {asked:?}");
+    assert!(
+        !err.contains("refused the rule"),
+        "an observing session is named as a refusal: {err}"
+    );
+    assert!(err.contains("no enforcing session in scope"), "got: {err}");
+    assert_eq!(out.status.code(), Some(1), "got: {err}");
+}
+
 /// `sbx proc live --json` whose snapshot cannot be written fails, said once, and one whose reader
 /// has gone does not. A full disk under `> file` leaves a stream cut short there, which a script
 /// reading the exit code has to learn; a reader gone, `… | head`, is the end of a pipeline the
