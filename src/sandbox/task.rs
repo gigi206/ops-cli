@@ -1367,7 +1367,7 @@ impl TaskEngine {
                     stopped = super::cagewait::ended_on_our_kill(status);
                     break status;
                 }
-                None => std::thread::sleep(POLL_INTERVAL),
+                None => super::cagewait::nap(POLL_INTERVAL, deadline),
             }
         };
         Ok((status, timed_out, stopped))

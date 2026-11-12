@@ -64,9 +64,18 @@ pub(in crate::sandbox) fn wait_capped(
                 let status = child.wait()?;
                 return Ok((status, ended_on_our_kill(status)));
             }
-            None => std::thread::sleep(poll),
+            None => nap(poll, deadline),
         }
     }
+}
+
+/// Sleep one `poll`, or what is left until `deadline` when that is shorter.
+///
+/// A poll longer than what is left would let a run outlive its ceiling by the difference, so the
+/// waits that poll a cage against a deadline sleep through this: [`wait_capped`], and the task
+/// engine's own loop, which also answers a stop.
+pub(in crate::sandbox) fn nap(poll: Duration, deadline: Instant) {
+    std::thread::sleep(poll.min(deadline.saturating_duration_since(Instant::now())));
 }
 
 #[cfg(test)]
@@ -149,6 +158,30 @@ mod tests {
             status.signal(),
             Some(libc::SIGKILL),
             "the ceiling kills the run rather than waiting it out"
+        );
+    }
+
+    /// The ceiling is met where it falls, not at the next poll past it: a cadence longer than what
+    /// is left of the budget is cut to it.
+    #[test]
+    fn a_poll_longer_than_the_budget_does_not_carry_the_run_past_it() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("sleep can be spawned");
+        let start = Instant::now();
+        let (_, capped) = wait_capped(
+            &mut child,
+            start + Duration::from_millis(100),
+            Duration::from_secs(10),
+        )
+        .expect("the child can be waited for");
+        assert!(capped, "a run alive at its ceiling is reported as capped");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the run was killed {:?} after it started, past its 100 ms ceiling by most of a poll",
+            start.elapsed()
         );
     }
 }
