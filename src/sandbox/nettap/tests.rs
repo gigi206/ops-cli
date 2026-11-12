@@ -621,7 +621,9 @@ fn shrink_buffer(socket: &impl AsRawFd, option: libc::c_int) {
 
 /// A peer that keeps asking and never reads its answers is let go once a write has waited as long
 /// as a read may: the answers fill both buffers, and without a bound on the write the connection
-/// would hold its thread and its slot for as long as the cage lives.
+/// would hold its thread and its slot for as long as the cage lives. The service is held to ending
+/// on that write's own failure, since a connection that ended sooner for any other reason would
+/// also have let its thread go.
 #[test]
 fn a_dns_connection_whose_peer_stops_reading_is_let_go() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
@@ -631,8 +633,12 @@ fn a_dns_connection_whose_peer_stops_reading_is_let_go() {
         let (stream, _) = listener.accept().expect("accept");
         shrink_buffer(&stream, libc::SO_SNDBUF);
         let table = Mutex::new(FakeIps::new());
-        let _ = serve_dns_stream(stream, &table, &Reporter::default(), Duration::from_secs(1));
-        let _ = ended.send(());
+        let _ = ended.send(serve_dns_stream(
+            stream,
+            &table,
+            &Reporter::default(),
+            Duration::from_secs(1),
+        ));
     });
 
     // Held open until the assertion: a peer that closed would end the write with an error, which
@@ -652,9 +658,12 @@ fn a_dns_connection_whose_peer_stops_reading_is_let_go() {
         }
     });
 
+    let ended = served
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the connection must be let go once its answers have nowhere to go");
     assert!(
-        served.recv_timeout(Duration::from_secs(10)).is_ok(),
-        "the connection must be let go once its answers have nowhere to go"
+        matches!(&ended, Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
+        "the write that waited is what ended the service: {ended:?}"
     );
     drop(client);
 }
