@@ -308,14 +308,10 @@ fn the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag() {
         ("launch_foreground", include_str!("mod.rs")),
         ("detached_child", include_str!("detach.rs")),
     ] {
-        let start = production
-            .find(&format!("\nfn {name}("))
+        // The whole function, to the brace that closes its own: a `}` at the start of a line in
+        // one of its strings does not end it before an arm that follows.
+        let body = crate::testutil::function_body(production, &format!("fn {name}("))
             .unwrap_or_else(|| panic!("`{name}` is where a guardless launch decides to exec"));
-        // A top-level `}` in the first column ends the function.
-        let rest = &production[start + 1..];
-        let body = &rest[..rest
-            .find("\n}\n")
-            .unwrap_or_else(|| panic!("`{name}` never closes"))];
 
         // The pair that decides whether an observer is started at all.
         assert!(

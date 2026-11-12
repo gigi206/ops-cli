@@ -841,6 +841,20 @@ pub(crate) fn closing_brace(text: &[u8], open: usize) -> Option<usize> {
     None
 }
 
+/// The body of the first function whose signature begins `signature` (`fn resolve(`), from the
+/// brace that opens it to the one that closes it, both included; `None` when the source has no such
+/// function or it never closes.
+///
+/// Closed by [`closing_brace`], so a brace inside a string or a comment in the body, or a line that
+/// holds a lone `}` in a multi-line string, neither ends the body early nor holds it open: a guard
+/// that reads one function reads all of it and nothing past it.
+pub(crate) fn function_body<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
+    let at = source.find(signature)?;
+    let open = at + source[at..].find('{')?;
+    let close = closing_brace(source.as_bytes(), open)?;
+    Some(&source[open..=close])
+}
+
 /// Every `.rs` source under `src/cli`, sorted, subdirectories included.
 ///
 /// Two guards read the dispatcher sources — the routed-subcommand check in [`crate::cli`] and the
@@ -1955,6 +1969,23 @@ mod helper_tests {
             production_half(gated_items),
             "#[cfg(test)]\nuse x::y;\nfn a() {}\n"
         );
+    }
+
+    /// A function's body runs to the brace that closes its own. A line holding a lone `}` inside a
+    /// multi-line string, which a search for the first `\n}\n` took for the function's end, does
+    /// not end it, and what follows that line is still read; the next function is not.
+    #[test]
+    fn a_function_body_ends_at_its_own_closing_brace() {
+        let source = "fn other() {}\n\nfn target(x: u8) {\n    let s = \"\n}\n\";\n    tail();\n}\n\n\
+                      fn after() { never(); }\n";
+        let body = function_body(source, "fn target(").expect("the body");
+        assert!(body.contains("tail();"), "the body was cut short: {body:?}");
+        assert!(
+            !body.contains("never"),
+            "the body ran past its end: {body:?}"
+        );
+        assert!(body.starts_with('{') && body.ends_with('}'), "{body:?}");
+        assert_eq!(function_body(source, "fn absent("), None);
     }
 
     /// A brace inside a string, a character, or a comment opens nothing: a test module holding one
