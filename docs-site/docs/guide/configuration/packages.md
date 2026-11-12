@@ -302,8 +302,8 @@ store, its `bin/` prepended to the cage `PATH`. Durable and offline-reusable, ex
 like `nix:`. The flake ref must carry an explicit scheme in the flake itself, before any
 `#`, and **every local-source form is rejected** (`path:`/`git+file:`, a leading
 `/`·`.`·`~`, the indirect `nixpkgs` bare or as `flake:nixpkgs`, which your nix registry
-can point anywhere) so a config cannot aim the build at a host path. A ref starting with
-`-` is refused too. The build fetches its inputs over the **host**
+can point anywhere) so a config cannot aim the build at a host path, however its scheme is
+capitalised. A ref starting with `-` is refused too. The build fetches its inputs over the **host**
 network (not the cage allowlist), so a flake whose build self-fetches with its own HTTP
 client (e.g. `bun install`) builds fine: the cage allowlist governs only the app's
 **runtime** egress. Pins advance with

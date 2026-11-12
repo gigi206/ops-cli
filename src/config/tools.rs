@@ -1047,14 +1047,20 @@ pub(crate) fn names_a_local_flake_source(reference: &str) -> bool {
 /// `flake:<id>`, goes through the same registry, which a user's own can point at a local path, so
 /// it is refused with the bare one. And a reference starting with `-` is refused: what is left of
 /// it before the `#` reads as an option to nix (`--impure#x:y` leaves `--impure`).
+///
+/// The schemes refused below are compared without regard to case, which is how a scheme is read
+/// (RFC 3986 §3.1) while the charset admits capitals. The nix and git this is run with refuse the
+/// capitalised spellings on their own, an unsupported input or a git remote helper that does not
+/// exist, and the refusal does not lean on that staying true.
 fn is_valid_flake_ref(reference: &str, allow_insecure_http: bool) -> bool {
     let flake = reference
         .split_once('#')
         .map_or(reference, |(flake, _)| flake);
+    let lower = reference.to_ascii_lowercase();
     if reference.is_empty()
         || reference.starts_with('-')
-        || reference.starts_with("flake:")
-        || names_a_local_flake_source(reference)
+        || lower.starts_with("flake:")
+        || names_a_local_flake_source(&lower)
         || !flake.contains(':')
     {
         return false;
@@ -1067,8 +1073,7 @@ fn is_valid_flake_ref(reference: &str, allow_insecure_http: bool) -> bool {
     // The five sibling backends have required HTTPS since they were written; this validator is the
     // one that never did, which is why the opt-in below arrives here as a widening rather than as
     // the removal of a check it already had.
-    if !allow_insecure_http && (reference.starts_with("http://") || reference.contains("+http://"))
-    {
+    if !allow_insecure_http && (lower.starts_with("http://") || lower.contains("+http://")) {
         return false;
     }
     reference.chars().all(|c| {

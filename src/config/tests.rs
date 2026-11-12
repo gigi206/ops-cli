@@ -6095,6 +6095,40 @@ fn a_flake_reference_takes_its_scheme_from_the_flake_not_the_attribute() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A scheme is read without regard to case (RFC 3986 §3.1), so the plaintext and local schemes are
+/// refused however they are capitalised, and so is the explicit indirect form. The nix and git this
+/// was measured with refuse `HTTP://`, `PATH:` and `FILE://` as an unsupported input on their own,
+/// and `git+HTTP://` and `git+FILE://` die on a `remote-HTTP` or `remote-FILE` helper git does not
+/// have, so the refusal is the declaration's own rather than theirs. Every shape is checked before
+/// the test fails, beside a remote reference that must still be admitted.
+#[test]
+fn a_flake_scheme_is_refused_however_it_is_capitalised() {
+    let refused = [
+        ("http", "flake:HTTP://e/x.tar.gz"),
+        ("git-http", "flake:git+HTTP://e/r"),
+        ("tarball-http", "flake:tarball+Http://e/x.tar.gz"),
+        ("path", "flake:PATH:/tmp/x"),
+        ("file", "flake:FILE:///tmp/x"),
+        ("git-file", "flake:git+FILE:///tmp/x"),
+        ("indirect", "flake:FLAKE:nixpkgs#hello"),
+    ];
+    let admitted = [("git-https", "flake:git+https://h/r?ref=main#a")];
+    let all: Vec<(&str, &str)> = refused.iter().chain(&admitted).copied().collect();
+    let r = resolve_no_plugins(raw_packages(&all), None);
+    let mut wrong = Vec::new();
+    for (name, value) in refused {
+        if pkg(&r.packages, name).is_some() {
+            wrong.push(format!("`{value}` was admitted"));
+        }
+    }
+    for (name, value) in admitted {
+        if pkg(&r.packages, name).is_none() {
+            wrong.push(format!("`{value}` was refused"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 fn raw_flakes(flakes: &[(&str, &str, Option<&str>)]) -> RawConfig {
     RawConfig {
         flakes: flakes
