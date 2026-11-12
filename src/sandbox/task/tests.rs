@@ -2125,5 +2125,10 @@ fn a_deeply_nested_output_is_sized_without_recursing() {
         .expect("a small-stack thread")
         .join()
         .expect("the walk returns");
+    // Deeper than the fixture's own removal descends, so taken down here by the walk that keeps
+    // its own list of directories, and before the assertion, so a size gone wrong does not leave
+    // it on the disk after the run either.
+    crate::sandbox::gc::force_remove_dir_all(&tmp.path().join("out"))
+        .expect("the deep tree is removed");
     assert_eq!(size, 8);
 }
