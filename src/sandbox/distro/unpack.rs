@@ -284,20 +284,18 @@ fn cage(binary: RawFd, copy: bool, rootfs: &Path, args: Vec<OsString>) -> io::Re
 /// deadline: this thread only waits. It is the thread that started the child, so the parent-death
 /// signal bubblewrap arms, which follows the starting thread, cannot fire early.
 ///
-/// The streams are joined after the wait, and their end is what says the cage has gone with
-/// bubblewrap: the caller removes the tree on an error, and a child still writing into it would
-/// race that removal.
+/// The streams are joined after the wait, on the path that stops early too ([`abandon`]), and
+/// their end is what says the cage has gone with bubblewrap: the caller removes the tree on an
+/// error, and a child still writing into it would race that removal.
 fn collect(mut child: Child, deadline: Instant) -> io::Result<Ended> {
     let out = drain(child.stdout.take(), RESULT_MAX, "sbx-unpack-out");
     let message = drain(child.stderr.take(), MESSAGE_MAX, "sbx-unpack-err");
     let (out, message) = match (out, message) {
         (Ok(out), Ok(message)) => (out, message),
-        // Not returned before the child is gone, for the same removal.
-        (Err(e), _) | (_, Err(e)) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
+        (Err(e), Ok(drained)) | (Ok(drained), Err(e)) => {
+            return Err(abandon(child, Some(drained), e));
         }
+        (Err(e), Err(_)) => return Err(abandon(child, None, e)),
     };
     let (status, out_of_time) = crate::sandbox::cagewait::wait_capped(&mut child, deadline, POLL)?;
     Ok(Ended {
@@ -306,6 +304,25 @@ fn collect(mut child: Child, deadline: Instant) -> io::Result<Ended> {
         message: message.join().unwrap_or_default(),
         out_of_time,
     })
+}
+
+/// Stop `child` when one of its streams got no thread to drain it, and hand back `why`.
+///
+/// Not returned before the cage is gone, for the removal [`collect`] names: the child is killed and
+/// reaped, then the stream that was `drained` is joined, since its end, as on the path that read
+/// both, is what says the cage has gone with bubblewrap. Reaping bubblewrap alone does not say it:
+/// the cage's processes die after it, once its death has reached them.
+fn abandon(
+    mut child: Child,
+    drained: Option<std::thread::JoinHandle<Bounded>>,
+    why: io::Error,
+) -> io::Error {
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Some(drained) = drained {
+        let _ = drained.join();
+    }
+    why
 }
 
 /// Read `stream` to its end on a thread named `name`, keeping at most `max` bytes of it.

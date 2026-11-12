@@ -307,6 +307,50 @@ fn an_unpack_that_ends_in_time_is_read_off_both_streams() {
     assert_eq!(outcome(&ended).expect("it said what it spent"), (3, 4));
 }
 
+/// An unpack stopped because a stream got no thread to drain it waits for the cage to be gone, as
+/// the path that drained both does: the stream that was drained is read to its end before the
+/// error is handed back. The child stands for bubblewrap and its subshell for the cage, which
+/// outlives the kill, still holds the pipe, and writes into the tree before it lets go of it.
+#[test]
+fn an_unpack_stopped_for_a_stream_left_undrained_waits_for_the_cage_to_go() {
+    let dir = TmpDir::new();
+    let (started, marker) = (dir.join("cage-started"), dir.join("written-after-the-kill"));
+    let mut child = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "(: >\"$1\"; sleep 1; : >\"$2\") & exec sleep 30",
+            "sh",
+        ])
+        .args([&started, &marker])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("a shell can be spawned");
+    let drained = drain(child.stdout.take(), RESULT_MAX, "sbx-unpack-out")
+        .expect("a thread drains the output");
+    // The kill has to find the cage standing, or there is nothing left to wait for.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !started.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !started.exists() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the subshell standing for the cage never started");
+    }
+    let err = abandon(
+        child,
+        Some(drained),
+        io::Error::other("no thread for the messages"),
+    );
+    assert_eq!(err.to_string(), "no thread for the messages");
+    assert!(
+        marker.exists(),
+        "the stop returned while the cage could still write into the tree"
+    );
+}
+
 /// The unpack's cage names nothing of the host but the userland, the binary and the tree: the one
 /// writable bind is the tree at [`ROOT`], there is no network, and no device or process table.
 #[test]
