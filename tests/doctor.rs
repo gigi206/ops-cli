@@ -276,6 +276,34 @@ fn doctor_reports_a_refused_data_directory_as_refused_not_unset() {
     assert_eq!(verdict(&out), 1, "a refused data directory stops sbx");
 }
 
+/// The other half of that refusal: a verb that needs the store stops on it and points back at it.
+/// After the refusal it used to add that none of `$SBX_DATA_DIR`, `$XDG_DATA_HOME` and `$HOME` was
+/// set, the very absence the line above it had ruled out.
+#[test]
+fn a_verb_stopped_by_a_refused_data_directory_points_at_the_refusal() {
+    let data = TmpDir::new("dr");
+    let long = data.path().join("d".repeat(120));
+    let out = sbx()
+        .arg("store")
+        .env("XDG_DATA_HOME", &long)
+        .output()
+        .expect("spawn sbx store");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr was:\n{stderr}");
+    assert!(
+        stderr.contains("sbx's data directory is"),
+        "the refusal names the directory; stderr was:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("the data directory refused above"),
+        "the verb points at the refusal; stderr was:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("no $SBX_DATA_DIR"),
+        "a refusal is not an unset environment; stderr was:\n{stderr}"
+    );
+}
+
 /// Whether an unprivileged process gets a capability-bearing user namespace here, asked the way
 /// `doctor`'s own stand-in asks before it classifies a failed launch: a forked child creates a user
 /// namespace, then a mount namespace inside it, which needs `CAP_SYS_ADMIN` there.

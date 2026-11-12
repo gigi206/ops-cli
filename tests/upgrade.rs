@@ -77,14 +77,16 @@ fn upgrade_self_refuses_a_build_from_source_and_a_selector() {
     assert!(!data.exists(), "the refusals created the data directory");
 }
 
-/// Whether `log` carries one of the two refusals `sbx upgrade` gives before it rolls anything: no
-/// usable nix, or a data directory sbx refused. Both are the host's failures rather than the roll's.
+/// Whether `log` carries one of the refusals `sbx upgrade` gives before it rolls anything: no usable
+/// nix, or a data directory sbx refused or found no base for. Each is the host's failure rather than
+/// the roll's.
 ///
 /// Each is read off its own sentence, not off "cannot upgrade" alone: a roll that ran and failed
 /// says "cannot upgrade the nixpkgs channel: …" or "cannot upgrade the mise engine: …", and taking
 /// either for a host that cannot roll skips the very failure the test is there to catch.
 fn refused_before_any_roll(log: &str) -> bool {
     log.contains("— cannot upgrade. See `sbx doctor`.")
+        || log.contains("sbx: cannot go on without the data directory refused above.")
         || log.contains("sbx: cannot resolve the data directory")
 }
 

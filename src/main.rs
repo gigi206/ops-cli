@@ -572,9 +572,15 @@ fn current_project_identity() -> Result<String, String> {
 /// and the remedy — the variables that decide where the directory is — has to be in it.
 fn layout_or_fail() -> Result<store::Layout, ExitCode> {
     store::Layout::from_env().ok_or_else(|| {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
+        // A refused directory was named on stderr as it was refused, with its way out
+        // (`Layout::from_env` speaks every refusal it makes), so this line points back at it. Only
+        // a machine that names no base at all is told the variables are unset: said of a refusal,
+        // that contradicted the line printed just above it.
+        diag::error(if store::data_dir_refused() {
+            "sbx: cannot go on without the data directory refused above."
+        } else {
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        });
         ExitCode::FAILURE
     })
 }
