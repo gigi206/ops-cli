@@ -509,6 +509,49 @@ mod tests {
         }
     }
 
+    /// A refused path that does not decode to text is not learned at either level that learns a
+    /// path: the rule it would make is one the grammar refuses for an allow, so the classifier pass
+    /// at the end of [`synthesize`] drops it with a note. Every level misread is reported together.
+    #[test]
+    fn a_path_that_does_not_decode_to_text_is_not_learned() {
+        let learned = |path: &str, gran: Granularity| {
+            synthesize(
+                &[ev(
+                    "api.test",
+                    443,
+                    Some("GET"),
+                    Some(path),
+                    "denied-default",
+                )],
+                &empty_policy(),
+                gran,
+            )
+        };
+        let mut wrong = Vec::new();
+        for gran in [Granularity::Path, Granularity::Exact] {
+            let clean = learned("/a/x", gran);
+            assert!(
+                !clean.rules.is_empty(),
+                "calibration: a clean path is learned at {gran:?}"
+            );
+            let out = learned("/a%FF/x", gran);
+            if !out.rules.is_empty() || !out.notes.iter().any(|n| n.contains("skipped")) {
+                wrong.push(format!(
+                    "{gran:?}: rules {:?}, notes {:?}",
+                    out.rules, out.notes
+                ));
+            }
+            for rule in &out.rules {
+                if crate::allowlist::classify(rule).is_err() {
+                    wrong.push(format!(
+                        "{gran:?} learned `{rule}`, which the grammar refuses"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     fn empty_policy() -> EgressPolicy {
         EgressPolicy::new(vec![], vec![])
     }
