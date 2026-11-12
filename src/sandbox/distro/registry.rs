@@ -147,15 +147,7 @@ fn token(challenge: &str, credential: Option<&Credential>) -> io::Result<Option<
     })?;
     // The realm is a URL the registry chose, so it goes through the same https-only gate every
     // other hop does; `http::get` refuses anything else.
-    let query: Vec<String> = extra
-        .iter()
-        .map(|(k, v)| format!("{k}={}", percent_encode(v)))
-        .collect();
-    let url = if query.is_empty() {
-        realm
-    } else {
-        format!("{realm}?{}", query.join("&"))
-    };
+    let url = token_url(realm, &extra);
     let headers: Vec<(&str, &str)> = credential
         .map(|c| vec![("Authorization", c.header())])
         .unwrap_or_default();
@@ -180,6 +172,21 @@ fn token(challenge: &str, credential: Option<&Credential>) -> io::Result<Option<
         .and_then(|v| v.as_str())
         .ok_or_else(|| io::Error::other("the token document carries no token"))?;
     Ok(Some(token.to_string()))
+}
+
+/// The URL a token is asked for at: the challenge's realm, with the `service` and `scope` it named
+/// added to the realm's query. A realm may carry a query of its own, which the parameters extend
+/// rather than follow with a second `?` that would make the first of them part of its last value.
+fn token_url(realm: String, params: &[(String, String)]) -> String {
+    if params.is_empty() {
+        return realm;
+    }
+    let query: Vec<String> = params
+        .iter()
+        .map(|(k, v)| format!("{k}={}", percent_encode(v)))
+        .collect();
+    let separator = if realm.contains('?') { '&' } else { '?' };
+    format!("{realm}{separator}{}", query.join("&"))
 }
 
 /// Percent-encode a query parameter value. The scope carries a repository path with `/` and `:` in

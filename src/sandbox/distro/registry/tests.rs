@@ -841,3 +841,28 @@ fn no_failure_of_a_layer_fetch_leaves_its_download_behind() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// The token parameters extend a realm's own query rather than start a second one.
+#[test]
+fn a_realm_with_a_query_of_its_own_keeps_the_token_parameters_apart() {
+    let params = [
+        ("service".to_string(), "registry.example".to_string()),
+        ("scope".to_string(), "repository:team/app:pull".to_string()),
+    ];
+    // Calibration: a realm without a query takes one, and a challenge that names no parameter
+    // leaves the realm as it is.
+    assert_eq!(
+        token_url("https://auth.example/token".to_string(), &params),
+        "https://auth.example/token?service=registry.example&scope=repository%3Ateam%2Fapp%3Apull"
+    );
+    assert_eq!(
+        token_url("https://auth.example/token".to_string(), &[]),
+        "https://auth.example/token"
+    );
+    assert_eq!(
+        token_url("https://auth.example/token?account=ci".to_string(), &params),
+        "https://auth.example/token?account=ci&service=registry.example\
+         &scope=repository%3Ateam%2Fapp%3Apull",
+        "a second `?` would make the first parameter part of the realm's last value"
+    );
+}
