@@ -525,6 +525,23 @@ fn run_relay(
         }
     }
     run_windows_watch(&home, stdout);
+    // The watch ends when its pipe does: `Drop` killed the watcher, or the watcher died on its own.
+    // Only the second costs the session its live updates, and it would otherwise go unsaid.
+    if watcher
+        .lock()
+        .is_ok_and(|slot| watch_ended_unasked(slot.stopping))
+    {
+        diag::warn(
+            "`dbus = true`: the Windows theme watcher ended — the app keeps the theme it has now",
+        );
+    }
+}
+
+/// Whether the Windows watch ended without the relay having been told to stop, which is the watcher
+/// dying on its own, worth a word; a stop asked for by [`ThemeRelay::drop`] ends it too, and says
+/// nothing. Pure, for the reason [`may_publish`] is.
+fn watch_ended_unasked(stopping: bool) -> bool {
+    !stopping
 }
 
 /// What [`ThemeRelay`] and its thread share about the Windows-side watcher: the process once it
@@ -574,6 +591,12 @@ impl ThemeRelay {
         let handle = std::thread::Builder::new()
             .name("sbx-theme-relay".to_string())
             .spawn(move || run_relay(home, portal_answered, rx, &theirs))
+            .map_err(|e| {
+                diag::warn(&format!(
+                    "`dbus = true`: the live-theme relay could not start ({e}) — the app keeps its \
+                     at-launch theme"
+                ));
+            })
             .ok();
         ThemeRelay {
             shutdown,
@@ -1198,6 +1221,21 @@ mod tests {
         assert!(
             guard.child.is_none(),
             "and `Drop` had nothing to kill, which is exactly why the flag has to carry the stop"
+        );
+    }
+
+    /// A Windows watch that ends while the relay was not told to stop is the watcher dying on its
+    /// own, which costs the session its live updates and is said; one that `Drop` ended, by setting
+    /// the flag before it kills the watcher, says nothing.
+    #[test]
+    fn only_a_windows_watch_that_ends_unasked_is_said() {
+        assert!(
+            super::watch_ended_unasked(false),
+            "a watcher that died with the relay still running is worth a word"
+        );
+        assert!(
+            !super::watch_ended_unasked(true),
+            "a watch the relay's end stopped is the ordinary end, and silent"
         );
     }
 
