@@ -803,15 +803,28 @@ fn a_refused_namespace_gives_a_capturing_cage_no_holder() {
 /// `holder_plan` reads `as_root` as a parameter because the spec that would carry it does not
 /// exist yet at the call site, and the caller passes `false`. That is only sound while nothing
 /// on this path sets it — so pin exactly that, for the next person to add a launch mode here.
+///
+/// A cage is mapped to uid 0 by `SandboxSpec::rooted_in_its_namespace`, called or passed by name
+/// (the distribution build maps it over a spec), or by writing the `as_root` field, which the
+/// whole sandbox module can reach. Each is looked for in every file of the launch path, since a
+/// spec `build` returns can be changed in any of them before it runs.
 #[test]
 fn nothing_on_the_launch_path_maps_the_cage_to_root() {
-    let text = std::fs::read_to_string("src/sandbox/launch/build.rs").expect("the launch path");
-    let production = crate::testutil::production_half(&text);
-    assert!(
-        !crate::testutil::calls_function(&production, ".as_root("),
-        "this file now maps a cage to uid 0; `holder_plan` is called with a hard-coded \
-             `false` and would silently give that cage the holder. Thread the real value in."
-    );
+    for (name, source) in [
+        ("launch/build.rs", include_str!("build.rs")),
+        ("launch/cage.rs", include_str!("cage.rs")),
+        ("launch/mod.rs", include_str!("mod.rs")),
+        ("launch/reclaim.rs", include_str!("reclaim.rs")),
+        ("launch/session.rs", include_str!("session.rs")),
+        ("launch/detach.rs", include_str!("detach.rs")),
+    ] {
+        let production = crate::testutil::production_half(source);
+        assert!(
+            !production.contains("rooted_in_its_namespace") && !production.contains(".as_root ="),
+            "{name} now maps a cage to uid 0; `holder_plan` is called with a hard-coded `false` \
+             and would silently give that cage the holder. Thread the real value in."
+        );
+    }
 }
 
 /// The launch gate accepts what `sbx doctor` accepts. The stand-in is sbx's own user namespace,
