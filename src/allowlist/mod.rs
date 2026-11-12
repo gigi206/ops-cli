@@ -416,7 +416,9 @@ pub(crate) struct Request {
     /// when it is not 443, an IPv6 host bracketed). Egress is HTTPS, so the scheme is always
     /// `https`. Decoded so a regex deny is not dodged by encoding — but `.`/`..` are **not**
     /// resolved here and the query is still attached, because this is the string the request
-    /// actually carried.
+    /// actually carried. A raw `#` and what follows it is not: that is the fragment, which no origin
+    /// server is given, so it is cut before decoding, and an encoded `%23` stays part of the path.
+    /// Kept, it was text a cage could add to satisfy a `re:` allow without sending any of it.
     url: String,
     /// The same URL rebuilt from [`Self::segs`]: `.`/`..` resolved, empty segments dropped, query
     /// removed. A `re:` rule is matched against **both** this and [`Self::url`], and matching
@@ -447,7 +449,8 @@ impl Request {
     pub(crate) fn new(host: &str, port: u16, target: &str) -> Self {
         let host = canonical_host(host);
         let segs = canonical_segments(target);
-        let decoded = percent_decode(target);
+        let sent = target.split('#').next().unwrap_or("");
+        let decoded = percent_decode(sent);
         let authority = if port == 443 {
             display_host(&host)
         } else {

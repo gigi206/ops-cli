@@ -3545,3 +3545,24 @@ fn a_rule_names_a_destination_whatever_path_it_is_scoped_to() {
         "a pattern over-asks"
     );
 }
+
+/// A fragment is never sent to the origin, so it cannot satisfy a `re:` allow: a pattern that
+/// admits a path ending in `t` and refuses a query admits `/at`, and refuses `/a?t` and `/a#t`
+/// alike.
+#[test]
+fn a_fragment_never_sent_cannot_satisfy_a_regex_allow() {
+    let p = allow(&["re:^https://x\\.test/[^?]*t$"]);
+    let verdict = |target: &str| p.explain("x.test", 443, target, "GET");
+    assert!(
+        matches!(verdict("/at"), Decision::AllowedBy(_)),
+        "calibration: the pattern admits a path ending in `t`"
+    );
+    assert!(
+        matches!(verdict("/a?t"), Decision::DeniedDefault),
+        "calibration: the pattern refuses a query"
+    );
+    assert!(
+        matches!(verdict("/a#t"), Decision::DeniedDefault),
+        "a fragment admits nothing the request does not send"
+    );
+}
