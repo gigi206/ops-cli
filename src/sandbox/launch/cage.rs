@@ -318,15 +318,21 @@ pub(super) fn run_captured(
     let err_reader = std::thread::spawn(move || drain_capped(&mut err_pipe, CAPTURED_CAP));
 
     let deadline = std::time::Instant::now() + CAPTURED_TIMEOUT;
-    let (status, timed_out) =
-        match crate::sandbox::cagewait::wait_capped(&mut child, deadline, CAPTURED_POLL) {
-            Ok(waited) => waited,
-            Err(e) => return (1, format!("cannot wait for the sandbox: {e}")),
-        };
+    let waited = crate::sandbox::cagewait::wait_capped(&mut child, deadline, CAPTURED_POLL);
+    // Both readers are joined before the wait's answer is read, an error included, so neither
+    // outlives this run and writes into the report printed next. The joins cannot hang on an error:
+    // the wait fails only once the cage is dead and reaped (see
+    // [`crate::sandbox::cagewait::wait_capped`]), and so is everything holding its pipes, the netns
+    // holder's configurer included, which dies with the cage's bwrap.
+    //
     // A reader thread that panicked leaves no bytes rather than taking the upgrade down: the exit
     // status is the part the report most needs, and losing a stream is the safe direction.
     let (stdout, out_cut) = out_reader.join().unwrap_or_default();
     let (stderr, err_cut) = err_reader.join().unwrap_or_default();
+    let (status, timed_out) = match waited {
+        Ok(waited) => waited,
+        Err(e) => return (1, format!("cannot wait for the sandbox: {e}")),
+    };
     let mut combined = String::from_utf8_lossy(&stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&stderr));
     // Said in the output rather than only in the exit code, because the output is what the report
