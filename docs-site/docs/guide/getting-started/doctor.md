@@ -72,6 +72,9 @@ differently, and the store moves into it:
   stripped of capabilities. `doctor` checks for the capability-bearing case
   specifically, so it will not pass a host where the namespace exists but is inert.
 
+  With no bubblewrap to launch, nothing proves it: the `sandbox` line is a warning
+  that says so, and the stand-in probe's answer is a note under it, unproven.
+
 - **The bubblewrap engine.** The sandbox itself. `doctor` reports which `bwrap` it
   would use and why: the bundled static engine, or one found on `PATH`, with an
   AppArmor note where relevant (see [Provisioning](../concepts/provisioning)).

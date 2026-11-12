@@ -679,7 +679,15 @@ fn report_security_boundary(
         // already recorded), and still flag a broken namespace as its own fault.
         match probe_userns() {
             Userns::Ok => {
-                rep.note("user namespaces: capability-bearing (cannot prove without bubblewrap)")
+                // A check of its own rather than a note: a note lands under whichever check was
+                // recorded last, the missing engine's here, and a reader keyed on check names
+                // found no word about the boundary at all. The sysctls noted next go under it too.
+                rep.check(
+                    "warn",
+                    "sandbox",
+                    "not launched — there is no bubblewrap to launch one with",
+                );
+                rep.note("user namespaces: capability-bearing (cannot prove without bubblewrap)");
             }
             other => classify_namespace_failure(rep, &other, remediation),
         }
@@ -995,6 +1003,29 @@ mod tests {
             last.status,
             last.name,
             last.notes
+        );
+    }
+
+    /// With no bubblewrap to launch, what is said about the boundary goes under a check of its own
+    /// and not under the missing engine's line. Where the stand-in finds a capability-bearing
+    /// namespace, nothing used to record a check at all, so its word and the sysctls after it
+    /// were filed under `bubblewrap`. A host whose stand-in answers otherwise records the failed
+    /// namespace check either way, so only the first kind of host can show the old shape.
+    #[test]
+    fn with_no_engine_the_boundary_is_reported_under_a_check_of_its_own() {
+        let pal = style::Palette::plain();
+        let mut rep = Report::new(true, &pal);
+        rep.check("fail", "bubblewrap", "not found");
+        let mut remediation = Vec::new();
+        report_security_boundary(&mut rep, None, &mut remediation);
+        assert!(
+            rep.checks[0].notes.is_empty(),
+            "the missing engine's line took a note: {:?}",
+            rep.checks[0].notes
+        );
+        assert!(
+            rep.checks.len() > 1,
+            "nothing was recorded about the boundary"
         );
     }
 
