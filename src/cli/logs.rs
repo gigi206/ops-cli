@@ -329,15 +329,15 @@ fn live_view<E>(
     // time, so that is what the error says.
     let first = match (view.read)(&socket, None) {
         Ok(s) => s,
-        Err(e) if crate::sandbox::lens::unanswered(&e) => {
+        Err(e) if crate::sandbox::control::session_gone(&e) => {
+            diag::error(&(view.absent)(pid));
+            return ExitCode::from(2);
+        }
+        Err(e) => {
             diag::error(&format!(
                 "sbx: {}: session {pid} did not answer in full, so none of it is shown: {e}",
                 view.verb
             ));
-            return ExitCode::from(2);
-        }
-        Err(_) => {
-            diag::error(&(view.absent)(pid));
             return ExitCode::from(2);
         }
     };
@@ -382,7 +382,10 @@ fn live_view<E>(
                 unanswering.answered(&pid);
                 s
             }
-            Err(e) if crate::sandbox::lens::unanswered(&e) => {
+            // Only a session that is gone ends the follow, as for `sbx net logs`: one that was
+            // reached and answered with an error, or could not be asked this time, has stalled,
+            // and its events are shown when it answers again.
+            Err(e) if !crate::sandbox::control::session_gone(&e) => {
                 if unanswering.stalled(pid) {
                     crate::cli::warn_unanswered(
                         view.verb,
@@ -1099,7 +1102,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
                     unfollowable.push(feed.name);
                 }
             }
-            Err(e) if live && crate::sandbox::lens::unanswered(&e) => {
+            Err(e) if live && !crate::sandbox::control::session_gone(&e) => {
                 cut.push((feed.name, e));
             }
             Err(_) => {
@@ -1411,7 +1414,9 @@ fn follow_round(
                 lost_cursor |= head.is_none();
                 feed.cursor = head;
             }
-            Err(e) if crate::sandbox::lens::unanswered(&e) => {
+            // A feed whose session is gone stops being followed; any other failure is a stall,
+            // asked again from the same cursor next round.
+            Err(e) if !crate::sandbox::control::session_gone(&e) => {
                 if unanswering.stalled(feed.name) {
                     stalled.push((feed.name, e));
                 }

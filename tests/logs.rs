@@ -424,6 +424,82 @@ fn a_follow_names_a_session_each_time_it_stops_answering() {
     }
 }
 
+/// A view whose session refuses its read names the refusal and fails: the session was reached, so
+/// its lens is not absent, and it holds no empty feed either. Read as lines with nothing to keep,
+/// the refusal was a view that listed nothing at exit 0; read as an error, it was the sentence for
+/// a lens never stood up.
+#[test]
+fn a_view_names_a_session_that_refuses_its_read() {
+    let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
+    let child = Standin::new();
+    common::write_session_record(data.path(), child.pid(), "project", project.path());
+    serve_reply(data.path(), "fs", child.pid(), "err not-now\n".to_string());
+    let pid = child.pid().to_string();
+
+    let out = run_view(
+        Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(["fs", "logs", &pid])
+            .env("XDG_DATA_HOME", data.path()),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("did not answer in full") && stderr.contains("not-now"),
+        "the refusal is named as one: {stderr}"
+    );
+}
+
+/// A follow whose session answers a poll with an error goes on following it: the session was
+/// reached, so it has not ended, and only a session that is gone ends the follow, as for
+/// `sbx net logs`. The refusal is named on standard error, the next poll asks again from the same
+/// cursor, and what that poll gets is shown. Read as the end, it closed the view on a live session.
+#[test]
+fn a_follow_goes_on_past_a_poll_its_session_answers_with_an_error() {
+    for args in [&["fs", "logs"][..], &["logs", "--feed", "fs"][..]] {
+        let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
+        let child = Standin::new();
+        common::write_session_record(data.path(), child.pid(), "project", project.path());
+        let asked = serve_script(
+            data.path(),
+            "fs",
+            child.pid(),
+            vec![
+                frame(&["event seq=1 at=1700000000123 kind=write path=first.rs"]),
+                "err not-now\n".to_string(),
+                "head=2\nevent seq=2 at=1700000000456 kind=create path=later.rs\nok\n".to_string(),
+            ],
+        );
+        let pid = child.pid().to_string();
+        let mut argv: Vec<&str> = args.to_vec();
+        argv.push(&pid);
+        argv.push("--follow");
+
+        let out = run_view(
+            Command::new(env!("CARGO_BIN_EXE_sbx"))
+                .args(&argv)
+                .env("XDG_DATA_HOME", data.path()),
+        );
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert_eq!(out.status.code(), Some(0), "{argv:?}: {stdout}{stderr}");
+        assert!(
+            stderr.contains("not-now"),
+            "{argv:?}: the refusal is named: {stderr}"
+        );
+        assert!(
+            stdout.contains("later.rs"),
+            "{argv:?}: the poll after the refusal is shown: {stdout}"
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            ["LOG", "LOG after=1", "LOG after=1"],
+            "{argv:?}: the refused poll is asked again from the same cursor"
+        );
+    }
+}
+
 /// A feed of the merged view that did not answer in full at the first read is asked again by the
 /// follow, from the start of its ring, rather than dropped for the rest of it; the header says so,
 /// and the polls that go on not answering do not name it again. Its rows are shown once it answers.

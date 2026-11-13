@@ -106,7 +106,8 @@ view that would read as a quiet session.
 A feed whose answer does not arrive in full is named as such, and none of its events are shown,
 since part of a record would pass for all of it. That covers an answer that stops before the `ok`
 that closes every whole one, a session that closes the connection without reading the request (what
-it does to a reader it refuses, at its connection ceiling or its peer check), and one that does not
+it does to a reader it refuses, at its connection ceiling or its peer check), one that answers the
+read with a refusal (an `err …` line, named in the session's own words), and one that does not
 answer in time. Under `--follow`, a later read that does not arrive in full moves nothing: the feed
 is asked again from where it was, so no event is skipped, and it is named on standard error when it
 stops answering, once for each run of such reads rather than on every poll. `sbx proc logs`, `sbx
@@ -144,8 +145,9 @@ sbx logs --json | jq 'select(.feed == "net")'
 `--feed` takes a comma-separated list. A name no feed answers to is an error, not a silently
 narrower view: reading absence as quiet is exactly the failure this command exists to prevent.
 
-`--follow` polls every live feed past its own cursor and returns when the last one ends. The feeds
-are independent, so one ending is not the session ending.
+`--follow` polls every live feed past its own cursor and returns when the last one ends. A feed
+ends when its socket is gone, which is its session ending; one that is reached and does not answer
+in full is asked again. The feeds are independent, so one ending is not the session ending.
 
 `--json` emits one object per line (NDJSON), each with a `feed` field:
 
