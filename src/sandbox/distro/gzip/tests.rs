@@ -32,20 +32,28 @@ macro_rules! need_gzip {
 /// Compress `data` the way a registry's layer is compressed, so the reader is exercised against a
 /// real gzip member rather than one this test also invented.
 fn gzip(data: &[u8]) -> Vec<u8> {
+    through_gzip("-c", data)
+}
+
+/// What the host's `gzip`, run with `flag`, writes for `data`.
+///
+/// `data` is written from a thread of its own while the output is read here: `gzip` writes as it
+/// reads, so an output larger than its pipe holds stops it until something reads, and a write of
+/// the whole input made first would wait on it for good.
+fn through_gzip(flag: &str, data: &[u8]) -> Vec<u8> {
     use std::io::Write;
     let mut child = std::process::Command::new("gzip")
-        .arg("-c")
+        .arg(flag)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("gzip on PATH");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(data)
-        .expect("write");
-    let out = child.wait_with_output().expect("gzip ran");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let out = std::thread::scope(|scope| {
+        // The input ends when the writer drops its end, once everything is written.
+        scope.spawn(move || stdin.write_all(data).expect("write"));
+        child.wait_with_output().expect("gzip ran")
+    });
     assert!(out.status.success());
     out.stdout
 }
@@ -153,22 +161,46 @@ fn a_file_of_several_gzip_members_inflates_to_all_of_them() {
 
 /// Decompress with the host's `gzip`, so a test's expectation is not this module's own answer.
 fn gunzip(data: &[u8]) -> Vec<u8> {
-    use std::io::Write;
-    let mut child = std::process::Command::new("gzip")
-        .arg("-dc")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("gzip on PATH");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(data)
-        .expect("write");
-    let out = child.wait_with_output().expect("gzip ran");
-    assert!(out.status.success());
-    out.stdout
+    through_gzip("-dc", data)
+}
+
+/// A payload larger than a pipe holds and that does not compress crosses the host's `gzip` both
+/// ways, and this reader inflates what it wrote: the oracle reads its output while it writes the
+/// input, so neither side waits on the other.
+#[test]
+fn an_incompressible_payload_larger_than_a_pipe_crosses_the_oracle() {
+    need_gzip!();
+    // xorshift64: bytes that do not compress, the same on every run.
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let payload: Vec<u8> = (0..1 << 20)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect();
+    let crossed = crate::testutil::returns_within(
+        std::time::Duration::from_secs(30),
+        "a MiB through the host's gzip and back",
+        move || {
+            let compressed = gzip(&payload);
+            let back = gunzip(&compressed);
+            (payload, compressed, back)
+        },
+    );
+    let (payload, compressed, back) = crossed;
+    assert!(
+        compressed.len() > 1 << 16,
+        "the payload compressed to {} bytes, within what a pipe holds",
+        compressed.len()
+    );
+    assert_eq!(back, payload, "the host's gzip gives the payload back");
+    assert_eq!(
+        inflate_all(&compressed).expect("inflates"),
+        payload,
+        "this reader inflates what the host's gzip wrote"
+    );
 }
 
 /// One gzip member around `payload`, deflated in process, for a test whose expectation is its own
