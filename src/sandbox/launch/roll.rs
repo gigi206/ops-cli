@@ -1441,5 +1441,8 @@ fn mise_roll_recap(
     }
 }
 
+mod project_tools;
+pub(crate) use project_tools::{app_rolls_project_tools, upgrade_project_tools};
+
 #[cfg(test)]
 mod tests;

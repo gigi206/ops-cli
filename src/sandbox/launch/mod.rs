@@ -86,7 +86,10 @@ use session::{launch_display_name, render_gui_stop_hint};
 pub(crate) use build::{RUNTIME_DIR_ENV, WAYLAND_DISPLAY_ENV};
 pub(crate) use detach::{SessionHeader, detach_log_path, parse_session_header};
 pub(crate) use reclaim::{gc, superseded_reclaimable_hint};
-pub(crate) use roll::{RollMode, upgrade_mise_packages, upgrade_provision_steps};
+pub(crate) use roll::{
+    RollMode, app_rolls_project_tools, upgrade_mise_packages, upgrade_project_tools,
+    upgrade_provision_steps,
+};
 pub(crate) use session::{attach, stop};
 // Re-exported at the width they had as one file: `pub(super)` on a child would now mean "visible in
 // `launch`", and these four are read from `sandbox` itself.

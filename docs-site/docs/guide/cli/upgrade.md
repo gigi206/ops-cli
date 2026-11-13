@@ -16,7 +16,7 @@ replaces `sbx` and rolls no channel.
 |---|---|
 | `all` | every channel, and the bundles' install steps under their own guards (the default) |
 | `nix` | the nixpkgs channel (base userland + native `nix:` packages) |
-| `mise` | the mise engine, the project's `nix:` tools, `mise:` packages, and the [task tool pool](../tasks/execution#the-task-tool-pool) |
+| `mise` | the mise engine, the project's mise tools (`nix:` and [the rest](../housekeeping/upgrade#the-projects-own-mise-tools)), `mise:` packages, and the [task tool pool](../tasks/execution#the-task-tool-pool) |
 | `distro` | the declared [`distro`](../configuration/distro) image, re-resolved to the digest the registry serves now |
 | `provision` | re-run the apps' [bundle install steps](../configuration/bundles#the-install-step) in-cage, regardless of their guards |
 | `self` | the `sbx` binary, replaced with what its release serves now; never part of `all` (see [Upgrading sbx itself](#upgrading-sbx-itself)) |

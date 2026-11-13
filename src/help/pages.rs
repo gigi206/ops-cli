@@ -1875,7 +1875,8 @@ pub(super) const PAGES: &[Page] = &[
             ),
             (
                 "mise",
-                "the mise engine, the project's nix: tools, mise: packages, and the task tool pool",
+                "the mise engine, the project's mise tools (nix: and the rest), mise: packages, \
+                 and the task tool pool",
             ),
             (
                 "distro",
@@ -2353,6 +2354,8 @@ pub(super) const PAGES: &[Page] = &[
             `sbx upgrade nix` does not move. An inline `[flakes.<name>]` rolls nowhere: it pins its\n\
             inputs in its own source and rebuilds when that source changes, so no channel advances\n\
             it.\n\n\
+            It also rolls the project's own non-`nix:` mise tools in this app's home, unless the\n\
+            app reads the pool `sbx run` fills, whose copy the project's roll moves.\n\n\
             What it leaves alone is everything that belongs to the project rather than to this\n\
             app: the mise engine, the project's `nix:` tools, the task tool pool, the baseline's\n\
             packages, and the distribution image, which no app can declare. It also prunes\n\

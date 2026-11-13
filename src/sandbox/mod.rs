@@ -178,9 +178,10 @@ pub(crate) use gc::{
     reset_home, tree_size, tree_usage, tree_usage_parts,
 };
 pub(crate) use launch::{
-    Learned, RollMode, SessionHeader, app, attach, detach_log_path, distro_lock_path,
-    effective_lock_target, gc, parse_session_header, run, run_mise, shell_quote, stop,
-    superseded_reclaimable_hint, upgrade_mise_packages, upgrade_provision_steps,
+    Learned, RollMode, SessionHeader, app, app_rolls_project_tools, attach, detach_log_path,
+    distro_lock_path, effective_lock_target, gc, parse_session_header, run, run_mise, shell_quote,
+    stop, superseded_reclaimable_hint, upgrade_mise_packages, upgrade_project_tools,
+    upgrade_provision_steps,
 };
 pub(crate) use learn::Synthesis;
 pub(crate) use naming::cage_name;

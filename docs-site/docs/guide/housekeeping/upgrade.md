@@ -40,7 +40,7 @@ sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>] [-n]
 |---|---|
 | `all` | every backend below (the default), plus the bundles' install steps under their own guards |
 | `nix` | the nixpkgs channel: the base userland and native `nix:` packages |
-| `mise` | the mise engine, the project's `nix:` tools, `mise:` packages, and the declared operations' tool pool |
+| `mise` | the mise engine, the project's mise tools (`nix:` and the rest), `mise:` packages, and the declared operations' tool pool |
 | `distro` | the declared [`distro`](../configuration/distro) image, re-resolved to the digest the registry serves now |
 | `provision` | re-runs the apps' bundle install steps in-cage, one cage per app, regardless of their guards |
 | `self` | no lock: the `sbx` binary, replaced with what its release serves now, and never part of `all` (see [Upgrading sbx itself](../cli/upgrade#upgrading-sbx-itself)) |
@@ -60,8 +60,25 @@ it is the table in [What each backend does on upgrade](#what-each-backend-does-o
 
 Each cage a roll starts serves its app's own declarations and nothing else. The tools the
 project's mise file declares from another backend than `nix:` (`npm:`, `aqua:`, `cargo:`…)
-are not installed there, whichever project the roll is started from: they belong to the
-project, and its next launch equips them as usual.
+are rolled apart, under their own heading, `project mise tools`.
+
+### The project's own mise tools
+
+A launch installs a tool of the project's mise file only when no installed version satisfies
+it, and never moves one (see [Non-`nix:` backends](../configuration/tools#non-nix-backends-auto-equipped-in-cage)).
+`sbx upgrade mise` is what moves them: it runs mise's own `upgrade` on them, within the range
+the file declares, and installs a declared tool the home does not hold yet. The file itself
+is never written; a `mise.lock` beside it, if the project keeps one, is updated as mise
+updates it.
+
+Every cage of the project keeps its own copy, so the roll walks the same homes: the
+project's (`sbx run`) and each app's. An app that reads the pool `sbx run` fills
+([`[apps] read_project_pool`](../configuration/packages#apps-read_project_pool-when-an-app-needs-the-tools-the-projects-shell-installed),
+on by default) is named as following the project's pool and not rolled itself: the project's
+roll moves the copy it runs. `--app <name>` rolls that app's home only. Each home is rolled
+under its own egress, so an app that does not read the pool and whose egress refuses a tool's
+host fails there, and says so. The roll is trusted-only, like the project's `nix:` tools.
+`--dry-run` names what each home would install and installs nothing.
 
 See [`sbx upgrade`](../cli/upgrade) for the flags (`-a <name>`, `--project <path>`,
 `-n, --dry-run`) and the per-target behavior. `--dry-run` reports what a roll would move

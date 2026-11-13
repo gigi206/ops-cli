@@ -178,6 +178,9 @@ same roll as [`sbx upgrade --app <name>`](upgrade#rolling-one-app), under its ow
 | `nix:` packages | rolls them against the [app's own nixpkgs lock](upgrade#an-apps-base-channel) |
 | an inline [`[flakes.<name>]`](../configuration/packages#flakes-an-inline-nix-flake) | nothing: it pins its inputs in its own source, so no channel advances it |
 
+It also rolls the project's own non-`nix:` mise tools in this app's home, unless the app
+reads the pool `sbx run` fills: see [The project's own mise tools](../housekeeping/upgrade#the-projects-own-mise-tools).
+
 What the roll does **not** touch is everything that belongs to the project rather than to
 this app: the mise engine, the project's `nix:` tools, the
 [task tool pool](../tasks/execution#the-task-tool-pool), the project baseline's packages,

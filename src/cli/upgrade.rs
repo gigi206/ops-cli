@@ -387,6 +387,9 @@ fn run_upgrade(
         // config before any sandbox work (so a project with no `mise:` package keeps this cheap and
         // sandbox-free), and the cage is built against `cwd` so `--project` retargets it too.
         ok &= sandbox::upgrade_mise_packages(&cwd, &cfg, &pal, only, mode);
+        // The project's own mise tools, which a launch installs when they are missing and never
+        // moves: rolled here, in the project's home and in each app's that does not read it.
+        ok &= sandbox::upgrade_project_tools(&cwd, &cfg, &pal, only, mode);
     }
     if matches!(what, "all") {
         // The project's and apps' `flake:` `[packages]` re-resolve to a fixed revision and the
@@ -592,10 +595,15 @@ fn app_selector_refusal(
             "sbx: {verb}: app `{name}` declares no install step — it rides a `[packages]` \
              backend, so `sbx upgrade --app {name}` advances it."
         )),
-        "mise" if !declares_mise_package(cfg, app) => Some(format!(
-            "sbx: {verb}: app `{name}` declares no `mise:` package — `sbx upgrade --app {name}` \
-             rolls the backends it does declare."
-        )),
+        "mise"
+            if !declares_mise_package(cfg, app) && !sandbox::app_rolls_project_tools(cfg, name) =>
+        {
+            Some(format!(
+                "sbx: {verb}: app `{name}` declares no `mise:` package and keeps no copy of the \
+                 project's mise tools of its own — `sbx upgrade --app {name}` rolls the backends it \
+                 does declare."
+            ))
+        }
         // The one target with no per-app unit at all, and structurally so: `ResolvedApp` carries no
         // `distro` field, so the distribution image is the project's and no app can name one of its
         // own. This is a different answer from the two above — they say "not this app", this one
@@ -614,7 +622,8 @@ fn app_selector_refusal(
         "all"
             if app.packages.is_empty()
                 && app.provisions.is_empty()
-                && !declares_mise_package(cfg, app) =>
+                && !declares_mise_package(cfg, app)
+                && !sandbox::app_rolls_project_tools(cfg, name) =>
         {
             Some(format!(
                 "sbx: {verb}: app `{name}` declares no packages and no install step — there is \

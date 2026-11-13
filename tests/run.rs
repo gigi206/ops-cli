@@ -7710,6 +7710,114 @@ fn an_upgrade_leaves_the_projects_own_mise_tools_out_of_every_app_cage() {
     );
 }
 
+/// The versions `sbx run` installed for the project's mise file, read off its pool.
+fn project_pool_versions(data: &Path, tool_dir: &str) -> Vec<String> {
+    let mut versions: Vec<String> = std::fs::read_dir(data.join("projects"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|project| {
+            std::fs::read_dir(
+                project
+                    .path()
+                    .join("home/.local/share/mise/installs")
+                    .join(tool_dir),
+            )
+            .into_iter()
+            .flatten()
+            .flatten()
+        })
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    versions.sort();
+    versions
+}
+
+#[test]
+fn a_launch_keeps_the_project_tool_it_has_and_only_sbx_upgrade_moves_it() {
+    // A tool the project's mise file asks for by a range is installed once and kept: a launch
+    // installs only what is missing, and `sbx upgrade mise` is what moves it, after a dry run that
+    // names the move and changes nothing. Teeth: the pool holds 1.5.0 for a range `1` whose newest
+    // release is newer, and each step is read off the pool rather than off what sbx prints. Skips
+    // (never fails) without a sandbox or the network.
+    let project = TmpDir::prefixed("r", "ptr-proj");
+    let data = TmpDir::prefixed("r", "ptr-data");
+    let state = TmpDir::prefixed("r", "ptr-state");
+
+    probe_or_skip!(
+        "project tools roll e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
+    need_reachable!(
+        cache_reachable(),
+        "skipping project tools roll e2e: the network is unreachable"
+    );
+
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[network]\nmode = \"deny\"\nallow = [\"{GET,HEAD} https://registry.npmjs.org\"]\n\
+         [packages]\nnode = \"nix:nodejs\"\n",
+    )
+    .unwrap();
+    let step = |what: &str, args: &[&str]| {
+        let out = sbx_in(project.path(), data.path(), state.path(), args);
+        assert!(
+            out.status.success(),
+            "{what} failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let declare = |version: &str| {
+        std::fs::write(
+            project.path().join("mise.toml"),
+            format!("[tools]\n\"npm:cowsay\" = \"{version}\"\n"),
+        )
+        .unwrap();
+        step("sbx trust", &["trust", "--yes"]);
+    };
+
+    declare("1.5.0");
+    step("the first launch", &["run", "--", "true"]);
+    assert_eq!(project_pool_versions(data.path(), "npm-cowsay"), ["1.5.0"]);
+
+    // A range the installed version satisfies: the launch installs nothing.
+    declare("1");
+    step("a launch under the range", &["run", "--", "true"]);
+    assert_eq!(
+        project_pool_versions(data.path(), "npm-cowsay"),
+        ["1.5.0"],
+        "a launch must not move a version the pool satisfies"
+    );
+
+    // The dry run names the move and installs nothing.
+    let dry = step("sbx upgrade mise -n", &["upgrade", "mise", "-n"]);
+    assert!(
+        dry.contains("project mise tools") && dry.contains("npm:cowsay@1.6"),
+        "the dry run names the release it would install: {dry}"
+    );
+    assert_eq!(
+        project_pool_versions(data.path(), "npm-cowsay"),
+        ["1.5.0"],
+        "a dry run installs nothing"
+    );
+
+    // The roll moves it.
+    let rolled = step("sbx upgrade mise", &["upgrade", "mise"]);
+    assert!(
+        rolled.contains("1.5.0 → 1.6"),
+        "the roll names the move: {rolled}"
+    );
+    assert!(
+        project_pool_versions(data.path(), "npm-cowsay")
+            .iter()
+            .any(|v| v.starts_with("1.6")),
+        "the roll installs the newer release"
+    );
+}
+
 #[test]
 fn an_app_finds_the_project_tools_sbx_run_installed_without_fetching_them() {
     // An app's `[network]` replaces the project's, so a tool the project's mise file declares from a
