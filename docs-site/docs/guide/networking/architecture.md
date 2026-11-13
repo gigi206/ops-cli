@@ -622,11 +622,15 @@ read from the same bytes; they can differ only for the moment a `--session` rule
 been sent and is not yet in force, and a connection refused then carries
 `supervisor-denied`.
 
-Every v6 spelling that carries a v4 inside it is unwrapped first and classified by the
-address it embeds, so the guard cannot be dodged by an alternate encoding: v4-mapped
-(`::ffff:127.0.0.1`), v4-compatible (`::127.0.0.1`), NAT64 (`64:ff9b::`), 6to4
-(`2002::/16`) and Teredo (`2001:0::/32`). Two addresses only look like that last shape
-and keep their own classes: `::1` is the loopback and `::` is refused outright.
+Every v6 spelling that carries a v4 at a fixed place is unwrapped first and classified by
+the address it embeds, so the guard cannot be dodged by an alternate encoding: v4-mapped
+(`::ffff:127.0.0.1`), v4-compatible (`::127.0.0.1`), NAT64's well-known prefix
+(`64:ff9b::/96`), 6to4 (`2002::/16`) and Teredo (`2001:0::/32`). Two addresses only look
+like that last shape and keep their own classes: `::1` is the loopback and `::` is refused
+outright. A prefix a network chooses for its own NAT64, the local-use `64:ff9b:1::/48`
+included, puts the v4 where that prefix's length says, which the address alone does not
+tell: on a network that translates through one, the guard classifies the address by its v6
+spelling.
 
 ### Fail-closed upstream validation
 

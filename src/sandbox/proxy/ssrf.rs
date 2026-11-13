@@ -42,9 +42,11 @@ enum IpClass {
 fn classify_ip(ip: IpAddr) -> IpClass {
     match ip {
         IpAddr::V4(v4) => classify_v4(v4),
-        // An IPv6 address that embeds a v4 (mapped, NAT64, 6to4, Teredo) is classified as that v4,
-        // so an internal/metadata v4 cannot dodge the v4 guard wearing a v6 spelling (e.g.
-        // `64:ff9b::a9fe:a9fe`, NAT64 of `169.254.169.254`).
+        // An IPv6 address that embeds a v4 at a fixed place (mapped, compatible, NAT64's well-known
+        // prefix, 6to4, Teredo) is classified as that v4, so an internal/metadata v4 cannot dodge
+        // the v4 guard wearing a v6 spelling (e.g. `64:ff9b::a9fe:a9fe`, NAT64 of
+        // `169.254.169.254`). A prefix a network picks for its own NAT64 is not unwrapped: where
+        // its v4 sits depends on that prefix's length, which the address does not carry.
         IpAddr::V6(v6) => match allowlist::embedded_v4(v6) {
             Some(v4) => classify_v4(v4),
             None => classify_v6(v6),
