@@ -282,7 +282,8 @@ mod tests {
     ///
     /// Counted rather than trusted to stay converted, because the failure is silent: a new warning
     /// producer with a plain `warn` looks exactly like a correct one. The loop variable is the tell
-    /// — a `warn` whose argument is a bare `warning` or `w` is printing somebody else's string.
+    /// — a `warn` whose argument is a bare `warning`, `w` or `notice` is printing somebody else's
+    /// string, the last the name an override's notices go by.
     ///
     /// **The population is the whole crate.** The rule belongs to the function it is about rather
     /// than to any one module that happens to hold today's instances: the launch tree and the CLI
@@ -307,7 +308,7 @@ mod tests {
                 continue;
             };
             let production = crate::testutil::production_half(&text);
-            for needle in ["warn(warning)", "warn(w)"] {
+            for needle in ["warn(warning)", "warn(w)", "warn(notice)"] {
                 let n = production.matches(needle).count();
                 if n > 0 {
                     let relative = file.display().to_string().replacen(&root, "", 1);

@@ -854,8 +854,9 @@ fn take_override_flag(
 fn build_override(cli: &config::CliOverrides) -> Result<config::Override, ExitCode> {
     match config::overrides::collect(cli) {
         Ok(ov) => {
+            // A notice can name what an override blob spelled, as every config warning can.
             for notice in ov.notices() {
-                diag::warn(notice);
+                diag::warn_config(notice);
             }
             Ok(ov)
         }
