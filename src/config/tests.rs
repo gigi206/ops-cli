@@ -14798,6 +14798,10 @@ fn a_contract_the_launch_cannot_honour_is_refused_with_its_reason() {
             "must be a command-line option",
         ),
         (
+            "cmd = \"agent\"\ncontract = { arg = \"--prompt\\nsbx: note: forged\" }",
+            "must be a command-line option",
+        ),
+        (
             "cmd = \"agent\"\ncontract = { env = \"PROMPT_FILE\" }",
             "unknown key `env`",
         ),

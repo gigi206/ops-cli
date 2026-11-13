@@ -232,7 +232,9 @@ pub(super) fn validate_contract(
         ));
         return None;
     };
-    if !arg.starts_with('-') || arg == "--" || arg == "-" {
+    // An option name holds no control character, and one that did would also reach the warnings
+    // that quote it, a line feed starting a line of its own.
+    if !arg.starts_with('-') || arg == "--" || arg == "-" || arg.chars().any(char::is_control) {
         warnings.push(format!(
             "{source}: ignoring `contract` — `arg` must be a command-line option such as \
              `--append-system-prompt-file`, not `{}`",
