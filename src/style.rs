@@ -67,13 +67,15 @@ impl Palette {
         }
     }
 
-    /// Decide color for a stream — the conventional auto-detection: colored only when the stream
-    /// is a terminal, `NO_COLOR` is unset, and the terminal is not `dumb`. The caller passes the
-    /// stream's `is_terminal()` so the same logic serves stdout and stderr.
+    /// Decide color for a stream — the conventional auto-detection ([`colors_on`]): colored only
+    /// when the stream is a terminal, `NO_COLOR` is unset or empty, and the terminal is not `dumb`.
+    /// The caller passes the stream's `is_terminal()` so the same logic serves stdout and stderr.
     pub(crate) fn for_stream(is_tty: bool) -> Self {
-        let on = is_tty
-            && std::env::var_os("NO_COLOR").is_none()
-            && std::env::var_os("TERM").is_none_or(|t| t != "dumb");
+        let on = colors_on(
+            is_tty,
+            std::env::var_os("NO_COLOR").as_deref(),
+            std::env::var_os("TERM").as_deref(),
+        );
         if on { Self::colored() } else { Self::plain() }
     }
 
@@ -82,6 +84,19 @@ impl Palette {
     pub(crate) fn is_plain(&self) -> bool {
         self.reset.is_empty()
     }
+}
+
+/// Whether a stream is painted, from what [`Palette::for_stream`] reads: the stream is a terminal,
+/// `NO_COLOR` asks for nothing, and `TERM` is not `dumb`.
+///
+/// `NO_COLOR` turns color off when it is present and not empty, whatever its value, as the
+/// convention it comes from has it (no-color.org): an empty one is the same as none.
+fn colors_on(
+    is_tty: bool,
+    no_color: Option<&std::ffi::OsStr>,
+    term: Option<&std::ffi::OsStr>,
+) -> bool {
+    is_tty && no_color.is_none_or(std::ffi::OsStr::is_empty) && term.is_none_or(|t| t != "dumb")
 }
 
 /// Lift each `` `…` `` span in `text` to `hue` — the one backtick-span scanner every painter
@@ -227,7 +242,35 @@ pub(crate) enum Align {
 
 #[cfg(test)]
 mod tests {
-    use super::{Align, Palette, render_table};
+    use super::{Align, Palette, colors_on, render_table};
+    use std::ffi::OsStr;
+
+    /// A stream is painted only on a terminal, without a `NO_COLOR` that asks for none and
+    /// without a `dumb` terminal; an empty `NO_COLOR` asks for nothing, and any other value, `0`
+    /// included, turns color off. Each case is checked on its own, and every one decided the other
+    /// way is named.
+    #[test]
+    fn no_color_turns_color_off_only_when_it_is_set_to_something() {
+        let cases: [(bool, Option<&str>, Option<&str>, bool); 7] = [
+            (true, None, None, true),
+            (true, Some(""), None, true),
+            (true, Some("1"), None, false),
+            (true, Some("0"), None, false),
+            (true, None, Some("dumb"), false),
+            (true, None, Some("xterm-256color"), true),
+            (false, None, None, false),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(tty, no_color, term, want)| {
+                colors_on(*tty, no_color.map(OsStr::new), term.map(OsStr::new)) != *want
+            })
+            .map(|(tty, no_color, term, want)| {
+                format!("tty={tty} NO_COLOR={no_color:?} TERM={term:?} wants {want}")
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
 
     #[test]
     fn plain_spans_are_all_empty_so_captured_output_is_byte_for_byte_plain() {
