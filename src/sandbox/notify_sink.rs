@@ -2373,7 +2373,6 @@ mod tests {
     /// candidates are on the Windows drive, so repeating it per announcement is the defect.
     #[test]
     fn the_toast_launcher_is_resolved_once_and_then_reused() {
-        use std::os::unix::fs::PermissionsExt as _;
         let mut sink = WslToastSink {
             context: "test".into(),
             // Already made, so the delivery does not also run the two interop round-trips of the
@@ -2395,8 +2394,11 @@ mod tests {
         // nothing here too, and spawn nothing; a child proves it used what was kept.
         let tmp = crate::testutil::TmpDir::new();
         let fake = tmp.join("launcher");
-        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::testutil::write_script(&fake, "exit 0");
+        // Run once first: a neighbouring test's fork may still hold the descriptor the write used,
+        // and the delivery takes a spawn that fails on it for a toast it could not show, not for an
+        // error. One run that starts means no copy is left, and none can be made after.
+        crate::testutil::output_past_etxtbsy(&mut std::process::Command::new(&fake));
         sink.toaster.powershell = Some(Some(fake.clone()));
 
         assert!(sink.deliver("second", "body", None).is_ok());
