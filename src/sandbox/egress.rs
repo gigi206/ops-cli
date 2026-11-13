@@ -1759,16 +1759,23 @@ pub(crate) fn resolve_chain(
     bwrap: &Path,
     brokers: &[super::broker::Reachable],
 ) -> io::Result<String> {
+    // What an answer quotes, a source's path or locator or what a decrypting program said, is the
+    // config's or that program's to spell, line feed included, and each caller prints it on a line
+    // of its own: a launch refusal, a warning, a task's error. It leaves here written the way
+    // `diag::visible` writes it, the kind kept for the callers that read it.
+    let quoted = |e: io::Error| io::Error::new(e.kind(), crate::diag::visible(&e.to_string()));
     let mut tried = Vec::with_capacity(sources.len());
     for source in sources {
         tried.push(source.describe());
-        if let Some(value) = read_source(source, label, project_root, bwrap, brokers)? {
+        if let Some(value) =
+            read_source(source, label, project_root, bwrap, brokers).map_err(quoted)?
+        {
             return Ok(value);
         }
     }
     Err(io::Error::other(format!(
         "no source resolved the secret for `{label}` (tried: {})",
-        tried.join(", ")
+        crate::diag::visible(&tried.join(", "))
     )))
 }
 
@@ -4871,6 +4878,43 @@ mod tests {
                 "{} is refused, not followed: {got:?}",
                 path.display()
             );
+        }
+    }
+
+    /// Every answer of the chain is written on one line, whoever prints it: the list of what it
+    /// tried when nothing resolved, and a source's own refusal, each naming a path the config
+    /// spelled, line feed included. The broker's, the registry's and a task's callers print the
+    /// answer as it is, so it leaves the chain escaped, with its kind.
+    #[test]
+    fn the_chains_answer_keeps_a_source_path_on_its_line() {
+        let project = TmpDir::new();
+        let forged = "\nsbx: note: forged";
+        let absent = resolve_chain(
+            &[SecretSource::File(format!("/nonexistent{forged}").into())],
+            "Authorization",
+            project.path(),
+            Path::new(UNUSED_BWRAP),
+            &[],
+        )
+        .unwrap_err();
+        let refused = resolve_chain(
+            &[SecretSource::File(
+                project.path().join(format!("in-project{forged}")),
+            )],
+            "Authorization",
+            project.path(),
+            Path::new(UNUSED_BWRAP),
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        for (answer, quoted) in [
+            (&absent, "/nonexistent\\x0asbx"),
+            (&refused, "in-project\\x0asbx"),
+        ] {
+            let text = answer.to_string();
+            assert!(!text.contains('\n'), "{text:?}");
+            assert!(text.contains(quoted), "{text:?}");
         }
     }
 
