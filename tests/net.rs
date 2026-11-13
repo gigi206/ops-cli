@@ -2422,6 +2422,14 @@ fn net_stats_aggregates_a_projects_sessions_and_filters_by_app() {
         .expect("evil.test row");
     assert_eq!(evil["deny"], 3);
     assert_eq!(evil["blocked"], 1);
+    // Nothing was folded and no tap answered: both keys say so as `null`, present rather than
+    // absent, the shape the observability page documents for a reader of either.
+    for key in ["overflow", "resolutions"] {
+        assert!(
+            v.get(key).is_some_and(serde_json::Value::is_null),
+            "`{key}` is null when there is nothing to report: {v}"
+        );
+    }
 
     // `--app demo`: only the tagged session (allow 5), the untagged session's evil.test is gone.
     let v = common::json_of(&fx.run_ok(&["net", "stats", "--app", "demo", "--json"]));

@@ -92,9 +92,9 @@ pub(super) fn net_stats(args: &[OsString]) -> ExitCode {
                 })
             })
             .collect();
-        // Present only when something was folded, so a reader that never meets the cap sees the
-        // shape it always saw. Its counts are in no row above, so a consumer summing the rows must
-        // add this to get the total the proxy decided.
+        // `null` when nothing was folded, the shape the observability page documents: the key is
+        // always there, and holds counts only past the cap. Those counts are in no row above, so a
+        // consumer summing the rows must add them to get the total the proxy decided.
         let overflow = (tally.overflow.total() > 0).then(|| {
             serde_json::json!({
                 "allow": tally.overflow.allow,
@@ -102,8 +102,7 @@ pub(super) fn net_stats(args: &[OsString]) -> ExitCode {
                 "blocked": tally.overflow.blocked,
             })
         });
-        // Present on the same terms as the fold above: absent when the tap answered nothing, so a
-        // session that never ran one renders the shape it always rendered.
+        // On the same terms as the fold above: `null` when the tap answered nothing.
         let resolutions = (tally.resolutions > 0).then_some(tally.resolutions);
         crate::cli::print_document(&format!(
             "{}\n",
