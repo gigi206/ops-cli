@@ -40,6 +40,11 @@ pub(super) enum EquipVerb {
     /// in the cage's own pool and in every pool `MISE_SHARED_INSTALL_DIRS` names, so a token it
     /// resolves is left alone and only the rest is installed, which is what a plain `mise install`
     /// does with the same file. Moving a satisfied tool to a newer release is the roll's job.
+    ///
+    /// A `mise reshim` closes the step, missing tools or not. A tool reaches the cage's `PATH`
+    /// through a shim in the cage's own pool, and mise writes one only when it installs something:
+    /// a tool resolved from a shared pool into a pool that installs nothing would otherwise stay off
+    /// the `PATH`.
     InstallMissing,
 }
 
@@ -276,7 +281,8 @@ fn disabled_mise_tools(env: &[(String, String)]) -> Vec<&str> {
 /// leaving an interactive `sbx run`'s pty job control unchanged. [`EquipVerb::PinGlobally`] runs
 /// `mise use -g --pin <tokens>`; [`EquipVerb::InstallMissing`] asks `mise where` about each token
 /// and runs `mise install` on those it does not resolve, and runs no install at all when it
-/// resolves every one, since mise reads an empty list as "the whole config". The verb is an
+/// resolves every one, since mise reads an empty list as "the whole config"; a `mise reshim`
+/// follows either way, for the reason [`EquipVerb::InstallMissing`] gives. The verb is an
 /// sbx-chosen literal interpolated **unquoted**, because `use -g` has to reach mise as two words;
 /// the tokens and the command ride `"$@"` positionally, and the mise path goes through
 /// [`shell_quote`], so a token from an untrusted config can never inject shell. The tokens follow a
@@ -390,7 +396,8 @@ pub(super) fn wrap_mise_equip(
             "missing=(); for t in \"${{@:1:{n}}}\"; do \
              {data_dir_prefix}{mise} where -- \"$t\" >/dev/null 2>&1 || missing+=(\"$t\"); done; \
              if [ \"${{#missing[@]}}\" -gt 0 ]; then \
-             {data_dir_prefix}{mise} install -- \"${{missing[@]}}\" 1>&2; fi"
+             {data_dir_prefix}{mise} install -- \"${{missing[@]}}\" 1>&2; fi; \
+             {data_dir_prefix}{mise} reshim 1>&2"
         ),
     };
     let script = format!(

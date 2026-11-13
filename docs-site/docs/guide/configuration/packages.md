@@ -276,8 +276,8 @@ apps_read_project_pool = true
 A tool the project's mise file asks for then resolves from that pool with no network at all,
 whether it names an exact version, a range or `latest`: a launch installs only what no installed
 version satisfies (see [Non-`nix:` backends](tools#non-nix-backends-auto-equipped-in-cage)), so the
-version `sbx run` installed is the one the apps run until a roll moves it. A tool `sbx run` has not
-installed yet is fetched by the app as before.
+version `sbx run` installed is the one the apps run until an upgrade in the project's cage moves it.
+A tool `sbx run` has not installed yet is fetched by the app as before.
 
 Unlike an app's pool, this one sits inside a home its cage can write. It is therefore never mounted
 by its path: the launch holds it open with every link on its path refused, bubblewrap mounts the

@@ -61,8 +61,8 @@ mise resolves a tool handed to `install` by name against the newest release, so 
 first asked of `mise where`, which answers from what is installed, in the cage's own pool and in
 any pool it reads (see [`apps_read_project_pool`](packages#apps_read_project_pool-when-an-app-needs-the-tools-the-projects-shell-installed)); only the tools it does not
 resolve reach `mise install`, and a launch where none is missing runs no install at all. A launch
-therefore never moves a version: [`sbx mise upgrade`](../cli/mise) does, inside the project's
-cage and under its egress.
+therefore never moves a version: mise's own `upgrade`, run through [`sbx mise`](../cli/mise) in the
+project's cage and under its egress, does.
 
 A tool the cage's `MISE_DISABLE_TOOLS` names is not equipped. mise honours that variable when it
 reads the file, but installs a tool it is handed by name regardless, so sbx leaves it out: a
@@ -158,6 +158,6 @@ a pinned toolchain:
 
 ```sh
 sbx upgrade mise               # move the nix: tools and the [packages] mise: tools
-sbx mise upgrade               # move this mise file's other tools, within their declared range
+sbx mise upgrade node          # move one of this mise file's other tools, within its declared range
 sbx upgrade nix                # move the base userland's channel
 ```

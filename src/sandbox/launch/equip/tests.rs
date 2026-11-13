@@ -176,7 +176,9 @@ fn wrap_autoequip_passes_tokens_and_command_positionally() {
 /// handing it every token reinstalled `node@26` at each launch once a newer 26.x was out, with
 /// 26.13.0 installed in the pool the cage reads. Under an app's egress that fetch was refused, at
 /// every launch, for a tool the cage already had. Run with a stand-in mise whose `where` resolves
-/// only the tokens `$SBX_TEST_PRESENT` names, so the test sees which tokens reach `install`.
+/// only the tokens `$SBX_TEST_PRESENT` names, so the test sees which tokens reach `install`. Each
+/// form ends with a `mise reshim`, the step that puts a tool resolved from a shared pool on the
+/// cage's `PATH` when nothing is installed.
 #[test]
 fn the_project_lane_installs_only_the_tokens_mise_where_does_not_resolve() {
     let bash = PathBuf::from("/bin/bash");
@@ -256,7 +258,7 @@ fn the_project_lane_installs_only_the_tokens_mise_where_does_not_resolve() {
         let calls = std::fs::read_to_string(&record).expect("the stand-ins recorded their calls");
         assert_eq!(
             calls,
-            format!("{wheres}{}cmd\n", install.unwrap_or("")),
+            format!("{wheres}{}mise reshim\ncmd\n", install.unwrap_or("")),
             "present: {present:?}"
         );
     }

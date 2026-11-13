@@ -1244,7 +1244,7 @@ fn mise_equip_lanes<'a>(
                     // project wrote them.
                     let shown = mise_token_display(auto_equip.iter());
                     crate::diag::error(&format!(
-                        "sbx: equipping non-nix tools in-cage via mise, those not installed yet: \
+                        "sbx: equipping non-nix tools in-cage via mise, if not installed yet: \
                          {shown} (each backend's host must be in [network].allow under an \
                          allowlist)"
                     ));
