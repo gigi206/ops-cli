@@ -82,10 +82,12 @@ sbx plugins info <scheme>     # an `integrity:` line, in all four states
 ```
 
 The digest covers exactly what git records: the set of regular files, their
-paths, the executable bit, and their bytes: so it catches an edited resolver
-script **and** an edited `plugin.toml`. The manifest is the sharper of the two:
-it carries the `[sandbox]` grant, so editing it in place widens what the plugin
-may reach, and the registry would otherwise honor that without a word.
+paths, the executable bit (the owner's, the only one git keeps, so a file that
+only its group or others may execute counts as not executable), and their bytes:
+so it catches an edited resolver script **and** an edited `plugin.toml`. The
+manifest is the sharper of the two: it carries the `[sandbox]` grant, so editing
+it in place widens what the plugin may reach, and the registry would otherwise
+honor that without a word.
 
 Four states, deliberately distinct:
 
