@@ -538,8 +538,10 @@ pub(in crate::sandbox) fn read_ppid(pid: u32) -> Option<u32> {
     after_comm.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// Every descendant pid of `root` (excluding `root`), by breadth-first walk over the
-/// parent map. Pure over its input, so the tree walk is unit-testable.
+/// Every descendant pid of `root` (excluding `root`), by a depth-first walk over the parent map:
+/// the pids waiting are a stack, so the highest-numbered child's subtree comes out first, which is
+/// the order [`in_session_cage`] reasons about. Pure over its input, so the tree walk is
+/// unit-testable.
 fn descendants(root: u32, parents: &BTreeMap<u32, u32>) -> Vec<u32> {
     let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for (&pid, &ppid) in parents {
@@ -1067,6 +1069,8 @@ mod tests {
             .into_iter()
             .collect();
         let mut got = descendants(2, &parents);
+        // Depth-first, the highest-numbered child's subtree first: 4 and its 5 before 3.
+        assert_eq!(got, vec![4, 5, 3]);
         got.sort_unstable();
         assert_eq!(got, vec![3, 4, 5]);
     }
