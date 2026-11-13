@@ -1553,6 +1553,36 @@ fn net_pending_lists_nothing_when_no_session_is_parked() {
     assert_eq!(v["pending"].as_array().map(|a| a.len()), Some(0));
 }
 
+/// A word `sbx net` or `sbx net pending` does not take is named in the refusal, a misspelt verb as
+/// much as a token that is not UTF-8, so neither reads as the bare command it is answered like.
+#[test]
+fn an_unknown_net_word_is_named_in_the_refusal() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let fx = Project::new("net");
+    let not_utf8 = std::path::Path::new(std::ffi::OsStr::from_bytes(b"x\xff"));
+    for (args, word, named) in [
+        (&["net"][..], not_utf8, "unknown subcommand \"x\\xFF\""),
+        (
+            &["net", "pending"][..],
+            not_utf8,
+            "unexpected argument \"x\\xFF\"",
+        ),
+        (
+            &["net", "pending"][..],
+            std::path::Path::new("alow"),
+            "unexpected argument \"alow\"",
+        ),
+    ] {
+        let out = fx.run_with_path(args, word, &[]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?} {word:?}: {err}");
+        assert!(
+            err.contains(named),
+            "{args:?} {word:?} is not named:\n{err}"
+        );
+    }
+}
+
 #[test]
 fn net_pending_answer_rejects_a_malformed_id() {
     let fx = Project::new("net");

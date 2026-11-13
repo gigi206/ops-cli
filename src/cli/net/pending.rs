@@ -102,7 +102,10 @@ pub(super) fn net_pending_list(args: &[OsString]) -> ExitCode {
                     }
                 }
             }
+            // Named before the usage, by the token itself rather than its UTF-8 reading, so a
+            // misspelt verb (`alow`) or a token that is not UTF-8 is said for what it is.
             _ => {
+                diag::error(&format!("sbx: net pending: unexpected argument {a:?}"));
                 diag::error(&format!(
                     "sbx: usage: {}",
                     help::synopsis_of(&["net", "pending"])

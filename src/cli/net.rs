@@ -74,8 +74,10 @@ pub(crate) fn net_cmd(args: &[OsString]) -> ExitCode {
         // Unknown or no subcommand: name the mistake (if any), then print the full page — its
         // Subcommands list reveals rules/allow/deny/pending/… instead of a bare one-line synopsis,
         // the way `sbx config` and bare `sbx` guide.
-        other => {
-            if let Some(tok) = other {
+        _ => {
+            // The token itself, not its UTF-8 reading: one that has none was typed too, and is
+            // named rather than answered as a bare `sbx net`.
+            if let Some(tok) = args.first() {
                 diag::error(&format!("sbx: net: unknown subcommand {tok:?}"));
             }
             err!("{}", help::page_usage(&["net"]).unwrap_or_default());
