@@ -102,9 +102,10 @@ pub(crate) fn hosts_contents(
 /// per-home synthetic id gives each app a distinct, persistent machine identity instead. The input is
 /// domain-separated so the raw home path is not recoverable from the id.
 ///
-/// The path is hashed as sbx spells it, from `$SBX_DATA_DIR` or `$XDG_DATA_HOME`, and not resolved:
-/// the same data directory reached under another spelling (through a link, or with a doubled `/`)
-/// gives another id, as a data directory moved elsewhere does.
+/// The path is hashed as sbx holds it and not resolved: the data directory as `$SBX_DATA_DIR` or
+/// `$XDG_DATA_HOME` spells it, or the mount point of the storage volume it was moved to. The same
+/// directory reached under another spelling (through a link, or with a doubled `/`) gives another
+/// id, as a data directory moved elsewhere, onto a volume included, does.
 pub(super) fn machine_id_contents(home_src: &Path) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
