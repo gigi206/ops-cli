@@ -32,8 +32,9 @@ pub(crate) fn version_order(a: &str, b: &str) -> Option<Ordering> {
         if core.is_empty() {
             return None;
         }
+        // `core` is not empty, so `split` yields at least one component and `nums` is never empty.
         let nums: Option<Vec<u64>> = core.split('.').map(|c| c.parse::<u64>().ok()).collect();
-        nums.filter(|n| !n.is_empty()).map(|n| (n, pre))
+        nums.map(|n| (n, pre))
     }
     let (a_nums, a_pre) = split(a)?;
     let (b_nums, b_pre) = split(b)?;
