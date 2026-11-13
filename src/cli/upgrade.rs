@@ -158,6 +158,15 @@ fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
                 what = known_target(s);
                 i += 1;
             }
+            // An option this verb does not take. It cannot name an app either, since `--app`
+            // refuses a value that is an option, so it is named for what it is, with the verb's
+            // own usage, rather than answered with a selector that would be refused next.
+            Some(s) if s.starts_with('-') && s != "-" => {
+                return ParsedArgs::Error(format!(
+                    "sbx: upgrade: unknown option `{}` — run `sbx help upgrade` for usage.",
+                    crate::diag::visible(s)
+                ));
+            }
             _ => {
                 // The word is not a target, and the likeliest reason is that it is an APP name:
                 // "advance this one thing" is the common request, and a target list alone answers
@@ -2331,6 +2340,18 @@ mod tests {
             typo.contains("sbx upgrade --app freebuff-desktop"),
             "the refusal must name what to do with an app name: {typo}"
         );
+        // An option is not an app name: `--app --foo` is refused in turn, so an unknown option is
+        // named as one, and no selector is offered for it.
+        for option in ["--foo", "-x", "--dryrun=1"] {
+            let ParsedArgs::Error(message) = parse_upgrade_args(&os(&[option])) else {
+                panic!("`{option}` must be refused");
+            };
+            assert!(
+                message.contains(&format!("unknown option `{option}`"))
+                    && !message.contains("--app"),
+                "{option}: {message}"
+            );
+        }
 
         // Value forms that carry no name, and a repeat.
         for bad in [
