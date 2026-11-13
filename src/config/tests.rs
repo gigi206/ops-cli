@@ -15397,3 +15397,49 @@ fn an_unreadable_shared_deny_entry_stops_every_app_it_would_have_tightened() {
         );
     }
 }
+
+/// `[apps] read_project_pool` is on for a trusted project that does not write it, and only there:
+/// a trusted `false` withdraws it, an untrusted project's silence grants nothing and says nothing,
+/// and a directory with no project config grants nothing.
+#[test]
+fn reading_the_project_pool_is_on_by_default_for_a_trusted_project() {
+    let parse = |text: &str| -> RawConfig { toml::from_str(text).expect("the config parses") };
+
+    let r = resolve_no_plugins(RawConfig::default(), Some((parse(""), TrustState::Trusted)));
+    assert!(
+        r.apps_read_project_pool,
+        "a trusted project grants it unwritten"
+    );
+    assert_eq!(
+        r.apps_read_project_pool_origin,
+        Provenance::Default,
+        "and the views say the project did not write it"
+    );
+
+    let r = resolve_no_plugins(
+        RawConfig::default(),
+        Some((
+            parse("[apps]\nread_project_pool = false\n"),
+            TrustState::Trusted,
+        )),
+    );
+    assert!(!r.apps_read_project_pool, "a trusted `false` withdraws it");
+    assert_eq!(r.apps_read_project_pool_origin, Provenance::Project);
+
+    let r = resolve_no_plugins(
+        RawConfig::default(),
+        Some((parse(""), TrustState::Untrusted)),
+    );
+    assert!(
+        !r.apps_read_project_pool,
+        "an untrusted project grants nothing"
+    );
+    assert!(
+        !r.warnings.iter().any(|w| w.contains("read_project_pool")),
+        "and its silence is not refused: {:?}",
+        r.warnings
+    );
+
+    let r = resolve_no_plugins(RawConfig::default(), None);
+    assert!(!r.apps_read_project_pool, "no project config, no grant");
+}

@@ -400,7 +400,9 @@ cages that run in it, since those cages are precisely what writes to it.
 
 Two agents you need kept apart therefore belong in two project directories, which is two
 stores. Within one directory, apps share a filesystem the way they already share the
-project tree.
+project tree. It is also why a trusted project's apps read the tools its `sbx run` shell
+installed by default ([`[apps] read_project_pool`](../configuration/packages#apps-read_project_pool-when-an-app-needs-the-tools-the-projects-shell-installed)):
+that shell could already place a program they run, through this store.
 
 ## See also
 

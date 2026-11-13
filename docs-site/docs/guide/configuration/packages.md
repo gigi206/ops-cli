@@ -267,19 +267,20 @@ rather than extending it, so a tool fetched from a host only the project allows 
 `sbx run` and fails in every app, at every launch: an app whose egress refuses `nodejs.org` never
 gets the `node` the project declares.
 
-A global app launched from a project that does not set it, and that fails to install one of
-these tools, says so after mise's own error, and names this setting:
-
-```text
-sbx: note: a tool of the project's mise file could not be installed in this app's cage; if `sbx run` installs it, `[apps] read_project_pool = true` in the project's .sbx.toml lets this app run that copy instead
-```
-
-Set this in the project's config and each global app also reads, read-only and last, the pool
-`sbx run` fills:
+So each global app of a **trusted** project also reads, read-only and last, the pool `sbx run`
+fills. It is on by default there, unwritten; a project withdraws it with:
 
 ```toml
 [apps]
-read_project_pool = true
+read_project_pool = false
+```
+
+An untrusted project grants it neither by default nor when it writes `true`, which is refused with
+the reason. A global app that does not read the pool, and fails to install one of these tools,
+says so after mise's own error:
+
+```text
+sbx: note: a tool of the project's mise file could not be installed in this app's cage; if `sbx run` installs it, this app runs that copy once the project is trusted and its `[apps] read_project_pool` is not `false`
 ```
 
 A tool the project's mise file asks for then resolves from that pool with no network at all,
@@ -296,8 +297,12 @@ anything runs. On a bubblewrap without `--bind-fd` the pool is not shared at all
 This is a security field, [trusted-only](#why-the-tool-sources-are-trusted-only), and project-only
 like `[apps] share_install_pools`. What it gives up is that a tool the project's shell installed
 becomes a tool its apps can run, so anything that runs in `sbx run` can place a program an app with
-credentials will run. Leave it off unless what runs in the project's shell is something you would
-let the apps' tools come from.
+credentials will run. It is on by default because that opens nothing new: every cage of a project
+already writes the project's `/nix` store, which every app of the project runs from, so the project
+is the unit of isolation (see the [security model](../concepts/security-model#the-store-an-agent-writes-into-is-shared-by-the-projects-apps)).
+Two agents you need kept apart belong in two project directories; `false` is for a project whose
+shell you would rather its apps did not take tools from at all. `sbx trust` and `sbx config show`
+name the grant whether the project writes it or not.
 
 ### `flake:`: a nix flake output
 

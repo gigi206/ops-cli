@@ -2214,22 +2214,30 @@ fn resolve(
         }
     }
     // Whether this project's apps may read the pool `sbx run` fills: project-only and trusted-only,
-    // for the reasons the grant above is.
+    // for the reasons the grant above is, and on by default for a trusted project (see
+    // `schema::RawApps::read_project_pool`). The default carries `Default` as its origin, so the
+    // views say the project did not write it.
     let mut apps_read_project_pool = false;
     let mut apps_read_project_pool_origin = Provenance::Default;
-    if let Some((section, state)) = project_apps_section.as_ref()
-        && section.read_project_pool
-    {
-        if *state == TrustState::Trusted {
-            apps_read_project_pool = true;
-            apps_read_project_pool_origin = Provenance::Project;
-        } else {
-            refuse_untrusted(
+    if let Some((_, state)) = project.as_ref() {
+        let declared = project_apps_section
+            .as_ref()
+            .and_then(|(section, _)| section.read_project_pool);
+        let trusted = *state == TrustState::Trusted;
+        match declared {
+            Some(value) if trusted => {
+                apps_read_project_pool = value;
+                apps_read_project_pool_origin = Provenance::Project;
+            }
+            None if trusted => apps_read_project_pool = true,
+            Some(true) => refuse_untrusted(
                 &mut warnings,
                 PROJECT_CONFIG,
                 "`[apps] read_project_pool`",
                 *state,
-            );
+            ),
+            // An untrusted project's `false`, or its silence, grants nothing and needs no word.
+            Some(false) | None => {}
         }
     }
     apply_tools(

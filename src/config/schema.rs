@@ -426,18 +426,24 @@ pub(crate) struct RawApps {
     /// security model); this extends the same shape to the backends that never touch the store.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) share_install_pools: bool,
-    /// `read_project_pool`: lets the project's global apps read, read-only and last, the mise pool `sbx run` fills: the
-    /// project's own tools, fetched under the project's `[network]`, which an app's posture
-    /// replaces. An app whose egress refuses those tools' hosts finds them there instead of failing
-    /// to fetch them at every launch.
+    /// `read_project_pool`: lets the project's global apps read, read-only and last, the mise pool
+    /// `sbx run` fills: the project's own tools, fetched under the project's `[network]`, which an
+    /// app's posture replaces. An app whose egress refuses those tools' hosts finds them there
+    /// instead of failing to fetch them at every launch.
     ///
-    /// **A security field**, honored only from a trusted project and never from the global config,
-    /// for the reason [`Self::share_install_pools`] gives. What it gives up is that a tool the
-    /// project's shell installed becomes a tool an app can run. The pool lies inside a home that
-    /// shell's cage writes, so it is mounted only from a descriptor the launch held with every link
-    /// refused, and not at all on a bubblewrap without `--bind-fd`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) read_project_pool: bool,
+    /// **On by default for a trusted project**: absent, a trusted project grants it, and `false`
+    /// withdraws it. Every project with a mise file needs it as soon as an app's egress is narrower
+    /// than the project's, and the reading opens nothing a cage of the project could not already
+    /// do: the project's `/nix` store, which every cage of the project writes and every app of it
+    /// runs from, makes the project the unit of isolation (see the security model). The pool lies
+    /// inside a home that shell's cage writes, so it is mounted only from a descriptor the launch
+    /// held with every link refused, and not at all on a bubblewrap without `--bind-fd`.
+    ///
+    /// **A security field** all the same: never granted by an untrusted project, whose explicit
+    /// `true` is refused with the reason, and never read from the global config, for the reason
+    /// [`Self::share_install_pools`] gives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) read_project_pool: Option<bool>,
     /// Every key of this table sbx does not know, kept so the loader names it.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,

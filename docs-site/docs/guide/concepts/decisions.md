@@ -133,6 +133,14 @@ have in common, and the global config cannot set it: the question is about these
 project, and answering it once for a machine would open the pools of projects that never
 asked.
 
+Reading the pool `sbx run` fills
+([`[apps] read_project_pool`](../configuration/packages#apps-read_project_pool-when-an-app-needs-the-tools-the-projects-shell-installed))
+weighs the other way, and is on by default for a trusted project. What it buys is not disk
+space but the tools themselves: an app's egress is usually narrower than the project's, so
+without it an app fails to install the project's tools at every launch. What it opens is
+nothing the store does not already: the shell that fills the pool also writes the store the
+apps run from. It stays project-only and trusted-only, and a project can still say `false`.
+
 The concrete opening is worth naming, because it is narrower than "one app can run another's
 code" suggests and not zero. An app resolves only what its own activation or the project's
 mise file asks for, by name and version, so a neighbour cannot place a binary an app will run

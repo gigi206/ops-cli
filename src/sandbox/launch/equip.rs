@@ -56,8 +56,8 @@ pub(super) enum EquipVerb {
 /// What a global app's launch prints when it could not install a tool of the project's mise file:
 /// the grant that lets it run the copy `sbx run` installs instead of fetching its own.
 pub(super) const PROJECT_POOL_HINT: &str = "sbx: note: a tool of the project's mise file could \
-     not be installed in this app's cage; if `sbx run` installs it, `[apps] read_project_pool = \
-     true` in the project's .sbx.toml lets this app run that copy instead";
+     not be installed in this app's cage; if `sbx run` installs it, this app runs that copy once \
+     the project is trusted and its `[apps] read_project_pool` is not `false`";
 
 /// The global option that runs a mise invocation as if started at `/`, outside the project.
 ///

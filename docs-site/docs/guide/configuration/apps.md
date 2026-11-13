@@ -289,7 +289,7 @@ configures every app launched from that project, whichever its profile:
 ```toml
 # ./.sbx.toml
 [apps]
-read_project_pool   = true   # each app may run the tools `sbx run` installed
+read_project_pool   = false  # on by default: each app may run the tools `sbx run` installed
 share_install_pools = true   # each app may run a tool another app of the project installed
 
 [apps.network]
