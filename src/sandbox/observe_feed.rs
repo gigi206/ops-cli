@@ -219,16 +219,26 @@ impl ExecObserver {
     /// Start observing the cage rooted at `root` (the supervisor's own pid), pushing each new process
     /// into `ring`. With `inline`, each event is also written to stderr (the foreground non-tty feed);
     /// an interactive or detached session leaves it `false` and reads the ring out-of-band instead.
-    pub(crate) fn start(root: u32, interval: Duration, ring: Arc<ExecRing>, inline: bool) -> Self {
+    ///
+    /// An error when the thread cannot start (the user at the limit of the processes it may run,
+    /// or no memory for its stack), rather than the panic in the supervisor `std::thread::spawn`
+    /// raises: observation is best-effort, and the caller warns.
+    pub(crate) fn start(
+        root: u32,
+        interval: Duration,
+        ring: Arc<ExecRing>,
+        inline: bool,
+    ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let color = inline && std::io::IsTerminal::is_terminal(&std::io::stderr());
-        let handle =
-            std::thread::spawn(move || run_loop(root, interval, &flag, color, &ring, inline));
-        ExecObserver {
+        let handle = std::thread::Builder::new()
+            .name("sbx-exec-feed".to_string())
+            .spawn(move || run_loop(root, interval, &flag, color, &ring, inline))?;
+        Ok(ExecObserver {
             stop,
             handle: Some(handle),
-        }
+        })
     }
 }
 
@@ -372,9 +382,16 @@ impl Observation {
             let exec_ring = Arc::new(ExecRing::new(EXEC_RING_CAP).with_record(
                 super::lens::open_record(record, &proc_control_dir(data_dir)),
             ));
-            let exec_socket = bind_control(data_dir, pid, &exec_ring);
-            let observer = ExecObserver::start(pid, OBSERVE_POLL_INTERVAL, exec_ring, inline);
-            (Some(observer), exec_socket)
+            match ExecObserver::start(pid, OBSERVE_POLL_INTERVAL, exec_ring.clone(), inline) {
+                Ok(observer) => (Some(observer), bind_control(data_dir, pid, &exec_ring)),
+                Err(e) => {
+                    crate::diag::warn(&format!(
+                        "could not start process observation ({e}) — `sbx proc logs` will not \
+                         see this session"
+                    ));
+                    (None, None)
+                }
+            }
         } else {
             (None, None)
         };
@@ -633,7 +650,8 @@ mod tests {
             .expect("sh runs");
         let ring = Arc::new(ExecRing::new(EXEC_RING_CAP));
         let observer =
-            ExecObserver::start(parent.id(), OBSERVE_POLL_INTERVAL, Arc::clone(&ring), false);
+            ExecObserver::start(parent.id(), OBSERVE_POLL_INTERVAL, Arc::clone(&ring), false)
+                .expect("the observer starts");
         let wrapper = event_in(&ring, "the wrapper is reported", |e| {
             e.command.starts_with("sh -c i=0; while")
         })
@@ -648,6 +666,88 @@ mod tests {
         // SAFETY: a signal to the wrapper, a process this test started and has just seen running.
         unsafe { libc::kill(became.pid as libc::pid_t, libc::SIGKILL) };
         parent.wait().expect("the parent is reaped");
+    }
+
+    /// Observation stood up where no thread can start, and a lens socket served there, run alone
+    /// by [`a_lens_whose_thread_cannot_start_is_warned_of_and_the_launch_goes_on`]; anywhere else
+    /// it does nothing. The process limit is set to none, which stops every thread this process
+    /// would start after it; where the limit does not bind (root, or a capability that lifts it)
+    /// it says so and stops there.
+    #[test]
+    #[ignore = "run alone by the test that reads what it wrote"]
+    fn observation_where_no_thread_starts() {
+        crate::testutil::when_run_alone(|dir| {
+            let dir = Path::new(dir);
+            let project = dir.join("project");
+            std::fs::create_dir(&project)?;
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `limit` is a live struct for the kernel to fill.
+            if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut limit) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = 0;
+            // SAFETY: as above, read by the kernel; the hard limit is left as it was.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &limit) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if std::thread::Builder::new().spawn(|| ()).is_ok() {
+                eprintln!("sbx-alone: the process limit does not bind here");
+                return Ok(());
+            }
+            drop(Observation::start(
+                &dir.join("data"),
+                &project,
+                true,
+                true,
+                false,
+                None,
+            ));
+            let socket = dir.join("lens.sock");
+            match super::super::lens::bind_and_serve(&socket, |_| Ok(())) {
+                Ok(()) => {
+                    eprintln!("sbx-alone: a lens served with no thread");
+                    return Err(std::io::Error::other("a lens served with no thread"));
+                }
+                Err(e) => eprintln!("sbx-alone: bind_and_serve: {e}"),
+            }
+            if socket.exists() {
+                eprintln!("sbx-alone: the socket nothing serves is left at its name");
+                return Err(std::io::Error::other(
+                    "the socket nothing serves is left at its name",
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    /// A lens whose thread cannot start is warned of, and the launch goes on: observation is
+    /// best-effort, where `std::thread::spawn` raises a panic in the supervisor. Read from
+    /// what the observation wrote, in a process of its own, since the limit it sets would stop
+    /// every other test's threads.
+    #[test]
+    fn a_lens_whose_thread_cannot_start_is_warned_of_and_the_launch_goes_on() {
+        let ran = crate::testutil::run_alone(concat!(
+            module_path!(),
+            "::observation_where_no_thread_starts"
+        ));
+        if ran.stderr.contains("the process limit does not bind here") {
+            skip_incapable!(
+                "skipping: the process limit does not stop a thread here (root, or a capability \
+                 that lifts it)"
+            );
+            return;
+        }
+        assert!(ran.ended_well(), "{}{}", ran.stdout, ran.stderr);
+        for said in [
+            "could not start process observation",
+            "could not start filesystem observation",
+            "bind_and_serve: no thread to serve it",
+        ] {
+            assert!(ran.stderr.contains(said), "{said}: {}", ran.stderr);
+        }
     }
 
     #[test]

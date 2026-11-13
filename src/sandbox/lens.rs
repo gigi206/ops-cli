@@ -958,15 +958,29 @@ pub(crate) fn ensure_control_dir(dir: &Path) -> io::Result<()> {
 /// The thread is detached and never joined. It sits blocked in `accept` for the session's life and
 /// is reaped when the supervisor exits — the egress control thread has the same lifetime. What ends
 /// a reader's follow cleanly is the caller unlinking the socket, not this thread stopping.
+///
+/// A thread that cannot start (the user at the limit of the processes it may run, or no memory for
+/// its stack) is an error like a socket that cannot be bound, which every caller warns of, rather
+/// than the panic `std::thread::spawn` raises; the socket bound for it is unlinked, so no reader
+/// connects to a name nothing serves.
 pub(crate) fn bind_and_serve(
     socket: &Path,
     serve: impl FnOnce(UnixListener) -> io::Result<()> + Send + 'static,
 ) -> io::Result<()> {
     let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket)?;
-    std::thread::spawn(move || {
-        let _ = serve(listener);
-    });
+    let started = std::thread::Builder::new()
+        .name("sbx-lens-serve".to_string())
+        .spawn(move || {
+            let _ = serve(listener);
+        });
+    if let Err(e) = started {
+        let _ = std::fs::remove_file(socket);
+        return Err(io::Error::new(
+            e.kind(),
+            format!("no thread to serve it: {e}"),
+        ));
+    }
     Ok(())
 }
 

@@ -131,7 +131,11 @@ impl FsWatcher {
 
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let handle = std::thread::spawn(move || watcher.event_loop(&flag));
+        // Started by the builder rather than `std::thread::spawn`, whose failure to start a thread
+        // is a panic in the supervisor: here it is an error, which the caller warns of.
+        let handle = std::thread::Builder::new()
+            .name("sbx-fs-watch".to_string())
+            .spawn(move || watcher.event_loop(&flag))?;
         Ok(FsWatcher {
             stop,
             handle: Some(handle),
