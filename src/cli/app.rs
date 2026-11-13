@@ -525,9 +525,12 @@ fn app_import(args: &[OsString]) -> ExitCode {
         Err(code) => return code,
     };
     if !config::is_valid_app_name(&name) {
+        // The name failed the charset, so it may hold anything, a line feed included: it is
+        // written the way `diag::visible` writes it, on the refusal's line.
         diag::error(&format!(
-            "sbx: '{name}' is not a usable app name (1–64 of [A-Za-z0-9._-], not beginning with \
-             `-`, not `.`/`..`)"
+            "sbx: '{}' is not a usable app name (1–64 of [A-Za-z0-9._-], not beginning with `-`, \
+             not `.`/`..`)",
+            diag::visible(&name)
         ));
         // A name taken from the file is the one the user did not choose, and `--as` chooses one.
         if parsed.as_name.is_none() {

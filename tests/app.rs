@@ -1726,6 +1726,12 @@ fn what_an_import_quotes_stays_on_its_line() {
             &["--as", renamed.as_str()][..],
             "x\\x0asbx: note",
         ),
+        (
+            &["app", "import"][..],
+            &ghost,
+            &["--as", renamed.as_str()][..],
+            "x\\x0asbx: note",
+        ),
     ] {
         let out = fx.run_with_path(args, file, rest);
         let err = String::from_utf8_lossy(&out.stderr);
