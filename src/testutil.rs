@@ -2097,6 +2097,153 @@ mod helper_tests {
         assert_eq!(function_body(source, "fn absent("), None);
     }
 
+    /// The lines of `text` where a function that calls one of the walks reads a file with the error
+    /// dropped: into a default, into an `Option`, through a closure that ignores it, or by a pattern
+    /// that keeps the `Ok` alone. A read elsewhere in the file, of a log or a `/proc` entry, is not
+    /// a guard's, and is not counted.
+    fn reads_that_drop_the_error(text: &str) -> std::collections::BTreeSet<usize> {
+        // In pieces, so the guard that sweeps the crate with this, which calls a walk itself, holds
+        // no read of its own to find.
+        let read = concat!("read_to", "_string(");
+        let walks = ["crate_sources(", "cli_sources(", "files_under("];
+        let dropped = [".unwrap_or_default()", ".ok()", ".unwrap_or_else(|_|"];
+        let bytes = text.as_bytes();
+        let mut lines = std::collections::BTreeSet::new();
+        for (at, _) in text.match_indices("fn ") {
+            if at > 0 && matches!(bytes[at - 1], b'_' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9') {
+                continue;
+            }
+            // The body opens at the first brace outside the signature's parentheses and brackets,
+            // since an array type in it (`[u8; 4]`) holds a `;` of its own; a declaration without a
+            // body, in a trait or an `extern` block, ends at a `;` instead.
+            let mut depth = 0usize;
+            let Some(open) = text[at..]
+                .bytes()
+                .position(|b| match b {
+                    b'(' | b'[' => {
+                        depth += 1;
+                        false
+                    }
+                    b')' | b']' => {
+                        depth = depth.saturating_sub(1);
+                        false
+                    }
+                    b'{' | b';' => depth == 0,
+                    _ => false,
+                })
+                .map(|n| at + n)
+            else {
+                continue;
+            };
+            if bytes[open] != b'{' {
+                continue;
+            }
+            let Some(close) = closing_delimiter(bytes, open) else {
+                continue;
+            };
+            let body = &text[open..=close];
+            if !walks.iter().any(|walk| calls_function(body, walk)) {
+                continue;
+            }
+            for (at_read, _) in body.match_indices(read) {
+                let Some(end) = closing_delimiter(body.as_bytes(), at_read + read.len() - 1) else {
+                    continue;
+                };
+                let after = body[end + 1..].trim_start();
+                let line = body[..at_read].rsplit('\n').next().unwrap_or_default();
+                let before_path =
+                    line.trim_end_matches(|c: char| c.is_alphanumeric() || "_:".contains(c));
+                let keeps_ok = line.contains("Ok(") && before_path.trim_end().ends_with('=');
+                if keeps_ok || dropped.iter().any(|form| after.starts_with(form)) {
+                    lines.insert(text[..open + at_read].matches('\n').count() + 1);
+                }
+            }
+        }
+        lines
+    }
+
+    /// A guard that walks the tree reads each file the walk listed through [`read_listed`], so a
+    /// file it cannot read fails it by name.
+    ///
+    /// A guard counts offenders in the text it read, and no text holds none: one that turns a
+    /// failed read into an empty string, or into no file at all, passes on that file in silence,
+    /// which is what [`read_listed`] refuses.
+    #[test]
+    fn a_guard_that_walks_the_tree_fails_on_a_file_it_cannot_read() {
+        let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        for file in crate_sources() {
+            let Some(text) = read_listed(&file) else {
+                continue;
+            };
+            let relative = file.display().to_string().replacen(&root, "", 1);
+            offenders.extend(
+                reads_that_drop_the_error(&text)
+                    .into_iter()
+                    .map(|line| format!("{relative}:{line}")),
+            );
+        }
+        assert!(
+            offenders.is_empty(),
+            "a guard that walks the tree reads a file it listed with the error dropped, so a file \
+             it cannot read passes as one with nothing to report; read it with \
+             `testutil::read_listed`: {offenders:?}"
+        );
+    }
+
+    /// Each form that drops a read's error is found on its own, on the line of the read, in a
+    /// function that walks the tree; none is found where the error fails the guard, or where the
+    /// function walks nothing.
+    #[test]
+    fn every_form_that_drops_a_reads_error_is_found() {
+        let read = concat!("std::fs::read_to", "_string(&file)");
+        let dropping = [
+            format!("let t = {read}.unwrap_or_default();"),
+            format!("let t = {read}\n            .unwrap_or_default();"),
+            format!("let t = {read}.ok()?;"),
+            format!("let t = {read}.unwrap_or_else(|_| String::new());"),
+            format!("let Ok(t) = {read} else {{ continue; }};"),
+            format!("if let Ok(t) = {read} {{ take(t); }}"),
+        ];
+        // Each walk, and a signature whose array type holds a `;` of its own.
+        let walks = [
+            "crate_sources()",
+            "cli_sources()",
+            "files_under(&dir, &[\"rs\"])",
+        ];
+        let signatures = ["fn guard()", "fn guard(needles: [&str; 2])"];
+        for statement in &dropping {
+            for walk in walks {
+                for signature in signatures {
+                    let source = format!(
+                        "{signature} {{\n    for file in {walk} {{\n        {statement}\n    }}\n}}\n"
+                    );
+                    assert_eq!(
+                        reads_that_drop_the_error(&source),
+                        std::collections::BTreeSet::from([3]),
+                        "{source}"
+                    );
+                }
+            }
+            let elsewhere = format!("fn other() {{\n    {statement}\n}}\n");
+            assert!(
+                reads_that_drop_the_error(&elsewhere).is_empty(),
+                "{elsewhere}"
+            );
+        }
+        for kept in [
+            "let Some(t) = read_listed(&file) else { continue; };".to_string(),
+            format!("let t = {read}.expect(\"a source\");"),
+            format!("let t = {read}.unwrap_or_else(|e| panic!(\"{{e}}\"));"),
+            format!("take(Ok({read}.expect(\"a source\")));"),
+        ] {
+            let source = format!(
+                "fn guard() {{\n    for file in cli_sources() {{\n        {kept}\n    }}\n}}\n"
+            );
+            assert!(reads_that_drop_the_error(&source).is_empty(), "{source}");
+        }
+    }
+
     /// A brace inside a string, a character, or a comment opens nothing: a test module holding one
     /// still ends at its own closing brace, and the production code after it is kept.
     #[test]

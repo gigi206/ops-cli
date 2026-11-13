@@ -106,7 +106,9 @@ mod tests {
             if crate::testutil::is_test_only_source(&file) || test_only.contains(&file) {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let Some(text) = crate::testutil::read_listed(&file) else {
+                continue;
+            };
             let production = crate::testutil::production_half(&text);
             let entry = ["distro::store::provision(", "distro::store::refresh("]
                 .iter()

@@ -1085,7 +1085,9 @@ mod tests {
             if crate::testutil::is_test_only_source(&file) {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let Some(text) = crate::testutil::read_listed(&file) else {
+                continue;
+            };
             let production = crate::testutil::production_half(&text);
             let relative = file.display().to_string().replacen(&root, "", 1);
             // `trust::trust_written(` does not contain `trust::trust(` — the character after the

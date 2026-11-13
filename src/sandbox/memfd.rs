@@ -328,8 +328,8 @@ mod tests {
                 !crate::testutil::is_test_only_source(file) && !declared_test_only.contains(file)
             })
             .filter(|file| {
-                let text = std::fs::read_to_string(file).unwrap_or_default();
-                stages_one(&crate::testutil::production_half(&text))
+                crate::testutil::read_listed(file)
+                    .is_some_and(|text| stages_one(&crate::testutil::production_half(&text)))
             })
             .map(|file| file.display().to_string().replacen(&root, "", 1))
             .collect();

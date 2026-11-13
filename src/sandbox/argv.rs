@@ -1634,7 +1634,9 @@ mod tests {
             if crate::testutil::is_test_only_source(&file) || declared_test_only.contains(&file) {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let Some(text) = crate::testutil::read_listed(&file) else {
+                continue;
+            };
             // The production half: a file's own `cfg(test)` module builds nothing the binary
             // ships, and reading it here would put a module in a launcher category for a fixture.
             // The attribute is named without its brackets on purpose: `production_half` splits on

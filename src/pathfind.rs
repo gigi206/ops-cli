@@ -430,7 +430,9 @@ mod tests {
             if crate::testutil::is_test_only_source(&file) || declared_test_only.contains(&file) {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let Some(text) = crate::testutil::read_listed(&file) else {
+                continue;
+            };
             let production = crate::testutil::production_half(&text);
             for (at, needle) in production.match_indices("Command::new(\"") {
                 let Some(name) = production[at + needle.len()..].split('"').next() else {
@@ -512,7 +514,9 @@ mod tests {
             if file.ends_with("src/pathfind.rs") {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let Some(text) = crate::testutil::read_listed(&file) else {
+                continue;
+            };
             // The name as a token on a code line, however it is reached: qualified, imported and
             // called bare, or passed as a value. Comment lines are skipped, since a doc that names
             // the function searches nothing.

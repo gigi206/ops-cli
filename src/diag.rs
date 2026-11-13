@@ -286,7 +286,9 @@ mod tests {
             if crate::testutil::is_test_only_source(&file) {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let Some(text) = crate::testutil::read_listed(&file) else {
+                continue;
+            };
             let production = crate::testutil::production_half(&text);
             for needle in ["warn(warning)", "warn(w)"] {
                 let n = production.matches(needle).count();
