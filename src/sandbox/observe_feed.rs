@@ -652,10 +652,10 @@ mod tests {
         let observer =
             ExecObserver::start(parent.id(), OBSERVE_POLL_INTERVAL, Arc::clone(&ring), false)
                 .expect("the observer starts");
-        let wrapper = event_in(&ring, "the wrapper is reported", |e| {
-            e.command.starts_with("sh -c i=0; while")
-        })
-        .pid;
+        // The parent's one child is the wrapper, listed before its own children, so the first
+        // event is the wrapper's, under whichever command line the tick caught: between the fork
+        // and the exec of the inner shell it already runs as `sh`, with the parent's.
+        let wrapper = event_in(&ring, "the wrapper is reported", |_| true).pid;
         std::fs::write(&released, b"").expect("the wrapper is released");
         let became = event_in(
             &ring,
