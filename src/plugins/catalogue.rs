@@ -195,7 +195,9 @@ pub(crate) fn verified_catalogue(
 /// entry's `sha256`. It covers exactly what git records — the set of regular files,
 /// their repo-relative paths (`/`-separated), the executable bit, and their bytes — so
 /// a clone of the store reproduces it; it ignores mtime, owner, and the non-exec mode
-/// bits, which git does not track. The framing per file, in path-sorted order, is
+/// bits, which git does not track. The executable bit is the owner's, the one git records:
+/// a file executable by its group or others alone is committed, and cloned, as not
+/// executable. The framing per file, in path-sorted order, is
 /// `relpath ‖ 0x00 ‖ ('1'|'0') ‖ 0x00 ‖ sha256(bytes) ‖ '\n'`, hashed with SHA-256. A
 /// symlink or any non-regular file is refused (fail-closed: a store must not smuggle a
 /// link or device into a trusted tree).
@@ -286,7 +288,7 @@ fn collect_dir(
             let rel = repo_rel(rel)?;
             let bytes =
                 std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-            let exec = (meta.permissions().mode() & 0o111) != 0;
+            let exec = (meta.permissions().mode() & 0o100) != 0;
             out.push((rel, exec, Sha256::digest(&bytes).into()));
         } else {
             return Err(format!(
@@ -606,6 +608,32 @@ mod tests {
         write(&a.path().join("resolve"), b"same", true);
         write(&b.path().join("resolve"), b"same", false);
         assert_ne!(dir_digest(a.path()).unwrap(), dir_digest(b.path()).unwrap());
+    }
+
+    /// The executable bit is the owner's, as git records it: a publisher's file executable by its
+    /// group or others alone is committed, and cloned, as not executable, so it hashes as a file
+    /// that is not, and a catalogue signed from that tree verifies against its clone.
+    #[test]
+    fn the_executable_bit_is_the_owners_as_git_records_it() {
+        let digest_with_mode = |mode: u32| {
+            let dir = crate::testutil::TmpDir::new();
+            let file = dir.path().join("resolve");
+            std::fs::write(&file, b"same").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+            dir_digest(dir.path()).unwrap()
+        };
+        for (mode, as_git_records) in [
+            (0o654, 0o644),
+            (0o645, 0o644),
+            (0o744, 0o755),
+            (0o700, 0o755),
+        ] {
+            assert_eq!(
+                digest_with_mode(mode),
+                digest_with_mode(as_git_records),
+                "{mode:o} hashes as git records it, {as_git_records:o}"
+            );
+        }
     }
 
     #[test]
