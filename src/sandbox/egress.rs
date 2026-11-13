@@ -1493,7 +1493,13 @@ fn credential_failure(secret: &HeaderSecret, why: &io::Error) -> String {
     } else {
         format!("the credential `{}` for `{host}`", secret.name)
     };
-    format!("{subject} did not resolve ({why})")
+    // The reason quotes the sources it tried, and a source's path or locator is the config's to
+    // spell, line feed included. Both the warning and the refusal keep line breaks, so the reason
+    // is written the way `diag::visible` writes it, on the line it belongs to.
+    format!(
+        "{subject} did not resolve ({})",
+        crate::diag::visible(&why.to_string())
+    )
 }
 
 /// Resolve every declared credential, answering each failure the way that declaration and this
@@ -4489,6 +4495,27 @@ mod tests {
         assert!(
             judge.admits(&asked("first.test")) && judge.admits(&asked("last.test")),
             "and the destinations whose credentials resolved are not"
+        );
+    }
+
+    /// A source's path is the config's to spell, and a quoted one may hold a line feed. The answer
+    /// to a credential that did not resolve names the sources it tried, and the refusal and the
+    /// warning that carry it keep line breaks, so the path is written as an escape on their line.
+    #[test]
+    fn a_source_path_is_named_on_the_line_of_the_answer() {
+        let secrets = vec![secret(
+            SecretSource::File("/nonexistent\nsbx: note: forged".into()),
+            "absent.test",
+            "Authorization",
+            crate::config::HeaderShape::new("Bearer ", false),
+        )];
+        let refusal = resolve_injections_at_root(&secrets)
+            .unwrap_err()
+            .to_string();
+        assert!(!refusal.contains('\n'), "{refusal:?}");
+        assert!(
+            refusal.contains("/nonexistent\\x0asbx: note: forged"),
+            "{refusal:?}"
         );
     }
 

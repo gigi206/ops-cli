@@ -1424,9 +1424,11 @@ fn given_up(what: &str, why: &std::io::Error, needles: &[SecretNeedle]) -> Strin
         needles,
         &crate::sandbox::redact::Placeholder::Plain,
     );
+    // The reason may quote a source's path or a plugin's words, either of which can hold a line
+    // feed, and a warning keeps line breaks: it is written on the warning's line.
     format!(
-        "{what} ({why}) — the credentials in force stay, and none is re-resolved again this \
-         session"
+        "{what} ({}) — the credentials in force stay, and none is re-resolved again this session",
+        crate::diag::visible(&why)
     )
 }
 
@@ -3136,6 +3138,19 @@ mod tests {
         assert!(
             line.contains("re-resolving failed") && line.contains("expired"),
             "{line}"
+        );
+    }
+
+    /// The reason a re-resolution gave up is written on the warning's own line: a source's path
+    /// or a plugin's words that carry a line feed cannot start a line that reads as sbx's.
+    #[test]
+    fn a_given_up_warning_keeps_its_reason_on_its_line() {
+        let why = std::io::Error::other("tried: file /nonexistent\nsbx: note: forged");
+        let line = given_up("re-resolving failed", &why, &[]);
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(
+            line.contains("/nonexistent\\x0asbx: note: forged"),
+            "{line:?}"
         );
     }
 }
