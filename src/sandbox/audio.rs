@@ -671,6 +671,40 @@ mod tests {
         assert!(carried.is_ok(), "{carried:?}");
     }
 
+    /// The shim finds a library in an `LD_LIBRARY_PATH` directory whose name a glob would read as a
+    /// pattern: the directory is matched as the path it is, so `lib[x]` is that directory and not
+    /// one named `libx`. Run in the Python the host has, with the staged shim on `PYTHONPATH`.
+    #[test]
+    fn the_shim_finds_a_library_in_a_directory_named_like_a_pattern() {
+        let Some(python) = crate::pathfind::find_on_path("python3") else {
+            skip_incapable!("skipping the audio shim's library lookup: no python3 on this host");
+            return;
+        };
+        let tmp = crate::testutil::TmpDir::new();
+        let shim = tmp.path().join("shim");
+        std::fs::create_dir_all(&shim).unwrap();
+        std::fs::write(shim.join("sitecustomize.py"), SITECUSTOMIZE).unwrap();
+        let libs = tmp.path().join("lib[x]");
+        std::fs::create_dir_all(&libs).unwrap();
+        std::fs::write(libs.join("libsbxprobe.so.1"), b"").unwrap();
+        let out = std::process::Command::new(python)
+            .args([
+                "-c",
+                "import ctypes.util; print(ctypes.util.find_library('sbxprobe'))",
+            ])
+            .env("PYTHONPATH", &shim)
+            .env("LD_LIBRARY_PATH", &libs)
+            .output()
+            .unwrap();
+        let found = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            found.trim(),
+            libs.join("libsbxprobe.so.1").to_string_lossy(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn stage_atomically_rewrites_a_stale_file_when_the_content_changes() {
         // A new sbx release ships an updated shim; the staged file must be replaced, not kept stale.

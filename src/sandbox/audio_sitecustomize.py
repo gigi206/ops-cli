@@ -28,7 +28,8 @@ def _sbx_find_library(name):
         if not directory:
             continue
         for pattern in ("lib%s.so.*" % name, "lib%s.so" % name, "%s.so.*" % name, "%s.so" % name):
-            hits = sorted(glob.glob(os.path.join(directory, pattern)))
+            # The directory is a path, not a pattern: `glob.escape` keeps a `[` or a `*` in it literal.
+            hits = sorted(glob.glob(os.path.join(glob.escape(directory), pattern)))
             if hits:
                 return hits[-1]
     return found
