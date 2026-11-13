@@ -288,9 +288,12 @@ mod tests {
     }
 
     /// An abort under the unpack's filters ends its process by `SIGABRT`, the signal a reader
-    /// takes for one. The C library signals the thread it is on, and asks the kernel which that is
-    /// first; refused that, it has no signal to send, and ends the process by a fault of its own.
-    /// In a process of its own, for the reason [`run_alone`] gives, and one that dumps no core.
+    /// takes for one. glibc signals the thread it is on, and asks the kernel which that is first;
+    /// refused that, it has no signal to send and falls back on an instruction that faults. On
+    /// x86_64 the Rust runtime's own handler catches that fault and, with `rt_sigaction` off the
+    /// list, cannot take itself off, so the process faults again on the same instruction and never
+    /// ends: hence one exact signal, within the time [`run_alone`] waits. In a process of its own,
+    /// for the reason [`run_alone`] gives, and one that dumps no core.
     #[test]
     fn an_abort_under_the_filters_still_reads_as_one() {
         let ran = run_alone(concat!(module_path!(), "::an_abort_under_the_filters"));

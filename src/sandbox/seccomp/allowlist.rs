@@ -33,9 +33,11 @@ fn floor() -> Vec<i64> {
         // Returning from a signal handler, and resuming a wait a signal interrupted.
         libc::SYS_rt_sigreturn,
         libc::SYS_restart_syscall,
-        // An abort, which signals its own process: refused, it would end in some other fault and
-        // no longer read as one. glibc asks the kernel which thread it is on before signalling it,
-        // where musl reads it from its own record.
+        // An abort, which signals its own process: refused, it would no longer read as one. It
+        // would end in some other fault, or, on x86_64 under a list without `rt_sigaction` (the
+        // unpack's), not end at all: the Rust runtime's handler catches that fault and cannot take
+        // itself off. glibc asks the kernel which thread it is on before signalling it, where musl
+        // reads it from its own record.
         libc::SYS_getpid,
         libc::SYS_gettid,
         libc::SYS_tgkill,
