@@ -12,7 +12,8 @@
 
 # An app launched from here reads the project's tools from the pool `sbx run` filled, read-only,
 # instead of fetching them under its own egress, which refuses the hosts below.
-apps_read_project_pool = true
+[apps]
+read_project_pool = true
 
 # Read-only: what the tools of `mise.toml` and cargo fetch, on top of the nix and GitHub hosts the
 # self-equip lane already opens.

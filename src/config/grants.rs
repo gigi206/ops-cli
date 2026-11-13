@@ -238,7 +238,7 @@ fn delta(before: &Resolved, after: &Resolved, app: Option<&String>, out: &mut Ve
     }
     if *apps_share_install_pools && !before.apps_share_install_pools {
         push(
-            "apps_share_install_pools",
+            "apps.share_install_pools",
             "true".into(),
             Risk::Notable,
             "one app can place a program another runs",
@@ -246,7 +246,7 @@ fn delta(before: &Resolved, after: &Resolved, app: Option<&String>, out: &mut Ve
     }
     if *apps_read_project_pool && !before.apps_read_project_pool {
         push(
-            "apps_read_project_pool",
+            "apps.read_project_pool",
             "true".into(),
             Risk::Notable,
             "the project's `sbx run` shell can place a program its apps run",

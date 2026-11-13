@@ -374,7 +374,7 @@ pub(crate) fn app_per_project_mise_pools(
 /// offer, and naming it would put an empty directory on a fallback list. Sorted by app name, so the
 /// order a cage is given is stable across launches rather than following the filesystem's.
 ///
-/// This is the set `apps_share_install_pools` grants a read of. It is discovered on disk rather
+/// This is the set `[apps] share_install_pools` grants a read of. It is discovered on disk rather
 /// than declared, so the grant covers exactly the apps that have run in this project, and it is
 /// symmetric by construction: each app sees the others, none sees itself twice.
 ///
@@ -409,7 +409,7 @@ pub(crate) fn project_mise_pools(
 /// those whose pool it can share.
 ///
 /// `sbx app prune --stale` reads each one's activations to keep what it asks for, since
-/// `apps_share_install_pools` lets one app resolve a tool out of another's pool. The app that relies
+/// `[apps] share_install_pools` lets one app resolve a tool out of another's pool. The app that relies
 /// on that most is one that never installed anything itself, and whose pool therefore holds no
 /// `installs`, so none is left out for what its pool holds. A listing that cannot be read whole is an
 /// error naming the directory rather than a shorter list: a neighbour missing from it is a version

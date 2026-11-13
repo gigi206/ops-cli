@@ -529,14 +529,14 @@ pub(crate) struct Resolved {
     /// Set only by a trusted project (never by the global config), it puts each app's pool in the
     /// read-only fallback list of the others, so the second app to want a tool the project declares
     /// finds the first app's copy instead of fetching one. See
-    /// [`schema::RawConfig::apps_share_install_pools`] for what the grant gives up.
+    /// [`schema::RawApps::share_install_pools`] for what the grant gives up.
     pub(crate) apps_share_install_pools: bool,
     /// Which layer granted it (`Default` when none did, and never `Global`: there is no global
     /// form). Carried rather than inferred at the render, so a global form added later cannot make
     /// a hardcoded tag say `project` about a value the machine set.
     pub(crate) apps_share_install_pools_origin: Provenance,
     /// Whether the global apps of this project may read the mise pool `sbx run` fills. Set only by
-    /// a trusted project; see [`schema::RawConfig::apps_read_project_pool`].
+    /// a trusted project; see [`schema::RawApps::read_project_pool`].
     pub(crate) apps_read_project_pool: bool,
     /// Which layer granted it (`Default` when none did, and never `Global`: there is no global
     /// form).
@@ -1140,8 +1140,6 @@ impl Resolved {
             allow_insecure_http,
             // Dropped by `overlay_into` before it reaches here, and named for the same reason: the
             // grant belongs to the project's config, not to one launch.
-            apps_share_install_pools: _,
-            apps_read_project_pool: _,
             apps: _,
             env,
             binds,
@@ -2192,8 +2190,8 @@ fn resolve(
     // untrusted or changed project is refused with a warning rather than quietly granted.
     let mut apps_share_install_pools = false;
     let mut apps_share_install_pools_origin = Provenance::Default;
-    if let Some((proj, state)) = project.as_ref()
-        && proj.apps_share_install_pools
+    if let Some((section, state)) = project_apps_section.as_ref()
+        && section.share_install_pools
     {
         if *state == TrustState::Trusted {
             apps_share_install_pools = true;
@@ -2202,7 +2200,7 @@ fn resolve(
             refuse_untrusted(
                 &mut warnings,
                 PROJECT_CONFIG,
-                "`apps_share_install_pools`",
+                "`[apps] share_install_pools`",
                 *state,
             );
         }
@@ -2211,8 +2209,8 @@ fn resolve(
     // for the reasons the grant above is.
     let mut apps_read_project_pool = false;
     let mut apps_read_project_pool_origin = Provenance::Default;
-    if let Some((proj, state)) = project.as_ref()
-        && proj.apps_read_project_pool
+    if let Some((section, state)) = project_apps_section.as_ref()
+        && section.read_project_pool
     {
         if *state == TrustState::Trusted {
             apps_read_project_pool = true;
@@ -2221,7 +2219,7 @@ fn resolve(
             refuse_untrusted(
                 &mut warnings,
                 PROJECT_CONFIG,
-                "`apps_read_project_pool`",
+                "`[apps] read_project_pool`",
                 *state,
             );
         }

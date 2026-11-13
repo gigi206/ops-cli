@@ -2673,7 +2673,7 @@ fn every_runtime_names_the_host_directory_a_declared_tool_installs_into() {
 
 #[test]
 fn the_grant_puts_the_other_apps_pools_behind_the_apps_own_and_read_only() {
-    // `apps_share_install_pools` is a read of a pool another app owns, so three properties decide
+    // `[apps] share_install_pools` is a read of a pool another app owns, so three properties decide
     // whether it is the grant it claims to be, and none of them is visible in the flag itself.
     // Each neighbour is bound READ-ONLY (the list is a search path mise never writes, and the mode
     // says so rather than trusting it); the app's own installs come FIRST in the list, so a version
@@ -2769,7 +2769,7 @@ fn the_grant_puts_the_other_apps_pools_behind_the_apps_own_and_read_only() {
     );
 }
 
-/// The pool `sbx run` fills lies inside a home its cage writes, so `apps_read_project_pool` reaches
+/// The pool `sbx run` fills lies inside a home its cage writes, so `[apps] read_project_pool` reaches
 /// it only when the launch can hold it: bound read-only behind every app pool, mounted from a
 /// descriptor opened with every link refused, and left out when the launch cannot do that or the
 /// pool is not what a launch left. It is its own grant: the apps' pools are shared only under theirs.

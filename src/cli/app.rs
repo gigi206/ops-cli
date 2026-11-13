@@ -2766,7 +2766,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
                         specs.entry(tool).or_default().extend(versions);
                     }
                 }
-                // And the other apps of this project, because `apps_share_install_pools` lets one
+                // And the other apps of this project, because `[apps] share_install_pools` lets one
                 // resolve out of another's pool: a tool this app equipped once and no longer asks
                 // for may be the one a neighbour found here and therefore never installed itself,
                 // so reading this app's activations alone would empty a pool under a running

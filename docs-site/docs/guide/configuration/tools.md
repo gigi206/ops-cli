@@ -59,7 +59,7 @@ A launch installs only what is **missing**: a tool an installed version already 
 left as it is, so `node = "20"` keeps running the 20.x it has when a newer 20.x is published.
 mise resolves a tool handed to `install` by name against the newest release, so each one is
 first asked of `mise where`, which answers from what is installed, in the cage's own pool and in
-any pool it reads (see [`apps_read_project_pool`](packages#apps_read_project_pool-when-an-app-needs-the-tools-the-projects-shell-installed)); only the tools it does not
+any pool it reads (see [`[apps] read_project_pool`](packages#apps-read_project_pool-when-an-app-needs-the-tools-the-projects-shell-installed)); only the tools it does not
 resolve reach `mise install`, and a launch where none is missing runs no install at all. A launch
 therefore never moves a version: mise's own `upgrade`, run through [`sbx mise`](../cli/mise) in the
 project's cage and under its egress, does.

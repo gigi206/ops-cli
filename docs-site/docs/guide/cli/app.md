@@ -600,7 +600,7 @@ names is asking for it.
 
 A third source joins them for a per-project pool: the activation record of every other app that
 has run in the same project, whether or not it installed anything there. Where the project sets
-[`apps_share_install_pools`](../configuration/packages#apps_share_install_pools-when-two-apps-in-one-project-equip-the-same-tool),
+[`[apps] share_install_pools`](../configuration/packages#apps-share_install_pools-when-two-apps-in-one-project-equip-the-same-tool),
 a version this app equipped and no longer asks for may be the one a neighbour found here and
 therefore never installed itself, and a sweep reading this app's records alone would take it out
 from under a neighbour. Those records are read whether or not the project shares its pools: with

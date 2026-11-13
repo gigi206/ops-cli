@@ -111,7 +111,7 @@ The tools a project's own mise file declares are the case where this is most vis
 are the same tools for every app, by construction, and each app installs them again.
 
 Sharing them is offered, and it is off until a project asks for it
-([`apps_share_install_pools`](../configuration/packages#apps_share_install_pools-when-two-apps-in-one-project-equip-the-same-tool)).
+([`[apps] share_install_pools`](../configuration/packages#apps-share_install_pools-when-two-apps-in-one-project-equip-the-same-tool)).
 The mechanism was already in place: mise reads a list of read-only install directories to
 fall back on, and sbx already points it at the app's own pool so a tool the agent equips in
 one project is reused in the next. Each app's pool is another entry in that list, not a

@@ -2587,7 +2587,7 @@ pub(super) const PAGES: &[Page] = &[
             \n\
             For a per-project pool a third source is read: the activation record of every other app\n\
             that has run in that project, whether or not it installed anything there. Where the\n\
-            project sets `apps_share_install_pools`, a version this app no longer asks for may be the\n\
+            project sets `[apps] share_install_pools`, a version this app no longer asks for may be the\n\
             one a neighbour found here and never installed itself. They are read whether or not the\n\
             project shares, since with sharing off they name versions no launch resolves from this\n\
             pool, so reading them can only keep a version and never remove one. A project whose list\n\

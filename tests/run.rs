@@ -7257,7 +7257,7 @@ fn a_global_apps_project_mise_tool_lands_in_the_per_project_pool() {
 
 #[test]
 fn a_shared_pool_lets_the_second_app_reuse_what_the_first_installed() {
-    // `apps_share_install_pools` is a read of one app's pool by another, and the only thing that
+    // `[apps] share_install_pools` is a read of one app's pool by another, and the only thing that
     // shows whether the read happened is where the tool does NOT get installed. Two apps in one
     // project, both auto-equipping the same tool from the project's own `mise.toml` (Lane 2, the
     // case the grant exists for). The first has nothing to fall back on and installs it; the second
@@ -7273,7 +7273,7 @@ fn a_shared_pool_lets_the_second_app_reuse_what_the_first_installed() {
     let state = TmpDir::prefixed("r", "shp-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
-        "apps_share_install_pools = true\n\
+        "[apps]\nshare_install_pools = true\n\
          [app.one]\ncmd = [\"sh\", \"-c\", \"rg --version\"]\n\
          [app.two]\ncmd = [\"sh\", \"-c\", \"rg --version\"]\n",
     )
@@ -7329,7 +7329,7 @@ fn a_shared_pool_lets_the_second_app_reuse_what_the_first_installed() {
             String::from_utf8_lossy(&out.stdout)
         );
         assert!(
-            !log.contains("ignoring `apps_share_install_pools`"),
+            !log.contains("ignoring `[apps] share_install_pools`"),
             "the grant must be honored for app `{name}`, or the sharing is not what is measured: \
              {log}"
         );
@@ -7714,7 +7714,7 @@ fn an_upgrade_leaves_the_projects_own_mise_tools_out_of_every_app_cage() {
 fn an_app_finds_the_project_tools_sbx_run_installed_without_fetching_them() {
     // An app's `[network]` replaces the project's, so a tool the project's mise file declares from a
     // host only the project allows failed to install at every app launch, and the app never had it.
-    // Under `apps_read_project_pool` the app reads the pool `sbx run` filled. Teeth: `sbx run`
+    // Under `[apps] read_project_pool` the app reads the pool `sbx run` filled. Teeth: `sbx run`
     // installs an exact-version `npm:` tool under the project's egress, and the app, whose egress
     // refuses the registry, then runs it with no failed install and no request to the registry.
     // Skips (never fails) without a sandbox or the network.
@@ -7746,7 +7746,7 @@ fn an_app_finds_the_project_tools_sbx_run_installed_without_fetching_them() {
     .unwrap();
     std::fs::write(
         project.path().join(".sbx.toml"),
-        "apps_read_project_pool = true\n\
+        "[apps]\nread_project_pool = true\n\
          [network]\nmode = \"deny\"\nallow = [\"{GET,HEAD} https://registry.npmjs.org\"]\n\
          [packages]\nnode = \"nix:nodejs\"\n\
          [app.pp]\ncmd = [\"sh\", \"-c\", \"command -v cowsay\"]\n\

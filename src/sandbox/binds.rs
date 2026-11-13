@@ -747,11 +747,11 @@ pub(crate) struct Overlay<'a> {
     /// too. Empty whenever the project has none, or has one that is honored.
     pub(crate) ignored_mise_paths: &'a [std::path::PathBuf],
     /// Whether this project's apps may read each other's per-project mise install pools
-    /// (`apps_share_install_pools`, a trusted project's grant). Only a global app has such a pool,
+    /// (`[apps] share_install_pools`, a trusted project's grant). Only a global app has such a pool,
     /// so it changes nothing for the other runtimes.
     pub(crate) share_install_pools: bool,
     /// Whether a global app may read the pool `sbx run` fills ([`PROJECT_POOL`];
-    /// `apps_read_project_pool`, a trusted project's grant). It takes a bubblewrap that mounts a
+    /// `[apps] read_project_pool`, a trusted project's grant). It takes a bubblewrap that mounts a
     /// source from its descriptor, since that pool, unlike an app's, lies inside a home its cage can
     /// write: by path, a parent swapped for a link between the plan and the mount would choose what
     /// the reading cage sees.
@@ -790,7 +790,7 @@ struct SandboxPaths<'a> {
     /// The other apps' per-project mise pools this cage may read, as `(app name, host pool dir)`.
     /// Each is bound read-only at `<MISE_SHARED_INCAGE>/<app>` ([`shared_pool_mounts`]), and the
     /// `installs` inside it is named to mise as a fallback after the app's own. Empty unless a
-    /// trusted project granted `apps_share_install_pools`, and empty for every runtime but a
+    /// trusted project granted `[apps] share_install_pools`, and empty for every runtime but a
     /// global app.
     mise_shared_pools: &'a [(String, PathBuf)],
     /// Synthetic identity files; bound read-only at `/etc/passwd`/`/etc/group`.
@@ -1182,7 +1182,7 @@ fn cage_mounts(
 
     // Zone 2 — the other apps' install pools, bound READ-ONLY, one per app under
     // [`MISE_SHARED_INCAGE`]. Present only when a trusted project granted
-    // `apps_share_install_pools`; empty otherwise, which is every launch that did not ask. mise
+    // `[apps] share_install_pools`; empty otherwise, which is every launch that did not ask. mise
     // treats its fallback list as a search path and never writes to one, so the read-only mode
     // states the same thing the tool already does rather than relying on it. An app name is a
     // validated single path component (the config app-name check), so joining it cannot traverse
@@ -1605,7 +1605,7 @@ const MISE_PROJECT_INCAGE: &str = "/opt/sbx/mise-project";
 
 /// Where the *other* apps' per-project install pools are bound read-only inside the cage, one
 /// directory per app under this root (`<this>/<app>`). Only a global app in a project whose trusted
-/// config sets `apps_share_install_pools` gets any, and each is a read of a pool another app owns:
+/// config sets `[apps] share_install_pools` gets any, and each is a read of a pool another app owns:
 /// the bind is read-only, and mise treats the whole fallback list as a search path it never writes.
 /// Under `/opt/sbx`, disjoint from every structural mount; the root is the destination
 /// [`STRUCTURAL_DESTS`] carries, its per-app children being derived the way the home's are.

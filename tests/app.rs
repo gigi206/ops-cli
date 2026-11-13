@@ -1245,7 +1245,7 @@ fn prune_stale_reads_the_specs_of_a_tool_whose_directory_mise_named_from_capital
     );
 }
 
-/// A pool the sweep keeps for a neighbour: `apps_share_install_pools` lets another app of the
+/// A pool the sweep keeps for a neighbour: `[apps] share_install_pools` lets another app of the
 /// project resolve a tool out of this pool, and the app that depends on that most is one that never
 /// installed anything itself, whose own pool holds no `installs` at all — most pools a launch
 /// leaves hold only mise's `plugins`. What that neighbour's activation asks for is kept.

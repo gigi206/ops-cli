@@ -52,40 +52,8 @@ pub(crate) struct RawConfig {
     /// never as a blanket.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) accepts_fresh_releases: Vec<String>,
-    /// Whether the apps of this project may read each other's installed mise tools.
-    ///
-    /// A global app equips what the project's own mise file declares into a pool under this
-    /// project's tree, keyed by app, so two apps in one project install the same tool twice. Set
-    /// here, each app's pool joins the read-only fallback list of the others, so the second app
-    /// finds what the first installed instead of fetching it again. The pools stay separate and
-    /// each app still writes only its own; what changes is what it may read.
-    ///
-    /// An app's own tools win: its pool and its home are searched before any neighbour's, and a
-    /// version it holds itself is the one it resolves. What a neighbour supplies is a version the
-    /// app has nowhere else.
-    ///
-    /// **A security field**, honored only from a trusted project, and never from the global config
-    /// — the grant is about *these* apps in *this* project, and a machine-wide default would open
-    /// it for projects that never asked. What it gives up is that a tool one app installed becomes
-    /// a tool another app can run: an app that equips the version a second app is about to ask for
-    /// gets its copy run instead. The project's `/nix` store is already shared this way (see the
-    /// security model); this extends the same shape to the backends that never touch the store.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) apps_share_install_pools: bool,
-    /// Lets the project's global apps read, read-only and last, the mise pool `sbx run` fills: the
-    /// project's own tools, fetched under the project's `[network]`, which an app's posture
-    /// replaces. An app whose egress refuses those tools' hosts finds them there instead of failing
-    /// to fetch them at every launch.
-    ///
-    /// **A security field**, honored only from a trusted project and never from the global config,
-    /// for the reason [`Self::apps_share_install_pools`] gives. What it gives up is that a tool the
-    /// project's shell installed becomes a tool an app can run. The pool lies inside a home that
-    /// shell's cage writes, so it is mounted only from a descriptor the launch held with every link
-    /// refused, and not at all on a bubblewrap without `--bind-fd`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) apps_read_project_pool: bool,
-    /// What every app launched from this project shares, as an `[apps]` table: today its
-    /// `[apps.network]` rules (see [`RawApps`]).
+    /// What every app launched from this project shares, as an `[apps]` table: the install pools
+    /// its apps may read and the rules added to each one's network policy (see [`RawApps`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) apps: Option<RawApps>,
     /// Inline nix flakes, declared as `[flakes.<name>]` tables. Each carries a full `flake.nix`
@@ -431,12 +399,45 @@ pub(crate) struct RawConfig {
 }
 
 /// The `[apps]` table: settings that apply to every app launched from the project, whichever its
-/// profile.
+/// profile. Read from a trusted project only, never from the global config: each of them is about
+/// *these* apps in *this* project.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawApps {
     /// Egress rules added to every app's own posture, as `[apps.network]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) network: Option<RawAppsNetwork>,
+    /// `share_install_pools`: whether the apps of this project may read each other's installed mise tools.
+    ///
+    /// A global app equips what the project's own mise file declares into a pool under this
+    /// project's tree, keyed by app, so two apps in one project install the same tool twice. Set
+    /// here, each app's pool joins the read-only fallback list of the others, so the second app
+    /// finds what the first installed instead of fetching it again. The pools stay separate and
+    /// each app still writes only its own; what changes is what it may read.
+    ///
+    /// An app's own tools win: its pool and its home are searched before any neighbour's, and a
+    /// version it holds itself is the one it resolves. What a neighbour supplies is a version the
+    /// app has nowhere else.
+    ///
+    /// **A security field**, honored only from a trusted project, and never from the global config
+    /// — the grant is about *these* apps in *this* project, and a machine-wide default would open
+    /// it for projects that never asked. What it gives up is that a tool one app installed becomes
+    /// a tool another app can run: an app that equips the version a second app is about to ask for
+    /// gets its copy run instead. The project's `/nix` store is already shared this way (see the
+    /// security model); this extends the same shape to the backends that never touch the store.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) share_install_pools: bool,
+    /// `read_project_pool`: lets the project's global apps read, read-only and last, the mise pool `sbx run` fills: the
+    /// project's own tools, fetched under the project's `[network]`, which an app's posture
+    /// replaces. An app whose egress refuses those tools' hosts finds them there instead of failing
+    /// to fetch them at every launch.
+    ///
+    /// **A security field**, honored only from a trusted project and never from the global config,
+    /// for the reason [`Self::share_install_pools`] gives. What it gives up is that a tool the
+    /// project's shell installed becomes a tool an app can run. The pool lies inside a home that
+    /// shell's cage writes, so it is mounted only from a descriptor the launch held with every link
+    /// refused, and not at all on a bubblewrap without `--bind-fd`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) read_project_pool: bool,
     /// Every key of this table sbx does not know, kept so the loader names it.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,

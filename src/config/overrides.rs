@@ -514,23 +514,11 @@ fn push_ignored_field_notices(
 #[allow(clippy::type_complexity)]
 const DROPPED_TABLES: &[(&str, fn(&RawConfig) -> bool, &str)] = &[
     (
-        "apps_share_install_pools",
-        |r| r.apps_share_install_pools,
-        "the grant that lets a project's apps read each other's install pools is a property of \
-         the app set, written in the project's config where it is reviewed, not a one-launch \
-         decision",
-    ),
-    (
-        "apps_read_project_pool",
-        |r| r.apps_read_project_pool,
-        "the grant that lets a project's apps run the tools its shell installed is a property of \
-         the project, written in its config where it is reviewed, not a one-launch decision",
-    ),
-    (
         "apps",
         |r| r.apps.is_some(),
-        "the rules every app of a project shares are a property of the project, written in its \
-         config where they are reviewed; a launch adds its own through `network`",
+        "what every app of a project shares, the install pools it may read and the rules added to \
+         its network policy, is a property of the project, written in its config where it is \
+         reviewed, not a one-launch decision; a launch adds its own rules through `network`",
     ),
     (
         "distro",
@@ -632,17 +620,12 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
     // `_` with its reason, never omitted.
     let RawConfig {
         allow_insecure_http,
-        // The grant that lets this project's apps read each other's install pools is a property
-        // of the app set, recorded in the project's own config where it is reviewed. It is not a
-        // one-launch decision, and an ambient variable carrying it would open the pools of every
-        // launch without a line anywhere saying so. `push_ignored_field_notices` says it is
-        // dropped rather than letting it govern nothing in silence.
-        apps_share_install_pools: _,
-        // Dropped for the same reason: which of the project's own tools its apps may run is
-        // recorded in the project's config, not decided for one launch.
-        apps_read_project_pool: _,
-        // Dropped for the same reason: rules every app of the project shares are recorded in the
-        // project's config, and a launch names its own rules through `network`.
+        // What every app of the project shares, the install pools it may read and the rules
+        // added to its network policy, is recorded in the project's own config where it is
+        // reviewed. It is not a one-launch decision, and an ambient variable carrying it would
+        // open the pools of every launch without a line anywhere saying so; a launch names its
+        // own rules through `network`. `push_ignored_field_notices` says it is dropped rather than
+        // letting it govern nothing in silence.
         apps: _,
         binds,
         packages,
@@ -758,17 +741,12 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     // with its reason, never omitted.
     let RawConfig {
         allow_insecure_http,
-        // The grant that lets this project's apps read each other's install pools is a property
-        // of the app set, recorded in the project's own config where it is reviewed. It is not a
-        // one-launch decision, and an ambient variable carrying it would open the pools of every
-        // launch without a line anywhere saying so. `push_ignored_field_notices` says it is
-        // dropped rather than letting it govern nothing in silence.
-        apps_share_install_pools: _,
-        // Dropped for the same reason: which of the project's own tools its apps may run is
-        // recorded in the project's config, not decided for one launch.
-        apps_read_project_pool: _,
-        // Dropped for the same reason: rules every app of the project shares are recorded in the
-        // project's config, and a launch names its own rules through `network`.
+        // What every app of the project shares, the install pools it may read and the rules
+        // added to its network policy, is recorded in the project's own config where it is
+        // reviewed. It is not a one-launch decision, and an ambient variable carrying it would
+        // open the pools of every launch without a line anywhere saying so; a launch names its
+        // own rules through `network`. `push_ignored_field_notices` says it is dropped rather than
+        // letting it govern nothing in silence.
         apps: _,
         env,
         binds,

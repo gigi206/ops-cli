@@ -83,8 +83,6 @@ fn validate_network(
 
 fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
-        apps_share_install_pools: false,
-        apps_read_project_pool: false,
         apps: None,
         accepts_fresh_releases: Default::default(),
         net_group_files: Default::default(),
@@ -15296,5 +15294,43 @@ fn an_app_named_network_with_no_command_is_named_as_the_apps_table_misspelled() 
             .any(|w| w.contains("`[app.network]`") && w.contains("`[apps.network]`")),
         "{:?}",
         r.warnings
+    );
+}
+
+/// The two pool grants are read under `[apps]`, from a trusted project only: an untrusted
+/// project's is refused with the reason, and the global config's grants nothing.
+#[test]
+fn the_pool_grants_are_read_under_apps_from_a_trusted_project_only() {
+    let grants = "[apps]\nshare_install_pools = true\nread_project_pool = true\n";
+    let parse = |text: &str| -> RawConfig { toml::from_str(text).expect("the config parses") };
+
+    let r = resolve_no_plugins(
+        RawConfig::default(),
+        Some((parse(grants), TrustState::Trusted)),
+    );
+    assert!(
+        r.apps_share_install_pools && r.apps_read_project_pool,
+        "a trusted project grants both"
+    );
+
+    let r = resolve_no_plugins(
+        RawConfig::default(),
+        Some((parse(grants), TrustState::Untrusted)),
+    );
+    assert!(!r.apps_share_install_pools && !r.apps_read_project_pool);
+    for what in ["`[apps] share_install_pools`", "`[apps] read_project_pool`"] {
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains(&format!("ignoring {what}"))),
+            "the refusal of {what} is named: {:?}",
+            r.warnings
+        );
+    }
+
+    let r = resolve_no_plugins(parse(grants), None);
+    assert!(
+        !r.apps_share_install_pools && !r.apps_read_project_pool,
+        "the global config grants neither"
     );
 }

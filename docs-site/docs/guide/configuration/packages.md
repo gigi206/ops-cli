@@ -210,7 +210,7 @@ package with the reason written beside it, never as a blanket, and remove it onc
 cadence slows enough for the delay to clear on its own. A [bundle](bundles) may carry the line for
 the tool it ships, which is where it belongs when the package belongs there too.
 
-#### `apps_share_install_pools`: when two apps in one project equip the same tool
+#### `[apps] share_install_pools`: when two apps in one project equip the same tool
 
 A global app's `[packages] mise:` tools live in its own home and follow it into every project. What
 the *project's* mise file declares is equipped somewhere else: a pool under the project's tree,
@@ -221,7 +221,8 @@ Set this in the project's config and each app's pool joins the read-only fallbac
 others:
 
 ```toml
-apps_share_install_pools = true
+[apps]
+share_install_pools = true
 ```
 
 The pools stay separate. Each app still writes only its own, and mise treats the others as a search
@@ -258,7 +259,7 @@ project declares is written in a file every app in it can read. The project's `/
 this extends the same shape to the backends that never touch the store. Leave it off unless the
 apps in the project are ones you would let each other's tools run.
 
-#### `apps_read_project_pool`: when an app needs the tools the project's shell installed
+#### `[apps] read_project_pool`: when an app needs the tools the project's shell installed
 
 The project's own mise file is equipped in every cage launched from the project, `sbx run` and each
 app alike, and each fetches under its own `[network]`. An app's posture replaces the project's
@@ -270,7 +271,8 @@ Set this in the project's config and each global app also reads, read-only and l
 `sbx run` fills:
 
 ```toml
-apps_read_project_pool = true
+[apps]
+read_project_pool = true
 ```
 
 A tool the project's mise file asks for then resolves from that pool with no network at all,
@@ -285,7 +287,7 @@ object held (`--ro-bind-fd`), and the cage checks what it sees there against wha
 anything runs. On a bubblewrap without `--bind-fd` the pool is not shared at all.
 
 This is a security field, [trusted-only](#why-the-tool-sources-are-trusted-only), and project-only
-like `apps_share_install_pools`. What it gives up is that a tool the project's shell installed
+like `[apps] share_install_pools`. What it gives up is that a tool the project's shell installed
 becomes a tool its apps can run, so anything that runs in `sbx run` can place a program an app with
 credentials will run. Leave it off unless what runs in the project's shell is something you would
 let the apps' tools come from.
