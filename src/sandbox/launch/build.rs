@@ -1226,6 +1226,7 @@ fn mise_equip_lanes<'a>(
     // `gc` read), not the ambient per-project primary. Pin the equip step there for a global app;
     // for `sbx run`/a per-project app the ambient primary is already the app-global home, so no pin.
     let app_global_mise_dir = binds::app_equip_data_dir(runtime);
+    let suggest_project_pool = suggests_project_pool(runtime, prep.cfg.apps_read_project_pool);
     if !global_mise.is_empty() || !auto_equip.is_empty() {
         if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
             // `network = "none"`: a mise tool cannot be fetched, so skip the equip (it would only
@@ -1263,7 +1264,9 @@ fn mise_equip_lanes<'a>(
                             // below, whose config file is the cage's own and is sbx's to write.
                             // A tool already satisfied is not reinstalled: a launch never moves a
                             // version (see `EquipVerb::InstallMissing`).
-                            EquipVerb::InstallMissing,
+                            EquipVerb::InstallMissing {
+                                suggest_project_pool,
+                            },
                             &auto_equip,
                             // Lane 2 (project `.mise.toml` tools) runs under the ambient primary —
                             // the per-project pool for a global app, which is where these belong.
@@ -1323,6 +1326,14 @@ fn mise_equip_lanes<'a>(
     }
 
     autoequip_env
+}
+
+/// Whether a failed install of the project's own tools should name `[apps] read_project_pool`.
+///
+/// Only a global app can read the pool `sbx run` fills, so it is the one runtime for which naming
+/// that grant points at a remedy, and only while the project has not granted it.
+fn suggests_project_pool(runtime: binds::Runtime, reads_project_pool: bool) -> bool {
+    matches!(runtime, binds::Runtime::GlobalApp(_)) && !reads_project_pool
 }
 
 /// Register the in-cage build of this launch's inline flakes.

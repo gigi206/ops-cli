@@ -45,8 +45,19 @@ pub(super) enum EquipVerb {
     /// through a shim in the cage's own pool, and mise writes one only when it installs something:
     /// a tool resolved from a shared pool into a pool that installs nothing would otherwise stay off
     /// the `PATH`.
-    InstallMissing,
+    ///
+    /// `suggest_project_pool` is set for a global app that does not read the pool `sbx run` fills.
+    /// Such an app fetches the project's tools under its own egress, which usually refuses their
+    /// hosts, and the failure mise prints names a URL, not the remedy: when the install fails, the
+    /// script then prints [`PROJECT_POOL_HINT`].
+    InstallMissing { suggest_project_pool: bool },
 }
+
+/// What a global app's launch prints when it could not install a tool of the project's mise file:
+/// the grant that lets it run the copy `sbx run` installs instead of fetching its own.
+pub(super) const PROJECT_POOL_HINT: &str = "sbx: note: a tool of the project's mise file could \
+     not be installed under this app's egress; `[apps] read_project_pool = true` in the project's \
+     .sbx.toml lets every app of the project run the copy `sbx run` installs instead";
 
 /// The global option that runs a mise invocation as if started at `/`, outside the project.
 ///
@@ -392,13 +403,21 @@ pub(super) fn wrap_mise_equip(
         EquipVerb::PinGlobally => {
             format!("{data_dir_prefix}{mise} {MISE_EQUIP_VERB} -- \"${{@:1:{n}}}\" 1>&2")
         }
-        EquipVerb::InstallMissing => format!(
-            "missing=(); for t in \"${{@:1:{n}}}\"; do \
-             {data_dir_prefix}{mise} where -- \"$t\" >/dev/null 2>&1 || missing+=(\"$t\"); done; \
-             if [ \"${{#missing[@]}}\" -gt 0 ]; then \
-             {data_dir_prefix}{mise} install -- \"${{missing[@]}}\" 1>&2; fi; \
-             {data_dir_prefix}{mise} reshim 1>&2"
-        ),
+        EquipVerb::InstallMissing {
+            suggest_project_pool,
+        } => {
+            let hint = match suggest_project_pool {
+                true => format!(" || echo {} 1>&2", shell_quote(PROJECT_POOL_HINT)),
+                false => String::new(),
+            };
+            format!(
+                "missing=(); for t in \"${{@:1:{n}}}\"; do \
+                 {data_dir_prefix}{mise} where -- \"$t\" >/dev/null 2>&1 || missing+=(\"$t\"); done; \
+                 if [ \"${{#missing[@]}}\" -gt 0 ]; then \
+                 {data_dir_prefix}{mise} install -- \"${{missing[@]}}\" 1>&2{hint}; fi; \
+                 {data_dir_prefix}{mise} reshim 1>&2"
+            )
+        }
     };
     let script = format!(
         "{repair}{equip}; shift {shifted}; exec \"$@\"",

@@ -106,7 +106,9 @@ fn an_interpolated_mise_path_is_one_word_whatever_it_contains() {
     let argv = wrap_mise_equip(
         &mise,
         &bash,
-        EquipVerb::InstallMissing,
+        EquipVerb::InstallMissing {
+            suggest_project_pool: false,
+        },
         &tokens,
         None,
         false,
@@ -137,7 +139,9 @@ fn wrap_autoequip_passes_tokens_and_command_positionally() {
     let argv = wrap_mise_equip(
         &mise,
         &bash,
-        EquipVerb::InstallMissing,
+        EquipVerb::InstallMissing {
+            suggest_project_pool: false,
+        },
         &tokens,
         None,
         false,
@@ -233,7 +237,9 @@ fn the_project_lane_installs_only_the_tokens_mise_where_does_not_resolve() {
         let argv = wrap_mise_equip(
             Path::new("./mise"),
             &bash,
-            EquipVerb::InstallMissing,
+            EquipVerb::InstallMissing {
+                suggest_project_pool: false,
+            },
             &tokens,
             None,
             false,
@@ -260,6 +266,58 @@ fn the_project_lane_installs_only_the_tokens_mise_where_does_not_resolve() {
             calls,
             format!("{wheres}{}mise reshim\ncmd\n", install.unwrap_or("")),
             "present: {present:?}"
+        );
+    }
+}
+
+/// A global app that does not read the project's pool is told, when an install of the project's
+/// tools fails, which grant would let it run the copy `sbx run` installs; the line is printed only
+/// on a failure, and only for the launch that asked for it.
+#[test]
+fn a_failed_project_install_names_the_project_pool_grant_when_asked() {
+    let bash = PathBuf::from("/bin/bash");
+    if !bash.is_file() {
+        skip_incapable!("skipping equip-script run: no /bin/bash on this host");
+        return;
+    }
+    let dir = crate::testutil::TmpDir::new();
+    let mise = dir.path().join("mise");
+    // `where` resolves nothing, so every token is missing; `install` exits with the code asked for.
+    std::fs::write(
+        &mise,
+        "#!/bin/sh\ncase \"$1\" in where) exit 1;; install) exit \"$SBX_TEST_INSTALL_RC\";; esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&mise, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    for (suggest, install_rc, printed) in
+        [(true, "1", true), (true, "0", false), (false, "1", false)]
+    {
+        let argv = wrap_mise_equip(
+            Path::new("./mise"),
+            &bash,
+            EquipVerb::InstallMissing {
+                suggest_project_pool: suggest,
+            },
+            &["core:demo-runtime@2".to_string()],
+            None,
+            false,
+            vec![OsString::from("/bin/true")],
+        );
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(dir.path())
+            .env("SBX_TEST_INSTALL_RC", install_rc)
+            .output()
+            .expect("run the generated equip script");
+        assert!(
+            out.status.success(),
+            "the command still runs after a failed install"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.contains(PROJECT_POOL_HINT),
+            printed,
+            "suggest {suggest}, install exit {install_rc}: {stderr}"
         );
     }
 }
@@ -652,7 +710,9 @@ fn every_mise_script_ends_the_options_before_its_tokens() {
             wrap_mise_equip(
                 mise,
                 &bash,
-                EquipVerb::InstallMissing,
+                EquipVerb::InstallMissing {
+                    suggest_project_pool: false,
+                },
                 &tokens,
                 None,
                 false,

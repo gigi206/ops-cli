@@ -1419,3 +1419,26 @@ fn the_spec_dump_is_created_owner_only() {
         "the dump holds the spec: {text}"
     );
 }
+
+/// A failed install of the project's tools names `[apps] read_project_pool` for a global app the
+/// project has not granted it, and for no other launch: the grant reaches no other runtime, and an
+/// app that already reads the pool gains nothing from being told about it.
+#[test]
+fn only_an_ungranted_global_app_is_told_about_the_project_pool() {
+    assert!(suggests_project_pool(
+        binds::Runtime::GlobalApp("demo-app"),
+        false
+    ));
+    assert!(!suggests_project_pool(
+        binds::Runtime::GlobalApp("demo-app"),
+        true
+    ));
+    assert!(!suggests_project_pool(
+        binds::Runtime::ProjectApp("demo-app"),
+        false
+    ));
+    assert!(!suggests_project_pool(
+        binds::Runtime::ProjectDefault,
+        false
+    ));
+}
