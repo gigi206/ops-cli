@@ -351,13 +351,7 @@ fn run_attach_direct(
             return Err(e);
         }
     }
-    if libc::WIFEXITED(status) {
-        Ok(libc::WEXITSTATUS(status))
-    } else if libc::WIFSIGNALED(status) {
-        Ok(128 + libc::WTERMSIG(status))
-    } else {
-        Ok(126)
-    }
+    Ok(crate::sandbox::pty::exit_code(status))
 }
 
 /// Render the `sbx session stop --all` line for an empty registry (stdout): nothing to stop is a no-op
