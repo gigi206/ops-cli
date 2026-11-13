@@ -168,10 +168,12 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
 
     // Best-effort ALSA→pulse shim — a failure leaves the native-PulseAudio layer intact.
     let mut pyshim = None;
-    let alsa = match provision_alsa_shim(&provision_one, layout.data_dir()) {
+    // A store path is logical: what it holds is read through the store's place on this host.
+    let present = |logical: &Path| store::physical_path(layout, logical).is_dir();
+    let alsa = match provision_alsa_shim(&provision_one, &present, layout.data_dir()) {
         Ok((alsa_lib_root, plugins_root, asound_conf)) => {
             let shim = AlsaShim {
-                config_dir: alsa_lib_root.join("share/alsa"),
+                config_dir: alsa_lib_root.join(ALSA_CONFIG_DIR),
                 plugin_dir: plugins_root.join("lib/alsa-lib"),
                 asound_conf,
             };
@@ -212,14 +214,30 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
     })
 }
 
+/// Where in `alsa-lib`'s output its base configuration lives (`alsa.conf`, which loads the
+/// plugins): the directory `ALSA_CONFIG_DIR` names.
+const ALSA_CONFIG_DIR: &str = "share/alsa";
+
 /// Provision the ALSA shim's two store paths and stage the `asound.conf`. Returned as raw paths so
 /// [`provision`] can add them to the seed roots; any failure propagates and the caller degrades to a
 /// layer without the shim.
+///
+/// A provision proves the one file its marker names, the library here. The configuration the shim
+/// points ALSA at is another directory of the same output, which no marker reaches, so it is asked
+/// of `present` (whether a store path is a directory on this host): an output that stopped carrying
+/// it is a shim that cannot work, said by the caller's warning rather than left to fail inside ALSA.
 fn provision_alsa_shim(
     provision_one: &impl Fn((&str, &str, &str)) -> io::Result<PathBuf>,
+    present: &impl Fn(&Path) -> bool,
     data_dir: &Path,
 ) -> io::Result<(PathBuf, PathBuf, PathBuf)> {
     let alsa_lib_root = provision_one(ALSA_LIB)?;
+    if !present(&alsa_lib_root.join(ALSA_CONFIG_DIR)) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("`alsa-lib` carries no `{ALSA_CONFIG_DIR}` to point ALSA at"),
+        ));
+    }
     let plugins_root = provision_one(ALSA_PLUGINS)?;
     let asound_conf = stage_asound_conf(data_dir)?;
     Ok((alsa_lib_root, plugins_root, asound_conf))
@@ -628,6 +646,29 @@ mod tests {
         // allowlist, and is untouched when SSL_CERT_FILE is unset (no MITM).
         assert!(SITECUSTOMIZE.contains("os.environ.get(\"SSL_CERT_FILE\")"));
         assert!(SITECUSTOMIZE.contains("certifi.where = lambda: _sbx_ca"));
+    }
+
+    /// An `alsa-lib` output that does not carry the configuration directory fails the shim, which
+    /// the caller then warns about, rather than handing ALSA a directory that is not there; one
+    /// that carries it gives the shim. The two calls differ in nothing but that directory.
+    #[test]
+    fn an_alsa_lib_without_its_configuration_fails_the_shim() {
+        let data = crate::testutil::TmpDir::new();
+        let store = crate::testutil::TmpDir::new();
+        let provision_one = |(attr, _, _): (&str, &str, &str)| {
+            let root = store.path().join(attr);
+            std::fs::create_dir_all(&root)?;
+            Ok(root)
+        };
+        let present = |p: &Path| p.is_dir();
+        let missing = provision_alsa_shim(&provision_one, &present, data.path());
+        assert!(
+            missing.is_err(),
+            "a shim pointing ALSA at no configuration: {missing:?}"
+        );
+        std::fs::create_dir_all(store.path().join("alsa-lib").join(ALSA_CONFIG_DIR)).unwrap();
+        let carried = provision_alsa_shim(&provision_one, &present, data.path());
+        assert!(carried.is_ok(), "{carried:?}");
     }
 
     #[test]
