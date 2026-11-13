@@ -12,6 +12,25 @@ use std::path::Path;
 
 use crate::{diag, style};
 
+/// `value` as an identifier a confirmation names, written out the way [`diag::visible`] writes it:
+/// between backticks on a plain stream, in the identifier hue on a terminal. Painted here rather
+/// than through [`style::paint_spans`], which reads every backtick as a span mark, so that one
+/// inside the value is shown rather than taken for the end of the span.
+fn identifier(value: &str, pal: &style::Palette) -> String {
+    let value = diag::visible(value);
+    if pal.is_plain() {
+        format!("`{value}`")
+    } else {
+        format!("{}{value}{}", pal.name, pal.reset)
+    }
+}
+
+/// `path` as a confirmation shows it ([`diag::visible`]): a directory's name is whatever its
+/// creator chose, and it must not start a line of its own or drive the terminal.
+fn shown(path: &Path) -> String {
+    diag::visible(&path.display().to_string())
+}
+
 /// Ask a terminal to confirm an action, `question` followed by `[y/N]`.
 ///
 /// Without a terminal there is nobody to ask, and an action a verb gates on this must not happen
@@ -47,8 +66,8 @@ pub(crate) fn render_config_write(
     let (ok, n, r) = (pal.ok, pal.name, pal.reset);
     format!(
         "sbx: {ok}{verb}{r} {} in {n}{}{r}",
-        style::paint_spans(&format!("`{key}`"), pal.name, "", pal),
-        path.display()
+        identifier(key, pal),
+        shown(path)
     )
 }
 
@@ -65,9 +84,9 @@ pub(crate) fn render_list_edit(
     let (ok, n, r) = (pal.ok, pal.name, pal.reset);
     format!(
         "sbx: {ok}{done}{r} {} {preposition} {} in {n}{}{r}",
-        style::paint_spans(&format!("`{entry}`"), pal.name, "", pal),
-        style::paint_spans(&format!("`{key}`"), pal.name, "", pal),
-        path.display()
+        identifier(entry, pal),
+        identifier(key, pal),
+        shown(path)
     )
 }
 
@@ -83,9 +102,9 @@ pub(crate) fn render_list_unchanged(
     let (dim, r) = (pal.dim, pal.reset);
     format!(
         "sbx: {} {dim}{why}{r} {} {dim}in {} (no change){r}",
-        style::paint_spans(&format!("`{entry}`"), pal.name, "", pal),
-        style::paint_spans(&format!("`{key}`"), pal.name, "", pal),
-        path.display()
+        identifier(entry, pal),
+        identifier(key, pal),
+        shown(path)
     )
 }
 
@@ -95,8 +114,8 @@ pub(crate) fn render_config_same_value(key: &str, path: &Path, pal: &style::Pale
     let (dim, r) = (pal.dim, pal.reset);
     format!(
         "sbx: {} {dim}already reads that way in {} (no change){r}",
-        style::paint_spans(&format!("`{key}`"), pal.name, "", pal),
-        path.display()
+        identifier(key, pal),
+        shown(path)
     )
 }
 
@@ -106,8 +125,8 @@ pub(crate) fn render_config_unchanged(key: &str, path: &Path, pal: &style::Palet
     let (dim, r) = (pal.dim, pal.reset);
     format!(
         "sbx: {} {dim}was not set in {}{r}",
-        style::paint_spans(&format!("`{key}`"), pal.name, "", pal),
-        path.display()
+        identifier(key, pal),
+        shown(path)
     )
 }
 
@@ -117,7 +136,7 @@ pub(crate) fn render_trusted_whole_file(path: &Path, pal: &style::Palette) -> St
     let (ok, n, dim, r) = (pal.ok, pal.name, pal.dim, pal.reset);
     format!(
         "sbx: {ok}trusted{r} {n}{}{r} {dim}(the whole file is now trusted){r}",
-        path.display()
+        shown(path)
     )
 }
 
@@ -133,18 +152,19 @@ pub(crate) fn render_app_imported(
 ) -> String {
     use std::fmt::Write as _;
     let (ok, n, dim, r) = (pal.ok, pal.name, pal.dim, pal.reset);
+    let name = diag::visible(name);
     let mut o = String::new();
     let _ = writeln!(
         o,
         "{ok}imported{r} app profile '{n}{name}{r}' -> {n}{}{r}",
-        dest.display()
+        shown(dest)
     );
     let _ = writeln!(
         o,
         "  {dim}granted posture (trusted by location — honored even on an untrusted project):{r}"
     );
     for line in summary {
-        let _ = writeln!(o, "    {line}");
+        let _ = writeln!(o, "    {}", diag::visible(line));
     }
     let _ = write!(o, "  {dim}launch it with: sbx app run{r} {n}{name}{r}");
     o
@@ -157,8 +177,8 @@ pub(crate) fn render_app_exported(name: &str, path: &Path, pal: &style::Palette)
     let (ok, n, r) = (pal.ok, pal.name, pal.reset);
     format!(
         "{ok}exported{r} app {} -> {n}{}{r}",
-        style::paint_spans(&format!("`{name}`"), pal.name, "", pal),
-        path.display()
+        identifier(name, pal),
+        shown(path)
     )
 }
 
@@ -174,8 +194,9 @@ pub(crate) fn render_plugin_installed(
     pal: &style::Palette,
 ) -> String {
     let (ok, n, dim, r) = (pal.ok, pal.name, pal.dim, pal.reset);
+    let name = diag::visible(name);
     let from = match from_store {
-        Some(s) => format!(" from store '{n}{s}{r}'"),
+        Some(s) => format!(" from store '{n}{}{r}'", diag::visible(s)),
         None => String::new(),
     };
     // A resolver is placed under the namespace it answers for, so that is what the line shows. The
@@ -184,7 +205,7 @@ pub(crate) fn render_plugin_installed(
     // rather than inferred from the missing scheme: more than one kind has none, so "no scheme"
     // names nothing.
     let what = match scheme {
-        Some(scheme) => format!("{scheme}://"),
+        Some(scheme) => format!("{}://", diag::visible(scheme)),
         None => kind.token().to_string(),
     };
     format!(
@@ -197,6 +218,7 @@ pub(crate) fn render_plugin_installed(
 /// (`store`, `app profile`), or `None` for a bare resolver plugin. A pure presenter.
 pub(crate) fn render_removed(label: Option<&str>, name: &str, pal: &style::Palette) -> String {
     let (ok, n, r) = (pal.ok, pal.name, pal.reset);
+    let name = diag::visible(name);
     match label {
         Some(l) => format!("{ok}removed{r} {l} '{n}{name}{r}'"),
         None => format!("{ok}removed{r} '{n}{name}{r}'"),
@@ -212,6 +234,7 @@ pub(crate) fn render_removed(label: Option<&str>, name: &str, pal: &style::Palet
 /// the store itself supplied. Goes to stderr, so its palette is decided from stderr's stream.
 pub(crate) fn render_store_tofu(pubkey_hex: &str, name: &str, pal: &style::Palette) -> String {
     let (warn, n, r) = (pal.warn, pal.name, pal.reset);
+    let (pubkey_hex, name) = (diag::visible(pubkey_hex), diag::visible(name));
     format!(
         "{warn}⚠ pinned the key this store ships — nothing outside the store confirms it{r}\n\n  \
          pinned key: {n}{pubkey_hex}{r}\n\n  \
@@ -232,6 +255,7 @@ pub(crate) fn render_store_tofu(pubkey_hex: &str, name: &str, pal: &style::Palet
 /// case: the key was supplied out of band when the store was added.
 pub(crate) fn render_store_verified(name: &str, already: bool, pal: &style::Palette) -> String {
     let (ok, n, r) = (pal.ok, pal.name, pal.reset);
+    let name = diag::visible(name);
     if already {
         return format!(
             "{ok}verified{r} store '{n}{name}{r}' {}",
@@ -266,6 +290,11 @@ pub(crate) fn render_store_needs_key(
     pal: &style::Palette,
 ) -> String {
     let (warn, n, r) = (pal.warn, pal.name, pal.reset);
+    let (name, url, pubkey_hex) = (
+        diag::visible(name),
+        diag::visible(url),
+        diag::visible(pubkey_hex),
+    );
     format!(
         "{warn}this store needs a trust anchor{r} — it ships this key:\n\n    \
          {n}{pubkey_hex}{r}\n\n  {}\n\n  {}\n    sbx plugins store add --name {name} --url {url} \
@@ -293,6 +322,11 @@ pub(crate) fn render_store_rekey_alert(
     pal: &style::Palette,
 ) -> String {
     let (warn, n, r) = (pal.warn, pal.name, pal.reset);
+    let (name, old_hex, new_hex) = (
+        diag::visible(name),
+        diag::visible(old_hex),
+        diag::visible(new_hex),
+    );
     format!(
         "{warn}⚠ SECURITY — you are about to change the signing identity of store \
          '{n}{name}{r}{warn}'{r}\n\n  \
@@ -321,6 +355,11 @@ pub(crate) fn render_store_rekeyed(
     pal: &style::Palette,
 ) -> String {
     let (ok, n, r) = (pal.ok, pal.name, pal.reset);
+    let (name, old_hex, new_hex) = (
+        diag::visible(name),
+        diag::visible(old_hex),
+        diag::visible(new_hex),
+    );
     let tail = if tofu {
         style::dim_prose(
             "it was taken from the store itself, so it is flagged as unconfirmed until a second \
@@ -352,6 +391,7 @@ pub(crate) fn render_store_configured(
     use std::fmt::Write as _;
     let (ok, n, dim, r) = (pal.ok, pal.name, pal.dim, pal.reset);
     let plural = if plugins.len() == 1 { "" } else { "s" };
+    let name = diag::visible(name);
     let mut o = String::new();
     let _ = writeln!(
         o,
@@ -362,6 +402,11 @@ pub(crate) fn render_store_configured(
         // Already the whole label the caller wants shown — `pass://` for a resolver, `broker` for
         // a plugin that claims no namespace. Composed by the caller, because only it knows which
         // kind it holds.
+        let (pname, what, version) = (
+            diag::visible(pname),
+            diag::visible(what),
+            diag::visible(version),
+        );
         let _ = write!(o, "  {n}{pname}{r}  {dim}({what}){r}");
         if !version.is_empty() {
             let _ = write!(o, "  {dim}v{version}{r}");
@@ -378,7 +423,7 @@ pub(crate) fn render_publish_key_warning(key_path: &Path, pal: &style::Palette) 
     format!(
         "{warn}⚠ keep the signing key{r} {} \
          {warn}secret — it is this store's identity{r}",
-        style::paint_spans(&format!("`{}`", key_path.display()), pal.name, "", pal)
+        identifier(&key_path.display().to_string(), pal)
     )
 }
 
@@ -396,6 +441,7 @@ pub(crate) fn render_published(
     use std::fmt::Write as _;
     let (ok, n, dim, r) = (pal.ok, pal.name, pal.dim, pal.reset);
     let plural = if plugins.len() == 1 { "" } else { "s" };
+    let pubkey_hex = diag::visible(pubkey_hex);
     let mut o = String::new();
     let _ = writeln!(
         o,
@@ -403,6 +449,7 @@ pub(crate) fn render_published(
         plugins.len()
     );
     for (name, label) in plugins {
+        let (name, label) = (diag::visible(name), diag::visible(label));
         let _ = writeln!(o, "  {n}{name}{r}  {dim}({label}){r}");
     }
     let _ = writeln!(o, "pubkey: {n}{pubkey_hex}{r}");
@@ -432,6 +479,7 @@ pub(crate) fn render_store_updated(
 ) -> String {
     let (ok, n, dim, r) = (pal.ok, pal.name, pal.dim, pal.reset);
     let plural = if count == 1 { "" } else { "s" };
+    let name = diag::visible(name);
     if new_rev > old_rev {
         format!(
             "{ok}updated store{r} '{n}{name}{r}' \
@@ -469,6 +517,234 @@ mod tests {
         assert!(line.contains("refetched"), "{line}");
         assert!(line.contains("revision 5"), "{line}");
         assert!(line.contains("1 plugin"), "{line}");
+    }
+
+    /// A value a confirmation names is shown as written, on the line it belongs to: a newline, a
+    /// line separator, an escape sequence or a character that reorders the line, in any argument a
+    /// renderer interpolates, comes out written out, and the renderer prints as many lines as it
+    /// does for a plain value. Each argument is made hostile on its own, the others left plain, and
+    /// every one that reaches the line raw is named.
+    #[test]
+    fn every_value_a_confirmation_names_is_written_out_on_its_own_line() {
+        let p = style::Palette::plain();
+        let hostile = "a\nb\u{2028}c\x1b[31md\u{202e}e";
+        let cfg = Path::new("/p/.sbx.toml");
+        type Render<'a> = Box<dyn Fn(&str) -> String + 'a>;
+        let cases: Vec<(&str, Render)> = vec![
+            (
+                "config write: key",
+                Box::new(|v| render_config_write("set", v, cfg, &p)),
+            ),
+            (
+                "config write: path",
+                Box::new(|v| render_config_write("set", "env.FOO", Path::new(v), &p)),
+            ),
+            (
+                "list edit: entry",
+                Box::new(|v| render_list_edit("added", "to", v, "binds", cfg, &p)),
+            ),
+            (
+                "list edit: key",
+                Box::new(|v| render_list_edit("added", "to", "x", v, cfg, &p)),
+            ),
+            (
+                "list edit: path",
+                Box::new(|v| render_list_edit("added", "to", "x", "binds", Path::new(v), &p)),
+            ),
+            (
+                "list unchanged: entry",
+                Box::new(|v| render_list_unchanged(v, "is not in", "binds", cfg, &p)),
+            ),
+            (
+                "list unchanged: key",
+                Box::new(|v| render_list_unchanged("x", "is not in", v, cfg, &p)),
+            ),
+            (
+                "list unchanged: path",
+                Box::new(|v| render_list_unchanged("x", "is not in", "binds", Path::new(v), &p)),
+            ),
+            (
+                "same value: key",
+                Box::new(|v| render_config_same_value(v, cfg, &p)),
+            ),
+            (
+                "same value: path",
+                Box::new(|v| render_config_same_value("env.FOO", Path::new(v), &p)),
+            ),
+            (
+                "unchanged: key",
+                Box::new(|v| render_config_unchanged(v, cfg, &p)),
+            ),
+            (
+                "unchanged: path",
+                Box::new(|v| render_config_unchanged("env.FOO", Path::new(v), &p)),
+            ),
+            (
+                "trusted whole file: path",
+                Box::new(|v| render_trusted_whole_file(Path::new(v), &p)),
+            ),
+            (
+                "app imported: name",
+                Box::new(|v| render_app_imported(v, cfg, &["command: x".into()], &p)),
+            ),
+            (
+                "app imported: dest",
+                Box::new(|v| render_app_imported("demo", Path::new(v), &["command: x".into()], &p)),
+            ),
+            (
+                "app imported: summary",
+                Box::new(|v| render_app_imported("demo", cfg, &[v.to_string()], &p)),
+            ),
+            (
+                "app exported: name",
+                Box::new(|v| render_app_exported(v, cfg, &p)),
+            ),
+            (
+                "app exported: path",
+                Box::new(|v| render_app_exported("demo", Path::new(v), &p)),
+            ),
+            (
+                "plugin installed: name",
+                Box::new(|v| render_plugin_installed(v, Some("pass"), Kind::Resolver, None, &p)),
+            ),
+            (
+                "plugin installed: scheme",
+                Box::new(|v| render_plugin_installed("pass", Some(v), Kind::Resolver, None, &p)),
+            ),
+            (
+                "plugin installed: store",
+                Box::new(|v| render_plugin_installed("pass", None, Kind::Broker, Some(v), &p)),
+            ),
+            (
+                "removed: name",
+                Box::new(|v| render_removed(Some("store"), v, &p)),
+            ),
+            (
+                "store tofu: key",
+                Box::new(|v| render_store_tofu(v, "hub", &p)),
+            ),
+            (
+                "store tofu: name",
+                Box::new(|v| render_store_tofu("ab12", v, &p)),
+            ),
+            (
+                "store verified: name",
+                Box::new(|v| render_store_verified(v, false, &p)),
+            ),
+            (
+                "store needs key: name",
+                Box::new(|v| render_store_needs_key(v, "https://h/s.git", "ab12", &p)),
+            ),
+            (
+                "store needs key: url",
+                Box::new(|v| render_store_needs_key("hub", v, "ab12", &p)),
+            ),
+            (
+                "store needs key: key",
+                Box::new(|v| render_store_needs_key("hub", "https://h/s.git", v, &p)),
+            ),
+            (
+                "rekey alert: name",
+                Box::new(|v| render_store_rekey_alert(v, "ab12", "cd34", &p)),
+            ),
+            (
+                "rekey alert: old key",
+                Box::new(|v| render_store_rekey_alert("hub", v, "cd34", &p)),
+            ),
+            (
+                "rekey alert: new key",
+                Box::new(|v| render_store_rekey_alert("hub", "ab12", v, &p)),
+            ),
+            (
+                "rekeyed: name",
+                Box::new(|v| render_store_rekeyed(v, "ab12", "cd34", true, 7, 2, &p)),
+            ),
+            (
+                "rekeyed: old key",
+                Box::new(|v| render_store_rekeyed("hub", v, "cd34", true, 7, 2, &p)),
+            ),
+            (
+                "rekeyed: new key",
+                Box::new(|v| render_store_rekeyed("hub", "ab12", v, true, 7, 2, &p)),
+            ),
+            (
+                "configured: store",
+                Box::new(|v| render_store_configured(v, 3, &[("vault", "vault://", "1.0")], &p)),
+            ),
+            (
+                "configured: plugin",
+                Box::new(|v| render_store_configured("hub", 3, &[(v, "vault://", "1.0")], &p)),
+            ),
+            (
+                "configured: label",
+                Box::new(|v| render_store_configured("hub", 3, &[("vault", v, "1.0")], &p)),
+            ),
+            (
+                "configured: version",
+                Box::new(|v| render_store_configured("hub", 3, &[("vault", "vault://", v)], &p)),
+            ),
+            (
+                "publish key warning: path",
+                Box::new(|v| render_publish_key_warning(Path::new(v), &p)),
+            ),
+            (
+                "published: plugin",
+                Box::new(|v| render_published(5, &[(v, "vault://")], "ab12", &p)),
+            ),
+            (
+                "published: label",
+                Box::new(|v| render_published(5, &[("vault", v)], "ab12", &p)),
+            ),
+            (
+                "published: key",
+                Box::new(|v| render_published(5, &[("vault", "vault://")], v, &p)),
+            ),
+            (
+                "store updated: name",
+                Box::new(|v| render_store_updated(v, 3, 5, 2, &p)),
+            ),
+            (
+                "store refetched: name",
+                Box::new(|v| render_store_updated(v, 5, 5, 2, &p)),
+            ),
+        ];
+        let raw = |c: char| {
+            (c.is_control() && c != '\n') || diag::reorders(c) || diag::separates_lines(c)
+        };
+        let leaked: Vec<String> = cases
+            .iter()
+            .filter_map(|(what, render)| {
+                let (plain, shown) = (render("x"), render(hostile));
+                (shown.chars().any(raw) || shown.lines().count() != plain.lines().count())
+                    .then(|| format!("{what}: {shown:?}"))
+            })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "{} of {} values reached the line raw:\n{}",
+            leaked.len(),
+            cases.len(),
+            leaked.join("\n")
+        );
+    }
+
+    /// On a terminal, a value that holds a backtick is shown whole inside its highlight: the
+    /// highlight is not read off backticks in the text, where one inside the value would close it
+    /// early and be dropped. A plain stream keeps the backticks around the value.
+    #[test]
+    fn a_backtick_in_a_value_stays_inside_its_highlight() {
+        let cfg = Path::new("/p/.sbx.toml");
+        let colored = style::Palette::colored();
+        let line = render_list_edit("added", "to", "a`b", "binds", cfg, &colored);
+        assert!(
+            line.contains(&format!("{}a`b{}", colored.name, colored.reset)),
+            "{line:?}"
+        );
+        let plain = style::Palette::plain();
+        assert_eq!(
+            render_list_edit("added", "to", "a`b", "binds", cfg, &plain),
+            "sbx: added `a`b` to `binds` in /p/.sbx.toml"
+        );
     }
 
     #[test]
