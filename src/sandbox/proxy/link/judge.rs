@@ -372,7 +372,12 @@ impl Judge {
             return Ok(vec![ip]);
         }
         let resolve = Arc::clone(&*read_locked(&self.resolve));
-        resolve(&asked.host).map_err(|_| ConnectRefusal::Dns)
+        // A name that resolves to no address failed to resolve, whatever the resolver made of it:
+        // left to the address guard, an empty list would read as every address refused.
+        match resolve(&asked.host) {
+            Ok(ips) if !ips.is_empty() => Ok(ips),
+            _ => Err(ConnectRefusal::Dns),
+        }
     }
 }
 
@@ -636,6 +641,20 @@ mod tests {
             .connect(&Asked::inspected("api.test", port, "POST", "/"), Some(8), 0)
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A name that resolves to no address is a resolution failure, answered `dns-failure`, and
+    /// never an address the guard refused, answered `ssrf-blocked`: the two read differently to the
+    /// cage and in `sbx net logs`, and only one of them is a policy at work.
+    #[test]
+    fn a_name_that_resolves_to_no_address_is_a_resolution_failure() {
+        let judge = judge(&["api.test:*"], DefaultAction::Deny, vec![]);
+        let asked = Asked::inspected("api.test", 443, "GET", "/");
+        assert_eq!(judge.check(1, &asked), Err(ConnectRefusal::Dns));
+        assert_eq!(
+            judge.connect(&asked, None, 0).map(|_| ()),
+            Err(ConnectRefusal::Dns)
+        );
     }
 
     /// A connection is asked for from a position, and says where it was reached: past an address
