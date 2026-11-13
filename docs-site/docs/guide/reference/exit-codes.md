@@ -26,8 +26,9 @@ See also: [`sbx run`](../cli/run) · [One-shot overrides](../configuration/overr
 An answer that cannot be written to standard output turns a success into `1`, said once on
 standard error: what reached a full disk under `> file` is not what the verb produced. A reader
 that has gone away, the end of `sbx … | head`, is not a failure and changes nothing. A view that
-redraws or streams on its own, `sbx net live`, `sbx net pending watch`, `sbx proc live` or `sbx
-session logs --follow`, ends at the first write that fails, on the same terms.
+redraws or streams on its own, `sbx net live`, `sbx net pending watch`, `sbx proc live`, `sbx
+session logs --follow`, or `sbx logs` and `sbx fs|proc|ssh-agent logs` with or without `--follow`,
+ends at the first write that fails, on the same terms.
 
 A diagnostic that cannot be written to standard error changes nothing either, whatever the
 cause: standard error is where a failure would be reported, and the exit code is the answer.
