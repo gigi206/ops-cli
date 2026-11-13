@@ -286,10 +286,11 @@ fn collect_dir(
                 .strip_prefix(root)
                 .map_err(|_| format!("path {} is not under the plugin root", path.display()))?;
             let rel = repo_rel(rel)?;
-            let bytes =
-                std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+            let file_hash = std::fs::File::open(&path)
+                .and_then(stream_digest)
+                .map_err(|e| format!("read {}: {e}", path.display()))?;
             let exec = (meta.permissions().mode() & 0o100) != 0;
-            out.push((rel, exec, Sha256::digest(&bytes).into()));
+            out.push((rel, exec, file_hash));
         } else {
             return Err(format!(
                 "plugin tree contains a non-regular file: {}",
@@ -298,6 +299,25 @@ fn collect_dir(
         }
     }
     Ok(())
+}
+
+/// How much of a plugin's file [`stream_digest`] holds at once.
+const DIGEST_CHUNK: usize = 64 * 1024;
+
+/// The SHA-256 of what `reader` holds, read [`DIGEST_CHUNK`] bytes at a time. A plugin's file is a
+/// fetched store's, whose size the store chooses: read whole, it would be held in memory at once,
+/// before the digest that judges it is even known.
+fn stream_digest(mut reader: impl std::io::Read) -> std::io::Result<[u8; 32]> {
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; DIGEST_CHUNK];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(h.finalize().into()),
+            Ok(n) => h.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// A path relative to the plugin root, as a `/`-joined string of plain components —
@@ -634,6 +654,74 @@ mod tests {
                 "{mode:o} hashes as git records it, {as_git_records:o}"
             );
         }
+    }
+
+    /// A plugin tree holding a file larger than what is left of this process's address space,
+    /// hashed under that limit, run alone by
+    /// [`a_plugin_file_larger_than_memory_allows_is_hashed_a_chunk_at_a_time`]; anywhere else it
+    /// does nothing. The file is sparse, so it costs no disk.
+    #[test]
+    #[ignore = "run alone by the test that reads how it ended"]
+    fn a_large_plugin_file_under_a_tight_address_space() {
+        crate::testutil::when_run_alone(|dir| {
+            const LARGE: u64 = 96 << 20;
+            const HEADROOM: u64 = 48 << 20;
+            let root = Path::new(dir).join("plugin");
+            std::fs::create_dir(&root)?;
+            std::fs::File::create(root.join("large"))?.set_len(LARGE)?;
+            let status = std::fs::read_to_string("/proc/self/status")?;
+            let size_kib: u64 = status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmSize:"))
+                .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
+                .ok_or_else(|| std::io::Error::other("no VmSize in /proc/self/status"))?;
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `limit` is a live struct for the kernel to fill.
+            if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = (size_kib * 1024 + HEADROOM).min(limit.rlim_max);
+            // SAFETY: as above, read by the kernel; the hard limit is left as it was.
+            if unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            dir_digest(&root).map(|_| ()).map_err(|e| {
+                eprintln!("sbx-alone: {e}");
+                std::io::Error::other(e)
+            })
+        });
+    }
+
+    /// A plugin's file is hashed a chunk at a time, so one larger than the memory left to the
+    /// process is hashed rather than read whole into it. In a process of its own, since the limit
+    /// it sets would hold every other test.
+    #[test]
+    fn a_plugin_file_larger_than_memory_allows_is_hashed_a_chunk_at_a_time() {
+        let ran = crate::testutil::run_alone(concat!(
+            module_path!(),
+            "::a_large_plugin_file_under_a_tight_address_space"
+        ));
+        assert!(
+            ran.ended_well(),
+            "{}: {}{}",
+            ran.status,
+            ran.stdout,
+            ran.stderr
+        );
+    }
+
+    /// What is hashed a chunk at a time is the whole file: the digest of one larger than a chunk
+    /// is the digest of its bytes.
+    #[test]
+    fn a_file_larger_than_a_chunk_hashes_as_its_bytes() {
+        let bytes: Vec<u8> = (0..3 * DIGEST_CHUNK + 17)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let expected: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(stream_digest(&bytes[..]).unwrap(), expected);
     }
 
     #[test]
