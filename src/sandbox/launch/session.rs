@@ -151,7 +151,7 @@ pub(crate) fn attach(id: &str, cmd: &[OsString]) -> ExitCode {
         Ok(h) => h,
         Err(e) => {
             crate::diag::error(&format!(
-                "sbx session attach: cannot open a handle to session '{id}''s cage: {e}"
+                "sbx session attach: cannot open a handle to the cage of session '{id}': {e}"
             ));
             return ExitCode::FAILURE;
         }
