@@ -105,7 +105,8 @@ On a **non-interactive foreground run** the process events are *also* echoed inl
   file feed sees a completed write-and-close, and only in the project tree (not `/tmp`, the store,
   or the home). A process that runs another program in place (`exec`) keeps its pid and is
   reported again under that program's name, which is how the feed tells the two apart: a program
-  run in place under the same name is not.
+  run in place under the same name is not, and a process that renames itself (as Node's
+  `process.title` does) is reported again under the name it took.
 - For **precise per-exec capture and blocking**, set [`[proc] mode = "enforce"`/`"ask"`](../configuration/proc)
   (a trusted-only security field): the process feed then comes from a seccomp user-notification
   supervisor that captures every exec exactly and can refuse a denied one before it runs. The
