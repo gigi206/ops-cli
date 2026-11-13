@@ -424,6 +424,106 @@ fn a_follow_names_a_session_each_time_it_stops_answering() {
     }
 }
 
+/// A session's project is written as text wherever a view names it: the header of a live view and
+/// of a recorded one, and the list a view without an id prints when several sessions answer. A
+/// directory name can carry an escape sequence or a right-to-left override, and `sbx session ls`
+/// already writes the same path through `diag::visible`.
+#[test]
+fn a_view_writes_its_sessions_project_as_text() {
+    let mut painted = Vec::new();
+    for (shape, name, escaped) in [
+        ("a screen clear", "proj\u{1b}[2J", "proj\\x1b[2J"),
+        (
+            "a right-to-left override",
+            "proj\u{202e}txt",
+            "proj\\u{202e}txt",
+        ),
+    ] {
+        let raw = name.chars().nth(4).expect("the shape's character");
+        let (data, root) = (TmpDir::new("l"), TmpDir::new("l"));
+        let project = root.path().join(name);
+        std::fs::create_dir(&project).unwrap();
+        let project = std::fs::canonicalize(&project).unwrap();
+        let (one, two) = (Standin::new(), Standin::new());
+        common::write_session_record(data.path(), one.pid(), "project", &project);
+        serve_lens(
+            data.path(),
+            "fs",
+            one.pid(),
+            &["event seq=1 at=1700000000123 kind=write path=first.rs"],
+        );
+
+        // The header of a live view.
+        let header = read_feed(data.path(), &["fs", "logs", &one.pid().to_string()]);
+        if header.contains(raw) || !header.contains(escaped) {
+            painted.push(format!("{shape}, live header: {header:?}"));
+        }
+
+        // The header of a view without an id, the one session of the project answering.
+        let out = run_view(
+            Command::new(env!("CARGO_BIN_EXE_sbx"))
+                .args(["fs", "logs"])
+                .current_dir(&project)
+                .env("XDG_DATA_HOME", data.path()),
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout.contains(raw) || !stdout.contains(escaped) {
+            painted.push(format!("{shape}, the project's session header: {stdout:?}"));
+        }
+
+        // The list of a view without an id, once two sessions answer for the project.
+        common::write_session_record(data.path(), two.pid(), "project", &project);
+        let out = run_view(
+            Command::new(env!("CARGO_BIN_EXE_sbx"))
+                .args(["fs", "logs"])
+                .current_dir(&project)
+                .env("XDG_DATA_HOME", data.path()),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains(raw) || !stderr.contains(escaped) {
+            painted.push(format!("{shape}, the list of sessions: {stderr:?}"));
+        }
+
+        // The header of a finished session's recorded view.
+        let lens_dir = data.path().join("sbx").join("fs");
+        std::fs::create_dir_all(&lens_dir).unwrap();
+        std::fs::write(
+            lens_dir.join("record-7-100.log"),
+            format!(
+                "project={}\nevent seq=1 at=1700000000100 kind=write path=recorded.rs\n",
+                project.display()
+            ),
+        )
+        .unwrap();
+        let out = run_view(
+            Command::new(env!("CARGO_BIN_EXE_sbx"))
+                .args(["fs", "logs", "7"])
+                .current_dir(&project)
+                .env("XDG_DATA_HOME", data.path()),
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout.contains(raw) || !stdout.contains(escaped) {
+            painted.push(format!("{shape}, recorded header: {stdout:?}"));
+        }
+        // And the merged view of that recorded session.
+        let out = run_view(
+            Command::new(env!("CARGO_BIN_EXE_sbx"))
+                .args(["logs", "7", "--feed", "fs"])
+                .current_dir(&project)
+                .env("XDG_DATA_HOME", data.path()),
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout.contains(raw) || !stdout.contains(escaped) {
+            painted.push(format!("{shape}, merged recorded header: {stdout:?}"));
+        }
+    }
+    assert!(
+        painted.is_empty(),
+        "the project must be written as text:\n{}",
+        painted.join("\n")
+    );
+}
+
 /// A view whose output cannot be written for any other reason than the reader leaving fails, and
 /// says so once, as every verb's output does. With standard output on `/dev/full`, every write is
 /// `ENOSPC`, what a `> file` on a full disk meets: read as a reader gone, the view ended at exit 0

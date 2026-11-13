@@ -203,7 +203,7 @@ fn resolve_source(
                         "session {} [{}] {}",
                         live.pid,
                         live.label(),
-                        live.project.display()
+                        diag::visible(&live.project.display().to_string())
                     ),
                 });
             }
@@ -239,7 +239,7 @@ fn resolve_source(
                 "session {} [{}] {}",
                 one.pid,
                 one.label(),
-                one.project.display()
+                diag::visible(&one.project.display().to_string())
             ),
         }),
         [] => Err(list_records(verb, dirs, project)),
@@ -249,7 +249,12 @@ fn resolve_source(
                 many.len()
             );
             for s in many {
-                errln!("       {}  [{}]  {}", s.pid, s.label(), s.project.display());
+                errln!(
+                    "       {}  [{}]  {}",
+                    s.pid,
+                    s.label(),
+                    diag::visible(&s.project.display().to_string())
+                );
             }
             Err(ExitCode::from(2))
         }
@@ -469,7 +474,8 @@ fn record_view<E: crate::sandbox::lens::Event>(
             writeln!(
                 out,
                 "{h}{} — session {pid} (ended) {}{r}",
-                view.feed, record.project
+                view.feed,
+                diag::visible(&record.project)
             )?;
             if reused {
                 writeln!(
@@ -1042,7 +1048,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
             }) => (
                 pid,
                 false,
-                format!("session {pid} (ended) {project}"),
+                format!("session {pid} (ended) {}", diag::visible(&project)),
                 reused,
                 Some(ticks),
             ),
