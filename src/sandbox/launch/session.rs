@@ -422,11 +422,15 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
 
     let mut any_missing = false;
     let mut any_unstopped = false;
+    // The sessions an earlier id of this run has stopped. The list was read once, before the
+    // first stop, so it still holds them.
+    let mut stopped: Vec<u32> = Vec::new();
     for id in ids {
         // Weighed against every session, not the first match: a cage name is derived and several
         // live sessions can answer to it, and stopping the wrong one is not recoverable.
-        let target = match crate::session::answering(&sessions, id) {
-            Ok(one) => one,
+        let target = match stop_target(&sessions, id, &stopped) {
+            Ok(Some(one)) => one,
+            Ok(None) => continue,
             Err(many) if many.is_empty() => {
                 crate::diag::error(&format!(
                     "sbx session stop: no live session '{id}' — run `sbx session ls` to list them."
@@ -440,10 +444,43 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
                 continue;
             }
         };
-        any_unstopped |= !stop_session(&registry, target, grace, &epal);
+        if stop_session(&registry, target, grace, &epal) {
+            stopped.push(target.pid);
+        } else {
+            any_unstopped = true;
+        }
     }
 
     ExitCode::from(stop_exit_code(any_unstopped, any_missing))
+}
+
+/// The session `id` names for a `stop` run that has already stopped the sessions `stopped`, from
+/// the list the run read before its first stop ([`crate::session::answering`]), less those.
+///
+/// `Ok(None)` when `id` names only sessions this run has stopped: an id typed twice, or a pid and a
+/// name for the same session, is done with, and is neither stopped again, which would report it as
+/// having exited, nor reported as an id that matched nothing. A name that answered a stopped
+/// session and another names the other: the list still holds the stopped one, and weighing it
+/// would refuse the name as ambiguous between a session that is gone and the one it can only mean.
+fn stop_target<'a>(
+    sessions: &'a [crate::session::Session],
+    id: &str,
+    stopped: &[u32],
+) -> Result<Option<&'a crate::session::Session>, Vec<&'a crate::session::Session>> {
+    let answering = match crate::session::answering(sessions, id) {
+        Ok(one) => vec![one],
+        Err(many) if many.is_empty() => return Err(many),
+        Err(many) => many,
+    };
+    let left: Vec<_> = answering
+        .into_iter()
+        .filter(|s| !stopped.contains(&s.pid))
+        .collect();
+    match left.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(*one)),
+        _ => Err(left),
+    }
 }
 
 /// Render one session's stop outcome (stderr): a clean SIGTERM stop is a real change (green

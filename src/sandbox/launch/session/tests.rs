@@ -72,6 +72,38 @@ fn a_stop_that_left_something_running_outranks_an_id_that_matched_nothing() {
     assert_eq!(stop_exit_code(true, true), 1);
 }
 
+/// An id a `stop` run has already acted on is not weighed against the sessions it stopped: an id
+/// typed twice, or a pid and the name of the same session, is done with, and a name that answered a
+/// stopped session and a live one names the live one rather than being refused as ambiguous. What
+/// was ambiguous before any stop still is, and an id that names nothing still names nothing.
+#[test]
+fn a_stop_run_resolves_each_id_past_the_sessions_it_stopped() {
+    let session = |pid: u32| crate::session::Session {
+        project: PathBuf::from("/work/probe"),
+        pid,
+        start_ticks: 1,
+        kind: crate::session::Kind::Run,
+        runtime: crate::session::SessionRuntime::Project,
+        detached: false,
+    };
+    let sessions = [session(100), session(200)];
+    let name = crate::sandbox::cage_name(None, Path::new("/work/probe"));
+    let pids = |r: Result<Option<&crate::session::Session>, Vec<&crate::session::Session>>| match r
+    {
+        Ok(one) => Ok(one.map(|s| s.pid)),
+        Err(many) => Err(many.iter().map(|s| s.pid).collect::<Vec<_>>()),
+    };
+    assert_eq!(
+        pids(stop_target(&sessions, &name, &[])),
+        Err(vec![100, 200])
+    );
+    assert_eq!(pids(stop_target(&sessions, &name, &[100])), Ok(Some(200)));
+    assert_eq!(pids(stop_target(&sessions, "100", &[100])), Ok(None));
+    assert_eq!(pids(stop_target(&sessions, &name, &[100, 200])), Ok(None));
+    assert_eq!(pids(stop_target(&sessions, "200", &[100])), Ok(Some(200)));
+    assert_eq!(pids(stop_target(&sessions, "999", &[100])), Err(vec![]));
+}
+
 #[test]
 fn a_stop_that_signalled_nothing_keeps_the_session_record() {
     // The reap is what makes `sbx session ls` clean the moment a stop lands. Applied to a stop
