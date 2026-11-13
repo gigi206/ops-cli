@@ -103,14 +103,17 @@ impl Regression {
     }
 }
 
-/// The part of a version that identifies its release line: everything before the first `-`.
+/// The part of a version that identifies its release line: everything before the first `-`, read
+/// the way [`version_order`] reads a version, its leading `v` set aside.
 ///
 /// The pre-release suffix is the free-form half [`version_order`] already declines to rank, and
 /// `rc2` against `beta` is churn inside one line rather than a move to another one. Comparing
 /// shapes past the dash would report that churn as a line change and bury the case worth seeing
-/// under it.
+/// under it. The `v` is set aside for the same reason: the ranking already reads `v1.2.3` as
+/// `1.2.3`, and a publisher that starts or stops writing it has not moved to another line.
 fn release_line(v: &str) -> &str {
     let v = v.trim();
+    let v = v.strip_prefix('v').unwrap_or(v);
     v.split_once('-').map_or(v, |(core, _)| core)
 }
 
@@ -187,6 +190,28 @@ mod tests {
         // dash precisely so this churn does not read as a move to another line.
         assert_eq!(regression("1.2.0-rc2", "1.2.0-beta"), None);
         assert_eq!(regression("1.2.0-beta", "1.2.0-rc2"), None);
+    }
+
+    /// A release line is read as the ranking reads a version: a `v` written or dropped in front of
+    /// it is not a move to another line. Each pair is checked on its own, and every one reported as
+    /// a changed line is named; a namespace in front still is one.
+    #[test]
+    fn a_leading_v_is_not_a_line_change() {
+        let pairs = [
+            ("v1.2.3-rc1", "1.2.3-beta"),
+            ("1.2.3-rc1", "v1.2.3-beta"),
+            ("v2024.01.15a", "2024.01.16a"),
+        ];
+        let flagged: Vec<String> = pairs
+            .iter()
+            .filter(|(old, new)| regression(old, new).is_some())
+            .map(|(old, new)| format!("{old} → {new}"))
+            .collect();
+        assert!(flagged.is_empty(), "{flagged:?}");
+        assert_eq!(
+            regression("7.4.17", "jetbrains/v7.1.2"),
+            Some(Regression::ChangedLine)
+        );
     }
 
     /// The transitions a real multi-app roll produced, held here so the classifier is measured
