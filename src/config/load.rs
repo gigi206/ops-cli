@@ -1557,9 +1557,10 @@ const GROUP_FILES: FileKind = FileKind {
 ///
 /// The one definition of what counts as a file in a config directory, shared by the three families:
 /// an absent directory yields nothing (it is simply not populated), an unreadable one warns once,
-/// a non-`*.toml` entry is skipped silently (a `.replaced` copy, an editor swap file), and a stem
-/// that is not a usable name is dropped with a warning rather than keyed under a name no reference
-/// could ever resolve.
+/// one whose listing fails part-way warns once and keeps what it had read (the listing ends at its
+/// first error), a non-`*.toml` entry is skipped silently (a `.replaced` copy, an editor swap
+/// file), and a stem that is not a usable name is dropped with a warning rather than keyed under a
+/// name no reference could ever resolve.
 fn named_toml_files(
     dir: &Path,
     kind: &FileKind,
