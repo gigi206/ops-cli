@@ -1578,7 +1578,22 @@ fn named_toml_files(
             return out;
         }
     };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    // A listing that fails part-way ends there, and what it had not reached is not read: said, as
+    // a directory that cannot be listed at all is, rather than read as a directory holding less.
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(e) => {
+                warnings.push(format!(
+                    "ignoring the rest of the {} directory {}: {e}",
+                    kind.many,
+                    dir.display()
+                ));
+                break;
+            }
+        }
+    }
     paths.sort();
     for path in paths {
         // Only `*.toml` files are read; anything else under the directory is ignored silently.
