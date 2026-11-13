@@ -1550,7 +1550,7 @@ mod tests {
     /// Whether `text` holds a character that breaks a line or turns around the words beside it.
     fn breaks_or_reorders(text: &str) -> bool {
         text.chars()
-            .any(|c| c.is_control() || crate::diag::reorders(c))
+            .any(|c| c.is_control() || crate::diag::reorders(c) || crate::diag::separates_lines(c))
     }
 
     /// A toast's text is laid out by the notification daemon, under the bidirectional algorithm: a

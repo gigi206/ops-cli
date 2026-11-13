@@ -558,18 +558,19 @@ read-only, for the tap the two sockets it dials, and for the unpack the tree it 
 capability; and a system-call filter that lists what their work calls, where every other
 cage gets a list of what it may not.
 
-Some bytes reach your terminal with no parser of sbx's in between: the agent's own output, in
-a foreground session, through a terminal or in `sbx session logs`. Your terminal reads those
+Some bytes reach your terminal with no parser of sbx's in between: the agent's own output, in a
+foreground session, through a terminal or in `sbx session logs`. Your terminal reads those
 bytes, not sbx. What the egress proxy writes to its standard error is not among them: the
-supervisor relays it a line at a time, with control characters and the characters that
-reorder a line replaced, to the terminal of a foreground session or to the log of a detached
-one. The capture tap's standard error is a pipe of its own rather than the session's terminal;
-when the tap does not come up, what it wrote there is quoted, cleaned the same way, in the
-warning that says so. sbx's own diagnostics (the `sbx: …` lines on standard error) quote values sbx did not
-write, such as a path the cage chose, a program's error output or a file a project names; each
-is printed with its control characters and its characters that reorder a line written as
-escapes such as `\x1b`. A line break is kept, so a value that carries one can still start a
-line of plain text.
+supervisor relays it a line at a time, with control characters, the characters that reorder a
+line and the Unicode line and paragraph separators replaced, to the terminal of a foreground
+session or to the log of a detached one. The capture tap's standard error is a pipe of its own
+rather than the session's terminal; when the tap does not come up, what it wrote there is
+quoted, cleaned the same way, in the warning that says so. sbx's own diagnostics (the `sbx: …`
+lines on standard error) quote values sbx did not write, such as a path the cage chose, a
+program's error output or a file a project names; each is printed with its control characters,
+its characters that reorder a line and its Unicode line and paragraph separators written as
+escapes such as `\x1b` or `\u{2028}`. A line break is kept, so a value that carries one can
+still start a line of plain text.
 
 ## Where each decision is made
 

@@ -106,7 +106,9 @@ pub(crate) const SANITIZED_CHARS: usize = 512;
 /// the value is safe on the line-based control wire, the stderr feed, and any terminal reading
 /// either. A Linux filename may carry a newline exactly as a hostile argv can. The characters that
 /// reorder a line ([`crate::diag::reorders`]) become spaces too: none is a control character, and
-/// each would let a name the cage chose turn around the words a reader sees beside it.
+/// each would let a name the cage chose turn around the words a reader sees beside it. So do the
+/// line and paragraph separators ([`crate::diag::separates_lines`]), at which a reader that lays the
+/// text out by Unicode's line-breaking rules, an editor or a page showing a log, starts a line.
 ///
 /// # What now depends on this, and why it must not be narrowed
 ///
@@ -147,7 +149,7 @@ pub(crate) fn sanitize(s: &str) -> String {
     let cleaned: String = s
         .chars()
         .map(|c| {
-            if c.is_control() || crate::diag::reorders(c) {
+            if c.is_control() || crate::diag::reorders(c) || crate::diag::separates_lines(c) {
                 ' '
             } else {
                 c
@@ -816,6 +818,15 @@ mod tests {
         let out = sanitize("/api/\u{202e}gnp.x\u{202c} \u{2067}a\u{2069}\u{200e} \u{05d0}");
         assert!(!out.chars().any(crate::diag::reorders), "{out:?}");
         assert_eq!(out, "/api/ gnp.x   a   \u{05d0}");
+    }
+
+    /// A name the cage chose cannot end the line it is shown on where Unicode's rules lay the text
+    /// out: the line and paragraph separators become spaces, as a newline does.
+    #[test]
+    fn sanitize_leaves_no_line_or_paragraph_separator() {
+        let out = sanitize("a\u{2028}sbx: note: forged\u{2029}b");
+        assert!(!out.chars().any(crate::diag::separates_lines), "{out:?}");
+        assert_eq!(out, "a sbx: note: forged b");
     }
 
     #[test]

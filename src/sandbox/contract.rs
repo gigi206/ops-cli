@@ -673,13 +673,14 @@ pub(crate) fn operations_section(tasks: &[TaskSpec]) -> String {
 ///
 /// A character that [`crate::diag::reorders`] a line becomes a space too: it is no control
 /// character, so the grammar lets it into a path or a pattern, and left in place it lays out the
-/// rest of its line in another order than the one the line says. Whitespace is kept as it is,
-/// unlike [`crate::diag::one_line`], because a run of spaces in a pattern is part of what it
-/// matches.
+/// rest of its line in another order than the one the line says. So does a line or paragraph
+/// separator ([`crate::diag::separates_lines`]), at which a reader that lays the document out by
+/// Unicode's line-breaking rules starts a line. Whitespace is kept as it is, unlike
+/// [`crate::diag::one_line`], because a run of spaces in a pattern is part of what it matches.
 fn one_line(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if c.is_control() || crate::diag::reorders(c) {
+            if c.is_control() || crate::diag::reorders(c) || crate::diag::separates_lines(c) {
                 ' '
             } else {
                 c
@@ -2175,10 +2176,11 @@ mod tests {
         assert!(text.contains("api.vendor.test"), "{text}");
     }
 
-    /// A rule cannot change the order its line is laid out in. The grammar refuses a control
-    /// character and nothing else, so a URL rule's path and a `re:` pattern can carry a character
-    /// that reorders a line; the listing writes it as a space and still names the rule. Every
-    /// disagreement is reported together, so each kind is seen to fail on its own.
+    /// A rule cannot change the order its line is laid out in, nor end it. The grammar refuses a
+    /// control character and nothing else, so a URL rule's path and a `re:` pattern can carry a
+    /// character that reorders a line or a line separator; the listing writes it as a space and
+    /// still names the rule. Every disagreement is reported together, so each kind is seen to fail
+    /// on its own.
     #[test]
     fn a_rule_cannot_reorder_the_line_it_is_listed_on() {
         let mut wrong = Vec::new();
@@ -2188,11 +2190,15 @@ mod tests {
                 "re:^https://y\\.test/\u{2066}c",
                 "- re:^https://y\\.test/ c",
             ),
+            ("https://z.test/d\u{2028}e", "- https://z.test/d e"),
         ] {
             let policy = policy_from(&[entry], &[]);
             let text = egress_contract(&NetworkPolicy::Allowlist(Box::new(policy)), &[]);
             if text.chars().any(crate::diag::reorders) {
                 wrong.push(format!("`{entry:?}` reorders its line"));
+            }
+            if text.chars().any(crate::diag::separates_lines) {
+                wrong.push(format!("`{entry:?}` ends its line"));
             }
             if !text.lines().any(|line| line == listed) {
                 wrong.push(format!("`{entry:?}` is not listed as `{listed}`"));

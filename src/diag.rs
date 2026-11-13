@@ -5,12 +5,13 @@
 //! byte for byte, backticks intact, so existing captured-output assertions are unaffected.
 //!
 //! Every message is written the way [`visible_lines`] writes it before any hue is added: a control
-//! character or a character that reorders a line comes out as an escape (`\x1b`, `\u{202e}`),
-//! while a line break and a tab are kept. A message quotes values sbx did not write (a path the
-//! cage chose, a program's stderr, a project's file name), and this is the one place they all
-//! reach the terminal, so a value is escaped whatever route it took. The hues sbx adds are the only
-//! escape sequences a diagnostic carries. What stays: a line break inside a value still starts a
-//! line, which can read as sbx's own, and only [`warn_config`] folds that away.
+//! character, a character that reorders a line or a Unicode line or paragraph separator comes out
+//! as an escape (`\x1b`, `\u{202e}`, `\u{2028}`), while a line break and a tab are kept. A message
+//! quotes values sbx did not write (a path the cage chose, a program's stderr, a project's file
+//! name), and this is the one place they all reach the terminal, so a value is escaped whatever
+//! route it took. The hues sbx adds are the only escape sequences a diagnostic carries. What stays:
+//! a line break inside a value still starts a line, which can read as sbx's own, and only
+//! [`warn_config`] folds that away.
 
 use crate::style::Palette;
 use std::io::IsTerminal;
@@ -20,16 +21,20 @@ use std::io::IsTerminal;
 ///
 /// A character that would move the cursor, erase a line, recolour the text or reorder it is written
 /// as an escape (`\x1b`, `\x0d`, `\u{202e}`): the reader sees that it is there instead of what it
-/// would do to the lines around it. A tab only moves forward, and is kept. Nothing is cut, unlike
-/// [`crate::sandbox::sanitize`], so a message that names a path still ends with what to do about
-/// it. Only what is printed is escaped; the text is compared and acted on as it is.
+/// would do to the lines around it. So is a character that [`separates_lines`], which a terminal
+/// leaves on the line but a reader of the same text elsewhere starts a new one at. A tab only moves
+/// forward, and is kept. Nothing is cut, unlike [`crate::sandbox::sanitize`], so a message that
+/// names a path still ends with what to do about it. Only what is printed is escaped; the text is
+/// compared and acted on as it is.
 pub(crate) fn visible(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
             '\t' => out.push(c),
             c if c.is_control() => out.push_str(&format!("\\x{:02x}", u32::from(c))),
-            c if reorders(c) => out.push_str(&format!("\\u{{{:04x}}}", u32::from(c))),
+            c if reorders(c) || separates_lines(c) => {
+                out.push_str(&format!("\\u{{{:04x}}}", u32::from(c)));
+            }
             c => out.push(c),
         }
     }
@@ -38,7 +43,8 @@ pub(crate) fn visible(text: &str) -> String {
 
 /// A message as a terminal is to show it: each line written the way [`visible`] writes it, the
 /// line breaks kept. Text whose only control characters are line breaks and tabs, and that holds no
-/// character that reorders a line, comes back byte for byte, and escaping twice changes nothing.
+/// character that reorders a line or separates lines, comes back byte for byte, and escaping twice
+/// changes nothing.
 ///
 /// For a message that spans lines on purpose, such as a parser's drawing the line at fault under a
 /// caret, whose line is the file's own text: a file sbx did not write can put an escape sequence or
@@ -58,6 +64,17 @@ pub(crate) fn reorders(c: char) -> bool {
         c,
         '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
     )
+}
+
+/// Whether `c` is Unicode's line separator or paragraph separator (U+2028, U+2029).
+///
+/// Neither is a control character to [`char::is_control`], and a terminal moves no cursor for one,
+/// but Unicode's line-breaking rules (UAX #14) make each a mandatory break: a reader that lays text
+/// out by them, an editor or a page showing a captured log, starts a new line there. So a value
+/// that is to stay on its line is held to this beside [`reorders`]. It is no test of the values a
+/// configuration may hold, which [`reorders`] also serves.
+pub(crate) fn separates_lines(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
 }
 
 /// Text sbx did not choose, folded to one line that reads as written: each control character (a
@@ -384,6 +401,34 @@ mod tests {
             assert!(!reorders(c), "{c:?}");
             assert_eq!(visible(&c.to_string()), c.to_string());
         }
+    }
+
+    /// The line and paragraph separators are written out, by [`visible`] and so by every line the
+    /// family prints: a page or an editor showing a captured log starts a line at each, so a value
+    /// carrying one would end, there, the line it is quoted on. Neither joins [`reorders`], which
+    /// also decides what a configuration may hold.
+    #[test]
+    fn a_line_or_paragraph_separator_in_a_value_is_written_out() {
+        for c in ['\u{2028}', '\u{2029}'] {
+            assert!(
+                separates_lines(c) && !c.is_control() && !reorders(c),
+                "{c:?}"
+            );
+            let value = format!("a{c}sbx: note: forged");
+            let shown = format!("a\\u{{{:04x}}}sbx: note: forged", u32::from(c));
+            assert_eq!(visible(&value), shown);
+            assert_eq!(visible_lines(&value), shown);
+            assert_eq!(
+                warning_line(&value, &Palette::plain()),
+                format!("sbx: warning: {shown}")
+            );
+            assert_eq!(visible_lines(&shown), shown);
+        }
+        for c in ['\n', '\u{0085}', ' ', 'a'] {
+            assert!(!separates_lines(c), "{c:?}");
+        }
+        // Folded to one line, each is whitespace and becomes a space.
+        assert_eq!(one_line("a\u{2028}b\u{2029}c"), "a b c");
     }
 
     /// Every line the family prints is the message as [`visible_lines`] writes it: an escape
