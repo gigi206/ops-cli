@@ -1116,7 +1116,6 @@ mod tests {
                 "src/sandbox/broker_control.rs",
                 "src/sandbox/fs_control.rs",
                 "src/sandbox/signer_control.rs",
-                "src/sandbox/sshagent_control.rs",
             ],
             "the lens rings that still hand out the ring underneath"
         );

@@ -190,20 +190,24 @@ impl AgentRing {
     }
 }
 
-/// The ring underneath, so a snapshot reads the same on this lens as on any other: `snapshot` is
-/// [`super::lens::Ring`]'s and is reached through here, while `push` above stays this lens's own.
-impl std::ops::Deref for AgentRing {
-    type Target = super::lens::Ring<AgentEvent>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.ring
+impl AgentRing {
+    /// The events past `after`, as [`super::lens::Ring::snapshot`] reads them, for the tests that
+    /// check what a decision left; a session reads them through [`serve`]. Nothing else of the ring
+    /// is handed out: it stays behind [`AgentRing::push`], the one door a decision comes in by,
+    /// where its detail is cleaned and a refusal announced, and a `Deref` to it would open a second
+    /// door, through which an event would arrive uncleaned and unannounced.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self, after: Option<u64>) -> AgentSnapshot {
+        self.ring.snapshot(after)
     }
 }
 
 /// Serve the control socket, answering `LOG` from the ring the broker pushes to. See
 /// [`super::lens::serve`].
 pub(crate) fn serve(listener: UnixListener, ring: Arc<AgentRing>) -> io::Result<()> {
-    super::lens::serve(listener, move |cmd| super::lens::dispatch_log(cmd, &ring))
+    super::lens::serve(listener, move |cmd| {
+        super::lens::dispatch_log(cmd, &ring.ring)
+    })
 }
 
 // ── Client side (the `sbx ssh-agent log` process) ──────────────────────────────────────────────
@@ -292,7 +296,7 @@ mod tests {
         ring.push(AgentKind::Sign, "deploy@example");
         ring.push(AgentKind::Refuse, "a key the grant does not name");
 
-        let reply = crate::sandbox::lens::dispatch_log("LOG", &ring);
+        let reply = crate::sandbox::lens::dispatch_log("LOG", &ring.ring);
         assert!(reply.ends_with("ok\n"), "{reply}");
         let parsed: Vec<AgentEvent> = reply
             .lines()
@@ -305,11 +309,11 @@ mod tests {
         assert_eq!(parsed[2].kind, AgentKind::Refuse);
 
         // A cursor past the head is a valid, empty answer that still carries the cursor.
-        let reply = crate::sandbox::lens::dispatch_log("LOG after=3", &ring);
+        let reply = crate::sandbox::lens::dispatch_log("LOG after=3", &ring.ring);
         assert!(reply.contains("head=3"), "{reply}");
         assert!(!reply.contains("event "), "{reply}");
         assert_eq!(
-            crate::sandbox::lens::dispatch_log("NOPE", &ring),
+            crate::sandbox::lens::dispatch_log("NOPE", &ring.ring),
             "err bad-request\n"
         );
     }
