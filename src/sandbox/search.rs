@@ -66,8 +66,9 @@ enum Exact {
         versions: Vec<VersionRow>,
     },
     /// The exact name was found, but fetching its versions failed (a transient nixhub
-    /// blip, or a name the metadata fetch rejects). The list still renders.
-    Unavailable { pkg: String },
+    /// blip, or a name the metadata fetch rejects). The list still renders, with `why`: the
+    /// fetch's own error on one bounded line, so a failure that retrying will not cure says so.
+    Unavailable { pkg: String, why: String },
 }
 
 /// Run a search: fetch the fuzzy matches, and when the query names a package exactly,
@@ -103,8 +104,9 @@ pub(crate) fn run(
                     summary: m.summary.clone(),
                     versions: parse_versions(&meta, system),
                 },
-                Err(_) => Exact::Unavailable {
+                Err(e) => Exact::Unavailable {
                     pkg: m.name.clone(),
+                    why: super::resolver::one_line_detail(e.to_string().as_bytes()),
                 },
             },
         );
@@ -247,10 +249,11 @@ fn render(
         // The exact name was found, but its version fetch failed — the list still stands,
         // so show it and say why the version block is missing (never the "name a package
         // exactly" nudge: the user already named one).
-        Some(Exact::Unavailable { pkg }) => {
+        Some(Exact::Unavailable { pkg, why }) => {
             push_match_table(&mut out, query, matches, pal);
             out.push_str(&format!(
-                "\ncould not fetch versions for `{n}{pkg}{r}` — try `sbx search {pkg}` again.\n"
+                "\ncould not fetch versions for `{n}{pkg}{r}` ({why}) — try `sbx search {pkg}` \
+                 again.\n"
             ));
         }
         None => {
@@ -539,6 +542,7 @@ mod tests {
         let matches = parse_matches(&search_json());
         let exact = Exact::Unavailable {
             pkg: "jq".to_string(),
+            why: "HTTP error 503".to_string(),
         };
         let out = render(
             "jq",
@@ -548,7 +552,7 @@ mod tests {
             &Palette::plain(),
         );
         assert!(out.contains("3 matches on nixhub") && out.contains("jq-lsp"));
-        assert!(out.contains("could not fetch versions for `jq`"));
+        assert!(out.contains("could not fetch versions for `jq` (HTTP error 503)"));
         assert!(!out.contains("name a package exactly"));
         assert!(!out.contains("has no release built"));
         assert!(!out.contains("declare it:"));
