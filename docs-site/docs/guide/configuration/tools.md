@@ -55,6 +55,15 @@ trusted/global-only choice: an untrusted project may *declare* `aqua:evil/x` but
 cannot *open* egress to fetch it. Under `network = "none"` the install is skipped with
 a by-name warning; under a filtering posture the fetch rides the allowlist.
 
+A launch installs only what is **missing**: a tool an installed version already satisfies is
+left as it is, so `node = "20"` keeps running the 20.x it has when a newer 20.x is published.
+mise resolves a tool handed to `install` by name against the newest release, so each one is
+first asked of `mise where`, which answers from what is installed, in the cage's own pool and in
+any pool it reads (see [`apps_read_project_pool`](packages#apps_read_project_pool-when-an-app-needs-the-tools-the-projects-shell-installed)); only the tools it does not
+resolve reach `mise install`, and a launch where none is missing runs no install at all. A launch
+therefore never moves a version: [`sbx mise upgrade`](../cli/mise) does, inside the project's
+cage and under its egress.
+
 A tool the cage's `MISE_DISABLE_TOOLS` names is not equipped. mise honours that variable when it
 reads the file, but installs a tool it is handed by name regardless, so sbx leaves it out: a
 project that brings `rust` through its own rustup and sets `MISE_DISABLE_TOOLS = "rust"` in its
@@ -148,6 +157,7 @@ And the upgrade path, which is a separate verb because a binary update does not 
 a pinned toolchain:
 
 ```sh
-sbx upgrade mise               # move the non-nix: tools to their newest release
+sbx upgrade mise               # move the nix: tools and the [packages] mise: tools
+sbx mise upgrade               # move this mise file's other tools, within their declared range
 sbx upgrade nix                # move the base userland's channel
 ```

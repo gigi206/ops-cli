@@ -103,7 +103,15 @@ fn an_interpolated_mise_path_is_one_word_whatever_it_contains() {
     let tokens = vec!["aqua:example/demo-tool".to_string()];
     let cmd = vec![OsString::from("demo-app")];
 
-    let argv = wrap_mise_equip(&mise, &bash, "install", &tokens, None, false, cmd);
+    let argv = wrap_mise_equip(
+        &mise,
+        &bash,
+        EquipVerb::InstallMissing,
+        &tokens,
+        None,
+        false,
+        cmd,
+    );
     let script = argv[2].to_string_lossy();
 
     assert!(
@@ -126,14 +134,25 @@ fn wrap_autoequip_passes_tokens_and_command_positionally() {
     ];
     let cmd = vec![OsString::from("demo-app"), OsString::from("--print")];
 
-    let argv = wrap_mise_equip(&mise, &bash, "install", &tokens, None, false, cmd);
+    let argv = wrap_mise_equip(
+        &mise,
+        &bash,
+        EquipVerb::InstallMissing,
+        &tokens,
+        None,
+        false,
+        cmd,
+    );
 
     assert_eq!(argv[0], OsString::from("/nix/store/bash/bin/bash"));
     assert_eq!(argv[1], OsString::from("-c"));
     let script = argv[2].to_string_lossy();
     // mise by absolute path; the slice/shift use the count, not the tokens; the command
     // is exec'd (so it stays the cage's main process) after the tokens are shifted off.
-    assert!(script.contains("'/nix/store/mise/bin/mise' install -- \"${@:1:2}\""));
+    assert!(
+        script.contains("for t in \"${@:1:2}\"; do '/nix/store/mise/bin/mise' where -- \"$t\"")
+    );
+    assert!(script.contains("'/nix/store/mise/bin/mise' install -- \"${missing[@]}\""));
     // The project's lane equips the project's own mise file, so it runs where that file is.
     assert!(!script.contains(MISE_OUTSIDE_PROJECT), "{script}");
     assert!(script.contains("shift 2;"));
@@ -150,6 +169,99 @@ fn wrap_autoequip_passes_tokens_and_command_positionally() {
     assert_eq!(argv[7], OsString::from("--print"));
 }
 
+/// The project's lane installs only what no installed version satisfies, and a launch with nothing
+/// missing runs no install at all.
+///
+/// mise resolves a token handed to `install` by name against the newest upstream release, so
+/// handing it every token reinstalled `node@26` at each launch once a newer 26.x was out, with
+/// 26.13.0 installed in the pool the cage reads. Under an app's egress that fetch was refused, at
+/// every launch, for a tool the cage already had. Run with a stand-in mise whose `where` resolves
+/// only the tokens `$SBX_TEST_PRESENT` names, so the test sees which tokens reach `install`.
+#[test]
+fn the_project_lane_installs_only_the_tokens_mise_where_does_not_resolve() {
+    let bash = PathBuf::from("/bin/bash");
+    if !bash.is_file() {
+        skip_incapable!("skipping equip-script run: no /bin/bash on this host");
+        return;
+    }
+    let dir = crate::testutil::TmpDir::new();
+    let mise = dir.path().join("mise");
+    // `where -- <token>`: resolved when the token is listed, an error past the one exit code mise
+    // uses for a token it cannot resolve when the token says so, and unresolved otherwise.
+    std::fs::write(
+        &mise,
+        "#!/bin/sh\necho \"mise $*\" >> \"$SBX_TEST_RECORD\"\n\
+         if [ \"$1\" = where ]; then\n\
+         case \" $SBX_TEST_PRESENT \" in *\" $3 \"*) exit 0;; esac\n\
+         case \"$3\" in *broken*) exit 7;; esac\n\
+         exit 1\nfi\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&mise, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let tokens = vec![
+        "core:node@26".to_string(),
+        "aqua:BurntSushi/ripgrep@latest".to_string(),
+        "npm:broken-lookup@1.0".to_string(),
+    ];
+    let wheres = "mise where -- core:node@26\n\
+                  mise where -- aqua:BurntSushi/ripgrep@latest\n\
+                  mise where -- npm:broken-lookup@1.0\n";
+    for (present, install) in [
+        // Every token resolves: no install runs, so nothing is fetched.
+        (
+            "core:node@26 aqua:BurntSushi/ripgrep@latest npm:broken-lookup@1.0",
+            None,
+        ),
+        // Some resolve: only the rest are installed, in declaration order, after a `--`.
+        (
+            "aqua:BurntSushi/ripgrep@latest",
+            Some("mise install -- core:node@26 npm:broken-lookup@1.0\n"),
+        ),
+        // None resolves, one of them through an error rather than a miss: all are installed.
+        (
+            "",
+            Some(
+                "mise install -- core:node@26 aqua:BurntSushi/ripgrep@latest \
+                 npm:broken-lookup@1.0\n",
+            ),
+        ),
+    ] {
+        let record = dir.path().join("record");
+        let _ = std::fs::remove_file(&record);
+        let argv = wrap_mise_equip(
+            Path::new("./mise"),
+            &bash,
+            EquipVerb::InstallMissing,
+            &tokens,
+            None,
+            false,
+            vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("echo cmd >> \"$SBX_TEST_RECORD\""),
+            ],
+        );
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(dir.path())
+            .env("SBX_TEST_RECORD", &record)
+            .env("SBX_TEST_PRESENT", present)
+            .output()
+            .expect("run the generated equip script");
+        assert!(
+            out.status.success(),
+            "the equip script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let calls = std::fs::read_to_string(&record).expect("the stand-ins recorded their calls");
+        assert_eq!(
+            calls,
+            format!("{wheres}{}cmd\n", install.unwrap_or("")),
+            "present: {present:?}"
+        );
+    }
+}
+
 #[test]
 fn wrap_mise_equip_uses_the_global_verb_for_app_packages() {
     // The app's `[packages] mise:` tools are equipped globally (`mise use -g`), so the verb
@@ -160,10 +272,18 @@ fn wrap_mise_equip_uses_the_global_verb_for_app_packages() {
     let tokens = vec!["aqua:example/demo-tool".to_string()];
     let cmd = vec![OsString::from("demo-app")];
 
-    let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, None, true, cmd);
+    let argv = wrap_mise_equip(
+        &mise,
+        &bash,
+        EquipVerb::PinGlobally,
+        &tokens,
+        None,
+        true,
+        cmd,
+    );
 
     let script = argv[2].to_string_lossy();
-    assert!(script.contains("'/nix/store/mise/bin/mise' -C / use -g -- \"${@:1:1}\""));
+    assert!(script.contains("'/nix/store/mise/bin/mise' -C / use -g --pin -- \"${@:1:1}\""));
     assert!(script.contains("shift 1;"));
     // no data-dir override: the equip runs under the ambient primary
     assert!(!script.contains("MISE_DATA_DIR="));
@@ -259,7 +379,15 @@ fn wrap_mise_equip_pins_the_app_global_data_dir_for_the_global_lane() {
     let cmd = vec![OsString::from("demo-app")];
     let data_dir = crate::sandbox::binds::mise_app_global_data_dir();
 
-    let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, Some(&data_dir), true, cmd);
+    let argv = wrap_mise_equip(
+        &mise,
+        &bash,
+        EquipVerb::PinGlobally,
+        &tokens,
+        Some(&data_dir),
+        true,
+        cmd,
+    );
 
     let script = argv[2].to_string_lossy();
     // the equip's MISE_DATA_DIR is pinned to the app-global home, quoted, before mise
@@ -320,7 +448,7 @@ fn running_the_equip_script_gives_mise_the_pinned_dir_and_the_command_the_ambien
         let argv = wrap_mise_equip(
             Path::new("./mise"),
             &bash,
-            "use -g",
+            EquipVerb::PinGlobally,
             &tokens,
             pin,
             true,
@@ -414,7 +542,7 @@ fn running_the_equip_script_reinstalls_a_pipx_tool_whose_python_is_gone() {
         let argv = wrap_mise_equip(
             Path::new("./mise"),
             &bash,
-            "use -g --pin",
+            EquipVerb::PinGlobally,
             &tokens,
             pin,
             true,
@@ -471,7 +599,7 @@ fn running_the_equip_script_repairs_a_pipx_tool_whose_directory_mise_named_from_
     let argv = wrap_mise_equip(
         Path::new("./mise"),
         &bash,
-        "use -g --pin",
+        EquipVerb::PinGlobally,
         &["pipx:Broken-Caps".to_string(), "pipx:Kept-Caps".to_string()],
         None,
         true,
@@ -519,12 +647,28 @@ fn every_mise_script_ends_the_options_before_its_tokens() {
     for (what, argv, called) in [
         (
             "the project's lane",
-            wrap_mise_equip(mise, &bash, "install", &tokens, None, false, then()),
-            "mise install -- --help",
+            wrap_mise_equip(
+                mise,
+                &bash,
+                EquipVerb::InstallMissing,
+                &tokens,
+                None,
+                false,
+                then(),
+            ),
+            "mise where -- --help",
         ),
         (
             "the app's lane",
-            wrap_mise_equip(mise, &bash, MISE_EQUIP_VERB, &tokens, None, true, then()),
+            wrap_mise_equip(
+                mise,
+                &bash,
+                EquipVerb::PinGlobally,
+                &tokens,
+                None,
+                true,
+                then(),
+            ),
             "mise -C / use -g --pin -- --help",
         ),
         (

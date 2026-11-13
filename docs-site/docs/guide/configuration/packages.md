@@ -273,10 +273,11 @@ Set this in the project's config and each global app also reads, read-only and l
 apps_read_project_pool = true
 ```
 
-A tool the project's mise file asks for by an exact version then resolves from that pool with no
-network at all. One asked for by a range or `latest` still asks its registry which release that
-names, and fails there under an egress that refuses it: pin the project's tools to exact versions
-for the apps to need nothing. A tool `sbx run` has not installed yet is fetched by the app as before.
+A tool the project's mise file asks for then resolves from that pool with no network at all,
+whether it names an exact version, a range or `latest`: a launch installs only what no installed
+version satisfies (see [Non-`nix:` backends](tools#non-nix-backends-auto-equipped-in-cage)), so the
+version `sbx run` installed is the one the apps run until a roll moves it. A tool `sbx run` has not
+installed yet is fetched by the app as before.
 
 Unlike an app's pool, this one sits inside a home its cage can write. It is therefore never mounted
 by its path: the launch holds it open with every link on its path refused, bubblewrap mounts the

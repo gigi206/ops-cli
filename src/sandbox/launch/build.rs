@@ -26,7 +26,7 @@
 //! fields out of them one at a time.
 
 use super::equip::{
-    MISE_EQUIP_VERB, auto_equip_tokens, equip_announcement, mise_token_display, wrap_flake_equip,
+    EquipVerb, auto_equip_tokens, equip_announcement, mise_token_display, wrap_flake_equip,
     wrap_mise_equip,
 };
 use super::startup::compose_startup_cmd;
@@ -1244,8 +1244,9 @@ fn mise_equip_lanes<'a>(
                     // project wrote them.
                     let shown = mise_token_display(auto_equip.iter());
                     crate::diag::error(&format!(
-                        "sbx: equipping non-nix tools in-cage via mise: {shown} (each backend's \
-                         host must be in [network].allow under an allowlist)"
+                        "sbx: equipping non-nix tools in-cage via mise, those not installed yet: \
+                         {shown} (each backend's host must be in [network].allow under an \
+                         allowlist)"
                     ));
                 }
                 wraps.push((
@@ -1254,13 +1255,15 @@ fn mise_equip_lanes<'a>(
                         wrap_mise_equip(
                             &prep.userland.mise_bin,
                             &prep.userland.shell_bin,
-                            // `install`, and deliberately no `--pin` here: this lane equips the
-                            // tools the PROJECT's own `.mise.toml` asks for, and that file belongs
-                            // to the user. `install` reads it and writes nothing; pinning would
-                            // rewrite a version the project chose to leave floating, in a file sbx
-                            // does not own. The pin belongs to lane 1 below, whose config file is
-                            // the cage's own and is sbx's to write.
-                            "install",
+                            // `install` of what is missing, and deliberately no `--pin` here:
+                            // this lane equips the tools the PROJECT's own `.mise.toml` asks for,
+                            // and that file belongs to the user. `install` reads it and writes
+                            // nothing; pinning would rewrite a version the project chose to leave
+                            // floating, in a file sbx does not own. The pin belongs to lane 1
+                            // below, whose config file is the cage's own and is sbx's to write.
+                            // A tool already satisfied is not reinstalled: a launch never moves a
+                            // version (see `EquipVerb::InstallMissing`).
+                            EquipVerb::InstallMissing,
                             &auto_equip,
                             // Lane 2 (project `.mise.toml` tools) runs under the ambient primary —
                             // the per-project pool for a global app, which is where these belong.
@@ -1303,7 +1306,7 @@ fn mise_equip_lanes<'a>(
                             // [`mise_upgrade_cmd`]): an exact pin is a range `mise upgrade` would
                             // consider already satisfied, so without it the roll would go quiet.
                             // Neither half works alone.
-                            MISE_EQUIP_VERB,
+                            EquipVerb::PinGlobally,
                             &global_mise,
                             // Pin the install to the app-global home pool for a global app (see
                             // above); None for other runtimes, where the ambient primary is already

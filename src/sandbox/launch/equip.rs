@@ -24,6 +24,25 @@ use super::*;
 pub(super) const MISE_EQUIP_VERB: &str = "use -g --pin";
 const MISE_ROLL_FLAG: &str = "--bump";
 
+/// What an equip script asks mise to do with the tokens it is handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EquipVerb {
+    /// `mise use -g --pin` every token ([`MISE_EQUIP_VERB`]): the app's `[packages] mise:` lane,
+    /// whose pin lives in the cage's own config and moves only on `sbx upgrade`.
+    PinGlobally,
+    /// `mise install` only the tokens no installed version satisfies: the project's lane, the
+    /// tools of the project's own mise file.
+    ///
+    /// A version is not chosen at launch. mise resolves a token it is handed by name against the
+    /// newest upstream release, even when an installed version already satisfies it: `node@26`
+    /// with 26.13.0 installed reinstalls as soon as 26.13.1 is published, and under an app's
+    /// egress that fetch is refused at every launch. `mise where` answers from what is installed,
+    /// in the cage's own pool and in every pool `MISE_SHARED_INSTALL_DIRS` names, so a token it
+    /// resolves is left alone and only the rest is installed, which is what a plain `mise install`
+    /// does with the same file. Moving a satisfied tool to a newer release is the roll's job.
+    InstallMissing,
+}
+
 /// The global option that runs a mise invocation as if started at `/`, outside the project.
 ///
 /// An app's `[packages] mise:` tools live in a pool of their own (the app-global one for a global
@@ -252,17 +271,21 @@ fn disabled_mise_tools(env: &[(String, String)]) -> Vec<&str> {
 }
 
 /// Wrap `cmd` so the cage equips a set of mise tools before running it: a static bash that runs
-/// `mise <verb> <tokens>` (its stdout redirected to stderr so a piped command's stdout stays
-/// clean) and then `exec`s the real command — which therefore stays the cage's main process,
-/// leaving an interactive `sbx run`'s pty job control unchanged. The `verb` is an sbx-chosen literal
-/// (`install` for the project's local `.mise.toml` tools, `use -g` for the app's `[packages]
-/// mise:` ones) and is interpolated **unquoted**, because `use -g` has to reach mise as two words;
+/// mise on the tokens as `verb` says (its stdout redirected to stderr so a piped command's stdout
+/// stays clean) and then `exec`s the real command — which therefore stays the cage's main process,
+/// leaving an interactive `sbx run`'s pty job control unchanged. [`EquipVerb::PinGlobally`] runs
+/// `mise use -g --pin <tokens>`; [`EquipVerb::InstallMissing`] asks `mise where` about each token
+/// and runs `mise install` on those it does not resolve, and runs no install at all when it
+/// resolves every one, since mise reads an empty list as "the whole config". The verb is an
+/// sbx-chosen literal interpolated **unquoted**, because `use -g` has to reach mise as two words;
 /// the tokens and the command ride `"$@"` positionally, and the mise path goes through
 /// [`shell_quote`], so a token from an untrusted config can never inject shell. The tokens follow a
 /// `--`, so none of them can read as an option to mise either: the project's lane takes its tokens
 /// from the project's own `.mise.toml`, which no declaration check has seen. Best-effort: a
 /// failed equip does not abort the command (the missing tool surfaces when it is used), matching
-/// the self-equip posture rather than the host `nix:` hard-fail guarantee.
+/// the self-equip posture rather than the host `nix:` hard-fail guarantee. A `where` that fails
+/// for any reason counts its token as missing, so the doubt costs an install attempt, never a
+/// tool left out.
 ///
 /// `outside_project` runs every mise invocation of the script with [`MISE_OUTSIDE_PROJECT`]: the
 /// app's lane sets it, so the project's own mise file shapes neither the equip nor the repair,
@@ -297,7 +320,7 @@ fn disabled_mise_tools(env: &[(String, String)]) -> Vec<&str> {
 pub(super) fn wrap_mise_equip(
     mise: &Path,
     bash: &Path,
-    verb: &str,
+    verb: EquipVerb,
     tokens: &[String],
     mise_data_dir: Option<&str>,
     outside_project: bool,
@@ -359,8 +382,19 @@ pub(super) fn wrap_mise_equip(
              done\n"
         )
     };
+    let equip = match verb {
+        EquipVerb::PinGlobally => {
+            format!("{data_dir_prefix}{mise} {MISE_EQUIP_VERB} -- \"${{@:1:{n}}}\" 1>&2")
+        }
+        EquipVerb::InstallMissing => format!(
+            "missing=(); for t in \"${{@:1:{n}}}\"; do \
+             {data_dir_prefix}{mise} where -- \"$t\" >/dev/null 2>&1 || missing+=(\"$t\"); done; \
+             if [ \"${{#missing[@]}}\" -gt 0 ]; then \
+             {data_dir_prefix}{mise} install -- \"${{missing[@]}}\" 1>&2; fi"
+        ),
+    };
     let script = format!(
-        "{repair}{data_dir_prefix}{mise} {verb} -- \"${{@:1:{n}}}\" 1>&2; shift {shifted}; exec \"$@\"",
+        "{repair}{equip}; shift {shifted}; exec \"$@\"",
         shifted = n + 3 * m,
     );
     let mut out = vec![
