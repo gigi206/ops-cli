@@ -266,16 +266,21 @@ pub fn maybe_help(cmd: &str, rest: &[OsString]) -> Option<ExitCode> {
 /// A token shaped like an option is refused, save `--help`/`-h`, which asks for what this already
 /// does. Reading stopped at the first such token, so `sbx help --foo` printed the command list at
 /// exit 0: an answer that looks right to a command line that was mistyped.
+///
+/// A `--` ends the options, as it does in [`maybe_help`]: what follows it is a command path, read
+/// as written.
 pub fn dispatch(args: &[OsString]) -> ExitCode {
     let mut path: Vec<&str> = Vec::new();
+    let mut options = true;
     for arg in args {
         let Some(tok) = arg.to_str() else {
             crate::diag::error("sbx: help: an argument is not valid UTF-8");
             return ExitCode::from(2);
         };
         match tok {
-            "--help" | "-h" => {}
-            flag if flag.starts_with('-') => {
+            "--" if options => options = false,
+            "--help" | "-h" if options => {}
+            flag if options && flag.starts_with('-') => {
                 crate::diag::error(&format!(
                     "sbx: help: unknown option `{flag}`; run `sbx --help` for the list of \
                      commands."

@@ -382,6 +382,7 @@ fn help_refuses_an_option_it_does_not_know() {
         &["--help"],
         &["help", "app"],
         &["help", "app", "--help"],
+        &["help", "--", "app"],
     ] {
         let (code, out) = run(args, home.path());
         assert_eq!(
