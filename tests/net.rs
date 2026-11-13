@@ -2451,6 +2451,14 @@ fn net_stats_aggregates_a_projects_sessions_and_filters_by_app() {
         egress.join("stats-3").exists(),
         "another project's file must survive --reset"
     );
+
+    // The scope `--reset` names is written out: an app name carrying a newline stays on the one
+    // line the report is.
+    let out = fx.run(&["net", "stats", "--reset", "--app", "x\ny"]);
+    assert!(out.status.success());
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(said.lines().count(), 1, "{said:?}");
+    assert!(said.contains("for app x\\x0ay"), "{said:?}");
 }
 
 #[test]

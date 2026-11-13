@@ -72,7 +72,7 @@ pub(super) fn net_stats(args: &[OsString]) -> ExitCode {
         let n = sandbox::egress_stats::reset(&egress_dir, &project, app.as_deref());
         let scope = app
             .as_ref()
-            .map(|a| format!(" for app {a}"))
+            .map(|a| format!(" for app {}", diag::visible(a)))
             .unwrap_or_default();
         outln!("reset {n} egress stat file(s){scope}");
         return ExitCode::SUCCESS;
@@ -131,6 +131,10 @@ const FOLD_LABEL: &str = "(other hosts)";
 /// test): a project/app header, then one row per destination with its allow/deny/blocked counts,
 /// busiest first (ties broken by host for stable output). An empty result says nothing has been
 /// recorded yet and when recording happens.
+///
+/// Every name is shown the way [`diag::visible`] writes it: the project's path is whatever its
+/// directories are called, and a host is read back from a file on disk, so neither may start a
+/// line of its own or drive the terminal. The host column is as wide as the widest host as shown.
 fn render_stats(
     project: &str,
     app: Option<&str>,
@@ -140,7 +144,10 @@ fn render_stats(
     use std::fmt::Write as _;
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     let mut o = String::new();
-    let scope = app.map(|a| format!(" · app {a}")).unwrap_or_default();
+    let scope = app
+        .map(|a| format!(" · app {}", diag::visible(a)))
+        .unwrap_or_default();
+    let project = diag::visible(project);
     let _ = writeln!(o, "{h}egress stats{r} {dim}({project}{scope}){r}");
     if tally.is_empty() {
         let _ = writeln!(
@@ -153,6 +160,10 @@ fn render_stats(
     // Busiest host first; ties by host name so the order is stable run to run.
     let mut rows: Vec<(&String, &sandbox::egress_stats::Counts)> = tally.hosts.iter().collect();
     rows.sort_by(|(ha, a), (hb, b)| b.total().cmp(&a.total()).then(ha.cmp(hb)));
+    let rows: Vec<(String, &sandbox::egress_stats::Counts)> = rows
+        .into_iter()
+        .map(|(host, c)| (diag::visible(host), c))
+        .collect();
     // The folded-destinations row below prints its label in the host column, so that label is part
     // of the column's width: padded to a narrower one it would overflow and push its own counts
     // right of the ALLOW/DENY/BLOCKED headers they belong to, the one row whose numbers a reader
@@ -165,7 +176,7 @@ fn render_stats(
     };
     let host_w = rows
         .iter()
-        .map(|(host, _)| host.len())
+        .map(|(host, _)| host.chars().count())
         .max()
         .unwrap_or(0)
         .max(4)
@@ -260,6 +271,78 @@ mod tests {
         let busy = out.find("busy.test").unwrap();
         let quiet = out.find("quiet.test").unwrap();
         assert!(busy < quiet, "busiest host must sort first:\n{out}");
+    }
+
+    /// A name the table shows is written out on its own line: the project's path, the app and a
+    /// host read back from disk each carry a newline, a line separator, an escape sequence and a
+    /// character that reorders the line here, and the table has as many lines as it has for plain
+    /// names, none of them raw. Each name is made hostile on its own, and every one that reaches
+    /// the table raw is named.
+    #[test]
+    fn every_name_the_table_shows_is_written_out_on_its_line() {
+        use sandbox::egress_stats::{Counts, Tally};
+        let p = style::Palette::plain();
+        let hostile = "a\nb\u{2028}c\x1b[2Jd\u{202e}e";
+        let one_host = |host: &str| Tally {
+            hosts: [(
+                host.to_string(),
+                Counts {
+                    allow: 1,
+                    deny: 0,
+                    blocked: 0,
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let plain_host = one_host("h.test");
+        let render = |what: &str, v: &str| match what {
+            "project" => render_stats(v, Some("demo"), &plain_host, &p),
+            "app" => render_stats("/p", Some(v), &plain_host, &p),
+            _ => render_stats("/p", Some("demo"), &one_host(v), &p),
+        };
+        let raw = |c: char| {
+            (c.is_control() && c != '\n') || diag::reorders(c) || diag::separates_lines(c)
+        };
+        let leaked: Vec<String> = ["project", "app", "host"]
+            .into_iter()
+            .filter_map(|what| {
+                let (plain, shown) = (render(what, "x"), render(what, hostile));
+                (shown.chars().any(raw) || shown.lines().count() != plain.lines().count())
+                    .then(|| format!("{what}: {shown:?}"))
+            })
+            .collect();
+        assert!(leaked.is_empty(), "{}", leaked.join("\n"));
+    }
+
+    /// The host column is as wide as the widest host in characters, the unit the formatter pads in:
+    /// a host that is not ASCII takes no more room than its letters, so its counts sit right after
+    /// it, under their headers.
+    #[test]
+    fn the_host_column_is_as_wide_as_its_widest_host_in_characters() {
+        use sandbox::egress_stats::{Counts, Tally};
+        let tally = Tally {
+            hosts: [(
+                "ääääää".to_string(),
+                Counts {
+                    allow: 1,
+                    deny: 0,
+                    blocked: 0,
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let out = render_stats("/p", None, &tally, &style::Palette::plain());
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[1..],
+            [
+                "  HOST     ALLOW    DENY  BLOCKED",
+                "  ääääää       1       0        0"
+            ],
+            "{out}"
+        );
     }
 
     /// The destinations past the per-session cap get one row of their own, named rather than left

@@ -135,6 +135,10 @@ For each destination host it reports how many requests this project's launches:
 - had **blocked** by a security guard: [SSRF](architecture#the-ssrf-guard), the
   outbound-secret tripwire, or a domain-fronting host mismatch.
 
+A host, the project's path and an app name are shown as written: a control character, a
+character that reorders a line or a line separator is written out as an escape (`\x1b`,
+`\u{202e}`, `\u{2028}`), so no name can print a line of its own.
+
 Each request is counted once. Counters accrue while a filtering posture
 (`deny`/`allow`/`ask`) runs and **persist after the session** (owner-only, under the
 data dir). Transport/protocol failures are **not** a policy verdict and are not counted:
