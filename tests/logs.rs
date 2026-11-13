@@ -606,17 +606,21 @@ fn a_view_names_a_session_that_refuses_its_read() {
     serve_reply(data.path(), "fs", child.pid(), "err not-now\n".to_string());
     let pid = child.pid().to_string();
 
-    let out = run_view(
-        Command::new(env!("CARGO_BIN_EXE_sbx"))
-            .args(["fs", "logs", &pid])
-            .env("XDG_DATA_HOME", data.path()),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "{stderr}");
-    assert!(
-        stderr.contains("did not answer in full") && stderr.contains("not-now"),
-        "the refusal is named as one: {stderr}"
-    );
+    for args in [&["fs", "logs"][..], &["logs", "--feed", "fs"][..]] {
+        let mut argv: Vec<&str> = args.to_vec();
+        argv.push(&pid);
+        let out = run_view(
+            Command::new(env!("CARGO_BIN_EXE_sbx"))
+                .args(&argv)
+                .env("XDG_DATA_HOME", data.path()),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{argv:?}: {stderr}");
+        assert!(
+            stderr.contains("did not answer in full") && stderr.contains("not-now"),
+            "{argv:?}: the refusal is named as one: {stderr}"
+        );
+    }
 }
 
 /// A follow whose session answers a poll with an error goes on following it: the session was

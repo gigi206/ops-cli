@@ -1153,6 +1153,11 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+        // Each cut feed with what it met, as the single-feed view names it: a refusal in the
+        // session's own words, an answer cut short, or none in time.
+        for (name, e) in &cut {
+            diag::hint(&format!("       {name}: {e}"));
+        }
         for (name, why) in &absent {
             diag::hint(&format!("       {name}: {why}"));
         }
