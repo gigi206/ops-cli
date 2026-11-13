@@ -1658,6 +1658,88 @@ fn a_missing_reference_is_named_on_the_line_it_belongs_to() {
     }
 }
 
+/// What an import refuses or suggests quotes names and paths that the imported files, and the place
+/// they were unpacked to, chose; the refusal and the warning keep line breaks. Each is written as an
+/// escape on its line, so none starts a line that reads as sbx's own: the directory a catalogue was
+/// unpacked into, in the path the remedy suggests; a bundle or a group name `--with-deps` refuses;
+/// and an `--as` name each import refuses.
+#[test]
+fn what_an_import_quotes_stays_on_its_line() {
+    let fx = Project::new("app");
+    let forged = "sbx: note: forged";
+    let unpacked = fx.proj.path().join(format!("unpacked\n{forged}"));
+    for kind in ["app", "net-groups"] {
+        std::fs::create_dir_all(unpacked.join(kind)).unwrap();
+    }
+    std::fs::write(
+        unpacked.join("net-groups/lane.toml"),
+        "entries = [\"api.example.com\"]\n",
+    )
+    .unwrap();
+    let laned = unpacked.join("app/laned.toml");
+    std::fs::write(&laned, "cmd = \"demo\"\n[network]\nallow = [\"@lane\"]\n").unwrap();
+    let ghost = fx.catalogue(
+        "app",
+        "ghost-app",
+        &format!("cmd = \"demo\"\nuse = [\"ghost\\n{forged}\"]\n"),
+    );
+    let bundle = fx.catalogue("bundle", "demo-tool", "allow = [\"api.example.com\"]\n");
+    let group = fx.catalogue(
+        "net-groups",
+        "demo-lane",
+        "entries = [\"api.example.com\"]\n",
+    );
+    let grouped = fx.catalogue(
+        "app",
+        "grouped-app",
+        &format!("cmd = \"demo\"\n[network]\nallow = [\"@lane\\n{forged}\"]\n"),
+    );
+    let renamed = format!("x\n{forged}");
+    for (args, file, rest, quoted) in [
+        (
+            &["app", "import"][..],
+            &laned,
+            &[][..],
+            "unpacked\\x0asbx: note",
+        ),
+        (
+            &["app", "import"][..],
+            &ghost,
+            &["--with-deps"][..],
+            "ghost\\x0asbx: note",
+        ),
+        (
+            &["app", "import"][..],
+            &grouped,
+            &["--with-deps"][..],
+            "lane\\x0asbx: note",
+        ),
+        (
+            &["bundle", "import"][..],
+            &bundle,
+            &["--as", renamed.as_str()][..],
+            "x\\x0asbx: note",
+        ),
+        (
+            &["net", "groups", "import"][..],
+            &group,
+            &["--as", renamed.as_str()][..],
+            "x\\x0asbx: note",
+        ),
+    ] {
+        let out = fx.run_with_path(args, file, rest);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !err.lines().any(|line| line.starts_with(forged)),
+            "`{args:?} {rest:?}` let a quoted value start a line:\n{err}"
+        );
+        assert!(
+            err.contains(quoted),
+            "`{args:?} {rest:?}` does not quote `{quoted}`:\n{err}"
+        );
+    }
+}
+
 /// `--with-deps` is the opt-in half of the same finding: instead of naming what is missing, the
 /// import follows the reference and merges it. It writes into the file the user maintains by hand,
 /// which is why it is a flag and not the default.

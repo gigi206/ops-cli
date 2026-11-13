@@ -797,9 +797,11 @@ fn bundle_import(args: &[OsString]) -> ExitCode {
     // A name keys an on-disk file and a `use` reference; an invalid one would be dropped at load,
     // leaving an app that names it silently short of its tool. Fail closed, naming the offender.
     if !config::is_valid_bundle_name(&name) {
+        // The name failed the charset, so it may hold anything, a line feed included: it is
+        // written the way `diag::visible` writes it, on the refusal's line.
         diag::error(&format!(
-            "sbx: bundle import: invalid bundle name `{name}` (1–64 of [A-Za-z0-9._-]); nothing \
-             imported"
+            "sbx: bundle import: invalid bundle name `{}` (1–64 of [A-Za-z0-9._-]); nothing imported",
+            diag::visible(&name)
         ));
         return ExitCode::from(2);
     }

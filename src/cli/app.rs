@@ -689,7 +689,7 @@ fn dep_plan(
         if !config::is_valid_bundle_name(&m.name) {
             return Err(format!(
                 "invalid bundle name `{}` (1–64 of [A-Za-z0-9._-]); nothing was written",
-                m.name
+                diag::visible(&m.name)
             ));
         }
         let Some(file) = m.file.as_ref() else {
@@ -718,7 +718,7 @@ fn dep_plan(
         if !config::is_valid_group_name(&m.name) {
             return Err(format!(
                 "invalid group name `{}` (1–64 of [A-Za-z0-9._-]); nothing was written",
-                m.name
+                diag::visible(&m.name)
             ));
         }
         let Some(file) = m.file.as_ref() else {

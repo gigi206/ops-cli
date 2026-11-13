@@ -272,9 +272,11 @@ pub(super) fn net_groups_import(args: &[OsString]) -> ExitCode {
     // A name keys an on-disk file and a `@<name>` reference; an invalid one is dropped at load, the
     // silent shortfall this path exists to remove. Fail closed, naming the offender.
     if !config::is_valid_group_name(&name) {
+        // The name failed the charset, so it may hold anything, a line feed included: it is
+        // written the way `diag::visible` writes it, on the refusal's line.
         diag::error(&format!(
-            "sbx: net groups import: invalid group name `{name}` (1–64 of [A-Za-z0-9._-]); nothing \
-             imported"
+            "sbx: net groups import: invalid group name `{}` (1–64 of [A-Za-z0-9._-]); nothing imported",
+            diag::visible(&name)
         ));
         return ExitCode::from(2);
     }
