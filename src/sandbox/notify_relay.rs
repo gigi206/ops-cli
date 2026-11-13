@@ -110,14 +110,14 @@
 //!
 //! Lifecycle:[`NotifyRelay::start`] spawns a dedicated thread that drives the async work with
 //! `zbus::block_on` (zbus's own pure-Rust runtime — no tokio, and the runtime never leaves this
-//! module). The thread waits for the in-cage `dbus-daemon` to create the private-bus socket (the
+//! module). The thread waits for the in-cage `dbus-daemon` to serve the private-bus socket (the
 //! portal's command wrap starts it before the app runs), then attaches; the wait has no bound of its
 //! own, because the relay is started before the rest of the launch is provisioned. The guard's
 //! `Drop` closes a shutdown channel and joins the thread, so the relay is torn down before the
 //! portal's host directory (and its socket) is removed. Everything is **best-effort**: a socket
-//! that never appears leaves the relay waiting until that teardown, and no host bus or a failed
-//! connection warns; either way the app simply runs without notifications (the picker and
-//! at-launch theme, served entirely in-cage, are unaffected).
+//! that never appears, or never takes the relay's connection, leaves the relay waiting until that
+//! teardown, and no host bus or a failed connection warns; either way the app simply runs without
+//! notifications (the picker and at-launch theme, served entirely in-cage, are unaffected).
 
 use crate::diag;
 use crate::sandbox::locks::locked;
@@ -1294,23 +1294,35 @@ async fn relay(
     shutdown: async_channel::Receiver<()>,
     needles: crate::sandbox::notify_sink::Needles,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Wait for the in-cage dbus-daemon to create its socket (the portal wrap starts it before the
+    // Wait for the in-cage dbus-daemon to serve its socket (the portal wrap starts it before the
     // app). The relay is started before the rest of the launch is provisioned, and on a first launch
     // that can mean minutes of downloads before the cage exists, so the wait has no bound of its
-    // own: it ends when the socket appears or when the launch tears the relay down. A portal that
-    // never came up already warned elsewhere.
-    while !private_socket.exists() {
+    // own: it ends when the bus takes the relay's connection or when the launch tears the relay
+    // down. A portal that never came up already warned elsewhere.
+    //
+    // The socket's name exists from the daemon's `bind`, before its `listen`, and a dial in between
+    // is refused. A refusal is waited past like a name not there yet: ended on, it would stop the
+    // relay for the whole launch, with nothing said, since `start_on` reads a refused connection
+    // as the cage going away.
+    //
+    // The private bus's socket sits in a directory bound into the cage read-write, so the name is the
+    // cage's to replace. It is dialed first, through the inode it resolves to at each dial: a link,
+    // or anything but a socket, left at the name is refused there rather than followed to whatever
+    // it names on the host (see `forward::dial_cage_socket`, which the forward's own sockets are
+    // dialed through).
+    let private_stream = loop {
+        if private_socket.exists() {
+            match super::forward::dial_cage_socket(&private_socket) {
+                Ok(stream) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         if shutdown.is_closed() {
             return Ok(());
         }
         async_io::Timer::after(POLL_INTERVAL).await;
-    }
-
-    // The private bus's socket sits in a directory bound into the cage read-write, so the name is the
-    // cage's to replace. It is dialed first, through the inode it resolves to: a link, or anything
-    // but a socket, left at the name is refused there rather than followed to whatever it names on
-    // the host (see `forward::dial_cage_socket`, which the forward's own sockets are dialed through).
-    let private_stream = super::forward::dial_cage_socket(&private_socket)?;
+    };
 
     // The host bus (the ambient $DBUS_SESSION_BUS_ADDRESS unless told otherwise) and a proxy onto
     // its notifications daemon, every call to which gives up after `HOST_CALL_DEADLINE`.
@@ -1967,6 +1979,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A private bus that refuses the relay's first dial is dialed again once it serves. The
+    /// in-cage daemon's socket name exists from its `bind`, before its `listen`, and the relay that
+    /// dials in between is refused; a socket left at the name with nothing listening refuses the
+    /// same way, and stands for it here. No bus is needed: the private bus is dialed before the
+    /// host's.
+    #[test]
+    fn a_private_bus_that_refuses_the_first_dial_is_dialed_again() {
+        use std::os::unix::net::UnixListener;
+        let dir = crate::testutil::TmpDir::new();
+        let sock = dir.join("bus");
+        drop(UnixListener::bind(&sock).unwrap());
+        let relay = NotifyRelay::start_on(
+            sock.clone(),
+            Some(address_of(&dir.join("host"))),
+            Default::default(),
+        );
+        // Long enough for the relay to have found the name and been refused.
+        std::thread::sleep(POLL_INTERVAL * 6);
+        // Bound beside the name and renamed over it, so the name is never absent: a dial that met
+        // no name at all would end the relay on that, not on the refusal.
+        let beside = dir.join("bus.next");
+        let bus = UnixListener::bind(&beside).unwrap();
+        std::fs::rename(&beside, &sock).unwrap();
+        bus.set_nonblocking(true).unwrap();
+        let started = Instant::now();
+        let dialed = loop {
+            match bus.accept() {
+                Ok(_) => break true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() >= SOCKET_WAIT {
+                        break false;
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Err(e) => panic!("the stand-in bus could not accept: {e}"),
+            }
+        };
+        drop(relay);
+        assert!(
+            dialed,
+            "the relay stopped at a refused dial and never dialed the bus again"
+        );
     }
 
     /// One `Notify` as the caged app makes it, answered with the id the relay returns to the cage.
