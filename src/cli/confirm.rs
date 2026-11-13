@@ -10,6 +10,7 @@
 use std::io::IsTerminal;
 use std::path::Path;
 
+use crate::config::view::shell_word;
 use crate::{diag, style};
 
 /// `value` as an identifier a confirmation names, written out the way [`diag::visible`] writes it:
@@ -29,6 +30,14 @@ fn identifier(value: &str, pal: &style::Palette) -> String {
 /// creator chose, and it must not start a line of its own or drive the terminal.
 fn shown(path: &Path) -> String {
     diag::visible(&path.display().to_string())
+}
+
+/// `value` as one word of a command a confirmation suggests, the way a shell reads it back:
+/// written out ([`diag::visible`]), then quoted where a shell would split or expand it
+/// ([`shell_word`]). A store's URL is held to no charset, and a local path with a blank in it is
+/// one git accepts.
+fn word(value: &str) -> String {
+    shell_word(&diag::visible(value))
 }
 
 /// Ask a terminal to confirm an action, `question` followed by `[y/N]`.
@@ -166,7 +175,11 @@ pub(crate) fn render_app_imported(
     for line in summary {
         let _ = writeln!(o, "    {}", diag::visible(line));
     }
-    let _ = write!(o, "  {dim}launch it with: sbx app run{r} {n}{name}{r}");
+    let _ = write!(
+        o,
+        "  {dim}launch it with: sbx app run{r} {n}{}{r}",
+        shell_word(&name)
+    );
     o
 }
 
@@ -210,7 +223,8 @@ pub(crate) fn render_plugin_installed(
     };
     format!(
         "{ok}installed{r} '{n}{name}{r}' {dim}({what}){r}{from} \
-         {dim}— remove with: sbx plugins rm {name}{r}"
+         {dim}— remove with: sbx plugins rm {}{r}",
+        shell_word(&name)
     )
 }
 
@@ -240,7 +254,8 @@ pub(crate) fn render_store_tofu(pubkey_hex: &str, name: &str, pal: &style::Palet
          pinned key: {n}{pubkey_hex}{r}\n\n  \
          next: get that key from a source this store does not control — its author, a release\n        \
          page, a channel you already trust — compare the two, then run:\n\n    \
-         {n}sbx plugins store verify {name} --key <the key you obtained>{r}\n\n  {}\n",
+         {n}sbx plugins store verify {} --key <the key you obtained>{r}\n\n  {}\n",
+        shell_word(&name),
         style::dim_prose(
             "until then the store works normally, and a later key change is refused.",
             pal
@@ -290,11 +305,7 @@ pub(crate) fn render_store_needs_key(
     pal: &style::Palette,
 ) -> String {
     let (warn, n, r) = (pal.warn, pal.name, pal.reset);
-    let (name, url, pubkey_hex) = (
-        diag::visible(name),
-        diag::visible(url),
-        diag::visible(pubkey_hex),
-    );
+    let (name, url, pubkey_hex) = (word(name), word(url), diag::visible(pubkey_hex));
     format!(
         "{warn}this store needs a trust anchor{r} — it ships this key:\n\n    \
          {n}{pubkey_hex}{r}\n\n  {}\n\n  {}\n    sbx plugins store add --name {name} --url {url} \
@@ -726,6 +737,52 @@ mod tests {
             cases.len(),
             leaked.join("\n")
         );
+    }
+
+    /// A command a confirmation suggests reads back as the values it names: a value a shell would
+    /// split is quoted, in every command, so a pasted one acts on that value and not on its first
+    /// word. Each suggestion is checked on its own, and every one that is not is named.
+    #[test]
+    fn a_suggested_command_reads_back_as_the_values_it_names() {
+        let p = style::Palette::plain();
+        let cfg = Path::new("/p/demo.toml");
+        let cases: Vec<(&str, String, &str)> = vec![
+            (
+                "app imported",
+                render_app_imported("my app", cfg, &[], &p),
+                "sbx app run 'my app'",
+            ),
+            (
+                "plugin installed",
+                render_plugin_installed("my plugin", None, Kind::Broker, None, &p),
+                "sbx plugins rm 'my plugin'",
+            ),
+            (
+                "store tofu",
+                render_store_tofu("ab12", "my hub", &p),
+                "sbx plugins store verify 'my hub' --key",
+            ),
+            (
+                "store needs key: name",
+                render_store_needs_key("my hub", "https://h/s.git", "ab12", &p),
+                "--name 'my hub' --url",
+            ),
+            (
+                "store needs key: url",
+                render_store_needs_key("hub", "/srv/my stores & co", "ab12", &p),
+                "--url '/srv/my stores & co' --",
+            ),
+        ];
+        let unquoted: Vec<String> = cases
+            .iter()
+            .filter(|(_, line, command)| {
+                // `store add` is suggested twice, pinning the key and accepting it.
+                let seen = line.matches(*command).count();
+                seen == 0 || (line.contains("store add") && seen != 2)
+            })
+            .map(|(what, line, command)| format!("{what}: no `{command}` in {line:?}"))
+            .collect();
+        assert!(unquoted.is_empty(), "{}", unquoted.join("\n"));
     }
 
     /// On a terminal, a value that holds a backtick is shown whole inside its highlight: the
