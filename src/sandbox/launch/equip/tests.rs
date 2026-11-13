@@ -173,9 +173,9 @@ fn wrap_autoequip_passes_tokens_and_command_positionally() {
 /// missing runs no install at all.
 ///
 /// mise resolves a token handed to `install` by name against the newest upstream release, so
-/// handing it every token reinstalled `node@26` at each launch once a newer 26.x was out, with
-/// 26.13.0 installed in the pool the cage reads. Under an app's egress that fetch was refused, at
-/// every launch, for a tool the cage already had. Run with a stand-in mise whose `where` resolves
+/// handing it every token reinstalls `tool@2` at each launch once a newer 2.x is out, though a
+/// 2.x is installed in the pool the cage reads, and under an app's egress that fetch is refused
+/// at every launch for a tool the cage already has. Run with a stand-in mise whose `where` resolves
 /// only the tokens `$SBX_TEST_PRESENT` names, so the test sees which tokens reach `install`. Each
 /// form ends with a `mise reshim`, the step that puts a tool resolved from a shared pool on the
 /// cage's `PATH` when nothing is installed.
@@ -201,29 +201,29 @@ fn the_project_lane_installs_only_the_tokens_mise_where_does_not_resolve() {
     .unwrap();
     std::fs::set_permissions(&mise, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let tokens = vec![
-        "core:node@26".to_string(),
-        "aqua:BurntSushi/ripgrep@latest".to_string(),
+        "core:demo-runtime@2".to_string(),
+        "aqua:example/demo-tool@latest".to_string(),
         "npm:broken-lookup@1.0".to_string(),
     ];
-    let wheres = "mise where -- core:node@26\n\
-                  mise where -- aqua:BurntSushi/ripgrep@latest\n\
+    let wheres = "mise where -- core:demo-runtime@2\n\
+                  mise where -- aqua:example/demo-tool@latest\n\
                   mise where -- npm:broken-lookup@1.0\n";
     for (present, install) in [
         // Every token resolves: no install runs, so nothing is fetched.
         (
-            "core:node@26 aqua:BurntSushi/ripgrep@latest npm:broken-lookup@1.0",
+            "core:demo-runtime@2 aqua:example/demo-tool@latest npm:broken-lookup@1.0",
             None,
         ),
         // Some resolve: only the rest are installed, in declaration order, after a `--`.
         (
-            "aqua:BurntSushi/ripgrep@latest",
-            Some("mise install -- core:node@26 npm:broken-lookup@1.0\n"),
+            "aqua:example/demo-tool@latest",
+            Some("mise install -- core:demo-runtime@2 npm:broken-lookup@1.0\n"),
         ),
         // None resolves, one of them through an error rather than a miss: all are installed.
         (
             "",
             Some(
-                "mise install -- core:node@26 aqua:BurntSushi/ripgrep@latest \
+                "mise install -- core:demo-runtime@2 aqua:example/demo-tool@latest \
                  npm:broken-lookup@1.0\n",
             ),
         ),

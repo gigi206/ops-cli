@@ -34,9 +34,9 @@ pub(super) enum EquipVerb {
     /// tools of the project's own mise file.
     ///
     /// A version is not chosen at launch. mise resolves a token it is handed by name against the
-    /// newest upstream release, even when an installed version already satisfies it: `node@26`
-    /// with 26.13.0 installed reinstalls as soon as 26.13.1 is published, and under an app's
-    /// egress that fetch is refused at every launch. `mise where` answers from what is installed,
+    /// newest upstream release, even when an installed version already satisfies it: `tool@2`
+    /// with 2.0.0 installed reinstalls as soon as 2.0.1 is published, and under an app's egress
+    /// that fetch is refused at every launch. `mise where` answers from what is installed,
     /// in the cage's own pool and in every pool `MISE_SHARED_INSTALL_DIRS` names, so a token it
     /// resolves is left alone and only the rest is installed, which is what a plain `mise install`
     /// does with the same file. Moving a satisfied tool to a newer release is the roll's job.
