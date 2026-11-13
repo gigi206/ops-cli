@@ -218,7 +218,7 @@ pub(crate) fn dir_digest(root: &Path) -> Result<[u8; 32], String> {
     }
 
     let mut entries: Vec<(String, bool, [u8; 32])> = Vec::new();
-    collect_files(root, root, &mut entries)?;
+    collect_files(root, &mut entries)?;
     entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     let mut h = Sha256::new();
     for (rel, exec, file_hash) in &entries {
@@ -243,10 +243,27 @@ pub(crate) fn dir_digest_hex(root: &Path) -> Result<String, String> {
     Ok(to_hex(&dir_digest(root)?))
 }
 
-fn collect_files(
+/// Every regular file under `root`, with its repo-relative path, executable bit and SHA-256, in no
+/// particular order: [`dir_digest`] sorts them.
+///
+/// The directories still to read are kept on the heap rather than on the call stack. A fetched
+/// store chooses its tree's depth, and a checkout can write one a few thousand levels deep: a
+/// descent that spent a stack frame per level overflowed a thread's stack there, which aborts sbx
+/// where it should have hashed the tree or refused it.
+fn collect_files(root: &Path, out: &mut Vec<(String, bool, [u8; 32])>) -> Result<(), String> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        collect_dir(root, &dir, out, &mut pending)?;
+    }
+    Ok(())
+}
+
+/// The regular files of `dir` into `out`, and its subdirectories onto `pending`.
+fn collect_dir(
     root: &Path,
     dir: &Path,
     out: &mut Vec<(String, bool, [u8; 32])>,
+    pending: &mut Vec<std::path::PathBuf>,
 ) -> Result<(), String> {
     let rd = std::fs::read_dir(dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
     for entry in rd {
@@ -261,7 +278,7 @@ fn collect_files(
                 path.display()
             ));
         } else if ft.is_dir() {
-            collect_files(root, &path, out)?;
+            pending.push(path);
         } else if ft.is_file() {
             let rel = path
                 .strip_prefix(root)
@@ -597,6 +614,57 @@ mod tests {
         write(&root.path().join("plugin.toml"), b"x", false);
         std::os::unix::fs::symlink("/etc/passwd", root.path().join("link")).unwrap();
         assert!(dir_digest(root.path()).is_err());
+    }
+
+    /// A plugin tree as deep as a walk by full path reads, hashed on a thread with a small stack,
+    /// run alone by [`a_tree_as_deep_as_a_checkout_writes_is_hashed_without_overflowing`];
+    /// anywhere else it does nothing. The tree is taken down from its deepest directory up, by
+    /// this process, so no recursive removal meets it.
+    #[test]
+    #[ignore = "run alone by the test that reads how it ended"]
+    fn a_deep_plugin_tree() {
+        crate::testutil::when_run_alone(|dir| {
+            let root = Path::new(dir).join("plugin");
+            // Single-letter levels up to a full path a little short of PATH_MAX, which is as deep
+            // as a walk by full path reads. A checkout, which writes by relative path, goes deeper
+            // still: a shallow clone writes a tree two thousand levels deep.
+            let depth = 4000usize.saturating_sub(root.as_os_str().len()) / 2;
+            let mut deepest = root.clone();
+            for _ in 0..depth {
+                deepest.push("a");
+            }
+            std::fs::create_dir_all(&deepest)?;
+            std::fs::write(deepest.join("f"), b"x")?;
+            let hashed = {
+                let root = root.clone();
+                std::thread::Builder::new()
+                    .stack_size(1 << 20)
+                    .spawn(move || dir_digest(&root))?
+                    .join()
+                    .map_err(|_| std::io::Error::other("the digest panicked"))?
+            };
+            std::fs::remove_file(deepest.join("f"))?;
+            while deepest != root {
+                std::fs::remove_dir(&deepest)?;
+                deepest.pop();
+            }
+            hashed.map(|_| ()).map_err(std::io::Error::other)
+        });
+    }
+
+    /// A tree as deep as a walk by full path reads is hashed, where a descent spending a stack
+    /// frame per level overflowed the thread and aborted the process. In a process of its own,
+    /// since an overflow ends the whole of it.
+    #[test]
+    fn a_tree_as_deep_as_a_checkout_writes_is_hashed_without_overflowing() {
+        let ran = crate::testutil::run_alone(concat!(module_path!(), "::a_deep_plugin_tree"));
+        assert!(
+            ran.ended_well(),
+            "{}: {}{}",
+            ran.status,
+            ran.stdout,
+            ran.stderr
+        );
     }
 
     #[test]
