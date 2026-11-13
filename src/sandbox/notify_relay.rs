@@ -2481,7 +2481,7 @@ mod tests {
         let path = sock.to_str().expect("a UTF-8 test path");
         std::fs::write(&conf, super::super::portal::session_conf(path, dir, dir))
             .expect("the configuration is written");
-        let bus = TestBus(
+        let mut bus = TestBus(
             std::process::Command::new("dbus-daemon")
                 .arg(format!("--config-file={}", conf.display()))
                 .arg("--nofork")
@@ -2489,15 +2489,14 @@ mod tests {
                 .spawn()
                 .ok()?,
         );
-        let started = Instant::now();
-        while !sock.exists() {
-            assert!(
-                started.elapsed() < SOCKET_WAIT,
-                "the bus at {} never came up",
-                sock.display()
-            );
-            std::thread::sleep(POLL_INTERVAL);
-        }
+        assert!(
+            crate::testutil::accepts_within(sock, SOCKET_WAIT, || matches!(
+                bus.0.try_wait(),
+                Ok(None)
+            )),
+            "the bus at {} never came up",
+            sock.display()
+        );
         Some(bus)
     }
 

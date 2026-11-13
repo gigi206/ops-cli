@@ -317,6 +317,29 @@ pub(crate) fn returns_within<T: Send + 'static>(
         .unwrap_or_else(|_| panic!("{what} did not return within {limit:?}"))
 }
 
+/// Whether the server at `sock` takes a connection within `limit`, asked again every few
+/// milliseconds for as long as `alive` holds; the connection is closed at once.
+///
+/// A server's socket name exists from its `bind`, and a connect before its `listen` is refused;
+/// `dbus-daemon` does other work between the two. A fixture that waits for the name alone can
+/// dial a server that does not serve yet, and fail on that refusal.
+pub(crate) fn accepts_within(
+    sock: &Path,
+    limit: std::time::Duration,
+    mut alive: impl FnMut() -> bool,
+) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if std::os::unix::net::UnixStream::connect(sock).is_ok() {
+            return true;
+        }
+        if started.elapsed() >= limit || !alive() {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// How long a process [`run_within`] runs has to end before it is killed and the test that ran it
 /// fails.
 const END_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
@@ -2005,6 +2028,47 @@ mod helper_tests {
     #[should_panic(expected = "failed")]
     fn a_wait_that_fails_fails_the_test() {
         reap(std::process::id() as libc::pid_t);
+    }
+
+    /// A socket name that refuses a connect is waited past until a listener takes one, and a server
+    /// that is gone is not waited on for the whole bound. A socket left at the name with nothing
+    /// listening refuses a connect as a server's does between its `bind` and its `listen`.
+    #[test]
+    fn a_name_that_refuses_is_waited_past_until_a_listener_takes_the_connection() {
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+        let dir = TmpDir::new();
+        let sock = dir.join("server");
+        drop(UnixListener::bind(&sock).unwrap());
+        let serving_after = Duration::from_millis(300);
+        let server = {
+            let sock = sock.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(serving_after);
+                std::fs::remove_file(&sock).unwrap();
+                UnixListener::bind(&sock).unwrap()
+            })
+        };
+        let started = Instant::now();
+        assert!(accepts_within(&sock, Duration::from_secs(10), || true));
+        assert!(
+            started.elapsed() >= serving_after,
+            "the wait ended on the name, before any listener took the connection: {:?}",
+            started.elapsed()
+        );
+        let _listener = server.join().unwrap();
+
+        let started = Instant::now();
+        assert!(!accepts_within(
+            &sock.with_extension("gone"),
+            Duration::from_secs(10),
+            || false
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a server that is gone held the wait for {:?}",
+            started.elapsed()
+        );
     }
 
     /// A parenthesis is closed by the one that matches it, counted like a brace: a `)` inside a

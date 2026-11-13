@@ -1221,14 +1221,10 @@ mod tests {
             }
         }
         let mut child = Reap(child);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !socket.exists() && Instant::now() < deadline {
-            if child.0.try_wait().is_ok_and(|s| s.is_some()) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        if !socket.exists() {
+        let serving = crate::testutil::accepts_within(&socket, Duration::from_secs(5), || {
+            !child.0.try_wait().is_ok_and(|s| s.is_some())
+        });
+        if !serving {
             skip_incapable!(
                 "skipping the foreign-namespace server test: no listener came up under `unshare \
                  -Urp` (no user namespaces, or no python3)"
