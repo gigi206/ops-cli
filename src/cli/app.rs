@@ -843,11 +843,7 @@ fn report_missing_refs(name: &str, bundles: &[super::MissingRef], groups: &[supe
             } else {
                 "bundles"
             },
-            bundles
-                .iter()
-                .map(|m| m.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
+            super::missing_names(bundles, ""),
             if bundles.len() == 1 { "it" } else { "them" },
         ));
     }
@@ -865,11 +861,7 @@ fn report_missing_refs(name: &str, bundles: &[super::MissingRef], groups: &[supe
             } else {
                 "egress groups"
             },
-            groups
-                .iter()
-                .map(|m| format!("@{}", m.name))
-                .collect::<Vec<_>>()
-                .join(", "),
+            super::missing_names(groups, "@"),
             if groups.len() == 1 { "it" } else { "them" },
         ));
     }

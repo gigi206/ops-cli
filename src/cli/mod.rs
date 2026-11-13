@@ -757,6 +757,19 @@ pub(crate) fn missing_refs<D, T>(
         .collect()
 }
 
+/// The names of `missing`, each behind `prefix` (`@` for a group), joined for a warning.
+///
+/// A name is the imported file's to spell, line feed included, and a warning keeps line breaks, so
+/// each is written the way [`crate::diag::visible`] writes it: one in a name cannot start a line
+/// that reads as sbx's own.
+pub(crate) fn missing_names(missing: &[MissingRef], prefix: &str) -> String {
+    missing
+        .iter()
+        .map(|m| format!("{prefix}{}", crate::diag::visible(&m.name)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The remedy clause for a set of undeclared references: one backticked `sbx <verb> <file>` per
 /// name when **every** file resolved, and the generic `<file>` placeholder otherwise.
 ///
@@ -771,7 +784,12 @@ pub(crate) fn import_remedy(verb: &str, missing: &[MissingRef]) -> String {
     missing
         .iter()
         .filter_map(|m| m.file.as_ref())
-        .map(|p| format!("`sbx {verb} {}`", p.display()))
+        .map(|p| {
+            format!(
+                "`sbx {verb} {}`",
+                crate::diag::visible(&p.display().to_string())
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }

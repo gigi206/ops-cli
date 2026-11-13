@@ -940,11 +940,7 @@ fn undefined_groups_note(
         } else {
             "this bundle references egress groups"
         },
-        missing
-            .iter()
-            .map(|m| format!("@{}", m.name))
-            .collect::<Vec<_>>()
-            .join(", "),
+        crate::cli::missing_names(&missing, "@"),
         if missing.len() == 1 { "it" } else { "them" },
     ))
 }

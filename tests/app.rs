@@ -1614,6 +1614,50 @@ fn bundle_import_reports_the_groups_the_bundle_itself_references() {
     );
 }
 
+/// A name an imported file references is that file's to spell, line feed included, and the warning
+/// that names it as missing keeps line breaks. Each name is written as an escape on the line it
+/// belongs to, so none starts a line that reads as sbx's own: a bundle in an app's `use`, a group in
+/// an app's egress list, and a group in a bundle's.
+#[test]
+fn a_missing_reference_is_named_on_the_line_it_belongs_to() {
+    let fx = Project::new("app");
+    let forged = "sbx: note: forged";
+    let profile = fx.catalogue(
+        "app",
+        "demo-app",
+        &format!(
+            "cmd = \"demo\"\nuse = [\"ghost\\n{forged}\"]\n[network]\nallow = [\"@lane\\n{forged}\"]\n"
+        ),
+    );
+    let bundle = fx.catalogue(
+        "bundle",
+        "demo-tool",
+        &format!("allow = [\"@lane\\n{forged}\"]\n"),
+    );
+    for (verb, file, named) in [
+        (
+            "app",
+            &profile,
+            &["ghost\\x0asbx: note", "@lane\\x0asbx: note"][..],
+        ),
+        ("bundle", &bundle, &["@lane\\x0asbx: note"][..]),
+    ] {
+        let out = fx.run_with_path(&[verb, "import"], file, &[]);
+        assert!(out.status.success(), "{}", text(&out));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !err.lines().any(|line| line.starts_with(forged)),
+            "`{verb} import` let a name start a line:\n{err}"
+        );
+        for name in named {
+            assert!(
+                err.contains(name),
+                "`{verb} import` does not name `{name}`:\n{err}"
+            );
+        }
+    }
+}
+
 /// `--with-deps` is the opt-in half of the same finding: instead of naming what is missing, the
 /// import follows the reference and merges it. It writes into the file the user maintains by hand,
 /// which is why it is a flag and not the default.
