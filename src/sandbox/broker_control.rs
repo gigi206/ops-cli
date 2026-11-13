@@ -172,18 +172,21 @@ impl BrokerRing {
     }
 }
 
-/// The ring underneath, so a snapshot reads the same on this lens as on any other.
-impl std::ops::Deref for BrokerRing {
-    type Target = super::lens::Ring<BrokerEvent>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl BrokerRing {
+    /// The events past `after`, as [`super::lens::Ring::snapshot`] reads them, for the tests that
+    /// check what a decision left; a session reads them through [`serve`]. Nothing else of the ring
+    /// is handed out: it stays behind [`BrokerRing::push`], the one door a decision comes in by,
+    /// where its detail is assembled and cleaned, and a `Deref` to it would open a second door,
+    /// through which an event would arrive uncleaned.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self, after: Option<u64>) -> BrokerSnapshot {
+        self.0.snapshot(after)
     }
 }
 
 /// Serve the control socket, answering `LOG` from the ring the broker pushes to.
 pub(crate) fn serve(listener: UnixListener, ring: Arc<BrokerRing>) -> io::Result<()> {
-    super::lens::serve(listener, move |cmd| super::lens::dispatch_log(cmd, &ring))
+    super::lens::serve(listener, move |cmd| super::lens::dispatch_log(cmd, &ring.0))
 }
 
 /// This lens's own `0700` runtime directory: the control socket and the session records sit in
