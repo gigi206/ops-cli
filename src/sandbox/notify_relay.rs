@@ -1161,21 +1161,13 @@ impl NotifyRelay {
         let handle = std::thread::Builder::new()
             .name("sbx-notify-relay".to_string())
             .spawn(move || {
-                if let Err(e) = zbus::block_on(run(private_socket, host_bus, rx, needles)) {
-                    // A connection error to the private bus is almost always the cage tearing down
-                    // (the in-cage dbus-daemon went away) — a benign teardown race on a short-lived
-                    // launch, not worth alarming the user. Only a genuinely unexpected failure (e.g.
-                    // no host session bus) warns.
-                    let msg = e.to_string();
-                    if !msg.contains("Connection refused")
-                        && !msg.contains("Broken pipe")
-                        && !msg.contains("reset by peer")
-                    {
-                        diag::warn(&format!(
-                            "`dbus = true`: the notifications relay stopped ({e}) — the app \
-                             runs without desktop notifications"
-                        ));
-                    }
+                if let Err(e) = zbus::block_on(run(private_socket, host_bus, rx, needles))
+                    && !ended_with_the_cage(&e.to_string())
+                {
+                    diag::warn(&format!(
+                        "`dbus = true`: the notifications relay stopped ({e}) — the app runs \
+                         without desktop notifications"
+                    ));
                 }
             })
             .inspect_err(|e| {
@@ -1187,6 +1179,14 @@ impl NotifyRelay {
             .ok();
         NotifyRelay { shutdown, handle }
     }
+}
+
+/// Whether the relay stopped on `error` because the private bus went away under it: the cage
+/// tearing down, which ends the in-cage dbus-daemon, a benign race on a short-lived launch that is
+/// not worth alarming the user over. Any other stop warns, a host bus that refuses the relay among
+/// them. A refused dial of the private bus never stops the relay, which dials it again.
+fn ended_with_the_cage(error: &str) -> bool {
+    error.contains("Broken pipe") || error.contains("reset by peer")
 }
 
 impl Drop for NotifyRelay {
@@ -1302,8 +1302,7 @@ async fn relay(
     //
     // The socket's name exists from the daemon's `bind`, before its `listen`, and a dial in between
     // is refused. A refusal is waited past like a name not there yet: ended on, it would stop the
-    // relay for the whole launch, with nothing said, since `start_on` reads a refused connection
-    // as the cage going away.
+    // relay for the whole launch.
     //
     // The private bus's socket sits in a directory bound into the cage read-write, so the name is the
     // cage's to replace. It is dialed first, through the inode it resolves to at each dial: a link,
@@ -2022,6 +2021,54 @@ mod tests {
         assert!(
             dialed,
             "the relay stopped at a refused dial and never dialed the bus again"
+        );
+    }
+
+    /// A relay whose private bus takes its connection and whose host bus refuses it, its socket
+    /// left at its name with nothing listening, run alone by
+    /// [`a_host_bus_that_refuses_the_relay_is_warned_about`]; anywhere else it does nothing. It
+    /// waits for the relay to stop on its own before tearing it down, since a teardown that came
+    /// first would end the relay without a word.
+    #[test]
+    #[ignore = "run alone by the test that reads what it wrote"]
+    fn a_relay_whose_host_bus_refuses() {
+        crate::testutil::when_run_alone(|dir| {
+            use std::os::unix::net::UnixListener;
+            let dir = std::path::Path::new(dir);
+            let sock = dir.join("bus");
+            let _private = UnixListener::bind(&sock)?;
+            let host = dir.join("host");
+            drop(UnixListener::bind(&host)?);
+            let relay = NotifyRelay::start_on(sock, Some(address_of(&host)), Default::default());
+            let started = Instant::now();
+            while !relay
+                .handle
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                if started.elapsed() >= SOCKET_WAIT {
+                    return Err(std::io::Error::other("the relay did not stop on its own"));
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            drop(relay);
+            Ok(())
+        });
+    }
+
+    /// A host bus that refuses the relay stops it with a warning: the app runs without
+    /// notifications, and the refusal is not the private bus going away. Read from what the relay
+    /// wrote, in a process of its own ([`crate::testutil::run_alone`]), which also bounds it.
+    #[test]
+    fn a_host_bus_that_refuses_the_relay_is_warned_about() {
+        let ran =
+            crate::testutil::run_alone(concat!(module_path!(), "::a_relay_whose_host_bus_refuses"));
+        assert!(ran.ended_well(), "{}{}", ran.stdout, ran.stderr);
+        assert!(
+            ran.stderr.contains("the notifications relay stopped")
+                && ran.stderr.contains("Connection refused"),
+            "a host bus that refuses is left unsaid: {}",
+            ran.stderr
         );
     }
 
