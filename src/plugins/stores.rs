@@ -1936,6 +1936,36 @@ mod tests {
         assert!(!leaked_stage(data.path()));
     }
 
+    /// A publisher's file that only its group or others may execute is committed, and cloned, as
+    /// not executable, and the catalogue signed from that tree pins it so: the clone a consumer
+    /// fetches reproduces the pin. Driven through `publish`, a commit, `add` over `file://`, and the
+    /// check an install makes on the checkout.
+    #[test]
+    fn a_store_published_with_a_file_only_others_may_execute_verifies_from_its_clone() {
+        let Some(git) = git_or_skip() else { return };
+        let repo = crate::testutil::TmpDir::new();
+        let keys = crate::testutil::TmpDir::new();
+        let data = crate::testutil::TmpDir::new();
+        write_source_plugin(repo.path(), "pass", "secret-store");
+        let helper = repo.path().join("plugins/pass/helper.sh");
+        std::fs::write(&helper, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o654)).unwrap();
+        let published = publish(repo.path(), &keys.path().join("store.key"), Some(1)).unwrap();
+        let url = commit_repo(&git, repo.path());
+        let layout = crate::store::Layout::under(data.path());
+
+        let added =
+            add(&layout, "default", &url, published.pubkey, &git).expect("add the published store");
+        let entry = added
+            .catalogue
+            .plugins
+            .get("pass")
+            .expect("the plugin is listed");
+        let checkout = layout.store_path("default").join(CHECKOUT);
+        crate::plugins::catalogue::verify_entry(entry, &checkout.join(&entry.path))
+            .expect("the clone reproduces the pin its publisher signed");
+    }
+
     #[test]
     fn add_refuses_a_catalogue_signed_by_another_key_and_places_nothing() {
         let Some(git) = git_or_skip() else { return };
