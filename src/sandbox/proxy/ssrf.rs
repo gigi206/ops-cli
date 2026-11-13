@@ -23,7 +23,7 @@ enum IpClass {
     Public,
     /// An address that is not the public Internet's: loopback, RFC1918, ULA, CGNAT, and the ranges
     /// IANA set aside for something else (TEST-NET, benchmarking, documentation, reserved, "this
-    /// network", the deprecated v6 site-local prefix).
+    /// network", the IETF protocol assignments, the deprecated v6 site-local prefix).
     ///
     /// Reachable only when the policy explicitly named this exact host (an intentional internal
     /// target).
@@ -75,10 +75,15 @@ fn classify_v4(v4: Ipv4Addr) -> IpClass {
     //
     // Written by octets, like the CGNAT range beside it, because `is_benchmarking` and
     // `is_reserved` are still unstable; `is_documentation` is not, so TEST-NET uses it.
+    //
+    // The IETF protocol assignments 192.0.0.0/24 (RFC 6890) are set aside the same way, save the two
+    // anycast addresses IANA marks globally reachable inside them, Port Control Protocol's
+    // 192.0.0.9 (RFC 7723) and TURN's 192.0.0.10 (RFC 8155), which stay public.
     if v4.is_documentation()
         || o[0] == 0
         || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
         || o[0] >= 240
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0 && !matches!(o[3], 9 | 10))
     {
         return IpClass::Private;
     }
@@ -92,12 +97,15 @@ fn classify_v6(v6: Ipv6Addr) -> IpClass {
         return IpClass::Blocked;
     }
     // loopback ::1, unique-local fc00::/7, the site-local fec0::/10 that unique-local replaced
-    // (RFC 3879), and the documentation prefix 2001:db8::/32: the v6 half of the same rule the v4
-    // classifier applies to TEST-NET.
+    // (RFC 3879), the documentation prefixes 2001:db8::/32 and 3fff::/20 (RFC 9637), and the
+    // benchmarking prefix 2001:2::/48 (RFC 5180): the v6 half of the same rule the v4 classifier
+    // applies to TEST-NET and to 198.18.0.0/15.
     if v6.is_loopback()
         || (s[0] & 0xfe00) == 0xfc00
         || (s[0] & 0xffc0) == 0xfec0
         || (s[0] == 0x2001 && s[1] == 0x0db8)
+        || (s[0] == 0x3fff && (s[1] & 0xf000) == 0)
+        || (s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0)
     {
         return IpClass::Private;
     }
@@ -670,6 +678,12 @@ mod tests {
             "0.0.0.1",            // "this network", one above the unspecified address
             "0.255.255.255",      // ...and its top
             "2001:db8::1",        // the v6 documentation prefix
+            "3fff::1",            // the second v6 documentation prefix
+            "3fff:fff:ffff::1",   // ...and its top
+            "2001:2::1",          // the v6 benchmarking prefix
+            "2001:2:0:ffff::1",   // ...and its top
+            "192.0.0.1",          // the IETF protocol assignments
+            "192.0.0.255",        // ...and their top
             "fec0::1",            // the deprecated v6 site-local prefix
             "feff:ffff::1",       // ...and its top
             "::ffff:203.0.113.9", // and a set-aside v4 wearing a v6 spelling
@@ -692,6 +706,16 @@ mod tests {
             "203.0.114.1",
             "1.0.0.1",
             "2001:db9::1",
+            "3ffe:ffff::1",
+            "3fff:1000::1",
+            "4000::1",
+            "2001:2:1::1",
+            "2001:3::1",
+            "192.0.1.1",
+            "191.255.255.255",
+            // The two anycast addresses IANA marks globally reachable inside 192.0.0.0/24.
+            "192.0.0.9",
+            "192.0.0.10",
         ] {
             assert!(
                 matches!(c(public), IpClass::Public),
