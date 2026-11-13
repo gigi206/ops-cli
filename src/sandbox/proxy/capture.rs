@@ -435,6 +435,7 @@ impl CaptureGuard {
         capture.req_body = self.req_body.take();
         let (head, body) = split_response(
             self.response.take(),
+            self.caps.head,
             self.keeps_body.then_some(self.caps.body),
         );
         capture.res_head = head;
@@ -473,7 +474,17 @@ impl Drop for CaptureGuard {
 /// without passing it). The cap is applied HERE rather than by the sink: the response arrives as one
 /// stream, so the sink is sized for a head *plus* a body and only this split knows where the body
 /// actually starts. Without it a short head would let a body run to the sink's whole size.
-fn split_response(raw: CaptureBytes, body_cap: Option<usize>) -> (CaptureBytes, CaptureBytes) {
+///
+/// `head_cap` bounds the head the same way, for the same reason, and the way the request's head is
+/// bounded ([`CaptureGuard::set_request`]): a head over it is cut there and marked cut. An HTTP/1.1
+/// head is refused well before it (`HEAD_MAX`), but an HTTP/2 one is rendered from its frames, which
+/// may carry a header list larger than the head cap, and the sink that holds it is sized for a body
+/// too.
+fn split_response(
+    raw: CaptureBytes,
+    head_cap: usize,
+    body_cap: Option<usize>,
+) -> (CaptureBytes, CaptureBytes) {
     let CaptureBytes { bytes, truncated } = raw;
     if bytes.is_empty() && !truncated {
         // Nothing came back at all (a relay that failed before the first byte) — that is an absent
@@ -485,15 +496,15 @@ fn split_response(raw: CaptureBytes, body_cap: Option<usize>) -> (CaptureBytes, 
         // the cap cut it or because the upstream never finished it.
         return (
             CaptureBytes {
-                bytes,
+                bytes: bytes[..head_cap.min(bytes.len())].to_vec(),
                 truncated: true,
             },
             CaptureBytes::default(),
         );
     };
     let head = CaptureBytes {
-        bytes: bytes[..end].to_vec(),
-        truncated: false,
+        bytes: bytes[..head_cap.min(end)].to_vec(),
+        truncated: end > head_cap,
     };
     let Some(cap) = body_cap else {
         return (head, CaptureBytes::default());
@@ -864,9 +875,40 @@ mod tests {
             bytes: b"HTTP/1.1 200 OK\r\nx-long: aaa".to_vec(),
             truncated: true,
         };
-        let (head, body) = split_response(raw, Some(8 * 1024));
+        let (head, body) = split_response(raw, usize::MAX, Some(8 * 1024));
         assert!(head.truncated, "an unterminated head is incomplete");
         assert!(body.is_empty(), "and nothing can be claimed as its body");
+    }
+
+    /// A response head longer than the head cap is kept to the cap and marked cut, whether its blank
+    /// line was captured or not, as the request's head is; the body after it is still split off
+    /// whole. Each shape is checked on its own, and every head kept past its cap is named.
+    #[test]
+    fn a_response_head_is_held_to_the_head_cap() {
+        let head_cap = 16;
+        let long_head = format!("HTTP/2 200\r\nx-flood: {}", "a".repeat(64));
+        let mut over = Vec::new();
+        for (what, bytes, truncated) in [
+            ("ended", format!("{long_head}\r\n\r\nbody"), false),
+            ("unended", long_head.clone(), true),
+        ] {
+            let raw = CaptureBytes {
+                bytes: bytes.into_bytes(),
+                truncated,
+            };
+            let (head, body) = split_response(raw, head_cap, Some(8 * 1024));
+            if head.bytes.len() > head_cap || !head.truncated {
+                over.push(format!(
+                    "{what}: {} bytes, cut={}",
+                    head.bytes.len(),
+                    head.truncated
+                ));
+            }
+            if what == "ended" && body.bytes != b"body" {
+                over.push(format!("{what}: body {:?}", body.bytes));
+            }
+        }
+        assert!(over.is_empty(), "{over:?}");
     }
 
     #[test]
