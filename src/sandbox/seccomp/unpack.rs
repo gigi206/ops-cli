@@ -16,7 +16,10 @@
 //! whiteout, an opaque marker, a directory replaced by a file and a file by a directory, a whole
 //! distribution's userland, and each refusal) under both C libraries sbx is built with.
 //!
-//! `fcntl` is allowed only to duplicate a descriptor, mark it close-on-exec or read its flags.
+//! `fcntl` is allowed only to duplicate a descriptor, set its close-on-exec flag or read its flags.
+//! The value the flag is set to is not checked: the flag acts only at an `execve`, and nothing
+//! under this list makes one, `execve` and `execveat` being refused, and every `clone` that would
+//! start a process.
 //!
 //! `openat2` is made by number rather than through a C library, on every architecture: the unpack
 //! resolves the directories on the way to each member in that one call, following no link. Left
@@ -149,6 +152,13 @@ mod tests {
         let empty: [*const libc::c_char; 1] = [std::ptr::null()];
         let empty = empty.as_ptr() as libc::c_long;
         out.push(("execve", call(libc::SYS_execve, &[nowhere, empty, empty])));
+        out.push((
+            "execveat",
+            call(
+                libc::SYS_execveat,
+                &[libc::AT_FDCWD as _, nowhere, empty, empty, 0],
+            ),
+        ));
         // A process `clone` let through runs on here as a copy of this thread, and leaves at
         // once.
         let process = call(libc::SYS_clone, &[libc::SIGCHLD as _, 0, 0, 0, 0]);
@@ -230,6 +240,7 @@ mod tests {
             "socket unix",
             "socket inet",
             "execve",
+            "execveat",
             "clone process",
             "ioctl TCGETS",
             "fcntl F_SETFL",
