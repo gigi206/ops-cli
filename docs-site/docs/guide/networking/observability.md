@@ -425,7 +425,10 @@ Every exchange sbx inspects:
   too, so a compressed tunnel reads the same as a plain one. Message boundaries are not
   kept, so successive messages read run together, which for the JSON-per-message
   protocols this is used on stays readable. Control frames (ping, pong, close) carry no
-  application data and are skipped.
+  application data and are skipped. A frame that cannot be read as the text it carries (a
+  reserved opcode, a reserved bit that only an extension sbx does not follow gives a
+  meaning, a compressed message that does not decode) ends that direction's transcript at the
+  last message read before it.
 
   **When it appears.** A WebSocket is the one exchange shown in steps, because a tunnel
   outlives its handshake: the handshake appears immediately at the `101`, then **each
@@ -470,7 +473,9 @@ closes the tunnel instead: see below.)
   Within one message a value spanning several frames is still seen, and a
   `permessage-deflate` message is inflated as its frames arrive and scanned whole, past
   whatever a capture keeps of it. Control frames past 125 bytes or fragmented leave that
-  direction unscanned. A direction stops instead on a compressed message it cannot follow:
+  direction unscanned, and so does a frame that sets `RSV2` or `RSV3`, bits that only an
+  extension sbx does not follow gives a meaning. A direction stops instead on a compressed
+  message it cannot follow:
   one that decompresses to more than 64 MiB, one that does not decode, one another message
   begins in the midst of, or one on a direction whose upgrade response agreed no
   compression sbx can follow. A

@@ -376,7 +376,9 @@ pub(super) struct Deflate {
 /// Only the response decides: the client may offer the extension and the server decline it, in which
 /// case nothing is compressed. A response naming any other extension — first, last, or beside
 /// `permessage-deflate` — is not something this decoder can follow, so it reports nothing negotiated
-/// and the payloads are captured as they cross.
+/// and the payloads are captured as they cross, up to the first frame that sets a reserved bit: an
+/// extension marks the frames it transformed there, and the direction stops on one rather than file
+/// what that extension left behind as the message's text.
 ///
 /// That is a whole-list rule, not a search for the deflate entry: extensions negotiated on one
 /// stream compose, each transforming what the next one sees (RFC 6455 §9.1), so an unknown entry
@@ -834,6 +836,14 @@ fn scan_frame_header(buf: &[u8]) -> HeaderScan {
     // Control frames: close (`0x8`), ping (`0x9`), pong (`0xA`). Anything else is reserved, and a
     // reserved opcode means this stream is not what it claims — stop rather than guess.
     if !matches!(opcode, 0x0 | 0x1 | 0x2 | 0x8 | 0x9 | 0xa) {
+        return HeaderScan::Bad;
+    }
+    // `RSV2` and `RSV3` have a meaning only under an extension that gives them one (RFC 6455 §5.2),
+    // and no extension this decoder follows does. A frame that sets either carries a payload such
+    // an extension has transformed, as a frame setting `RSV1` with no compression to follow does,
+    // so its bytes are not the text it carries: stop, which [`FrameTee::newly_blinded`] reports,
+    // rather than scan them as if they were and find nothing.
+    if buf[0] & 0x30 != 0 {
         return HeaderScan::Bad;
     }
     let masked = buf[1] & 0x80 != 0;
@@ -2043,6 +2053,44 @@ mod tests {
             "a control frame inside the protocol's limit is ordinary traffic"
         );
         assert_eq!(ok.sightings(), vec!["demo-token".to_string()]);
+    }
+
+    /// A frame that sets `RSV2` or `RSV3` stops the direction: only an extension this decoder does
+    /// not follow gives those bits a meaning, so the payload is what that extension made of the
+    /// text, not the text. A scanned direction tells the relay, and a captured one ends its
+    /// transcript at the last frame before it rather than file those bytes as the message. Each bit
+    /// is checked on each kind of direction on its own, and every one that is followed instead is
+    /// named; a frame setting neither is still followed.
+    #[test]
+    fn a_frame_setting_a_reserved_bit_stops_the_direction() {
+        let mut followed = Vec::new();
+        for (what, bit) in [("RSV2", 0x20u8), ("RSV3", 0x10)] {
+            let reserved = |payload: &[u8]| {
+                let mut f = frame(0x1, payload, None);
+                f[0] |= bit;
+                f
+            };
+            let mut t = scanning_tee(&[needle()], None);
+            let mut wire = frame(0x1, b"before", None);
+            wire.extend(reserved(NEEDLE_VALUE));
+            t.push(&wire);
+            if !(t.done && t.newly_blinded()) {
+                followed.push(format!("scan: {what}"));
+            }
+            let (mut c, sink) = tee(1024);
+            let mut wire = frame(0x1, b"real", None);
+            wire.extend(reserved(b"transformed"));
+            wire.extend(frame(0x1, b"never-seen", None));
+            c.push(&wire);
+            if captured(&sink).bytes != b"real" {
+                followed.push(format!("capture: {what}"));
+            }
+        }
+        assert!(followed.is_empty(), "followed past {followed:?}");
+        let mut plain = scanning_tee(&[needle()], None);
+        plain.push(&frame(0x1, NEEDLE_VALUE, None));
+        assert!(!plain.done, "a frame with neither bit is ordinary traffic");
+        assert_eq!(plain.sightings(), vec!["demo-token".to_string()]);
     }
 
     /// A direction that gives up on the framing while a leak scan is configured says so — once.
