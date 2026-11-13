@@ -148,10 +148,10 @@ fn the_commands_run_in_order_on_the_tree_and_a_failure_names_the_one_that_failed
         skip_incapable!("skipping the distribution build: need bwrap and a usable userns");
         return;
     };
-    let Some(image) = crate::sandbox::distro::reference::parse("oci:docker.io/library/alpine:3.22")
-    else {
-        return;
-    };
+    // A reference this test writes itself: one the parser refuses is the parser's defect, and fails
+    // here rather than passing a build that never ran.
+    let image = crate::sandbox::distro::reference::parse("oci:docker.io/library/alpine:3.22")
+        .expect("a well-formed image reference");
     let tmp = crate::testutil::TmpDir::new();
     let rootfs = tmp.join("rootfs");
     let Ok(resolved) = crate::sandbox::distro::registry::resolve(&image, None) else {
