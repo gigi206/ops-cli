@@ -86,11 +86,23 @@ impl SessionRuntime {
     /// Parse the token form. An unrecognised or absent value is the project default — back-compat
     /// with records written before this field, and fail-safe: an unknown runtime attaches as a
     /// plain project shell rather than as an app it cannot identify.
+    ///
+    /// An app name is unrecognised unless it is one [`crate::config::is_valid_app_name`] admits,
+    /// the only kind a launch can run as. The record is read back from a file, and its reader cannot
+    /// know who wrote it: a name carrying a newline or an escape would reach every surface that
+    /// names the session, a listing, a stop's outcome, the attach banner, as text a terminal acts on,
+    /// and a `--json` document as a value no app has.
     fn parse(value: &str) -> Self {
-        if let Some(name) = value.strip_prefix("global-app:") {
-            SessionRuntime::GlobalApp(name.to_string())
-        } else if let Some(name) = value.strip_prefix("project-app:") {
-            SessionRuntime::ProjectApp(name.to_string())
+        let app = |prefix: &str| {
+            value
+                .strip_prefix(prefix)
+                .filter(|name| crate::config::is_valid_app_name(name))
+                .map(str::to_string)
+        };
+        if let Some(name) = app("global-app:") {
+            SessionRuntime::GlobalApp(name)
+        } else if let Some(name) = app("project-app:") {
+            SessionRuntime::ProjectApp(name)
         } else {
             SessionRuntime::Project
         }
@@ -1325,6 +1337,32 @@ mod tests {
         assert_eq!(s.label(), "app:demo-app");
         s.runtime = SessionRuntime::ProjectApp("agent".into());
         assert_eq!(s.label(), "app:agent");
+    }
+
+    /// A record whose runtime names no app a launch could have run as is read as a project
+    /// session: a name carrying a newline, a line separator, an escape or a character that
+    /// reorders the line never reaches a label. Each kind of app is checked on its own, and every
+    /// one read as an app is named; a valid name still reads back as its app.
+    #[test]
+    fn a_record_naming_no_valid_app_is_read_as_a_project_session() {
+        let mut taken = Vec::new();
+        for hostile in ["a\nb", "a\u{2028}b", "a\x1b[2Jb", "a\u{202e}b", "-a", ""] {
+            for prefix in ["global-app:", "project-app:"] {
+                let token = format!("{prefix}{hostile}");
+                if SessionRuntime::parse(&token) != SessionRuntime::Project {
+                    taken.push(token);
+                }
+            }
+        }
+        assert!(taken.is_empty(), "read as an app: {taken:?}");
+        assert_eq!(
+            SessionRuntime::parse("global-app:demo-app"),
+            SessionRuntime::GlobalApp("demo-app".into())
+        );
+        assert_eq!(
+            SessionRuntime::parse("project-app:agent"),
+            SessionRuntime::ProjectApp("agent".into())
+        );
     }
 
     #[test]
