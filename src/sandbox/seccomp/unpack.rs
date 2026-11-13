@@ -29,7 +29,11 @@
 //!
 //! On x86_64 its C libraries make some of those calls under their older names (`open`, `stat`,
 //! `lstat`, `mkdir`, `chmod`, `symlink`, `unlink`), which aarch64 does not have; there they make
-//! the `*at` calls the list names on every architecture. The aarch64 build was not traced.
+//! the `*at` calls the list names on every architecture. The aarch64 list was not read from a
+//! trace of its own. The build of the published binary runs it on an ARM runner, putting a layer
+//! of every kind of member through the unpack in its cage and under these filters
+//! (`.github/actions/build-static-sbx`), but that run is built against glibc: no test runs the
+//! musl build published for aarch64 under them.
 
 use super::{Rules, allowlist};
 use std::io;
