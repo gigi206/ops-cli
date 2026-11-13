@@ -3620,8 +3620,9 @@ fn union_forward(base: &mut Vec<ForwardPort>, extra: Vec<ForwardPort>) {
 /// where the layer that supplied the entry — and the trust gate it passed — is known.
 pub(super) fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &schema::RawConfig) {
     // A quoted TOML key may hold any character, a line feed included, and an override's notices
-    // reach the terminal through `diag::warn`, which keeps line breaks: the key is written the way
-    // `diag::visible` writes it, so it cannot start a line of its own.
+    // reach the terminal through `diag::warn`, which keeps line breaks: the key, and the table name
+    // a section carries, are written the way `diag::visible` writes them, so neither can start a
+    // line of its own.
     let mut report = |section: &str, keys: &BTreeMap<String, schema::RawIgnored>| {
         for key in keys.keys() {
             warnings.push(format!(
@@ -3674,7 +3675,10 @@ pub(super) fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &
     // A `[plugin.<name>]` table names the variables one plugin reads, so an unknown key there is
     // named with the plugin it was written under: two plugins can misspell different things.
     for (name, plugin) in &raw.plugin {
-        report(&format!(" under `[plugin.{name}]`"), &plugin.rest);
+        report(
+            &format!(" under `[plugin.{}]`", crate::diag::visible(name)),
+            &plugin.rest,
+        );
     }
     // `[network]` is reported where it is validated, not here: its table form is one variant of an
     // untagged enum, so the bare-string posture must stay a parse success, and the unknown keys are

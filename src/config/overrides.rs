@@ -1935,9 +1935,10 @@ mod tests {
         assert!(n.contains("--config"), "named against its blob: {n}");
     }
 
-    /// A blob's key is the blob's to spell, and a quoted one may hold a line feed. The notice that
-    /// names it reaches the terminal through `diag::warn`, which keeps line breaks, so the key is
-    /// written as an escape on the notice's own line: it cannot start a line that reads as sbx's.
+    /// A blob's key is the blob's to spell, and a quoted one may hold a line feed, as may the name
+    /// of a table it sits under. The notice that names them reaches the terminal through
+    /// `diag::warn`, which keeps line breaks, so each is written as an escape on the notice's own
+    /// line: neither can start a line that reads as sbx's.
     #[test]
     fn an_unknown_key_is_named_on_its_notices_own_line() {
         let ov = collect_cli(Cli {
@@ -1952,6 +1953,20 @@ mod tests {
             .unwrap_or_else(|| panic!("{:?}", ov.notices()));
         assert!(!n.contains('\n'), "{n:?}");
         assert!(n.contains("`bogus\\x0asbx: note: forged`"), "{n:?}");
+
+        // The same for the name of the table the key sits under.
+        let ov = collect_cli(Cli {
+            config: &["[plugin.\"p\\nsbx: note: forged\"]\nbogus = 1"],
+            ..Default::default()
+        })
+        .unwrap();
+        let n = ov
+            .notices()
+            .iter()
+            .find(|n| n.contains("[plugin."))
+            .unwrap_or_else(|| panic!("{:?}", ov.notices()));
+        assert!(!n.contains('\n'), "{n:?}");
+        assert!(n.contains("`[plugin.p\\x0asbx: note: forged]`"), "{n:?}");
     }
 
     #[test]
