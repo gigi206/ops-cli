@@ -1554,7 +1554,6 @@ const UNDOCUMENTED_MODULE_ITEMS: &[(&str, &str)] = &[
     ("paths.rs", "EntryView"),
     ("plugins/catalogue.rs", "RawCatalogue"),
     ("plugins/catalogue.rs", "RawEntry"),
-    ("plugins/catalogue.rs", "collect_files"),
     ("plugins/stores.rs", "RawStoreToml"),
     ("sandbox/argv.rs", "lit"),
     ("sandbox/argv.rs", "path"),
