@@ -541,6 +541,14 @@ pub(crate) struct Resolved {
     /// Which layer granted it (`Default` when none did, and never `Global`: there is no global
     /// form).
     pub(crate) apps_read_project_pool_origin: Provenance,
+    /// The `[apps.network]` entries added to every app's network policy, as the project wrote
+    /// them and prefixed with their list (`allow …`, `deny …`, `mute …`); empty when no trusted
+    /// project adds any. Each app's own policy already carries them; this is what `sbx config show`
+    /// names at the project level, where no single app is in view.
+    pub(crate) apps_network: Vec<String>,
+    /// Which layer added them (`Default` when none did, and never `Global`: there is no global
+    /// form).
+    pub(crate) apps_network_origin: Provenance,
     /// Per-plugin settings for the installed resolver plugins, keyed by plugin name: where to get
     /// a program the manifest declares when `PATH` does not have it, and values for the variables
     /// it reads. Layered global-under-project and gated by trust, like `[packages]`.
@@ -3109,7 +3117,7 @@ fn resolve(
         allow_insecure_http,
         plugins,
     );
-    apply_apps_section(
+    let apps_network = apply_apps_section(
         &mut warnings,
         &mut apps,
         global_apps_section,
@@ -3186,6 +3194,12 @@ fn resolve(
         apps_share_install_pools_origin,
         apps_read_project_pool,
         apps_read_project_pool_origin,
+        apps_network_origin: if apps_network.is_empty() {
+            Provenance::Default
+        } else {
+            Provenance::Project
+        },
+        apps_network,
         allow_insecure_http,
         allow_insecure_http_origin,
         env,

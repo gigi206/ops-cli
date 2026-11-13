@@ -362,6 +362,16 @@ fn desktop_sections(view: &config::view::ConfigView, pal: &style::Palette) -> Op
             provenance_tag(view.apps_read_project_pool_origin, pal)
         );
     }
+    if !view.apps_network.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}[apps.network]:{r} {dim}(added to every app's own rules; not to `sbx run`){r}{}",
+            provenance_tag(view.apps_network_origin, pal)
+        );
+        for entry in &view.apps_network {
+            let _ = writeln!(o, "    {entry}");
+        }
+    }
     if view.audio {
         let _ = writeln!(
             o,
@@ -1545,6 +1555,8 @@ mod tests {
             apps_share_install_pools_origin: Default::default(),
             apps_read_project_pool: false,
             apps_read_project_pool_origin: Default::default(),
+            apps_network: Vec::new(),
+            apps_network_origin: Default::default(),
             cwd: "/proj".into(),
             env: vec![],
             binds: vec![],
@@ -2053,6 +2065,39 @@ mod tests {
             line.contains("enabled") && line.contains("another app") && line.contains("(project)"),
             "the grant must say what it opens and which layer opened it: {line}"
         );
+    }
+
+    #[test]
+    fn config_render_names_the_rules_every_app_shares_only_when_a_project_adds_some() {
+        // The rules are folded into each app's policy, where no project-level view looks: this
+        // line is where an audit of the project meets them.
+        let out = render_config(&sample_config_view(), &style::Palette::plain(), false);
+        assert!(
+            !out.contains("[apps.network]"),
+            "none added, none named:\n{out}"
+        );
+
+        let mut view = sample_config_view();
+        view.apps_network = vec![
+            "allow downloads.example.com".into(),
+            "deny tracker.example.com".into(),
+        ];
+        view.apps_network_origin = config::view::ProvenanceView::Project;
+        let out = render_config(&view, &style::Palette::plain(), false);
+        let line = out
+            .lines()
+            .find(|l| l.contains("[apps.network]"))
+            .unwrap_or_else(|| panic!("the table must be rendered:\n{out}"));
+        assert!(
+            line.contains("every app") && line.contains("(project)"),
+            "{line}"
+        );
+        for entry in ["allow downloads.example.com", "deny tracker.example.com"] {
+            assert!(
+                out.lines().any(|l| l.trim() == entry),
+                "{entry} is listed:\n{out}"
+            );
+        }
     }
 
     #[test]

@@ -271,7 +271,7 @@ A global app launched from a project that does not set it, and that fails to ins
 these tools, says so after mise's own error, and names this setting:
 
 ```text
-sbx: note: a tool of the project's mise file could not be installed under this app's egress; `[apps] read_project_pool = true` in the project's .sbx.toml lets every app of the project run the copy `sbx run` installs instead
+sbx: note: a tool of the project's mise file could not be installed in this app's cage; if `sbx run` installs it, `[apps] read_project_pool = true` in the project's .sbx.toml lets this app run that copy instead
 ```
 
 Set this in the project's config and each global app also reads, read-only and last, the pool

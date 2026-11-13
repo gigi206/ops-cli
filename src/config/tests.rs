@@ -15172,6 +15172,13 @@ fn apps_network_adds_its_rules_to_every_filtering_app_and_keeps_each_mode() {
     for app in ["denying", "inheriting"] {
         assert_eq!(r.apps[app].network_origin, Provenance::Project, "`{app}`");
     }
+    // The project-level view names what was added, list by list, and the layer that added it.
+    assert_eq!(
+        r.apps_network,
+        ["allow shared.example.com", "deny blocked.example.com"],
+        "the entries the project added"
+    );
+    assert_eq!(r.apps_network_origin, Provenance::Project);
     // The project's own shell is not an app: its policy is the project's `[network]` alone.
     let NetworkPolicy::Allowlist(base) = &r.network else {
         panic!("the project keeps its allowlist: {:?}", r.network);
@@ -15219,6 +15226,11 @@ fn apps_network_is_project_only_and_trusted_only() {
     assert!(
         !allow.iter().any(|h| h.contains("example.com")),
         "neither layer added a rule: {allow:?}"
+    );
+    assert!(
+        r.apps_network.is_empty(),
+        "nothing is shown as added: {:?}",
+        r.apps_network
     );
     assert!(
         r.warnings

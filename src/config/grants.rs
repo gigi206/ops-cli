@@ -118,6 +118,10 @@ fn delta(before: &Resolved, after: &Resolved, app: Option<&String>, out: &mut Ve
         apps_share_install_pools_origin: _,
         apps_read_project_pool,
         apps_read_project_pool_origin: _,
+        // Each entry is already in the policy of every app it reaches, where the per-app pass
+        // below names it, so naming it here too would name it twice.
+        apps_network: _,
+        apps_network_origin: _,
         plugin,
         open,
         service,

@@ -1235,6 +1235,9 @@ pub(super) fn project_app_source(name: &str) -> String {
 /// Project-only and trusted-only, see [`schema::RawAppsNetwork`]. The global config's `[apps]` is
 /// named and dropped, an untrusted project's is refused with the reason, and each key the tables do
 /// not know, `mode` among them, is named rather than passed over.
+///
+/// Returns the entries it added, each prefixed with its list, for the project-level view; empty
+/// when it added none.
 pub(super) fn apply_apps_section(
     warnings: &mut Vec<String>,
     apps: &mut BTreeMap<String, ResolvedApp>,
@@ -1242,7 +1245,7 @@ pub(super) fn apply_apps_section(
     project: Option<(schema::RawApps, TrustState)>,
     net_groups: &NetGroups,
     baseline_network: &NetworkPolicy,
-) {
+) -> Vec<String> {
     if global.is_some() {
         warnings.push(format!(
             "{GLOBAL_CONFIG}: ignoring `[apps]` — it is read from a project's config only: a rule \
@@ -1260,7 +1263,7 @@ pub(super) fn apply_apps_section(
         ));
     }
     let Some((section, state)) = project else {
-        return;
+        return Vec::new();
     };
     for key in section.rest.keys() {
         warnings.push(format!(
@@ -1269,7 +1272,7 @@ pub(super) fn apply_apps_section(
         ));
     }
     let Some(table) = section.network else {
-        return;
+        return Vec::new();
     };
     for key in table.rest.keys() {
         warnings.push(format!(
@@ -1279,12 +1282,20 @@ pub(super) fn apply_apps_section(
         ));
     }
     if table.allow.is_empty() && table.deny.is_empty() && table.mute.is_empty() {
-        return;
+        return Vec::new();
     }
     if state != TrustState::Trusted {
         refuse_untrusted(warnings, PROJECT_CONFIG, "`[apps.network]`", state);
-        return;
+        return Vec::new();
     }
+    let shown: Vec<String> = [
+        ("allow", &table.allow),
+        ("deny", &table.deny),
+        ("mute", &table.mute),
+    ]
+    .into_iter()
+    .flat_map(|(list, entries)| entries.iter().map(move |e| format!("{list} {e}")))
+    .collect();
     let field = schema::NetworkField::Table(schema::NetworkTable {
         allow: table.allow,
         deny: table.deny,
@@ -1311,4 +1322,5 @@ pub(super) fn apply_apps_section(
             app.network_origin = Provenance::Project;
         }
     }
+    shown
 }

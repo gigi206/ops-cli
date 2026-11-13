@@ -754,8 +754,9 @@ every app the table amends until it is fixed.
 A rule written here reaches every app, those that hold credentials among them. The table is
 therefore a security field, read from a **trusted project only** and never from the global
 config: an untrusted or changed project's table is ignored with the reason, and `sbx trust`
-names each rule it adds, on each app it reaches. `sbx config show --app <name>` shows an app's
-policy with them folded in.
+names each rule it adds, on each app it reaches. `sbx config show` lists the table's entries
+under `[apps.network]`, and `sbx config show --app <name>` shows an app's policy with them
+folded in.
 
 An `[app.network]` written for this table declares an app named `network` instead; with no
 command it cannot launch, and sbx says so on every launch.

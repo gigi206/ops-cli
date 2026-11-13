@@ -126,6 +126,11 @@ pub(crate) struct ConfigView {
     pub(crate) apps_read_project_pool: bool,
     /// Which layer granted it (`Default` when none did; only a project can).
     pub(crate) apps_read_project_pool_origin: ProvenanceView,
+    /// The `[apps.network]` entries added to every app's network policy, each prefixed with its
+    /// list (`allow …`); empty when none is added.
+    pub(crate) apps_network: Vec<String>,
+    /// Which layer added them (`Default` when none did; only a project can).
+    pub(crate) apps_network_origin: ProvenanceView,
     /// Whether audio (microphone + playback) is open (`audio = true`).
     pub(crate) audio: bool,
     /// Which layer supplied the audio posture (`Default` when neither config set it).
@@ -1347,6 +1352,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         apps_share_install_pools_origin: resolved.apps_share_install_pools_origin.into(),
         apps_read_project_pool: resolved.apps_read_project_pool,
         apps_read_project_pool_origin: resolved.apps_read_project_pool_origin.into(),
+        apps_network: resolved.apps_network.clone(),
+        apps_network_origin: resolved.apps_network_origin.into(),
         limits,
         secrets,
         apps,
@@ -2446,6 +2453,8 @@ mod tests {
             apps_share_install_pools_origin: Default::default(),
             apps_read_project_pool: false,
             apps_read_project_pool_origin: Default::default(),
+            apps_network: Vec::new(),
+            apps_network_origin: Default::default(),
             open: vec![],
             service: vec![],
             plugins: vec![],
@@ -3066,6 +3075,8 @@ mod tests {
             apps_share_install_pools_origin: Default::default(),
             apps_read_project_pool: false,
             apps_read_project_pool_origin: Default::default(),
+            apps_network: Vec::new(),
+            apps_network_origin: Default::default(),
             distro_run: Vec::new(),
             accepts_fresh_releases: Default::default(),
             timezone: None,
