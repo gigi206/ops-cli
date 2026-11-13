@@ -104,6 +104,19 @@ fn the_project_root_is_one_of_the_binds_the_control_plane_is_pinned_against() {
     );
 }
 
+/// Where `needle` stands in `source`, failing the test naming `what` unless it stands there exactly
+/// once. An order checked against the source holds only for the one call it means: a second copy
+/// of the needle, a comment quoting the call or a second call site, would let the check pass on
+/// the copy while the call itself had moved.
+fn the_one_place(source: &str, needle: &str, what: &str) -> usize {
+    let mut at = source.match_indices(needle).map(|(i, _)| i);
+    match (at.next(), at.next()) {
+        (Some(first), None) => first,
+        (None, _) => panic!("{what}: `{needle}` is not in the source"),
+        (Some(_), Some(_)) => panic!("{what}: `{needle}` stands more than once in the source"),
+    }
+}
+
 /// The pins are computed from the config binds the launch keeps, decided before them. A read-only
 /// bind decides pins (its roots, and the intermediates it spares), and the filter that drops a
 /// read-only bind the launch cannot establish used to run after them: a bind dropped there left
@@ -112,12 +125,16 @@ fn the_project_root_is_one_of_the_binds_the_control_plane_is_pinned_against() {
 #[test]
 fn the_pins_are_computed_from_the_binds_the_launch_keeps() {
     let source = crate::testutil::production_half(include_str!("../build.rs"));
-    let kept = source
-        .find("let config_binds: Vec<crate::config::Bind> = prep")
-        .expect("the filter this test orders against");
-    let pinned = source
-        .find("pin_sources(&config_binds, &prep.cwd, project_writable)")
-        .expect("the pin sources must be the binds the launch keeps");
+    let kept = the_one_place(
+        &source,
+        "let config_binds: Vec<crate::config::Bind> = prep",
+        "the filter this test orders against",
+    );
+    let pinned = the_one_place(
+        &source,
+        "pin_sources(&config_binds, &prep.cwd, project_writable)",
+        "the pin sources must be the binds the launch keeps",
+    );
     assert!(
         kept < pinned,
         "the binds the launch keeps must be decided before the pins"
@@ -1084,23 +1101,32 @@ fn the_wraps_nest_around_the_composed_startup_and_not_the_bare_command() {
     // The whole file is production code now that the tests live in this sibling, so no cut is
     // needed to keep the tests' own calls to these helpers out of the search.
     let body = include_str!("../build.rs");
-    let compose = body
-        .find("compose_startup_cmd(&prep.cfg.provisions")
-        .expect("`build` composes the startup from the resolved provisions");
-    let wrap = body
-        .find("wrap_cage_command(startup_cmd, wraps)")
-        .expect("`build` nests the wraps around the composed startup, by that name");
+    let compose = the_one_place(
+        body,
+        "compose_startup_cmd(&prep.cfg.provisions",
+        "`build` composes the startup from the resolved provisions",
+    );
+    let wrap = the_one_place(
+        body,
+        "wrap_cage_command(startup_cmd, wraps)",
+        "`build` nests the wraps around the composed startup, by that name",
+    );
     assert!(
         compose < wrap,
         "`build` applies its wraps at byte {wrap} and composes the startup at {compose}: the \
          composition has moved back outside the nesting, so every bundle's install step runs \
          before the mise equip lanes and before the egress forwarder is up"
     );
-    // The bare command must no longer be wrapped anywhere: a second call site would reinstate
-    // the old order for whichever branch reached it first.
-    assert!(
-        !body.contains("wrap_cage_command(cmd, wraps)"),
-        "`build` still wraps the bare command somewhere, so a launch can take the old order"
+    // Nothing else is wrapped anywhere: a second call site, under whatever argument, would
+    // reinstate the old order for whichever branch reached it first. Counted over every spelling
+    // of the call but the definition, so neither the argument's name nor a copy can hide one.
+    let calls = body
+        .match_indices("wrap_cage_command(")
+        .filter(|(at, _)| !body[..*at].ends_with("fn "))
+        .count();
+    assert_eq!(
+        calls, 1,
+        "`build` wraps a command at {calls} sites, so a launch can take the old order"
     );
 }
 
