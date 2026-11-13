@@ -75,7 +75,9 @@ Every cage of the project keeps its own copy, so the roll walks the same homes: 
 project's (`sbx run`) and each app's. An app that reads the pool `sbx run` fills
 ([`[apps] read_project_pool`](../configuration/packages#apps-read_project_pool-when-an-app-needs-the-tools-the-projects-shell-installed),
 on by default) is named as following the project's pool and not rolled itself: the project's
-roll moves the copy it runs. `--app <name>` rolls that app's home only. Each home is rolled
+roll moves the copy it runs. A home that never equipped the project's tools, an app never
+launched from this project, is named and left alone: its first launch installs what is missing,
+and a roll does not install a whole toolchain into it. `--app <name>` rolls that app's home only. Each home is rolled
 under its own egress, so an app that does not read the pool and whose egress refuses a tool's
 host fails there, and says so. The roll is trusted-only, like the project's `nix:` tools.
 `--dry-run` names what each home would install and installs nothing.

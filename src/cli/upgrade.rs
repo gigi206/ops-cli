@@ -668,7 +668,8 @@ fn declares_mise_package(cfg: &config::Resolved, app: &config::ResolvedApp) -> b
 /// starts.
 ///
 /// The narrower command is named **only when it would work**. `sbx upgrade mise --app <name>`
-/// refuses an app that declares no `mise:` package, and for five of the shipped profiles the
+/// refuses an app that declares no `mise:` package and keeps no copy of the project's own mise
+/// tools, and for five of the shipped profiles the
 /// install step is the whole of what advances them — offering an escape hatch there would send the
 /// reader to a refusal, which is the failure this notice exists to remove, reintroduced one line
 /// above the work.
@@ -677,12 +678,11 @@ fn declares_mise_package(cfg: &config::Resolved, app: &config::ResolvedApp) -> b
 /// the code.
 fn install_step_notice(name: &str, cfg: &config::Resolved, pal: &style::Palette) -> String {
     let (dim, r) = (pal.dim, pal.reset);
-    let rolls_mise = cfg
-        .apps
-        .get(name)
-        .is_some_and(|app| declares_mise_package(cfg, app));
+    let rolls_mise = cfg.apps.get(name).is_some_and(|app| {
+        declares_mise_package(cfg, app) || sandbox::app_rolls_project_tools(cfg, name)
+    });
     let cheaper = if rolls_mise {
-        format!(" — `sbx upgrade mise --app {name}` rolls only the packages.")
+        format!(" — `sbx upgrade mise --app {name}` rolls only its mise tools.")
     } else {
         ".".to_string()
     };

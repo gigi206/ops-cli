@@ -94,6 +94,21 @@ pub(crate) fn home_src(data_dir: &Path, cwd: &Path, runtime: Runtime) -> io::Res
     Ok(project_runtime(data_dir, &project, runtime).home_src)
 }
 
+/// The host path of the mise pool the project's own tools are equipped into for this launch: a
+/// global app's per-project pool, or the home's own mise data for every other runtime. Lets a roll
+/// tell a home that equipped the project's tools from one that never did.
+pub(crate) fn project_lane_pool(
+    data_dir: &Path,
+    cwd: &Path,
+    runtime: Runtime,
+) -> io::Result<PathBuf> {
+    let project = canonicalize_project(cwd)?;
+    let rt = project_runtime(data_dir, &project, runtime);
+    Ok(rt
+        .mise_project_src
+        .unwrap_or_else(|| rt.home_src.join(super::MISE_DATA_REL)))
+}
+
 /// A collision-resistant directory name for a canonical project path. A project's runtime tree —
 /// its home, its store, its pin locks — sits under `<data>/projects/<id>/`, and housekeeping hashes
 /// a running session's recorded canonical path with this to match it against a tree, so it can skip

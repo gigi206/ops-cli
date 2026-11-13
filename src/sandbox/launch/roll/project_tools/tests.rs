@@ -129,17 +129,17 @@ fn the_project_tools_roll_trusts_the_file_and_schedules_no_deletion_in_a_global_
         (
             binds::Runtime::ProjectDefault,
             RollMode::Apply,
-            "trusted=/demo/project prune=unset mise upgrade -- --help core:demo-runtime@2",
+            "trusted=/demo/project prune=unset mise -C /demo/project upgrade -- --help core:demo-runtime@2",
         ),
         (
             binds::Runtime::GlobalApp("demo-app"),
             RollMode::Apply,
-            "trusted=/demo/project prune=0 mise upgrade -- --help core:demo-runtime@2",
+            "trusted=/demo/project prune=0 mise -C /demo/project upgrade -- --help core:demo-runtime@2",
         ),
         (
             binds::Runtime::ProjectApp("demo-app"),
             RollMode::DryRun,
-            "trusted=/demo/project prune=unset mise upgrade --dry-run -- --help core:demo-runtime@2",
+            "trusted=/demo/project prune=unset mise -C /demo/project upgrade --dry-run -- --help core:demo-runtime@2",
         ),
     ] {
         let record = dir.path().join("record");
@@ -196,4 +196,35 @@ fn the_project_tools_report_reads_mise_s_own_lines() {
         (vec!["aqua:example/demo-tool@1.1.0".to_string()], false)
     );
     assert_eq!(project_tools_moves("", RollMode::DryRun), (vec![], true));
+}
+
+/// A home counts as having equipped the project's tools when the pool the project's lane installs
+/// into holds an `installs` directory: the home's own mise data for the project's shell and a
+/// project-scoped app, a global app's per-project pool for a global app. A home with none is never
+/// rolled, so a roll does not install the project's toolchain into an app never launched there.
+#[test]
+fn a_home_is_rolled_only_once_it_equipped_the_project_tools() {
+    let data = crate::testutil::TmpDir::new();
+    let project = crate::testutil::TmpDir::new();
+    let id = binds::project_id(&project.path().canonicalize().unwrap());
+    let base = data.path().join("projects").join(&id);
+    let global = binds::Runtime::GlobalApp("demo-app");
+    for runtime in [binds::Runtime::ProjectDefault, global] {
+        assert!(
+            !equipped(data.path(), project.path(), runtime),
+            "nothing equipped yet"
+        );
+    }
+    std::fs::create_dir_all(base.join("home/.local/share/mise/installs")).unwrap();
+    assert!(equipped(
+        data.path(),
+        project.path(),
+        binds::Runtime::ProjectDefault
+    ));
+    assert!(
+        !equipped(data.path(), project.path(), global),
+        "the project's pool is not the app's own"
+    );
+    std::fs::create_dir_all(base.join("apps/demo-app/mise/installs")).unwrap();
+    assert!(equipped(data.path(), project.path(), global));
 }

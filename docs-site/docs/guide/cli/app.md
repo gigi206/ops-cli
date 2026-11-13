@@ -229,7 +229,7 @@ Because nothing gates it, the cost is named **before** the cage is built rather 
 reported after it:
 
 ```
-  the install step below re-runs in junie's own cage regardless of its guard, which downloads again — `sbx upgrade mise --app junie` rolls only the packages.
+  the install step below re-runs in junie's own cage regardless of its guard, which downloads again — `sbx upgrade mise --app junie` rolls only its mise tools.
 ```
 
 That second clause appears only for an app that has packages to roll. `sbx upgrade mise

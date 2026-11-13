@@ -31,7 +31,7 @@ pub(crate) use self::nesting::{
     unestablishable_bind_warning,
 };
 pub(crate) use self::runtime::{
-    Runtime, home_src, project_id, project_identity, project_runtime_id,
+    Runtime, home_src, project_id, project_identity, project_lane_pool, project_runtime_id,
 };
 use self::runtime::{canonicalize_project, project_runtime};
 pub(super) use self::synthetic::hosts_contents;

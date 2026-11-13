@@ -82,6 +82,13 @@ pub(super) fn project_tools_plan(
     plan
 }
 
+/// Whether the home `runtime` names has equipped the project's tools in this project: its pool for
+/// them holds an `installs` directory.
+pub(super) fn equipped(data_dir: &Path, cwd: &Path, runtime: binds::Runtime) -> bool {
+    binds::project_lane_pool(data_dir, cwd, runtime)
+        .is_ok_and(|pool| pool.join("installs").is_dir())
+}
+
 /// Whether `sbx upgrade --app <name>` has project tools to roll in that app's own home: the app
 /// equips some, and does not follow the project's pool. Read from the configuration alone, so an
 /// app granted the pool counts as following it whatever this host's bubblewrap can mount; the roll
@@ -93,8 +100,9 @@ pub(crate) fn app_rolls_project_tools(cfg: &Resolved, name: &str) -> bool {
         && !project_tools_plan(cfg, Some(name), true).groups.is_empty()
 }
 
-/// The command a project-tools roll runs in one home's cage: `mise upgrade -- <tokens>`, in the
-/// project, so mise reads the project's mise file the tokens come from.
+/// The command a project-tools roll runs in one home's cage: `mise -C <project> upgrade --
+/// <tokens>`, so mise reads the project's mise file the tokens come from whatever directory the
+/// cage starts in.
 ///
 /// mise upgrades only the tools a configuration it reads declares, and it reads the project's file
 /// only when it is told to trust it: without `MISE_TRUSTED_CONFIG_PATHS` it reports every tool up
@@ -129,9 +137,9 @@ pub(super) fn project_tools_upgrade_cmd(
         RollMode::Apply => "",
         RollMode::DryRun => " --dry-run",
     };
+    let project = shell_quote(&project.to_string_lossy());
     let script = format!(
-        "export MISE_TRUSTED_CONFIG_PATHS={}; {prune}{} upgrade{dry} -- \"$@\"",
-        shell_quote(&project.to_string_lossy()),
+        "export MISE_TRUSTED_CONFIG_PATHS={project}; {prune}{} -C {project} upgrade{dry} -- \"$@\"",
         shell_quote(&mise.to_string_lossy()),
     );
     let mut cmd = vec![
@@ -222,6 +230,19 @@ pub(crate) fn upgrade_project_tools(
         let say = |status: String| outln!("{}", roll_line(&name, width, &status, pal));
         if matches!(cfg.network, crate::config::NetworkPolicy::Isolated) {
             say(format!("{dim}network \"none\" — skipped{r}"));
+            continue;
+        }
+        // A home that never equipped the project's tools holds no copy to move, and rolling it
+        // would install the project's whole toolchain into an app never launched here. Its first
+        // launch installs what is missing.
+        let layout = crate::store::Layout::from_env();
+        if !layout
+            .as_ref()
+            .is_some_and(|layout| equipped(layout.data_dir(), cwd, home.runtime()))
+        {
+            say(format!(
+                "{dim}never launched here — its first launch installs the tools{r}"
+            ));
             continue;
         }
         // A dry run writes nothing, and building a cage can: it seeds the project's store on a
@@ -324,7 +345,7 @@ pub(crate) fn upgrade_project_tools(
             )
         ),
         many => outln!(
-            "  {dim}{} apps follow the project's pool, rolled with it{r}",
+            "  {dim}{} apps follow the project's pool, whose roll moves their copy{r}",
             many.len()
         ),
     }
