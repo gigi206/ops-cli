@@ -349,7 +349,7 @@ fn desktop_sections(view: &config::view::ConfigView, pal: &style::Palette) -> Op
     if view.apps_share_install_pools {
         let _ = writeln!(
             o,
-            "  {h}apps.share_install_pools:{r} enabled {dim}(each app may run a tool another app \
+            "  {h}[apps] share_install_pools:{r} enabled {dim}(each app may run a tool another app \
              in this project installed){r}{}",
             provenance_tag(view.apps_share_install_pools_origin, pal)
         );
@@ -357,7 +357,7 @@ fn desktop_sections(view: &config::view::ConfigView, pal: &style::Palette) -> Op
     if view.apps_read_project_pool {
         let _ = writeln!(
             o,
-            "  {h}apps.read_project_pool:{r} enabled {dim}(each app may run a tool this project's \
+            "  {h}[apps] read_project_pool:{r} enabled {dim}(each app may run a tool this project's \
              `sbx run` installed){r}{}",
             provenance_tag(view.apps_read_project_pool_origin, pal)
         );
@@ -2037,7 +2037,7 @@ mod tests {
         // layer that granted it, and silent otherwise -- off is the default and says nothing.
         let out = render_config(&sample_config_view(), &style::Palette::plain(), false);
         assert!(
-            !out.contains("apps.share_install_pools"),
+            !out.contains("[apps] share_install_pools"),
             "an ungranted config must not mention the grant:\n{out}"
         );
 
@@ -2047,7 +2047,7 @@ mod tests {
         let out = render_config(&view, &style::Palette::plain(), false);
         let line = out
             .lines()
-            .find(|l| l.contains("apps.share_install_pools"))
+            .find(|l| l.contains("[apps] share_install_pools"))
             .unwrap_or_else(|| panic!("the grant must be rendered:\n{out}"));
         assert!(
             line.contains("enabled") && line.contains("another app") && line.contains("(project)"),
@@ -2060,7 +2060,7 @@ mod tests {
         // The same audit for the grant that lets an app run what the project's shell installed.
         let out = render_config(&sample_config_view(), &style::Palette::plain(), false);
         assert!(
-            !out.contains("apps.read_project_pool"),
+            !out.contains("[apps] read_project_pool"),
             "an ungranted config must not mention the grant:\n{out}"
         );
 
@@ -2070,7 +2070,7 @@ mod tests {
         let out = render_config(&view, &style::Palette::plain(), false);
         let line = out
             .lines()
-            .find(|l| l.contains("apps.read_project_pool"))
+            .find(|l| l.contains("[apps] read_project_pool"))
             .unwrap_or_else(|| panic!("the grant must be rendered:\n{out}"));
         assert!(
             line.contains("enabled") && line.contains("`sbx run`") && line.contains("(project)"),

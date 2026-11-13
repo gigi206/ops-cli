@@ -747,6 +747,10 @@ The rules are added after the project's `[app.<name>.network]`, so an overlay th
 still decides last, and the project's own shell (`sbx run`) is not an app: its policy stays the
 project's `[network]`.
 
+An entry that cannot be read is left out with a warning, as in any `[network]` table, except a
+`deny` entry: leaving it out would leave the host it named reachable, so it stops the launch of
+every app the table amends until it is fixed.
+
 A rule written here reaches every app, those that hold credentials among them. The table is
 therefore a security field, read from a **trusted project only** and never from the global
 config: an untrusted or changed project's table is ignored with the reason, and `sbx trust`

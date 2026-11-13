@@ -15167,6 +15167,11 @@ fn apps_network_adds_its_rules_to_every_filtering_app_and_keeps_each_mode() {
         "an app under `shared` stays shared: {:?}",
         r.apps["open"].network
     );
+    // An app the table amended reports the project as the layer that set its policy, including one
+    // that had no policy of its own and so reported the built-in default before.
+    for app in ["denying", "inheriting"] {
+        assert_eq!(r.apps[app].network_origin, Provenance::Project, "`{app}`");
+    }
     // The project's own shell is not an app: its policy is the project's `[network]` alone.
     let NetworkPolicy::Allowlist(base) = &r.network else {
         panic!("the project keeps its allowlist: {:?}", r.network);
@@ -15333,4 +15338,50 @@ fn the_pool_grants_are_read_under_apps_from_a_trusted_project_only() {
         !r.apps_share_install_pools && !r.apps_read_project_pool,
         "the global config grants neither"
     );
+}
+
+/// A one-shot posture is laid over the merged app and decides last, so `--net shared` or
+/// `--net none` still governs an app the project's `[apps.network]` amended.
+#[test]
+fn a_one_shot_posture_beats_the_rules_every_app_shares() {
+    let r = apps_network_fixture(APPS_NETWORK_PROJECT);
+    for posture in ["shared", "none"] {
+        let mut launched = r.clone();
+        launched.merge_app(r.apps["inheriting"].clone());
+        let overlay: RawConfig =
+            toml::from_str(&format!("network = \"{posture}\"\n")).expect("the overlay parses");
+        launched
+            .apply_override(super::Override::for_test(overlay), None)
+            .expect("the override applies");
+        let expected = match posture {
+            "shared" => matches!(launched.network, NetworkPolicy::Shared),
+            _ => matches!(launched.network, NetworkPolicy::Isolated),
+        };
+        assert!(
+            expected,
+            "`--net {posture}` decides: {:?}",
+            launched.network
+        );
+    }
+}
+
+/// A `deny` entry that cannot be read would leave the host it named reachable, so it stops the
+/// launch of every app the table amends, and no other.
+#[test]
+fn an_unreadable_shared_deny_entry_stops_every_app_it_would_have_tightened() {
+    let r = apps_network_fixture("[apps.network]\ndeny = [\"re:(\"]\n");
+    for app in ["denying", "asking", "denylisting", "inheriting"] {
+        assert!(
+            !r.apps[app].refusals.is_empty(),
+            "`{app}` stops on the unreadable entry: {:?}",
+            r.apps[app].warnings
+        );
+    }
+    for app in ["closed", "open"] {
+        assert!(
+            r.apps[app].refusals.is_empty(),
+            "`{app}` was not amended, so it does not stop: {:?}",
+            r.apps[app].refusals
+        );
+    }
 }

@@ -281,6 +281,31 @@ code. These integrity gates enforce it:
 `packages` is similarly protected: an untrusted project cannot override (or DoS) a
 trusted app's package.
 
+## `[apps]`: what every app of a project shares
+
+`[app.<name>]` configures one app. The `[apps]` table, written in a project's `.sbx.toml`,
+configures every app launched from that project, whichever its profile:
+
+```toml
+# ./.sbx.toml
+[apps]
+read_project_pool   = true   # each app may run the tools `sbx run` installed
+share_install_pools = true   # each app may run a tool another app of the project installed
+
+[apps.network]
+allow = ["{GET,HEAD} https://downloads.example.com"]
+```
+
+| Key | What it grants | Details |
+|---|---|---|
+| `read_project_pool` | the project's own mise tools, read from the pool `sbx run` fills | [packages](packages#apps-read_project_pool-when-an-app-needs-the-tools-the-projects-shell-installed) |
+| `share_install_pools` | the mise tools another app of the project installed | [packages](packages#apps-share_install_pools-when-two-apps-in-one-project-equip-the-same-tool) |
+| `[apps.network]` | `allow`/`deny`/`mute` rules added to each app's own | [network](network#rules-every-app-of-the-project-shares-appsnetwork) |
+
+Each one is a security field, read from a trusted project only and never from the global
+config: what it grants reaches every app, those that hold credentials among them, so it
+belongs to the project that asks for it.
+
 ## Every app is Mode B
 
 An app is the locked-down [agent posture](../concepts/#the-two-actor-modes):

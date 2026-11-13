@@ -1306,6 +1306,9 @@ pub(super) fn apply_apps_section(
             current,
         ) {
             app.network = Some(policy);
+            // The policy now carries what the project wrote, so the per-app view names the project
+            // as the layer that set it, not the built-in default an inheriting app reported.
+            app.network_origin = Provenance::Project;
         }
     }
 }
