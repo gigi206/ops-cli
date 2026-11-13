@@ -320,9 +320,9 @@ pub(crate) fn returns_within<T: Send + 'static>(
 /// Whether the server at `sock` takes a connection within `limit`, asked again every few
 /// milliseconds for as long as `alive` holds; the connection is closed at once.
 ///
-/// A server's socket name exists from its `bind`, and a connect before its `listen` is refused;
-/// `dbus-daemon` does other work between the two. A fixture that waits for the name alone can
-/// dial a server that does not serve yet, and fail on that refusal.
+/// A server's socket name exists from its `bind`, and a connect before its `listen` is refused,
+/// however short the time between the two. A fixture that waits for the name alone can dial a
+/// server that does not serve yet, and fail on that refusal.
 pub(crate) fn accepts_within(
     sock: &Path,
     limit: std::time::Duration,

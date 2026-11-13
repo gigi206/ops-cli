@@ -1187,10 +1187,13 @@ mod tests {
     fn a_control_socket_served_from_another_pid_namespace_is_refused() {
         // The socket's path reaches the listener as bytes in its environment: the host's `unshare`
         // may refuse an argument that is not UTF-8, which the fixture root can make it, and a
-        // working directory under that root can stop the `python3` a host resolves.
+        // working directory under that root can stop the `python3` a host resolves. A client that
+        // left before its answer, as the readiness probe does, is passed over: the write to it
+        // would raise, and end the listener the test then dials.
         const SERVE: &str = "import os,socket\n\
             s=socket.socket(socket.AF_UNIX); s.bind(os.environb[b'SBX_TEST_SOCKET']); s.listen(4)\n\
-            while True:\n    c,_=s.accept(); c.sendall(b'ok\\n'); c.close()\n";
+            while True:\n    c,_=s.accept()\n    try: c.sendall(b'ok\\n')\n    \
+            except OSError: pass\n    c.close()\n";
         let data = crate::testutil::TmpDir::new();
         let socket = data.path().join("control-1.sock");
         let child = std::process::Command::new("unshare")
