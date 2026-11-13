@@ -705,6 +705,26 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
+    /// A descriptor handed over beyond the signers the document names is refused as well, on the
+    /// state a proxy starts with: the two lists cross together, and a count that differs means the
+    /// document and its descriptors no longer match.
+    #[test]
+    fn a_descriptor_handed_over_beyond_the_signers_named_is_refused() {
+        let (process, _plugin) = stand_in();
+        let set = full_set(&process);
+        let state = Credentials::new(set.injections, set.needles, 24, Vec::new());
+        let mut transfer = state.encode().unwrap();
+        let (_kept, surplus) = std::os::unix::net::UnixStream::pair().unwrap();
+        transfer.signers.push(OwnedFd::from(surplus));
+        let e = Credentials::decode(transfer).err().expect("refused");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            e.to_string()
+                .contains("the document names 1 signers, and 2 were handed over"),
+            "{e}"
+        );
+    }
+
     /// A malformed document is reported by where it broke, never by what it held there: the bytes
     /// are credentials, and the parser's own message quotes the value it stopped on.
     #[test]
