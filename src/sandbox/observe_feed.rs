@@ -3,7 +3,8 @@
 //! When observation is on, the launch is forced onto a supervised path (a parent that outlives the
 //! cage), and observation runs from there. The **exec lens** (this module's [`ExecObserver`]) polls the
 //! cage's process set from `/proc` on a short interval, diffs successive snapshots, and for each
-//! newly-seen process pushes an event into the exec ring — read out-of-band by `sbx proc logs` — and,
+//! newly-seen process, or one that runs another program in place, pushes an event into the exec
+//! ring — read out-of-band by `sbx proc logs` — and,
 //! on the foreground non-tty path, also echoes a `[sbx:exec] <cmd>` line to stderr inline with the run.
 //! The **filesystem lens** ([`super::fs_watch`]) watches the project tree with inotify and pushes each
 //! write into the fs ring, read by `sbx fs logs`.
@@ -240,9 +241,60 @@ impl Drop for ExecObserver {
     }
 }
 
-/// The poll loop: each tick, snapshot the cage's descendants, record any newly-seen non-plumbing
-/// process (into the ring, and to stderr when `inline`), then sleep in short slices so a stop is
-/// honoured promptly.
+/// The descendants of `root` in `table` that one tick reports: each one that is new since the
+/// last tick, or that now runs another program, and is not launch plumbing. `seen` holds what the
+/// last tick saw, each live pid with the name it ran under, and is brought up to `table`.
+///
+/// A process that runs another program in place (`execve`, as `exec "$@"` in a wrapper does) keeps
+/// its pid, and the kernel renames it after the program: its `comm` is what tells the two apart,
+/// where a pid alone would report the wrapper and never the program it became. The name, rather
+/// than the command line, because a process that has exited and is not yet reaped has no command
+/// line left, and would read as another program on every tick it is caught in that state. A name
+/// that could not be read is no change either: [`observe::read_proc_table`] leaves it empty for a
+/// process that went between the listing and the read. A program that runs another under the same
+/// name in place is not told apart, and neither is a process that renames itself
+/// (`prctl(PR_SET_NAME)`), which is reported again under the name it took.
+///
+/// `seen` holds only the pids still alive at the last tick, not every pid ever observed. Two
+/// reasons, and the first is the one that costs correctness: a pid the kernel reuses after its
+/// first holder exits would otherwise be remembered forever and its `execve` never reported, a gap
+/// the observed workload can arrange by churning short-lived processes until the counter wraps
+/// onto a number the lens has already retired. The second is that a long run's map would grow
+/// without bound. Retaining against the live set costs one pass over a collection whose size is
+/// the cage's process count.
+///
+/// A pid is recorded whatever it is named, plumbing included, so a launch process that runs the
+/// agent's command in place is reported once it does.
+fn newly_running<'t>(
+    table: &'t BTreeMap<u32, ProcInfo>,
+    root: u32,
+    seen: &mut BTreeMap<u32, String>,
+) -> Vec<(u32, &'t ProcInfo)> {
+    let live = descendant_pids(table, root);
+    let live_set: BTreeSet<u32> = live.iter().copied().collect();
+    seen.retain(|pid, _| live_set.contains(pid));
+    let mut fresh = Vec::new();
+    for pid in live {
+        let Some(info) = table.get(&pid) else {
+            continue;
+        };
+        if seen
+            .get(&pid)
+            .is_some_and(|comm| info.comm.is_empty() || *comm == info.comm)
+        {
+            continue;
+        }
+        seen.insert(pid, info.comm.clone());
+        if !is_plumbing(&info.comm) {
+            fresh.push((pid, info));
+        }
+    }
+    fresh
+}
+
+/// The poll loop: each tick, snapshot the cage's descendants, record each process
+/// [`newly_running`] reports (into the ring, and to stderr when `inline`), then sleep in short
+/// slices so a stop is honoured promptly.
 fn run_loop(
     root: u32,
     interval: Duration,
@@ -252,35 +304,19 @@ fn run_loop(
     inline: bool,
 ) {
     let pal = crate::style::Palette::for_stream(color);
-    // Holds only the pids still alive at the last tick, not every pid ever observed. Two reasons,
-    // and the first is the one that costs correctness: a pid the kernel reuses after its first
-    // holder exits would otherwise be remembered forever and its `execve` never reported — a gap
-    // the observed workload can arrange, by churning short-lived processes until the counter wraps
-    // onto a number the lens has already retired. The second is that a long run's set would grow
-    // without bound. Retaining against the live set costs one pass over a collection whose size is
-    // the cage's process count.
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    let mut seen: BTreeMap<u32, String> = BTreeMap::new();
     while !stop.load(Ordering::Relaxed) {
         let table = observe::read_proc_table();
-        let live = descendant_pids(&table, root);
-        let live_set: BTreeSet<u32> = live.iter().copied().collect();
-        seen.retain(|pid| live_set.contains(pid));
-        for pid in live {
-            if seen.insert(pid)
-                && let Some(info) = table.get(&pid)
-                && !is_plumbing(&info.comm)
-            {
-                let cmd = command_of(info);
-                ring.push(pid, &cmd);
-                if inline {
-                    // One `\n`-terminated line per event. Inline runs only on the non-tty
-                    // foreground path (an interactive terminal reads `sbx proc logs`/`live`
-                    // instead), so no raw-mode `\r` framing is needed — plain newlines are
-                    // correct here.
-                    // Verbatim, never through the span painter: `cmd` is the agent's own
-                    // argv, and a backtick pair inside it is command text, not markup.
-                    errln!("{}[sbx:exec]{} {}", pal.dim, pal.reset, cmd);
-                }
+        for (pid, info) in newly_running(&table, root, &mut seen) {
+            let cmd = command_of(info);
+            ring.push(pid, &cmd);
+            if inline {
+                // One `\n`-terminated line per event. Inline runs only on the non-tty foreground
+                // path (an interactive terminal reads `sbx proc logs`/`live` instead), so no
+                // raw-mode `\r` framing is needed — plain newlines are correct here.
+                // Verbatim, never through the span painter: `cmd` is the agent's own argv, and a
+                // backtick pair inside it is command text, not markup.
+                errln!("{}[sbx:exec]{} {}", pal.dim, pal.reset, cmd);
             }
         }
         sleep_interruptible(interval, stop);
@@ -479,6 +515,139 @@ mod tests {
             comm: comm.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    /// One tick of [`newly_running`] over `rows`, under root 1: the pids it reports.
+    fn tick(seen: &mut BTreeMap<u32, String>, rows: &[(u32, ProcInfo)]) -> Vec<u32> {
+        let table: BTreeMap<u32, ProcInfo> = rows.iter().cloned().collect();
+        newly_running(&table, 1, seen)
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect()
+    }
+
+    /// A process that runs another program in place keeps its pid, and is reported again under
+    /// the program it became: the kernel renames it after that program.
+    #[test]
+    fn a_process_that_runs_another_program_in_place_is_reported_again() {
+        let mut seen = BTreeMap::new();
+        let wrapper = info(1, "sh", &["sh", "-c", "sleep 0.9; exec sleep 1.5"]);
+        assert_eq!(tick(&mut seen, &[(7, wrapper.clone())]), vec![7]);
+        assert_eq!(tick(&mut seen, &[(7, wrapper)]), Vec::<u32>::new());
+        assert_eq!(
+            tick(&mut seen, &[(7, info(1, "sleep", &["sleep", "1.5"]))]),
+            vec![7],
+            "the program the wrapper became is never reported"
+        );
+    }
+
+    /// A launch process, first seen under a plumbing name and left out of the feed, is reported
+    /// once it runs the agent's command in place.
+    #[test]
+    fn plumbing_that_runs_the_command_in_place_is_reported_then() {
+        let mut seen = BTreeMap::new();
+        assert_eq!(
+            tick(&mut seen, &[(7, info(1, "bwrap", &["bwrap"]))]),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            tick(&mut seen, &[(7, info(1, "node", &["node", "agent"]))]),
+            vec![7]
+        );
+    }
+
+    /// A process that has exited and is not yet reaped has no command line left, and keeps its
+    /// name: it is not reported again on the ticks that catch it so.
+    #[test]
+    fn an_exited_process_not_yet_reaped_is_not_reported_again() {
+        let mut seen = BTreeMap::new();
+        assert_eq!(
+            tick(&mut seen, &[(7, info(1, "sleep", &["sleep", "0.1"]))]),
+            vec![7]
+        );
+        assert_eq!(
+            tick(&mut seen, &[(7, info(1, "sleep", &[]))]),
+            Vec::<u32>::new()
+        );
+    }
+
+    /// A pid gone at one tick and held again at the next belongs to another process, reported
+    /// though it runs under the same name.
+    #[test]
+    fn a_pid_held_again_after_a_tick_without_it_is_reported() {
+        let mut seen = BTreeMap::new();
+        let sleeping = info(1, "sleep", &["sleep", "1"]);
+        assert_eq!(tick(&mut seen, &[(7, sleeping.clone())]), vec![7]);
+        assert_eq!(tick(&mut seen, &[]), Vec::<u32>::new());
+        assert_eq!(tick(&mut seen, &[(7, sleeping)]), vec![7]);
+    }
+
+    /// A process whose name could not be read, gone between the listing and the read, is not
+    /// reported again: the empty name is no other program.
+    #[test]
+    fn a_name_that_could_not_be_read_is_no_other_program() {
+        let mut seen = BTreeMap::new();
+        assert_eq!(
+            tick(&mut seen, &[(7, info(1, "sleep", &["sleep", "1"]))]),
+            vec![7]
+        );
+        assert_eq!(tick(&mut seen, &[(7, info(1, "", &[]))]), Vec::<u32>::new());
+    }
+
+    /// The first event in `ring` that `wanted` accepts, failing the test naming `what` when none has
+    /// come within ten seconds.
+    fn event_in(
+        ring: &ExecRing,
+        what: &str,
+        wanted: impl Fn(&super::super::proc_control::ExecEvent) -> bool,
+    ) -> super::super::proc_control::ExecEvent {
+        let started = std::time::Instant::now();
+        loop {
+            let events = ring.snapshot(None).events;
+            if let Some(event) = events.iter().find(|e| wanted(e)) {
+                return event.clone();
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{what}: {events:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Driven through a real observer over real processes: a wrapper that runs `sleep` in place
+    /// once the test has seen it, under a parent of the test's own so no other test's processes
+    /// reach the ring. The wrapper waits for a file the test writes after the wrapper's own event,
+    /// and the program it becomes outlives many ticks, so neither form depends on when a tick lands.
+    /// The wait is bounded, so a test that fails before the release leaves nothing waiting for good.
+    #[test]
+    fn the_observer_reports_the_program_a_wrapper_runs_in_place() {
+        let dir = crate::testutil::TmpDir::new();
+        let released = dir.join("released");
+        let wrapper_script = "i=0; while [ ! -e \"$0\" ] && [ $i -lt 400 ]; do sleep 0.05; \
+                              i=$((i+1)); done; exec sleep 30";
+        let mut parent = std::process::Command::new("sh")
+            .args(["-c", "sh -c \"$1\" \"$2\"; true", "parent", wrapper_script])
+            .arg(&released)
+            .spawn()
+            .expect("sh runs");
+        let ring = Arc::new(ExecRing::new(EXEC_RING_CAP));
+        let observer =
+            ExecObserver::start(parent.id(), OBSERVE_POLL_INTERVAL, Arc::clone(&ring), false);
+        let wrapper = event_in(&ring, "the wrapper is reported", |e| {
+            e.command.starts_with("sh -c i=0; while")
+        })
+        .pid;
+        std::fs::write(&released, b"").expect("the wrapper is released");
+        let became = event_in(
+            &ring,
+            "the program the wrapper runs in place is reported",
+            |e| e.pid == wrapper && e.command == "sleep 30",
+        );
+        drop(observer);
+        // SAFETY: a signal to the wrapper, a process this test started and has just seen running.
+        unsafe { libc::kill(became.pid as libc::pid_t, libc::SIGKILL) };
+        parent.wait().expect("the parent is reaped");
     }
 
     #[test]

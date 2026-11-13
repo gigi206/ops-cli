@@ -103,7 +103,9 @@ On a **non-interactive foreground run** the process events are *also* echoed inl
   terminal with [`sbx proc logs <id> -f`](proc#logs) / [`sbx fs logs <id> -f`](fs#logs), which, for a detached run, is the only way to see what it does.
 - Honest limit: the process feed polls, so a process shorter than a tick (~300 ms) is missed; the
   file feed sees a completed write-and-close, and only in the project tree (not `/tmp`, the store,
-  or the home).
+  or the home). A process that runs another program in place (`exec`) keeps its pid and is
+  reported again under that program's name, which is how the feed tells the two apart: a program
+  run in place under the same name is not.
 - For **precise per-exec capture and blocking**, set [`[proc] mode = "enforce"`/`"ask"`](../configuration/proc)
   (a trusted-only security field): the process feed then comes from a seccomp user-notification
   supervisor that captures every exec exactly and can refuse a denied one before it runs. The
