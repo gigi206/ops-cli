@@ -988,7 +988,7 @@ pub(crate) fn bind_and_serve(
 /// past a cursor). A session whose socket is absent — the lens was never stood up, or the launch is
 /// dead — fails the connect, which the caller distinguishes from an empty feed. An answer cut before
 /// its `ok` fails too ([`super::reply`]), so its `head=` never moves a cursor past events that did
-/// not arrive.
+/// not arrive, and so does a refusal, an `err …` line ([`super::reply::refused`]).
 ///
 /// A line the reader does not recognise is skipped rather than failing the read, so a session
 /// serving a field this reader has never heard of is still readable.
@@ -1012,6 +1012,12 @@ pub(crate) fn read_log<E: Event>(socket: &Path, after: Option<u64>) -> io::Resul
     let mut head = 0;
     for line in super::reply::answer(BufReader::new(&stream)) {
         let line = line?;
+        // A refusal is the session's whole answer, and an error: read as lines with nothing to
+        // keep, it would be a feed holding nothing at cursor 0, from which a follow reads the ring
+        // again from its start.
+        if line.starts_with("err ") {
+            return Err(super::reply::refused(&line));
+        }
         if let Some(v) = line.strip_prefix("dropped=") {
             dropped = v.parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("head=") {
@@ -1340,6 +1346,25 @@ mod tests {
             read_log(&socket, Some(snap.head)).expect("the follow read");
         assert_eq!(snap.events.iter().map(|e| e.seq).collect::<Vec<_>>(), [2]);
         assert_eq!(snap.events[0].tail, "second");
+    }
+
+    /// A session that answers a read with a refusal is an error the reader names, not a feed that
+    /// holds nothing: its `err` line is the whole answer, and read as a feed it handed back no
+    /// events and a cursor of 0, from which a follow reads the ring again.
+    #[test]
+    fn a_refused_read_is_an_error_not_an_empty_feed() {
+        let dir = crate::testutil::TmpDir::new();
+        let socket = dir.join("lens.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        std::thread::spawn(move || {
+            let _ = serve(listener, |_| "err not-now\n".to_string());
+        });
+        let e = read_log::<TestEvent>(&socket, Some(4)).expect_err("a refusal is not a feed");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+        assert!(
+            e.to_string().contains("not-now"),
+            "the refusal is named: {e}"
+        );
     }
 
     /// Past [`super::conncap::CONTROL_CONNS`] a connection is closed unanswered rather than given a thread,
