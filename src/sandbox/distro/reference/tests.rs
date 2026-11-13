@@ -51,12 +51,24 @@ fn a_port_is_part_of_the_registry_not_a_tag_separator() {
 fn docker_hub_is_addressed_at_the_host_that_serves_its_api() {
     // The published name and the serving name differ, and a fetcher that used the published one
     // would be following a redirect to a host it never checked.
-    for published in ["docker.io", "index.docker.io"] {
+    // However the name is written to mean that host: in another case, or with the port an
+    // `https` request takes anyway.
+    for published in [
+        "docker.io",
+        "index.docker.io",
+        "Docker.io",
+        "INDEX.DOCKER.IO",
+        "docker.io:443",
+        "Index.Docker.io:443",
+    ] {
         let parsed = parse(&format!("oci:{published}/library/debian:10")).expect("valid");
         assert_eq!(parsed.api_host(), "registry-1.docker.io", "{published}");
     }
-    let parsed = parse("oci:ghcr.io/owner/image:1").expect("valid");
-    assert_eq!(parsed.api_host(), "ghcr.io");
+    // Another port is another service, asked as written, and so is any other host.
+    for other in ["docker.io:5000", "ghcr.io", "mirror.docker.io"] {
+        let parsed = parse(&format!("oci:{other}/owner/image:1")).expect("valid");
+        assert_eq!(parsed.api_host(), other);
+    }
 }
 
 /// A tag is the shape a registry accepts: up to 128 characters, opening on a letter, a digit or

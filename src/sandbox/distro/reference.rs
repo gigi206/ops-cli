@@ -51,10 +51,16 @@ impl ImageRef {
     /// request to the former answers with a redirect a fetcher would have to follow to a host it
     /// never checked. Naming the substitution here keeps it one line instead of one condition per
     /// request.
+    ///
+    /// Recognised however the name is written to mean the same host: a host name is read without
+    /// regard to case, and `:443` is the port an `https` request takes anyway. Another port is
+    /// another service, and is asked as written.
     pub(crate) fn api_host(&self) -> &str {
-        match self.registry.as_str() {
-            "docker.io" | "index.docker.io" => "registry-1.docker.io",
-            other => other,
+        let host = self.registry.strip_suffix(":443").unwrap_or(&self.registry);
+        if host.eq_ignore_ascii_case("docker.io") || host.eq_ignore_ascii_case("index.docker.io") {
+            "registry-1.docker.io"
+        } else {
+            &self.registry
         }
     }
 
