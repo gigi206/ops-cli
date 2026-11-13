@@ -89,7 +89,7 @@ fn bundle_rm(args: &[OsString]) -> ExitCode {
         // Asked BEFORE the file goes away: the answer is read out of the profiles, and a reader
         // would still get it afterwards, but naming the apps in the same breath as the removal is
         // the point of saying it at all.
-        let users = config::apps_using_bundle(name);
+        let (users, unread) = config::apps_using_bundle(name);
         let path = dir.join(format!("{name}.toml"));
         match std::fs::remove_file(&path) {
             Ok(()) => {
@@ -103,6 +103,17 @@ fn bundle_rm(args: &[OsString]) -> ExitCode {
                          until the bundle is imported again or dropped from its `use`. A \
                          project's own `[app.<name>] use` is not searched here.",
                         users.join(", ")
+                    ));
+                }
+                // A profile that could not be read is in neither list: say so, or an empty
+                // answer reads as "no app uses it".
+                if !unread.is_empty() {
+                    for w in &unread {
+                        diag::warn_config(w);
+                    }
+                    diag::warn(&format!(
+                        "not every app profile could be read, so one that still names `{name}` \
+                         in `use` may be missing from this answer"
                     ));
                 }
             }

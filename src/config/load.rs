@@ -1474,13 +1474,18 @@ fn read_profile_apps(warnings: &mut Vec<String>) -> BTreeMap<String, RawApp> {
 /// Only the global profiles are read, and that is the honest limit: a bundle is global, but a
 /// project's own `.sbx.toml` may name one in an `[app.<name>] use` too, and there is no register of
 /// every project on the machine to consult. A caller must not phrase the answer as exhaustive.
-pub(crate) fn apps_using_bundle(bundle: &str) -> Vec<String> {
+///
+/// The second half is what the read of the profiles warned of: a profile that could not be read
+/// or parsed, or a directory that could not be listed, is not among the answer whatever its `use`
+/// says, so an empty answer with warnings is not "no app uses it".
+pub(crate) fn apps_using_bundle(bundle: &str) -> (Vec<String>, Vec<String>) {
     let mut warnings = Vec::new();
-    read_profile_apps(&mut warnings)
+    let users = read_profile_apps(&mut warnings)
         .into_iter()
         .filter(|(_, app)| app.uses.iter().any(|u| u == bundle))
         .map(|(name, _)| name)
-        .collect()
+        .collect();
+    (users, warnings)
 }
 
 /// Read every `<name>.toml` profile under `dir`, keyed by its filename stem (the app name). Each

@@ -6767,6 +6767,34 @@ fn bundle_rm_names_the_app_profiles_that_still_use_it() {
     );
 }
 
+/// An app profile that could not be read is not searched for the bundle, whatever its `use`
+/// says, and the removal says so: without it, a removal that named no app read as one no app
+/// was using.
+#[test]
+fn bundle_rm_says_when_a_profile_it_could_not_read_may_still_use_it() {
+    let p = Project::new("brm");
+    p.write_bundle("demo", "[packages]\njq = \"nix:jq\"\n");
+    // Not TOML: the array is never closed.
+    p.write_profile("broken", "cmd = [\"true\"]\nuse = [\"demo\"\n");
+
+    let out = p.run(&["bundle", "rm", "demo"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the removal is not refused: {stderr}"
+    );
+    assert!(
+        stderr.contains("broken"),
+        "it names the profile it could not read: {stderr}"
+    );
+    assert!(
+        stderr.contains("may be missing from this answer"),
+        "and that the answer is not exhaustive for it: {stderr}"
+    );
+    assert!(!p.bundle_path("demo").exists());
+}
+
 #[test]
 fn bundle_rm_refuses_an_absent_name_and_a_bad_one() {
     let p = Project::new("brm");

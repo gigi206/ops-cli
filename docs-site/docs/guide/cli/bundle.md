@@ -158,7 +158,9 @@ sbx: warning: app profile(s) still name `demo` in `use`: claude-code — none of
 ```
 
 Only the global app profiles are searched. A project's own `[app.<name>] use` is not, since there
-is no register of every project on the machine.
+is no register of every project on the machine. A profile that cannot be read or parsed is not
+searched either: the removal names it, and says that an app it holds may still name the bundle,
+so an answer that names no app is not taken for one that found none.
 
 ## Examples
 
