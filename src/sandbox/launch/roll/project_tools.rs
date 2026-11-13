@@ -211,7 +211,7 @@ pub(crate) fn upgrade_project_tools(
         .groups
         .iter()
         .map(|g| g.home.name())
-        .chain(plan.following.iter().cloned())
+        .chain(plan.following.first().cloned())
         .map(|n| n.chars().count())
         .max()
         .unwrap_or(0);
@@ -310,16 +310,23 @@ pub(crate) fn upgrade_project_tools(
             }
         }
     }
-    for name in &plan.following {
-        outln!(
+    // One line for every app that follows the project's pool: in a project whose apps all read it,
+    // a line each would bury the homes that were actually rolled.
+    match plan.following.as_slice() {
+        [] => {}
+        [one] => outln!(
             "{}",
             roll_line(
-                name,
+                one,
                 width,
                 &format!("{dim}follows the project's pool{r}"),
                 pal
             )
-        );
+        ),
+        many => outln!(
+            "  {dim}{} apps follow the project's pool, rolled with it{r}",
+            many.len()
+        ),
     }
     ok
 }
