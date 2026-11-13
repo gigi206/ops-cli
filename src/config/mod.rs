@@ -3619,11 +3619,15 @@ fn union_forward(base: &mut Vec<ForwardPort>, extra: Vec<ForwardPort>) {
 /// reported by [`warn_unknown_task_keys`] and [`apps::warn_unknown_app_keys`] instead, each called
 /// where the layer that supplied the entry — and the trust gate it passed — is known.
 pub(super) fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &schema::RawConfig) {
+    // A quoted TOML key may hold any character, a line feed included, and an override's notices
+    // reach the terminal through `diag::warn`, which keeps line breaks: the key is written the way
+    // `diag::visible` writes it, so it cannot start a line of its own.
     let mut report = |section: &str, keys: &BTreeMap<String, schema::RawIgnored>| {
         for key in keys.keys() {
             warnings.push(format!(
-                "{source}: ignoring unknown key `{key}`{section} — sbx does not know this field \
-                 (check the spelling; a newer sbx's fields are ignored here on purpose)"
+                "{source}: ignoring unknown key `{}`{section} — sbx does not know this field \
+                 (check the spelling; a newer sbx's fields are ignored here on purpose)",
+                crate::diag::visible(key)
             ));
         }
     };

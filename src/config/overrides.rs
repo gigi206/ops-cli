@@ -1935,6 +1935,25 @@ mod tests {
         assert!(n.contains("--config"), "named against its blob: {n}");
     }
 
+    /// A blob's key is the blob's to spell, and a quoted one may hold a line feed. The notice that
+    /// names it reaches the terminal through `diag::warn`, which keeps line breaks, so the key is
+    /// written as an escape on the notice's own line: it cannot start a line that reads as sbx's.
+    #[test]
+    fn an_unknown_key_is_named_on_its_notices_own_line() {
+        let ov = collect_cli(Cli {
+            config: &["\"bogus\\nsbx: note: forged\" = 1"],
+            ..Default::default()
+        })
+        .unwrap();
+        let n = ov
+            .notices()
+            .iter()
+            .find(|n| n.contains("bogus"))
+            .unwrap_or_else(|| panic!("{:?}", ov.notices()));
+        assert!(!n.contains('\n'), "{n:?}");
+        assert!(n.contains("`bogus\\x0asbx: note: forged`"), "{n:?}");
+    }
+
     #[test]
     fn a_mise_table_in_a_blob_is_named_like_the_other_global_only_ones() {
         // `[mise]` is global-only by construction, the same class as `[bundle.*]` and
