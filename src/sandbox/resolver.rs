@@ -855,9 +855,12 @@ fn apply_host_env(
         if path_valued {
             env_paths.retain(|(k, _)| k != key);
             if let Some(why) = unbindable(value) {
+                // The value is the config's to spell, line feed included, and a warning keeps line
+                // breaks: it is written the way `diag::visible` writes it, on the warning's line.
                 crate::diag::warn(&format!(
-                    "not passing ${key} to the `{called}` plugin — the value `{value}` configured \
-                     for it {why}, so there is nothing in the cage for it to name"
+                    "not passing ${key} to the `{called}` plugin — the value `{}` configured for it \
+                     {why}, so there is nothing in the cage for it to name",
+                    crate::diag::visible(value)
                 ));
                 continue;
             }
@@ -888,7 +891,8 @@ fn resolve_env_paths(keys: &[String]) -> Vec<(String, String)> {
     for (key, value) in resolve_allow_env(keys) {
         if let Some(why) = unbindable(&value) {
             crate::diag::warn(&format!(
-                "not binding ${key} for a resolver plugin — its value `{value}` {why}"
+                "not binding ${key} for a resolver plugin — its value `{}` {why}",
+                crate::diag::visible(&value)
             ));
             continue;
         }
@@ -2614,6 +2618,57 @@ printf 'run-%s' "$n""#,
         assert!(
             allow_env.is_empty() && env_paths.is_empty(),
             "a configured value is dropped with its bind: {allow_env:?} {env_paths:?}"
+        );
+    }
+
+    /// Run alone by [`an_unbindable_value_is_named_on_its_warnings_own_line`]: the same relative
+    /// value, carrying a line feed, from a `[plugin.<name>]` table and from sbx's environment.
+    #[test]
+    #[ignore = "run alone by the test that reads what it wrote"]
+    fn an_unbindable_value_is_warned_about() {
+        crate::testutil::when_run_alone(|_| {
+            const VAR: &str = "SBX_TEST_RESOLVER_UNBINDABLE_LINE";
+            let value = "relative\nsbx: note: forged";
+            let (mut allow_env, mut env_paths) = (Vec::new(), Vec::new());
+            apply_host_env(
+                &[(VAR.to_string(), value.to_string())],
+                &[VAR.to_string()],
+                "test",
+                &mut allow_env,
+                &mut env_paths,
+            );
+            let _lock = env_lock();
+            let _var = EnvVar::set(VAR, value);
+            resolve_env_paths(&[VAR.to_string()]);
+            Ok(())
+        });
+    }
+
+    /// A path-valued variable's value is named in the warning that drops it, as the config or the
+    /// environment spelled it, and a warning keeps line breaks: the value is written as an escape
+    /// on the warning's own line, so a line feed in it cannot start a line that reads as sbx's.
+    /// Read from what the two warnings wrote, in a process of their own.
+    #[test]
+    fn an_unbindable_value_is_named_on_its_warnings_own_line() {
+        let ran = crate::testutil::run_alone(concat!(
+            module_path!(),
+            "::an_unbindable_value_is_warned_about"
+        ));
+        assert!(ran.ended_well(), "{}{}", ran.stdout, ran.stderr);
+        assert_eq!(
+            ran.stderr
+                .matches("`relative\\x0asbx: note: forged`")
+                .count(),
+            2,
+            "both warnings name the value as an escape: {}",
+            ran.stderr
+        );
+        assert!(
+            !ran.stderr
+                .lines()
+                .any(|line| line.starts_with("sbx: note: forged")),
+            "a value started a line: {}",
+            ran.stderr
         );
     }
 
