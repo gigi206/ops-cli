@@ -527,6 +527,12 @@ const DROPPED_TABLES: &[(&str, fn(&RawConfig) -> bool, &str)] = &[
          the project, written in its config where it is reviewed, not a one-launch decision",
     ),
     (
+        "apps",
+        |r| r.apps.is_some(),
+        "the rules every app of a project shares are a property of the project, written in its \
+         config where they are reviewed; a launch adds its own through `network`",
+    ),
+    (
         "distro",
         |r| r.distro.is_some(),
         "the substrate a cage is built on is not a one-launch decision",
@@ -635,6 +641,9 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         // Dropped for the same reason: which of the project's own tools its apps may run is
         // recorded in the project's config, not decided for one launch.
         apps_read_project_pool: _,
+        // Dropped for the same reason: rules every app of the project shares are recorded in the
+        // project's config, and a launch names its own rules through `network`.
+        apps: _,
         binds,
         packages,
         nixpkgs,
@@ -758,6 +767,9 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         // Dropped for the same reason: which of the project's own tools its apps may run is
         // recorded in the project's config, not decided for one launch.
         apps_read_project_pool: _,
+        // Dropped for the same reason: rules every app of the project shares are recorded in the
+        // project's config, and a launch names its own rules through `network`.
+        apps: _,
         env,
         binds,
         packages,

@@ -1217,3 +1217,95 @@ fn global_app_source(name: &str) -> String {
 pub(super) fn project_app_source(name: &str) -> String {
     format!("{PROJECT_CONFIG} [app.{name}]")
 }
+
+/// Add the project's `[apps.network]` rules to every app's network policy.
+///
+/// Applied once every app is resolved, so the addition lands on the policy the app ends up with:
+/// its profile's, the project's `[app.<name>.network]` for it, or, for an app that declares
+/// neither, the posture it inherits (`baseline_network`). A project overlay naming a `mode` is a
+/// policy of its own and replaces the one below it, so rules added before it would be dropped; added
+/// here they survive it. A one-shot override is laid over the merged policy later and still decides
+/// last.
+///
+/// The rules amend a filtering posture only. Under `none` or `shared` an app carries no rules, and
+/// amending would hand it a posture nobody chose (an app that reaches nothing turned into an
+/// allowlist that reaches these hosts, one that reaches everything narrowed to them), so such an
+/// app is left as it is.
+///
+/// Project-only and trusted-only, see [`schema::RawAppsNetwork`]. The global config's `[apps]` is
+/// named and dropped, an untrusted project's is refused with the reason, and each key the tables do
+/// not know, `mode` among them, is named rather than passed over.
+pub(super) fn apply_apps_section(
+    warnings: &mut Vec<String>,
+    apps: &mut BTreeMap<String, ResolvedApp>,
+    global: Option<schema::RawApps>,
+    project: Option<(schema::RawApps, TrustState)>,
+    net_groups: &NetGroups,
+    baseline_network: &NetworkPolicy,
+) {
+    if global.is_some() {
+        warnings.push(format!(
+            "{GLOBAL_CONFIG}: ignoring `[apps]` — it is read from a project's config only: a rule \
+             written there reaches every app launched from that project, so it belongs to the \
+             project that asks for it"
+        ));
+    }
+    // `[app.network]` parses as an app named `network`, and an app reports against itself, so the
+    // slip from `[apps.network]` would surface on a launch nobody makes. With no command from any
+    // layer it cannot launch either, which is what tells the slip from a real app of that name.
+    if apps.get("network").is_some_and(|app| app.cmd.is_empty()) {
+        warnings.push(format!(
+            "{PROJECT_CONFIG}: `[app.network]` declares an app named `network`, which has no \
+             command; the rules every app shares are written under `[apps.network]`"
+        ));
+    }
+    let Some((section, state)) = project else {
+        return;
+    };
+    for key in section.rest.keys() {
+        warnings.push(format!(
+            "{PROJECT_CONFIG}: ignoring unknown key `{key}` under `[apps]` — sbx does not know \
+             this field (check the spelling)"
+        ));
+    }
+    let Some(table) = section.network else {
+        return;
+    };
+    for key in table.rest.keys() {
+        warnings.push(format!(
+            "{PROJECT_CONFIG}: ignoring `{key}` under `[apps.network]` — only `allow`, `deny` and \
+             `mute` are added to every app; an app's posture is its own, set in its profile or in \
+             `[app.<name>.network]`"
+        ));
+    }
+    if table.allow.is_empty() && table.deny.is_empty() && table.mute.is_empty() {
+        return;
+    }
+    if state != TrustState::Trusted {
+        refuse_untrusted(warnings, PROJECT_CONFIG, "`[apps.network]`", state);
+        return;
+    }
+    let field = schema::NetworkField::Table(schema::NetworkTable {
+        allow: table.allow,
+        deny: table.deny,
+        mute: table.mute,
+        ..Default::default()
+    });
+    let source = format!("{PROJECT_CONFIG} [apps.network]");
+    for app in apps.values_mut() {
+        let current = app.network.as_ref().unwrap_or(baseline_network);
+        if !matches!(current, NetworkPolicy::Allowlist(_)) {
+            continue;
+        }
+        if let Some(policy) = validate_network_amending(
+            &mut app.warnings,
+            &mut app.refusals,
+            &source,
+            field.clone(),
+            net_groups,
+            current,
+        ) {
+            app.network = Some(policy);
+        }
+    }
+}

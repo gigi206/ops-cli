@@ -715,6 +715,47 @@ A one-shot `--config` blob whose `[network]` table names no `mode` amends the sa
 launch: `--config 'network.capture = "headers"'` watches an app's traffic under the rules it
 already has. See [One-shot overrides](overrides#the---net-posture).
 
+### Rules every app of the project shares: `[apps.network]`
+
+An app's own posture replaces the project's, so a host every app launched from a project needs
+would otherwise be written once per app. A trusted project writes it once instead:
+
+```toml
+# ./.sbx.toml
+[apps.network]
+allow = ["{GET,HEAD} https://downloads.example.com"]
+deny = ["tracker.example.com"]
+mute = ["telemetry.example.com"]
+```
+
+Each app launched from the project gets these entries on top of its own rules, whatever its
+profile is. The table amends like a mode-less overlay and takes the same entry grammar,
+`@group` references included, but it carries **rules only**: `allow`, `deny` and `mute`. A
+`mode`, or any other `[network]` setting, is named and ignored, because an app's posture is its
+own and stays set in its profile or in `[app.<name>.network]`.
+
+What each app ends up with:
+
+| The app's posture | With `[apps.network]` |
+|---|---|
+| `mode = "deny"`, `"ask"` or `"allow"` | the same mode, its own rules, and the shared ones |
+| none of its own | the posture it inherits, with the shared rules added |
+| `network = "none"` or `"shared"` | unchanged: it carries no rules, so none is added |
+
+The rules are added after the project's `[app.<name>.network]`, so an overlay that names a
+`mode`, and therefore replaces the policy below it, keeps them. A one-shot `--net` or `--config`
+still decides last, and the project's own shell (`sbx run`) is not an app: its policy stays the
+project's `[network]`.
+
+A rule written here reaches every app, those that hold credentials among them. The table is
+therefore a security field, read from a **trusted project only** and never from the global
+config: an untrusted or changed project's table is ignored with the reason, and `sbx trust`
+names each rule it adds, on each app it reaches. `sbx config show --app <name>` shows an app's
+policy with them folded in.
+
+An `[app.network]` written for this table declares an app named `network` instead; with no
+command it cannot launch, and sbx says so on every launch.
+
 Every other layered table composes instead of replacing: [`[limits]`](limits) merges field by
 field, [`[fs]`](fs), [`forward`](../networking/forward), [`[devices]`](devices), [`[seccomp]`](seccomp)
 and [`[ssh_agent]`](ssh-agent) union their entries, and [`[notify]`](notify) inherits per

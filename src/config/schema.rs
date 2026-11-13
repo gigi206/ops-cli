@@ -84,6 +84,10 @@ pub(crate) struct RawConfig {
     /// refused, and not at all on a bubblewrap without `--bind-fd`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) apps_read_project_pool: bool,
+    /// What every app launched from this project shares, as an `[apps]` table: today its
+    /// `[apps.network]` rules (see [`RawApps`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) apps: Option<RawApps>,
     /// Inline nix flakes, declared as `[flakes.<name>]` tables. Each carries a full `flake.nix`
     /// written directly in the config (the `flake` field, a multiline string) plus an optional
     /// output `attr` (default `"default"`); sbx stages it, binds it read-only into the cage, and
@@ -422,6 +426,43 @@ pub(crate) struct RawConfig {
     /// config written for a newer sbx load on an older one — but a misspelled `memory_maxx` and a
     /// field from next year's release are indistinguishable in silence, and only one of them is
     /// harmless. Kept so the loader can say what it passed over. See [`RawIgnored`].
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
+}
+
+/// The `[apps]` table: settings that apply to every app launched from the project, whichever its
+/// profile.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawApps {
+    /// Egress rules added to every app's own posture, as `[apps.network]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) network: Option<RawAppsNetwork>,
+    /// Every key of this table sbx does not know, kept so the loader names it.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
+}
+
+/// The `[apps.network]` table: `allow`, `deny` and `mute` entries appended to the network policy
+/// of every app launched from the project, on top of its profile and of the project's own
+/// `[app.<name>.network]` for it.
+///
+/// An addition, never a posture: it carries no `mode`, and an app whose posture carries no rules
+/// (`network = "none"` or `"shared"`) is left exactly as it is, so a rule written here can neither
+/// open an app that reaches nothing nor narrow one that reaches everything. The entries take the
+/// grammar of a `[network]` table, `@group` references included.
+///
+/// **A security field**, honored only from a trusted project and never from the global config: a
+/// rule written once reaches every app, those that hold credentials among them, so it belongs to
+/// the project that asks for it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawAppsNetwork {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) deny: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) mute: Vec<String>,
+    /// Every key of this table sbx does not know, a `mode` among them, kept so the loader names it.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,
 }

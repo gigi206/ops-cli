@@ -61,7 +61,7 @@ pub(crate) use tools::{
     is_valid_tarball_url, names_a_local_flake_source,
 };
 // The per-app overlay engine, which the resolution engine drives once per resolution.
-use apps::resolve_apps;
+use apps::{apply_apps_section, resolve_apps};
 // The label a project app's notes carry, which the bundle fold's own notes on that app share.
 use apps::project_app_source;
 // The gate the resolution engine routes every security-relevant field through, and the two
@@ -1142,6 +1142,7 @@ impl Resolved {
             // grant belongs to the project's config, not to one launch.
             apps_share_install_pools: _,
             apps_read_project_pool: _,
+            apps: _,
             env,
             binds,
             packages,
@@ -2067,6 +2068,12 @@ fn resolve(
     let project_apps = project
         .as_mut()
         .map(|(proj, state)| (std::mem::take(&mut proj.app), *state));
+    // The rules every app shares, lifted with the apps they apply to. Project-only: the global
+    // config's `[apps]` is named and dropped where the rest of its fields are read.
+    let global_apps_section = global.apps.take();
+    let project_apps_section = project
+        .as_mut()
+        .and_then(|(proj, state)| proj.apps.take().map(|section| (section, *state)));
 
     let mut warnings = Vec::new();
     let mut refusals = Vec::new();
@@ -3103,6 +3110,14 @@ fn resolve(
         &notify,
         allow_insecure_http,
         plugins,
+    );
+    apply_apps_section(
+        &mut warnings,
+        &mut apps,
+        global_apps_section,
+        project_apps_section,
+        &net_groups,
+        &network,
     );
 
     // An *app* `[packages] mise:nix:<pkg>` re-introduces the per-project misalignment the mise split

@@ -85,6 +85,7 @@ fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
         apps_share_install_pools: false,
         apps_read_project_pool: false,
+        apps: None,
         accepts_fresh_releases: Default::default(),
         net_group_files: Default::default(),
         timezone: None,
@@ -15035,4 +15036,265 @@ fn a_destination_is_reserved_once_per_table_and_anew_by_an_overlay() {
     };
     let by: Vec<&[String]> = p.reserved().iter().map(|r| r.by()).collect();
     assert_eq!(by, vec![&["git".to_string()][..]]);
+}
+
+/// The rule strings of one app's filtering policy, for the `[apps.network]` tests.
+fn apps_network_rules(
+    r: &Resolved,
+    app: &str,
+) -> (crate::allowlist::DefaultAction, Vec<String>, Vec<String>) {
+    let Some(NetworkPolicy::Allowlist(p)) = &r.apps[app].network else {
+        panic!(
+            "`{app}` keeps a filtering policy: {:?}",
+            r.apps[app].network
+        );
+    };
+    let text = |rules: &[crate::allowlist::Rule]| rules.iter().map(|r| r.to_string()).collect();
+    (
+        p.default_action(),
+        text(p.allow_rules()),
+        text(p.deny_rules()),
+    )
+}
+
+/// A global config declaring one app per network posture, and a trusted project adding rules to
+/// every app through `[apps.network]`.
+fn apps_network_fixture(project: &str) -> Resolved {
+    let global: RawConfig = toml::from_str(
+        r#"
+[app.denying]
+cmd = ["true"]
+[app.denying.network]
+mode = "deny"
+allow = ["profile.example.com"]
+
+[app.asking]
+cmd = ["true"]
+[app.asking.network]
+mode = "ask"
+
+[app.denylisting]
+cmd = ["true"]
+[app.denylisting.network]
+mode = "allow"
+deny = ["tracker.example.com"]
+
+[app.closed]
+cmd = ["true"]
+network = "none"
+
+[app.open]
+cmd = ["true"]
+network = "shared"
+
+[app.inheriting]
+cmd = ["true"]
+"#,
+    )
+    .expect("the global config parses");
+    let project: RawConfig = toml::from_str(project).expect("the project config parses");
+    resolve_no_plugins(global, Some((project, TrustState::Trusted)))
+}
+
+const APPS_NETWORK_PROJECT: &str = r#"
+[network]
+mode = "deny"
+allow = ["base.example.com"]
+
+[apps.network]
+allow = ["shared.example.com"]
+deny = ["blocked.example.com"]
+"#;
+
+/// `[apps.network]` adds its rules to every app whose posture filters, and changes no app's mode:
+/// a `deny`, `ask` or `allow` app keeps its mode and its own rules and gains the shared ones, an app
+/// with no posture of its own gains them over the one it inherits, and an app under `none` or
+/// `shared` carries no rules and is left as it is, so the shared rules neither open the one nor
+/// narrow the other.
+#[test]
+fn apps_network_adds_its_rules_to_every_filtering_app_and_keeps_each_mode() {
+    use crate::allowlist::DefaultAction;
+    let r = apps_network_fixture(APPS_NETWORK_PROJECT);
+    for (app, mode, own_allow, own_deny) in [
+        (
+            "denying",
+            DefaultAction::Deny,
+            Some("profile.example.com"),
+            None,
+        ),
+        ("asking", DefaultAction::Ask, None, None),
+        (
+            "denylisting",
+            DefaultAction::Allow,
+            None,
+            Some("tracker.example.com"),
+        ),
+        (
+            "inheriting",
+            DefaultAction::Deny,
+            Some("base.example.com"),
+            None,
+        ),
+    ] {
+        let (action, allow, deny) = apps_network_rules(&r, app);
+        assert_eq!(action, mode, "`{app}` keeps its mode");
+        assert!(
+            allow.iter().any(|h| h.contains("shared.example.com")),
+            "`{app}` gains the shared allow rule: {allow:?}"
+        );
+        assert!(
+            deny.iter().any(|h| h.contains("blocked.example.com")),
+            "`{app}` gains the shared deny rule: {deny:?}"
+        );
+        if let Some(own) = own_allow {
+            assert!(
+                allow.iter().any(|h| h.contains(own)),
+                "`{app}` keeps {own}: {allow:?}"
+            );
+        }
+        if let Some(own) = own_deny {
+            assert!(
+                deny.iter().any(|h| h.contains(own)),
+                "`{app}` keeps {own}: {deny:?}"
+            );
+        }
+    }
+    assert!(
+        matches!(r.apps["closed"].network, Some(NetworkPolicy::Isolated)),
+        "an app under `none` stays closed: {:?}",
+        r.apps["closed"].network
+    );
+    assert!(
+        matches!(r.apps["open"].network, Some(NetworkPolicy::Shared)),
+        "an app under `shared` stays shared: {:?}",
+        r.apps["open"].network
+    );
+    // The project's own shell is not an app: its policy is the project's `[network]` alone.
+    let NetworkPolicy::Allowlist(base) = &r.network else {
+        panic!("the project keeps its allowlist: {:?}", r.network);
+    };
+    assert!(
+        !base
+            .allow_rules()
+            .iter()
+            .any(|h| h.to_string().contains("shared.example.com")),
+        "`[apps.network]` does not reach `sbx run`"
+    );
+}
+
+/// A project overlay naming a `mode` replaces the policy below it; the shared rules are added after
+/// it, so they survive it.
+#[test]
+fn apps_network_survives_a_project_overlay_that_names_a_mode() {
+    let r = apps_network_fixture(&format!(
+        "{APPS_NETWORK_PROJECT}\n[app.denying.network]\nmode = \"deny\"\nallow = [\"own.example.com\"]\n"
+    ));
+    let (_, allow, _) = apps_network_rules(&r, "denying");
+    assert!(
+        allow.iter().any(|h| h.contains("own.example.com")),
+        "{allow:?}"
+    );
+    assert!(
+        allow.iter().any(|h| h.contains("shared.example.com")),
+        "{allow:?}"
+    );
+}
+
+/// An untrusted project's `[apps.network]` opens nothing and says why; the global config's is
+/// named and dropped, since the table is project-only.
+#[test]
+fn apps_network_is_project_only_and_trusted_only() {
+    let global: RawConfig = toml::from_str(
+        "[apps.network]\nallow = [\"global.example.com\"]\n\
+         [app.denying]\ncmd = [\"true\"]\n[app.denying.network]\nmode = \"deny\"\n",
+    )
+    .expect("the global config parses");
+    let project: RawConfig = toml::from_str("[apps.network]\nallow = [\"shared.example.com\"]\n")
+        .expect("the project config parses");
+    let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
+    let (_, allow, _) = apps_network_rules(&r, "denying");
+    assert!(
+        !allow.iter().any(|h| h.contains("example.com")),
+        "neither layer added a rule: {allow:?}"
+    );
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("ignoring `[apps.network]`")),
+        "the untrusted table is named: {:?}",
+        r.warnings
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("ignoring `[apps]`")),
+        "the global table is named: {:?}",
+        r.warnings
+    );
+}
+
+/// `[apps.network]` takes rules only: a `mode` written there is named and changes no app's posture,
+/// and an unknown key under `[apps]` is named too.
+#[test]
+fn apps_network_names_what_it_does_not_take() {
+    let r = apps_network_fixture(
+        "[apps]\nnetwrok = true\n[apps.network]\nmode = \"deny\"\nallow = [\"shared.example.com\"]\n",
+    );
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("ignoring `mode` under `[apps.network]`")),
+        "{:?}",
+        r.warnings
+    );
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("unknown key `netwrok` under `[apps]`")),
+        "{:?}",
+        r.warnings
+    );
+    assert!(
+        matches!(r.apps["open"].network, Some(NetworkPolicy::Shared)),
+        "a `mode` here does not turn a shared app into an allowlist: {:?}",
+        r.apps["open"].network
+    );
+}
+
+/// Approving a project that adds `[apps.network]` names each shared rule on every app it reaches,
+/// so the review shows what the table opens before it is trusted.
+#[test]
+fn approving_apps_network_names_its_rules_on_every_app() {
+    let before = apps_network_fixture("[network]\nmode = \"deny\"\n");
+    let after = apps_network_fixture(APPS_NETWORK_PROJECT);
+    let granted = super::grants::grants(&before, &after);
+    for app in ["denying", "asking", "denylisting", "inheriting"] {
+        assert!(
+            granted.iter().any(|g| g.app.as_deref() == Some(app)
+                && g.field == "network"
+                && g.what.contains("shared.example.com")),
+            "`{app}`'s new rule is named: {granted:?}"
+        );
+    }
+    assert!(
+        !granted
+            .iter()
+            .any(|g| matches!(g.app.as_deref(), Some("closed" | "open"))
+                && g.what.contains("shared.example.com")),
+        "an app the table leaves alone is granted nothing: {granted:?}"
+    );
+}
+
+/// `[app.network]` declares an app named `network`, whose warnings only its own launch would show,
+/// so the slip from `[apps.network]` is named with the warnings every launch prints.
+#[test]
+fn an_app_named_network_with_no_command_is_named_as_the_apps_table_misspelled() {
+    let project: RawConfig = toml::from_str("[app.network]\nallow = [\"x.example.com\"]\n")
+        .expect("the project config parses");
+    let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Trusted)));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("`[app.network]`") && w.contains("`[apps.network]`")),
+        "{:?}",
+        r.warnings
+    );
 }
