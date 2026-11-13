@@ -17,7 +17,8 @@ use crate::{diag, help, layout_or_fail, sandbox, store, style};
 /// Further *words* are still ignored, which is a different decision and a deliberate one: nixhub
 /// matches a single token, so a multi-word search has nothing to carry — quote a phrase to pass it
 /// as one argument. An argument that is not valid UTF-8 cannot be a query nixhub answers to, so it
-/// is refused by name rather than dropped.
+/// is refused by name rather than dropped. A word that is empty or only blanks names nothing either:
+/// it is read as no query, the usage error, rather than sent to nixhub as one.
 ///
 /// `Err` carries the lines to print, in order, so the grammar is unit-tested without capturing
 /// output.
@@ -29,7 +30,7 @@ fn parse_search_args(args: &[OsString]) -> Result<&str, Vec<String>> {
             Some(flag) if flag.starts_with('-') => {
                 return Err(vec![format!("sbx: search: unknown flag `{flag}`"), usage()]);
             }
-            Some(word) if query.is_none() => query = Some(word),
+            Some(word) if query.is_none() && !word.trim().is_empty() => query = Some(word),
             Some(_) => {}
             None => {
                 return Err(vec!["sbx: search: argument is not valid UTF-8".to_string()]);
@@ -110,5 +111,18 @@ mod tests {
 
         // No query at all is still the usage error it was.
         assert!(parse_search_args(&v(&[])).is_err());
+    }
+
+    /// An empty word, or one of blanks only, names no package, and is read as no query rather than
+    /// sent to nixhub: each is the usage error on its own, and a query after it is still taken.
+    #[test]
+    fn an_empty_query_is_the_usage_error() {
+        let v = |xs: &[&str]| -> Vec<OsString> { xs.iter().map(OsString::from).collect() };
+        let taken: Vec<&str> = ["", " ", "\t"]
+            .into_iter()
+            .filter(|blank| parse_search_args(&v(&[blank])).is_ok())
+            .collect();
+        assert!(taken.is_empty(), "taken as a query: {taken:?}");
+        assert_eq!(parse_search_args(&v(&["", "ripgrep"])), Ok("ripgrep"));
     }
 }
