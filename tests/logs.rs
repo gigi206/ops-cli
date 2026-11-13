@@ -424,6 +424,76 @@ fn a_follow_names_a_session_each_time_it_stops_answering() {
     }
 }
 
+/// A view whose output cannot be written for any other reason than the reader leaving fails, and
+/// says so once, as every verb's output does. With standard output on `/dev/full`, every write is
+/// `ENOSPC`, what a `> file` on a full disk meets: read as a reader gone, the view ended at exit 0
+/// with the file cut short. This suite holds no capability skip, so `/dev/full` is opened outright:
+/// every Linux has it.
+#[test]
+fn a_view_that_cannot_write_its_output_fails_once() {
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("/dev/full");
+    let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
+    let child = Standin::new();
+    common::write_session_record(data.path(), child.pid(), "project", project.path());
+    serve_lens(
+        data.path(),
+        "fs",
+        child.pid(),
+        &["event seq=1 at=1700000000123 kind=write path=first.rs"],
+    );
+    let pid = child.pid().to_string();
+    for args in [&["fs", "logs"][..], &["logs", "--feed", "fs"][..]] {
+        let mut argv: Vec<&str> = args.to_vec();
+        argv.push(&pid);
+        let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(&argv)
+            .env("XDG_DATA_HOME", data.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(full.try_clone().expect("dup /dev/full"))
+            .output()
+            .expect("spawn sbx");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{argv:?}: {stderr}");
+        assert_eq!(
+            stderr.matches("cannot write to standard output").count(),
+            1,
+            "{argv:?}: said once: {stderr}"
+        );
+    }
+
+    // And a finished session's view, read from the record its lens left, writes through its own
+    // loop: the same accounting holds there.
+    let canon = std::fs::canonicalize(project.path()).unwrap();
+    let lens_dir = data.path().join("sbx").join("fs");
+    std::fs::create_dir_all(&lens_dir).unwrap();
+    std::fs::write(
+        lens_dir.join("record-7-100.log"),
+        format!(
+            "project={}\nevent seq=1 at=1700000000100 kind=write path=recorded.rs\n",
+            canon.display()
+        ),
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["fs", "logs", "7"])
+        .current_dir(&canon)
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(full.try_clone().expect("dup /dev/full"))
+        .output()
+        .expect("spawn sbx");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "a recorded view: {stderr}");
+    assert_eq!(
+        stderr.matches("cannot write to standard output").count(),
+        1,
+        "a recorded view: said once: {stderr}"
+    );
+}
+
 /// A view whose session refuses its read names the refusal and fails: the session was reached, so
 /// its lens is not absent, and it holds no empty feed either. Read as lines with nothing to keep,
 /// the refusal was a view that listed nothing at exit 0; read as an error, it was the sentence for

@@ -357,7 +357,10 @@ fn live_view<E>(
             }
             out.flush()
         })();
-        if wrote.is_err() {
+        if let Err(e) = wrote {
+            // A reader gone ends the view cleanly; any other failure is a failure of the verb's
+            // output, exit 1 ([`crate::cli::note_output_failure`]).
+            crate::cli::note_output_failure(&e);
             return ExitCode::SUCCESS;
         }
     }
@@ -421,8 +424,10 @@ fn live_view<E>(
             out.flush()
         })();
         drop(out);
-        if wrote.is_err() {
-            // A closed downstream pipe (`… | head`) ends the follow cleanly.
+        if let Err(e) = wrote {
+            // A closed downstream pipe (`… | head`) ends the follow cleanly; any other failure is a
+            // failure of the verb's output, exit 1 ([`crate::cli::note_output_failure`]).
+            crate::cli::note_output_failure(&e);
             return ExitCode::SUCCESS;
         }
         cursor = snap.head;
@@ -493,8 +498,10 @@ fn record_view<E: crate::sandbox::lens::Event>(
         }
         out.flush()
     })();
-    if wrote.is_err() {
-        // A closed downstream pipe (`… | head`) ends the view cleanly.
+    if let Err(e) = wrote {
+        // A closed downstream pipe (`… | head`) ends the view cleanly; any other failure is a
+        // failure of the verb's output, exit 1 ([`crate::cli::note_output_failure`]).
+        crate::cli::note_output_failure(&e);
         return ExitCode::SUCCESS;
     }
     ExitCode::SUCCESS
@@ -1218,7 +1225,10 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
             }
             out.flush()
         })();
-        if wrote.is_err() {
+        if let Err(e) = wrote {
+            // A reader gone ends the view cleanly; any other failure is a failure of the verb's
+            // output, exit 1 ([`crate::cli::note_output_failure`]).
+            crate::cli::note_output_failure(&e);
             return ExitCode::SUCCESS;
         }
     }
@@ -1318,7 +1328,10 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
             out.flush()
         })();
         drop(out);
-        if wrote.is_err() {
+        if let Err(e) = wrote {
+            // A reader gone ends the view cleanly; any other failure is a failure of the verb's
+            // output, exit 1 ([`crate::cli::note_output_failure`]).
+            crate::cli::note_output_failure(&e);
             return ExitCode::SUCCESS;
         }
         if let Some(end) = round.end {
