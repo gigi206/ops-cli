@@ -8,6 +8,25 @@
 mod common;
 use common::project::Project;
 
+/// Whether `line` holds a `YYYY-MM-DD` date: four digits, a dash, two, a dash, two, with no digit
+/// on either side. A digit pair alone, a `20` in a path or a pid, proves nothing.
+fn holds_a_civil_date(line: &str) -> bool {
+    let b = line.as_bytes();
+    (0..b.len().saturating_sub(9)).any(|i| {
+        let w = &b[i..i + 10];
+        let digits = |r: std::ops::Range<usize>| w[r].iter().all(u8::is_ascii_digit);
+        let before = i == 0 || !b[i - 1].is_ascii_digit();
+        let after = i + 10 == b.len() || !b[i + 10].is_ascii_digit();
+        digits(0..4)
+            && w[4] == b'-'
+            && digits(5..7)
+            && w[7] == b'-'
+            && digits(8..10)
+            && before
+            && after
+    })
+}
+
 #[test]
 fn path_lists_the_three_bases_with_present_absent_markers() {
     let fx = Project::new("path");
@@ -42,12 +61,16 @@ fn path_lists_the_three_bases_with_present_absent_markers() {
         "sbx.toml",
         "trusted/",
     ] {
-        assert!(s.contains(entry), "entry {entry} listed:\n{s}");
+        // On its own line: a tag anywhere else in the output, a base's own, says nothing about it.
+        let line = s
+            .lines()
+            .find(|l| l.trim_start().starts_with(entry))
+            .unwrap_or_else(|| panic!("entry {entry} listed:\n{s}"));
+        assert!(
+            line.contains("(present)") || line.contains("(absent)"),
+            "entry {entry} carries its state: {line:?}\n{s}"
+        );
     }
-    assert!(
-        s.contains("(present)") || s.contains("(absent)"),
-        "state tags:\n{s}"
-    );
     // The cross-reference to the config-files overview is shown.
     assert!(s.contains("sbx config path"), "cross-ref:\n{s}");
 }
@@ -76,9 +99,13 @@ fn path_enumerates_per_project_per_app_and_per_profile_entries() {
         s.contains("(markerless)"),
         "markerless state shown for a project:\n{s}"
     );
+    let project_line = s
+        .lines()
+        .find(|l| l.contains("abcdef") && l.contains("(markerless)"))
+        .unwrap_or_else(|| panic!("the project's line:\n{s}"));
     assert!(
-        s.contains("20"),
-        "a date is rendered beside the state:\n{s}"
+        holds_a_civil_date(project_line),
+        "a YYYY-MM-DD date is rendered beside the state: {project_line:?}"
     );
     assert!(
         s.contains("    myagent"),
