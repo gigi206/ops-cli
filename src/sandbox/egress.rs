@@ -4505,24 +4505,24 @@ mod tests {
         );
     }
 
-    /// A source's path is the config's to spell, and a quoted one may hold a line feed. The answer
-    /// to a credential that did not resolve names the sources it tried, and the refusal and the
-    /// warning that carry it keep line breaks, so the path is written as an escape on their line.
+    /// The answer to a credential that did not resolve quotes why, and the refusal and the warning
+    /// that carry it keep line breaks. A chain's own answer is already on one line
+    /// ([`the_chains_answer_keeps_a_source_path_on_its_line`]), and what else can fail here, a
+    /// signer that would not start, is written on the answer's line too.
     #[test]
-    fn a_source_path_is_named_on_the_line_of_the_answer() {
-        let secrets = vec![secret(
-            SecretSource::File("/nonexistent\nsbx: note: forged".into()),
+    fn a_failures_reason_is_written_on_the_answers_line() {
+        let declared = secret(
+            SecretSource::Env("SBX_TEST_EGRESS_ANSWER_LINE".into()),
             "absent.test",
             "Authorization",
             crate::config::HeaderShape::new("Bearer ", false),
-        )];
-        let refusal = resolve_injections_at_root(&secrets)
-            .unwrap_err()
-            .to_string();
-        assert!(!refusal.contains('\n'), "{refusal:?}");
+        );
+        let why = io::Error::other("the signer said: declined\nsbx: note: forged");
+        let answer = credential_failure(&declared, &why);
+        assert!(!answer.contains('\n'), "{answer:?}");
         assert!(
-            refusal.contains("/nonexistent\\x0asbx: note: forged"),
-            "{refusal:?}"
+            answer.contains("declined\\x0asbx: note: forged"),
+            "{answer:?}"
         );
     }
 
