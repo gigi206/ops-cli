@@ -291,6 +291,11 @@ fn command_failed(name: &str, stderr: &[u8]) -> io::Error {
 /// Validate a resolve command's captured stdout as a download URL: valid UTF-8, non-empty after
 /// trimming, and accepted by the backend's `validate` (so an arbitrary command cannot point sbx at a
 /// non-`https` or injecting source). Pure over the raw bytes, so it is testable without bubblewrap.
+///
+/// A URL the validator refuses is quoted in the refusal the way the command's stderr is
+/// ([`super::resolver::one_line_detail`]): on one line, bounded. It is text that failed the check,
+/// carried from a vendor's answer, and may hold a line break, a terminal sequence, or the whole of a
+/// page the command printed in place of a URL.
 fn validate_download_url(
     name: &str,
     stdout: Vec<u8>,
@@ -313,7 +318,8 @@ fn validate_download_url(
     }
     if !validate(&url, allow_insecure_http) {
         return Err(io::Error::other(format!(
-            "the `{name}` resolve command printed a URL that is not a valid {kind} source: {url}"
+            "the `{name}` resolve command printed a URL that is not a valid {kind} source: {}",
+            super::resolver::one_line_detail(url.as_bytes())
         )));
     }
     Ok(url)
@@ -474,6 +480,30 @@ mod tests {
             validate_download_url("app", b"http://e/app.zip".to_vec(), is_targz, true, "x")
                 .is_err()
         );
+    }
+
+    /// A URL the validator refuses is quoted on one line, bounded, with nothing a terminal acts
+    /// on: a line break in it, a terminal sequence or a page's worth of text printed in place of a
+    /// URL does not reach the launching terminal as it came. Each shape is checked on its own, and
+    /// every refusal that carries one through is named.
+    #[test]
+    fn a_refused_url_is_quoted_on_one_bounded_line() {
+        let refuse = |_: &str, _: bool| false;
+        let long = format!("https://e/{}", "a".repeat(4096));
+        let mut leaked = Vec::new();
+        for (what, printed) in [
+            ("a line break", "https://e/a\nsbx: note: forged".to_string()),
+            ("an escape", "https://e/a\x1b[2Jb".to_string()),
+            ("a page", long),
+        ] {
+            let why = validate_download_url("app", printed.into_bytes(), refuse, false, "x")
+                .expect_err("the validator refuses")
+                .to_string();
+            if why.contains('\n') || why.contains('\x1b') || why.chars().count() > 400 {
+                leaked.push(format!("{what}: {why:?}"));
+            }
+        }
+        assert!(leaked.is_empty(), "{leaked:?}");
     }
 
     #[test]
