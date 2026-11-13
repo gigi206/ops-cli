@@ -253,9 +253,10 @@ fn opening_a_detached_log_trims_the_directory_to_its_ceiling() {
     }
     std::fs::write(logs.join("not-a-log.txt"), b"x").unwrap();
 
+    // Through the opening itself, where the trim is enforced: a test of the reaper alone would pass
+    // with the opening no longer calling it.
     let opening = logs.join("99999.log");
-    std::fs::write(&opening, b"x").unwrap();
-    super::reap_old_logs(&logs, &opening);
+    drop(open_detach_log(&opening).expect("open this launch's log"));
 
     let kept: Vec<_> = std::fs::read_dir(&logs)
         .unwrap()
@@ -330,9 +331,18 @@ fn a_live_sessions_log_survives_the_ceiling_however_old_it_is() {
     .detached();
     registry.register(&session).expect("a registered session");
 
-    // Written first, so it is the oldest thing in the directory — the far end of the tail.
+    // The oldest thing in the directory — the far end of the tail — by a modification time set
+    // rather than by being written first: a hundred files written in one filesystem tick tie, and
+    // the tie is broken on the path, which puts a pid's log ahead of every `dead-…` one and so in
+    // what is kept whether or not the guard holds.
     let alive = logs.join(format!("{}.log", session.pid));
     std::fs::write(&alive, b"quiet but running").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&alive)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400))
+        .unwrap();
     for i in 0..(super::MAX_KEPT_LOGS + 45) {
         std::fs::write(logs.join(format!("dead-{i}.log")), b"x").unwrap();
     }
