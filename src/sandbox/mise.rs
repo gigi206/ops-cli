@@ -632,7 +632,10 @@ mod tests {
         // this file honest reads the file for that call, and a test making it would answer for the
         // code under test.
         let limits = super::super::cgroup::Limits::default();
-        if super::super::cgroup::probe(&limits).properties.is_empty() {
+        if super::super::cgroup::probe(&limits, None)
+            .properties
+            .is_empty()
+        {
             skip_incapable!("skipping the mise scope check: this host applies no resource limits");
             return;
         }

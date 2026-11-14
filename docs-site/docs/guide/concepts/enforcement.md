@@ -271,6 +271,24 @@ cage in a **transient systemd user scope**
 into the cage (it registers the scope, moves itself in, then execs), so it behaves
 like a plain argv prefix: the process tree and pty job control are unchanged.
 
+The cage does not start in the scope's own cgroup but in one below it, named `cage`. A small
+step `sbx` carries in its binary runs between `systemd-run` and bubblewrap: it creates that
+cgroup, moves itself in, then execs bubblewrap in place. The reason is where the limits live.
+They are files of the scope's cgroup (`memory.max`, `pids.max`), and the user manager creates
+that cgroup with your ownership. bubblewrap roots the cage's cgroup namespace at the cgroup it
+starts in, so a cage left in the scope's own one, once a [`[seccomp]` relaxation](../configuration/seccomp)
+lets it create a user namespace and mount, could mount a cgroup2 filesystem showing that cgroup
+and write the limits away. Started below it, the cage's view is rooted at a cgroup carrying no
+limit file at all, while the scope above still bounds everything under it.
+
+The step is placed in the engine directory under the data directory, beside the engines `sbx`
+runs on the host, and like them it is out of every cage's reach: the data directory is never
+handed to a cage writable. It is placed for the session's cage, the one a
+[`[seccomp]` relaxation](../configuration/seccomp) can reach. The helper cages keep the mandatory
+denylist, which refuses `mount` and every way into a user namespace, so they start in their
+scope's own cgroup. Where the step cannot be placed or run, the session's cage starts there too,
+still limited, and [`sbx doctor`](../cli/doctor) says so under its resource limits line.
+
 The default profile:
 
 | Limit | Property | Effect |

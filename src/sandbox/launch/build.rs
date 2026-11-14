@@ -3026,7 +3026,7 @@ pub(super) fn build(
     // The limit decision, taken once: its properties go into the contract below, and the scope
     // travels on the spec to the launch, so the ceilings the document names are the ones the cage
     // is wrapped in.
-    let limit_scope = crate::sandbox::cgroup::Scope::decide(&prep.cfg.limits);
+    let limit_scope = crate::sandbox::cgroup::Scope::decide(&prep.cfg.limits, Some(&prep.layout));
     // The binds the cage really finds at their path. One inside the project, or under a structural
     // mount, is covered by a mount emitted after it, so listing it would describe a mode the cage
     // does not have: a read-only bind inside the project takes a write, through the project's own

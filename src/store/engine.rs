@@ -79,15 +79,20 @@ mod bundled {
     include!(concat!(env!("OUT_DIR"), "/bundled_nix.rs"));
 }
 
-/// The in-cage exec-enforcement shim sbx carries inside its own binary, built from `proc-shim/`
-/// and embedded by `build.rs`. Unconditional, unlike the engines: there is no host copy to fall
-/// back to, and no other binary may take its place inside a cage.
+/// The helpers sbx carries inside its own binary, built from `proc-shim/` and embedded by
+/// `build.rs`: the in-cage exec-enforcement shim and the host-side cgroup leaf step. Unconditional,
+/// unlike the engines: there is no host copy to fall back to, and no other binary may take either's
+/// place.
 mod proc_shim_blob {
     include!(concat!(env!("OUT_DIR"), "/proc_shim.rs"));
 }
 
 /// The name the shim is materialized under, in the owned engine directory.
 const PROC_SHIM_NAME: &str = "proc-shim";
+
+/// The stem of the name the cgroup leaf step is materialized under, in the owned engine directory;
+/// the name carries the start of the step's hash after it (see [`ensure_cgroup_leaf`]).
+const CGROUP_LEAF_NAME: &str = "cgroup-leaf";
 
 /// The embedded shim's bytes, so the enforcement tests can exercise the artifact sbx actually binds
 /// rather than a stand-in that reimplements it. A stand-in would pass while the shipped shim drifted.
@@ -131,31 +136,72 @@ fn placed_intact(target: &Path, len: usize) -> bool {
 /// Unlike the engines' best-effort placement, a failure here is returned rather than swallowed:
 /// the caller is standing up enforcement, and the honest response to "the shim is not on disk" is
 /// to refuse the launch, never to bind something else in its place.
+pub(crate) fn ensure_proc_shim(layout: &Layout) -> io::Result<PathBuf> {
+    ensure_embedded(
+        &layout.engine_dir(),
+        PROC_SHIM_NAME,
+        proc_shim_blob::PROC_SHIM_BIN,
+        proc_shim_blob::PROC_SHIM_SHA256,
+    )
+}
+
+/// Materialize the embedded cgroup leaf step into the owned engine directory and return its path.
+///
+/// The step stands between the resource scope and the cage (see
+/// [`crate::sandbox::cgroup::Scope`]) and is executed host-side, which is why it lives in the
+/// engine directory: the data directory is a control-plane root, so no cage is handed it writable.
+/// A failure is returned for the scope to launch without the step, since resource limits never
+/// decide whether a cage starts.
+///
+/// The file is named after its hash rather than replaced in place. Two builds of sbx share one data
+/// directory (an installed release and a development build, or a test binary), and each launch
+/// writes then executes the step; a name per build means neither ever rewrites a file the other is
+/// about to execute.
+///
+/// Executed host-side like an owned engine, it is held to the same verdict before it is handed out
+/// ([`host_exec_verdict`]): a copy that is not a regular file, or is world-writable, is refused.
+pub(crate) fn ensure_cgroup_leaf(layout: &Layout) -> io::Result<PathBuf> {
+    let sha = proc_shim_blob::CGROUP_LEAF_SHA256;
+    let name = format!("{CGROUP_LEAF_NAME}-{}", &sha[..16]);
+    let step = ensure_embedded(
+        &layout.engine_dir(),
+        &name,
+        proc_shim_blob::CGROUP_LEAF_BIN,
+        sha,
+    )?;
+    match engine_probe(&step) {
+        EngineProbe::Trusted => Ok(step),
+        _ => Err(io::Error::other(format!(
+            "the cgroup leaf step {} is not one to execute",
+            step.display()
+        ))),
+    }
+}
+
+/// Materialize one embedded helper as `name` in `dir` and return its path.
 ///
 /// Placement is atomic and idempotent on the same principle as the engines: a unique temp sibling
-/// is written, made executable and renamed over the target, and a `.proc-shim.sha256` marker is
+/// is written, made executable and renamed over the target, and a `.<name>.sha256` marker is
 /// stamped **last** so an interrupted run re-materializes next time instead of trusting a
-/// half-written binary. A new sbx carrying a newer shim changes the hash and replaces it; the
-/// rename leaves a running cage's shim on its old inode.
-pub(crate) fn ensure_proc_shim(layout: &Layout) -> io::Result<PathBuf> {
+/// half-written binary. A new sbx carrying a newer helper changes the hash and replaces it; the
+/// rename leaves a running process's copy on its old inode.
+fn ensure_embedded(dir: &Path, name: &str, bytes: &[u8], sha: &str) -> io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
-    let dir = layout.engine_dir();
-    let shim = dir.join(PROC_SHIM_NAME);
-    let marker = dir.join(".proc-shim.sha256");
-    let sha = proc_shim_blob::PROC_SHIM_SHA256;
-    if placed_intact(&shim, proc_shim_blob::PROC_SHIM_BIN.len())
+    let target = dir.join(name);
+    let marker = dir.join(format!(".{name}.sha256"));
+    if placed_intact(&target, bytes.len())
         && std::fs::read_to_string(&marker).ok().as_deref() == Some(sha)
     {
-        return Ok(shim);
+        return Ok(target);
     }
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(&dir)?;
-    place_executable(&shim, proc_shim_blob::PROC_SHIM_BIN)?;
+        .create(dir)?;
+    place_executable(&target, bytes)?;
     // Whole and durable like the binary it vouches for, and after it.
     crate::sandbox::atomicfile::write_atomic(&marker, sha.as_bytes())?;
-    Ok(shim)
+    Ok(target)
 }
 
 /// Read an engine-override env var as an **absolute** path, ignoring (with a warning) a relative

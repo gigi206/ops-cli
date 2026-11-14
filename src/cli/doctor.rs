@@ -238,7 +238,7 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
     if let Some(v) = read_sysctl("/proc/sys/kernel/unprivileged_userns_clone") {
         rep.note(&format!("kernel.unprivileged_userns_clone = {v}"));
     }
-    report_resource_limits(&mut rep, &config::global_limits());
+    report_resource_limits(&mut rep, &config::global_limits(), layout.as_ref());
     // Read before anything later adds to it: what is recorded so far is the engine and the
     // boundary, and either one missing means no launch runs at all.
     let launches_run = remediation.is_empty();
@@ -464,11 +464,15 @@ fn report_capture(rep: &mut Report<'_>, support: &sandbox::CaptureSupport, launc
 /// still runs, so an unavailable limiter is reported for context and never
 /// recorded as a missing prerequisite. The probe launches a real transient scope,
 /// so a green line means limiting actually works on this host.
-fn report_resource_limits(rep: &mut Report<'_>, limits: &sandbox::cgroup::Limits) {
+fn report_resource_limits(
+    rep: &mut Report<'_>,
+    limits: &sandbox::cgroup::Limits,
+    layout: Option<&store::Layout>,
+) {
     // Reflect the *global* config's limits — they apply to every launch regardless of project,
     // and the live probe validates them, so a bad global value surfaces here. A trusted project
     // may further tune them per project; `sbx config` is the project-aware view.
-    let report: sandbox::LimitReport = sandbox::resource_limits(limits);
+    let report: sandbox::LimitReport = sandbox::resource_limits(limits, layout);
     if report.verified {
         rep.check(
             "ok",
@@ -478,6 +482,11 @@ fn report_resource_limits(rep: &mut Report<'_>, limits: &sandbox::cgroup::Limits
                 report.properties.join(", ")
             ),
         );
+        // The scope ran, but its cage would sit in the scope's own cgroup: said under the line,
+        // since the limits hold for a cage that cannot mount and only a relaxed one can lift them.
+        if let Some(note) = report.note {
+            rep.note(&note);
+        }
     } else if let Some(note) = report.note {
         rep.check("warn", "resource limits", &note);
     }

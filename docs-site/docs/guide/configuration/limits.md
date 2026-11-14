@@ -75,6 +75,11 @@ delegated controller, or a `systemd-run` that does not answer `--help` (sbx then
 tell whether it would rewrite the cage's arguments), the cage launches **without** limits
 rather than failing: the limits are hardening, never the boundary. See [Enforcement stack](../concepts/enforcement).
 
+The cage itself runs one cgroup below the scope, so the files that hold the limits stay out of
+its reach even under a [`[seccomp]`](seccomp) relaxation that lets it mount a cgroup2
+filesystem; [the enforcement stack](../concepts/enforcement#cgroup-v2-resource-limits-anti-dos)
+explains the step that places it there.
+
 The memory ceiling is honestly **per-cage**, not host-global (N concurrent cages can
 sum past total RAM); the task cap is the clean host-wide anti-DoS guarantee.
 

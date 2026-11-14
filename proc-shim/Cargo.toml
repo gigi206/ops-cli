@@ -1,7 +1,8 @@
-# The in-cage exec-enforcement shim, built as a binary of its own so that what sbx binds
-# inside a sandbox is a program that can do three things and nothing else. Its own workspace
-# root: sbx's build script compiles it as a separate build, and it must never inherit sbx's
-# dependency graph — the whole point is that this binary contains none of sbx.
+# sbx's two small embedded helpers, each a binary of its own so it can do its few steps and
+# nothing else: the in-cage exec-enforcement shim, and the host-side step that places a cage one
+# cgroup below its resource scope. Its own workspace root: sbx's build script compiles it as a
+# separate build, and it must never inherit sbx's dependency graph — the whole point is that these
+# binaries contain none of sbx.
 [workspace]
 
 [package]
@@ -15,6 +16,10 @@ publish = false
 [[bin]]
 name = "sbx-proc-shim"
 path = "src/main.rs"
+
+[[bin]]
+name = "sbx-cgroup-leaf"
+path = "src/cgroup_leaf.rs"
 
 [dependencies]
 # The only dependency, and deliberately the only one: this binary lives inside a sandbox, so

@@ -350,8 +350,8 @@ fn union_cage_members(mut subtree: Vec<(u32, u64)>, scope: Vec<(u32, u64)>) -> V
 /// `(pid, start_ticks)`.
 ///
 /// The launch wraps each cage in a systemd user scope whose unit name ends on the launcher's pid —
-/// `sbx-<slug>-<n>-<pid>.scope`, the same pid the session record pins — and each scope's cgroup
-/// lists exactly that cage's processes. Reading them gives a teardown a reliable member set even
+/// `sbx-<slug>-<n>-<pid>.scope`, the same pid the session record pins — and each scope's subtree
+/// holds exactly that cage's processes. Reading them gives a teardown a reliable member set even
 /// when the ppid subtree does not (a scope can reparent a cage off the launcher). Empty when no
 /// scope was created (the best-effort degraded launch on a host without a usable systemd user
 /// manager), in which case the ppid subtree is the only source and covers that case.
@@ -382,18 +382,25 @@ fn is_cage_scope(name: &str, pid: u32) -> bool {
     crate::sandbox::cgroup::scope_launcher_pid(name) == Some(pid)
 }
 
-/// The `cgroup.procs` contents of every cage scope this launcher owns. Empty when it created none
-/// (a launch degraded to no scope), and a scope whose cgroup cannot be read is left out rather than
-/// aborting the rest — a partial member set still tears down what it names.
+/// The processes of every cage scope this launcher owns, each scope read through its whole subtree
+/// ([`crate::sandbox::cgroup::subtree_procs`]) so a cage that moved into a cgroup below its scope's
+/// is still a member. Empty when it created none (a launch degraded to no scope), and a scope whose
+/// cgroup cannot be read is left out rather than aborting the rest — a partial member set still
+/// tears down what it names.
 fn scope_cgroup_procs(pid: u32) -> Vec<String> {
-    crate::sandbox::cgroup::cage_scope_dirs()
-        .into_iter()
+    scope_cgroup_procs_among(crate::sandbox::cgroup::cage_scope_dirs(), pid)
+}
+
+/// [`scope_cgroup_procs`] over an explicit list of scope directories, so the member read is
+/// exercised against a written tree rather than only against the host's cgroupfs.
+fn scope_cgroup_procs_among(dirs: Vec<std::path::PathBuf>, pid: u32) -> Vec<String> {
+    dirs.into_iter()
         .filter(|d| {
             d.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| is_cage_scope(n, pid))
         })
-        .filter_map(|d| std::fs::read_to_string(d.join("cgroup.procs")).ok())
+        .filter_map(|d| crate::sandbox::cgroup::subtree_procs(&d).map(|(procs, _)| procs))
         .collect()
 }
 
@@ -1042,6 +1049,35 @@ mod tests {
         // Another launcher's cages stay another launcher's, whatever they are named.
         assert!(!is_cage_scope("sbx-demo-app-0-43.scope", 42));
         assert!(!is_cage_scope("sbx-plugin-demo-vault-5-43.scope", 42));
+    }
+
+    /// A cage that moved into a cgroup below its scope's is still one of the scope's members.
+    ///
+    /// A cage whose seccomp relaxation lets it mount a cgroup2 filesystem can create a cgroup under
+    /// its own and move into it. The scope's own `cgroup.procs` then lists nothing, and a teardown
+    /// reading that file alone would stop nothing the scope holds. The written tree stands in for
+    /// the cgroupfs: an empty scope file, the cage one level down, and one of its processes a level
+    /// further.
+    #[test]
+    fn a_cage_hidden_below_its_scope_is_still_a_member() {
+        let tmp = TmpDir::new();
+        let scope = tmp.join("sbx-demo-app-0-42.scope");
+        let leaf = scope.join("cage");
+        let hidden = leaf.join("hide");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(scope.join("cgroup.procs"), "").unwrap();
+        std::fs::write(leaf.join("cgroup.procs"), "7001\n").unwrap();
+        std::fs::write(hidden.join("cgroup.procs"), "7002\n").unwrap();
+
+        let members: Vec<String> = scope_cgroup_procs_among(vec![scope], 42)
+            .iter()
+            .flat_map(|procs| procs.split_whitespace().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            members,
+            ["7001", "7002"],
+            "the teardown reads the scope's whole subtree"
+        );
     }
 
     /// A pid no process can hold: above `PID_MAX_LIMIT`, the ceiling `/proc/sys/kernel/pid_max`

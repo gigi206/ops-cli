@@ -17,6 +17,10 @@
 //! shell keeps its controlling terminal and job control — it behaves like a plain
 //! argv prefix.
 //!
+//! **The cage starts below the scope:** the limits are files of the scope's own cgroup, owned by
+//! this user, so the session's cage is placed in a cgroup below it before bubblewrap roots its
+//! cgroup namespace there — see [`cgroup_leaf_step`].
+//!
 //! **Best-effort, never the boundary:** resource limits are hardening, not the
 //! security control (that is the namespace + seccomp + egress layer, which hard-
 //! fails). Where there is no cgroup v2, no systemd user session, no `systemd-run`,
@@ -280,14 +284,26 @@ fn enforceable_properties(delegated: &[String], limits: &Limits) -> Vec<String> 
         .collect()
 }
 
+/// What [`limiter`] decides when resource limits can be applied on this host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Limiter {
+    /// The `systemd-run` that asks the user manager for the scope.
+    systemd_run: PathBuf,
+    /// The enforceable unit properties the scope carries.
+    props: Vec<String>,
+    /// The step that moves the cage one cgroup below the scope before it starts, or `None` where it
+    /// could not be placed (see [`cgroup_leaf_step`]).
+    leaf: Option<PathBuf>,
+}
+
 /// The single decision both the launch path ([`wrap`]) and the `doctor` probe
-/// ([`probe`]) consult: the `systemd-run` launcher and the enforceable unit
-/// properties when resource limits can be applied on this host, or the reason
+/// ([`probe`]) consult: the `systemd-run` launcher, the enforceable unit
+/// properties and the leaf step when resource limits can be applied on this host, or the reason
 /// none can be — [`LimiterMiss`] — for graceful degradation. Routing both consumers
 /// through here means `doctor` can never report a posture a launch would not
 /// actually take, and carrying the reason means it need not search a second time
 /// to say which posture it is.
-fn limiter(limits: &Limits) -> Result<(PathBuf, Vec<String>), LimiterMiss> {
+fn limiter(limits: &Limits, layout: Option<&crate::store::Layout>) -> Result<Limiter, LimiterMiss> {
     let Some(systemd_run) = crate::store::find_trusted_on_path("systemd-run") else {
         // Reached only when nothing usable was found, so the ordinary launch pays for one search.
         // The second is the unweighed one on purpose: telling "absent" from "refused" is exactly
@@ -320,7 +336,51 @@ fn limiter(limits: &Limits) -> Result<(PathBuf, Vec<String>), LimiterMiss> {
     if expansion_can_be_disabled(&systemd_run).is_none() {
         return Err(LimiterMiss::Unanswered);
     }
-    Ok((systemd_run, props))
+    Ok(Limiter {
+        systemd_run,
+        props,
+        leaf: layout.and_then(cgroup_leaf_step),
+    })
+}
+
+/// The cgroup leaf step, materialized in `layout`'s engine directory, or `None` where it cannot run
+/// from there.
+///
+/// The scope's limits are files of the scope's own cgroup, owned by this user. A cage left in that
+/// cgroup gets a cgroup namespace rooted at it, and a cage whose seccomp relaxation lets it create a
+/// user namespace and mount can mount a cgroup2 filesystem of its own and rewrite those files. The
+/// step moves the cage into a cgroup below the scope's before bubblewrap creates that namespace, so
+/// the files holding the limits are outside every view the cage can mount, while the scope still
+/// bounds everything below it.
+///
+/// Only the launch whose cage may carry a `[seccomp]` relaxation asks for it, by handing its layout
+/// to [`Scope::decide`]. A helper cage (a resolve command, a plugin, a pool install, a userland
+/// build) keeps the mandatory denylist, which refuses `mount` and every way into a user namespace,
+/// so its scope's own cgroup is out of its reach already.
+///
+/// A data directory mounted `noexec`, or one the step cannot be written to, leaves the launch
+/// without the step: the cage then runs in the scope's own cgroup, still limited, and `doctor` says
+/// so.
+fn cgroup_leaf_step(layout: &crate::store::Layout) -> Option<PathBuf> {
+    let step = crate::store::ensure_cgroup_leaf(layout).ok()?;
+    mounted_exec(&step).then_some(step)
+}
+
+/// Whether the filesystem holding `path` lets a program on it be executed.
+fn mounted_exec(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `c_path` is a NUL-terminated string that outlives the call, and `stat` is a writable
+    // buffer of the type `statvfs` fills.
+    if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `statvfs` returned success, so it filled the buffer.
+    let stat = unsafe { stat.assume_init() };
+    stat.f_flag & libc::ST_NOEXEC == 0
 }
 
 /// Whether the user manager under the runtime directory `runtime` has its private socket,
@@ -509,13 +569,17 @@ fn scope_prefix(systemd_run: &Path, props: &[String], cage_slug: &str) -> Vec<Os
 /// and its full argument list (excluding `argv[0]`). With limits available the
 /// program becomes `systemd-run` and bwrap is spliced in after `--`; otherwise the
 /// pair is returned unchanged so the caller launches bwrap directly.
+///
+/// For a helper cage, which keeps the mandatory seccomp denylist: no leaf step is placed (see
+/// [`cgroup_leaf_step`]). The launch whose cage may carry a relaxation takes its own decision
+/// through [`Scope::decide`] with its layout.
 pub(crate) fn wrap(
     bwrap: &Path,
     bwrap_argv: Vec<OsString>,
     limits: &Limits,
     cage_slug: &str,
 ) -> (PathBuf, Vec<OsString>) {
-    Scope::decide(limits).wrap(bwrap, bwrap_argv, cage_slug)
+    Scope::decide(limits, None).wrap(bwrap, bwrap_argv, cage_slug)
 }
 
 /// The limit decision for one launch, taken once and read by everything that describes or builds
@@ -530,12 +594,14 @@ pub(crate) fn wrap(
 /// ceiling on every host where `systemd-run`, the user session or a delegated controller is
 /// missing, which are precisely the hosts where the cage runs **without** limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Scope(Option<(PathBuf, Vec<String>)>);
+pub(crate) struct Scope(Option<Limiter>);
 
 impl Scope {
-    /// Take the decision [`limiter`] takes, the one `doctor` reports too.
-    pub(crate) fn decide(limits: &Limits) -> Self {
-        Scope(limiter(limits).ok())
+    /// Take the decision [`limiter`] takes, the one `doctor` reports too. `layout` is handed by
+    /// the launch whose cage may carry a `[seccomp]` relaxation, and places the leaf step in its
+    /// engine directory ([`cgroup_leaf_step`]); `None` places none.
+    pub(crate) fn decide(limits: &Limits, layout: Option<&crate::store::Layout>) -> Self {
+        Scope(limiter(limits, layout).ok())
     }
 
     /// The decision of a host with no limiter: the cage is run as composed, with no scope in front.
@@ -547,7 +613,7 @@ impl Scope {
 
     /// The unit properties this launch will carry, or empty when it carries none.
     pub(crate) fn properties(&self) -> &[String] {
-        self.0.as_ref().map_or(&[], |(_, props)| props.as_slice())
+        self.0.as_ref().map_or(&[], |l| l.props.as_slice())
     }
 
     /// Wrap a bwrap invocation in this scope, as [`wrap`] does for a decision it takes itself.
@@ -569,10 +635,17 @@ impl Scope {
     /// [`unit_slug`] holds every slug to that charset, and a limit value has already passed [`is_valid_memory_value`] / [`is_valid_tasks_value`], neither of
     /// which admits one — while the command past `--` is protected by asking the launcher not to
     /// substitute at all.
+    ///
+    /// Where the leaf step was placed ([`cgroup_leaf_step`]), it follows the `--`, itself ending
+    /// with a `--`, so the command it executes is the one the scope would otherwise have run.
     fn wrapper(&self, cage_slug: &str) -> Option<(PathBuf, Vec<OsString>)> {
-        let (systemd_run, props) = self.0.as_ref()?;
-        let prefix = scope_prefix(systemd_run, props, cage_slug);
-        Some((systemd_run.clone(), prefix))
+        let limiter = self.0.as_ref()?;
+        let mut prefix = scope_prefix(&limiter.systemd_run, &limiter.props, cage_slug);
+        if let Some(leaf) = &limiter.leaf {
+            prefix.push(leaf.as_os_str().to_owned());
+            prefix.push(OsString::from("--"));
+        }
+        Some((limiter.systemd_run.clone(), prefix))
     }
 }
 
@@ -650,6 +723,59 @@ fn cage_scope_dirs_under(root: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// The most cgroups [`subtree_procs`] reads below one scope before it stops and reports the read as
+/// incomplete. A launch places its cage one level below the scope; anything deeper was made by the
+/// cage itself, and a cage able to create cgroups can create them faster than a walk reads them, so
+/// the walk is bounded rather than left to the size of a tree the workload chose.
+const SUBTREE_CGROUP_CAP: usize = 4096;
+
+/// The pids of `scope`'s cgroup and of every cgroup below it, as one `cgroup.procs`-shaped text,
+/// and whether every one of those cgroups was read.
+///
+/// A scope's own `cgroup.procs` names only the processes placed in that cgroup itself, not those in
+/// cgroups below it. The session's cage starts one level down ([`cgroup_leaf_step`]), and a cage
+/// whose seccomp relaxation lets it mount a cgroup2 filesystem can create cgroups below its own and
+/// move into them. A reader of the scope's file alone would see an empty cage in both cases, so
+/// every member reader goes through this walk.
+///
+/// The walk is iterative, does not follow links, and stops at [`SUBTREE_CGROUP_CAP`] directories:
+/// the part of the tree below the scope is written by the workload. `None` when the scope's own file
+/// cannot be read, so a vanished or unreadable scope keeps the meaning it has for every caller. An
+/// unreadable cgroup further down, or a walk cut at the cap, yields what was read with `false`, so a
+/// caller deciding to reclaim can refuse an incomplete view while a teardown still acts on the
+/// processes it did find.
+pub(crate) fn subtree_procs(scope: &Path) -> Option<(String, bool)> {
+    let mut procs = std::fs::read_to_string(scope.join("cgroup.procs")).ok()?;
+    let mut complete = true;
+    let mut stack = vec![scope.to_path_buf()];
+    let mut read = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            complete = false;
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            if read == SUBTREE_CGROUP_CAP {
+                return Some((procs, false));
+            }
+            read += 1;
+            let path = entry.path();
+            match std::fs::read_to_string(path.join("cgroup.procs")) {
+                Ok(more) => {
+                    procs.push('\n');
+                    procs.push_str(&more);
+                }
+                Err(_) => complete = false,
+            }
+            stack.push(path);
+        }
+    }
+    Some((procs, complete))
+}
+
 /// What a cage scope's cgroup holds, reduced to the three shapes the reclaim decision turns on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Occupancy {
@@ -661,8 +787,9 @@ enum Occupancy {
     /// A cage whose init has lost its bubblewrap monitor: the init's parent is not in this cgroup.
     ///
     /// A live cage always holds its monitor. The outer bwrap is the process the scope was created
-    /// for — `systemd-run --scope` execs it in place — and it waits on the init for as long as the
-    /// init lives, so the init's parent is inside the cgroup. An init whose parent is outside it has
+    /// for — `systemd-run --scope` execs it in place, through the leaf step where one was placed —
+    /// and it waits on the init for as long as the init lives, so the init's parent is inside the
+    /// scope's subtree, the set this reads ([`subtree_procs`]). An init whose parent is outside it has
     /// been reparented to the user's subreaper: its monitor died while the init was still setting
     /// up, before the init re-armed its own parent-death signal, and the payload runs on with no one
     /// to stop it — held open, in the case measured, by the egress forwarder long after the command
@@ -671,6 +798,27 @@ enum Occupancy {
     Unmonitored,
     /// Anything else, every unreadable case included.
     Running,
+}
+
+/// The sweep's verdict on one cage scope: reclaimable only once its launcher is gone and the whole
+/// subtree holds nothing running. The cgroup is read only when the launcher is known gone.
+fn reclaimable_scope(scope: &Path, launcher_alive: bool, proc_root: &Path) -> bool {
+    let held = if launcher_alive {
+        Occupancy::Running
+    } else {
+        scope_occupancy(scope, proc_root)
+    };
+    is_reclaimable(launcher_alive, held)
+}
+
+/// What the whole of a cage scope holds, read through [`subtree_procs`]. A scope that cannot be read,
+/// or whose subtree was read only in part, answers [`Occupancy::Running`]: the sweep reclaims on
+/// this answer, and a process it did not see may be a live cage.
+fn scope_occupancy(scope: &Path, proc_root: &Path) -> Occupancy {
+    match subtree_procs(scope) {
+        Some((procs, true)) => occupancy(&procs, proc_root),
+        _ => Occupancy::Running,
+    }
 }
 
 /// Classify what a `cgroup.procs` holds, reading each pid's facts under `proc_root`.
@@ -835,14 +983,7 @@ pub(crate) fn sweep_stale_scopes() {
             .filter_map(|dir| {
                 let name = dir.file_name()?.to_str()?.to_string();
                 let alive = crate::session::pid_is_live(scope_launcher_pid(&name)?);
-                // Read the cgroup only once the launcher is known gone.
-                let procs = if alive {
-                    None
-                } else {
-                    std::fs::read_to_string(dir.join("cgroup.procs")).ok()
-                };
-                let held = procs.map_or(Occupancy::Running, |p| occupancy(&p, Path::new("/proc")));
-                is_reclaimable(alive, held).then(|| OsString::from(name))
+                reclaimable_scope(&dir, alive, Path::new("/proc")).then(|| OsString::from(name))
             })
             .collect();
         if stale.is_empty() {
@@ -934,7 +1075,8 @@ pub(crate) struct LimitReport {
     pub(crate) properties: Vec<String>,
     /// A live `systemd-run` scope with those properties ran a trivial command.
     pub(crate) verified: bool,
-    /// Why limits are unavailable or unverified, when they are.
+    /// Why limits are unavailable or unverified, when they are; or, with `verified`, why the cage
+    /// would run in the scope's own cgroup rather than below it (see [`cgroup_leaf_step`]).
     pub(crate) note: Option<String>,
 }
 
@@ -942,14 +1084,14 @@ pub(crate) struct LimitReport {
 /// the enforceable properties — the conclusive check, matching how the security
 /// boundary is decided by a live launch rather than inferred. Never fails: an
 /// unavailable or non-working limiter is reported, not raised.
-pub(crate) fn probe(limits: &Limits) -> LimitReport {
+pub(crate) fn probe(limits: &Limits, layout: Option<&crate::store::Layout>) -> LimitReport {
     // The verdict comes from the same `limiter()` decision a launch takes, so the
     // report cannot drift from reality; only when limits *would* be applied does
     // the live scope confirm they actually work. Passing the effective `limits`
     // means the live scope also validates a config override, surfacing a bad value
     // in `doctor` rather than at a launch.
-    let (systemd_run, props) = match limiter(limits) {
-        Ok(pair) => pair,
+    let limiter = match limiter(limits, layout) {
+        Ok(limiter) => limiter,
         // Four ways to arrive here and the note must not collapse them, but the distinction is
         // `limiter`'s to make: it already searched, and it already reported any refusal.
         Err(miss) => {
@@ -961,16 +1103,31 @@ pub(crate) fn probe(limits: &Limits) -> LimitReport {
         }
     };
 
-    let mut cmd = std::process::Command::new(&systemd_run);
+    let mut cmd = std::process::Command::new(&limiter.systemd_run);
     cmd.args(["--user", "--scope", "-q", "--collect"]);
-    for p in &props {
+    for p in &limiter.props {
         cmd.arg("-p").arg(p);
     }
-    cmd.args(["--", "true"]);
+    cmd.arg("--");
+    // Through the leaf step when a launch would take it, so the line reports the step too: it moves
+    // itself, then runs the launcher's own `--version`, an absolute program that answers without
+    // reaching the manager. A move that failed is said on stderr under the step's name.
+    match &limiter.leaf {
+        Some(leaf) => {
+            cmd.arg(leaf)
+                .arg("--")
+                .arg(&limiter.systemd_run)
+                .arg("--version");
+        }
+        None => {
+            cmd.arg("true");
+        }
+    }
     // Bounded, so a manager that never answers is a line in the report rather than a `doctor` that
     // never returns.
     live_scope_report(
-        props,
+        limiter.props,
+        limiter.leaf.is_some(),
         super::resolver::output_within(&mut cmd, PROBE_DEADLINE, "`systemd-run --scope`"),
     )
 }
@@ -981,26 +1138,52 @@ pub(crate) fn probe(limits: &Limits) -> LimitReport {
 /// one line, rather than leaving the reader with no cause.
 fn live_scope_report(
     properties: Vec<String>,
+    leaf_placed: bool,
     ran: std::io::Result<std::process::Output>,
 ) -> LimitReport {
-    let note = match ran {
-        Ok(out) if out.status.success() => None,
+    match ran {
+        Ok(out) if out.status.success() => {
+            let said = super::resolver::one_line(&out.stderr);
+            let note = if !leaf_placed {
+                Some(LEAF_ABSENT.to_string())
+            } else if said.contains(LEAF_SAYS) {
+                Some(said)
+            } else {
+                None
+            };
+            LimitReport {
+                properties,
+                verified: true,
+                note,
+            }
+        }
         Ok(out) => {
             let said = super::resolver::one_line(&out.stderr);
-            Some(if said.is_empty() {
-                "systemd-run could not create a limited scope".to_string()
-            } else {
-                format!("systemd-run could not create a limited scope: {said}")
-            })
+            LimitReport {
+                properties,
+                verified: false,
+                note: Some(if said.is_empty() {
+                    "systemd-run could not create a limited scope".to_string()
+                } else {
+                    format!("systemd-run could not create a limited scope: {said}")
+                }),
+            }
         }
-        Err(e) => Some(format!("systemd-run failed to run: {e}")),
-    };
-    LimitReport {
-        properties,
-        verified: note.is_none(),
-        note,
+        Err(e) => LimitReport {
+            properties,
+            verified: false,
+            note: Some(format!("systemd-run failed to run: {e}")),
+        },
     }
 }
+
+/// The prefix the leaf step writes its stderr lines under, which is how [`live_scope_report`] tells
+/// a move that failed from a step that ran clean.
+const LEAF_SAYS: &str = "sbx-cgroup-leaf:";
+
+/// What `doctor` says when the leaf step could not be placed.
+const LEAF_ABSENT: &str = "the cage runs in its scope's own cgroup, where a cage allowed to mount \
+     can change its limits: the leaf step could not be placed in the engine directory";
 
 #[cfg(test)]
 mod tests {
@@ -1024,7 +1207,7 @@ mod tests {
     #[test]
     fn the_properties_the_contract_names_are_the_ones_a_launch_would_carry() {
         let limits = Limits::default();
-        let named = Scope::decide(&limits).properties().to_vec();
+        let named = Scope::decide(&limits, None).properties().to_vec();
         let asked: Vec<String> = profile(&limits).into_iter().map(|(_, p)| p).collect();
         for prop in &named {
             assert!(
@@ -1034,7 +1217,7 @@ mod tests {
         }
         assert_eq!(
             named,
-            probe(&limits).properties,
+            probe(&limits, None).properties,
             "the contract and `doctor` read the same decision"
         );
     }
@@ -1369,6 +1552,62 @@ mod tests {
         assert_eq!(got, want, "arguments must arrive unchanged");
     }
 
+    /// A cage starts in a cgroup strictly below the scope that carries its limits.
+    ///
+    /// bubblewrap roots the cage's cgroup namespace at the cgroup it starts in. Started in the
+    /// scope's own cgroup, a cage whose seccomp relaxation lets it create a user namespace and mount
+    /// can mount a cgroup2 filesystem showing that cgroup and write `max` over `memory.max` and
+    /// `pids.max`: the files belong to the uid its nested namespace maps to root. Started below it,
+    /// the files holding the limits are outside every view the cage can mount.
+    ///
+    /// Driven through [`Scope::decide`] with a layout, the decision the launch takes, and
+    /// [`Scope::wrap`], with a stand-in for bubblewrap that records the cgroup it landed in.
+    #[test]
+    fn a_cage_starts_below_the_scope_that_carries_its_limits() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TmpDir::new();
+        let seen = dir.path().join("cgroup.txt");
+        let fake = dir.path().join("fake-bwrap");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\ncat /proc/self/cgroup > {}\n",
+                crate::testutil::sh_word(&seen)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let layout = crate::store::Layout::under(&dir.path().join("data"));
+        let (program, argv) =
+            Scope::decide(&Limits::default(), Some(&layout)).wrap(&fake, Vec::new(), "leaf-probe");
+        if program == fake {
+            skip_incapable!("skipping the leaf check: this host applies no resource limits");
+            return;
+        }
+        let status = Command::new(&program)
+            .args(&argv)
+            .status()
+            .expect("the scope launches");
+        assert!(status.success(), "the scoped stand-in ran: {status}");
+
+        let cgroup = std::fs::read_to_string(&seen).unwrap();
+        let path = cgroup
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .expect("a cgroup v2 line");
+        let path = Path::new(path);
+        let scope = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        assert!(
+            scope_launcher_pid(scope) == Some(std::process::id()),
+            "the cage's cgroup is a child of this launcher's scope, not the scope itself: {cgroup}"
+        );
+    }
+
     #[test]
     fn compose_splices_bwrap_after_the_scope_prefix() {
         // The wrapped branch: the launcher runs, with bwrap and its argv after the
@@ -1400,7 +1639,7 @@ mod tests {
             skip_incapable!("skipping scope-unit test: no systemd user session");
             return;
         }
-        let Some((_launcher, prefix)) = Scope::decide(&Limits::default()).wrapper("demo-app")
+        let Some((_launcher, prefix)) = Scope::decide(&Limits::default(), None).wrapper("demo-app")
         else {
             skip_incapable!("skipping scope-unit test: no delegated controller");
             return;
@@ -1552,6 +1791,43 @@ mod tests {
         assert_eq!(occupancy("4710\n4712\n", tmp.path()), Occupancy::Running);
         // One process of the set that cannot be read keeps the cage.
         assert_eq!(occupancy("4711\n4799\n", tmp.path()), Occupancy::Running);
+    }
+
+    /// The sweep never reclaims a scope whose cage lives below the scope's own cgroup.
+    ///
+    /// A cage that moved into a cgroup under its scope's leaves the scope's `cgroup.procs` empty.
+    /// Read alone, that file made a dead launcher's scope look over, and the sweep stopped the unit
+    /// with the cage still running in it. A cgroup further down that cannot be read is a part of the
+    /// cage the sweep did not see, so it keeps the scope too.
+    #[test]
+    fn the_sweep_keeps_a_scope_whose_cage_runs_below_it() {
+        let proc_root = TmpDir::new();
+        fake_proc_with_parent(proc_root.path(), "4710", "2000", "4710", Some("4711\n"));
+        fake_proc_with_parent(proc_root.path(), "4711", "4710", "4711 1", Some("4712\n"));
+        fake_proc_with_parent(proc_root.path(), "4712", "4711", "4712 2", Some(""));
+
+        let tree = TmpDir::new();
+        let scope = tree.join("sbx-demo-app-0-42.scope");
+        let leaf = scope.join("cage");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(scope.join("cgroup.procs"), "").unwrap();
+        std::fs::write(leaf.join("cgroup.procs"), "4710\n4711\n4712\n").unwrap();
+        assert!(
+            !reclaimable_scope(&scope, false, proc_root.path()),
+            "a cage running below its scope's cgroup keeps the scope"
+        );
+
+        std::fs::write(leaf.join("cgroup.procs"), "").unwrap();
+        assert!(
+            reclaimable_scope(&scope, false, proc_root.path()),
+            "an empty subtree under a dead launcher is reclaimable"
+        );
+
+        std::fs::create_dir(leaf.join("unreadable")).unwrap();
+        assert!(
+            !reclaimable_scope(&scope, false, proc_root.path()),
+            "a cgroup below the scope that cannot be read keeps it"
+        );
     }
 
     #[test]
@@ -1904,6 +2180,7 @@ mod tests {
         let refused = |stderr: &[u8]| {
             live_scope_report(
                 vec!["TasksMax=16384".into()],
+                true,
                 Ok(std::process::Output {
                     status: std::process::ExitStatus::from_raw(1 << 8),
                     stdout: Vec::new(),

@@ -138,7 +138,10 @@ them reduces that *defense-in-depth*, but the boundary does not rest on it. Once
 is lifted, a nested user namespace can be created and can map its uid to root, and the
 capabilities that gives it hold over that namespace alone: the cage's own mounts stay locked
 against it, so it can neither unmount an `[fs]` mask, nor bind the directory under one
-without the mask, nor remount a read-only path writable. What it does reach is the kernel
+without the mask, nor remount a read-only path writable. The same holds through the newer
+mount calls (`open_tree`, `move_mount`, `mount_setattr`) when those are lifted too. It can
+mount a cgroup2 filesystem of its own, but that view is rooted below the cgroup holding the
+cage's [`[limits]`](limits), so the limits stay out of reach. What it does reach is the kernel
 code behind those calls, which is the surface the denylist exists to remove. Lifting a
 syscall is your informed, trusted-only choice.
 
