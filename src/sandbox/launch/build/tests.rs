@@ -1442,3 +1442,104 @@ fn only_an_ungranted_global_app_is_told_about_the_project_pool() {
         false
     ));
 }
+
+/// The two mise lanes a launch registers equip with different verbs, and only the registration
+/// says which gets which: the project's mise file tools are installed when `mise where` does not
+/// resolve them, which never moves a version and writes nothing, while the app's own `mise:`
+/// packages are pinned in the cage's global config. Swapped, a launch would rewrite the version a
+/// project left floating, or leave an app's tool re-resolving `latest` on every exec. Run with a
+/// stand-in mise that records each call and resolves nothing.
+#[test]
+fn the_project_lane_installs_what_is_missing_and_the_app_lane_pins() {
+    let bash = PathBuf::from("/bin/bash");
+    if !bash.is_file() {
+        skip_incapable!("skipping mise lanes run: no /bin/bash on this host");
+        return;
+    }
+    let dir = TmpDir::new();
+    let mise = dir.path().join("mise");
+    std::fs::write(
+        &mise,
+        "#!/bin/sh\necho \"mise $*\" >> \"$SBX_TEST_RECORD\"\n[ \"$1\" != where ]\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&mise, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let mut cfg = crate::testutil::resolved_channels(None, None);
+    cfg.mise = Some(crate::config::MiseConfig {
+        name: "mise.toml".into(),
+        state: crate::trust::TrustState::Trusted,
+        files: vec![(
+            "mise.toml".into(),
+            b"[tools]\n\"core:demo-runtime\" = \"2\"\n".to_vec(),
+        )],
+    });
+    cfg.packages.push(crate::config::Package {
+        name: "demo-tool".into(),
+        backend: crate::config::Backend::Mise("aqua:example/demo-tool".into()),
+        state: crate::trust::TrustState::Trusted,
+        libs: Vec::new(),
+        main: String::new(),
+    });
+    let userland = Userland {
+        base_roots: vec![],
+        interp_src: PathBuf::from("/store/nix-ld"),
+        interp_dest: PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
+        ca_bundle_src: PathBuf::from("/store/cacert/etc/ssl/certs/ca-bundle.crt"),
+        base_loader: PathBuf::from("/nix/store/glibc/lib/ld"),
+        foreign_lib_paths: vec![],
+        bin_paths: vec![],
+        distro: None,
+        shell_bin: bash,
+        env_bin: PathBuf::from("/nix/store/coreutils/bin/env"),
+        ldd_bin: PathBuf::from("/nix/store/glibc-bin/bin/ldd"),
+        socat_bin: PathBuf::from("/nix/store/socat/bin/socat"),
+        mise_bin: mise,
+        nix_bin: PathBuf::from("/nix/store/nix/bin/nix"),
+        locale_archive: PathBuf::from("/nix/store/locales/lib/locale/locale-archive"),
+        zoneinfo_src: PathBuf::from("/nix/store/tzdata/share/zoneinfo"),
+    };
+    let prep = super::super::Prepared {
+        bwrap: PathBuf::from("/usr/bin/bwrap"),
+        nix: PathBuf::from("/nix/store/nix/bin/nix"),
+        nix_store: PathBuf::from("/nix/store/nix/bin/nix-store"),
+        layout: crate::store::Layout::under(dir.path()),
+        cwd: dir.path().to_path_buf(),
+        cfg,
+        nixpkgs: String::new(),
+        engine_ref: String::new(),
+        userland,
+        learn_exec: false,
+        contract_text: None,
+        in_batch: true,
+        equips: true,
+        project_lane: true,
+        unresolved_secret: crate::sandbox::egress::Unresolved::Abort,
+    };
+
+    let mut wraps = Vec::new();
+    mise_equip_lanes(&prep, binds::Runtime::ProjectDefault, &mut wraps);
+    let argv = wrap_cage_command(vec![OsString::from("true")], wraps);
+    let record = dir.path().join("record");
+    let out = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .env("SBX_TEST_RECORD", &record)
+        .output()
+        .expect("run the equip scripts");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = std::fs::read_to_string(&record).expect("the stand-in recorded its calls");
+    let calls: Vec<&str> = calls.lines().collect();
+    assert_eq!(
+        calls,
+        [
+            "mise -C / use -g --pin -- aqua:example/demo-tool",
+            "mise where -- core:demo-runtime@2",
+            "mise install -- core:demo-runtime@2",
+            "mise reshim",
+        ]
+    );
+}
