@@ -1188,8 +1188,28 @@ mod tests {
             vec![
                 ("seccomp", "ptrace", Risk::High),
                 ("ssh_agent", "deploy", Risk::High),
+                ("[apps] read_project_pool", "true", Risk::Notable),
                 ("forward", "1455", Risk::Notable),
             ]
+        );
+    }
+
+    /// Approval switches on a project's apps reading its `sbx run` pool by default, so a first
+    /// approval names it; a project that turns it off grants nothing there.
+    #[test]
+    fn a_first_approval_names_the_project_pool_unless_the_project_turns_it_off() {
+        let named = |toml: &str| {
+            seen(&grants(
+                &resolved(toml, TrustState::Untrusted),
+                &resolved(toml, TrustState::Trusted),
+            ))
+            .iter()
+            .any(|(field, _, _)| *field == "[apps] read_project_pool")
+        };
+        assert!(named("forward = [1455]\n"), "on by default once approved");
+        assert!(
+            !named("[apps]\nread_project_pool = false\n"),
+            "turned off by the project"
         );
     }
 
