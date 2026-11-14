@@ -7267,13 +7267,15 @@ fn a_shared_pool_lets_the_second_app_reuse_what_the_first_installed() {
     // the second app either way, from its own copy or from the first's, so only the absence of a
     // second copy separates a shared read from a silent re-download. Without the grant this same
     // shape puts a copy in each pool, which is what
-    // `a_global_apps_project_mise_tool_lands_in_the_per_project_pool` pins.
+    // `a_global_apps_project_mise_tool_lands_in_the_per_project_pool` pins. The project's own pool
+    // is turned off: the sandbox probe below is an `sbx run` that installs the same tool there, and
+    // an app reading it would install nothing either way.
     let project = TmpDir::prefixed("r", "shp-proj");
     let data = TmpDir::prefixed("r", "shp-data");
     let state = TmpDir::prefixed("r", "shp-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
-        "[apps]\nshare_install_pools = true\n\
+        "[apps]\nshare_install_pools = true\nread_project_pool = false\n\
          [app.one]\ncmd = [\"sh\", \"-c\", \"rg --version\"]\n\
          [app.two]\ncmd = [\"sh\", \"-c\", \"rg --version\"]\n",
     )
@@ -7712,14 +7714,11 @@ fn an_upgrade_leaves_the_projects_own_mise_tools_out_of_every_app_cage() {
 
 /// The versions `sbx run` installed for the project's mise file, read off its pool.
 fn project_pool_versions(data: &Path, tool_dir: &str) -> Vec<String> {
-    let mut versions: Vec<String> = std::fs::read_dir(data.join("projects"))
+    let mut versions: Vec<String> = project_trees(data)
         .into_iter()
-        .flatten()
-        .flatten()
         .flat_map(|project| {
             std::fs::read_dir(
                 project
-                    .path()
                     .join("home/.local/share/mise/installs")
                     .join(tool_dir),
             )
