@@ -2285,9 +2285,12 @@ fn pump_redacting<R: Read, W: Write>(
 ///
 /// A needle already complete inside the window was masked before this is asked, so the suffix
 /// considered here is only ever an incomplete one.
-fn needle_prefix_suffix(window: &[u8], needles: &[SecretNeedle]) -> usize {
+fn needle_prefix_suffix<'a>(
+    window: &[u8],
+    needles: impl IntoIterator<Item = &'a SecretNeedle>,
+) -> usize {
     needles
-        .iter()
+        .into_iter()
         .map(|needle| needle.prefix_suffix_len(window))
         .max()
         .unwrap_or(0)
@@ -2309,6 +2312,19 @@ pub(crate) fn redact_in_place(buf: &mut [u8], needles: &[SecretNeedle]) {
 /// question there.
 pub(crate) fn redact_record_in_place(buf: &mut [u8], needles: &[SecretNeedle], host: &str) {
     mask_each(buf, needles.iter().filter(|n| n.masks_record_for(host)));
+}
+
+/// [`redact_record_in_place`] for a record cut short at a size cap. A needle the cut went through
+/// left only its beginning at the end of `buf`, where no search for the whole needle finds it, so
+/// that beginning is masked as well, at equal length and however short: it is what a streaming scan
+/// holds back for the same reason ([`needle_prefix_suffix`]), and the record is marked cut there
+/// already. The needles are those that mask the record of an exchange with `host`, as for a whole
+/// value.
+pub(crate) fn redact_cut_record_in_place(buf: &mut [u8], needles: &[SecretNeedle], host: &str) {
+    redact_record_in_place(buf, needles, host);
+    let begun = needle_prefix_suffix(buf, needles.iter().filter(|n| n.masks_record_for(host)));
+    let end = buf.len();
+    buf[end - begun..].fill(b'*');
 }
 
 /// The masking itself, over whichever needles the caller selected.

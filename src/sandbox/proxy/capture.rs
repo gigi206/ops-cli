@@ -939,6 +939,81 @@ mod tests {
         );
     }
 
+    /// A secret that any cap cuts through leaves nothing of itself in the filed capture, whichever
+    /// part the cap belongs to: the request head (the client's own `Authorization` rides there), the
+    /// request body, the response head and body, and each direction of a WebSocket. The cut part is
+    /// marked cut and ends in a run of `*` where the cut left the secret's beginning, as it would
+    /// over the whole value. Each part is checked on its own, and every one that keeps any of the
+    /// secret, or is not marked cut, is named.
+    #[test]
+    fn a_secret_a_cap_cuts_through_leaves_none_of_itself_in_the_filed_capture() {
+        use crate::sandbox::proxy::SecretNeedle;
+        const VALUE: &str = "SECRETSECRETSECRETSECRETSECRET42";
+        let begun = &VALUE[..10];
+        let mut kept = Vec::new();
+        for what in [
+            "request head",
+            "request body",
+            "response head",
+            "response body",
+            "frames up",
+            "frames down",
+        ] {
+            let (g, ring, _log) = guard_over(
+                ring(CaptureLevel::Bodies, 1),
+                vec![SecretNeedle::named("TOKEN", VALUE.as_bytes().to_vec())],
+            );
+            let seq = g.id;
+            // `start`, then filler up to `begun.len()` bytes short of `cap`, then the whole value:
+            // the cap falls inside the value, `begun` into it.
+            let cut_by = |cap: usize, start: &str| {
+                let fill = "x".repeat(cap - start.len() - begun.len());
+                format!("{start}{fill}{VALUE}")
+            };
+            let (head_cap, body_cap) = (g.caps.head, g.caps.body);
+            match what {
+                "request head" => g.set_request(
+                    cut_by(head_cap, "POST /v1 HTTP/1.1\r\nauthorization: ").as_bytes(),
+                    &[],
+                ),
+                "request body" => g.set_request_body(cut_by(body_cap, "").as_bytes()),
+                "response head" => g.push_response(
+                    format!("{}\r\n\r\nbody", cut_by(head_cap, "HTTP/2 200\r\nx-echo: "))
+                        .as_bytes(),
+                ),
+                "response body" => g.push_response(
+                    format!("HTTP/2 200\r\n\r\n{}tail", cut_by(body_cap, "")).as_bytes(),
+                ),
+                "frames up" => {
+                    g.ws_sinks().0.push(cut_by(body_cap, "").as_bytes());
+                }
+                _ => {
+                    g.ws_sinks().1.push(cut_by(body_cap, "").as_bytes());
+                }
+            }
+            drop(g);
+            let (found, _) = ring.get(&[seq]);
+            let c = &found[0];
+            let part = match what {
+                "request head" => &c.req_head,
+                "request body" => &c.req_body,
+                "response head" => &c.res_head,
+                "response body" => &c.res_body,
+                "frames up" => &c.ws_up,
+                _ => &c.ws_down,
+            };
+            let tail = &part.bytes[part.bytes.len().saturating_sub(begun.len())..];
+            if !part.truncated || tail != "*".repeat(begun.len()).as_bytes() {
+                kept.push(format!(
+                    "{what}: cut={}, ends {:?}",
+                    part.truncated,
+                    String::from_utf8_lossy(tail)
+                ));
+            }
+        }
+        assert!(kept.is_empty(), "{kept:?}");
+    }
+
     #[test]
     fn the_request_head_is_captured_verbatim_with_the_injected_names_but_never_their_values() {
         let (g, ring, _log) = guard(CaptureLevel::Bodies, 8);

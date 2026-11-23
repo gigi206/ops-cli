@@ -39,7 +39,7 @@ use std::sync::Mutex;
 
 use crate::sandbox::locks::locked;
 use crate::sandbox::proxy::SecretNeedle;
-use crate::sandbox::proxy::redact_record_in_place;
+use crate::sandbox::proxy::{redact_cut_record_in_place, redact_record_in_place};
 
 /// How much of each exchange a launch captures. `Off` is the default and costs nothing — no buffer
 /// is ever allocated on the forwarding path.
@@ -319,6 +319,10 @@ impl Capture {
     /// records it (a needle the cage taught the proxy on one service masks that service's record and
     /// no other, see [`SecretNeedle`]). Runs on whole parts rather than on streamed chunks, so a
     /// secret that arrived split across two reads is a contiguous run here and is masked exactly.
+    ///
+    /// A part cut short at its size cap may end partway into a value, and what the cut left of it is
+    /// masked as well ([`redact_cut_record_in_place`]): a cap never leaves the beginning of a secret
+    /// in the clear.
     pub(crate) fn mask(mut self, needles: &[SecretNeedle], host: &str) -> Masked {
         for part in [
             &mut self.req_head,
@@ -329,7 +333,11 @@ impl Capture {
             &mut self.ws_up,
             &mut self.ws_down,
         ] {
-            redact_record_in_place(&mut part.bytes, needles, host);
+            if part.truncated {
+                redact_cut_record_in_place(&mut part.bytes, needles, host);
+            } else {
+                redact_record_in_place(&mut part.bytes, needles, host);
+            }
         }
         Masked(self)
     }
@@ -703,6 +711,81 @@ mod tests {
                 .any(|w| w == b"s3cr3t-value"),
             "a reflected secret is masked on the response side too"
         );
+    }
+
+    /// A part cut short at its size cap may end partway into a secret, where no search for the whole
+    /// value finds it: what the cut left of it is masked too, in each of the seven parts. The same
+    /// bytes ending a part that is whole begin no secret there and stay as they are. Each shape is
+    /// checked on its own, and every one decided the other way is named.
+    #[test]
+    fn a_part_cut_partway_into_a_secret_keeps_none_of_it() {
+        const VALUE: &str = "s3cr3t-value-0123";
+        let needles = vec![needle(VALUE)];
+        type PartOf = fn(&mut Capture) -> &mut CaptureBytes;
+        let parts: [(&str, PartOf); CAPTURE_PARTS] = [
+            ("req_head", |c| &mut c.req_head),
+            ("injected", |c| &mut c.injected),
+            ("req_body", |c| &mut c.req_body),
+            ("res_head", |c| &mut c.res_head),
+            ("res_body", |c| &mut c.res_body),
+            ("ws_up", |c| &mut c.ws_up),
+            ("ws_down", |c| &mut c.ws_down),
+        ];
+        let mut wrong = Vec::new();
+        for (name, part) in parts {
+            for (truncated, want) in [(true, "kept **********"), (false, "kept s3cr3t-val")] {
+                let mut cap = Capture::new(1);
+                *part(&mut cap) = CaptureBytes {
+                    bytes: format!("kept {}", &VALUE[..10]).into_bytes(),
+                    truncated,
+                };
+                let mut masked = cap.mask(&needles, "api.example.com").0;
+                let got = String::from_utf8_lossy(&part(&mut masked).bytes).into_owned();
+                if got != want {
+                    wrong.push(format!("{name}, cut={truncated}: {got:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// What a cut leaves of a value is masked by the needles that mask the record of that exchange,
+    /// as the whole value is: a value the cage taught the proxy on one service is masked where a cut
+    /// ends that service's record, and not where it ends the record of another host, where those
+    /// bytes leaving are what the record is for. Each host is checked on its own.
+    #[test]
+    fn a_cut_masks_a_learned_value_in_its_own_services_record_only() {
+        use crate::sandbox::proxy::Credentials;
+
+        const VALUE: &str = "cage-chosen-value-0";
+        let credentials = std::sync::Arc::new(Credentials::new(
+            Vec::new(),
+            Vec::new(),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            Vec::new(),
+        ));
+        assert!(
+            credentials.observe("authorization", &format!("Bearer {VALUE}"), "api.test"),
+            "a learned needle is the premise of this test"
+        );
+        let begun = &VALUE[..10];
+        let mut wrong = Vec::new();
+        for (host, want) in [
+            ("api.test", "x=**********".to_string()),
+            ("elsewhere.test", format!("x={begun}")),
+        ] {
+            let mut cap = Capture::new(1);
+            cap.req_body = CaptureBytes {
+                bytes: format!("x={begun}").into_bytes(),
+                truncated: true,
+            };
+            let masked = cap.mask(&credentials.masking_needles(), host).0;
+            let got = String::from_utf8_lossy(&masked.req_body.bytes).into_owned();
+            if got != want {
+                wrong.push(format!("{host}: {got:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
     }
 
     /// The history is bounded, so something has to go when it fills, and what goes must never be a
