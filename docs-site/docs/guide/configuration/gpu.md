@@ -44,6 +44,10 @@ Each piece is **best-effort**: if mesa cannot be provisioned (no network on a fi
 or a render node is absent, the app still runs and falls back to software rendering rather
 than failing the launch.
 
+An untrusted `[env]` cannot set these variables. A trusted one that sets a driver path
+replaces sbx's value whole, while one that sets `LD_LIBRARY_PATH` keeps its own directories
+first and those a bridge below puts there after them (see [`env`](env#precedence)).
+
 ## Under WSL: the dxgkrnl node and the Windows driver store
 
 A WSL distribution publishes no DRM node at all. There is no `/dev/dri`, and the whole of the

@@ -2985,8 +2985,8 @@ pub(super) fn build(
         (EnvLayer::Task, task.env),
         (EnvLayer::Config, prep.cfg.env.clone()),
     ];
-    for (key, ours) in kept_keys_mise_restates(&layers) {
-        crate::diag::note(&mise_restates_note(key, ours));
+    for (key, side, ours) in kept_keys_mise_restates(&layers) {
+        crate::diag::note(&mise_restates_note(key, side, ours));
     }
     let extra_env = extra_cage_env(layers);
 
@@ -3792,9 +3792,9 @@ enum EnvLayer {
     Gui,
     /// The non-`nix:` auto-equip variable.
     AutoEquip,
-    /// A trusted project's mise `[env]`. Its value for a [`KEPT_IN_FRONT`] key carries sbx's in
-    /// front, as the config's does, in the cage's environment; a process mise itself starts is
-    /// handed mise's own value again (see [`KEPT_IN_FRONT`]).
+    /// A trusted project's mise `[env]`. Its value for a [`KEPT_LISTS`] key carries sbx's entries,
+    /// as the config's does, in the cage's environment; a process mise itself starts is handed
+    /// mise's own value again (see [`KEPT_LISTS`]).
     Mise,
     /// The egress machinery: the proxy variables and the per-session MITM CA, which must beat
     /// [`EnvLayer::Cacert`] so a cage under an allowlist trusts the proxy standing in for its
@@ -3810,7 +3810,7 @@ enum EnvLayer {
     Task,
     /// The `.sbx.toml` `[env]`: the sbx-native config has the final say. An untrusted one has
     /// already lost its reserved keys upstream, so overriding here is self-harm only. On a
-    /// [`KEPT_IN_FRONT`] key its say is on what follows sbx's own entries, which stay in front.
+    /// [`KEPT_LISTS`] key its say is on its own entries, and sbx's stay beside them.
     Config,
 }
 
@@ -3839,13 +3839,11 @@ fn merge_loader_path(env: &mut Vec<(String, String)>) {
     if !env.iter().any(|(k, _)| k == KEY) {
         return;
     }
-    let joined = env
-        .iter()
-        .filter(|(k, _)| k == KEY)
-        .flat_map(|(_, v)| v.split(':'))
-        .filter(|dir| !dir.is_empty())
-        .collect::<Vec<_>>()
-        .join(":");
+    let joined = join_dirs(
+        env.iter()
+            .filter(|(k, _)| k == KEY)
+            .map(|(_, v)| v.as_str()),
+    );
     let mut first = true;
     env.retain(|(k, _)| k != KEY || std::mem::replace(&mut first, false));
     match env.iter().position(|(k, _)| k == KEY) {
@@ -3857,8 +3855,29 @@ fn merge_loader_path(env: &mut Vec<(String, String)>) {
     }
 }
 
+/// Join `:`-separated lists into one, in the order given, leaving out every empty element (a
+/// leading, trailing or doubled `:`), which a search path reads as the working directory.
+fn join_dirs<'a>(lists: impl IntoIterator<Item = &'a str>) -> String {
+    lists
+        .into_iter()
+        .flat_map(|list| list.split(':'))
+        .filter(|dir| !dir.is_empty())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Where sbx's own entries on a [`KEPT_LISTS`] key go, relative to the entries a project layer
+/// sets on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SbxSide {
+    /// In front of the project's: what sbx puts there must be the one found.
+    Front,
+    /// After the project's: the project's are found first, and sbx's are still found.
+    Back,
+}
+
 /// The list variables that a layer of sbx's own puts an entry on and that a project layer's value
-/// for the same key keeps in front of its entries, instead of replacing.
+/// for the same key keeps, on the side named here, instead of replacing.
 ///
 /// `PYTHONPATH` carries the audio shim's directory (a `sitecustomize.py`, see
 /// [`crate::sandbox::audio`]). A project that sets its own, `PYTHONPATH = "src"` in its mise `[env]`
@@ -3867,46 +3886,85 @@ fn merge_loader_path(env: &mut Vec<(String, String)>) {
 /// first because the `sitecustomize` it holds must be the one Python imports; one that a project
 /// directory carries is shadowed, as one an app ships already is.
 ///
-/// The mise `[env]` value is kept behind sbx's in the cage's environment only: a process that mise
-/// itself starts, through a shim or `mise exec`, is handed the project's mise `[env]` again by
-/// mise, whose `PYTHONPATH` then stands alone and leaves the shim out, which the launch says in a
-/// note ([`kept_keys_mise_restates`]). The `.sbx.toml` `[env]` is not one mise reads, so a
-/// `PYTHONPATH` set there keeps the shim in front for those too.
-const KEPT_IN_FRONT: &[&str] = &["PYTHONPATH"];
-
-/// The [`KEPT_IN_FRONT`] keys the project's mise `[env]` sets while a layer of sbx's own puts an
-/// entry on them, each with sbx's last word on it by [`EnvLayer`] precedence.
+/// `LD_LIBRARY_PATH` carries the audio client libraries and a GPU bridge's (see
+/// [`merge_loader_path`]). A project that sets its own would otherwise lose sound and the GPU
+/// without a word. The project's directories go first, so a library both carry under one soname is
+/// the project's, which is what setting the variable asks for, and sbx's follow, so what only they
+/// carry is still found. The joined value has no empty element (see [`join_dirs`]), and a project
+/// value with nothing else leaves sbx's alone.
 ///
-/// The cage's environment keeps that entry in front, but a program mise itself starts is handed
-/// mise's value alone (see [`KEPT_IN_FRONT`]), so the launch names what such a program goes
-/// without. A key only the `.sbx.toml` `[env]` sets is left out: mise does not read that one.
-fn kept_keys_mise_restates(layers: &[(EnvLayer, Vec<(String, String)>)]) -> Vec<(&str, &str)> {
+/// The mise `[env]` value is kept with sbx's in the cage's environment only: a process that mise
+/// itself starts, through a shim or `mise exec`, is handed the project's mise `[env]` again by
+/// mise, whose value then stands alone and leaves sbx's entries out, which the launch says in a
+/// note ([`kept_keys_mise_restates`]). The `.sbx.toml` `[env]` is not one mise reads, so a value
+/// set there keeps sbx's entries for those too.
+///
+/// Every other key is the last writer's, lists among them: a GPU driver path a project sets
+/// replaces sbx's, and `XDG_DATA_DIRS` has to, since the portal relies on it carrying sbx's single
+/// entry (see `crate::sandbox::openuri`).
+const KEPT_LISTS: &[(&str, SbxSide)] = &[
+    ("PYTHONPATH", SbxSide::Front),
+    ("LD_LIBRARY_PATH", SbxSide::Back),
+];
+
+/// The side sbx's entries go on for `key`, when it is a [`KEPT_LISTS`] key.
+fn kept_side(key: &str) -> Option<SbxSide> {
+    KEPT_LISTS
+        .iter()
+        .find(|(kept, _)| *kept == key)
+        .map(|(_, side)| *side)
+}
+
+/// A project layer's `value` for a [`KEPT_LISTS`] key, with sbx's `ours` kept on `side`. A value
+/// with no entry of its own leaves sbx's alone.
+fn keep_ours(side: SbxSide, ours: &str, value: &str) -> String {
+    match side {
+        SbxSide::Front if value.is_empty() => ours.to_string(),
+        SbxSide::Front => format!("{ours}:{value}"),
+        SbxSide::Back => join_dirs([value, ours]),
+    }
+}
+
+/// The [`KEPT_LISTS`] keys the project's mise `[env]` sets while a layer of sbx's own puts an
+/// entry on them, each with its side and sbx's last word on it by [`EnvLayer`] precedence.
+///
+/// The cage's environment keeps that entry, but a program mise itself starts is handed mise's
+/// value alone (see [`KEPT_LISTS`]), so the launch names what such a program goes without. A key
+/// only the `.sbx.toml` `[env]` sets is left out: mise does not read that one.
+fn kept_keys_mise_restates(
+    layers: &[(EnvLayer, Vec<(String, String)>)],
+) -> Vec<(&str, SbxSide, &str)> {
     let mise_sets = |key: &str| {
         layers
             .iter()
             .any(|(layer, env)| *layer == EnvLayer::Mise && env.iter().any(|(k, _)| k == key))
     };
-    KEPT_IN_FRONT
+    KEPT_LISTS
         .iter()
-        .filter(|key| mise_sets(key))
-        .filter_map(|key| {
+        .filter(|(key, _)| mise_sets(key))
+        .filter_map(|(key, side)| {
             layers
                 .iter()
                 .filter(|(layer, _)| !layer.is_project())
                 .flat_map(|(layer, env)| env.iter().map(move |entry| (*layer, entry)))
                 .filter(|(_, (k, _))| k == key)
                 .max_by_key(|(layer, _)| *layer)
-                .map(|(_, (_, ours))| (*key, ours.as_str()))
+                .map(|(_, (_, ours))| (*key, *side, ours.as_str()))
         })
         .collect()
 }
 
-/// The note a launch prints for a [`kept_keys_mise_restates`] key: the key, sbx's entry on it
-/// that a program mise starts goes without, and where to set the key instead.
-fn mise_restates_note(key: &str, ours: &str) -> String {
+/// The note a launch prints for a [`kept_keys_mise_restates`] key: the key, sbx's entry on it and
+/// where the cage's environment keeps it, which a program mise starts goes without, and where to
+/// set the key instead.
+fn mise_restates_note(key: &str, side: SbxSide, ours: &str) -> String {
+    let place = match side {
+        SbxSide::Front => "in front of it",
+        SbxSide::Back => "after its entries",
+    };
     format!(
-        "the project's mise `[env]` sets `{key}`: the cage's environment keeps sbx's `{ours}` in \
-         front of it, but a program mise itself starts, through a shim or `mise exec`, is handed \
+        "the project's mise `[env]` sets `{key}`: the cage's environment keeps sbx's `{ours}` \
+         {place}, but a program mise itself starts, through a shim or `mise exec`, is handed \
          mise's value alone, without it; set `{key}` in `.sbx.toml`'s `[env]` rather than in \
          mise's to keep it there too"
     )
@@ -3917,8 +3975,8 @@ fn mise_restates_note(key: &str, ours: &str) -> String {
 /// The caller may list its layers in any order — they are sorted here. Two entries carrying the
 /// same layer keep the order they were given, since the sort is stable.
 ///
-/// A project layer's value for a [`KEPT_IN_FRONT`] key carries sbx's own value for that key in
-/// front of it: the project keeps the final say on its entries, and sbx's stay.
+/// A project layer's value for a [`KEPT_LISTS`] key carries sbx's own value for that key on the
+/// side the table names: the project keeps the final say on its entries, and sbx's stay.
 fn extra_cage_env(mut layers: Vec<(EnvLayer, Vec<(String, String)>)>) -> Vec<(String, String)> {
     layers.sort_by_key(|(layer, _)| *layer);
     // sbx's own entries for the kept keys, in precedence order, so the last one is its last word.
@@ -3926,17 +3984,17 @@ fn extra_cage_env(mut layers: Vec<(EnvLayer, Vec<(String, String)>)>) -> Vec<(St
         .iter()
         .filter(|(layer, _)| !layer.is_project())
         .flat_map(|(_, env)| env)
-        .filter(|(key, _)| KEPT_IN_FRONT.contains(&key.as_str()))
+        .filter(|(key, _)| kept_side(key).is_some())
         .cloned()
         .collect();
     let mut env = Vec::new();
     for (layer, entries) in layers {
         for (key, value) in entries {
-            let value = match ours.iter().rev().find(|(k, _)| *k == key) {
-                Some((_, front)) if layer.is_project() && !value.is_empty() => {
-                    format!("{front}:{value}")
+            let mine = ours.iter().rev().find(|(k, _)| *k == key);
+            let value = match (mine, kept_side(&key)) {
+                (Some((_, mine)), Some(side)) if layer.is_project() => {
+                    keep_ours(side, mine, &value)
                 }
-                Some((_, front)) if layer.is_project() => front.clone(),
                 _ => value,
             };
             env.push((key, value));

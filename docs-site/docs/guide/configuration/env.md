@@ -35,9 +35,19 @@ structural (set by sbx)  <  passthrough (TERM/LANG)  <  sbx-injected  <  config 
 So a trusted config `env` value wins over `sbx`'s own structural defaults. (An
 untrusted config's `env` has already lost its reserved keys, see below, so it
 cannot override those.) An app's `[app.<name>.env]` overlays the baseline `env`, the
-app winning on a key collision. One key is kept rather than replaced: under `audio = true`, a
-`PYTHONPATH` the config sets keeps the directory of sbx's audio shim in front of its entries
-(see [Audio](audio)).
+app winning on a key collision. Two list keys are kept rather than replaced. Under `audio = true`,
+a `PYTHONPATH` the config sets keeps the directory of sbx's audio shim in front of its entries
+(see [Audio](audio)). An `LD_LIBRARY_PATH` it sets keeps its own directories first and the ones
+sbx put there after them, the audio client libraries and a GPU bridge's (see [GPU](gpu)). Joined
+that way the value has no empty element, and one with no directory of its own leaves sbx's alone;
+where sbx put nothing, the value is left as written. A value the project's mise
+`[env]` sets for either key is kept the same way in the cage's environment, but a program mise
+itself starts, through a shim or `mise exec`, is handed mise's value alone, which the launch says
+in a note: set these two in `.sbx.toml` rather than in mise's `[env]`. Every other key a config
+sets replaces sbx's value whole, lists among them: the GPU driver paths (`LIBGL_DRIVERS_PATH`,
+`__EGL_VENDOR_LIBRARY_DIRS`, `VK_DRIVER_FILES` and the rest of that group below) and
+`NIX_LD_LIBRARY_PATH`, the base libraries a foreign binary is offered, become exactly what the
+config says.
 
 ## `TZ` also moves the clock's other half
 

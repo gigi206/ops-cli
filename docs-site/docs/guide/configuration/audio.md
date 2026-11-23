@@ -79,7 +79,8 @@ The base C++ runtime (`libstdc++`) follows these libraries on `LD_LIBRARY_PATH`,
 engine's `dlopen`ed native library (ctranslate2, onnxruntime) finds it. The base glibc does not:
 that path is searched ahead of a nix binary's own `RUNPATH`, and a binary built against a newer
 glibc, such as the mise an `sbx upgrade` rolled forward, would load the older one and refuse to
-start.
+start. An `LD_LIBRARY_PATH` the project sets keeps its own directories first and these after
+them, so sound still loads (see [`env`](env#precedence)).
 
 Everything is hermetic (the same pinned nixpkgs as the app, no host library path). The socket bind
 and `PULSE_SERVER` are firm; the client libraries and the ALSA shim are **best-effort**: if they

@@ -1305,8 +1305,8 @@ fn a_project_python_path_keeps_the_audio_shim_in_front() {
 /// that entry, since a program mise starts is handed mise's value alone; with two of sbx's layers on
 /// the key, the one that wins in the cage. A key only the `.sbx.toml` `[env]` sets is not named,
 /// mise does not read it, nor one sbx puts nothing on, nor a key a project replaces. The note names
-/// the key, sbx's entry and where to set the key instead. Each case is checked on its own, and
-/// every one decided another way is named.
+/// the key, sbx's entry, the side the cage keeps it on and where to set the key instead. Each case
+/// is checked on its own, and every one decided another way is named.
 #[test]
 fn a_kept_key_the_mise_env_restates_is_named_with_the_entry_it_leaves_out() {
     const SHIM: &str = crate::sandbox::audio::PYSHIM_INCAGE;
@@ -1316,12 +1316,12 @@ fn a_kept_key_the_mise_env_restates_is_named_with_the_entry_it_leaves_out() {
         (
             "mise [env]",
             vec![(EnvLayer::Gui, py(SHIM)), (EnvLayer::Mise, py("src"))],
-            vec![("PYTHONPATH", SHIM)],
+            vec![("PYTHONPATH", SbxSide::Front, SHIM)],
         ),
         (
             "an empty one, listed first",
             vec![(EnvLayer::Mise, py("")), (EnvLayer::Gui, py(SHIM))],
-            vec![("PYTHONPATH", SHIM)],
+            vec![("PYTHONPATH", SbxSide::Front, SHIM)],
         ),
         (
             "both project layers",
@@ -1330,7 +1330,15 @@ fn a_kept_key_the_mise_env_restates_is_named_with_the_entry_it_leaves_out() {
                 (EnvLayer::Mise, py("a")),
                 (EnvLayer::Config, py("b")),
             ],
-            vec![("PYTHONPATH", SHIM)],
+            vec![("PYTHONPATH", SbxSide::Front, SHIM)],
+        ),
+        (
+            "the loader path",
+            vec![
+                (EnvLayer::Gui, set("LD_LIBRARY_PATH", "/sbx/lib")),
+                (EnvLayer::Mise, set("LD_LIBRARY_PATH", "/proj/lib")),
+            ],
+            vec![("LD_LIBRARY_PATH", SbxSide::Back, "/sbx/lib")],
         ),
         (
             "two of sbx's layers",
@@ -1339,7 +1347,7 @@ fn a_kept_key_the_mise_env_restates_is_named_with_the_entry_it_leaves_out() {
                 (EnvLayer::Cacert, py("/cacert")),
                 (EnvLayer::Mise, py("src")),
             ],
-            vec![("PYTHONPATH", SHIM)],
+            vec![("PYTHONPATH", SbxSide::Front, SHIM)],
         ),
         (
             ".sbx.toml [env] only",
@@ -1364,16 +1372,128 @@ fn a_kept_key_the_mise_env_restates_is_named_with_the_entry_it_leaves_out() {
             wrong.push(format!("{what}: {got:?}, wants {want:?}"));
         }
     }
-    let note = mise_restates_note("PYTHONPATH", SHIM);
-    let entry = format!("`{SHIM}`");
-    for word in [
-        "`PYTHONPATH`",
-        entry.as_str(),
-        "`mise exec`",
-        "`.sbx.toml`'s `[env]`",
+    for (key, side, ours, place) in [
+        ("PYTHONPATH", SbxSide::Front, SHIM, "in front of it"),
+        (
+            "LD_LIBRARY_PATH",
+            SbxSide::Back,
+            "/sbx/lib",
+            "after its entries",
+        ),
     ] {
-        if !note.contains(word) {
-            wrong.push(format!("the note leaves out {word}: {note:?}"));
+        let note = mise_restates_note(key, side, ours);
+        let (key, ours) = (format!("`{key}`"), format!("`{ours}`"));
+        for word in [
+            key.as_str(),
+            ours.as_str(),
+            place,
+            "`mise exec`",
+            "`.sbx.toml`'s `[env]`",
+        ] {
+            if !note.contains(word) {
+                wrong.push(format!("the note leaves out {word}: {note:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+/// A project that sets its own `LD_LIBRARY_PATH`, in its mise `[env]` or its `.sbx.toml` `[env]`,
+/// keeps its directories first, and the ones sbx put there (the audio client libraries, a GPU
+/// bridge) follow instead of being dropped: the project's libraries win a soname both carry, and
+/// sound and the GPU still load. An empty element, which the loader reads as the working
+/// directory, is not carried into the joined value, and a project value with nothing else leaves
+/// sbx's alone; a value sbx put nothing beside is the project's as written. `PYTHONPATH` keeps
+/// sbx's entry in front, and a GPU driver path a project sets still replaces sbx's. The value read
+/// is the one the assembler keeps, the last. Each case is checked on its own, and every one decided
+/// another way is named.
+#[test]
+fn a_project_loader_path_keeps_sbx_libraries_after_its_entries() {
+    const SBX: &str = "/sbx/audio/lib:/sbx/gpu/lib";
+    let set = |key: &str, value: &str| vec![(key.to_string(), value.to_string())];
+    let ld = |value: &str| set("LD_LIBRARY_PATH", value);
+    let cases = [
+        (
+            "mise [env]",
+            vec![(EnvLayer::Gui, ld(SBX)), (EnvLayer::Mise, ld("/proj/lib"))],
+            "LD_LIBRARY_PATH",
+            format!("/proj/lib:{SBX}"),
+        ),
+        (
+            ".sbx.toml [env]",
+            vec![
+                (EnvLayer::Gui, ld(SBX)),
+                (EnvLayer::Config, ld("/proj/lib")),
+            ],
+            "LD_LIBRARY_PATH",
+            format!("/proj/lib:{SBX}"),
+        ),
+        (
+            "both, the .sbx.toml one last",
+            vec![
+                (EnvLayer::Gui, ld(SBX)),
+                (EnvLayer::Mise, ld("/a")),
+                (EnvLayer::Config, ld("/b")),
+            ],
+            "LD_LIBRARY_PATH",
+            format!("/b:{SBX}"),
+        ),
+        (
+            "empty elements",
+            vec![
+                (EnvLayer::Gui, ld(SBX)),
+                (EnvLayer::Config, ld(":/proj/lib::")),
+            ],
+            "LD_LIBRARY_PATH",
+            format!("/proj/lib:{SBX}"),
+        ),
+        (
+            "an empty one",
+            vec![(EnvLayer::Gui, ld(SBX)), (EnvLayer::Config, ld(""))],
+            "LD_LIBRARY_PATH",
+            SBX.to_string(),
+        ),
+        (
+            "nothing but separators",
+            vec![(EnvLayer::Gui, ld(SBX)), (EnvLayer::Mise, ld("::"))],
+            "LD_LIBRARY_PATH",
+            SBX.to_string(),
+        ),
+        (
+            "nothing of sbx's",
+            vec![(EnvLayer::Config, ld(":/proj/lib"))],
+            "LD_LIBRARY_PATH",
+            ":/proj/lib".to_string(),
+        ),
+        (
+            "PYTHONPATH",
+            vec![
+                (EnvLayer::Gui, set("PYTHONPATH", "/sbx/shim")),
+                (EnvLayer::Config, set("PYTHONPATH", "src")),
+            ],
+            "PYTHONPATH",
+            "/sbx/shim:src".to_string(),
+        ),
+        (
+            "a GPU driver path",
+            vec![
+                (EnvLayer::Gui, set("LIBGL_DRIVERS_PATH", "/sbx/dri")),
+                (EnvLayer::Config, set("LIBGL_DRIVERS_PATH", "/proj/dri")),
+            ],
+            "LIBGL_DRIVERS_PATH",
+            "/proj/dri".to_string(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, layers, key, want) in cases {
+        let env = extra_cage_env(layers);
+        let got = env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str());
+        if got != Some(want.as_str()) {
+            wrong.push(format!("{what}: {got:?}, wants {want:?}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:?}");
