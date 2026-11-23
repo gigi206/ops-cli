@@ -642,7 +642,9 @@ says, which the address alone does not tell: on a network that translates throug
 guard classifies the address by its v6 spelling. The local-use `64:ff9b:1::/48` is set aside
 whole for that reason, as a range that is not globally reachable: a public host an IPv6-only
 network reaches only through it needs a rule that names the host, and the `ssrf-blocked`
-refusal says so.
+refusal says so. That holds for the hosts sbx equips itself from too: a built-in rule never
+opens a private address, so on such a network they need a rule of the operator's own that
+names each of them.
 
 ### Fail-closed upstream validation
 
