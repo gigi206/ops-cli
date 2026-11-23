@@ -66,6 +66,8 @@ jobs:
           nixpkgs-rev: ${{ env.NIXPKGS_REV }}
           target: ${{ matrix.target }}
           asset: ${{ matrix.asset }}
+          # Read on the ARM arm only: the unpack's caged test, built for musl as well as glibc.
+          unpack-under-musl: "true"
 
       # Named after the asset, not after the workflow: two matrix arms uploading under one
       # name is a conflict, and the name is what `publish` globs for below.

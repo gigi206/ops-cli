@@ -32,8 +32,9 @@
 //! the `*at` calls the list names on every architecture. The aarch64 list was not read from a
 //! trace of its own. The build of the published binary runs it on an ARM runner, putting a layer
 //! of every kind of member through the unpack in its cage and under these filters
-//! (`.github/actions/build-static-sbx`), but that run is built against glibc: no test runs the
-//! musl build published for aarch64 under them.
+//! (`.github/actions/build-static-sbx`). Every publishing build runs that test built against
+//! glibc; `latest`'s also runs it built for musl, the C library of the published binary
+//! (`unpack-under-musl`), while `nightly` and a release do not.
 
 use super::{Rules, allowlist};
 use std::io;

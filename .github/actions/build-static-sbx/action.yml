@@ -55,6 +55,16 @@ inputs:
       site — the same reason `nixpkgs-rev` is passed in.
     required: false
     default: sbx-linux-x86_64
+  unpack-under-musl:
+    description: >
+      Also run the unpack's caged test built for `target`, the musl C library the published binary
+      carries, and not only for the runner's own glibc. Read on an ARM runner only, where the step
+      that runs it under glibc is the one run of that test under the aarch64 filters. Which system
+      call a library call becomes is the C library's choice, and the allowlist names system calls,
+      so the glibc run does not answer for the binary a user installs. It compiles the test binary
+      a second time, so a caller asks for it: `latest`, which builds on every push.
+    required: false
+    default: "false"
   skip-test:
     description: >
       The one unit test excluded from the pre-build gate. It asserts the behaviour of the host's
@@ -188,6 +198,29 @@ runs:
         log="$RUNNER_TEMP/unpack-in-its-cage.log"
         PATH="$(dirname "$BWRAP_ENGINE"):$PATH" RUSTFLAGS="-D warnings" \
           cargo test --bins -- "$t" | tee "$log"
+        grep -q '^test result: ok\. 1 passed' "$log"
+
+    # The same test, built for the target the release ships rather than for the runner's glibc: the
+    # allowlist names system calls, and which one a library call becomes is the C library's choice.
+    # Opt-in, see `unpack-under-musl`. `cargo-zigbuild test` runs the binary it builds, a static
+    # one, so the cage needs no library of the runner's; the count is read back as in the step above.
+    - name: The unpack in its cage, under the aarch64 filters, built for musl
+      if: runner.arch == 'ARM64' && inputs.unpack-under-musl == 'true'
+      shell: bash
+      env:
+        BWRAP_ENGINE: ${{ steps.bwrap.outputs.path }}
+        SBX_REQUIRE_CAPABLE: "1"
+        TARGET: ${{ inputs.target }}
+      run: |
+        set -euo pipefail
+        knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+        if [ -e "$knob" ]; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+        t=unpack::tests::a_layer_unpacked_in_its_cage_lands_in_the_tree_and_reaches_nothing_else
+        log="$RUNNER_TEMP/unpack-in-its-cage-musl.log"
+        PATH="$(dirname "$BWRAP_ENGINE"):$PATH" \
+          cargo-zigbuild test --target "$TARGET" --bins -- "$t" | tee "$log"
         grep -q '^test result: ok\. 1 passed' "$log"
 
     # The release stamp rides this step alone. The unit gate above compiles without it, as every
