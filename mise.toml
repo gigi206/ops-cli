@@ -44,7 +44,7 @@ zig                             = "0.15.2"
 # Source-based code coverage. Prebuilt + checksum-verified via aqua. On its first run it
 # provisions the `llvm-tools-preview` rustup component (llvm-cov / llvm-profdata) itself, so
 # nothing else is needed. Run `mise run coverage`.
-"aqua:taiki-e/cargo-llvm-cov"      = "0.9.1"
+"aqua:taiki-e/cargo-llvm-cov"      = "0.9.2"
 # Dependency advisories, for both lockfiles (`mise run audit`). Pinned like the other build tools:
 # an audit that reads the RustSec database is only as reproducible as the client that reads it.
 "cargo:cargo-audit"             = "0.22.2"
