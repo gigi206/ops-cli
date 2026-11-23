@@ -284,3 +284,19 @@ fn attach_argv_rejects_a_command_argument_with_an_interior_nul() {
     ];
     assert!(attach_argv(&cmd).is_err());
 }
+
+/// An argument reaches the cage as the bytes it was given, UTF-8 or not: a file name is whatever
+/// bytes the filesystem holds, and an attach that re-encoded one would run the command on a name
+/// that does not exist. Compared as bytes, which [`argv_strings`] cannot do.
+#[test]
+fn attach_argv_passes_an_argument_that_is_not_utf8_byte_for_byte() {
+    use std::os::unix::ffi::OsStrExt;
+    let name: &[u8] = b"caf\xe9.txt";
+    let cmd = vec![
+        OsString::from("cat"),
+        std::ffi::OsStr::from_bytes(name).to_os_string(),
+    ];
+    let argv = attach_argv(&cmd).expect("command argv builds");
+    let passed: Vec<&[u8]> = argv.iter().skip(4).map(|c| c.as_bytes()).collect();
+    assert_eq!(passed, vec![&b"cat"[..], name]);
+}
