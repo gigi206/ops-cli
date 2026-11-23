@@ -35,7 +35,9 @@ structural (set by sbx)  <  passthrough (TERM/LANG)  <  sbx-injected  <  config 
 So a trusted config `env` value wins over `sbx`'s own structural defaults. (An
 untrusted config's `env` has already lost its reserved keys, see below, so it
 cannot override those.) An app's `[app.<name>.env]` overlays the baseline `env`, the
-app winning on a key collision.
+app winning on a key collision. One key is kept rather than replaced: under `audio = true`, a
+`PYTHONPATH` the config sets keeps the directory of sbx's audio shim in front of its entries
+(see [Audio](audio)).
 
 ## `TZ` also moves the clock's other half
 

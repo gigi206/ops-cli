@@ -3788,7 +3788,9 @@ enum EnvLayer {
     Gui,
     /// The non-`nix:` auto-equip variable.
     AutoEquip,
-    /// A trusted project's mise `[env]`.
+    /// A trusted project's mise `[env]`. Its value for a [`KEPT_IN_FRONT`] key carries sbx's in
+    /// front, as the config's does, in the cage's environment; a process mise itself starts is
+    /// handed mise's own value again (see [`KEPT_IN_FRONT`]).
     Mise,
     /// The egress machinery: the proxy variables and the per-session MITM CA, which must beat
     /// [`EnvLayer::Cacert`] so a cage under an allowlist trusts the proxy standing in for its
@@ -3803,12 +3805,19 @@ enum EnvLayer {
     /// The task plane's discovery handles.
     Task,
     /// The `.sbx.toml` `[env]`: the sbx-native config has the final say. An untrusted one has
-    /// already lost its reserved keys upstream, so overriding here is self-harm only.
+    /// already lost its reserved keys upstream, so overriding here is self-harm only. On a
+    /// [`KEPT_IN_FRONT`] key its say is on what follows sbx's own entries, which stay in front.
     Config,
 }
 
-/// Layer the cage's extra environment by [`EnvLayer`] precedence, lowest first.
-///
+impl EnvLayer {
+    /// Whether the project wrote this layer's values (its mise `[env]`, its `.sbx.toml` `[env]`)
+    /// rather than sbx.
+    fn is_project(self) -> bool {
+        matches!(self, EnvLayer::Mise | EnvLayer::Config)
+    }
+}
+
 /// Fold repeated `LD_LIBRARY_PATH` entries into one, joined in the order they were added, with no
 /// empty element.
 ///
@@ -3844,11 +3853,53 @@ fn merge_loader_path(env: &mut Vec<(String, String)>) {
     }
 }
 
+/// The list variables that a layer of sbx's own puts an entry on and that a project layer's value
+/// for the same key keeps in front of its entries, instead of replacing.
+///
+/// `PYTHONPATH` carries the audio shim's directory (a `sitecustomize.py`, see
+/// [`crate::sandbox::audio`]). A project that sets its own, `PYTHONPATH = "src"` in its mise `[env]`
+/// or its `.sbx.toml` `[env]`, would otherwise drop the shim without a word, and with it PortAudio's
+/// library lookup and a `certifi`-pinned client's trust in the proxy's CA. sbx's directory goes
+/// first because the `sitecustomize` it holds must be the one Python imports; one that a project
+/// directory carries is shadowed, as one an app ships already is.
+///
+/// The mise `[env]` value is kept behind sbx's in the cage's environment only: a process that mise
+/// itself starts, through a shim or `mise exec`, is handed the project's mise `[env]` again by
+/// mise, whose `PYTHONPATH` then stands alone and leaves the shim out. The `.sbx.toml` `[env]` is
+/// not one mise reads, so a `PYTHONPATH` set there keeps the shim in front for those too.
+const KEPT_IN_FRONT: &[&str] = &["PYTHONPATH"];
+
+/// Layer the cage's extra environment by [`EnvLayer`] precedence, lowest first.
+///
 /// The caller may list its layers in any order — they are sorted here. Two entries carrying the
 /// same layer keep the order they were given, since the sort is stable.
+///
+/// A project layer's value for a [`KEPT_IN_FRONT`] key carries sbx's own value for that key in
+/// front of it: the project keeps the final say on its entries, and sbx's stay.
 fn extra_cage_env(mut layers: Vec<(EnvLayer, Vec<(String, String)>)>) -> Vec<(String, String)> {
     layers.sort_by_key(|(layer, _)| *layer);
-    layers.into_iter().flat_map(|(_, env)| env).collect()
+    // sbx's own entries for the kept keys, in precedence order, so the last one is its last word.
+    let ours: Vec<(String, String)> = layers
+        .iter()
+        .filter(|(layer, _)| !layer.is_project())
+        .flat_map(|(_, env)| env)
+        .filter(|(key, _)| KEPT_IN_FRONT.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    let mut env = Vec::new();
+    for (layer, entries) in layers {
+        for (key, value) in entries {
+            let value = match ours.iter().rev().find(|(k, _)| *k == key) {
+                Some((_, front)) if layer.is_project() && !value.is_empty() => {
+                    format!("{front}:{value}")
+                }
+                Some((_, front)) if layer.is_project() => front.clone(),
+                _ => value,
+            };
+            env.push((key, value));
+        }
+    }
+    env
 }
 
 #[cfg(test)]

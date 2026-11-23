@@ -61,6 +61,19 @@ point ALSA at them). An ALSA `default` capture/playback is then transparently ro
 PulseAudio socket, the same mechanism a desktop uses to let ALSA apps reach PipeWire. `libasound`
 itself is provisioned too, for a CLI binary that does not carry its own.
 
+**For a Python voice stack** (`sounddevice` over PortAudio): Python's `ctypes.util.find_library`
+does not consult `LD_LIBRARY_PATH` (on Linux it asks `ldconfig`, `gcc` or `ld`, none of which a
+hermetic cage carries), so when PortAudio is provisioned sbx puts a directory holding a
+`sitecustomize.py` on `PYTHONPATH`. It lets `find_library` fall back to scanning
+`LD_LIBRARY_PATH`, and, when `SSL_CERT_FILE` is set, makes `certifi` return that bundle, so a
+`certifi`-pinned client trusts the CA the proxy presents. A `PYTHONPATH` the project sets in its
+`.sbx.toml` `[env]` keeps its entries, and sbx's directory stays in front of them instead of being
+replaced: its `sitecustomize.py` is the one Python imports, so one in a project directory on that
+path is shadowed. A `PYTHONPATH` set in the project's mise `[env]` is kept the same way in the
+cage's environment, but a Python that mise itself starts, through a shim or `mise exec`, is handed
+mise's value again, alone, and the shim is not loaded: under `audio = true`, set `PYTHONPATH` in
+`.sbx.toml` rather than in mise's `[env]`.
+
 The base C++ runtime (`libstdc++`) follows these libraries on `LD_LIBRARY_PATH`, so a voice
 engine's `dlopen`ed native library (ctranslate2, onnxruntime) finds it. The base glibc does not:
 that path is searched ahead of a nix binary's own `RUNPATH`, and a binary built against a newer

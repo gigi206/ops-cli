@@ -1223,6 +1223,84 @@ fn two_pieces_of_one_layer_keep_the_order_they_were_given() {
     assert_eq!(seen, ["a", "b"]);
 }
 
+/// A project that sets its own `PYTHONPATH`, in its mise `[env]` or its `.sbx.toml` `[env]`, keeps
+/// its entries, and the audio shim's directory stays in front of them instead of being replaced:
+/// without it the shim's `sitecustomize` is gone, and with it PortAudio's lookup and a
+/// `certifi`-pinned client's trust in the proxy. The project keeps the final say on what follows,
+/// the shim alone is unchanged, a cage without the shim is untouched, and another key a project
+/// sets still replaces sbx's. The value read is the one the assembler keeps, the last. Each case
+/// is checked on its own, and every one decided another way is named.
+#[test]
+fn a_project_python_path_keeps_the_audio_shim_in_front() {
+    const SHIM: &str = crate::sandbox::audio::PYSHIM_INCAGE;
+    let set = |key: &str, value: &str| vec![(key.to_string(), value.to_string())];
+    let py = |value: &str| set("PYTHONPATH", value);
+    let cases = [
+        (
+            "mise [env]",
+            vec![(EnvLayer::Gui, py(SHIM)), (EnvLayer::Mise, py("src"))],
+            "PYTHONPATH",
+            format!("{SHIM}:src"),
+        ),
+        (
+            ".sbx.toml [env]",
+            vec![(EnvLayer::Gui, py(SHIM)), (EnvLayer::Config, py("src"))],
+            "PYTHONPATH",
+            format!("{SHIM}:src"),
+        ),
+        (
+            "both, the .sbx.toml one last",
+            vec![
+                (EnvLayer::Gui, py(SHIM)),
+                (EnvLayer::Mise, py("a")),
+                (EnvLayer::Config, py("b")),
+            ],
+            "PYTHONPATH",
+            format!("{SHIM}:b"),
+        ),
+        (
+            "an empty one",
+            vec![(EnvLayer::Gui, py(SHIM)), (EnvLayer::Config, py(""))],
+            "PYTHONPATH",
+            SHIM.to_string(),
+        ),
+        (
+            "the shim alone",
+            vec![(EnvLayer::Gui, py(SHIM))],
+            "PYTHONPATH",
+            SHIM.to_string(),
+        ),
+        (
+            "no shim",
+            vec![(EnvLayer::Config, py("src"))],
+            "PYTHONPATH",
+            "src".to_string(),
+        ),
+        (
+            "another key",
+            vec![
+                (EnvLayer::Gui, set("ALSA_CONFIG_DIR", "/sbx")),
+                (EnvLayer::Config, set("ALSA_CONFIG_DIR", "/project")),
+            ],
+            "ALSA_CONFIG_DIR",
+            "/project".to_string(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, layers, key, want) in cases {
+        let env = extra_cage_env(layers);
+        let got = env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str());
+        if got != Some(want.as_str()) {
+            wrong.push(format!("{what}: {got:?}, wants {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
 #[test]
 fn net_policy_maps_the_config_posture_to_the_cage_posture() {
     // the cheap, total map between the two posture vocabularies — the one place
