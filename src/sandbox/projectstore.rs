@@ -354,6 +354,21 @@ pub(crate) fn lock_project_store(
     .map(ProjectStoreLock)
 }
 
+/// [`lock_project_store`] for a verb that goes on only while the project still has a store (`sbx gc`
+/// on the current project): the lock, once taken, or `None` when the store is gone by then.
+///
+/// The store is looked for **under** the lock. A check made before it races the verb that removes
+/// the project's tree (`sbx projects rm`), which holds the same lock: a removal that ran while this
+/// waited leaves no store, and a sweep that went on would seed it again only to collect it.
+pub(crate) fn lock_existing_project_store(
+    layout: &Layout,
+    project_id: &str,
+    waiting: &dyn Fn(&Path),
+) -> io::Result<Option<ProjectStoreLock>> {
+    let lock = lock_project_store(layout, project_id, waiting)?;
+    Ok(store_exists(layout, project_id).then_some(lock))
+}
+
 /// Record the project's canonical path in a durable marker beside its store, so a later `sbx gc`
 /// can recognise this tree (`<id>` alone is a one-way hash) and reclaim it once the project
 /// directory is gone. Written by [`super::atomicfile::write_atomic_mode`]: atomic, owner-only from
@@ -1933,6 +1948,44 @@ mod tests {
             "gc did not go on once the launches let go"
         );
         gc.join().unwrap();
+    }
+
+    /// The store a verb finds once it holds the lock is the one it acts on: a removal that ran while
+    /// it waited for the lock leaves it nothing, which it is told rather than handed the lock to go
+    /// on with, and a store still there is handed over with the lock held.
+    #[test]
+    fn a_store_removed_while_its_lock_was_awaited_is_found_gone() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        std::fs::create_dir_all(store_dir_for(&layout, "p")).unwrap();
+        let there = lock_existing_project_store(&layout, "p", &|_| panic!("nothing holds it"));
+        assert!(
+            there.unwrap().is_some(),
+            "a store that is there is handed over"
+        );
+
+        // The removal holds the lock while the verb waits for it, and removes the store meanwhile.
+        let removal = lock_project_store(&layout, "p", &|_| panic!("nothing holds it")).unwrap();
+        let (said, waiting) = mpsc::channel();
+        let path = data.path().to_path_buf();
+        let verb = std::thread::spawn(move || {
+            let layout = Layout::under(&path);
+            lock_existing_project_store(&layout, "p", &|_| said.send(()).unwrap())
+                .unwrap()
+                .is_some()
+        });
+        assert!(
+            waiting.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the verb did not wait for the removal"
+        );
+        std::fs::remove_dir_all(store_dir_for(&layout, "p")).unwrap();
+        drop(removal);
+        assert!(
+            !verb.join().unwrap(),
+            "a store removed while the verb waited for its lock was handed over"
+        );
     }
 
     #[test]

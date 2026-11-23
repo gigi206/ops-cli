@@ -481,21 +481,34 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     // read: a launch of the project still provisioning or seeding holds it shared until its session
     // is recorded, so the check below sees every launch that went ahead, and a launch that comes
     // later waits until this sweep is done. A cage no session records (an `sbx upgrade` step)
-    // holds it for its whole run, and this waits for it.
-    let _store_lock =
-        match crate::sandbox::projectstore::lock_project_store(&prep.layout, &id, &|lock| {
+    // holds it for its whole run, and this waits for it. The store is looked for again under the
+    // lock: the check above ran before it, and a removal of the project can have run in between.
+    let _store_lock = match crate::sandbox::projectstore::lock_existing_project_store(
+        &prep.layout,
+        &id,
+        &|lock| {
             crate::diag::note(&format!(
                 "waiting for the project's store lock `{}`, which a launch of the project holds \
                  until its session is recorded, and an `sbx upgrade` step until it ends",
                 lock.display()
             ))
-        }) {
-            Ok(lock) => lock,
-            Err(e) => {
-                crate::diag::error(&format!("sbx gc: cannot lock the project's store: {e}"));
-                return Err(ExitCode::FAILURE);
-            }
-        };
+        },
+    ) {
+        Ok(Some(lock)) => lock,
+        // Removed while this waited for the lock (`sbx projects rm`, which holds it too): nothing
+        // is left to reclaim, and going on would seed the store again only to sweep it.
+        Ok(None) => {
+            outln!(
+                "{h}sbx gc{r} — {n}{}{r}: {dim}no per-project store any more, nothing to reclaim.{r}",
+                project.display()
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            crate::diag::error(&format!("sbx gc: cannot lock the project's store: {e}"));
+            return Err(ExitCode::FAILURE);
+        }
+    };
 
     // Refuse if a live sandbox holds this project: collecting a store a running cage reads and
     // writes could drop a path it still needs. The registry list prunes dead records as it goes.
