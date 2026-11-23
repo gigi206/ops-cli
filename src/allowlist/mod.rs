@@ -415,9 +415,10 @@ pub(crate) struct Request {
     /// The request as sent, decoded: `https://host[:port]<decoded-target>` (the port shown only
     /// when it is not 443, an IPv6 host bracketed). Egress is HTTPS, so the scheme is always
     /// `https`. Decoded so a regex deny is not dodged by encoding — but `.`/`..` are **not**
-    /// resolved here and the query and any fragment are still attached, because this is the string
-    /// the request actually carried: the tunneled plane relays the request line as the cage wrote
-    /// it, `#` included, so a regex deny written for what follows one must still see it.
+    /// resolved here and the query is still attached, because this is the string the request
+    /// actually carried. A fragment is kept too when the target has one, which only a URL given to
+    /// `sbx test net` can: every proxy plane that relays a request line refuses one carrying a raw
+    /// `#`, and HTTP/2 drops it.
     url: String,
     /// The same URL rebuilt from [`Self::segs`]: `.`/`..` resolved, empty segments dropped, query
     /// removed. A `re:` rule is matched against **both** this and [`Self::url`], and matching
@@ -709,8 +710,8 @@ fn path_matches(req_segs: &[String], rule_path: &str, subtree: bool) -> bool {
 /// serves `/secret;jsessionid=…` as `/secret`, so a `deny host/secret` that compared the raw
 /// spelling refused nothing. The fragment is dropped for the same reason: a target carrying one is
 /// read as the resource before it, so a deny of that resource is not dodged by appending one. The
-/// form a request is sent in ([`Request`]'s `url`) keeps it, since the tunneled plane relays the
-/// request line as written.
+/// form a request is sent in ([`Request`]'s `url`) keeps it, for a URL given to `sbx test net`: the
+/// proxy's planes refuse a request line carrying a raw `#` before deciding it.
 ///
 /// **Both cuts happen after decoding, and that is a deliberate over-normalization.** A literal
 /// `%23` or `%3B` in a path decodes to a character this function then treats as a delimiter, so

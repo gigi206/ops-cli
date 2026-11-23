@@ -9542,6 +9542,73 @@ fn a_url_in_the_query_is_not_absolute_form() {
     );
 }
 
+/// A target carrying a raw `#` is refused `400 bad-request` before any verdict, on the tunnel and
+/// on the absolute-form planes: a fragment is no part of a request, and the upstream would serve the
+/// resource before it, judged with it. An encoded `%23` is a byte of the path and passes.
+///
+/// Teeth: the resolver answers the cloud-metadata address, which the SSRF guard always refuses, so
+/// a target that passes the check comes back `403 ssrf-blocked` rather than `400 bad-request`. Each
+/// target is checked on each plane on its own, and every one answered the other way is named.
+#[test]
+fn a_target_carrying_a_fragment_is_refused_on_every_plane_that_relays_it() {
+    let tunneled = |target: &str| {
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["allowed.test:*"]))
+                .unwrap()
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
+        );
+        let request =
+            format!("GET {target} HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n");
+        through_proxy(
+            ctx,
+            proxy_ca_der,
+            "allowed.test",
+            "allowed.test",
+            8443,
+            request.as_bytes(),
+        )
+        .unwrap()
+    };
+    let absolute = |target: &str| {
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["http://allowed.test:80"]),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
+        );
+        let request = format!(
+            "GET http://allowed.test{target} HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n"
+        );
+        through_cleartext(ctx, request.as_bytes()).unwrap()
+    };
+    let mut wrong = Vec::new();
+    for (target, refused) in [
+        ("/a#t", true),
+        ("/a?q=1#t", true),
+        ("/#", true),
+        ("/a%23t", false),
+    ] {
+        for (plane, resp) in [
+            ("tunnel", tunneled(target)),
+            ("absolute-form", absolute(target)),
+        ] {
+            let answered = if refused {
+                resp.contains("400") && resp.contains("bad-request") && resp.contains("fragment")
+            } else {
+                resp.contains("403") && resp.contains("ssrf-blocked")
+            };
+            if !answered {
+                wrong.push(format!("{plane} `{target}`: {resp:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A header injection scoped to `to` (in allowlist-entry syntax), setting `header` to `value`.
 fn injection(to: &str, header: &str, value: &str) -> HeaderInjection {
     HeaderInjection::fixed(classify(to).unwrap(), header.to_string(), value.to_string())

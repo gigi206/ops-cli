@@ -3602,8 +3602,9 @@ fn an_allow_path_that_does_not_decode_to_text_is_refused() {
     assert!(wrong.is_empty(), "{}", wrong.join("; "));
 }
 
-/// A regex deny reads the fragment a request carries: the tunneled plane relays the request line
-/// as written, `#` included, so `re:\.exe$` refuses `/file#.exe` as it refuses `/file.exe`.
+/// A regex deny reads the fragment a target carries, as a URL given to `sbx test net` does:
+/// `re:\.exe$` refuses `/file#.exe` as it refuses `/file.exe`. The proxy's planes refuse a request
+/// line carrying a raw `#` before deciding it.
 #[test]
 fn a_regex_deny_reads_the_fragment_the_request_carries() {
     let p = EgressPolicy::new(

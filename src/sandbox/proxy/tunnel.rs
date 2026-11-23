@@ -195,6 +195,25 @@ pub(super) fn serve_tunneled_request(
             "the tunneled request target must be origin-form (a path)",
         );
     }
+    // A raw `#` is a fragment, which a request never carries (`carries_fragment`): the upstream would
+    // serve the resource before it, judged with it.
+    if super::carries_fragment(&itarget) {
+        ctx.push_log(
+            crate::sandbox::control::Proto::Https,
+            connect_host,
+            port,
+            Some(&imethod),
+            Some(&itarget),
+            crate::sandbox::control::LogVerdict::Blocked,
+            "bad-request",
+        );
+        return respond_refusal_tls(
+            &mut br,
+            "400 Bad Request",
+            "bad-request",
+            super::FRAGMENT_REFUSED,
+        );
+    }
     // Anti request-smuggling, fail-closed, through the check every inspected plane shares: a byte
     // another parser could frame by, a coding this proxy does not forward, a duplicated
     // Content-Length or Host, a length that is not a number. What it answers with is a reason and a

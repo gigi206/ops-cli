@@ -227,9 +227,11 @@ rule cannot express.
 Three `re:` caveats:
 
 - **It is matched twice: against the request as sent, and against its canonical form.**
-  A match on either is a match. The request as sent is decoded, with its query and any
-  fragment attached and its `.`/`..` left as written (the HTTP/1.1 plane relays the
-  request line as the client wrote it); a target that does not start with `/` is read
+  A match on either is a match. The request as sent is decoded, with its query attached
+  and its `.`/`..` left as written (the HTTP/1.1 planes relay the request line as the
+  client wrote it, and refuse `400 bad-request` one that carries a raw `#`, a fragment
+  being no part of a request; a URL given to [`sbx test net`](../cli/test) is read with
+  its fragment); a target that does not start with `/` is read
   under the root, so the URL always names the request's own host. The canonical form is
   the one a path rule sees, with `.`/`..` resolved and the query and fragment removed.
   So a deny like `re:…/secret$` now catches `/foo/../secret` and `/secret?x=1`, and a
