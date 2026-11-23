@@ -606,8 +606,9 @@ documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), the
 benchmarking range `198.18.0.0/15`, the reserved `240.0.0.0/4`, "this network"
 `0.0.0.0/8`, the IETF protocol assignments `192.0.0.0/24` (save the two anycast
 addresses `192.0.0.9` and `192.0.0.10`, which are public), ULA `fc00::/7`, the
-deprecated site-local `fec0::/10`, documentation `2001:db8::/32` and `3fff::/20`, and
-benchmarking `2001:2::/48`; link-local, multicast, unspecified and broadcast are blocked
+deprecated site-local `fec0::/10`, documentation `2001:db8::/32` and `3fff::/20`,
+benchmarking `2001:2::/48`, and the local-use NAT64 prefix `64:ff9b:1::/48`; link-local,
+multicast, unspecified and broadcast are blocked
 outright and never reachable. A dial is bounded by the socket timeout, trying
 the permitted addresses in order and reporting the last error; a connection whose TLS
 handshake fails moves on to the next address the same way.
@@ -636,10 +637,12 @@ the address it embeds, so the guard cannot be dodged by an alternate encoding: v
 (`::ffff:127.0.0.1`), v4-compatible (`::127.0.0.1`), NAT64's well-known prefix
 (`64:ff9b::/96`), 6to4 (`2002::/16`) and Teredo (`2001:0::/32`). Two addresses only look
 like that last shape and keep their own classes: `::1` is the loopback and `::` is refused
-outright. A prefix a network chooses for its own NAT64, the local-use `64:ff9b:1::/48`
-included, puts the v4 where that prefix's length says, which the address alone does not
-tell: on a network that translates through one, the guard classifies the address by its v6
-spelling.
+outright. A prefix a network chooses for its own NAT64 puts the v4 where that prefix's length
+says, which the address alone does not tell: on a network that translates through one, the
+guard classifies the address by its v6 spelling. The local-use `64:ff9b:1::/48` is set aside
+whole for that reason, as a range that is not globally reachable: a public host an IPv6-only
+network reaches only through it needs a rule that names the host, and the `ssrf-blocked`
+refusal says so.
 
 ### Fail-closed upstream validation
 

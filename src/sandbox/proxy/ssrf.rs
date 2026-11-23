@@ -46,7 +46,8 @@ fn classify_ip(ip: IpAddr) -> IpClass {
         // prefix, 6to4, Teredo) is classified as that v4, so an internal/metadata v4 cannot dodge
         // the v4 guard wearing a v6 spelling (e.g. `64:ff9b::a9fe:a9fe`, NAT64 of
         // `169.254.169.254`). A prefix a network picks for its own NAT64 is not unwrapped: where
-        // its v4 sits depends on that prefix's length, which the address does not carry.
+        // its v4 sits depends on that prefix's length, which the address does not carry. The
+        // local-use `64:ff9b:1::/48` is set aside whole by `classify_v6` instead.
         IpAddr::V6(v6) => match allowlist::embedded_v4(v6) {
             Some(v4) => classify_v4(v4),
             None => classify_v6(v6),
@@ -101,13 +102,17 @@ fn classify_v6(v6: Ipv6Addr) -> IpClass {
     // loopback ::1, unique-local fc00::/7, the site-local fec0::/10 that unique-local replaced
     // (RFC 3879), the documentation prefixes 2001:db8::/32 and 3fff::/20 (RFC 9637), and the
     // benchmarking prefix 2001:2::/48 (RFC 5180): the v6 half of the same rule the v4 classifier
-    // applies to TEST-NET and to 198.18.0.0/15.
+    // applies to TEST-NET and to 198.18.0.0/15. The local-use NAT64 prefix 64:ff9b:1::/48 (RFC 8215)
+    // is not globally reachable either, and where it carries a v4 depends on a length the address
+    // does not tell, so it is set aside whole rather than unwrapped: a public host a network reaches
+    // only through it is reached by a rule naming that host.
     if v6.is_loopback()
         || (s[0] & 0xfe00) == 0xfc00
         || (s[0] & 0xffc0) == 0xfec0
         || (s[0] == 0x2001 && s[1] == 0x0db8)
         || (s[0] == 0x3fff && (s[1] & 0xf000) == 0)
         || (s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0)
+        || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001)
     {
         return IpClass::Private;
     }
@@ -256,7 +261,9 @@ impl ConnectRefusal {
         match self {
             Self::Dns => format!("DNS resolution failed for `{host}`"),
             Self::Ssrf => format!(
-                "`{host}` resolved only to disallowed addresses (a private or metadata range)"
+                "`{host}` resolved only to addresses outside the public Internet (loopback, private, \
+                 link-local or metadata, or a range IANA sets aside); a rule that names that exact \
+                 host reaches a private one, never a link-local one"
             ),
             Self::Unreachable => format!("`{host}:{port}` is allowed but could not be reached"),
             Self::Supervisor => format!(
@@ -342,6 +349,55 @@ pub(crate) fn names_exact_host(host: &str, deciding: Option<&Rule>) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// The local-use NAT64 prefix `64:ff9b:1::/48` is set aside whole, its bottom and its top, as the
+    /// ranges IANA marks not globally reachable are, while its neighbours stay public and the
+    /// well-known prefix `64:ff9b::/96` is still unwrapped to the v4 it carries. Each address is
+    /// checked on its own, and every one classified another way is named.
+    #[test]
+    fn the_local_use_nat64_prefix_is_set_aside_and_the_well_known_one_still_unwrapped() {
+        let name = |class: IpClass| match class {
+            IpClass::Public => "public",
+            IpClass::Private => "private",
+            IpClass::Blocked => "blocked",
+        };
+        let mut wrong = Vec::new();
+        for (addr, want) in [
+            ("64:ff9b:1::", "private"),
+            ("64:ff9b:1::a9fe:a9fe", "private"),
+            ("64:ff9b:1:ffff:ffff:ffff:ffff:ffff", "private"),
+            ("64:ff9b:2::1", "public"),
+            ("64:ff9b:0:ffff::1", "public"),
+            ("64:ff9b::101:101", "public"),
+            ("64:ff9b::7f00:1", "private"),
+            ("64:ff9b::a9fe:a9fe", "blocked"),
+        ] {
+            let got = name(classify_ip(addr.parse().unwrap()));
+            if got != want {
+                wrong.push(format!("{addr}: {got}, wants {want}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// The refusal of an address the guard keeps out says which addresses those are, the ranges
+    /// IANA sets aside among them, and what reaches a private one: a rule naming the exact host. A
+    /// network that reaches public hosts only through a set-aside prefix learns from the refusal
+    /// itself that it has to name them. Every phrase it lacks is named.
+    #[test]
+    fn the_address_refusal_names_the_ranges_and_the_rule_that_reaches_them() {
+        let said = ConnectRefusal::Ssrf.message("api.test", 443);
+        let missing: Vec<&str> = [
+            "`api.test`",
+            "a range IANA sets aside",
+            "link-local",
+            "names that exact host",
+        ]
+        .into_iter()
+        .filter(|phrase| !said.contains(phrase))
+        .collect();
+        assert!(missing.is_empty(), "{missing:?} not in {said:?}");
+    }
 
     /// A destination that never answers gives the dial back on the deadline instead of holding the
     /// thread for the kernel's retry schedule.
