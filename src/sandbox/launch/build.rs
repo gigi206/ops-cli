@@ -2966,7 +2966,7 @@ pub(super) fn build(
     // assembler, which upserts all of these over them. An untrusted config has already lost its
     // reserved keys upstream — including the proxy and CA keys — so it can neither redirect the
     // egress nor swap the CA; a trusted config overriding them only harms its own cage.
-    let extra_env = extra_cage_env(vec![
+    let layers = vec![
         (EnvLayer::Passthrough, passthrough_env()),
         (EnvLayer::Cacert, binds::cacert_env()),
         (EnvLayer::Gui, gui.env),
@@ -2984,7 +2984,11 @@ pub(super) fn build(
         ),
         (EnvLayer::Task, task.env),
         (EnvLayer::Config, prep.cfg.env.clone()),
-    ]);
+    ];
+    for (key, ours) in kept_keys_mise_restates(&layers) {
+        crate::diag::note(&mise_restates_note(key, ours));
+    }
+    let extra_env = extra_cage_env(layers);
 
     // The cage's zone, checked against the database that will actually be bound — assembly is pure,
     // so this is the last place a name can be held against something real. Read off the assembled
@@ -3865,9 +3869,48 @@ fn merge_loader_path(env: &mut Vec<(String, String)>) {
 ///
 /// The mise `[env]` value is kept behind sbx's in the cage's environment only: a process that mise
 /// itself starts, through a shim or `mise exec`, is handed the project's mise `[env]` again by
-/// mise, whose `PYTHONPATH` then stands alone and leaves the shim out. The `.sbx.toml` `[env]` is
-/// not one mise reads, so a `PYTHONPATH` set there keeps the shim in front for those too.
+/// mise, whose `PYTHONPATH` then stands alone and leaves the shim out, which the launch says in a
+/// note ([`kept_keys_mise_restates`]). The `.sbx.toml` `[env]` is not one mise reads, so a
+/// `PYTHONPATH` set there keeps the shim in front for those too.
 const KEPT_IN_FRONT: &[&str] = &["PYTHONPATH"];
+
+/// The [`KEPT_IN_FRONT`] keys the project's mise `[env]` sets while a layer of sbx's own puts an
+/// entry on them, each with sbx's last word on it by [`EnvLayer`] precedence.
+///
+/// The cage's environment keeps that entry in front, but a program mise itself starts is handed
+/// mise's value alone (see [`KEPT_IN_FRONT`]), so the launch names what such a program goes
+/// without. A key only the `.sbx.toml` `[env]` sets is left out: mise does not read that one.
+fn kept_keys_mise_restates(layers: &[(EnvLayer, Vec<(String, String)>)]) -> Vec<(&str, &str)> {
+    let mise_sets = |key: &str| {
+        layers
+            .iter()
+            .any(|(layer, env)| *layer == EnvLayer::Mise && env.iter().any(|(k, _)| k == key))
+    };
+    KEPT_IN_FRONT
+        .iter()
+        .filter(|key| mise_sets(key))
+        .filter_map(|key| {
+            layers
+                .iter()
+                .filter(|(layer, _)| !layer.is_project())
+                .flat_map(|(layer, env)| env.iter().map(move |entry| (*layer, entry)))
+                .filter(|(_, (k, _))| k == key)
+                .max_by_key(|(layer, _)| *layer)
+                .map(|(_, (_, ours))| (*key, ours.as_str()))
+        })
+        .collect()
+}
+
+/// The note a launch prints for a [`kept_keys_mise_restates`] key: the key, sbx's entry on it
+/// that a program mise starts goes without, and where to set the key instead.
+fn mise_restates_note(key: &str, ours: &str) -> String {
+    format!(
+        "the project's mise `[env]` sets `{key}`: the cage's environment keeps sbx's `{ours}` in \
+         front of it, but a program mise itself starts, through a shim or `mise exec`, is handed \
+         mise's value alone, without it; set `{key}` in `.sbx.toml`'s `[env]` rather than in \
+         mise's to keep it there too"
+    )
+}
 
 /// Layer the cage's extra environment by [`EnvLayer`] precedence, lowest first.
 ///

@@ -71,8 +71,9 @@ hermetic cage carries), so when PortAudio is provisioned sbx puts a directory ho
 replaced: its `sitecustomize.py` is the one Python imports, so one in a project directory on that
 path is shadowed. A `PYTHONPATH` set in the project's mise `[env]` is kept the same way in the
 cage's environment, but a Python that mise itself starts, through a shim or `mise exec`, is handed
-mise's value again, alone, and the shim is not loaded: under `audio = true`, set `PYTHONPATH` in
-`.sbx.toml` rather than in mise's `[env]`.
+mise's value again, alone, and the shim is not loaded. The launch says so in a note naming the
+shim's directory: under `audio = true`, set `PYTHONPATH` in `.sbx.toml` rather than in mise's
+`[env]`.
 
 The base C++ runtime (`libstdc++`) follows these libraries on `LD_LIBRARY_PATH`, so a voice
 engine's `dlopen`ed native library (ctranslate2, onnxruntime) finds it. The base glibc does not:

@@ -1301,6 +1301,84 @@ fn a_project_python_path_keeps_the_audio_shim_in_front() {
     assert!(wrong.is_empty(), "{wrong:?}");
 }
 
+/// The launch names a key the project's mise `[env]` sets while sbx puts its own entry on it, with
+/// that entry, since a program mise starts is handed mise's value alone; with two of sbx's layers on
+/// the key, the one that wins in the cage. A key only the `.sbx.toml` `[env]` sets is not named,
+/// mise does not read it, nor one sbx puts nothing on, nor a key a project replaces. The note names
+/// the key, sbx's entry and where to set the key instead. Each case is checked on its own, and
+/// every one decided another way is named.
+#[test]
+fn a_kept_key_the_mise_env_restates_is_named_with_the_entry_it_leaves_out() {
+    const SHIM: &str = crate::sandbox::audio::PYSHIM_INCAGE;
+    let set = |key: &str, value: &str| vec![(key.to_string(), value.to_string())];
+    let py = |value: &str| set("PYTHONPATH", value);
+    let cases = [
+        (
+            "mise [env]",
+            vec![(EnvLayer::Gui, py(SHIM)), (EnvLayer::Mise, py("src"))],
+            vec![("PYTHONPATH", SHIM)],
+        ),
+        (
+            "an empty one, listed first",
+            vec![(EnvLayer::Mise, py("")), (EnvLayer::Gui, py(SHIM))],
+            vec![("PYTHONPATH", SHIM)],
+        ),
+        (
+            "both project layers",
+            vec![
+                (EnvLayer::Gui, py(SHIM)),
+                (EnvLayer::Mise, py("a")),
+                (EnvLayer::Config, py("b")),
+            ],
+            vec![("PYTHONPATH", SHIM)],
+        ),
+        (
+            "two of sbx's layers",
+            vec![
+                (EnvLayer::Gui, py(SHIM)),
+                (EnvLayer::Cacert, py("/cacert")),
+                (EnvLayer::Mise, py("src")),
+            ],
+            vec![("PYTHONPATH", SHIM)],
+        ),
+        (
+            ".sbx.toml [env] only",
+            vec![(EnvLayer::Gui, py(SHIM)), (EnvLayer::Config, py("src"))],
+            vec![],
+        ),
+        ("no shim", vec![(EnvLayer::Mise, py("src"))], vec![]),
+        ("the shim alone", vec![(EnvLayer::Gui, py(SHIM))], vec![]),
+        (
+            "another key",
+            vec![
+                (EnvLayer::Gui, set("ALSA_CONFIG_DIR", "/sbx")),
+                (EnvLayer::Mise, set("ALSA_CONFIG_DIR", "/project")),
+            ],
+            vec![],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, layers, want) in cases {
+        let got = kept_keys_mise_restates(&layers);
+        if got != want {
+            wrong.push(format!("{what}: {got:?}, wants {want:?}"));
+        }
+    }
+    let note = mise_restates_note("PYTHONPATH", SHIM);
+    let entry = format!("`{SHIM}`");
+    for word in [
+        "`PYTHONPATH`",
+        entry.as_str(),
+        "`mise exec`",
+        "`.sbx.toml`'s `[env]`",
+    ] {
+        if !note.contains(word) {
+            wrong.push(format!("the note leaves out {word}: {note:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
 #[test]
 fn net_policy_maps_the_config_posture_to_the_cage_posture() {
     // the cheap, total map between the two posture vocabularies — the one place
