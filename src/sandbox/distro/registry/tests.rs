@@ -98,7 +98,7 @@ fn momentary(status: u16) -> bool {
 
 /// The status in an `… answered <status> …` error, the shape in which [`resolve`], [`token`] and
 /// [`http::get_to_writer`] refuse an answer they received.
-fn answered(e: &io::Error) -> Option<u16> {
+pub(in crate::sandbox::distro) fn answered(e: &io::Error) -> Option<u16> {
     let text = e.to_string();
     let (_, after) = text.split_once(" answered ")?;
     after.get(..3)?.parse().ok()
@@ -166,8 +166,10 @@ fn a_registry_never_heard_from_is_told_apart_from_one_that_answered() {
 /// One `alpine:3.22` index, named by digest. It is deliberately not what that tag resolves to
 /// today: a tag moves whenever Alpine republishes a patch release, while a digest names one
 /// document for as long as the registry keeps it, which is what a by-digest pin has to be tested
-/// against.
-const ALPINE_3_22: &str = "sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce";
+/// against. The layers test unpacks the same index, so both tests move together when the registry
+/// stops holding it.
+pub(in crate::sandbox::distro) const ALPINE_3_22: &str =
+    "sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce";
 
 /// A tag's oracle is the registry's own `Docker-Content-Digest`, never a digest written down here.
 ///

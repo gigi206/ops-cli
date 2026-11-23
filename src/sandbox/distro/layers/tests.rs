@@ -804,23 +804,38 @@ fn a_layer_media_type_with_no_decoder_is_refused_by_name() {
 fn a_real_image_unpacks_into_a_usable_root_filesystem() {
     // The end of the chain, against a real registry: resolve, fetch, apply. A synthetic archive
     // proves the rules; only a published image proves the framing, the ordering and the media
-    // types agree with what a registry actually serves.
+    // types agree with what a registry actually serves. The image is the `alpine:3.22` index the
+    // registry's by-digest test pins, so what is unpacked does not move when Alpine republishes,
+    // and its layers are applied under one budget, as a provision applies an image's.
     use crate::sandbox::distro::reference;
-    let image = reference::parse("oci:docker.io/library/alpine:3.22").unwrap();
-    let Ok(resolved) = crate::sandbox::distro::registry::resolve(&image, None) else {
-        skip_unreachable!("skipping the image unpack: the registry did not answer");
-        return;
+    use crate::sandbox::distro::registry::tests::{ALPINE_3_22, answered, transient};
+    // Only a registry that gave no verdict, or one that no longer holds the pinned document, is a
+    // skip: anything else it answered is a verdict on the client, and fails naming it. An index that
+    // resolved still has its layers, so a layer the registry refuses is the client's fault too.
+    let skip = |e: &io::Error| transient(e) || answered(e) == Some(404);
+    let image = reference::parse(&format!("oci:docker.io/library/alpine@{ALPINE_3_22}")).unwrap();
+    let resolved = match crate::sandbox::distro::registry::resolve(&image, None) {
+        Ok(resolved) => resolved,
+        Err(e) if skip(&e) => {
+            skip_unreachable!("skipping the image unpack: no verdict on the pinned index: {e}");
+            return;
+        }
+        Err(e) => panic!("resolving the pinned index failed: {e}"),
     };
     let tmp = crate::testutil::TmpDir::new();
     let root = tmp.join("rootfs");
+    let mut budget = Budget::new();
     for layer in &resolved.layers {
-        let Ok(blob) =
-            crate::sandbox::distro::registry::fetch_layer(&image, layer, tmp.path(), None)
-        else {
-            skip_unreachable!("skipping the image unpack: a layer did not arrive");
-            return;
-        };
-        apply(&blob, &layer.media_type, &root, &mut Budget::new()).expect("the layer applies");
+        let blob =
+            match crate::sandbox::distro::registry::fetch_layer(&image, layer, tmp.path(), None) {
+                Ok(blob) => blob,
+                Err(e) if transient(&e) => {
+                    skip_unreachable!("skipping the image unpack: a layer did not arrive: {e}");
+                    return;
+                }
+                Err(e) => panic!("fetching a layer of the pinned index failed: {e}"),
+            };
+        apply(&blob, &layer.media_type, &root, &mut budget).expect("the layer applies");
     }
     let release = fs::read_to_string(root.join("etc/os-release")).expect("os-release landed");
     assert!(release.contains("ID=alpine"), "{release}");
