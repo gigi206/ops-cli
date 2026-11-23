@@ -678,7 +678,8 @@ fn render_addr_refusal(
     let why = match refusal {
         sandbox::AddrRefusal::PrivateWithoutExactHost => {
             "an address that is not the public Internet's (loopback, private, or a range IANA \
-             set aside) is reachable only when the deciding rule names that exact host"
+             set aside) is reachable only when the deciding rule names that exact host and the \
+             operator wrote it: a built-in rule never opens one"
         }
         sandbox::AddrRefusal::NeverReachable => {
             "a link-local (the cloud metadata address among them), multicast or unspecified \
@@ -1647,7 +1648,8 @@ mod tests {
             "DENIED   https://127.0.0.1/\n  the policy allows it (allow rule: re:.*), but the \
              proxy refuses the address at connect time: an address that is not the public \
              Internet's (loopback, private, or a range IANA set aside) is reachable only when the \
-             deciding rule names that exact host\n"
+             deciding rule names that exact host and the operator wrote it: a built-in rule never \
+             opens one\n"
         );
         let colored = render_addr_refusal(
             "https://127.0.0.1/",

@@ -152,7 +152,7 @@ would really connect to:
 $ sbx test net https://127.0.0.1/
 network: deny (allowlist — only listed and built-in hosts reach)
 DENIED   https://127.0.0.1/
-  the policy allows it (allow rule: re:.*), but the proxy refuses the address at connect time: a private or loopback address is reachable only when the deciding rule names that exact host
+  the policy allows it (allow rule: re:.*), but the proxy refuses the address at connect time: an address that is not the public Internet's (loopback, private, or a range IANA set aside) is reachable only when the deciding rule names that exact host and the operator wrote it: a built-in rule never opens one
 ```
 
 Naming the host exactly (`allow = ["192.168.1.10"]`, `allow = ["db.internal"]`) is the

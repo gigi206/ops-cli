@@ -262,8 +262,9 @@ impl ConnectRefusal {
             Self::Dns => format!("DNS resolution failed for `{host}`"),
             Self::Ssrf => format!(
                 "`{host}` resolved only to addresses outside the public Internet (loopback, private, \
-                 link-local or metadata, or a range IANA sets aside); a rule that names that exact \
-                 host reaches a private one, never a link-local one"
+                 link-local or metadata, or a range IANA sets aside); a rule the operator wrote \
+                 naming that exact host reaches a private one, a built-in rule never does, and none \
+                 reaches a link-local one"
             ),
             Self::Unreachable => format!("`{host}:{port}` is allowed but could not be reached"),
             Self::Supervisor => format!(
@@ -381,7 +382,8 @@ mod tests {
     }
 
     /// The refusal of an address the guard keeps out says which addresses those are, the ranges
-    /// IANA sets aside among them, and what reaches a private one: a rule naming the exact host. A
+    /// IANA sets aside among them, and what reaches a private one: a rule the operator wrote naming
+    /// the exact host, which a built-in rule naming it is not. A
     /// network that reaches public hosts only through a set-aside prefix learns from the refusal
     /// itself that it has to name them. Every phrase it lacks is named.
     #[test]
@@ -391,7 +393,8 @@ mod tests {
             "`api.test`",
             "a range IANA sets aside",
             "link-local",
-            "names that exact host",
+            "a rule the operator wrote",
+            "a built-in rule never does",
         ]
         .into_iter()
         .filter(|phrase| !said.contains(phrase))

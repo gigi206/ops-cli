@@ -684,7 +684,7 @@ const GUARDS: { term: string; detail: string }[] = [
   {
     term: 'SSRF',
     detail:
-      'A private, loopback or metadata address is refused unless the deciding rule names that exact host. A regex never does.',
+      'A private or loopback address is refused unless a rule the operator wrote names that exact host, and a metadata address always is. Neither a regex nor a built-in rule opens one.',
   },
   {
     term: 'Anti-fronting',
