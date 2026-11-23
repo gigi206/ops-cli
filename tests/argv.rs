@@ -394,6 +394,27 @@ fn help_refuses_an_option_it_does_not_know() {
     }
 }
 
+/// What follows a `--` given to `help` is a command path, read as written, a word that starts with a
+/// dash included: `-h` there asks for no help and `--zzz-not-a-flag` is no option, each is a command
+/// `help` has no page for, and so is a second `--`. Each line is checked on its own, and every one
+/// read another way is named.
+#[test]
+fn help_reads_every_word_after_a_double_dash_as_a_command_path() {
+    let home = TmpDir::new("argv");
+    let mut wrong = Vec::new();
+    for (args, path) in [
+        (&["help", "--", "-h"][..], "-h"),
+        (&["help", "--", "--zzz-not-a-flag"], "--zzz-not-a-flag"),
+        (&["help", "--", "--", "app"], "-- app"),
+    ] {
+        let (code, out) = run(args, home.path());
+        if code != 2 || !out.contains(&format!("no help for `sbx {path}`")) {
+            wrong.push(format!("`sbx {}` exited {code}:\n{out}", args.join(" ")));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A verb whose page documents no option refuses one in its name slot the same way it refuses one
 /// after it — `sbx plugins install --json` and `sbx plugins install foo --json` are the same
 /// mistake, and used to exit 1 and 2 respectively.
