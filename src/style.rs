@@ -1,7 +1,7 @@
 //! Shared ANSI styling for terminal output. One [`Palette`] decides whether a stream is
-//! painted (it is a terminal, `NO_COLOR` is unset, `TERM` is not `dumb`) or left plain (a
-//! pipe, a captured test). Every span is empty when color is off, so the render code stays
-//! unconditional and a non-terminal is byte-for-byte plain text.
+//! painted (it is a terminal, `NO_COLOR` is unset or empty, `TERM` is not `dumb`) or left
+//! plain (a pipe, a captured test). Every span is empty when color is off, so the render code
+//! stays unconditional and a non-terminal is byte-for-byte plain text.
 
 use std::io::IsTerminal;
 
