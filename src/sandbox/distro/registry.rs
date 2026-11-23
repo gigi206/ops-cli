@@ -19,6 +19,7 @@ use super::reference::{self, ImageRef, Reference};
 use sha2::{Digest, Sha256};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// The media types a manifest request accepts, most specific first. Both the OCI names and Docker's
 /// older ones, because a registry serves whichever the image was pushed as and an image is not
@@ -265,7 +266,11 @@ fn bearer_request(field: &str) -> io::Result<Option<String>> {
 /// exchanges for a token scoped to one repository, and once that token exists it is what every
 /// later request carries — so the credential itself never reaches the registry's blob storage, its
 /// CDN, or whatever host a redirect names.
-fn token(challenge: &str, credential: Option<&Credential>) -> io::Result<Option<String>> {
+fn token(
+    challenge: &str,
+    credential: Option<&Credential>,
+    by: Instant,
+) -> io::Result<Option<String>> {
     // The realm is a URL the registry chose, so it goes through the same https-only gate every
     // other hop does; `http::get` refuses anything else.
     let Some(url) = bearer_request(challenge)? else {
@@ -274,7 +279,7 @@ fn token(challenge: &str, credential: Option<&Credential>) -> io::Result<Option<
     let headers: Vec<(&str, &str)> = credential
         .map(|c| vec![("Authorization", c.header())])
         .unwrap_or_default();
-    let response = http::get(&url, &headers)?;
+    let response = http::get(&url, &headers, by)?;
     if response.status != 200 {
         return Err(io::Error::other(format!(
             "token endpoint answered {}{}",
@@ -335,18 +340,19 @@ fn get_authenticated(
     url: &str,
     accept: Option<&str>,
     credential: Option<&Credential>,
+    by: Instant,
 ) -> io::Result<http::Response> {
     let base: Vec<(&str, &str)> = accept.map(|a| vec![("Accept", a)]).unwrap_or_default();
-    let first = http::get(url, &base)?;
+    let first = http::get(url, &base, by)?;
     let Some(challenge) = answerable_challenge(&first)? else {
         return Ok(first);
     };
-    let Some(authorization) = authorization(&challenge, credential)? else {
+    let Some(authorization) = authorization(&challenge, credential, by)? else {
         return Ok(first);
     };
     let mut headers = base;
     headers.push(("Authorization", &authorization));
-    http::get(url, &headers)
+    http::get(url, &headers, by)
 }
 
 /// The challenges on `response` worth answering, or `None` when it carries none.
@@ -388,11 +394,15 @@ fn answerable_challenge(response: &http::Response) -> io::Result<Option<String>>
 /// then goes on the token request alone, and what the registry receives is a token scoped to one
 /// repository. A registry that offers only `Basic` has no token service to go through, which is
 /// common on a self-hosted one, and the credential answers the request itself.
-fn authorization(challenge: &str, credential: Option<&Credential>) -> io::Result<Option<String>> {
+fn authorization(
+    challenge: &str,
+    credential: Option<&Credential>,
+    by: Instant,
+) -> io::Result<Option<String>> {
     if let Some(header) = basic_answer(challenge, credential) {
         return Ok(Some(header.to_string()));
     }
-    Ok(token(challenge, credential)?.map(|t| format!("Bearer {t}")))
+    Ok(token(challenge, credential, by)?.map(|t| format!("Bearer {t}")))
 }
 
 /// The credential to answer a `Basic` challenge with: `Some` when the challenges in `challenge`
@@ -416,18 +426,19 @@ fn get_authenticated_to_writer<W: io::Write>(
     credential: Option<&Credential>,
     sink: &mut W,
     cap: u64,
+    by: Instant,
 ) -> io::Result<u64> {
     // A `HEAD`: the question is whether this registry challenges, and the blob's own bytes are
     // not part of the answer. Asking it with a `GET` meant a registry that does not challenge
     // answered `200` with the layer, which the document cap then refused for being too large:
     // no layer past four megabytes could be fetched from quay.io or registry.k8s.io at all.
-    let probe = http::head(url, &[])?;
+    let probe = http::head(url, &[], by)?;
     if let Some(challenge) = answerable_challenge(&probe)?
-        && let Some(authorization) = authorization(&challenge, credential)?
+        && let Some(authorization) = authorization(&challenge, credential, by)?
     {
-        return http::get_to_writer(url, &[("Authorization", &authorization)], sink, cap);
+        return http::get_to_writer(url, &[("Authorization", &authorization)], sink, cap, by);
     }
-    http::get_to_writer(url, &[], sink, cap)
+    http::get_to_writer(url, &[], sink, cap, by)
 }
 
 /// How many indexes a resolve reads through before the manifest that names the layers.
@@ -446,18 +457,31 @@ const MAX_INDEX_DEPTH: usize = 4;
 /// locator that already carries a digest is not re-resolved into something else: the manifest is
 /// fetched by that digest and checked against it, so this path proves the pin rather than trusting
 /// it.
-pub(super) fn resolve(image: &ImageRef, credential: Option<&Credential>) -> io::Result<Image> {
-    resolve_with(image, |image| manifest_body(image, credential))
+///
+/// Every request it makes, a token's and each index's included, is taken out of `time_left`, the
+/// image's share of [`FETCH_TIME_PER_IMAGE`] still unspent ([`spend`]).
+pub(super) fn resolve(
+    image: &ImageRef,
+    credential: Option<&Credential>,
+    time_left: &mut Duration,
+) -> io::Result<Image> {
+    spend(time_left, |by| {
+        resolve_with(image, |image| manifest_body(image, credential, by))
+    })
 }
 
 /// The manifest `image` names, as the registry served it, before anything has checked it.
-fn manifest_body(image: &ImageRef, credential: Option<&Credential>) -> io::Result<Vec<u8>> {
+fn manifest_body(
+    image: &ImageRef,
+    credential: Option<&Credential>,
+    by: Instant,
+) -> io::Result<Vec<u8>> {
     let selector = match &image.reference {
         Reference::Tag(tag) => tag,
         Reference::Digest(digest) => digest,
     };
     let url = v2_url(image, "manifests", selector);
-    let response = get_authenticated(&url, Some(MANIFEST_ACCEPT), credential)?;
+    let response = get_authenticated(&url, Some(MANIFEST_ACCEPT), credential, by)?;
     if response.status != 200 {
         return Err(io::Error::other(format!(
             "{} answered {} for {}",
@@ -606,16 +630,66 @@ fn blob_cap(size: u64) -> u64 {
 ///
 /// Every call fetches. A file already under the digest's name is one this call has not checked, so
 /// it is replaced rather than handed back as the layer.
+///
+/// What the fetch runs for, every hop included, is taken out of `time_left`, the image's share of
+/// [`FETCH_TIME_PER_IMAGE`] still unspent ([`spend`]).
 pub(super) fn fetch_layer(
     image: &ImageRef,
     layer: &Layer,
     dir: &Path,
     credential: Option<&Credential>,
+    time_left: &mut Duration,
 ) -> io::Result<PathBuf> {
     let url = v2_url(image, "blobs", &layer.digest);
-    fetch_layer_with(layer, dir, |mut sink, cap| {
-        get_authenticated_to_writer(&url, credential, &mut sink, cap)
+    spend(time_left, |by| {
+        fetch_layer_with(layer, dir, |mut sink, cap| {
+            get_authenticated_to_writer(&url, credential, &mut sink, cap, by)
+        })
     })
+}
+
+/// The most time one image's fetch may take, its manifests and all its layers together: spent
+/// fetch by fetch, as [`super::unpack::TIME_PER_IMAGE`] is spent layer by layer, so an image cannot
+/// multiply it by listing more layers or nesting more indexes. The unpack between two layers is
+/// not counted, having a time of its own.
+///
+/// Each wait for the registry is already bounded (a minute per read, in [`http`]), which ends a
+/// registry that goes silent but not one that sends a byte just inside each minute: without this,
+/// that one holds a provision for as long as the bytes it is allowed last. Set so the largest image
+/// the unpack accepts, 64 GiB, arrives at 5 MB/s (40 Mbit/s) with time to spare, in 3 h 49 min;
+/// an image of a few hundred megabytes takes about a minute at that rate. The name lookup of each
+/// host is not inside it: it keeps the system resolver's own bounds.
+pub(in crate::sandbox::distro) const FETCH_TIME_PER_IMAGE: Duration =
+    Duration::from_secs(4 * 60 * 60);
+
+/// Run `fetch` with the deadline what is left of `time_left` gives, and take what it ran for out of
+/// `time_left`. Refused before it starts once nothing is left, and a failure that spent the rest is
+/// reported as this bound rather than as the read it interrupted.
+fn spend<T>(
+    time_left: &mut Duration,
+    fetch: impl FnOnce(Instant) -> io::Result<T>,
+) -> io::Result<T> {
+    if time_left.is_zero() {
+        return Err(out_of_fetch_time());
+    }
+    let started = Instant::now();
+    let fetched = fetch(started + *time_left);
+    let spent = started.elapsed();
+    let exhausted = spent >= *time_left;
+    *time_left = time_left.saturating_sub(spent);
+    fetched.map_err(|e| if exhausted { out_of_fetch_time() } else { e })
+}
+
+/// Why an image whose share of [`FETCH_TIME_PER_IMAGE`] is spent is not fetched further.
+fn out_of_fetch_time() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "this image takes more than {} hours to fetch: stopping rather than waiting on its \
+             registry",
+            FETCH_TIME_PER_IMAGE.as_secs() / 3600
+        ),
+    )
 }
 
 /// [`fetch_layer`], with the body written by `fetch` into the sink it is handed, held to the cap it

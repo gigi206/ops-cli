@@ -286,6 +286,15 @@ image the two ceilings allow unpacks in well under half of that: a million entri
 bottom of the deepest path the kernel resolves take about ten minutes (forty-five on a
 kernel older than 5.6, below), and 64 GiB written at a slow disk's 100 MB/s about eleven.
 
+Fetching an image has a time of its own, **four hours**, for its manifests and all its
+layers together, the unpack between two layers not counted. Each wait for the registry
+already ends after a minute, which stops a registry that goes silent but not one that
+sends a byte just inside each minute; past the four hours the provision stops and says the
+image took too long to fetch. The figure lets the largest image the ceilings allow, 64 GiB,
+arrive at 5 MB/s (40 Mbit/s) in under four hours; an image of a few hundred megabytes takes
+about a minute at that rate. The name lookup of each host is not counted, and keeps the
+system resolver's own bounds.
+
 What the unpack reads to reach each member is bounded too, at **1 MiB**: the member's
 header, and the long name, long link or PAX record that describes it, which the tar reader
 holds whole in memory before the member reaches the budget. Nothing honest comes near it

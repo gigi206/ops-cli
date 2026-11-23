@@ -66,7 +66,8 @@ use std::rc::Rc;
 /// The most one image's layers may unpack to on disk, and the most entries they may create: a
 /// member, or a directory made on the way to one.
 ///
-/// The fetch is bounded ([`super::http::MAX_STREAMED_BODY`], 8 GiB per blob) and `safe_path` bounds
+/// The fetch is bounded ([`super::http::MAX_STREAMED_BODY`], 8 GiB per blob, and
+/// [`super::registry::FETCH_TIME_PER_IMAGE`] for the image) and `safe_path` bounds
 /// *where* a member lands, but nothing bounded how much arrives: gzip expands, so a blob inside the
 /// fetch ceiling inflates to orders of magnitude more, and a layer of a million empty files
 /// exhausts inodes without approaching either. Both ceilings are far above any userland: a full

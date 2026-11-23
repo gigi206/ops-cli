@@ -814,7 +814,8 @@ fn a_real_image_unpacks_into_a_usable_root_filesystem() {
     // resolved still has its layers, so a layer the registry refuses is the client's fault too.
     let skip = |e: &io::Error| transient(e) || answered(e) == Some(404);
     let image = reference::parse(&format!("oci:docker.io/library/alpine@{ALPINE_3_22}")).unwrap();
-    let resolved = match crate::sandbox::distro::registry::resolve(&image, None) {
+    let mut fetch_left = crate::sandbox::distro::registry::FETCH_TIME_PER_IMAGE;
+    let resolved = match crate::sandbox::distro::registry::resolve(&image, None, &mut fetch_left) {
         Ok(resolved) => resolved,
         Err(e) if skip(&e) => {
             skip_unreachable!("skipping the image unpack: no verdict on the pinned index: {e}");
@@ -826,15 +827,21 @@ fn a_real_image_unpacks_into_a_usable_root_filesystem() {
     let root = tmp.join("rootfs");
     let mut budget = Budget::new();
     for layer in &resolved.layers {
-        let blob =
-            match crate::sandbox::distro::registry::fetch_layer(&image, layer, tmp.path(), None) {
-                Ok(blob) => blob,
-                Err(e) if transient(&e) => {
-                    skip_unreachable!("skipping the image unpack: a layer did not arrive: {e}");
-                    return;
-                }
-                Err(e) => panic!("fetching a layer of the pinned index failed: {e}"),
-            };
+        let fetched = crate::sandbox::distro::registry::fetch_layer(
+            &image,
+            layer,
+            tmp.path(),
+            None,
+            &mut fetch_left,
+        );
+        let blob = match fetched {
+            Ok(blob) => blob,
+            Err(e) if transient(&e) => {
+                skip_unreachable!("skipping the image unpack: a layer did not arrive: {e}");
+                return;
+            }
+            Err(e) => panic!("fetching a layer of the pinned index failed: {e}"),
+        };
         apply(&blob, &layer.media_type, &root, &mut budget).expect("the layer applies");
     }
     let release = fs::read_to_string(root.join("etc/os-release")).expect("os-release landed");

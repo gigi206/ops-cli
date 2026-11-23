@@ -134,7 +134,10 @@ pub(crate) fn provision(
         Reference::Digest(digest) => digest.clone(),
         Reference::Tag(_) => match locked_base(layout, lock_path, locator)? {
             Some(digest) => digest,
-            None => registry::resolve(&image, credential.as_ref())?.digest,
+            None => {
+                let mut fetch_left = registry::FETCH_TIME_PER_IMAGE;
+                registry::resolve(&image, credential.as_ref(), &mut fetch_left)?.digest
+            }
         },
     };
 
@@ -278,7 +281,10 @@ pub(crate) fn refresh(
         });
     let base = match &image.reference {
         Reference::Digest(digest) => digest.clone(),
-        Reference::Tag(_) => registry::resolve(&image, credential.as_ref())?.digest,
+        Reference::Tag(_) => {
+            let mut fetch_left = registry::FETCH_TIME_PER_IMAGE;
+            registry::resolve(&image, credential.as_ref(), &mut fetch_left)?.digest
+        }
     };
     let key = if run.is_empty() {
         base.clone()
@@ -428,7 +434,10 @@ fn unpack_into(
     let outcome = (|| -> io::Result<()> {
         let blobs = partial.join("blobs");
         std::fs::create_dir_all(&blobs)?;
-        let manifest = registry::resolve(image, credential)?;
+        // One time to fetch the image in, its manifests and its layers together, spent only by the
+        // fetches: the unpack of a layer between two of them has a time of its own.
+        let mut fetch_left = registry::FETCH_TIME_PER_IMAGE;
+        let manifest = registry::resolve(image, credential, &mut fetch_left)?;
         let rootfs = partial.join("rootfs");
         // One budget for the image, not one per layer, and one time to unpack it in: the layers are
         // applied over the same tree, so a per-layer ceiling would multiply by however many the
@@ -436,7 +445,7 @@ fn unpack_into(
         let mut budget = layers::Budget::new();
         let mut time_left = super::unpack::TIME_PER_IMAGE;
         for layer in &manifest.layers {
-            let blob = registry::fetch_layer(image, layer, &blobs, credential)?;
+            let blob = registry::fetch_layer(image, layer, &blobs, credential, &mut fetch_left)?;
             super::unpack::apply(
                 bwrap,
                 &blob,

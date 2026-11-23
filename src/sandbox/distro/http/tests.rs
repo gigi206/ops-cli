@@ -503,7 +503,11 @@ fn a_space_or_a_non_ascii_character_in_the_request_line_is_refused() {
     }
     // Before connecting: the name below resolves nowhere, so an error about it would mean the
     // request was refused only once a connection had been tried.
-    let Err(err) = get("https://unreachable.invalid/a b", &[]) else {
+    let Err(err) = get(
+        "https://unreachable.invalid/a b",
+        &[],
+        Instant::now() + TIMEOUT,
+    ) else {
         panic!("refused");
     };
     assert!(err.to_string().contains("space or a non-ASCII"), "{err}");
@@ -543,4 +547,58 @@ fn a_refused_location_is_quoted_without_its_control_bytes() {
     };
     let text = err.to_string();
     assert!(!text.contains('\u{1b}') && text.contains("\\x1b"), "{text}");
+}
+
+/// A connection stops at its request's deadline however the server paces its bytes: dripped one at a
+/// time, each well inside the per-read wait, or not sent at all. The read that would cross the
+/// deadline is refused with it, as a timeout. The server ends once the client has gone, and after
+/// ten seconds at most, so a connection that ignored the deadline reads to that end rather than
+/// hanging the test. Each shape is checked on its own, and every one decided another way is named.
+#[test]
+fn a_connection_stops_at_its_deadline_however_the_server_paces_its_bytes() {
+    type Pace = fn(&mut TcpStream);
+    let shapes: [(&str, Pace); 2] = [
+        ("a byte every 100 ms", |peer| {
+            for _ in 0..100 {
+                if peer.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }),
+        ("silence", |peer| {
+            let _ = peer.set_read_timeout(Some(Duration::from_secs(10)));
+            let _ = peer.read(&mut [0u8; 1]);
+        }),
+    ];
+    let mut wrong = Vec::new();
+    for (what, pace) in shapes {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            pace(&mut peer);
+        });
+        let started = Instant::now();
+        let mut conn = Bounded {
+            sock: TcpStream::connect(addr).unwrap(),
+            by: started + Duration::from_millis(300),
+        };
+        let mut buf = [0u8; 16];
+        let ended = loop {
+            match conn.read(&mut buf) {
+                Ok(0) => break Ok(()),
+                Ok(_) => {}
+                Err(e) => break Err(e),
+            }
+        };
+        let took = started.elapsed();
+        drop(conn);
+        server.join().unwrap();
+        match ended {
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {}
+            other => wrong.push(format!("{what}: {other:?} after {took:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:?}");
 }

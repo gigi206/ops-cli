@@ -29,7 +29,7 @@ use super::super::proxy::ca;
 use super::super::proxy::wire;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How many redirects a request follows before giving up. Registries use one for the blob
 /// hand-off to object storage; a chain longer than this is a loop or a misconfiguration, and
@@ -55,6 +55,10 @@ pub(super) const MAX_STREAMED_BODY: u64 = 8 * 1024 * 1024 * 1024;
 
 /// How long to wait for the connection and for each read. A provisioning step that hangs is worse
 /// than one that fails: the failure names the host, and the caller can try again.
+///
+/// A bound on each wait, not on the fetch: a server that sends a byte just inside it is never
+/// waited on this long. That is what the deadline every request is given is for ([`Bounded`]),
+/// which shortens this wait once less than it is left.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A response worth acting on: its status, the headers a caller reads, and the body when one was
@@ -178,8 +182,12 @@ fn parse_url(url: &str) -> io::Result<Url> {
 }
 
 /// Open a validated TLS connection to `url`'s host, using the proxy's own upstream trust anchors so
-/// this fetch is held to exactly the transport the cage's own traffic is.
-fn connect(url: &Url) -> io::Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
+/// this fetch is held to exactly the transport the cage's own traffic is, and to the deadline `by`
+/// ([`Bounded`]), the handshake included.
+fn connect(
+    url: &Url,
+    by: Instant,
+) -> io::Result<rustls::StreamOwned<rustls::ClientConnection, Bounded>> {
     // The connection carries the same deadline the reads do, which is what [`TIMEOUT`] says it is
     // for. A plain `connect` has none of its own: an address that swallows the SYN is retried by
     // the kernel until *its* ceiling, and the read and write timeouts below are only armed once a
@@ -192,14 +200,15 @@ fn connect(url: &Url) -> io::Result<rustls::StreamOwned<rustls::ClientConnection
     // Every resolved address is tried, as `connect` does, so a host that answers on one family
     // after another is unreachable still connects. The deadline is per address rather than shared:
     // a name resolving to many addresses is the case where each one deserves its own chance, and
-    // the alternative is a first candidate that eats the whole budget.
+    // the alternative is a first candidate that eats the whole budget. Each still ends at the
+    // request's own deadline, `by`, when that comes first.
     let mut sock = None;
     let mut last: Option<io::Error> = None;
     for candidate in (url.host.as_str(), url.port)
         .to_socket_addrs()
         .map_err(|e| io::Error::other(format!("resolving {}:{}: {e}", url.host, url.port)))?
     {
-        match TcpStream::connect_timeout(&candidate, TIMEOUT) {
+        match TcpStream::connect_timeout(&candidate, time_left(by)?) {
             Ok(s) => {
                 sock = Some(s);
                 break;
@@ -219,7 +228,73 @@ fn connect(url: &Url) -> io::Result<rustls::StreamOwned<rustls::ClientConnection
     let name = ca::upstream_server_name(&url.host)?;
     let conn = rustls::ClientConnection::new(ca::upstream_config(), name)
         .map_err(|e| io::Error::other(format!("TLS to {}: {e}", url.host)))?;
-    Ok(rustls::StreamOwned::new(conn, sock))
+    Ok(rustls::StreamOwned::new(conn, Bounded { sock, by }))
+}
+
+/// A connection held to its request's deadline as well as to [`TIMEOUT`]: each read and write waits
+/// at most what is left before `by`, and none starts once nothing is. A server that answers a byte
+/// at a time, each just inside the per-read wait, still ends the fetch when its time is spent, and
+/// a wait the deadline cut short is reported as the deadline rather than as the socket's timeout.
+struct Bounded {
+    sock: TcpStream,
+    by: Instant,
+}
+
+impl Bounded {
+    /// Arm the socket for the next wait with `set`: the wait shortens only once less than
+    /// [`TIMEOUT`] is left, so a fetch far from its deadline makes no call for it.
+    fn arm(&self, set: impl Fn(&TcpStream, Option<Duration>) -> io::Result<()>) -> io::Result<()> {
+        let left = time_left(self.by)?;
+        if left < TIMEOUT {
+            set(&self.sock, Some(left))?;
+        }
+        Ok(())
+    }
+
+    /// `e`, or the deadline's refusal when `e` is a wait that ran out and the deadline has passed.
+    fn past(&self, e: io::Error) -> io::Error {
+        match time_left(self.by) {
+            Err(spent)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                spent
+            }
+            _ => e,
+        }
+    }
+}
+
+impl Read for Bounded {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.arm(TcpStream::set_read_timeout)?;
+        self.sock.read(buf).map_err(|e| self.past(e))
+    }
+}
+
+impl Write for Bounded {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.arm(TcpStream::set_write_timeout)?;
+        self.sock.write(buf).map_err(|e| self.past(e))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.sock.flush()
+    }
+}
+
+/// What is left before `by`, at most [`TIMEOUT`], or the refusal once nothing is.
+fn time_left(by: Instant) -> io::Result<Duration> {
+    by.checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .map(|left| left.min(TIMEOUT))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the time given to this fetch has run out",
+            )
+        })
 }
 
 /// Refuse a request that cannot be written as it was meant, before any connection is made for it.
@@ -333,8 +408,9 @@ fn send<S: Read + Write>(
 /// Fetch `url`, following redirects, and buffer the body up to [`MAX_DOCUMENT`].
 ///
 /// `headers` are sent on the first request only; see the module note on why a redirect drops them.
-pub(super) fn get(url: &str, headers: &[(&str, &str)]) -> io::Result<Response> {
-    request(url, headers, "GET")
+/// `by` is when the request has to have ended, every redirect included ([`Bounded`]).
+pub(super) fn get(url: &str, headers: &[(&str, &str)], by: Instant) -> io::Result<Response> {
+    request(url, headers, "GET", by)
 }
 
 /// The same request without its body: the status and headers only.
@@ -345,20 +421,20 @@ pub(super) fn get(url: &str, headers: &[(&str, &str)]) -> io::Result<Response> {
 /// that does *not* challenge answered `200` with the blob itself and every layer past four
 /// megabytes was refused for being too large to hold: the probe read the thing it was only meant
 /// to ask about. A body a `HEAD` carries no framing for is not read at all.
-pub(super) fn head(url: &str, headers: &[(&str, &str)]) -> io::Result<Response> {
-    request(url, headers, "HEAD")
+pub(super) fn head(url: &str, headers: &[(&str, &str)], by: Instant) -> io::Result<Response> {
+    request(url, headers, "HEAD", by)
 }
 
 /// The shared body of [`get`] and [`head`], parameterised by the method, so the redirect walk and
 /// the header handling are written once and the two cannot answer differently about a URL.
-fn request(url: &str, headers: &[(&str, &str)], method: &str) -> io::Result<Response> {
+fn request(url: &str, headers: &[(&str, &str)], method: &str, by: Instant) -> io::Result<Response> {
     let mut current = url.to_string();
     let mut carry = headers;
     let mut redirected = false;
     for _ in 0..=MAX_REDIRECTS {
         let parsed = parse_url(&current)?;
         check_request(&parsed, carry)?;
-        let stream = connect(&parsed)?;
+        let stream = connect(&parsed, by)?;
         let (status, headers, head, mut reader) = send(stream, &parsed, carry, method)?;
         if let Some(location) = redirect_target(status, &headers, &current)? {
             current = location;
@@ -394,19 +470,20 @@ fn request(url: &str, headers: &[(&str, &str)], method: &str) -> io::Result<Resp
 /// bytes pass, so nothing here decides whether the content was the right *content* — but the digest
 /// is only known once the whole body has been written, so `cap` is what decides how much may be
 /// written before that answer exists. Pass the length the caller expects when it knows one, and
-/// [`MAX_STREAMED_BODY`] when it does not.
+/// [`MAX_STREAMED_BODY`] when it does not. `by` is as for [`get`].
 pub(super) fn get_to_writer<W: Write>(
     url: &str,
     headers: &[(&str, &str)],
     sink: &mut W,
     cap: u64,
+    by: Instant,
 ) -> io::Result<u64> {
     let mut current = url.to_string();
     let mut carry = headers;
     for _ in 0..=MAX_REDIRECTS {
         let parsed = parse_url(&current)?;
         check_request(&parsed, carry)?;
-        let stream = connect(&parsed)?;
+        let stream = connect(&parsed, by)?;
         let (status, headers, head, mut reader) = send(stream, &parsed, carry, "GET")?;
         if let Some(location) = redirect_target(status, &headers, &current)? {
             current = location;

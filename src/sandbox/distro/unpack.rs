@@ -68,7 +68,8 @@ const MESSAGE_MAX: usize = 16 * 1024;
 /// written at 100 MB/s, a slow disk's pace, take eleven. An image that reaches both ceilings at
 /// once is inside this more than twice over, and a real one is minutes below it. On a kernel
 /// without `openat2` such a member takes 2.7 ms, and the million entries forty-five minutes, still
-/// inside it. Only the unpack counts, not the fetch of the blobs, which is bounded on its own.
+/// inside it. Only the unpack counts: the fetch has a time of its own,
+/// [`super::registry::FETCH_TIME_PER_IMAGE`].
 pub(super) const TIME_PER_IMAGE: Duration = Duration::from_secs(60 * 60);
 
 /// How often the parent looks whether a layer's unpack has ended. A layer often takes a few tens

@@ -154,14 +154,20 @@ fn the_commands_run_in_order_on_the_tree_and_a_failure_names_the_one_that_failed
         .expect("a well-formed image reference");
     let tmp = crate::testutil::TmpDir::new();
     let rootfs = tmp.join("rootfs");
-    let Ok(resolved) = crate::sandbox::distro::registry::resolve(&image, None) else {
+    let mut fetch_left = crate::sandbox::distro::registry::FETCH_TIME_PER_IMAGE;
+    let Ok(resolved) = crate::sandbox::distro::registry::resolve(&image, None, &mut fetch_left)
+    else {
         skip_unreachable!("skipping the distribution build: the registry did not answer");
         return;
     };
     for layer in &resolved.layers {
-        let Ok(blob) =
-            crate::sandbox::distro::registry::fetch_layer(&image, layer, tmp.path(), None)
-        else {
+        let Ok(blob) = crate::sandbox::distro::registry::fetch_layer(
+            &image,
+            layer,
+            tmp.path(),
+            None,
+            &mut fetch_left,
+        ) else {
             skip_unreachable!("skipping the distribution build: a layer did not arrive");
             return;
         };

@@ -1,5 +1,15 @@
 use super::*;
 
+/// A deadline no test here reaches: the whole of [`FETCH_TIME_PER_IMAGE`] from now.
+fn far() -> Instant {
+    Instant::now() + FETCH_TIME_PER_IMAGE
+}
+
+/// A whole [`FETCH_TIME_PER_IMAGE`], for a test that resolves or fetches once.
+fn whole() -> Duration {
+    FETCH_TIME_PER_IMAGE
+}
+
 #[test]
 fn a_v2_url_is_built_from_the_serving_host_not_the_published_one() {
     let image = reference::parse("oci:docker.io/library/debian:10").unwrap();
@@ -27,11 +37,15 @@ fn a_scope_is_percent_encoded_so_the_query_cannot_be_read_two_ways() {
 #[test]
 fn only_a_bearer_challenge_is_followed() {
     // `Basic` would mean presenting a credential sbx neither has nor was given.
-    assert!(token("Basic realm=\"private\"", None).unwrap().is_none());
-    assert!(token("", None).unwrap().is_none());
+    assert!(
+        token("Basic realm=\"private\"", None, far())
+            .unwrap()
+            .is_none()
+    );
+    assert!(token("", None, far()).unwrap().is_none());
     // A Bearer challenge with no realm names nowhere to go, which is an error rather than a
     // silent unauthenticated retry.
-    let err = token("Bearer service=\"registry.docker.io\"", None).expect_err("no realm");
+    let err = token("Bearer service=\"registry.docker.io\"", None, far()).expect_err("no realm");
     assert!(err.to_string().contains("names no realm"), "{err}");
 }
 
@@ -111,7 +125,7 @@ fn a_registry_never_heard_from_is_told_apart_from_one_that_answered() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
     let port = listener.local_addr().expect("a bound port").port();
     let closer = std::thread::spawn(move || drop(listener.accept()));
-    let Err(closed) = http::get(&format!("https://127.0.0.1:{port}/v2/"), &[]) else {
+    let Err(closed) = http::get(&format!("https://127.0.0.1:{port}/v2/"), &[], far()) else {
         panic!("the peer closed without answering, and a response came back");
     };
     // A client that failed before it connected leaves the peer waiting in `accept`: one connection
@@ -119,7 +133,7 @@ fn a_registry_never_heard_from_is_told_apart_from_one_that_answered() {
     let _ = std::net::TcpStream::connect(("127.0.0.1", port));
     closer.join().expect("the closing peer");
     assert!(transient(&closed), "{closed}");
-    let Err(refused) = http::get(&format!("https://127.0.0.1:{port}/v2/"), &[]) else {
+    let Err(refused) = http::get(&format!("https://127.0.0.1:{port}/v2/"), &[], far()) else {
         panic!("nothing listens on the port any more, and a response came back");
     };
     assert!(transient(&refused), "{refused}");
@@ -186,7 +200,7 @@ pub(in crate::sandbox::distro) const ALPINE_3_22: &str =
 fn a_tag_resolves_to_the_digest_the_registry_itself_reports() {
     let image = reference::parse("oci:docker.io/library/alpine:3.22").unwrap();
     let url = v2_url(&image, "manifests", "3.22");
-    let served = match get_authenticated(&url, Some(MANIFEST_ACCEPT), None) {
+    let served = match get_authenticated(&url, Some(MANIFEST_ACCEPT), None, far()) {
         Ok(served) => served,
         Err(e) if transient(&e) => {
             skip_unreachable!("skipping the registry resolve: no verdict came back: {e}");
@@ -225,7 +239,7 @@ fn a_tag_resolves_to_the_digest_the_registry_itself_reports() {
         "`alpine:3.22` names an index"
     );
 
-    let resolved = match resolve(&image, None) {
+    let resolved = match resolve(&image, None, &mut whole()) {
         Ok(resolved) => resolved,
         Err(e) if transient(&e) => {
             skip_unreachable!("skipping the registry resolve: no verdict came back: {e}");
@@ -249,7 +263,7 @@ fn a_digest_locator_is_checked_against_the_bytes_the_registry_serves() {
     // Resolving by digest proves the pin rather than trusting it: the manifest that comes back is
     // hashed and compared, so a registry serving something else fails here.
     let image = reference::parse(&format!("oci:docker.io/library/alpine@{ALPINE_3_22}")).unwrap();
-    let resolved = match resolve(&image, None) {
+    let resolved = match resolve(&image, None, &mut whole()) {
         Ok(resolved) => resolved,
         Err(e) if transient(&e) => {
             skip_unreachable!("skipping the resolve by digest: no verdict came back: {e}");
@@ -274,7 +288,7 @@ fn a_digest_locator_is_checked_against_the_bytes_the_registry_serves() {
 #[test]
 fn a_layer_is_verified_against_its_digest_as_it_lands() {
     let image = reference::parse("oci:docker.io/library/alpine:3.22").unwrap();
-    let resolved = match resolve(&image, None) {
+    let resolved = match resolve(&image, None, &mut whole()) {
         Ok(resolved) => resolved,
         Err(e) if transient(&e) => {
             skip_unreachable!("skipping the layer fetch: no verdict came back: {e}");
@@ -284,7 +298,7 @@ fn a_layer_is_verified_against_its_digest_as_it_lands() {
     };
     let dir = crate::testutil::TmpDir::new();
     let layer = &resolved.layers[0];
-    let path = match fetch_layer(&image, layer, dir.path(), None) {
+    let path = match fetch_layer(&image, layer, dir.path(), None, &mut whole()) {
         Ok(path) => path,
         Err(e) if transient(&e) => {
             skip_unreachable!("skipping the layer fetch: no verdict came back: {e}");
@@ -301,8 +315,8 @@ fn a_layer_is_verified_against_its_digest_as_it_lands() {
         digest: format!("sha256:{}", "b".repeat(64)),
         ..layer.clone()
     };
-    let err =
-        fetch_layer(&image, &wrong, dir.path(), None).expect_err("a mismatched digest is refused");
+    let err = fetch_layer(&image, &wrong, dir.path(), None, &mut whole())
+        .expect_err("a mismatched digest is refused");
     // Only a registry that answered can refuse, and a registry never heard from carries no verdict
     // to read: the error is the network's, and asserting the refusal's wording against it reports
     // a broken client where there was a broken connection. The refusal itself stays asserted for
@@ -450,7 +464,7 @@ fn the_challenge_probe_does_not_read_the_blob_it_asks_about() {
     let image =
         crate::sandbox::distro::reference::parse("oci:quay.io/prometheus/prometheus:latest")
             .expect("a valid reference");
-    let resolved = match super::resolve(&image, None) {
+    let resolved = match super::resolve(&image, None, &mut whole()) {
         Ok(resolved) => resolved,
         Err(e) if transient(&e) => {
             skip_unreachable!(
@@ -474,7 +488,7 @@ fn the_challenge_probe_does_not_read_the_blob_it_asks_about() {
     // Only a registry that does not challenge for the blob tells the two probes apart: one that
     // does answers a `GET` with its small `401` document as well, and either probe then reaches
     // the body.
-    let asked = match http::head(&url, &[]) {
+    let asked = match http::head(&url, &[], far()) {
         Ok(asked) => asked,
         Err(e) if transient(&e) => {
             skip_unreachable!(
@@ -490,7 +504,7 @@ fn the_challenge_probe_does_not_read_the_blob_it_asks_about() {
          blob from one that does not"
     );
     let mut sink = Refusing { reached: false };
-    match get_authenticated_to_writer(&url, None, &mut sink, blob_cap(biggest.size)) {
+    match get_authenticated_to_writer(&url, None, &mut sink, blob_cap(biggest.size), far()) {
         Err(_) if sink.reached => {}
         Err(e) if transient(&e) => {
             skip_unreachable!(
@@ -1048,6 +1062,7 @@ fn a_basic_challenge_is_answered_only_when_no_bearer_one_is_offered() {
     let err = authorization(
         r#"Bearer service="registry.example", Basic realm="x""#,
         Some(&c),
+        far(),
     )
     .expect_err("a Bearer challenge with no realm names nowhere to ask");
     assert!(err.to_string().contains("names no realm"), "{err}");
@@ -1097,15 +1112,70 @@ fn every_challenge_field_of_a_response_is_read() {
 fn a_basic_only_registry_is_answered_through_the_one_decision() {
     let c = Credential::basic("u:p");
     assert_eq!(
-        authorization(r#"Basic realm="x""#, Some(&c)).expect("no request is made"),
+        authorization(r#"Basic realm="x""#, Some(&c), far()).expect("no request is made"),
         Some(c.header().to_string())
     );
     assert_eq!(
-        authorization(r#"Basic realm="x""#, None).expect("no request is made"),
+        authorization(r#"Basic realm="x""#, None, far()).expect("no request is made"),
         None
     );
     assert_eq!(
-        authorization(r#"Basicx realm="y""#, Some(&c)).expect("no request is made"),
+        authorization(r#"Basicx realm="y""#, Some(&c), far()).expect("no request is made"),
         None
     );
+}
+
+/// An image's fetch time is spent fetch by fetch. A fetch that finds nothing left is refused without
+/// running; one that runs is handed the deadline what is left gives, and what it ran for is taken
+/// out; a failure that spent the rest is reported as the bound, and one with time left as itself.
+/// Each case is checked on its own, and every one decided another way is named.
+#[test]
+fn an_images_fetch_time_is_spent_fetch_by_fetch() {
+    let mut wrong = Vec::new();
+
+    let mut left = Duration::ZERO;
+    let mut ran = false;
+    let got = spend(&mut left, |_| {
+        ran = true;
+        Ok(())
+    });
+    if ran || !matches!(&got, Err(e) if e.to_string().contains("to fetch")) {
+        wrong.push(format!("nothing left: ran {ran}, {got:?}"));
+    }
+
+    let mut left = Duration::from_secs(60);
+    let before = Instant::now();
+    let got = spend(&mut left, |by| {
+        std::thread::sleep(Duration::from_millis(50));
+        Ok(by)
+    });
+    match got {
+        Ok(by)
+            if by >= before + Duration::from_secs(59)
+                && by <= Instant::now() + Duration::from_secs(60)
+                && left <= Duration::from_millis(59_950) => {}
+        other => wrong.push(format!("a fetch that runs: {other:?}, {left:?} left")),
+    }
+
+    let mut left = Duration::from_millis(20);
+    let got: io::Result<()> = spend(&mut left, |_| {
+        std::thread::sleep(Duration::from_millis(40));
+        Err(io::Error::other("a read cut short"))
+    });
+    if !left.is_zero()
+        || !matches!(&got, Err(e) if e.kind() == io::ErrorKind::TimedOut
+            && e.to_string().contains("to fetch"))
+    {
+        wrong.push(format!(
+            "a failure that spent the rest: {got:?}, {left:?} left"
+        ));
+    }
+
+    let mut left = Duration::from_secs(60);
+    let got: io::Result<()> = spend(&mut left, |_| Err(io::Error::other("answered 404")));
+    if !matches!(&got, Err(e) if e.to_string() == "answered 404") {
+        wrong.push(format!("a failure with time left: {got:?}"));
+    }
+
+    assert!(wrong.is_empty(), "{wrong:?}");
 }
