@@ -911,6 +911,34 @@ mod tests {
         assert!(over.is_empty(), "{over:?}");
     }
 
+    /// The guard that files an exchange holds the response head to the launch's head cap: a head
+    /// that runs past it is filed cut at the cap and marked cut, and the body after its blank line
+    /// is still split off whole. The cap reaches the split through the guard's own caps, which this
+    /// checks from the sink to the filed capture.
+    #[test]
+    fn a_filed_response_head_is_held_to_the_guards_head_cap() {
+        let (g, ring, _log) = guard(CaptureLevel::Bodies, 8);
+        let seq = g.id;
+        let head_cap = g.caps.head;
+        let raw = format!(
+            "HTTP/2 200\r\nx-flood: {}\r\n\r\nbody",
+            "a".repeat(head_cap)
+        );
+        let mut reader = CaptureReader::new(raw.as_bytes(), g.response_sink());
+        io::copy(&mut reader, &mut io::sink()).unwrap();
+        drop(g);
+
+        let (found, _) = ring.get(&[seq]);
+        let (head, body) = (&found[0].res_head, &found[0].res_body);
+        assert!(
+            head.bytes.len() == head_cap && head.truncated && body.bytes == b"body",
+            "head: {} bytes for a cap of {head_cap}, cut={}; body: {:?}",
+            head.bytes.len(),
+            head.truncated,
+            String::from_utf8_lossy(&body.bytes)
+        );
+    }
+
     #[test]
     fn the_request_head_is_captured_verbatim_with_the_injected_names_but_never_their_values() {
         let (g, ring, _log) = guard(CaptureLevel::Bodies, 8);
