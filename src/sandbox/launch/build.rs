@@ -3213,37 +3213,41 @@ pub(super) fn build(
         ));
         ExitCode::FAILURE
     })?;
-    // The config binds' sources, held open now that the plan is final, so bwrap mounts the objects
-    // opened here rather than whatever their paths name by the time it reaches them. A bubblewrap
-    // with no `--bind-fd` is handed the paths, and the race a held source closes stays open there.
-    // The project's own mise pool, when the plan shares it, is held the same way, and never goes by
-    // path: the plan shares it only where bubblewrap takes a descriptor.
-    let project_pool =
-        binds::hold_project_pool(prep.layout.data_dir(), &prep.cwd, &spec).map_err(|why| {
-            crate::diag::error(&format!("sbx: {why}"));
-            ExitCode::FAILURE
-        })?;
-    let spec = if config_binds.is_empty() {
-        spec.with_held_sources(project_pool.into_iter().collect())
-    } else if super::cage::bwrap_binds_descriptors(&prep.bwrap) {
-        match binds::hold_bind_sources(&config_binds) {
-            Ok(mut held) => {
-                held.extend(project_pool);
-                spec.with_held_sources(held)
-            }
-            Err(why) => {
-                crate::diag::error(&format!("sbx: {why}"));
-                return Err(ExitCode::FAILURE);
-            }
+    // The bind sources a cage could repoint, held open now that the plan is final, so bwrap mounts
+    // the objects opened here rather than whatever their paths name by the time it reaches them
+    // ([`binds::held_sources`]). A bubblewrap with no `--bind-fd` is handed the paths, and the race a
+    // held source closes stays open there.
+    let held = binds::held_sources(
+        prep.layout.data_dir(),
+        &prep.cwd,
+        &spec,
+        &config_binds,
+        || super::cage::bwrap_binds_descriptors(&prep.bwrap),
+    )
+    .map_err(|why| {
+        crate::diag::error(&format!("sbx: {why}"));
+        ExitCode::FAILURE
+    })?;
+    let pins_home = binds::pins_the_home(&spec);
+    if (!config_binds.is_empty() || pins_home) && !super::cage::bwrap_binds_descriptors(&prep.bwrap)
+    {
+        if !config_binds.is_empty() {
+            crate::diag::warn(&format!(
+                "{} has no `--bind-fd`, so the `[bind]` sources are mounted by path: a cage that \
+                 can write a parent of one could replace that parent with a link before the mount",
+                prep.bwrap.display()
+            ));
         }
-    } else {
-        crate::diag::warn(&format!(
-            "{} has no `--bind-fd`, so the `[bind]` sources are mounted by path: a cage that can \
-             write a parent of one could replace that parent with a link before the mount",
-            prep.bwrap.display()
-        ));
-        spec
-    };
+        if pins_home {
+            crate::diag::warn(&format!(
+                "{} has no `--bind-fd`, so the directories `[open]` pins over the cage's home are \
+                 mounted by path: a cage sharing this home that is still running could replace one \
+                 with a link before the mount",
+                prep.bwrap.display()
+            ));
+        }
+    }
+    let spec = spec.with_held_sources(held);
     // The cage checks each held source it sees against the object held here before it runs
     // anything ([`binds::held_source_check`]). Laid on now rather than with the other wraps, which
     // were composed before the pins settled which mounts the cage sees, and so it runs ahead of them.

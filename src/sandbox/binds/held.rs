@@ -1,5 +1,6 @@
 //! The config binds' sources, held open from the launch to the cage, and the check the cage runs on
-//! them before anything else.
+//! every held source before anything else: these, the project's shared mise pool and the mountpoint
+//! pins laid over the home ([`super::held_sources`]).
 //!
 //! A held source is mounted from its descriptor ([`super::super::spec::HeldSource`]), and bwrap
 //! looks up where that object is as it sets the cage up and mounts that path. From 0.10.0 it then

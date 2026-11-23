@@ -1599,6 +1599,129 @@ fn build_spec_refuses_an_open_pin_parent_the_cage_pointed_out_of_the_home() {
     );
 }
 
+/// A mountpoint pin laid over the home is mounted from the directory the plan made, never by its
+/// path. A cage of the same home that is still running can replace `.local` with a link once
+/// the plan has walked it, and bubblewrap, handed the path, would mount what the link names,
+/// read-write, in the cage it is setting up: the launch is refused instead. Once held, a
+/// replacement reaches nothing the descriptor names.
+#[test]
+fn a_pin_over_the_home_is_mounted_from_the_directory_the_plan_made() {
+    use std::os::unix::fs::MetadataExt;
+    let data = TmpDir::new();
+    let project = TmpDir::new();
+    let mut open = std::collections::BTreeMap::new();
+    open.insert(
+        "https".to_string(),
+        crate::config::OpenHandler {
+            argv: vec!["firefox".to_string()],
+            mode: crate::config::OpenMode::Exec,
+        },
+    );
+    let overlay = Overlay {
+        env: &[],
+        binds: &[],
+        bin_paths: &[],
+        timezone: DEFAULT_ZONE,
+        fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
+        share_install_pools: false,
+        share_project_pool: false,
+        git_config_read_only: false,
+    };
+    let planned = build_spec(
+        data.path(),
+        project.path(),
+        Runtime::ProjectDefault,
+        &userland(),
+        &nix_mount(),
+        &overlay,
+        &[],
+        NetPolicy::Shared,
+        &Default::default(),
+        &Default::default(),
+        crate::sandbox::seccomp::SeccompPolicy::default(),
+        &[],
+        &open,
+        false,
+        vec![OsString::from("/bin/sh")],
+    )
+    .expect("build spec");
+    let home = home_src(data.path(), project.path(), Runtime::ProjectDefault).unwrap();
+    let hold = |by_descriptor: bool| {
+        held_sources(data.path(), project.path(), &planned, &[], || by_descriptor)
+    };
+    let sorted = |mut dests: Vec<PathBuf>| {
+        dests.sort();
+        dests
+    };
+    let pins = sorted(
+        [".config", ".local", ".local/share"]
+            .iter()
+            .map(|rel| PathBuf::from(format!("{SANDBOX_HOME}/{rel}")))
+            .collect(),
+    );
+
+    // Every pin goes to bubblewrap as a descriptor, and the cage checks each one.
+    let handed = planned
+        .clone()
+        .with_held_sources(hold(true).expect("the pins hold"));
+    let by_descriptor = handed
+        .mounts
+        .iter()
+        .zip(handed.handed_sources())
+        .filter_map(|(m, held)| held.map(|_| m.dest().to_path_buf()))
+        .collect();
+    assert_eq!(sorted(by_descriptor), pins, "a pin mounted by its path");
+    let checked = handed
+        .seen_held_sources()
+        .iter()
+        .map(|held| held.dest().to_path_buf())
+        .collect();
+    assert_eq!(sorted(checked), pins, "a pin the cage does not check");
+
+    // A bind of a home directory elsewhere in the cage is not a pin, and is left as the plan has it.
+    let mut elsewhere = planned.clone();
+    elsewhere.mounts.push(Mount::Bind {
+        src: home.join(".local/share"),
+        dest: PathBuf::from("/opt/elsewhere"),
+    });
+    let held_dests = held_sources(data.path(), project.path(), &elsewhere, &[], || true)
+        .expect("the pins hold")
+        .iter()
+        .map(|held| held.dest().to_path_buf())
+        .collect();
+    assert_eq!(sorted(held_dests), pins, "a bind that is not a pin is held");
+
+    // Without `--bind-fd` they go by path, as the config binds do.
+    assert!(hold(false).expect("nothing to hold").is_empty());
+
+    // The cage replaces `.local` with a link after the plan walked it: the launch is refused.
+    let outside = data.join("outside");
+    std::fs::create_dir_all(outside.join("share")).unwrap();
+    let (local, moved) = (home.join(".local"), home.join(".local.real"));
+    std::fs::rename(&local, &moved).unwrap();
+    std::os::unix::fs::symlink(&outside, &local).unwrap();
+    let refused = hold(true).expect_err("a pin whose source is now a link is refused");
+    assert!(refused.contains("is a symlink"), "{refused}");
+
+    // Held first and replaced after: the descriptor names the directory the plan made.
+    std::fs::remove_file(&local).unwrap();
+    std::fs::rename(&moved, &local).unwrap();
+    let made = std::fs::metadata(&local).unwrap();
+    let held = hold(true).expect("the pins hold");
+    std::fs::rename(&local, &moved).unwrap();
+    std::os::unix::fs::symlink(&outside, &local).unwrap();
+    let local_pin = held
+        .iter()
+        .find(|held| held.dest() == Path::new(&format!("{SANDBOX_HOME}/.local")))
+        .expect("`.local` is held");
+    assert_eq!(
+        local_pin.identity().unwrap(),
+        format!("{}:{}", made.dev(), made.ino()),
+        "the held `.local` is not the directory the plan made"
+    );
+}
+
 /// The router the launch stages carries the cage's final `PATH`, so a handler named by its program
 /// resolves on the cage's package directories whoever calls `xdg-open`. Claude Desktop opens its
 /// sign-in link with a reduced `PATH`, and a router that kept the caller's never found `chromium`.

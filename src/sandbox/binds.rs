@@ -1298,7 +1298,9 @@ fn cage_mounts(
 /// bind, so the caller creates them through [`super::cagedir::ensure_under`] anchored on the home's
 /// mount point; a component the cage replaced with a symlink fails the launch there rather than
 /// becoming the source of a read-write bind here. This function is pure and cannot check that
-/// itself: it joins the paths the caller has already confined.
+/// itself: it joins the paths the caller has already confined. A component replaced after that
+/// walk, by a cage of the same home that is still running, is caught when the launch holds each
+/// source ([`hold_home_pins`]): bubblewrap mounts the held directory, not the path joined here.
 fn home_mountpoint_pins(home_src: &Path, rels: &[&str]) -> Vec<Mount> {
     let mut pinned: Vec<PathBuf> = Vec::new();
     for rel in rels {
@@ -1666,6 +1668,94 @@ pub(crate) fn hold_project_pool(
                 base.join(&rel).display()
             )
         })
+}
+
+/// The mountpoint pins [`home_mountpoint_pins`] lays over the cage's writable home: each a
+/// read-write bind of a directory of the home onto its own place in the cage. For each, the home's
+/// source, the pin's source and destination, and the source's path below the home.
+fn pins_over_home(spec: &super::spec::SandboxSpec) -> Vec<(&Path, &Path, &Path, &Path)> {
+    let Some(home) = spec.mounts.iter().find_map(|m| match m {
+        Mount::Bind { src, dest } if dest == Path::new(SANDBOX_HOME) => Some(src.as_path()),
+        _ => None,
+    }) else {
+        return Vec::new();
+    };
+    spec.mounts
+        .iter()
+        .filter_map(|m| match m {
+            Mount::Bind { src, dest } => {
+                let rel = src.strip_prefix(home).ok()?;
+                (!rel.as_os_str().is_empty() && *dest == Path::new(SANDBOX_HOME).join(rel))
+                    .then_some((home, src.as_path(), dest.as_path(), rel))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether the plan lays a mountpoint pin over the cage's home ([`home_mountpoint_pins`]).
+pub(crate) fn pins_the_home(spec: &super::spec::SandboxSpec) -> bool {
+    !pins_over_home(spec).is_empty()
+}
+
+/// Hold the source of each mountpoint pin laid over the cage's writable home, every link on its
+/// path from the home refused, for bubblewrap to mount from the descriptor.
+///
+/// The plan made those directories through [`super::cagedir::ensure_under`], which refuses a link a
+/// cage left behind, and then hands on their paths. A cage of the same home that is running while
+/// this launch is set up can replace one of them with a link after that walk, and bubblewrap, handed
+/// the path, mounts what the link names, read-write, in the cage it is setting up. Held here, the
+/// mount is the directory this walk reached, and the cage compares it before it runs anything
+/// ([`held_source_check`]). An error is a component replaced since the plan, which the launch is
+/// refused over, as for the project's pool.
+pub(crate) fn hold_home_pins(
+    spec: &super::spec::SandboxSpec,
+) -> Result<Vec<super::spec::HeldSource>, String> {
+    pins_over_home(spec)
+        .into_iter()
+        .map(|(home, src, dest, rel)| {
+            super::cagedir::hold_entry_beneath(home, rel)
+                .map(|fd| {
+                    super::spec::HeldSource::mounted_at(src.to_path_buf(), dest.to_path_buf(), fd)
+                })
+                .map_err(|e| {
+                    format!(
+                        "cannot hold {}, which the launch mounts over the cage's home: {e}. It was \
+                         made when the launch was planned, so a component of its path has been \
+                         replaced since",
+                        src.display()
+                    )
+                })
+        })
+        .collect()
+}
+
+/// The bind sources a launch holds open for bubblewrap to mount from their descriptors, rather than
+/// by paths a cage could repoint before the mount: the config binds' ([`hold_bind_sources`]), the
+/// project's own mise pool when the plan shares it ([`hold_project_pool`]), and the mountpoint
+/// pins laid over the home ([`hold_home_pins`]), in that order.
+///
+/// `descriptors` answers whether the bubblewrap that runs takes `--bind-fd`, and is asked only when
+/// there is a config bind or a pin to hold. Without it those go by path, and the race a held source
+/// closes stays open for them. The pool never goes by path: the plan shares it only
+/// where bubblewrap takes a descriptor.
+pub(crate) fn held_sources(
+    data_dir: &Path,
+    cwd: &Path,
+    spec: &super::spec::SandboxSpec,
+    config_binds: &[crate::config::Bind],
+    descriptors: impl FnOnce() -> bool,
+) -> Result<Vec<super::spec::HeldSource>, String> {
+    let by_descriptor = (!config_binds.is_empty() || pins_the_home(spec)) && descriptors();
+    let mut held = Vec::new();
+    if by_descriptor {
+        held.extend(hold_bind_sources(config_binds)?);
+    }
+    held.extend(hold_project_pool(data_dir, cwd, spec)?);
+    if by_descriptor {
+        held.extend(hold_home_pins(spec)?);
+    }
+    Ok(held)
 }
 
 /// mise's app-global data dir inside the cage — the sandbox `$HOME`'s mise dir. For a global app,

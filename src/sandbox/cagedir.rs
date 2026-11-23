@@ -58,11 +58,13 @@ use std::path::{Component, Path, PathBuf};
 /// the cage may exchange a component before the caller uses it. [`hold_under`] closes that
 /// window for what goes through its descriptor, and the project store's seed and the mise
 /// plugin registration ([`super::miseplugin::register`]) write that way, as does the creation
-/// of a distribution image's mountpoints when the tree is unpacked. The callers that keep the
-/// path give it to a mount or to `nix`, which open by name, or create a mountpoint in an image
-/// tree no cage can write: one is bound read-only into every cage that runs on it. For them the
-/// window this removes is the one inside the walk, and the case that needs no race at all, a
-/// symlink left behind for the next launch to find, is removed with it.
+/// of a distribution image's mountpoints when the tree is unpacked. The directories a launch
+/// mounts over a cage's home are made here too, and mounted from the descriptors the launch then
+/// takes of them ([`super::binds::hold_home_pins`]) rather than from this path. The callers that
+/// keep the path give it to `nix`, which opens by name, or create a mountpoint in an image tree no
+/// cage can write: one is bound read-only into every cage that runs on it. For them the window
+/// this removes is the one inside the walk, and the case that needs no race at all, a symlink left
+/// behind for the next launch to find, is removed with it.
 pub(crate) fn ensure_under(root: &Path, rel: &str, mode: u32) -> io::Result<PathBuf> {
     walk(root, Path::new(rel), Some(mode), libc::O_PATH).map(|(at, _)| at)
 }
