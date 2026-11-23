@@ -379,8 +379,10 @@ impl CaptureGuard {
         }
     }
 
-    /// Record a piece of request body already held in memory, capped like a streamed one. Called
-    /// once for a de-chunked HTTP/1.1 body, or once per DATA frame on the HTTP/2 path.
+    /// Record a request body already held in memory, capped like a streamed one: an HTTP/1.1 body
+    /// the proxy read whole, because a signer asked for its digest or because it was chunked and is
+    /// re-framed. Called once per request; the HTTP/2 path streams its body into
+    /// [`Self::request_body_sink`] instead.
     pub(super) fn set_request_body(&self, body: &[u8]) {
         self.req_body.push(body);
     }

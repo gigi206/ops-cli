@@ -87,7 +87,7 @@ fn runtime() -> io::Result<tokio::runtime::Runtime> {
 ///
 /// What that costs is a real bound rather than a free choice, so it is written down. Everything
 /// runs on one current-thread runtime, so a synchronous call inside a stream stalls every sibling
-/// stream on this tunnel, and the accept loop with them. Two such calls exist:
+/// stream on this tunnel, and the accept loop with them. Three such calls exist:
 ///
 /// - The signer plugin in [`super::inject::pairs_for`] is IPC to a child process, held under a
 ///   mutex. Per request, and the one worth naming: a stream needing no signer waits behind one that
@@ -95,12 +95,17 @@ fn runtime() -> io::Result<tokio::runtime::Runtime> {
 ///   recover the unrelated streams rather than any throughput.
 /// - The credential refresh a `401` triggers ([`super::note_final_status`]) runs a resolver, which
 ///   is another child process. Rare, and bounded by the refresher's own minimum gap.
+/// - A report to the supervisor ([`super::events::Emitter`]): every event a stream reports, the
+///   capture its guard files as it drops included ([`super::capture::CaptureGuard`]), waits for
+///   room once the supervisor has fallen a full queue behind. That wait is the queue's contract
+///   rather than a cost to move: it keeps the proxy's memory bounded without losing an event, and
+///   a capture dropped here would leave its logged decision without the status held back for it.
 ///
-/// Neither is moved off-thread, because `tokio::task::spawn_blocking` wants `Send + 'static` and
-/// that is precisely the borrow this shape exists to avoid: buying it means carrying an
-/// `Arc<ProxyCtx>` through every stream. A launch whose signer latency is the tunnel's limit would
-/// justify paying that, visible as sibling streams whose time to first byte tracks a signer they
-/// never invoked.
+/// The first two are not moved off-thread, because `tokio::task::spawn_blocking` wants
+/// `Send + 'static` and that is precisely the borrow this shape exists to avoid: buying it means
+/// carrying an `Arc<ProxyCtx>` through every stream. A launch whose signer latency is the tunnel's
+/// limit would justify paying that, visible as sibling streams whose time to first byte tracks a
+/// signer they never invoked.
 ///
 /// The questions a stream puts to the supervisor are the exception, because one of them waits for
 /// a dial and a dial may take its whole bound. They need only the link, which is shared for this
