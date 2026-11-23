@@ -191,13 +191,17 @@ Those spellings belong to the request side only: a *rule* that carries a fragmen
 `;parameters` of its own is [refused](#exact-url-and-subtrees), because this same cut
 would leave it matching the bare path.
 
-Both the fragment and the parameters are cut **after** decoding, so an encoded `%23` or
-`%3B` counts as the delimiter it decodes to. That is deliberate and it cuts one way: a
-rule may cover one spelling more than a strict reading would give it, and no spelling a
-server folds back onto a denied path escapes the deny. A *rule* written with `%23`, `%3B`
-or `%2F` in its own path is refused like the delimiter written in clear, and so is a
-segment that only decodes to `.` or `..` (`/a/%2e%2e/b`), because the same decoding
-would make it match a path other than the one it reads as. Dots written plainly say
+The parameters are cut **after** decoding, so an encoded `%3B` counts as the delimiter it
+decodes to. That is deliberate and it cuts one way: a rule may cover one spelling more
+than a strict reading would give it, and no spelling a server folds back onto a denied
+path escapes the deny. The fragment is cut **before** decoding, at a raw `#`: an encoded
+`%23` is a character of the path, as the server reads it, because cutting there would take
+the rest of the path with it (`/x%23/../secret` would read as `/x`, outside a deny of
+`/secret`, while the server serves `/secret`). A *rule* written with `%3B` or `%2F` in
+its own path is refused like the delimiter written in clear, and so is a segment that
+only decodes to `.` or `..` (`/a/%2e%2e/b`), because the same decoding would make it
+match a path other than the one it reads as. A rule written with `%23` is refused too: a
+path rule takes no `#`, raw or encoded, and a path that holds one is named with `re:`. Dots written plainly say
 what they do and are resolved as written. An `allow` path that does not decode to text
 (`/a%FF`, a lone `%C3`, a literal U+FFFD) is refused too: a request path is compared as
 text, every byte that is not UTF-8 reading as U+FFFD, so such a rule would also admit
@@ -230,8 +234,8 @@ Three `re:` caveats:
   A match on either is a match. The request as sent is decoded, with its query attached
   and its `.`/`..` left as written (the HTTP/1.1 planes relay the request line as the
   client wrote it, and refuse `400 bad-request` one that carries a raw `#`, a fragment
-  being no part of a request; a URL given to [`sbx test net`](../cli/test) is read with
-  its fragment); a target that does not start with `/` is read
+  being no part of a request; [`sbx test net`](../cli/test) tests a URL without its
+  fragment, as a client sends it); a target that does not start with `/` is read
   under the root, so the URL always names the request's own host. The canonical form is
   the one a path rule sees, with `.`/`..` resolved and the query and fragment removed.
   So a deny like `re:…/secret$` now catches `/foo/../secret` and `/secret?x=1`, and a

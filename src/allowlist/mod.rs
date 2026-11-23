@@ -416,9 +416,9 @@ pub(crate) struct Request {
     /// when it is not 443, an IPv6 host bracketed). Egress is HTTPS, so the scheme is always
     /// `https`. Decoded so a regex deny is not dodged by encoding — but `.`/`..` are **not**
     /// resolved here and the query is still attached, because this is the string the request
-    /// actually carried. A fragment is kept too when the target has one, which only a URL given to
-    /// `sbx test net` can: every proxy plane that relays a request line refuses one carrying a raw
-    /// `#`, and HTTP/2 drops it.
+    /// actually carried. A fragment is kept too when the target has one, which no request does any
+    /// more: every proxy plane that relays a request line refuses one carrying a raw `#`, HTTP/2
+    /// drops it, and `sbx test net` tests a URL without it.
     url: String,
     /// The same URL rebuilt from [`Self::segs`]: `.`/`..` resolved, empty segments dropped, query
     /// removed. A `re:` rule is matched against **both** this and [`Self::url`], and matching
@@ -710,11 +710,12 @@ fn path_matches(req_segs: &[String], rule_path: &str, subtree: bool) -> bool {
 /// serves `/secret;jsessionid=…` as `/secret`, so a `deny host/secret` that compared the raw
 /// spelling refused nothing. The fragment is dropped for the same reason: a target carrying one is
 /// read as the resource before it, so a deny of that resource is not dodged by appending one. The
-/// form a request is sent in ([`Request`]'s `url`) keeps it, for a URL given to `sbx test net`: the
-/// proxy's planes refuse a request line carrying a raw `#` before deciding it.
+/// form a request is sent in ([`Request`]'s `url`) keeps it. No request brings one any more: the
+/// proxy's planes refuse a request line carrying a raw `#`, HTTP/2 drops it, and `sbx test net`
+/// tests a URL without it.
 ///
-/// **Both cuts happen after decoding, and that is a deliberate over-normalization.** A literal
-/// `%23` or `%3B` in a path decodes to a character this function then treats as a delimiter, so
+/// **The parameters are cut after decoding, and that is a deliberate over-normalization.** A
+/// literal `%3B` in a path decodes to a character this function then treats as a delimiter, so
 /// `/secret%3Bx` canonicalizes to `secret` although a server reading it literally would serve a
 /// different resource. The alternative — cutting before the decode — leaves the escape open: the
 /// same `/secret%3Bx` reaches a servlet container as `/secret`, and the deny misses. The two
@@ -722,12 +723,19 @@ fn path_matches(req_segs: &[String], rule_path: &str, subtree: bool) -> bool {
 /// canonical form of a path the operator already named, which the origin answers or does not, so
 /// this fails closed.
 ///
-/// Cutting at both depths is deliberately **not** done: one delimiter normalized twice, at two
-/// depths, produces a third behaviour that neither rule nor request was written against.
+/// **The fragment is cut before decoding**, where a raw `#` stands, as the query is at a raw
+/// `?`. The `#` an encoded `%23` decodes to is a character of its segment, as the server reads
+/// it. Cut there instead, it took the rest of the path with it: `/x%23/../secret` read as `/x`,
+/// outside a deny of `/secret`, while the server served `/secret`, and an allow of `/a` admitted
+/// `/a%23/../b`. The parameters have no such reach, being cut within their own segment before
+/// `..` is resolved.
+///
+/// Cutting the parameters at both depths is deliberately **not** done: one delimiter normalized
+/// twice, at two depths, produces a third behaviour that neither rule nor request was written
+/// against.
 pub(crate) fn canonical_segments(target: &str) -> Vec<String> {
-    let path = target.split('?').next().unwrap_or("");
+    let path = target.split(['?', '#']).next().unwrap_or("");
     let decoded = percent_decode(path);
-    let decoded = decoded.split('#').next().unwrap_or("");
     let mut out: Vec<String> = Vec::new();
     for seg in decoded.split('/') {
         let seg = seg.split(';').next().unwrap_or("");

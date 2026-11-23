@@ -2560,9 +2560,8 @@ const FRAGMENT_REFUSED: &str = "the request target carries a fragment (`#`), whi
 /// for one path admitted another. Every plane that relays the request line it was given refuses
 /// such a target before deciding it: the TLS tunnel and both absolute-form planes. HTTP/2 needs no
 /// check of its own, since the `http` crate drops a fragment when it reads `:path`. An encoded
-/// `%23` is a byte of the path and passes this check; the policy, which decodes a path before it
-/// cuts a fragment ([`crate::allowlist::canonical_segments`]), still reads one as opening a
-/// fragment.
+/// `%23` is a byte of the path and passes this check, and the policy reads it as one too
+/// ([`crate::allowlist::canonical_segments`] cuts a fragment at a raw `#` only).
 fn carries_fragment(target: &str) -> bool {
     target.contains('#')
 }

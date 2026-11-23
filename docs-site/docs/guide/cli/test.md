@@ -44,7 +44,7 @@ character or a character that reorders a line is written out as an escape (`\x1b
 
 | Option | Meaning |
 |---|---|
-| `<url>` | the URL (or a bare host, completed to `https`) to test |
+| `<url>` | the URL (or a bare host, completed to `https`) to test. A `#fragment` is left out, as a client leaves it out, and a line after the verdict says so |
 | `tcp://host:port` | test a raw L4 splice instead: reports **SPLICED / NOT SPLICED** |
 | `-a, --app <name>` | test against that app's effective policy (baseline + overlay) |
 | `-X, --method <verb>` | the HTTP method to test (default `GET`); a `{GET}` rule only matches that verb (ignored for `tcp://`) |

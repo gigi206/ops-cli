@@ -429,23 +429,26 @@ fn a_path_rule_may_not_carry_an_encoded_separator() {
     assert!(classify("api.test/a%252fb").is_ok());
 }
 
-/// An encoded `#` or `;` is cut like the delimiter it decodes to, on the rule's path as on the
-/// request's, so a rule carrying one matches the path before it: `host/a%23b` opened `/a` and
-/// printed back as `a%23b`. Refused like the encoded separator, naming the path really opened; a
-/// double-encoded delimiter decodes to a literal `%23` inside one segment and stays admitted.
+/// An encoded `;` is cut like the delimiter it decodes to, on the rule's path as on the request's,
+/// so a rule carrying one matches the path around it: `host/a%3Bb/c` opened `/a/c`. Refused like the
+/// encoded separator, naming the path really opened. An encoded `#` is not cut, but names a `#`
+/// inside a segment, which a path rule takes in no spelling: refused too, pointing at `re:`. A
+/// double-encoded delimiter decodes to a literal `%23` or `%3B` inside one segment and stays
+/// admitted.
 #[test]
 fn a_path_rule_may_not_carry_an_encoded_fragment_or_parameter_delimiter() {
-    for (entry, delimiter, opened) in [
-        ("api.test/a%23b", "#", "`/a`"),
-        ("api.test/a%3Bb/c", ";", "`/a/c`"),
-        ("api.test/a%3bb/c", ";", "`/a/c`"),
-    ] {
+    for entry in ["api.test/a%3Bb/c", "api.test/a%3bb/c"] {
         let e = classify(entry).unwrap_err();
         assert!(
-            e.contains(&format!("encoded `{delimiter}`")) && e.contains(opened),
+            e.contains("encoded `;`") && e.contains("`/a/c`"),
             "the refusal names the encoding and the path really opened: {e}"
         );
     }
+    let e = classify("api.test/a%23b").unwrap_err();
+    assert!(
+        e.contains("encoded `#`") && e.contains("re:"),
+        "the refusal names the encoding and the way to name such a path: {e}"
+    );
     assert!(classify("api.test/a%2523b").is_ok());
     assert!(classify("api.test/a%253Bb").is_ok());
 }
@@ -1486,7 +1489,7 @@ fn canonical_segments_normalizes_the_path() {
     assert_eq!(canonical_segments("/secret#frag"), ["secret"]);
     assert_eq!(canonical_segments("/secret?x=1#frag"), ["secret"]);
 
-    // Both cuts happen after decoding, which over-normalizes a *literal* `%3B`/`%23`. Pinned here
+    // The parameters are cut after decoding, which over-normalizes a *literal* `%3B`. Pinned here
     // rather than left to prose: it is the cost of closing the escape above, and a change of mind
     // has to change this assertion deliberately. See `canonical_segments`' own note for why the
     // two errors are not symmetric.
@@ -1495,7 +1498,10 @@ fn canonical_segments_normalizes_the_path() {
         ["secret"],
         "an encoded `;` is treated as a delimiter — the fail-closed side of the trade"
     );
-    assert_eq!(canonical_segments("/secret%23x"), ["secret"]);
+    // The fragment is cut before decoding, at a raw `#`: an encoded one is a character of its
+    // segment, because a cut there took the rest of the path with it (see `canonical_segments`).
+    assert_eq!(canonical_segments("/secret%23x"), ["secret#x"]);
+    assert_eq!(canonical_segments("/x%23/../secret"), ["secret"]);
 }
 
 #[test]
@@ -3602,9 +3608,9 @@ fn an_allow_path_that_does_not_decode_to_text_is_refused() {
     assert!(wrong.is_empty(), "{}", wrong.join("; "));
 }
 
-/// A regex deny reads the fragment a target carries, as a URL given to `sbx test net` does:
-/// `re:\.exe$` refuses `/file#.exe` as it refuses `/file.exe`. The proxy's planes refuse a request
-/// line carrying a raw `#` before deciding it.
+/// A regex deny reads the fragment a target carries: `re:\.exe$` refuses `/file#.exe` as it
+/// refuses `/file.exe`. No request brings one to the policy any more (the planes refuse a raw `#`,
+/// HTTP/2 drops it, `sbx test net` leaves it out), so this holds the policy to its own reading.
 #[test]
 fn a_regex_deny_reads_the_fragment_the_request_carries() {
     let p = EgressPolicy::new(
@@ -3624,4 +3630,39 @@ fn a_regex_deny_reads_the_fragment_the_request_carries() {
         matches!(verdict("/file#.exe"), Decision::DeniedBy(_)),
         "a fragment the request carries is read by the deny"
     );
+}
+
+/// An encoded `%23` is a character of the path, as a server reads it, and not the start of a
+/// fragment: cut there after decoding, it took the rest of the path with it, so `/x%23/../secret`
+/// read as `/x` while the server served `/secret`. Neither a path deny, a path allow nor a regex
+/// allow is dodged by one, and a raw `#` still ends the path. Each case is checked on its own, and
+/// every one decided the other way is named.
+#[test]
+fn an_encoded_hash_is_a_character_of_the_path_and_not_a_fragment() {
+    let deny = EgressPolicy::new(
+        vec![classify("x.test").unwrap()],
+        vec![classify("x.test/secret").unwrap()],
+    );
+    let allow = EgressPolicy::new(vec![classify("x.test/a").unwrap()], vec![]);
+    let regex = EgressPolicy::new(vec![classify("re:^https://x\\.test/a$").unwrap()], vec![]);
+    let mut wrong = Vec::new();
+    for (what, policy, target, admitted) in [
+        ("deny", &deny, "/secret", false),
+        ("deny", &deny, "/secret#frag", false),
+        ("deny", &deny, "/x", true),
+        ("deny", &deny, "/x%23/../secret", false),
+        ("deny", &deny, "/x%23/%2e%2e/secret", false),
+        ("allow", &allow, "/a", true),
+        ("allow", &allow, "/a%23t", false),
+        ("allow", &allow, "/a%23/../b", false),
+        ("regex allow", &regex, "/a", true),
+        ("regex allow", &regex, "/a%23/../b", false),
+    ] {
+        let decision = policy.explain("x.test", 443, target, "GET");
+        let got = matches!(decision, Decision::AllowedBy(_) | Decision::AllowedDefault);
+        if got != admitted {
+            wrong.push(format!("{what} `{target}`: admitted={got}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:?}");
 }

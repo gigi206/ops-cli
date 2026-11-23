@@ -581,8 +581,8 @@ A request target carrying a raw `#` is refused `400 bad-request` as well, by eve
 relays the request line it was given: the TLS tunnel and both absolute-form planes. A fragment is
 no part of a request (the request-target grammar has no `#`), and a server serves the resource
 before it while a `re:` rule reads the target with it, so a regex allow written for one path would
-admit another. An encoded `%23` passes this refusal as a byte of the path, though a path rule,
-which decodes before it cuts a fragment, still reads it as opening one (see [Rules](rules)).
+admit another. An encoded `%23` passes this refusal as a byte of the path, and a path rule reads
+it as one too (see [Rules](rules)).
 HTTP/2 drops a fragment when it reads `:path`, so a request there is decided and sent without
 one.
 

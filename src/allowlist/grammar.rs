@@ -861,9 +861,11 @@ fn parse_path_rule(
         ));
     }
     // An encoded delimiter is the same mistake spelled once more. `canonical_segments` decodes a
-    // path before it splits it at `/` and cuts it at `#` and `;`, on the rule's side exactly as on
-    // the request's, so `host/a%2fb` matches `/a/b` and `host/a%23b` matches `/a`, while `sbx test
+    // path before it splits it at `/` and cuts it at `;`, on the rule's side exactly as on the
+    // request's, so `host/a%2fb` matches `/a/b` and `host/a%3bb/c` matches `/a/c`, while `sbx test
     // net` prints either back as written — a rule that reads as one resource and matches another.
+    // An encoded `#` is not cut (the fragment is, at a raw `#`, before decoding) but names a `#`
+    // inside a segment, which a path rule takes in no spelling: refused too, pointing at `re:`.
     // Percent-encoding itself stays legal, because decoding is the contract: `/%73ecret` is
     // `/secret` and an author may reasonably write either. Only a delimiter changes what the rule
     // matches.
@@ -876,15 +878,20 @@ fn parse_path_rule(
              literally"
         ));
     }
-    for (encoded, delimiter) in [("%23", '#'), ("%3b", ';')] {
-        if lower.contains(encoded) {
-            let opened = opened_path(path);
-            return Err(format!(
-                "entry `{s}` writes an encoded `{delimiter}` in a path rule — the path is decoded \
-                 before it is cut at `{delimiter}`, so this matches `{opened}`. Use `re:` to name \
-                 it: a regex is matched against the decoded URL, where it reads `{delimiter}`"
-            ));
-        }
+    if lower.contains("%23") {
+        return Err(format!(
+            "entry `{s}` writes an encoded `#` in a path rule, which takes no `#`, raw or encoded. \
+             Use `re:` to name a path that holds one: a regex is matched against the decoded URL, \
+             where it reads `#`"
+        ));
+    }
+    if lower.contains("%3b") {
+        let opened = opened_path(path);
+        return Err(format!(
+            "entry `{s}` writes an encoded `;` in a path rule — the path is decoded before it is cut \
+             at `;`, so this matches `{opened}`. Use `re:` to name it: a regex is matched against \
+             the decoded URL, where it reads `;`"
+        ));
     }
     // A segment that decodes to `.` or `..` is resolved like the dots it spells, so
     // `host/a/%2e%2e/b` matches `/b` while `sbx test net` prints it back as a segment of its own.

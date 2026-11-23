@@ -306,6 +306,31 @@ fn net_test(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// [`render_sent_url_verdict`] for the URL a client would send: one carrying a `#fragment` is
+/// tested without it, since a client keeps the fragment to itself, and a line after the verdict
+/// says what was left out. Read with it, the policy would answer for a request no client makes, and
+/// one the proxy's planes refuse outright.
+fn render_url_verdict(
+    url: &str,
+    effective: &allowlist::EgressPolicy,
+    user: &allowlist::EgressPolicy,
+    method: &str,
+    secrets: &[config::HeaderSecret],
+    pal: &style::Palette,
+) -> Result<String, String> {
+    let Some((sent, fragment)) = url.split_once('#') else {
+        return render_sent_url_verdict(url, effective, user, method, secrets, pal);
+    };
+    let mut o = render_sent_url_verdict(sent, effective, user, method, secrets, pal)?;
+    let (dim, r) = (pal.dim, pal.reset);
+    o.push_str(&format!(
+        "  {dim}note: the fragment `#{}` stays with the client and is not sent, so this is the \
+         verdict for `{sent}`{r}\n",
+        crate::diag::visible(fragment)
+    ));
+    Ok(o)
+}
+
 /// Render every line `sbx test net` prints for an `https://`/`http://` target: the verdict, the
 /// notes that qualify it, and any credential the proxy would inject.
 ///
@@ -317,7 +342,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
 ///
 /// `Err` carries the message for a target this command cannot parse as a URL; the caller reports it
 /// as a usage error.
-fn render_url_verdict(
+fn render_sent_url_verdict(
     url: &str,
     effective: &allowlist::EgressPolicy,
     user: &allowlist::EgressPolicy,
@@ -1535,6 +1560,29 @@ mod tests {
              the host\n"
         );
     }
+    /// A URL carrying a fragment is tested as a client sends it, without the fragment, which a
+    /// client keeps to itself, and a line after the verdict says what was left out. The policy
+    /// allows the host and denies `re:frag$`, so a fragment read as part of the request would turn
+    /// the verdict around.
+    #[test]
+    fn a_fragment_is_left_out_of_the_url_tested_as_a_client_leaves_it_out() {
+        let p = style::Palette::plain();
+        let policy = allowlist::EgressPolicy::new(
+            vec![allowlist::classify("x.test").unwrap()],
+            vec![allowlist::classify("re:frag$").unwrap()],
+        );
+        let out = render_url_verdict("https://x.test/a#frag", &policy, &policy, "GET", &[], &p)
+            .expect("a URL with a fragment parses");
+        assert!(
+            out.starts_with("ALLOWED  https://x.test/a\n"),
+            "the verdict is for the URL a client sends: {out}"
+        );
+        assert!(
+            out.contains("note: the fragment `#frag` stays with the client and is not sent"),
+            "the line names what was left out: {out}"
+        );
+    }
+
     /// The refusal above is only worth having if the command consults it. The reported defect was
     /// `sbx test net https://10.0.0.5/v1` printing ALLOWED, because the policy verdict was rendered
     /// first and a rule naming the address answered it; the proxy refuses that request with
