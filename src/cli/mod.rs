@@ -701,9 +701,10 @@ fn lines_named(lines: &[String]) -> Option<(String, String)> {
     Some((count, format!("{named}{more}")))
 }
 
-/// Fold a name repeated in one multi-name removal (`sbx app rm`, `sbx plugins rm`) down to a single
-/// removal, keeping the order the user typed. Without this the second pass over a name finds
-/// nothing left to remove and reports a phantom failure over work that in fact succeeded.
+/// Fold a name repeated in one multi-name removal (`sbx app rm`, `sbx bundle rm`, `sbx plugins rm`,
+/// `sbx projects rm`) down to a single removal, keeping the order the user typed. Without this the
+/// second pass over a name finds nothing left to remove and reports a phantom failure over work
+/// that in fact succeeded.
 pub(crate) fn dedupe_names(names: &mut Vec<&str>) {
     let mut seen = std::collections::HashSet::new();
     names.retain(|name| seen.insert(*name));

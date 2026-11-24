@@ -67,7 +67,7 @@ fn projects_show_cmd(args: &[OsString]) -> ExitCode {
 }
 
 fn projects_rm_cmd(args: &[OsString]) -> ExitCode {
-    let mut ids: Vec<String> = Vec::new();
+    let mut ids: Vec<&str> = Vec::new();
     let (mut dead, mut markerless) = (false, false);
     let (mut dry_run, mut yes) = (false, false);
     let (mut do_gc, mut force) = (false, false);
@@ -85,13 +85,16 @@ fn projects_rm_cmd(args: &[OsString]) -> ExitCode {
                 diag::hint("       run `sbx help projects` for usage.");
                 return ExitCode::from(2);
             }
-            Some(id) => ids.push(id.to_string()),
+            Some(id) => ids.push(id),
             None => {
                 diag::error("sbx: projects rm: argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }
     }
+    // A tree named twice is one removal: the second pass would find nothing left, and report the
+    // removal that succeeded as an id with no tree.
+    crate::cli::dedupe_names(&mut ids);
     if ids.is_empty() && !dead && !markerless {
         diag::error(
             "sbx: projects rm: name a project id, or use --dead / --markerless. \
@@ -106,5 +109,6 @@ fn projects_rm_cmd(args: &[OsString]) -> ExitCode {
         return ExitCode::from(2);
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let ids: Vec<String> = ids.into_iter().map(str::to_string).collect();
     sandbox::projects_rm(&ids, dead, markerless, apply, do_gc, force, &pal)
 }

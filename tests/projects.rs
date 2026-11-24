@@ -497,6 +497,35 @@ fn rm_a_named_tree_removes_it_immediately() {
     );
 }
 
+/// A tree named twice in one removal is removed once. The second pass found nothing left and made
+/// the removal that succeeded a usage error, at exit 2.
+#[test]
+fn rm_a_tree_named_twice_removes_it_once() {
+    let fx = Project::new("projects");
+    let dir = fx.make_tree("1234567890abcdef", Some(&fx.proj.path().join("gone")));
+    let out = fx.run(&["projects", "rm", "1234567890abcdef", "1234567890abcdef"]);
+    let said = text(&out);
+    assert!(
+        out.status.success(),
+        "a removal that succeeded fails:\n{said}"
+    );
+    assert!(!dir.exists(), "the tree should be gone:\n{said}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .matches("removed:")
+            .count(),
+        1,
+        "the tree is reported removed once:\n{said}"
+    );
+
+    // An id with no tree behind it is still a usage error beside one that is removed.
+    let other = fx.make_tree("abcdef1234567890", Some(&fx.proj.path().join("gone")));
+    let out = fx.run(&["projects", "rm", "abcdef1234567890", "0000000000000000"]);
+    let said = text(&out);
+    assert_eq!(out.status.code(), Some(2), "{said}");
+    assert!(!other.exists(), "the tree named first is removed:\n{said}");
+}
+
 #[test]
 fn rm_dry_run_previews_without_removing() {
     let fx = Project::new("projects");
