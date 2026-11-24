@@ -6,9 +6,10 @@
 //! suite sweeps every read-only verb with a token it cannot mean, and requires it refused (see
 //! [`refused`]): the usage exit, in the words a parser refuses an argument with.
 //!
-//! Only side-effect-free verbs are swept: nothing here launches a cage, fetches, installs, or
-//! writes outside its throwaway data directory. Verbs that legitimately take a positional (say
-//! `test net <target>`) are swept with a *second* one, since the first is a valid argument.
+//! No probe has an effect: nothing here launches a cage, fetches, installs, or writes outside its
+//! throwaway data directory, and a verb that writes is probed only with a flag it must refuse
+//! before writing (see [`VERBS_THAT_TAKE_NO_TRUST`]). Verbs that legitimately take a positional
+//! (say `test net <target>`) are swept with a *second* one, since the first is a valid argument.
 
 #[macro_use]
 mod common;
