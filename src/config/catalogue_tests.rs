@@ -267,7 +267,7 @@ fn reads_the_upgrade_signal(argv: &[String]) -> bool {
 /// argv needs nothing — sbx appends to it and the program reads its own arguments.
 #[test]
 fn every_shipped_shell_profile_forwards_its_trailing_arguments() {
-    const SHELLS: [&str; 4] = ["bash", "sh", "zsh", "dash"];
+    const SHELLS: [&str; 5] = ["bash", "sh", "zsh", "dash", "ash"];
     let (mut shell_profiles, mut plain) = (0, 0);
     for path in shipped_files("examples/app") {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();

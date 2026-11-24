@@ -14932,6 +14932,39 @@ fn a_contract_the_launch_cannot_honour_is_refused_with_its_reason() {
     }
 }
 
+/// An `ash` script refuses a contract as a `bash` one does: `ash -c` binds the element after the
+/// script to `$0`, so the option would reach the script's positional parameters, named alone or
+/// through the busybox binary.
+#[test]
+fn an_ash_script_refuses_a_contract_as_a_bash_one_does() {
+    let resolve = |cmd: &str| {
+        contract_app(
+            &format!("[app.demo]\ncmd = {cmd}\ncontract = {{ arg = \"--prompt\" }}\n"),
+            None,
+        )
+    };
+    let alone = resolve(r#"["ash", "-c", "exec agent"]"#);
+    assert_eq!(alone.contract, None, "{:#?}", alone.warnings);
+    assert!(
+        alone
+            .warnings
+            .iter()
+            .any(|w| w.contains("ignoring `contract`") && w.contains("ends in a shell script")),
+        "{:#?}",
+        alone.warnings
+    );
+    let multicall = resolve(r#"["busybox", "ash", "-c", "exec agent"]"#);
+    assert_eq!(multicall.contract, None, "{:#?}", multicall.warnings);
+    assert!(
+        multicall
+            .warnings
+            .iter()
+            .any(|w| w.contains("ignoring `contract`") && w.contains("ends in a shell script")),
+        "{:#?}",
+        multicall.warnings
+    );
+}
+
 /// The resolved-configuration dump [`resolve`] writes is created owner-only, whatever the umask: it
 /// reproduces the config files as written, `[env]` values and plugin keys included.
 #[cfg(debug_assertions)]

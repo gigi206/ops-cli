@@ -43,8 +43,9 @@ posture (network, binds, secrets, home) is fixed by the profile.
 
 When the profile's `cmd` is a shell script (`["bash", "-c", "..."]`), sbx inserts the
 app's name as the script's `$0` before appending, so your first argument arrives as `$1`
-instead of being absorbed as the shell's own name. The script still has to expand `"$@"`
-for the arguments to reach the program it runs: see
+instead of being absorbed as the shell's own name. sbx inserts it only after `bash`, `sh`,
+`zsh`, `dash` and `ash`; behind any other shell it appends your arguments as they are. The
+script still has to expand `"$@"` for the arguments to reach the program it runs: see
 [`cmd`](../configuration/apps#the-cmd-field-and-trailing-arguments).
 
 A one-shot override is applied after the app's overlay, so it is the final word: e.g.

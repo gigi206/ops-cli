@@ -97,6 +97,51 @@ fn an_app_argv_carries_its_contract_between_cmd_and_the_callers_arguments() {
     );
 }
 
+/// `ash`, busybox's shell, binds the element after its `-c` script to `$0` as `bash` does, so its
+/// script takes the `$0` filler and no contract, named alone or through the busybox binary.
+#[test]
+fn an_ash_script_takes_the_argv0_filler_and_no_contract() {
+    let os = |v: &[&str]| -> Vec<OsString> { v.iter().map(OsString::from).collect() };
+    let cmd = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
+    let file = crate::config::AppContract {
+        arg: "--prompt-file".into(),
+        toml_key: None,
+    };
+
+    assert_eq!(
+        app_argv(
+            "demo",
+            &cmd(&["ash", "-c", "exec agent \"$@\""]),
+            Some(&file),
+            os(&["one", "two"])
+        ),
+        (
+            os(&["ash", "-c", "exec agent \"$@\"", "demo", "one", "two"]),
+            None
+        )
+    );
+    assert_eq!(
+        app_argv(
+            "demo",
+            &cmd(&["busybox", "ash", "-c", "exec agent \"$@\""]),
+            Some(&file),
+            os(&["one", "two"])
+        ),
+        (
+            os(&[
+                "busybox",
+                "ash",
+                "-c",
+                "exec agent \"$@\"",
+                "demo",
+                "one",
+                "two"
+            ]),
+            None
+        )
+    );
+}
+
 /// A contract that takes the summary's text leaves the argv without it and returns where it goes —
 /// after `cmd`, ahead of the caller's arguments — and a shell script takes it no more than the path.
 #[test]

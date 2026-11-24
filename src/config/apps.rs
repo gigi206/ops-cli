@@ -199,9 +199,11 @@ pub(crate) struct ResolvedApp {
     pub(crate) refusals: Vec<String>,
 }
 
-/// The shells whose `-c` binds the *next* argv element to `$0`. All four are POSIX-family and
-/// agree on it, so the rule is theirs, not a per-shell quirk.
-const ARGV0_SHELLS: [&str; 4] = ["bash", "sh", "zsh", "dash"];
+/// The shells whose `-c` binds the *next* argv element to `$0`, the rule POSIX gives
+/// `sh -c <command_string> [<command_name>]`. The list is closed: sbx reads a shell outside it as a
+/// program, and appends a `contract` and the caller's trailing arguments after its script with no
+/// `$0` filler.
+const ARGV0_SHELLS: [&str; 5] = ["bash", "sh", "zsh", "dash", "ash"];
 
 /// Whether `cmd` ends in `<shell> -<flags>c <script>` — the shape whose trailing element is a
 /// script, not a program, so anything appended after it starts at `$0`.
