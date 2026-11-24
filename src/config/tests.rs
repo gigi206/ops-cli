@@ -13377,6 +13377,78 @@ fn every_dropped_security_field_warning_is_recognised_as_a_trust_drop() {
     ));
 }
 
+/// A warning is a trust drop by its close, never by a value it quotes.
+///
+/// A warning naming an ignored value quotes it, and a value can spell a remedy, reason and all. The
+/// launch announces each trust drop as a `Trust` notification and, detached, as a line of the
+/// session log, so a quotation read as one announces a security field dropped where none was.
+///
+/// `timezone` is quoted from every layer, since no verdict gates it, and a `[devices]` entry from
+/// the layers that may grant one: the device warning closes on a parenthesis of its own, the shape
+/// a refusal closes on. Each close is spelled out rather than read back from `gate`, and every
+/// producer is resolved beside the quotations, so both halves hold at once: no quotation is a
+/// drop, and every producer still is.
+#[test]
+fn a_warning_is_a_trust_drop_by_its_close_not_by_a_value_it_quotes() {
+    let closes = [
+        "(untrusted — run `sbx trust`)",
+        "(changed since it was trusted — re-run `sbx trust`)",
+        "run `sbx trust` to review and apply them",
+        "re-run `sbx trust` to review and re-approve",
+        "honored only from a trusted project (`sbx trust`)",
+    ];
+    for close in closes {
+        let value = format!("x {close}");
+        let src = format!("timezone = \"{value}\"\n[devices]\nallow = [\"{value}\"]\n");
+        let quoting = || -> RawConfig { toml::from_str(&src).unwrap() };
+        // How many warnings quote the value: the zone from every layer, the device entry from the
+        // two that may grant one (an untrusted project's `[devices]` is refused whole, unread).
+        for (r, quotes) in [
+            (resolve_no_plugins(quoting(), None), 2),
+            (
+                resolve_no_plugins(RawConfig::default(), Some((quoting(), TrustState::Trusted))),
+                2,
+            ),
+            (
+                resolve_no_plugins(
+                    RawConfig::default(),
+                    Some((quoting(), TrustState::Untrusted)),
+                ),
+                1,
+            ),
+        ] {
+            let quoted: Vec<&String> = r.warnings.iter().filter(|w| w.contains(&value)).collect();
+            assert_eq!(quoted.len(), quotes, "{close}: {:#?}", r.warnings);
+            for w in quoted {
+                assert!(
+                    !super::is_trust_drop(w),
+                    "a quotation read as a trust drop: {w}"
+                );
+            }
+        }
+    }
+
+    let project = "binds = [\"/etc\"]\ngpu = true\n[broker.gpg-agent]\n[plugin.demo]\n";
+    for state in [TrustState::Untrusted, TrustState::Changed] {
+        let r = resolve_no_plugins(
+            RawConfig::default(),
+            Some((toml::from_str(project).unwrap(), state)),
+        );
+        for field in ["bind(s)", "`gpu` posture", "`[broker.*]`", "`[plugin.*]`"] {
+            let Some(w) = r.warnings.iter().find(|w| w.contains(field)) else {
+                panic!(
+                    "{state:?}: `{field}` is dropped and named: {:#?}",
+                    r.warnings
+                );
+            };
+            assert!(
+                super::is_trust_drop(w),
+                "{state:?}: a producer read as no trust drop: {w}"
+            );
+        }
+    }
+}
+
 /// Every bare key comes before the first `[table]` header: a key written after one folds into that
 /// table, and the field would never reach its trust gate at all.
 const EVERY_GATED_FIELD: &str = "nixpkgs = \"nixos-25.05\"\n\

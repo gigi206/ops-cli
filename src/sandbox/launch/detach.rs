@@ -530,9 +530,10 @@ fn note_trust_drops(
 /// way to the desktop. No producer of a trust-drop warning interpolates agent-chosen text today —
 /// they carry a layer label, a caller-spelled field phrase, a bind count, plugin table names and a
 /// nix tool name — so this is a no-op on every string it currently sees. It is here for the producer
-/// added later: [`crate::config::is_trust_drop`] matches on the remedy rather than on any one
-/// reason's wording, so a new one flows into this writer without anyone revisiting it. A launch that
-/// needs no guard carries no needle set, and then the note goes out as the terminal already had it.
+/// added later: [`crate::config::is_trust_drop`] matches on the remedy a warning closes on rather
+/// than on any one reason's wording, so a new one that closes on it flows into this writer without
+/// anyone revisiting it. A launch that needs no guard carries no needle set, and then the note goes
+/// out as the terminal already had it.
 ///
 /// The lock is taken through [`crate::sandbox::locks::read_locked`], not `read().ok()`. This is the second
 /// reader of a set whose [`Needles`](crate::sandbox::notify_sink::Needles) doc calls the delivery thread its

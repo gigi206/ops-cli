@@ -13,7 +13,8 @@ fn a_poisoned_needle_set_still_redacts_the_trust_drop_note() {
     use std::sync::{Arc, RwLock};
 
     let secret = "hunter2-actual-token";
-    let warning = format!("project: dropped `network.allow` (token {secret}) — run `sbx trust`");
+    let warning =
+        format!("project: ignoring `network.allow` {secret} (untrusted — run `sbx trust`)");
     let needles: crate::sandbox::notify_sink::Needles =
         Arc::new(RwLock::new(vec![SecretNeedle::named(
             "TOKEN",

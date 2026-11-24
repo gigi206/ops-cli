@@ -17,8 +17,8 @@
 //!
 //! The refusal wording lives here for the same reason. A dropped field is visible to a user only as
 //! the sentence that says so, and there is more than one producer of that sentence — the gate's own
-//! refusal, the bind count, and the launcher's withheld package — so the remedy they must all point
-//! at ([`TRUST_DROP_MARKER`]) sits beside them instead of hundreds of lines away.
+//! refusal, the dropped binds, and the launcher's withheld package — so the close they must all end
+//! on, and [`is_trust_drop`] that reads it, sit beside them instead of hundreds of lines away.
 
 use super::*;
 
@@ -151,8 +151,8 @@ impl Gate<'_> {
 /// reads, so it is the caller's to spell, never something derived from a field name here.
 ///
 /// This is not the only producer of a dropped-for-want-of-trust warning — `binds` has a sentence of
-/// its own, and the launcher withholds a package in words of its own again ([`TRUST_DROP_MARKER`]
-/// is what spans them). What is centralized is one sentence, so that changing it is one edit.
+/// its own, and the launcher withholds a package in words of its own again ([`is_trust_drop`] is
+/// what spans them). What is centralized is one sentence, so that changing it is one edit.
 pub(super) fn refuse_untrusted(
     warnings: &mut Vec<String>,
     source: &str,
@@ -171,24 +171,52 @@ pub(super) fn refuse_untrusted(
 /// `sbx config` so the two never phrase the same verdict differently.
 pub(crate) fn untrusted_reason(state: TrustState) -> &'static str {
     match state {
-        TrustState::Changed => "changed since it was trusted — re-run `sbx trust`",
-        _ => "untrusted — run `sbx trust`",
+        TrustState::Changed => CHANGED_REASON,
+        _ => UNTRUSTED_REASON,
     }
 }
 
-/// What every dropped-for-want-of-trust warning points its reader at, and nothing else in a
-/// resolution does.
-///
-/// The marker is the *remedy*, not the wording of any one reason, because there is more than one
-/// producer: [`untrusted_reason`] phrases it one way and [`dropped_binds_warning`] another, and a
-/// third added later will phrase it a third. Matching on a single reason's exact text would silently
-/// stop covering the others — which is a failure of **silence**, the one thing nothing else catches.
-/// A test pins every producer against this.
-const TRUST_DROP_MARKER: &str = "`sbx trust`";
+/// Why a security field of a project that was never approved is held back, and the remedy.
+const UNTRUSTED_REASON: &str = "untrusted — run `sbx trust`";
+
+/// Why a security field of a project changed since its approval is held back, and the remedy.
+const CHANGED_REASON: &str = "changed since it was trusted — re-run `sbx trust`";
+
+/// How the warning for a project table dropped whole for want of trust (`[broker.*]`,
+/// `[plugin.*]`) ends.
+pub(super) const TRUSTED_PROJECT_ONLY: &str = "honored only from a trusted project (`sbx trust`)";
+
+/// How the warning for binds dropped from a project that was never approved ends.
+const BINDS_UNTRUSTED_REMEDY: &str = "run `sbx trust` to review and apply them";
+
+/// How the warning for binds dropped from a project changed since its approval ends.
+const BINDS_CHANGED_REMEDY: &str = "re-run `sbx trust` to review and re-approve";
 
 /// Whether a resolution warning is a security field dropped for want of trust.
+///
+/// Read off the warning's close, where every producer puts its remedy: [`refuse_untrusted`] ends on
+/// the reason [`untrusted_reason`] gives, in parentheses, [`dropped_binds_warning`] on a remedy of
+/// its own, and a project table dropped whole on [`TRUSTED_PROJECT_ONLY`]. Each producer writes its
+/// close from the constant read here, so the two cannot drift apart. The remedy and not the wording
+/// of any one reason, because a producer recognised by nothing is a dropped field the launch never
+/// announces — a failure of **silence**, the one thing nothing else catches. A test pins every
+/// producer against this.
+///
+/// The close and not anywhere in the text, because a warning that names an ignored value quotes it,
+/// and a value can spell `` `sbx trust` ``: a `timezone` that does would otherwise be announced as
+/// a security field dropped where none was.
 pub(crate) fn is_trust_drop(warning: &str) -> bool {
-    warning.contains(TRUST_DROP_MARKER)
+    let refused = warning
+        .strip_suffix(')')
+        .is_some_and(|w| w.ends_with(UNTRUSTED_REASON) || w.ends_with(CHANGED_REASON));
+    refused
+        || [
+            BINDS_UNTRUSTED_REMEDY,
+            BINDS_CHANGED_REMEDY,
+            TRUSTED_PROJECT_ONLY,
+        ]
+        .iter()
+        .any(|close| warning.ends_with(close))
 }
 
 /// The warning for security binds dropped from an untrusted project, made actionable: a *changed*
@@ -213,11 +241,11 @@ pub(super) fn dropped_binds_warning(state: TrustState, binds: &[RawBind]) -> Str
     match state {
         TrustState::Changed => format!(
             "{PROJECT_CONFIG} changed since it was trusted: dropping {count} bind(s) ({named}) — \
-             re-run `sbx trust` to review and re-approve"
+             {BINDS_CHANGED_REMEDY}"
         ),
         _ => format!(
             "{PROJECT_CONFIG} is untrusted: dropping {count} bind(s) ({named}) — \
-             run `sbx trust` to review and apply them"
+             {BINDS_UNTRUSTED_REMEDY}"
         ),
     }
 }

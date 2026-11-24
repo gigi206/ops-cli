@@ -64,9 +64,9 @@ pub(crate) use tools::{
 use apps::{apply_apps_section, resolve_apps};
 // The label a project app's notes carry, which the bundle fold's own notes on that app share.
 use apps::project_app_source;
-// The gate the resolution engine routes every security-relevant field through, and the two
-// refusal sentences it does not phrase itself.
-use gate::{Gate, dropped_binds_warning, refuse_untrusted};
+// The gate the resolution engine routes every security-relevant field through, the two refusal
+// sentences it does not phrase itself, and the close it ends a project table dropped whole on.
+use gate::{Gate, TRUSTED_PROJECT_ONLY, dropped_binds_warning, refuse_untrusted};
 // The declared-tool folds the resolution engine drives, one per layer it reads.
 use tools::{
     apply_fresh_releases, apply_packages, apply_tools, upsert_package, warn_mise_nix_packages,
@@ -2642,8 +2642,7 @@ fn resolve(
                 names.sort_unstable();
                 warnings.push(format!(
                     "{PROJECT_CONFIG}: ignoring `[broker.*]` ({}) — it decides what a cage may \
-                     reach through a broker plugin, so it is honored only from a trusted project \
-                     (`sbx trust`)",
+                     reach through a broker plugin, so it is {TRUSTED_PROJECT_ONLY}",
                     names.join(", ")
                 ));
             }
@@ -2683,7 +2682,7 @@ fn resolve(
                 warnings.push(format!(
                     "{PROJECT_CONFIG}: ignoring `[plugin.*]` ({}) — it can provision a \
                      program and set the environment of a host-side resolver, so it is \
-                     honored only from a trusted project (`sbx trust`)",
+                     {TRUSTED_PROJECT_ONLY}",
                     names.join(", ")
                 ));
             }
