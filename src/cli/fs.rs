@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use crate::cli::logs;
 use crate::{
     config, config_cwd, diag, format_log_time, help, report_rule_write, sandbox, split_one_rule,
-    style,
+    split_session_flags, style,
 };
 
 /// `sbx fs <subcommand>`: observe the files a running session writes in its project tree, and
@@ -123,11 +123,13 @@ fn fs_remove_mask(list: config::manage::FsList, args: &[OsString]) -> ExitCode {
 
 /// Refuse `--session`/`--all` before anything is parsed or written, naming why this family does not
 /// take them. Shared by both writing verbs so the sentence is one definition.
+///
+/// The two are found as [`split_session_flags`] finds them for `sbx net` and `sbx proc`: a word
+/// after a bare `--` is a positional whatever it looks like, so `sbx fs deny -- --all` masks a path
+/// of that name, which the mask writer accepts, rather than being refused for a flag.
 fn refuse_session_flags(verb: &str, args: &[OsString]) -> Result<(), ExitCode> {
-    if args
-        .iter()
-        .any(|a| matches!(a.to_str(), Some("--session") | Some("--all")))
-    {
+    let (session, all, _) = split_session_flags(args);
+    if session || all {
         diag::error(&fs_takes_no_session_flags(verb));
         return Err(ExitCode::from(2));
     }
@@ -208,5 +210,27 @@ fn write_fs_event(
         let (dim, r) = (pal.dim, pal.reset);
         let time = format_log_time(e.at_epoch_ms);
         writeln!(out, "  {dim}{time}{r}  {:<6}  {}", e.kind.token(), e.path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--session` and `--all` are refused as flags and only as flags: after a bare `--` each is
+    /// a path to mask, as it is a rule to write for `sbx net` and `sbx proc`.
+    #[test]
+    fn a_session_flag_is_refused_before_the_terminator_and_is_a_path_after_it() {
+        let argv = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
+        for flag in ["--session", "--all"] {
+            assert!(
+                refuse_session_flags("deny", &argv(&["secrets/", flag])).is_err(),
+                "`fs deny secrets/ {flag}` is refused"
+            );
+            assert!(
+                refuse_session_flags("deny", &argv(&["--", flag])).is_ok(),
+                "`fs deny -- {flag}` names a path"
+            );
+        }
     }
 }
