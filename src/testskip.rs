@@ -11,7 +11,9 @@
 //
 // * [`skip_incapable!`] — the **host** cannot run this test: no userns, no bwrap, no nix, no
 //   provisioned userland, no systemd. A host that is supposed to be capable can be made to prove
-//   it: with `SBX_REQUIRE_CAPABLE` set to anything but `0`, this skip becomes a failure.
+//   it: with `SBX_REQUIRE_CAPABLE` set to a non-empty value other than `0`, this skip becomes a
+//   failure. An empty value is off, because that is how the Cage workflow leaves the variable on
+//   a run nobody armed.
 // * [`skip_unreachable!`] — something **outside** the host is unavailable: a binary cache, a
 //   registry, the network. No host setting makes that dependable, so it is never enforced; it is
 //   only counted, because a suite that skipped forty tests on a bad network should say so.

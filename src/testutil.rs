@@ -1396,6 +1396,15 @@ mod skip_macro_tests {
             "a skip under `=0` was not recorded"
         );
 
+        // Empty is "no" as well: the Cage workflow sets the variable empty on a run nobody armed,
+        // and an empty value read as "set" would fail that run on its first host skip.
+        let _empty = EnvVar::set("SBX_REQUIRE_CAPABLE", "");
+        skip_incapable!("skipping c2");
+        assert!(
+            read().ends_with("skipping c2\n"),
+            "a skip under an empty value was not recorded"
+        );
+
         // Set: the host was supposed to manage, so a host skip is a failure — and the panic names
         // the reason, which is the whole point of failing rather than returning.
         let _on = EnvVar::set("SBX_REQUIRE_CAPABLE", "1");
