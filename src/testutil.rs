@@ -287,6 +287,24 @@ pub(crate) fn reap(pid: libc::pid_t) -> libc::c_int {
     }
 }
 
+/// The names the next `count` stagings of `path` would take
+/// ([`crate::sandbox::atomicfile::temp_sibling`]), spelled here rather than asked of the code that
+/// builds them. A span of them, because the sequence number is the process's, shared with whatever
+/// else stages a file while a test runs.
+pub(crate) fn next_temp_names(path: &Path, count: u64) -> impl Iterator<Item = PathBuf> {
+    let dir = path
+        .parent()
+        .expect("a path with a directory")
+        .to_path_buf();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("a UTF-8 file name")
+        .to_string();
+    let next = crate::sandbox::atomicfile::unique() + 1;
+    (next..next + count).map(move |n| dir.join(format!(".{name}.tmp.{}.{n}", std::process::id())))
+}
+
 /// Create a FIFO at `path`, with no writer: a reader that opens it without `O_NONBLOCK` waits for
 /// one for good.
 pub(crate) fn make_fifo(path: &Path) {

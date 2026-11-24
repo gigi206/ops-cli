@@ -726,9 +726,9 @@ fn a_file_already_under_the_layers_name_is_not_taken_for_the_layer() {
 /// `<digest>.partial`, a name that is the same for every fetch of the layer, and not at the names a
 /// fetch takes for a temp of its own.
 ///
-/// The names are planted over a span because the sequence number is the process's, shared with
-/// whatever else stages a file while this runs. The refusal has to be the collision itself, which
-/// is what says a planted name was reached rather than one nobody tried.
+/// The names are planted over a span ([`crate::testutil::next_temp_names`]). The refusal has to be
+/// the collision itself, which is what says a planted name was reached rather than one nobody
+/// tried.
 #[test]
 fn a_link_where_a_layer_downloads_is_refused_rather_than_written_through() {
     let dir = crate::testutil::TmpDir::new();
@@ -747,13 +747,7 @@ fn a_link_where_a_layer_downloads_is_refused_rather_than_written_through() {
         std::os::unix::fs::symlink(&target, &at).expect("plant a link");
     };
     link(dir.path().join(format!("{name}.partial")));
-    let next = crate::sandbox::atomicfile::unique() + 1;
-    for n in next..next + 64 {
-        link(
-            dir.path()
-                .join(format!(".{name}.tmp.{}.{n}", std::process::id())),
-        );
-    }
+    crate::testutil::next_temp_names(&dir.path().join(&name), 64).for_each(link);
 
     let err = fetch_layer_with(&layer, dir.path(), |sink, _| {
         sink.write_all(body)?;

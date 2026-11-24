@@ -10,16 +10,17 @@
 //! answers were once given eight times over, at which point they had already diverged. The callers
 //! are the cage's synthetic identity and in-cage contract ([`super::binds`]), the per-project pin
 //! locks ([`super::flake`], [`super::nixhub`], [`super::prebuilt`]), the staged audio shim
-//! ([`super::audio`]), the desktop mark ([`super::notify_sink`]), the mise config `sbx app prune`
-//! rewrites in a cage's home, through the descriptor of its directory
-//! ([`super::gc`](mod@super::gc)), the snapshot an overwrite keeps
-//! ([`crate::cli::keep_replaced_file`]), the profile an import writes ([`crate::cli::app`]) and the
-//! pointer to a storage volume ([`crate::storage::write_pointer`]). The last three arrived by
-//! deletion rather than by design: each had its own copy of this staging, and each named its temp
-//! from the pid alone. The layer fetch of a distro image ([`super::distro`]) takes the temp's name
-//! and its open from here ([`temp_sibling`], [`create_temp`]) and nothing else: it streams the body
-//! and checks it as it lands, and the blob does not outlive the provision that fetched it, which
-//! removes it once it is applied, so the flush is no use to it.
+//! ([`super::audio`]), the desktop mark ([`super::notify_sink`]), the record of where a plugin came
+//! from ([`crate::plugins::origin`]), the mise config `sbx app prune` rewrites in a cage's home,
+//! through the descriptor of its directory ([`super::gc`](mod@super::gc)), the snapshot an
+//! overwrite keeps ([`crate::cli::keep_replaced_file`]), the profile an import writes
+//! ([`crate::cli::app`]) and the pointer to a storage volume ([`crate::storage::write_pointer`]).
+//! The last three arrived by deletion rather than by design: each had its own copy of this staging,
+//! and each named its temp from the pid alone. The layer fetch of a distro image
+//! ([`super::distro`]) takes the temp's name and its open from here ([`temp_sibling`],
+//! [`create_temp`]) and nothing else: it streams the body and checks it as it lands, and the blob
+//! does not outlive the provision that fetched it, which removes it once it is applied, so the
+//! flush is no use to it.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -114,12 +115,17 @@ pub(crate) fn write_atomic_checked(
 
 /// The temp a staging of `path` writes before renaming it over `path`: a hidden sibling named for
 /// the target, this process and this staging ([`unique()`]). [`write_atomic`] says why each part is
-/// there.
+/// there. A long target name is cut to [`TARGET_PART`], so the temp's fits where the target's does.
 pub(crate) fn temp_sibling(path: &Path) -> PathBuf {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let name = &name[..name.floor_char_boundary(TARGET_PART)];
     dir.join(format!(".{name}.tmp.{}.{}", std::process::id(), unique()))
 }
+
+/// The most of a target's name its temp carries, in bytes. The rest of the temp's name (the dots,
+/// `tmp`, a pid and a sequence number) takes at most 37 of the 255 a file name may hold.
+const TARGET_PART: usize = 200;
 
 /// Create the temp `tmp` and open it for writing, with `mode` when one is given.
 ///
@@ -206,10 +212,9 @@ mod tests {
     /// inside its trust domain; the point is that this function no longer *assumes* it, at the cost
     /// of two open flags.
     ///
-    /// The names are planted over a span because the sequence number is the process's, shared with
-    /// whatever else stages a file while this runs. A span that the run walks past would fail the
-    /// test loudly rather than pass it on a name nobody used, which is the reason for the second
-    /// assertion.
+    /// The names are planted over a span ([`crate::testutil::next_temp_names`]). A span that the
+    /// run walks past would fail the test loudly rather than pass it on a name nobody used, which
+    /// is the reason for the second assertion.
     #[test]
     fn a_symlink_left_at_the_temps_name_is_refused_rather_than_written_through() {
         let dir = TmpDir::new();
@@ -217,16 +222,11 @@ mod tests {
         std::fs::write(&target, b"untouched").unwrap();
 
         let staged = dir.join("pointer.toml");
-        let next = unique() + 1;
-        let planted: Vec<std::path::PathBuf> = (next..next + 64)
-            .map(|n| {
-                let tmp = dir
-                    .path()
-                    .join(format!(".pointer.toml.tmp.{}.{n}", std::process::id()));
-                std::os::unix::fs::symlink(&target, &tmp).unwrap();
-                tmp
-            })
-            .collect();
+        let planted: Vec<std::path::PathBuf> =
+            crate::testutil::next_temp_names(&staged, 64).collect();
+        for tmp in &planted {
+            std::os::unix::fs::symlink(&target, tmp).unwrap();
+        }
 
         let e = write_atomic_mode(&staged, b"volume = \"/dev/sdb1\"\n", Some(0o600))
             .expect_err("a name this write did not create is not a name it may open");
@@ -250,6 +250,23 @@ mod tests {
             planted.iter().any(|p| !p.exists()),
             "the write never reached a planted name — the span no longer covers the sequence"
         );
+    }
+
+    /// A target whose name is as long as a name may be is staged all the same. The name is cut
+    /// inside a character of two bytes, which the temp leaves out whole.
+    #[test]
+    fn a_target_with_the_longest_name_there_is_is_written() {
+        let dir = TmpDir::new();
+        let name = format!("a{}", "é".repeat(127));
+        assert_eq!(
+            (name.len(), name.is_char_boundary(TARGET_PART)),
+            (255, false)
+        );
+        let target = dir.join(&name);
+        std::fs::write(&target, b"old").expect("a file system that holds a name of 255 bytes");
+        write_atomic(&target, b"new").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     /// The published file carries its mode, and a caller that needs one no longer has to set it

@@ -39,7 +39,10 @@ installed resolver plugins:
 ```
 
 The origin is either a local directory (by path) or a named store (with its URL, so
-the answer survives `store rm`). A plugin installed before origins were recorded, or placed by hand: reads as **unknown**; reinstalling it records the source.
+the answer survives `store rm`). A character in either that a terminal would act on is shown
+as an escape, `\u{202e}` for one that reorders the line. A plugin installed before origins
+were recorded, placed by hand, or first installed when its record could not be written reads
+as **unknown**; reinstalling it records the source.
 
 The record lives in `<data>/plugins/.origins/<name>.toml`, **outside** the
 plugin's own directory: a store pins a plugin by a hash over its whole tree, so a

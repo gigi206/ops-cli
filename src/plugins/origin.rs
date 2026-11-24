@@ -17,7 +17,7 @@
 //! yields [`Origin::Unknown`] rather than an error. An unknown origin is the honest answer for a
 //! plugin installed before origins were recorded, and it must never be able to break a listing.
 
-use super::{ensure_owner_only, unique, write_owner_only};
+use super::ensure_owner_only;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -73,16 +73,19 @@ impl Origin {
             Origin::Unknown => Origin::Unknown,
         }
     }
-    /// A full sentence for a per-plugin detail line, e.g. `sbx plugins list`.
+    /// A full sentence for a per-plugin detail line, e.g. `sbx plugins list`. The path and the URL
+    /// are written the way [`visible`](crate::diag::visible) writes text sbx did not choose: a
+    /// plugin's directory is named by whoever published it, and the line goes to a terminal.
     pub(crate) fn label(&self) -> String {
+        use crate::diag::visible;
         match self {
-            Origin::Local { path: Some(p), .. } => format!("local directory {p}"),
+            Origin::Local { path: Some(p), .. } => format!("local directory {}", visible(p)),
             Origin::Local { path: None, .. } => "a local directory".to_string(),
             Origin::Store {
                 store,
                 url: Some(url),
                 ..
-            } => format!("store '{store}' ({url})"),
+            } => format!("store '{store}' ({})", visible(url)),
             Origin::Store { store, .. } => format!("store '{store}'"),
             Origin::Unknown => {
                 "unknown (installed before sbx recorded plugin origins, or placed by hand)"
@@ -91,7 +94,9 @@ impl Origin {
         }
     }
 
-    /// A short noun phrase for an inline marker, e.g. `[name taken by store 'mine']`.
+    /// A short noun phrase for an inline marker, e.g. `[name taken by store 'mine']`. A store's
+    /// name is written as it is: what records one and what reads it back both hold it to
+    /// [`validate_install_name`](crate::plugins::validate_install_name).
     pub(crate) fn short(&self) -> String {
         match self {
             Origin::Local { .. } => "a local install".to_string(),
@@ -195,22 +200,13 @@ pub(crate) fn record(
         return Ok(());
     };
     crate::plugins::validate_install_name(plugin)?;
-    let dir = dir(layout);
-    ensure_owner_only(&dir)?;
-    // Write to a private temp file and rename over the target: a concurrent reader sees either the
-    // previous record or the new one, never a half-written file, and an existing record (including
-    // one orphaned by a hand-removed plugin) is replaced rather than kept.
-    let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), unique()));
-    let _ = std::fs::remove_file(&tmp);
-    if let Err(e) = write_owner_only(&tmp, text.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = std::fs::rename(&tmp, path_of(layout, plugin)) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("cannot record the plugin's origin: {e}"));
-    }
-    Ok(())
+    ensure_owner_only(&dir(layout))?;
+    // Staged beside the record and renamed over it: a concurrent reader sees either the previous
+    // record or the new one, never a half-written file, and an existing record (including one
+    // orphaned by a hand-removed plugin) is replaced rather than kept.
+    let path = path_of(layout, plugin);
+    crate::sandbox::atomicfile::write_atomic_mode(&path, text.as_bytes(), Some(0o600))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 /// Where a plugin came from, or [`Origin::Unknown`] when nothing usable is recorded. Infallible by
@@ -231,24 +227,24 @@ fn parse(text: &str) -> Origin {
     let Ok(raw) = toml::from_str::<RawOrigin>(text) else {
         return Origin::Unknown;
     };
-    // Every field is displayed verbatim in a terminal, so a control character (which could smuggle
-    // an escape sequence) drops that field rather than being printed. The fields are written by sbx
-    // itself, so this only ever fires on a corrupted or hand-edited record.
+    // sbx writes no control character into a record ([`push_field`]), so a field holding one is a
+    // corrupted or hand-edited one, and is dropped. What else a terminal would act on is escaped
+    // where the field is shown ([`Origin::label`]).
     let clean = |v: Option<String>| v.filter(|s| !s.is_empty() && !s.chars().any(char::is_control));
     match raw.kind.as_deref() {
         Some("local") => Origin::Local {
             path: clean(raw.path),
             sha256: clean(raw.sha256),
         },
-        Some("store") => match clean(raw.store) {
-            // A store record with no store name names nothing — weaker than useless, so it reads
-            // as unknown rather than as an anonymous store.
-            None => Origin::Unknown,
-            Some(store) => Origin::Store {
+        Some("store") => match raw.store {
+            Some(store) if crate::plugins::validate_install_name(&store).is_ok() => Origin::Store {
                 store,
                 url: clean(raw.url),
                 sha256: clean(raw.sha256),
             },
+            // A store record with no store name, or with one no store can have, names nothing —
+            // weaker than useless, so it reads as unknown rather than as an anonymous store.
+            _ => Origin::Unknown,
         },
         _ => Origin::Unknown,
     }
@@ -403,6 +399,59 @@ mod tests {
                 sha256: None,
             }
         );
+    }
+
+    /// What a listing prints of a record carries nothing a terminal acts on. A directory may be
+    /// named with a character that reorders the line, which a record holds as it is, and a record
+    /// edited by hand may hold one in any field: the path and the URL show it as an escape, and a
+    /// name no store can have is no store's.
+    #[test]
+    fn a_recorded_path_or_url_is_shown_as_text_and_a_store_name_is_held_to_a_name() {
+        let tmp = crate::testutil::TmpDir::new();
+        let layout = layout(tmp.path());
+        let origin = Origin::Local {
+            path: Some("/src/a\u{202e}b\u{2028}c".to_string()),
+            sha256: None,
+        };
+        record(&layout, "kp", &origin).unwrap();
+        assert_eq!(read(&layout, "kp"), origin, "the record keeps the path");
+        assert_eq!(
+            read(&layout, "kp").label(),
+            "local directory /src/a\\u{202e}b\\u{2028}c"
+        );
+
+        let edited = parse("kind = \"store\"\nstore = \"mine\"\nurl = \"https://a/\\u202eb\"\n");
+        assert_eq!(edited.label(), "store 'mine' (https://a/\\u{202e}b)");
+        for name in ["mi\\u202ene", "mi ne", ".mine", "../mine", ""] {
+            assert_eq!(
+                parse(&format!(
+                    "kind = \"store\"\nstore = \"{name}\"\nsha256 = \"aa\"\n"
+                )),
+                Origin::Unknown,
+                "{name:?}"
+            );
+        }
+    }
+
+    /// A record is staged at a name that carries its plugin's, so the recordings of two plugins
+    /// never meet at one, and a name something sits at already is refused rather than written over.
+    #[test]
+    fn a_record_is_staged_at_a_name_of_its_plugins_own() {
+        let tmp = crate::testutil::TmpDir::new();
+        let layout = layout(tmp.path());
+        let origin = |path: &str| Origin::Local {
+            path: Some(path.to_string()),
+            sha256: None,
+        };
+        record(&layout, "kp", &origin("/src/kp")).unwrap();
+        for at in crate::testutil::next_temp_names(&path_of(&layout, "kp"), 1024) {
+            std::fs::write(at, b"another's").unwrap();
+        }
+        let why = record(&layout, "kp", &origin("/src/newer")).expect_err("every name is taken");
+        assert!(why.contains("File exists"), "{why}");
+        assert_eq!(read(&layout, "kp"), origin("/src/kp"));
+        record(&layout, "other", &origin("/src/other")).unwrap();
+        assert_eq!(read(&layout, "other"), origin("/src/other"));
     }
 
     #[test]

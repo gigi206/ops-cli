@@ -2038,17 +2038,20 @@ fn install_inner(
             // Record the provenance only once the plugin is in place: a record without a plugin
             // would be inherited by a later install of that name, so a wrong origin is worse than
             // no origin. A failure here does not fail the install — the plugin is installed and
-            // usable; only the listing loses a detail — but it is never silent.
+            // usable; only the listing loses a detail — but it is never silent. A first install
+            // then drops the record the name may still hold, which describes a plugin that is gone.
+            // A replacement keeps it: it names the store both builds came from, and without it the
+            // next upgrade would pass the plugin over.
             //
             // The digest is of the tree *as placed*, not of the source: the staged copy had its
             // modes canonicalized, so only what was actually installed can later be compared
             // against it. A tree that cannot be hashed leaves no digest rather than a wrong one.
             let origin = origin.with_digest(catalogue::dir_digest_hex(&dest).ok());
             if let Err(why) = origin::record(layout, &name, &origin) {
-                crate::diag::warn(&format!(
-                    "plugin `{name}` is installed, but its origin could not be recorded \
-                     ({why}) — `sbx plugins list` will show it as unknown"
-                ));
+                if placement == Placement::Fresh {
+                    origin::forget(layout, &name);
+                }
+                crate::diag::warn(&unrecorded(layout, &name, &why));
             }
             Ok(Installed {
                 name,
@@ -2118,6 +2121,20 @@ pub(crate) fn integrity(layout: &crate::store::Layout, dir_name: &str) -> Integr
         Ok(got) if got == recorded => Integrity::Intact,
         Ok(_) => Integrity::Modified,
     }
+}
+
+/// The warning for a plugin whose record could not be written, `why` saying what failed. It ends on
+/// what the listings will read of it, which is the record its name holds all the same, or none.
+fn unrecorded(layout: &crate::store::Layout, name: &str, why: &str) -> String {
+    let read = match origin::read(layout, name) {
+        origin::Origin::Unknown => "`sbx plugins list` will show it as unknown".to_string(),
+        held => format!(
+            "the record that was there stays: `sbx plugins list` will show it from {}, and \
+             `sbx plugins verify` will compare it with that record",
+            held.short()
+        ),
+    };
+    format!("plugin `{name}` is installed, but its origin could not be recorded ({why}) — {read}")
 }
 
 /// A plugin's private state directory, `<data>/plugin-state/<name>`.
@@ -2503,10 +2520,10 @@ pub(super) fn ensure_owner_only(dir: &Path) -> Result<(), String> {
 
 /// Write `bytes` to a file created fresh and readable only by its owner.
 ///
-/// Stated once for the same reason [`ensure_owner_only`] is: every module in the plugins tree
-/// writes files into that owner-only tree — [`stores`] the cache's `store.toml` and
-/// `catalogue.lock`, [`origin`] the provenance records — and a hardening change applied to one
-/// copy would protect some of those files and not others, with nothing to say which.
+/// What [`stores`] writes with it is a cache's `store.toml` and `catalogue.lock`, and the signing
+/// key of a store being published. An origin record goes through
+/// [`crate::sandbox::atomicfile::write_atomic_mode`] instead, which holds its temp file to the same
+/// two flags.
 ///
 /// Both flags carry weight. The mode keeps a file that records a trust anchor unreadable by other
 /// users from the moment it exists, rather than after a later `chmod`. Refusing to open anything
@@ -2528,7 +2545,7 @@ pub(super) fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), String> 
 
 /// A per-call-unique suffix for a staging directory or a temp file, so two operations in one
 /// process never collide on a name — two installs, an install and a removal, two store fetches, two
-/// origin records. A monotonic process-local counter — no clock or RNG.
+/// key confirmations. A monotonic process-local counter — no clock or RNG.
 ///
 /// One counter serves the whole plugins tree: a counter per module is safe only for as long as no
 /// two modules ever stage under the same prefix, and one counter needs no such argument.
@@ -5292,6 +5309,73 @@ mod tests {
                 )
                 .as_str()
             )
+        );
+    }
+
+    /// An install whose record cannot be written says what the listings read instead, and that is
+    /// what they read. A first install drops the record its name still holds, of a plugin removed
+    /// by hand; a replacement keeps the one of the build it replaced, so the next upgrade still
+    /// finds the store the plugin came from.
+    #[test]
+    fn an_origin_that_cannot_be_recorded_leaves_what_the_warning_says() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let manifest = "name=\"kp\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n";
+        let first = source_plugin(src_root.path(), "v1", manifest, 0o755);
+        install_from_store(
+            &layout,
+            &first,
+            resolver_claim(&first, "kp", "kp"),
+            store_origin(),
+        )
+        .expect("install");
+        let held = origin::read(&layout, "kp");
+        assert!(held.is_store("mine"), "{held:?}");
+
+        let record = layout.plugins_dir().join(".origins/kp.toml");
+        let no_record_can_be_written = || {
+            for at in crate::testutil::next_temp_names(&record, 1024) {
+                fs::write(at, "taken").unwrap();
+            }
+        };
+        let second = source_plugin(src_root.path(), "v2", manifest, 0o755);
+        fs::write(second.join("resolve"), "#!/bin/sh\necho newer\n").unwrap();
+        no_record_can_be_written();
+        replace_from_store(
+            &layout,
+            &second,
+            resolver_claim(&second, "kp", "kp"),
+            store_origin(),
+            &held,
+        )
+        .expect("a replacement whose record cannot be written is a replacement all the same");
+        assert_eq!(
+            origin::read(&layout, "kp"),
+            held,
+            "the replaced build's record"
+        );
+        assert_eq!(integrity(&layout, "kp"), Integrity::Modified);
+        assert_eq!(
+            unrecorded(&layout, "kp", "no space"),
+            "plugin `kp` is installed, but its origin could not be recorded (no space) — the \
+             record that was there stays: `sbx plugins list` will show it from store 'mine', and \
+             `sbx plugins verify` will compare it with that record"
+        );
+
+        fs::remove_dir_all(layout.plugins_dir().join("kp")).unwrap();
+        no_record_can_be_written();
+        install(&layout, &second)
+            .expect("an install whose record cannot be written is an install all the same");
+        assert_eq!(
+            origin::read(&layout, "kp"),
+            origin::Origin::Unknown,
+            "the record of the plugin that is gone"
+        );
+        assert_eq!(
+            unrecorded(&layout, "kp", "no space"),
+            "plugin `kp` is installed, but its origin could not be recorded (no space) — \
+             `sbx plugins list` will show it as unknown"
         );
     }
 
