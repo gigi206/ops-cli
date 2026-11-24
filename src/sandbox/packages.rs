@@ -24,6 +24,7 @@
 use crate::config::{Backend, PROJECT_CONFIG, Package, untrusted_reason};
 use crate::store::{self, Layout};
 use crate::trust::TrustState;
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -100,7 +101,15 @@ pub(crate) fn provision(
     // content-addressed → a second project is a cache hit; seeded per project). The pin selects the
     // immutable build target — the locked ref when `flake-packages.lock` pins it, else the declared
     // ref (which floats, frozen warm until `sbx upgrade`, like a floating `mise:` tool).
-    let flake_pins = super::flake::pins(layout, &id)?;
+    // The lock is read only for a launch that has one to build: the other backends look nothing up
+    // in it, so one that cannot be read is not theirs to fail on.
+    let flake_pins = match admitted
+        .iter()
+        .any(|p| matches!(p.backend, Backend::Flake(_)))
+    {
+        true => super::flake::pins(layout, &id)?,
+        false => BTreeMap::new(),
+    };
 
     let mut bins = Vec::with_capacity(admitted.len());
     let mut roots = Vec::with_capacity(admitted.len());

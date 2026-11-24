@@ -1109,6 +1109,44 @@ mod tests {
         );
     }
 
+    /// A launch with no `flake:` package to build reads no flake lock: one that cannot be read,
+    /// kept from a package the project no longer declares, is nothing it would look a pin up in.
+    #[test]
+    fn a_launch_without_a_flake_package_reads_no_lock() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let project = TmpDir::new();
+        let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+        // A directory, which no process reads as a file whatever its rights.
+        std::fs::create_dir_all(lock_path(&layout, &id).unwrap()).unwrap();
+        let provision = |package| {
+            super::super::packages::provision(
+                Path::new("/nonexistent/nix"),
+                &layout,
+                project.path(),
+                &format!("github:NixOS/nixpkgs/{REV}"),
+                &[package],
+            )
+        };
+        let mise = crate::config::Package {
+            backend: crate::config::Backend::Mise("npm:tool".into()),
+            ..flake_pkg("tool", "github:o/r#default", true)
+        };
+        let bins = provision(mise)
+            .expect("a launch that has no pin to look up")
+            .bins;
+        assert!(bins.is_empty(), "{bins:?}");
+        for withheld in [false, true] {
+            let flake = flake_pkg("tool", "github:o/r#default", !withheld);
+            let err = provision(flake).err().map(|e| e.to_string());
+            assert_eq!(
+                err.as_deref().map(|e| e.contains("flake lock")),
+                (!withheld).then_some(true),
+                "withheld {withheld}: {err:?}"
+            );
+        }
+    }
+
     /// The lock is addressed only by an id `binds::project_id` spells, so a `..` or a `/` in what a
     /// caller hands over never names a directory beside the project's: the read and the write both
     /// refuse it, and every shape is checked before the test fails.
