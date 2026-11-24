@@ -555,3 +555,30 @@ fn a_word_a_dispatcher_does_not_take_is_named_even_when_not_utf8() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// An argument a verb does not take is named in its refusal even when it is not UTF-8. Read through
+/// `to_str`, it was refused as an empty one, which is an argument nobody typed.
+#[test]
+fn an_argument_a_verb_does_not_take_is_named_even_when_not_utf8() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let fx = common::project::Project::new("help");
+    let not_utf8 = std::path::Path::new(std::ffi::OsStr::from_bytes(b"x\xff"));
+    let mut wrong = Vec::new();
+    for args in [
+        &["secret", "list"][..],
+        &["task", "run"],
+        &["task", "result"],
+        &["task", "list"],
+    ] {
+        let out = fx.run_with_path(args, not_utf8, &[]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        let named = format!("sbx: {}: unexpected argument \"x\\xFF\"", args.join(" "));
+        if out.status.code() != Some(2) || !err.contains(&named) {
+            wrong.push(format!(
+                "{args:?} answered {:?} without naming the argument:\n{err}",
+                out.status.code()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

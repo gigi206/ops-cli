@@ -68,10 +68,10 @@ fn secret_list(args: &[OsString]) -> ExitCode {
                     }
                 }
             }
-            other => {
+            _ => {
                 diag::error(&format!(
                     "sbx: secret list: unexpected argument {:?}",
-                    other.unwrap_or_default()
+                    args[i]
                 ));
                 err!(
                     "{}",

@@ -734,11 +734,8 @@ fn task_run(args: &[OsString]) -> ExitCode {
                 name = Some(s.to_string());
                 i += 1;
             }
-            other => {
-                diag::error(&format!(
-                    "sbx: task run: unexpected argument {:?}",
-                    other.unwrap_or_default()
-                ));
+            _ => {
+                diag::error(&format!("sbx: task run: unexpected argument {:?}", args[i]));
                 err!("{}", help::page_usage(&["task", "run"]).unwrap_or_default());
                 return ExitCode::from(2);
             }
@@ -859,10 +856,10 @@ fn task_result(args: &[OsString]) -> ExitCode {
                 target = Some(s.to_string());
                 i += 1;
             }
-            other => {
+            _ => {
                 diag::error(&format!(
                     "sbx: task result: unexpected argument {:?}",
-                    other.unwrap_or_default()
+                    args[i]
                 ));
                 err!(
                     "{}",
@@ -1673,10 +1670,10 @@ fn listing_args(args: &[OsString], verb: &str) -> Result<Listing, ExitCode> {
                 listing.operation = Some(s.to_string());
                 i += 1;
             }
-            other => {
+            _ => {
                 diag::error(&format!(
                     "sbx: task {verb}: unexpected argument {:?}",
-                    other.unwrap_or_default()
+                    args[i]
                 ));
                 err!("{}", help::page_usage(&["task", verb]).unwrap_or_default());
                 return Err(ExitCode::from(2));
