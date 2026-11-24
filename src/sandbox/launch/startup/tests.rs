@@ -129,9 +129,9 @@ fn a_failed_service_does_not_fail_the_launch_but_a_failed_install_does() {
         script.contains("'install-it' || exit $?"),
         "the install chain ends the launch on failure: {script}"
     );
-    let after_install = &script[script.find("|| exit $?").unwrap()..];
-    assert!(
-        !after_install.contains("exit $?") || after_install.matches("exit $?").count() == 1,
+    assert_eq!(
+        script.matches("exit").count(),
+        1,
         "nothing after the install chain aborts the launch: {script}"
     );
 }
