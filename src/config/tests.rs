@@ -9288,6 +9288,32 @@ fn nixpkgs_source_validator() {
     }
 }
 
+/// A nixpkgs source nix would not read as a branch is refused, as the engine's source too.
+///
+/// `nix flake metadata github:NixOS/nixpkgs/<value>` reads a value its reference parser refuses as
+/// a path under the directory nix runs in: `..` would name `<project>/github:NixOS`, a flake the
+/// project can carry, where nixpkgs is meant. The witnesses beside each refused spelling are ones
+/// nix reads as a branch.
+#[test]
+fn a_nixpkgs_source_nix_would_read_as_a_path_is_refused() {
+    for path_like in [".", "..", ".hidden", "-x", "a..b", "nixos.", "main.lock"] {
+        assert!(
+            !is_valid_nixpkgs_source(path_like),
+            "{path_like} should be refused"
+        );
+        assert!(
+            !is_valid_mise_engine(path_like),
+            "{path_like} should be refused as the engine's source"
+        );
+    }
+    for branch in ["_x", "x-", "a.b", "nixos-24.05", "main.locks"] {
+        assert!(
+            is_valid_nixpkgs_source(branch),
+            "{branch} should be accepted"
+        );
+    }
+}
+
 #[test]
 fn distro_locator_validator() {
     let digest = "a".repeat(64);

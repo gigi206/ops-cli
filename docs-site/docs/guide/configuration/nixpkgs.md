@@ -30,9 +30,11 @@ If what you need is one tool on its own revision while the base stays put, that 
   unset).
 - A **40-hex revision** under `NixOS/nixpkgs`: an exact, immutable pin.
 
-The value is charset-validated before it reaches a flake reference. Forks and
-arbitrary flake refs are not accepted. A malformed source is warned about and ignored,
-keeping the default.
+The value is checked before it reaches a flake reference: the characters a branch name
+uses, in the shape nix reads as one (no leading `.` or `-`, no `..`, no trailing `.` or
+`.lock`). Nix would read any other value as a path on this machine rather than a branch of
+nixpkgs. Forks and arbitrary flake refs are not accepted. A malformed source is warned about
+and ignored, keeping the default.
 
 ## One channel pins the whole sandbox
 

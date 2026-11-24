@@ -4740,10 +4740,19 @@ pub(crate) fn is_valid_group_name(name: &str) -> bool {
 /// can never widen into a different flake reference (a fork, a `git+https`/`path:`
 /// URL) or smuggle shell-significant characters into a nix invocation — even from a
 /// trusted config. Arbitrary flake references are a later, additive feature.
+///
+/// Within those characters, held to the shape nix reads as a branch: no leading `.` or `-`, no
+/// `..`, no trailing `.` or `.lock`. Nix does not refuse a value outside that shape: it reads
+/// `github:NixOS/nixpkgs/<value>` as a path under the directory it runs in, which for a launch is
+/// the project: `..` would name `<project>/github:NixOS`, a flake the project can carry.
 fn is_valid_nixpkgs_source(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+        && !s.starts_with(['.', '-'])
+        && !s.contains("..")
+        && !s.ends_with('.')
+        && !s.ends_with(".lock")
 }
 
 /// Whether `s` is a distribution userland locator.
