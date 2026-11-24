@@ -970,8 +970,7 @@ impl Resolved {
         // posture re-decides injection just below — keeping it would let `sbx app <name>` both inject
         // a credential and print "ignoring N HTTP-header secret(s)". The re-check re-emits it only if
         // the *merged* posture still drops them.
-        self.warnings
-            .retain(|w| !w.contains("HTTP-header secret(s)"));
+        self.warnings.retain(|w| !is_secret_posture_warning(w));
         self.warnings.extend(app.warnings);
         // Re-derive the effective credentials from the *declared* set (not the posture-cleared
         // `secrets`), so an app that opens a filtering posture inherits a baseline credential the
@@ -1595,8 +1594,7 @@ impl Resolved {
         // Gated, because on a launch that left the posture alone the baseline verdict still stands
         // and re-deriving would only clear the set a second time and say so twice.
         if network_overridden {
-            self.warnings
-                .retain(|w| !w.contains("HTTP-header secret(s)"));
+            self.warnings.retain(|w| !is_secret_posture_warning(w));
             self.secrets = self.declared_secrets.clone();
         }
         enforce_secret_posture(&self.network, &mut self.secrets, &mut self.warnings);
@@ -3950,6 +3948,21 @@ pub(crate) fn global_limits() -> crate::sandbox::cgroup::Limits {
     validate_limits(&mut warnings, GLOBAL_CONFIG, global.limits)
 }
 
+/// What [`enforce_secret_posture`] writes after the count when it clears the credentials, kept in
+/// one place so the warning is recognised by its whole text ([`is_secret_posture_warning`]).
+const SECRET_POSTURE_NOTE: &str = "HTTP-header secret(s): credential injection requires a filtering \
+     network posture (`[network] mode = \"deny\"`, `\"allow\"`, or `\"ask\"`, the proxy that injects them)";
+
+/// Whether `warning` is the one [`enforce_secret_posture`] writes. An app overlay and a one-shot
+/// posture each re-decide injection and drop it first; matched on a phrase, that drop also took any
+/// other warning quoting the phrase, such as one naming a value sbx ignored.
+fn is_secret_posture_warning(warning: &str) -> bool {
+    warning
+        .strip_prefix("ignoring ")
+        .and_then(|rest| rest.split_once(' '))
+        .is_some_and(|(count, note)| count.parse::<usize>().is_ok() && note == SECRET_POSTURE_NOTE)
+}
+
 /// Clear injected credentials unless the posture is a filtering one. Injection is performed by
 /// the filtering proxy, which exists only under a `deny`/`allow` (filtered-egress) posture; under
 /// `shared` (no proxy) or `none` (no traffic) there is nowhere to inject, so the secrets are
@@ -3962,11 +3975,7 @@ fn enforce_secret_posture(
     warnings: &mut Vec<String>,
 ) {
     if !secrets.is_empty() && !matches!(network, NetworkPolicy::Allowlist(_)) {
-        warnings.push(format!(
-            "ignoring {} HTTP-header secret(s): credential injection requires a filtering \
-             network posture (`[network] mode = \"deny\"`, `\"allow\"`, or `\"ask\"`, the proxy that injects them)",
-            secrets.len()
-        ));
+        warnings.push(format!("ignoring {} {SECRET_POSTURE_NOTE}", secrets.len()));
         secrets.clear();
     }
 }
@@ -5218,7 +5227,7 @@ mod bad_fields_cost_a_field {
 mod a_layer_replaces_only_what_it_declares {
     // The fixtures next door parse and resolve a layered pair exactly as the loader does, so they
     // are reused here rather than written a second time.
-    use super::bad_fields_cost_a_field::{cfg, global, layered};
+    use super::bad_fields_cost_a_field::{cfg, global, layered, warned};
     use super::*;
 
     /// The headers a credential set writes, in declaration order — the whole of what the two halves
@@ -5365,6 +5374,65 @@ mod a_layer_replaces_only_what_it_declares {
             "and it is said once: {:?}",
             r.warnings
         );
+    }
+
+    /// The two re-checks of the secret posture drop its warning by the warning's whole text, so a
+    /// warning that only quotes its words stays.
+    ///
+    /// An app overlay and a one-shot posture each re-decide injection, and each dropped every warning
+    /// holding `HTTP-header secret(s)` before re-checking. A value sbx ignored, named in a warning of
+    /// its own that quoted those words (here an unreadable `timezone`), went with it, and the launch
+    /// ran without the value and without saying so. The posture warning itself still goes, or the
+    /// launch would inject a credential while a line said it was ignored.
+    #[test]
+    fn a_warning_that_quotes_the_secret_posture_outlives_its_recheck() {
+        let cleared = "network = \"none\"\n\
+             timezone = \"HTTP-header secret(s)\"\n\
+             [secret.\"api.example.com\"]\n\
+             from = \"env://DEMO_API_KEY\"\n\
+             header = \"Authorization\"\n\
+             type = \"bearer\"\n";
+        let posture = |r: &Resolved| {
+            r.warnings
+                .iter()
+                .filter(|w| w.starts_with("ignoring 1 HTTP-header secret(s):"))
+                .count()
+        };
+        let quoted = |r: &Resolved| warned(r, &["timezone", "HTTP-header secret(s)"]);
+
+        let mut overlay = global(&format!(
+            "{cleared}[app.demo]\ncmd = [\"demo\"]\nnetwork = \"deny\"\n"
+        ));
+        assert!(
+            posture(&overlay) == 1 && quoted(&overlay),
+            "the precondition: the baseline says both: {:?}",
+            overlay.warnings
+        );
+        let demo = overlay.apps["demo"].clone();
+        overlay.merge_app(demo);
+
+        let mut override_ = global(cleared);
+        override_
+            .apply_override(Override::for_test(cfg("network = \"deny\"\n")), None)
+            .expect("the override applies");
+
+        for (r, by) in [
+            (&overlay, "an app overlay"),
+            (&override_, "a one-shot posture"),
+        ] {
+            assert_eq!(
+                posture(r),
+                0,
+                "{by} drops the posture warning: {:?}",
+                r.warnings
+            );
+            assert!(quoted(r), "{by} keeps the one quoting it: {:?}", r.warnings);
+        }
+        // The whole text decides: a warning sharing only its opening, or only its note, is another.
+        assert!(!is_secret_posture_warning("ignoring 2 bundles: unreadable"));
+        assert!(!is_secret_posture_warning(&format!(
+            "ignoring some {SECRET_POSTURE_NOTE}"
+        )));
     }
 
     /// An app's own credential survives a one-shot posture — the override half of the rule
