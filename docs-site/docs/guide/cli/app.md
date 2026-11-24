@@ -438,6 +438,11 @@ The trees a package is built in are read from the data directory's `projects/` a
 When one of those, or a tree in it, cannot be read, `show` names it and exits 1 rather than
 report a built package `not installed`.
 
+A name nothing declares is refused with the apps that are declared, after the warnings the
+configuration was read with: an app whose profile cannot be read or parsed is not declared, and
+the warning says why. When such an app has a home, `show` reports the home, gives its packages as
+`unknown`, and says on an `incomplete:` line (`incomplete` in `--json`) what could not be read.
+
 ### What a home is made of
 
 Under each home, `show` lists what it holds, largest first, read from the disk. It names no

@@ -710,6 +710,30 @@ fn lines_named(lines: &[String]) -> Option<(String, String)> {
     Some((count, format!("{named}{more}")))
 }
 
+/// Refuse `name` as an app `resolved` does not declare, at the exit every verb gives a name that
+/// names nothing: the apps that are declared are listed, or none is said to be, which is what
+/// separates a misspelled name from the wrong directory.
+///
+/// What the load warned of comes first. It drops a profile or a config file it cannot read, and an
+/// app declared there reads as undeclared, so the refusal alone would deny a file the user can see.
+pub(crate) fn refuse_unknown_app(
+    verb: &str,
+    name: &str,
+    resolved: &crate::config::Resolved,
+) -> ExitCode {
+    for w in &resolved.warnings {
+        diag::warn_config(w);
+    }
+    diag::error(&format!("sbx: {verb}: no app named {name:?}"));
+    let declared: Vec<&str> = resolved.apps.keys().map(String::as_str).collect();
+    if declared.is_empty() {
+        diag::error("sbx: no apps are declared for this directory");
+    } else {
+        diag::error(&format!("sbx: declared apps: {}", declared.join(", ")));
+    }
+    ExitCode::from(2)
+}
+
 /// Fold a name repeated in one multi-name removal (`sbx app rm`, `sbx bundle rm`, `sbx plugins rm`,
 /// `sbx projects rm`) down to a single removal, keeping the order the user typed. Without this the
 /// second pass over a name finds nothing left to remove and reports a phantom failure over work

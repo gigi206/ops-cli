@@ -462,6 +462,110 @@ fn show_of_an_unknown_app_fails_and_lists_the_declared_ones() {
     );
 }
 
+/// A profile the load dropped leaves its app undeclared, and the verbs that then refuse the name
+/// say why: the file is there, and `sbx app ls` lists it.
+#[test]
+fn an_app_whose_profile_could_not_be_loaded_is_refused_with_the_reason() {
+    let fx = Project::new("app");
+    fx.write_profile("demo-app", &demo_profile());
+    fx.write_profile("broken", "cmd = [\"true\"\n");
+
+    for args in [
+        &["config", "show", "--app", "broken"][..],
+        &["app", "show", "broken"],
+        &["app", "prune", "broken"],
+        &["app", "run", "broken"],
+    ] {
+        let out = fx.run(args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", text(&out));
+        assert!(
+            err.contains("no app named") && err.contains("demo-app"),
+            "{args:?} refuses the name and lists the apps declared: {err}"
+        );
+        assert!(
+            err.lines()
+                .any(|l| l.contains("ignoring profile") && l.contains("broken.toml")),
+            "{args:?} says which file was dropped: {err}"
+        );
+    }
+
+    // With every file loaded, the same refusals have nothing more to say.
+    std::fs::remove_file(fx.profile_path("broken")).unwrap();
+    for args in [
+        &["config", "show", "--app", "broken"][..],
+        &["app", "show", "broken"],
+        &["app", "run", "broken"],
+    ] {
+        let err = fx.run(args).stderr;
+        let err = String::from_utf8_lossy(&err);
+        assert!(
+            err.contains("no app named") && !err.contains("warning"),
+            "{args:?}: {err}"
+        );
+    }
+}
+
+/// `app show` on the home of an app whose profile the load dropped reports the home, and says that
+/// what the app declares is not known rather than nothing. The home of an app no file declares is
+/// reported as before.
+#[test]
+fn show_of_a_home_whose_profile_could_not_be_loaded_does_not_say_nothing_is_declared() {
+    let fx = Project::new("app");
+    fx.write_profile("broken", "cmd = [\"true\"\n");
+    fx.install_mise_tool("broken", "pipx-demo", "1.0.0");
+    fx.install_mise_tool("removed", "pipx-demo", "1.0.0");
+
+    let out = fx.run_ok(&["app", "show", "broken"]);
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        shown.contains("packages: unknown\n")
+            && shown.contains("incomplete: the profile of app `broken`")
+            && shown.contains("  installed:\n"),
+        "{shown}"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("ignoring profile") && err.contains("broken.toml"),
+        "{err}"
+    );
+
+    let doc = common::json_of(&fx.run_ok(&["app", "show", "broken", "--json"]));
+    assert!(
+        doc["incomplete"]
+            .as_str()
+            .is_some_and(|why| why.contains("broken.toml")),
+        "{doc}"
+    );
+
+    let out = fx.run_ok(&["app", "show", "removed"]);
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        shown.contains("packages: none declared")
+            && shown.contains("installed (undeclared):")
+            && !shown.contains("incomplete:"),
+        "{shown}"
+    );
+}
+
+/// An app a trusted layer defines with no command, and an untrusted project gives one, is refused
+/// for want of a command with the trust gate's reason beside it.
+#[test]
+fn an_app_whose_command_the_trust_gate_held_back_is_refused_with_the_reason() {
+    let fx = Project::new("app");
+    fx.write_profile("ghost", "[network]\nmode = \"deny\"\n");
+    fx.write_project("[app.ghost]\ncmd = [\"true\"]\n");
+
+    let out = fx.run(&["app", "run", "ghost"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        err.contains("declares no command")
+            && err.contains("`cmd` for an app a trusted layer defines"),
+        "{err}"
+    );
+}
+
 /// A profile with no `cmd` is told where a command goes — in the file the profile is actually in.
 ///
 /// `sbx app import` refuses a `cmd`-less profile, but a launch reads the profile *directory*, not

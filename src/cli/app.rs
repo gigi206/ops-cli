@@ -1732,16 +1732,15 @@ fn open_app(verb: &str, name: &str) -> Result<AppTarget, ExitCode> {
             return Err(ExitCode::FAILURE);
         }
     };
-    if !resolved.apps.contains_key(name) && homes.is_empty() {
-        diag::error(&format!("sbx: {verb}: no app named {name:?}"));
-        let declared: Vec<String> = resolved.apps.keys().cloned().collect();
-        if declared.is_empty() {
-            diag::error("sbx: no apps are declared for this directory");
-        } else {
-            diag::error(&format!("sbx: declared apps: {}", declared.join(", ")));
+    if !resolved.apps.contains_key(name) {
+        if homes.is_empty() {
+            return Err(crate::cli::refuse_unknown_app(verb, name, &resolved));
         }
-        // A name that names nothing is a usage error, the exit every verb gives it.
-        return Err(ExitCode::from(2));
+        // A home nothing declares is a removed app's, or one whose declaration the load dropped:
+        // what it warned of says which.
+        for w in &resolved.warnings {
+            diag::warn_config(w);
+        }
     }
     Ok(AppTarget {
         resolved,
@@ -1776,7 +1775,10 @@ fn app_show(args: &[OsString]) -> ExitCode {
     let app = resolved.apps.get(name);
 
     let view = match build_app_show(name, app, &resolved.network, &homes, layout.data_dir()) {
-        Ok(view) => view,
+        Ok(view) => AppShow {
+            incomplete: config::undeclarable_app(&resolved, name),
+            ..view
+        },
         Err(e) => {
             diag::error(&format!(
                 "sbx: app show: {e}, so what '{name}' holds there cannot be shown"
@@ -1874,6 +1876,9 @@ struct AppShow {
     pools: Vec<AppMisePoolShow>,
     total_bytes: u64,
     packages: Vec<PackageShow>,
+    /// Why what the app declares cannot be told ([`config::undeclarable_app`]), when it cannot: the
+    /// packages above may not be all of them, and an orphan may be one it declares.
+    incomplete: Option<String>,
     /// Installed mise tools that no declared package accounts for.
     orphans: Vec<OrphanTool>,
 }
@@ -2021,6 +2026,7 @@ fn build_app_show(
         pools,
         total_bytes,
         packages,
+        incomplete: None,
         orphans,
     })
 }
@@ -2191,7 +2197,12 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
     }
     // Packages, each `backend:locator` (the declaration syntax) with its realized state.
     if v.packages.is_empty() {
-        let _ = writeln!(s, "  packages: {dim}none declared{r}");
+        let none = if v.incomplete.is_some() {
+            "unknown"
+        } else {
+            "none declared"
+        };
+        let _ = writeln!(s, "  packages: {dim}{none}{r}");
     } else {
         let _ = writeln!(s, "  packages:");
         for p in &v.packages {
@@ -2208,11 +2219,19 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
             let _ = writeln!(s, "    {n}{}:{}{r}  {hue}{tag}{r}", p.backend, p.locator);
         }
     }
+    if let Some(why) = &v.incomplete {
+        let _ = writeln!(s, "  {warn}incomplete:{r} {}", diag::visible(why));
+    }
     // Installed mise tools no declared package accounts for — a leftover profile or a mise-pulled
     // dependency. Each `name` already carries the `mise:` backend prefix (see `build_app_show`), so
     // the provider reads like the `packages:` section above (`mise:pipx:demo-agent`).
     if !v.orphans.is_empty() {
-        let _ = writeln!(s, "  installed (undeclared):");
+        let which = if v.incomplete.is_some() {
+            ""
+        } else {
+            " (undeclared)"
+        };
+        let _ = writeln!(s, "  installed{which}:");
         for t in &v.orphans {
             let versions = t.versions.join(", ");
             let suffix = if versions.is_empty() {

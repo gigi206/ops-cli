@@ -355,6 +355,16 @@ fn warn_observe_feed_absent(
     }
 }
 
+/// Print what the load warned of, for a refusal of an app that stops before the build. The build
+/// prints these for a launch that goes ahead, and here one of them may be the reason: a profile
+/// that could not be read leaves its app undeclared, and a `cmd` the trust gate held back leaves it
+/// without a command.
+fn warn_before_refusal<'a>(warnings: impl IntoIterator<Item = &'a String>) {
+    for warning in warnings {
+        crate::diag::warn_config(warning);
+    }
+}
+
 /// Apply the (non-channel) part of a one-shot override to a prepared config, aborting the launch
 /// with a pointed error (exit 2) when it sets an invalid scalar security value — there is no safe
 /// baseline fallback for one, so it is refused rather than run at the wrong posture. Shared by
@@ -606,6 +616,7 @@ pub(crate) fn app(
         Err(code) => return AppOutcome::plain(code),
     };
     let Some(app) = pc.cfg.apps.remove(name) else {
+        warn_before_refusal(&pc.cfg.warnings);
         crate::diag::error(&format!(
             "sbx: no app named `{name}`.{}",
             available_apps(&pc.cfg)
@@ -630,6 +641,7 @@ pub(crate) fn app(
         // profile file reaches here (`sbx app import` refuses a `cmd`-less one, a file dropped into
         // the directory is simply read), and telling its author to add an `[app.<name>]` table
         // would ask for the very wrapper `validate_profile` tells them to remove.
+        warn_before_refusal(pc.cfg.warnings.iter().chain(&app.warnings));
         crate::diag::error(&format!(
             "sbx: app `{name}` declares no command — add a `cmd` to its declaration (at the top \
              level of `apps/{name}.toml`, or in the `[app.{name}]` table of a project config)."

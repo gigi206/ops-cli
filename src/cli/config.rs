@@ -209,19 +209,7 @@ fn config_show(args: &[OsString]) -> ExitCode {
 /// Errors (listing the declared apps) when no such app exists.
 fn config_show_app(cwd: &Path, name: &str, json: bool, details: bool) -> ExitCode {
     let Some(view) = config::view::build_app_detail(cwd, name) else {
-        diag::error(&format!("sbx: config show: no app named {name:?}"));
-        let declared: Vec<String> = config::view::build(cwd)
-            .apps
-            .into_iter()
-            .map(|a| a.name)
-            .collect();
-        if declared.is_empty() {
-            diag::error("sbx: no apps are declared for this directory");
-        } else {
-            diag::error(&format!("sbx: declared apps: {}", declared.join(", ")));
-        }
-        // A name that names nothing is a usage error, the exit every verb gives it.
-        return ExitCode::from(2);
+        return crate::cli::refuse_unknown_app("config show", name, &config::load(cwd));
     };
 
     if json {
