@@ -347,6 +347,28 @@ pub(crate) fn pairs_for(
                     .iter()
                     .filter_map(|name| req.headers.get(name).map(|v| (name.clone(), v.to_string())))
                     .collect();
+                // What sbx observed of this request, which leads every line on the feed. The values
+                // are never in it — the header *names* are what a reader needs, and they are the
+                // manifest's own.
+                //
+                // Built on demand rather than up front: both readers are inside an `if let
+                // Some(log)`, so with no feed attached this allocated a string per request the
+                // signer saw — refused ones included — and dropped each unread. A signer runs on
+                // the request path, which is where that is worth not doing.
+                let asked = || format!("{} {}{}", req.method, req.host, req.target);
+                // Every refusal goes out through here and is recorded on its way, those decided
+                // before the plugin is asked included: the feed is the one place on the host where
+                // the reason a request was not sent is written, `sbx net logs` saying only
+                // `signer-refused`.
+                let refuse = |why: String| {
+                    if events.is_some() {
+                        record(SignerKind::Refuse, &signed.name, &asked(), None, Some(&why));
+                    }
+                    SignRefusal {
+                        signer: signed.name.clone(),
+                        why,
+                    }
+                };
                 // A plugin that asked for a body digest is never signed *around*: where the caller
                 // established nothing, the request is refused rather than put to the plugin without
                 // the fact its scheme was written to cover.
@@ -360,23 +382,19 @@ pub(crate) fn pairs_for(
                         Some(crate::sandbox::signer::BodyFacts::Held { algorithm, .. })
                             if *algorithm != want.name() =>
                         {
-                            return Err(SignRefusal {
-                                signer: signed.name.clone(),
-                                why: format!(
-                                    "another plugin signing this request had its body digested \
-                                     by {algorithm}, and this plugin's manifest asks for {}",
-                                    want.name()
-                                ),
-                            });
+                            return Err(refuse(format!(
+                                "another plugin signing this request had its body digested by \
+                                 {algorithm}, and this plugin's manifest asks for {}",
+                                want.name()
+                            )));
                         }
                         Some(facts) => Some(facts),
                         None => {
-                            return Err(SignRefusal {
-                                signer: signed.name.clone(),
-                                why: "sbx established nothing about this request's body, which \
-                                      this plugin's manifest asks to be told"
+                            return Err(refuse(
+                                "sbx established nothing about this request's body, which this \
+                                 plugin's manifest asks to be told"
                                     .to_string(),
-                            });
+                            ));
                         }
                     },
                 };
@@ -401,15 +419,6 @@ pub(crate) fn pairs_for(
                                                plugin"
                         .to_string()),
                 };
-                // What sbx observed of this request, which leads every line on the feed. The values
-                // are never in it — the header *names* are what a reader needs, and they are the
-                // manifest's own.
-                //
-                // Built on demand rather than up front: both readers are inside an `if let
-                // Some(log)`, so with no feed attached this allocated a string per request the
-                // signer saw — refused ones included — and dropped each unread. A signer runs on
-                // the request path, which is where that is worth not doing.
-                let asked = || format!("{} {}{}", req.method, req.host, req.target);
                 match signed_headers {
                     // The marker is substituted here and nowhere else: on the plugin's own bytes,
                     // on their way out, after they were bounded to the headers its manifest
@@ -434,13 +443,7 @@ pub(crate) fn pairs_for(
                             },
                         ))
                     }
-                    Err(why) => {
-                        record(SignerKind::Refuse, &signed.name, &asked(), None, Some(&why));
-                        return Err(SignRefusal {
-                            signer: signed.name.clone(),
-                            why,
-                        });
-                    }
+                    Err(why) => return Err(refuse(why)),
                 }
             }
         }
@@ -2832,6 +2835,63 @@ mod tests {
             events[1].detail.contains("no credentials for that region"),
             "a refusal carries the plugin's reason: {:?}",
             events[1]
+        );
+    }
+
+    /// A refusal decided before the plugin is asked reaches the feed too: one for a body sbx
+    /// established nothing about, and one for a body digested by another algorithm than the
+    /// plugin's manifest names. Each is a request that was not sent, and the feed is the one place
+    /// on the host where its reason is written.
+    #[test]
+    fn a_refusal_decided_before_the_plugin_is_asked_reaches_the_feed() {
+        use crate::sandbox::signer_control::{SIGNER_RING_CAP, SignerKind, SignerRing};
+
+        let ring = std::sync::Arc::new(SignerRing::new(SIGNER_RING_CAP));
+        let events = super::super::events::spawn(super::super::events::Sinks {
+            signer_log: Some(std::sync::Arc::clone(&ring)),
+            ..Default::default()
+        })
+        .unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let creds = CredentialSet {
+            injections: vec![digesting_injection(&seen)],
+            needles: Vec::new(),
+        };
+        let headers = Vec::new();
+        let md5 = crate::sandbox::signer::BodyFacts::Held {
+            bytes: 3,
+            algorithm: "md5",
+            digest: "x".to_string(),
+        };
+        let shapes = [(None, "established nothing"), (Some(&md5), "md5")];
+        for (body, _) in shapes {
+            let req = RequestFacts {
+                body,
+                ..facts(&headers)
+            };
+            assert!(
+                pairs_for(&creds, &[0], &req, Some(&events)).is_err(),
+                "the request is refused"
+            );
+        }
+        events.flush();
+        let recorded = ring.snapshot(None).events;
+        let missing: Vec<&str> = shapes
+            .iter()
+            .map(|(_, why)| *why)
+            .filter(|why| {
+                !recorded.iter().any(|event| {
+                    event.kind == SignerKind::Refuse
+                        && event
+                            .detail
+                            .starts_with("demo-signer: GET api.example.com/v1/thing — ")
+                        && event.detail.contains(why)
+                })
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "not on the feed: {missing:?} in {recorded:#?}"
         );
     }
 
