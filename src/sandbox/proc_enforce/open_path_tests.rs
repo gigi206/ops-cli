@@ -1,3 +1,4 @@
+use super::cagepath::caller_ids_in_cage;
 use super::*;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
 
@@ -146,6 +147,38 @@ fn a_parked_path_carries_no_byte_that_could_forge_a_row_on_the_wire() {
     );
 }
 
+/// What the operator reads is what [`crate::sandbox::sanitize`] makes of the name, not only the
+/// name without its newlines. `sbx proc pending` prints the path as the row carries it, so an
+/// escape sequence, a character that reorders the line or one that breaks it for a reader that
+/// lays text out would show another name than the one the operator is asked to decide on. And the
+/// reader holds a row to the length the sanitiser cuts at, so a longer name would read as an
+/// answer cut short.
+#[test]
+fn a_parked_path_is_cleaned_of_what_rewrites_its_line_and_cut_where_the_reader_stops() {
+    let pending = PendingExec::new();
+    let forged = format!(
+        "/tmp/\u{1b}[2J\u{202e}fdp.exe\u{2028}{}",
+        "a".repeat(crate::sandbox::SANITIZED_CHARS)
+    );
+    let (read_end, _write_end) = pipe();
+    pending.park(read_end.as_raw_fd(), 1, 4242, &forged);
+
+    let listed = pending.list();
+    assert_eq!(listed.len(), 1, "the park is registered");
+    let path = &listed[0].2;
+    assert!(
+        !path
+            .chars()
+            .any(|c| c.is_control() || crate::diag::reorders(c) || crate::diag::separates_lines(c)),
+        "a parked path reached the operator with a character that rewrites its line: {path:?}"
+    );
+    assert!(
+        path.chars().count() <= crate::sandbox::SANITIZED_CHARS,
+        "a parked path outran the length a reader holds a row to: {} characters",
+        path.chars().count()
+    );
+}
+
 #[test]
 fn each_exec_form_is_read_from_its_own_registers() {
     // The shim notifies on both forms, and they disagree on argument order. Reading `execveat`'s
@@ -235,6 +268,53 @@ fn a_self_path_for_a_caller_whose_ids_cannot_be_read_names_nothing() {
         Some("/etc/passwd"),
         "a path that does not name `self` needs no ids"
     );
+}
+
+/// The other half of the case above: a caller whose ids can be read has `self` and `thread-self`
+/// named outright, under its own root, so the walk reaches the caller's entry on the cage's `/proc`
+/// rather than the entry of whichever process walks it.
+///
+/// The caller is a thread spawned here, because a notification names the calling **thread**
+/// (seccomp_unotify(2)). Taken as the main thread, the group and the thread carry one number, and a
+/// rewrite that put one where the other belongs would still read as right.
+#[test]
+fn a_self_path_names_the_calling_thread_and_its_group_under_its_own_root() {
+    let (named, name) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let caller = std::thread::spawn(move || {
+        // SAFETY: `gettid` takes no argument and cannot fail.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        named
+            .send(tid as u32)
+            .expect("the test is waiting for the number");
+        // Held until the test is done with it, so its `/proc` entry is there to be read.
+        let _ = released.recv();
+    });
+    let pid = name.recv().expect("the caller names itself");
+    let (tgid, tid) = caller_ids_in_cage(pid).expect("a live thread has its own ids");
+    assert_ne!(
+        tgid, tid,
+        "a spawned thread is numbered apart from its group"
+    );
+    // Checked against what the two numbers are, not only against the reader: a reader that gave
+    // them back in each other's place would otherwise build the very paths expected below.
+    assert_eq!(
+        (tgid, tid),
+        (std::process::id(), pid),
+        "the group is this test's process and the thread is the one it spawned"
+    );
+    assert_eq!(
+        open_target_path(pid, libc::AT_FDCWD, "/proc/self/fd/3"),
+        PathBuf::from(format!("/proc/{pid}/root/proc/{tgid}/fd/3")),
+        "`self` names the caller's thread group, walked from the caller's root"
+    );
+    assert_eq!(
+        open_target_path(pid, libc::AT_FDCWD, "/proc/thread-self/status"),
+        PathBuf::from(format!("/proc/{pid}/root/proc/{tgid}/task/{tid}/status")),
+        "`thread-self` names the calling thread inside that group"
+    );
+    drop(release);
+    caller.join().expect("the caller ends once released");
 }
 
 #[test]
