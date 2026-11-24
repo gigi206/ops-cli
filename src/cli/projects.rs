@@ -30,7 +30,7 @@ pub(crate) fn projects_cmd(args: &[OsString]) -> ExitCode {
         }
         // The bare verb prints the page too, and a word that names no subcommand, UTF-8 or not, is
         // refused by name.
-        _ => crate::cli::unknown_subcommand("projects", args),
+        _ => crate::cli::unknown_subcommand(&["projects"], args),
     }
 }
 

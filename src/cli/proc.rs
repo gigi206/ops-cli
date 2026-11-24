@@ -42,15 +42,9 @@ pub(crate) fn proc_cmd(args: &[OsString]) -> ExitCode {
         Some("unallow") => proc_remove_rule(config::manage::ProcList::Allow, &args[1..]),
         Some("deny") => proc_add_rule(config::manage::ProcList::Deny, &args[1..]),
         Some("undeny") => proc_remove_rule(config::manage::ProcList::Deny, &args[1..]),
-        None => {
-            err!("{}", help::page_usage(&["proc"]).unwrap_or_default());
-            ExitCode::from(2)
-        }
-        Some(other) => {
-            diag::error(&format!("sbx: proc: unknown subcommand `{other}`"));
-            diag::hint("       run `sbx help proc` for usage.");
-            ExitCode::from(2)
-        }
+        // The bare verb prints the page, and a word that names no subcommand, UTF-8 or not, is
+        // refused by name.
+        _ => crate::cli::unknown_subcommand(&["proc"], args),
     }
 }
 

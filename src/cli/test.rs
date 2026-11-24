@@ -29,8 +29,10 @@ pub(crate) fn test_cmd(args: &[OsString]) -> ExitCode {
         Some("proc") => proc_test(&args[1..]),
         // Unknown or no kind: name the mistake (if any), then print the full page so its
         // Subcommands list guides, like bare `sbx net`/`sbx config`.
-        other => {
-            if let Some(tok) = other {
+        _ => {
+            // The token itself, not its UTF-8 reading: one that has none was typed too, and is
+            // named rather than answered as a bare `sbx test`.
+            if let Some(tok) = args.first() {
                 diag::error(&format!("sbx: test: unknown kind {tok:?}"));
             }
             err!("{}", help::page_usage(&["test"]).unwrap_or_default());

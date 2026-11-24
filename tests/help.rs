@@ -499,3 +499,59 @@ fn version_answers_a_help_flag_with_its_page_and_refuses_an_extra() {
         "the refusal should quote the verb's own synopsis, got {stderr}"
     );
 }
+
+/// A first word a dispatcher does not take is named in its refusal even when it is not UTF-8. Read
+/// through `to_str`, such a word fell into the arm of the bare command, which prints the page and
+/// names nothing. `net` and `projects` pin theirs in their own suites, and `app` answers every such
+/// word with its launch pointer by design.
+#[test]
+fn a_word_a_dispatcher_does_not_take_is_named_even_when_not_utf8() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let fx = common::project::Project::new("help");
+    let not_utf8 = std::path::Path::new(std::ffi::OsStr::from_bytes(b"x\xff"));
+    let mut wrong = Vec::new();
+    for (args, named) in [
+        (
+            &["session"][..],
+            "sbx: session: unknown subcommand \"x\\xFF\"",
+        ),
+        (&["task"][..], "sbx: task: unknown subcommand \"x\\xFF\""),
+        (
+            &["storage"][..],
+            "sbx: storage: unknown subcommand \"x\\xFF\"",
+        ),
+        (&["fs"][..], "sbx: fs: unknown subcommand \"x\\xFF\""),
+        (&["proc"][..], "sbx: proc: unknown subcommand \"x\\xFF\""),
+        (
+            &["secret"][..],
+            "sbx: secret: unknown subcommand \"x\\xFF\"",
+        ),
+        (
+            &["ssh-agent"][..],
+            "sbx: ssh-agent: unknown subcommand \"x\\xFF\"",
+        ),
+        (&["test"][..], "sbx: test: unknown kind \"x\\xFF\""),
+        (
+            &["plugins"][..],
+            "sbx: plugins: unknown subcommand \"x\\xFF\"",
+        ),
+        (
+            &["plugins", "store"][..],
+            "sbx: plugins store: unknown subcommand \"x\\xFF\"",
+        ),
+        (
+            &["config"][..],
+            "sbx: config: unknown subcommand \"x\\xFF\"",
+        ),
+    ] {
+        let out = fx.run_with_path(args, not_utf8, &[]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        if out.status.code() != Some(2) || !err.contains(named) {
+            wrong.push(format!(
+                "{args:?} answered {:?} without naming the word:\n{err}",
+                out.status.code()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

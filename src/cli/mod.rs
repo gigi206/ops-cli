@@ -172,14 +172,15 @@ impl<K: Eq + std::hash::Hash> Unanswering<K> {
     }
 }
 
-/// Answer the first token of `sbx <verb>` when it names none of the verb's subcommands: the verb's
-/// page when there is no token, which is the bare verb, and otherwise a refusal that names the token,
-/// with a pointer to that page. A token that is not UTF-8 is named by its debug form, which escapes
-/// what it holds: read through `to_str`, it would be answered as the bare verb, with no word of what
-/// was wrong.
-pub(crate) fn unknown_subcommand(verb: &str, args: &[OsString]) -> ExitCode {
+/// Answer the first token of `sbx <path>` when it names none of the command's subcommands: the
+/// command's page when there is no token, which is the bare command, and otherwise a refusal that
+/// names the token, with a pointer to that page. A token that is not UTF-8 is named by its debug form, which escapes
+/// what it holds: read through `to_str`, it would be answered as the bare command, with no word of
+/// what was wrong.
+pub(crate) fn unknown_subcommand(path: &[&str], args: &[OsString]) -> ExitCode {
+    let verb = path.join(" ");
     match args.first() {
-        None => err!("{}", crate::help::page_usage(&[verb]).unwrap_or_default()),
+        None => err!("{}", crate::help::page_usage(path).unwrap_or_default()),
         Some(tok) => {
             let named = tok
                 .to_str()

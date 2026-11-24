@@ -33,15 +33,9 @@ pub(crate) fn fs_cmd(args: &[OsString]) -> ExitCode {
         Some("undeny") => fs_remove_mask(FsList::Deny, &args[1..]),
         Some("readonly") => fs_add_mask(FsList::Readonly, &args[1..]),
         Some("unreadonly") => fs_remove_mask(FsList::Readonly, &args[1..]),
-        None => {
-            err!("{}", help::page_usage(&["fs"]).unwrap_or_default());
-            ExitCode::from(2)
-        }
-        Some(other) => {
-            diag::error(&format!("sbx: fs: unknown subcommand `{other}`"));
-            diag::hint("       run `sbx help fs` for usage.");
-            ExitCode::from(2)
-        }
+        // The bare verb prints the page, and a word that names no subcommand, UTF-8 or not, is
+        // refused by name.
+        _ => crate::cli::unknown_subcommand(&["fs"], args),
     }
 }
 

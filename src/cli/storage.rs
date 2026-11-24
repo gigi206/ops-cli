@@ -86,15 +86,9 @@ pub(crate) fn storage_cmd(args: &[OsString]) -> ExitCode {
         Some("use") => use_volume(args[1..].to_vec()),
         Some("migrate") => migrate(args[1..].to_vec()),
         Some("unuse") => unuse_volume(args[1..].to_vec()),
-        None => {
-            err!("{}", help::page_usage(&["storage"]).unwrap_or_default());
-            ExitCode::from(2)
-        }
-        Some(other) => {
-            diag::error(&format!("sbx: storage: unknown subcommand `{other}`"));
-            diag::hint("       run `sbx help storage` for usage.");
-            ExitCode::from(2)
-        }
+        // The bare verb prints the page, and a word that names no subcommand, UTF-8 or not, is
+        // refused by name.
+        _ => crate::cli::unknown_subcommand(&["storage"], args),
     }
 }
 

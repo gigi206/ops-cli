@@ -24,15 +24,9 @@ pub(crate) fn secret_cmd(args: &[OsString]) -> ExitCode {
     }
     match args.first().and_then(|a| a.to_str()) {
         Some("list") | Some("ls") => secret_list(&args[1..]),
-        None => {
-            err!("{}", help::page_usage(&["secret"]).unwrap_or_default());
-            ExitCode::from(2)
-        }
-        Some(other) => {
-            diag::error(&format!("sbx: secret: unknown subcommand `{other}`"));
-            diag::hint("       run `sbx help secret` for usage.");
-            ExitCode::from(2)
-        }
+        // The bare verb prints the page, and a word that names no subcommand, UTF-8 or not, is
+        // refused by name.
+        _ => crate::cli::unknown_subcommand(&["secret"], args),
     }
 }
 

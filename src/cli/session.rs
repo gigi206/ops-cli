@@ -33,15 +33,9 @@ pub(crate) fn session_cmd(args: &[OsString]) -> ExitCode {
         Some("logs") | Some("log") => logs_cmd(&args[1..]),
         Some("attach") => attach_cmd(&args[1..]),
         Some("stop") => stop_cmd(args[1..].to_vec()),
-        None => {
-            err!("{}", help::page_usage(&["session"]).unwrap_or_default());
-            ExitCode::from(2)
-        }
-        Some(other) => {
-            diag::error(&format!("sbx: session: unknown subcommand `{other}`"));
-            diag::hint("       run `sbx help session` for usage.");
-            ExitCode::from(2)
-        }
+        // The bare verb prints the page, and a word that names no subcommand, UTF-8 or not, is
+        // refused by name.
+        _ => crate::cli::unknown_subcommand(&["session"], args),
     }
 }
 

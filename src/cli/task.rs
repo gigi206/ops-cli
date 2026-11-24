@@ -47,15 +47,9 @@ pub(crate) fn task_cmd(args: &[OsString]) -> ExitCode {
         Some("show") => task_show(&args[1..]),
         Some("stop") => task_stop(&args[1..]),
         Some("logs") | Some("log") => task_logs(&args[1..]),
-        None => {
-            err!("{}", help::page_usage(&["task"]).unwrap_or_default());
-            ExitCode::from(2)
-        }
-        Some(other) => {
-            diag::error(&format!("sbx: task: unknown subcommand `{other}`"));
-            diag::hint("       run `sbx help task` for usage.");
-            ExitCode::from(2)
-        }
+        // The bare verb prints the page, and a word that names no subcommand, UTF-8 or not, is
+        // refused by name.
+        _ => crate::cli::unknown_subcommand(&["task"], args),
     }
 }
 

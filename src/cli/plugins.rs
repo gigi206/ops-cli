@@ -71,8 +71,10 @@ pub(crate) fn plugins_cmd(args: &[OsString]) -> ExitCode {
         Some("store") => plugins_store(&args[1..]),
         // Unknown or no subcommand: name the mistake (if any), then print the full page so its
         // Subcommands list guides, like bare `sbx net`/`sbx config`.
-        other => {
-            if let Some(tok) = other {
+        _ => {
+            // The token itself, not its UTF-8 reading: one that has none was typed too, and is
+            // named rather than answered as a bare `sbx plugins`.
+            if let Some(tok) = args.first() {
                 diag::error(&format!("sbx: plugins: unknown subcommand {tok:?}"));
             }
             err!("{}", help::page_usage(&["plugins"]).unwrap_or_default());
@@ -947,8 +949,10 @@ fn plugins_store(args: &[OsString]) -> ExitCode {
         }
         // Unknown or no subcommand: name the mistake (if any), then print the full page so its
         // Subcommands list guides, like bare `sbx net`/`sbx config`.
-        other => {
-            if let Some(tok) = other {
+        _ => {
+            // The token itself, not its UTF-8 reading: one that has none was typed too, and is
+            // named rather than answered as a bare `sbx plugins store`.
+            if let Some(tok) = args.first() {
                 diag::error(&format!("sbx: plugins store: unknown subcommand {tok:?}"));
             }
             err!(

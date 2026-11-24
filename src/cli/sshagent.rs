@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::process::ExitCode;
 
 use crate::cli::logs;
-use crate::{diag, format_log_time, help, sandbox, style};
+use crate::{format_log_time, help, sandbox, style};
 
 /// `sbx ssh-agent <subcommand>`. Currently one subcommand, `logs`; `log` is accepted as an alias.
 pub(crate) fn ssh_agent_cmd(args: &[OsString]) -> ExitCode {
@@ -15,15 +15,9 @@ pub(crate) fn ssh_agent_cmd(args: &[OsString]) -> ExitCode {
     }
     match args.first().and_then(|a| a.to_str()) {
         Some("logs") | Some("log") => agent_logs(&args[1..]),
-        None => {
-            err!("{}", help::page_usage(&["ssh-agent"]).unwrap_or_default());
-            ExitCode::from(2)
-        }
-        Some(other) => {
-            diag::error(&format!("sbx: ssh-agent: unknown subcommand `{other}`"));
-            diag::hint("       run `sbx help ssh-agent` for usage.");
-            ExitCode::from(2)
-        }
+        // The bare verb prints the page, and a word that names no subcommand, UTF-8 or not, is
+        // refused by name.
+        _ => crate::cli::unknown_subcommand(&["ssh-agent"], args),
     }
 }
 

@@ -68,7 +68,13 @@ pub(crate) fn config_cmd(args: &[OsString]) -> ExitCode {
                     "sbx: config: {tok:?} is an option of a subcommand — pick one from the list below"
                 )),
                 Some(tok) => diag::error(&format!("sbx: config: unknown subcommand {tok:?}")),
-                None => {}
+                // The token itself, not its UTF-8 reading: one that has none was typed too, and is
+                // named rather than answered as a bare `sbx config`.
+                None => {
+                    if let Some(tok) = args.first() {
+                        diag::error(&format!("sbx: config: unknown subcommand {tok:?}"));
+                    }
+                }
             }
             err!("{}", help::page_usage(&["config"]).unwrap_or_default());
             ExitCode::from(2)
