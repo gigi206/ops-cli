@@ -124,7 +124,8 @@ pub(crate) fn blanked(c: char) -> bool {
 /// line somebody reads:
 ///
 /// - [`command_of`], for the exec feed's inline stderr echo;
-/// - [`super::fs_watch`], for a project-relative path;
+/// - [`super::fs_control::FsRing::push`], the door every event of the file lens enters by, for a
+///   project-relative path;
 /// - [`super::proc_control::ExecRing::push_verdict`], the door every exec event enters by —
 ///   including the seccomp supervisor's, whose target path is read out of the calling process's own
 ///   memory and whose caller is a `/proc/<pid>/exe` link;
