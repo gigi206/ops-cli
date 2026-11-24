@@ -78,7 +78,10 @@ pub(crate) fn mimeinfo_cache(handlers: &BTreeMap<String, OpenHandler>) -> String
 /// Succeeding is deliberate. A tool that auto-opens a verification URL treats a failing open as a
 /// failed flow and gives up, when in fact the person can still follow the link — so the router
 /// reports and returns 0, leaving the decision with them.
-const FALLBACK: &str = "echo \"sbx: open on the host:\" \"$@\" >&2\nexit 0\n";
+///
+/// `printf` and not `echo`: what `echo` makes of a backslash is the shell's to choose, and a cage's
+/// `/bin/sh` may be one, such as `dash`, that reads it as an escape.
+const FALLBACK: &str = "printf 'sbx: open on the host: %s\\n' \"$*\" >&2\nexit 0\n";
 
 /// Where a `detach` handler's output is parked, as the router writes it: in the cage's `$HOME`, so
 /// it lands in the app's isolated home and can be read host-side afterwards. The `${HOME:-/tmp}`
@@ -229,10 +232,18 @@ mod tests {
         assert!(out.starts_with("#!/bin/sh\n"), "a POSIX sh script: {out}");
         assert!(!out.contains("case "), "no arms without handlers: {out}");
         assert!(out.contains("exit 0"), "the fallback succeeds: {out}");
-        assert!(
-            out.contains("\"$@\""),
-            "it names the URI it did not open: {out}"
-        );
+        // It names the URI it did not open, byte for byte, whatever the shell that runs it.
+        for uri in [
+            "https://example.com/a?b=1&c=%20",
+            r"file:///C:\new\tab\c",
+            "-n",
+            "%s%d",
+        ] {
+            assert_eq!(
+                opened(&BTreeMap::new(), uri),
+                format!("sbx: open on the host: {uri}")
+            );
+        }
     }
 
     #[test]
