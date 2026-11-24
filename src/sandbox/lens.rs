@@ -1113,30 +1113,33 @@ mod tests {
     /// producer had come in through it.
     ///
     /// Read from the sources, since a door left open is not something a test can see at run time:
-    /// every `Deref` impl whose block names `lens::Ring<` is collected, and the set must be exactly
-    /// the wrappers listed below. A wrapper that is given its `Deref` back fails here, and one that
-    /// loses it is taken off the list.
+    /// every `Deref` impl whose block names `lens::Ring<` is collected, and there must be none. The
+    /// detection is first run on the shape it looks for, so a scan that can no longer see a `Deref`
+    /// does not pass for one that found none.
     #[test]
     fn no_lens_ring_hands_out_the_ring_underneath() {
+        let hands_out = |production: &str| {
+            production.match_indices("Deref for ").any(|(at, _)| {
+                let block = &production[at..];
+                block[..block.find("\n}").unwrap_or(block.len())].contains("lens::Ring<")
+            })
+        };
+        assert!(
+            hands_out("impl std::ops::Deref for X {\n    type Target = super::lens::Ring<E>;\n}\n"),
+            "the detection must see the shape it looks for"
+        );
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut derefs = Vec::new();
         for path in crate::testutil::crate_sources() {
             let text = std::fs::read_to_string(&path).expect("read a source");
-            let production = crate::testutil::production_half(&text);
-            for (at, _) in production.match_indices("Deref for ") {
-                let block = &production[at..];
-                let block = &block[..block.find("\n}").unwrap_or(block.len())];
-                if block.contains("lens::Ring<") {
-                    let rel = path.strip_prefix(root).unwrap_or(&path);
-                    derefs.push(rel.display().to_string());
-                }
+            if hands_out(&crate::testutil::production_half(&text)) {
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                derefs.push(rel.display().to_string());
             }
         }
-        derefs.sort();
-        assert_eq!(
-            derefs,
-            ["src/sandbox/fs_control.rs"],
-            "the lens rings that still hand out the ring underneath"
+        assert!(
+            derefs.is_empty(),
+            "these lens rings hand out the ring underneath: {derefs:?}"
         );
     }
 

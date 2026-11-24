@@ -120,9 +120,9 @@ impl super::lens::Event for FsEvent {
 pub(crate) type FsSnapshot = super::lens::Snapshot<FsEvent>;
 
 /// A bounded ring of recent filesystem events. Shared (via `Arc`) between the watcher thread (which
-/// [`push`](FsRing::push)es) and the control serve thread (which [`snapshot`](super::lens::Ring::snapshot)s for
-/// `sbx fs logs`). The sequencing and eviction are [`super::lens::Ring`]'s; what this adds is the
-/// shape of a write event.
+/// [`push`](FsRing::push)es) and the control serve thread ([`serve`], which answers `sbx fs logs`).
+/// The sequencing and eviction are [`super::lens::Ring`]'s; what this adds is the shape of a write
+/// event.
 pub(crate) struct FsRing(super::lens::Ring<FsEvent>);
 
 impl FsRing {
@@ -155,20 +155,22 @@ impl FsRing {
     }
 }
 
-/// The ring underneath, so a snapshot reads the same on this lens as on any other: `snapshot` is
-/// [`super::lens::Ring`]'s and is reached through here, while `push` above stays this lens's own.
-impl std::ops::Deref for FsRing {
-    type Target = super::lens::Ring<FsEvent>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl FsRing {
+    /// The events past `after`, as [`super::lens::Ring::snapshot`] reads them, for the tests that
+    /// check what a write left; a session reads them through [`serve`]. Nothing else of the ring is
+    /// handed out: it stays behind [`FsRing::push`], the one door an event comes in by, where its
+    /// path is cleaned, and a `Deref` to it would open a second door, through which an event would
+    /// arrive uncleaned.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self, after: Option<u64>) -> FsSnapshot {
+        self.0.snapshot(after)
     }
 }
 
 /// Serve the control socket, answering `LOG` from the ring the watcher pushes to. See
 /// [`super::lens::serve`].
 pub(crate) fn serve(listener: UnixListener, ring: Arc<FsRing>) -> io::Result<()> {
-    super::lens::serve(listener, move |cmd| super::lens::dispatch_log(cmd, &ring))
+    super::lens::serve(listener, move |cmd| super::lens::dispatch_log(cmd, &ring.0))
 }
 
 // ── Client side (the `sbx fs logs` process) ───────────────────────────────────────────────────
