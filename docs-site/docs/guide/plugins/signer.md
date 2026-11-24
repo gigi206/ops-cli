@@ -176,7 +176,9 @@ verbatim.
 Where a signer is visible: every request it forms a credential for, and every one it
 would not, is one line of the **`signer` feed** in [`sbx logs`](../cli/logs#the-two-plugin-feeds).
 A `sign` line names the signer, the request, and the header names it put on it; the
-values are never shown. A refusal appears there too, and again in
+values are never shown. A request too long for the line is shortened with `…` at its
+end, so the header names and a refusal's reason keep their place after it. A refusal
+appears there too, and again in
 [`sbx net logs`](../cli/net) with the verdict `blocked` and the reason
 `signer-refused`, counted under `BLOCKED` in `sbx net stats`.
 

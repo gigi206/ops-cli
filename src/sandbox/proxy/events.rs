@@ -1538,6 +1538,7 @@ mod tests {
         let longest = crate::sandbox::signer_control::signer_detail(
             "demo",
             "GET api.example.com/",
+            None,
             Some(&"\u{1f980}".repeat(100_000)),
             &[],
         );

@@ -324,11 +324,15 @@ pub(crate) fn pairs_for(
     use crate::sandbox::signer_control::{SignerKind, signer_detail};
     // Composed and redacted here, on the proxy's side, so the line that leaves carries no value a
     // signer was handed.
-    let record = |kind: SignerKind, signer: &str, observed: &str, claimed: Option<&str>| {
+    let record = |kind: SignerKind,
+                  signer: &str,
+                  request: &str,
+                  formed: Option<&str>,
+                  claimed: Option<&str>| {
         if let Some(events) = events {
             events.send(super::events::ProxyEvent::Signer {
                 kind,
-                detail: signer_detail(signer, observed, claimed, &creds.needles),
+                detail: signer_detail(signer, request, formed, claimed, &creds.needles),
             });
         }
     };
@@ -418,7 +422,8 @@ pub(crate) fn pairs_for(
                             record(
                                 SignerKind::Sign,
                                 &signed.name,
-                                &format!("{} set {}", asked(), names.join(", ")),
+                                &asked(),
+                                Some(&names.join(", ")),
                                 sig.label.as_deref(),
                             );
                         }
@@ -430,7 +435,7 @@ pub(crate) fn pairs_for(
                         ))
                     }
                     Err(why) => {
-                        record(SignerKind::Refuse, &signed.name, &asked(), Some(&why));
+                        record(SignerKind::Refuse, &signed.name, &asked(), None, Some(&why));
                         return Err(SignRefusal {
                             signer: signed.name.clone(),
                             why,

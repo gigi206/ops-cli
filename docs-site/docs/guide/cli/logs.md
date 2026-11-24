@@ -78,7 +78,9 @@ feeds — session 4019373 [demo-app] ~/dev/demo-app
 ```
 
 A `sign` line names the signer, the request it formed a credential for, and the header names it
-put on it. The values are never shown. One record holds the whole session: a credential a
+put on it. The values are never shown. A request too long for the line is shortened with `…` at
+its end, so the header names, the plugin's own account and a refusal's reason keep their place
+after it. One record holds the whole session: a credential a
 [declared operation](../configuration/task) signs in its own ephemeral cage lands here too, beside
 what the agent's own requests carried. A `refuse` line is the request that was **not sent**: a
 credential that could not be formed refuses the request rather than letting it leave unsigned, and

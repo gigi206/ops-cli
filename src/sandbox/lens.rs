@@ -67,10 +67,20 @@ const _: () = assert!(DETAIL_MAX < super::SANITIZED_CHARS);
 /// chooses, so the record of a lens and the exec feed cannot drift apart on what a line may
 /// carry; only the cap is shorter.
 pub(crate) fn sanitize_detail(s: &str) -> String {
-    let mut out = super::sanitize(s);
-    if out.chars().count() > DETAIL_MAX {
-        out = out.chars().take(DETAIL_MAX - 1).collect::<String>() + "…";
+    cut(&super::sanitize(s), DETAIL_MAX)
+}
+
+/// `text` cut by its end to at most `max` characters, the last of them `…` when anything was
+/// cut. The cut falls between two characters, never inside one.
+pub(crate) fn cut(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
     }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(max - 1).collect();
+    out.push('…');
     out
 }
 
@@ -1197,6 +1207,27 @@ mod tests {
                 "{n}"
             );
         }
+    }
+
+    /// A cut keeps at most its bound, the `…` it ends on included, and cuts between two characters:
+    /// a text that fits is kept whole, and a bound of nothing keeps nothing.
+    #[test]
+    fn a_cut_keeps_at_most_its_bound_with_its_ellipsis() {
+        let shapes = [
+            ("abc", 3, "abc"),
+            ("abcd", 3, "ab…"),
+            ("ééé", 2, "é…"),
+            ("abc", 1, "…"),
+            ("abc", 0, ""),
+        ];
+        let wrong: Vec<String> = shapes
+            .iter()
+            .filter(|(text, max, want)| cut(text, *max) != *want)
+            .map(|(text, max, want)| {
+                format!("{text:?} to {max}: {:?}, not {want:?}", cut(text, *max))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

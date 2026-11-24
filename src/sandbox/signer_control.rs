@@ -144,38 +144,62 @@ impl SignerRing {
     }
 }
 
-/// The feed line for one signature or refusal, redacted. `observed` is sbx's own account and comes
-/// first; `claimed` is the plugin's — its label on an answer, its reason on a refusal — and is
-/// appended only when it said something.
+/// The least of the request a feed line keeps, in characters, however long the rest of the line:
+/// room for the method, the host and the start of the target. Past it, what gives way is the end
+/// of the line, where the plugin's own text is.
+const REQUEST_FLOOR: usize = super::lens::DETAIL_MAX / 3;
+
+/// The feed line for one signature or refusal, redacted. sbx's own account comes first: the
+/// `request` as the cage made it (method, host and target) and, on a signature, the header names
+/// it `formed`. `claimed` is the plugin's — its label on an answer, its reason on a refusal — and
+/// is appended only when it shows something ([`super::lens::shows_nothing`]).
 ///
 /// The order is deliberate, and it is the broker lens's rule for the same reason: a reader scanning
 /// a column of events reads the front of each line, so putting sbx's account there means a plugin
 /// cannot make a refusal *look* like a signature by choosing its words.
 ///
-/// `needles` are the launch's credential needles, and they are applied to the **whole** detail
-/// before it is capped, in that order and not the other way round. A signer is the one plugin type
-/// that may be handed a credential in plaintext, so a value echoed into a label is a real path to
-/// this record; and a cap applied first would cut a value in half, leaving the front of it in the
-/// line and no needle left to match. Composed on the proxy's side, so no value a signer was handed
-/// leaves the proxy in the clear; and capped there, as the record keeps it
-/// ([`super::lens::sanitize_detail`]), so what leaves the proxy is no longer than what the ring
-/// holds, and the supervisor can drop anything longer on arrival.
+/// The request is the one part of the line the cage chose, and the one that gives way when the line
+/// is too long: it is cut by its end to the room the rest of the line leaves it, though never below
+/// [`REQUEST_FLOOR`]. A long target would otherwise push the header names and the reason out of
+/// the line, and on the host the reason is nowhere else: `sbx net logs` records a refusal as
+/// `signer-refused` alone.
+///
+/// `needles` are the launch's credential needles, and they are applied before anything is cut, in
+/// that order and not the other way round: to the request on its own before it is cut to its room,
+/// then to the **whole** detail before it is capped. A signer is the one plugin type that may be
+/// handed a credential in plaintext, so a value echoed into a label is a real path to this record,
+/// and a target may carry one the cage obtained for itself. A cut applied first would cut a value
+/// in half, leaving the front of it in the line and no needle left to match. Composed on the
+/// proxy's side, so no value a signer was handed leaves the proxy in the clear; and capped there,
+/// as the record keeps it ([`super::lens::sanitize_detail`]), so what leaves the proxy is no longer
+/// than what the ring holds, and the supervisor can drop anything longer on arrival.
 pub(crate) fn signer_detail(
     signer: &str,
-    observed: &str,
+    request: &str,
+    formed: Option<&str>,
     claimed: Option<&str>,
     needles: &[SecretNeedle],
 ) -> String {
-    let detail = match claimed {
-        Some(c) if !super::lens::shows_nothing(c) => format!("{signer}: {observed} — {c}"),
-        _ => format!("{signer}: {observed}"),
+    let redact = |text: &str| {
+        crate::sandbox::redact::redact_string(
+            text,
+            needles,
+            &crate::sandbox::redact::Placeholder::Plain,
+        )
+        .0
     };
-    let (redacted, _) = crate::sandbox::redact::redact_string(
-        &detail,
-        needles,
-        &crate::sandbox::redact::Placeholder::Plain,
-    );
-    super::lens::sanitize_detail(&redacted)
+    let head = format!("{signer}: ");
+    let mut tail = formed
+        .map(|names| format!(" set {names}"))
+        .unwrap_or_default();
+    if let Some(c) = claimed.filter(|c| !super::lens::shows_nothing(c)) {
+        tail.push_str(&format!(" — {c}"));
+    }
+    let room = super::lens::DETAIL_MAX
+        .saturating_sub(head.chars().count() + redact(&tail).chars().count())
+        .max(REQUEST_FLOOR);
+    let request = super::lens::cut(&redact(request), room);
+    super::lens::sanitize_detail(&redact(&format!("{head}{request}{tail}")))
 }
 
 // The events are already redacted and capped by `push_detail`, but a `Debug` that dumped a session's
@@ -289,11 +313,15 @@ mod tests {
         ring: &SignerRing,
         kind: SignerKind,
         signer: &str,
-        observed: &str,
+        request: &str,
+        formed: Option<&str>,
         claimed: Option<&str>,
         needles: &[SecretNeedle],
     ) -> u64 {
-        ring.push_detail(kind, &signer_detail(signer, observed, claimed, needles))
+        ring.push_detail(
+            kind,
+            &signer_detail(signer, request, formed, claimed, needles),
+        )
     }
     use crate::sandbox::lens::Event as _;
 
@@ -310,7 +338,8 @@ mod tests {
             &ring,
             SignerKind::Sign,
             "demo-sigv4",
-            "PUT s3.example.com/bucket/key set Authorization",
+            "PUT s3.example.com/bucket/key",
+            Some("Authorization"),
             None,
             &[],
         );
@@ -329,6 +358,7 @@ mod tests {
             SignerKind::Refuse,
             "demo-sigv4",
             "GET s3.example.com/bucket",
+            None,
             Some("SIGNED EVERYTHING, honest"),
             &[],
         );
@@ -351,6 +381,7 @@ mod tests {
             SignerKind::Sign,
             "demo-sigv4",
             "GET s3.example.com/bucket",
+            None,
             Some("ok\nevent seq=99 at=0 kind=refuse detail=forged"),
             &[],
         );
@@ -379,6 +410,7 @@ mod tests {
             SignerKind::Refuse,
             "demo-sigv4",
             "GET s3.example.com/bucket",
+            None,
             Some("could not sign with wJalrXUtnFEMI-EXAMPLEKEY"),
             &needles,
         );
@@ -404,6 +436,7 @@ mod tests {
             SignerKind::Refuse,
             "demo-sigv4",
             "GET s3.example.com/bucket",
+            None,
             Some(&format!("{filler} wJalrXUtnFEMI-EXAMPLEKEY")),
             &needles,
         );
@@ -422,7 +455,6 @@ mod tests {
     #[test]
     fn a_label_that_shows_nothing_adds_no_separator() {
         let ring = ring();
-        let observed = "GET s3.example.com/bucket set Authorization";
         let long = " ".repeat(crate::sandbox::SANITIZED_CHARS + 1);
         let blanks = ["  ", "\t", "\u{1}", long.as_str()];
         for blank in blanks {
@@ -430,7 +462,8 @@ mod tests {
                 &ring,
                 SignerKind::Sign,
                 "demo-sigv4",
-                observed,
+                "GET s3.example.com/bucket",
+                Some("Authorization"),
                 Some(blank),
                 &[],
             );
@@ -440,7 +473,9 @@ mod tests {
             .events
             .iter()
             .zip(blanks)
-            .filter(|(event, _)| event.detail != format!("demo-sigv4: {observed}"))
+            .filter(|(event, _)| {
+                event.detail != "demo-sigv4: GET s3.example.com/bucket set Authorization"
+            })
             .map(|(event, blank)| {
                 let shown: String = blank.chars().take(8).collect();
                 format!(
@@ -453,6 +488,133 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// The request is the one part of a line the cage chose, and the one that gives way when the
+    /// line is too long: a long target is cut by its end to all the room the rest of the line
+    /// leaves it, and the header names a signature set, the plugin's label and a refusal's reason
+    /// stay whole. That room is counted on the rest as it is recorded: a credential in a label
+    /// takes the room of the name it becomes, not its own.
+    #[test]
+    fn a_long_request_gives_way_to_what_was_formed_and_why() {
+        let ring = ring();
+        let request = format!("PUT bucket.s3.example.com/{}", "k".repeat(300));
+        let reason = "the plugin refused to sign: no credentials for that region";
+        let needles = vec![SecretNeedle::named(
+            "aws_secret",
+            b"wJalrXUtnFEMI-EXAMPLEKEY".to_vec(),
+        )];
+        let shapes = [
+            (
+                SignerKind::Sign,
+                Some("Authorization, X-Amz-Date"),
+                Some("us-east-1 s3"),
+                " set Authorization, X-Amz-Date — us-east-1 s3".to_string(),
+            ),
+            (
+                SignerKind::Refuse,
+                None,
+                Some(reason),
+                format!(" — {reason}"),
+            ),
+            (
+                SignerKind::Sign,
+                Some("Authorization"),
+                Some("signed with wJalrXUtnFEMI-EXAMPLEKEY"),
+                " set Authorization — signed with ${aws_secret}".to_string(),
+            ),
+        ];
+        for (kind, formed, claimed, _) in &shapes {
+            push(
+                &ring,
+                *kind,
+                "demo-sigv4",
+                &request,
+                *formed,
+                *claimed,
+                &needles,
+            );
+        }
+        let events = ring.snapshot(None).events;
+        let wrong: Vec<&String> = events
+            .iter()
+            .zip(&shapes)
+            .filter(|(event, (_, _, _, end))| {
+                !(event
+                    .detail
+                    .starts_with("demo-sigv4: PUT bucket.s3.example.com/kk")
+                    && event.detail.ends_with(&format!("k…{end}"))
+                    && event.detail.chars().count() == crate::sandbox::lens::DETAIL_MAX)
+            })
+            .map(|(event, _)| &event.detail)
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The request is redacted before it is cut, never after: a credential the cage put in its
+    /// target would otherwise keep its leading bytes in the line wherever the cut ran through it,
+    /// with no whole needle left to match. The two targets place their credentials half a
+    /// credential apart, so that wherever the cut falls, it runs through one of them in at least
+    /// one target.
+    #[test]
+    fn a_credential_straddling_the_request_cut_is_still_named() {
+        let ring = ring();
+        let secret = "wJalrXUtnFEMI-EXAMPLEKEY";
+        let needles = vec![SecretNeedle::named(
+            "aws_secret",
+            secret.as_bytes().to_vec(),
+        )];
+        let targets = [
+            format!("GET s3.example.com/{}", format!("{secret}/").repeat(20)),
+            format!(
+                "GET s3.example.com/{}{}",
+                "x".repeat(12),
+                format!("/{secret}").repeat(20)
+            ),
+        ];
+        for target in &targets {
+            push(
+                &ring,
+                SignerKind::Sign,
+                "demo-sigv4",
+                target,
+                Some("Authorization"),
+                None,
+                &needles,
+            );
+        }
+        let events = ring.snapshot(None).events;
+        let wrong: Vec<&String> = events
+            .iter()
+            .map(|event| &event.detail)
+            .filter(|detail| detail.contains(&secret[..6]) || !detail.contains("${aws_secret}"))
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "not even a credential's leading bytes survive: {wrong:#?}"
+        );
+    }
+
+    /// However long the plugin's text, the line keeps the front of the request: the label gives
+    /// way at the end of the line, never sbx's account of what was asked.
+    #[test]
+    fn a_long_label_leaves_the_request_its_front() {
+        let ring = ring();
+        let label = "L".repeat(1000);
+        push(
+            &ring,
+            SignerKind::Sign,
+            "demo-sigv4",
+            "GET api.example.com/v1/thing",
+            Some("Authorization"),
+            Some(&label),
+            &[],
+        );
+        let detail = &ring.snapshot(None).events[0].detail;
+        assert!(
+            detail.starts_with("demo-sigv4: GET api.example.com/v1/thing set Authorization — L"),
+            "{detail}"
+        );
+    }
+
     #[test]
     fn an_event_survives_the_wire_round_trip() {
         let ring = ring();
@@ -460,7 +622,8 @@ mod tests {
             &ring,
             SignerKind::Sign,
             "demo-sigv4",
-            "PUT s3.example.com/bucket/key?x=1 set Authorization, X-Amz-Date",
+            "PUT s3.example.com/bucket/key?x=1",
+            Some("Authorization, X-Amz-Date"),
             Some("us-east-1 s3"),
             &[],
         );
