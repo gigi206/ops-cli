@@ -183,6 +183,10 @@ mod tests {
             done(upstream.set_write_timeout(bound)),
         ));
         out.push(("upstream nodelay", done(upstream.set_nodelay(true))));
+        out.push((
+            "upstream shutdown",
+            done(upstream.shutdown(std::net::Shutdown::Both)),
+        ));
         let (r, w, s) = (
             pipe_r.as_raw_fd() as libc::c_long,
             pipe_w.as_raw_fd() as libc::c_long,
@@ -329,6 +333,17 @@ mod tests {
             "fcntl F_DUPFD_CLOEXEC",
             opening(libc::SYS_fcntl, &[r, libc::F_DUPFD_CLOEXEC as _, 0]),
         ));
+        out.push((
+            "fcntl F_SETFD",
+            call(
+                libc::SYS_fcntl,
+                &[r, libc::F_SETFD as _, libc::FD_CLOEXEC as _],
+            ),
+        ));
+        out.push((
+            "fcntl F_GETFD",
+            call(libc::SYS_fcntl, &[r, libc::F_GETFD as _]),
+        ));
         let timeout = libc::timeval {
             tv_sec: 1,
             tv_usec: 0,
@@ -361,9 +376,11 @@ mod tests {
     /// are refused, `clone3` and the x32 ABI are answered `ENOSYS` so a fallback is taken, and the
     /// calls the proxy makes still work, starting a thread and reading a document handed over in a
     /// file among them. Among those are the read and write bounds and `TCP_NODELAY` the proxy sets
-    /// on each upstream socket and does not check: a filter that refused a bound would leave that
-    /// socket unbounded, and one that refused `TCP_NODELAY` would leave Nagle on, both without a
-    /// word, so the test is where the refusal shows.
+    /// on each upstream socket, and the `shutdown` that ends a tunnel, none of which it checks: a
+    /// filter that refused a bound would leave that socket unbounded, one that refused
+    /// `TCP_NODELAY` would leave Nagle on, and one that refused `shutdown` would leave a tunnel
+    /// whose far end is gone waiting on the near one, each without a word, so the test is where the
+    /// refusal shows.
     #[test]
     fn the_proxys_filters_refuse_what_its_work_does_not_make() {
         let outcomes = in_a_process(concat!(module_path!(), "::the_probes_process"));
@@ -415,10 +432,13 @@ mod tests {
             "poll",
             "fcntl F_GETFL",
             "fcntl F_DUPFD_CLOEXEC",
+            "fcntl F_SETFD",
+            "fcntl F_GETFD",
             "setsockopt SO_SNDTIMEO",
             "upstream read timeout",
             "upstream write timeout",
             "upstream nodelay",
+            "upstream shutdown",
         ] {
             assert!(got(name).is_ok(), "{name} is allowed: {:?}", got(name));
         }

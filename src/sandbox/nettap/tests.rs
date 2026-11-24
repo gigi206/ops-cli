@@ -1064,7 +1064,8 @@ fn the_taps_work_under_its_filter(dir: &Path) {
         let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
         let _ = c.write_all(b"hello");
         let mut back = Vec::new();
-        let _ = c.read_to_end(&mut back);
+        // To the end the tap puts to the connection: left open, the read fails on the bound above.
+        c.read_to_end(&mut back).expect("the connection ends");
         back
     });
 

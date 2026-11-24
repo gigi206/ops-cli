@@ -115,14 +115,15 @@ mod tests {
     /// Confine the process under the tap's filters, and make every probe, the calls that need a
     /// descriptor making them on one opened before.
     fn probes() -> Probes {
-        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut out = Vec::new();
         out.push(("confine", done(confine())));
-        // The bounds the tap sets through the standard library on the sockets it serves, without
-        // checking the result (`nettap`): set the same way here.
+        // The bounds the tap sets through the standard library on the sockets it serves, and the
+        // end it puts to them, without checking the result (`nettap`): the same calls here.
         let bound = Some(std::time::Duration::from_secs(1));
         out.push(("read timeout", done(socket.set_read_timeout(bound))));
         out.push(("write timeout", done(socket.set_write_timeout(bound))));
+        out.push(("shutdown", done(peer.shutdown(std::net::Shutdown::Both))));
         let s = socket.as_raw_fd() as libc::c_long;
         let path = c"/dev/null".as_ptr() as libc::c_long;
         let int = size_of::<libc::c_int>() as libc::c_long;
@@ -206,6 +207,17 @@ mod tests {
             "fcntl F_DUPFD_CLOEXEC",
             opening(libc::SYS_fcntl, &[s, libc::F_DUPFD_CLOEXEC as _, 0]),
         ));
+        out.push((
+            "fcntl F_SETFD",
+            call(
+                libc::SYS_fcntl,
+                &[s, libc::F_SETFD as _, libc::FD_CLOEXEC as _],
+            ),
+        ));
+        out.push((
+            "fcntl F_GETFD",
+            call(libc::SYS_fcntl, &[s, libc::F_GETFD as _]),
+        ));
         let timeout = libc::timeval {
             tv_sec: 1,
             tv_usec: 0,
@@ -230,8 +242,10 @@ mod tests {
     /// The tap's filters, in a process of their own: the calls that would reach past its cage are
     /// refused, `clone3` is answered `ENOSYS` so the fallback is taken, and the calls the tap makes
     /// still work, a thread started among them. Among those are the read and write bounds the tap
-    /// sets on its sockets and does not check: a filter that refused one would leave that socket
-    /// unbounded without a word, so the test is where the refusal shows.
+    /// sets on its sockets, and the `shutdown` that ends a connection, none of which it checks: a
+    /// filter that refused a bound would leave that socket unbounded, and one that refused
+    /// `shutdown` would leave a connection whose far end is gone waiting on the near one, each
+    /// without a word, so the test is where the refusal shows.
     #[test]
     fn the_taps_filters_refuse_what_its_work_does_not_make() {
         let outcomes = in_a_process(concat!(module_path!(), "::the_probes_process"));
@@ -264,9 +278,12 @@ mod tests {
         for name in [
             "socket unix",
             "fcntl F_DUPFD_CLOEXEC",
+            "fcntl F_SETFD",
+            "fcntl F_GETFD",
             "setsockopt SO_SNDTIMEO",
             "read timeout",
             "write timeout",
+            "shutdown",
         ] {
             assert!(got(name).is_ok(), "{name} is allowed: {:?}", got(name));
         }
