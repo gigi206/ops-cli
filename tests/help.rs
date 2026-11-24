@@ -501,9 +501,9 @@ fn version_answers_a_help_flag_with_its_page_and_refuses_an_extra() {
 }
 
 /// A first word a dispatcher does not take is named in its refusal even when it is not UTF-8. Read
-/// through `to_str`, such a word fell into the arm of the bare command, which prints the page and
-/// names nothing. `net` and `projects` pin theirs in their own suites, and `app` answers every such
-/// word with its launch pointer by design.
+/// through `to_str`, such a word would fall into the arm of the bare command, which prints the page
+/// and names nothing. `net` and `projects` pin theirs in their own suites, and `app` answers every
+/// such word with its launch pointer by design.
 #[test]
 fn a_word_a_dispatcher_does_not_take_is_named_even_when_not_utf8() {
     use std::os::unix::ffi::OsStrExt as _;

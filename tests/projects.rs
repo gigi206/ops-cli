@@ -402,8 +402,8 @@ fn bare_projects_prints_the_page_and_does_not_list() {
     );
 }
 
-/// A word `sbx projects` does not take is named in its refusal, a token that is not UTF-8 as much as
-/// a misspelt one, so neither is answered as the bare verb, which alone prints the page.
+/// A word `sbx projects` does not take is named in its refusal, a token that is not UTF-8 as much
+/// as a misspelt one, so neither is answered as the bare verb, which alone prints the page.
 #[test]
 fn a_projects_word_that_is_not_utf8_is_named_in_the_refusal() {
     let fx = Project::new("projects");
@@ -497,8 +497,8 @@ fn rm_a_named_tree_removes_it_immediately() {
     );
 }
 
-/// A tree named twice in one removal is removed once. The second pass found nothing left and made
-/// the removal that succeeded a usage error, at exit 2.
+/// A tree named twice in one removal is removed once: a second pass would find nothing left, and
+/// would make the removal that succeeded a usage error, at exit 2.
 #[test]
 fn rm_a_tree_named_twice_removes_it_once() {
     let fx = Project::new("projects");
@@ -815,9 +815,10 @@ fn gc_all_leaves_a_distribution_tree_alone_when_the_registry_cannot_be_read() {
     );
 }
 
-/// An id named beside a bulk selector previews with the sweep, and every preview of a named id points
-/// at the command that removes it on its own. The pointer said "(without `--dry-run`)", a flag
-/// nobody typed when the preview came from `--dead` or `--markerless`.
+/// An id named beside a bulk selector previews with the sweep, and every preview of a named id
+/// points at the command that removes it on its own, which holds whatever made it a preview: a
+/// pointer that named `--dry-run` would name a flag nobody typed when the preview comes from
+/// `--dead` or `--markerless`.
 #[test]
 fn a_named_id_previewed_points_at_its_own_removal() {
     let fx = Project::new("projects");
