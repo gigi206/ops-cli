@@ -426,7 +426,7 @@ pub(crate) fn parse_answer(
         verdict,
         more: raw.more,
         expect_reply: raw.expect_reply,
-        label: raw.label.filter(|l| !l.is_empty()),
+        label: raw.label.filter(|l| !super::lens::shows_nothing(l)),
     })
 }
 
@@ -3932,6 +3932,45 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         assert_eq!(a.label.as_deref(), Some("no such key"));
         let a = parse_answer(&answer("deny", ",\"label\":\"\""), 7, 64).unwrap();
         assert_eq!(a.label, None);
+    }
+
+    /// A label that shows nothing once cleaned is no label either: blanks, a tab, a control
+    /// character, or blanks past what the cleaning keeps. Kept, it would end the record's line and
+    /// the note on a separator with nothing after it, and on a reply of several frames a later
+    /// frame's blank would replace the real label an earlier one gave.
+    #[test]
+    fn a_label_that_shows_nothing_is_no_label() {
+        let long = " ".repeat(crate::sandbox::SANITIZED_CHARS + 1);
+        let blanks = ["  ", "\\t", "\\u0001", long.as_str()];
+        let kept: Vec<String> = blanks
+            .iter()
+            .enumerate()
+            .filter_map(|(at, blank)| {
+                let extra = format!(",\"label\":\"{blank}\"");
+                let label = parse_answer(&answer("deny", &extra), 7, 64).unwrap().label;
+                label.map(|l| format!("form {at} kept as a label of {} chars", l.chars().count()))
+            })
+            .collect();
+
+        let inspecting = BrokerSpec {
+            inspect_replies: true,
+            ..spec(None)
+        };
+        let mut host = FakeHost::with_runs(vec![vec![b"D 2.4.8".to_vec(), b"OK".to_vec()]]);
+        let parsed = |extra: &str| parse_answer(&answer("forward", extra), 7, 64).unwrap();
+        let mut plugin = ScriptedPlugin::new(vec![
+            ScriptedPlugin::forward(),
+            parsed(",\"more\":true,\"label\":\"version 2.4.8\""),
+            parsed(",\"more\":false,\"label\":\"  \""),
+        ]);
+        let Relayed { label, .. } =
+            relay(b"GETINFO version", &mut plugin, &mut host, &inspecting).unwrap();
+        let replaced = (label.as_deref() != Some("version 2.4.8"))
+            .then(|| format!("a later frame's blank replaced the real label: {label:?}"));
+        assert!(
+            kept.is_empty() && replaced.is_none(),
+            "{kept:#?} {replaced:?}"
+        );
     }
 
     /// A connection that opens and says nothing is closed, and a trickle does not buy it time.
