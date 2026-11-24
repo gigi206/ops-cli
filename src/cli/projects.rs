@@ -22,21 +22,15 @@ pub(crate) fn projects_cmd(args: &[OsString]) -> ExitCode {
         Some("list") | Some("ls") => projects_list_cmd(&args[1..]),
         Some("show") => projects_show_cmd(&args[1..]),
         Some("rm") | Some("remove") => projects_rm_cmd(&args[1..]),
-        // Bare `sbx projects`, or only flags (e.g. `--json`) with no subcommand: print the page so
-        // its subcommand list guides, like bare `sbx app`/`sbx session`.
-        None => {
-            err!("{}", help::page_usage(&["projects"]).unwrap_or_default());
-            ExitCode::from(2)
-        }
+        // Only flags (e.g. `--json`) with no subcommand: print the page so its subcommand list
+        // guides, like bare `sbx app`/`sbx session`.
         Some(flag) if flag.starts_with('-') => {
             err!("{}", help::page_usage(&["projects"]).unwrap_or_default());
             ExitCode::from(2)
         }
-        Some(other) => {
-            diag::error(&format!("sbx: projects: unknown subcommand `{other}`"));
-            diag::hint("       run `sbx help projects` for usage.");
-            ExitCode::from(2)
-        }
+        // The bare verb prints the page too, and a word that names no subcommand, UTF-8 or not, is
+        // refused by name.
+        _ => crate::cli::unknown_subcommand("projects", args),
     }
 }
 

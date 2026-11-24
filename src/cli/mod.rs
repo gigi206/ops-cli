@@ -172,6 +172,25 @@ impl<K: Eq + std::hash::Hash> Unanswering<K> {
     }
 }
 
+/// Answer the first token of `sbx <verb>` when it names none of the verb's subcommands: the verb's
+/// page when there is no token, which is the bare verb, and otherwise a refusal that names the token,
+/// with a pointer to that page. A token that is not UTF-8 is named by its debug form, which escapes
+/// what it holds: read through `to_str`, it would be answered as the bare verb, with no word of what
+/// was wrong.
+pub(crate) fn unknown_subcommand(verb: &str, args: &[OsString]) -> ExitCode {
+    match args.first() {
+        None => err!("{}", crate::help::page_usage(&[verb]).unwrap_or_default()),
+        Some(tok) => {
+            let named = tok
+                .to_str()
+                .map_or_else(|| format!("{tok:?}"), |word| format!("`{word}`"));
+            diag::error(&format!("sbx: {verb}: unknown subcommand {named}"));
+            diag::hint(&format!("       run `sbx help {verb}` for usage."));
+        }
+    }
+    ExitCode::from(2)
+}
+
 /// Refuse an argument a verb does not take, rather than ignoring it. Silently dropping one is worse
 /// than not supporting it: `sbx plugins store ls --installed` would print the whole listing, which
 /// reads as a filtered result and quietly answers a different question than the one asked — and a

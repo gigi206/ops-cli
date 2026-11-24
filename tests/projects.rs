@@ -402,6 +402,45 @@ fn bare_projects_prints_the_page_and_does_not_list() {
     );
 }
 
+/// A word `sbx projects` does not take is named in its refusal, a token that is not UTF-8 as much as
+/// a misspelt one, so neither is answered as the bare verb, which alone prints the page.
+#[test]
+fn a_projects_word_that_is_not_utf8_is_named_in_the_refusal() {
+    let fx = Project::new("projects");
+    let not_utf8 = Path::new(std::ffi::OsStr::from_bytes(b"x\xff"));
+    let out = fx.run_with_path(&["projects"], not_utf8, &[]);
+    let said = text(&out);
+    assert_eq!(out.status.code(), Some(2), "{said}");
+    assert!(
+        said.contains("sbx: projects: unknown subcommand \"x\\xFF\""),
+        "the token is not named:\n{said}"
+    );
+    assert!(
+        said.contains("run `sbx help projects` for usage."),
+        "the refusal points at the page:\n{said}"
+    );
+
+    // A misspelt word keeps its wording, and the bare verb its page, with no refusal line.
+    let bogus = fx.run(&["projects", "bogus"]);
+    assert_eq!(bogus.status.code(), Some(2), "{}", text(&bogus));
+    assert!(
+        text(&bogus).contains("sbx: projects: unknown subcommand `bogus`"),
+        "{}",
+        text(&bogus)
+    );
+    let bare = fx.run(&["projects"]);
+    let said = text(&bare);
+    assert_eq!(bare.status.code(), Some(2), "{said}");
+    assert!(
+        said.contains("sbx projects list"),
+        "the bare verb prints the page:\n{said}"
+    );
+    assert!(
+        !said.contains("unknown subcommand"),
+        "and refuses nothing:\n{said}"
+    );
+}
+
 #[test]
 fn list_json_is_an_array_carrying_state_and_size() {
     let fx = Project::new("projects");
