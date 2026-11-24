@@ -682,7 +682,7 @@ fn a_group_admits_every_rule_form() {
     )]);
     assert!(w.is_empty(), "every form is valid, so no warnings: {w:?}");
     assert_eq!(
-        g.get("mixed").map(|r| r.len()),
+        g.get("mixed").map(|g| g.rules.len()),
         Some(3),
         "all three forms classify into rules"
     );
@@ -697,11 +697,11 @@ fn build_net_groups_validates_names_entries_and_rejects_nesting() {
         ("malformed", &["https://*"]),         // a classify error → dropped
     ]);
     // The valid group is present with its one rule; the invalid-named one never lands.
-    assert_eq!(g.get("ok").map(|r| r.len()), Some(1));
+    assert_eq!(g.get("ok").map(|g| g.rules.len()), Some(1));
     assert!(!g.contains_key("bad name!"));
     // `nested` and `malformed` exist but drop their (only) offending entry → empty.
-    assert_eq!(g.get("nested").map(|r| r.len()), Some(0));
-    assert_eq!(g.get("malformed").map(|r| r.len()), Some(0));
+    assert_eq!(g.get("nested").map(|g| g.rules.len()), Some(0));
+    assert_eq!(g.get("malformed").map(|g| g.rules.len()), Some(0));
     assert_eq!(
         w.len(),
         3,
@@ -14984,6 +14984,49 @@ fn a_reservation_that_cannot_be_kept_is_refused() {
         assert_eq!(r.len(), 1, "{entry}: one refusal stops the launch: {r:?}");
         assert!(r[0].contains(says), "{entry}: {r:?}");
         assert!(w.contains(&r[0]), "{entry}: and it is reported");
+    }
+}
+
+/// A group that left one of its entries out stops a launch where the omission fails open, as the
+/// same entry written in the list itself does.
+///
+/// `build_net_groups` drops a malformed or nested entry with a warning, and a list referencing the
+/// group gets the rest. A `deny` entry or a `reserve` key sbx cannot read stops the launch, so a
+/// host its author meant to restrict is not left open; the same entry inside a group referenced
+/// from either only warned, and the launch went on without it. The witnesses are the same group
+/// from `allow` and `mute`, where the omission is the safe direction and the build's warnings are
+/// the whole note, and a clean group from `deny`.
+#[test]
+fn a_group_that_left_an_entry_out_stops_a_launch_where_that_fails_open() {
+    let (groups, w) = make_groups(&[
+        ("trackers", &["ads.example.com", "https://*", "@other"]),
+        ("clean", &["ads.example.com"]),
+    ]);
+    assert_eq!(w.len(), 2, "the build names each entry it left out: {w:?}");
+    for table in [
+        "mode = \"allow\"\ndeny = [\"@trackers\"]\n",
+        "mode = \"deny\"\n[reserve.\"@trackers\"]\nby = [\"curl\"]\n",
+    ] {
+        let (_, w, r) = reserve_policy(table, &groups);
+        assert_eq!(r.len(), 1, "{table}: one refusal stops the launch: {r:?}");
+        assert!(
+            r[0].contains("`@trackers`")
+                && r[0].contains("left out 2 of its entries")
+                && r[0].contains("`sbx net groups trackers` names each"),
+            "{table}: it names the group and what it left out: {r:?}"
+        );
+        assert!(w.contains(&r[0]), "{table}: and it is reported");
+    }
+    for table in [
+        "mode = \"deny\"\nallow = [\"@trackers\"]\n",
+        "mode = \"deny\"\nmute = [\"@trackers\"]\n",
+        "mode = \"allow\"\ndeny = [\"@clean\"]\n",
+    ] {
+        let (_, w, r) = reserve_policy(table, &groups);
+        assert!(
+            r.is_empty() && w.is_empty(),
+            "{table}: nothing to refuse, and nothing to add to what the build said: {w:?} {r:?}"
+        );
     }
 }
 

@@ -95,6 +95,12 @@ A group is a **flat list**: a group entry may **not** itself be a `@other`
 reference. A nested reference is rejected with a warning (the offending entry is
 dropped). This makes an unbounded or cyclic expansion impossible by construction.
 
+A group that drops one of its own entries, a nested reference or one sbx cannot parse,
+is shorter than its file says. From an `allow` or `mute` list the rest of it applies,
+and the warnings name what was dropped. From a `deny` list or a `reserve` key the
+launch **stops**, naming the group, on the same terms as an undefined reference: the
+hosts it was written to restrict would otherwise stay open.
+
 ---
 
 ## Inspecting groups

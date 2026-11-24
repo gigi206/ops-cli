@@ -4540,7 +4540,17 @@ pub(crate) const DURATION_MAX_SECS: u64 = 365 * 24 * 3600;
 /// Pre-classified reusable egress groups: each `[network.groups]` name mapped to the rules its
 /// entries classify to. Built once from the global config (trusted by location) and consulted
 /// when a `[network]` `allow`/`deny` list references a group with `@<name>`.
-type NetGroups = BTreeMap<String, Vec<crate::allowlist::Rule>>;
+type NetGroups = BTreeMap<String, NetGroup>;
+
+/// One group of [`NetGroups`]: the rules its entries classify to, and how many of its entries were
+/// left out, malformed or a nested reference, each named in a warning when the group was built. The
+/// count travels with the group because what leaving them out costs depends on the list that
+/// references it ([`classify_entries`]), and a group is built before any list does.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NetGroup {
+    rules: Vec<crate::allowlist::Rule>,
+    dropped: usize,
+}
 
 /// The group an egress entry references, or `None` when the entry is a rule of its own. **Only a
 /// leading `@` is a reference**: a `@` anywhere else (a URL path like `host/@user`, a `re:` pattern)
@@ -4578,7 +4588,9 @@ pub(crate) fn group_refs<'a>(entries: impl Iterator<Item = &'a String>) -> Vec<S
 /// unreachable, a `mute` entry leaves a denial logged: the note is enough. A `deny` entry left out
 /// leaves reachable the host its author meant to block, and a `reserve` entry left out leaves its
 /// destination open to every program a wider `allow` admits — the two cases where a typo fails
-/// open, so the note goes to `refusals` too, and a launch stops on it.
+/// open, so the note goes to `refusals` too, and a launch stops on it. A group that left one of its
+/// own entries out is shorter than its file says, so a reference to it from either of those two
+/// stops a launch the same way; from the other two, the warnings its build wrote are the note.
 fn classify_entries(
     warnings: &mut Vec<String>,
     refusals: &mut Vec<String>,
@@ -4607,7 +4619,19 @@ fn classify_entries(
     for entry in entries {
         if let Some(name) = group_ref(&entry) {
             match groups.get(name) {
-                Some(group_rules) => rules.extend(group_rules.iter().cloned()),
+                Some(group) => {
+                    rules.extend(group.rules.iter().cloned());
+                    if restricts && group.dropped > 0 {
+                        left_out(format!(
+                            "{source_label}: {list} references group `@{name}`, which left out {} \
+                             of its entries (`sbx net groups {name}` names each) — a launch stops \
+                             rather than run with them not {}",
+                            group.dropped,
+                            slot.consequence(),
+                            name = crate::diag::visible(name)
+                        ));
+                    }
+                }
                 // Both ways in are named: a group most often arrives as a portable fragment
                 // (`sbx net groups import`), and pointing only at hand-editing sends the reader to
                 // write by hand what a verb already imports — the same defect as a message that
@@ -4661,7 +4685,8 @@ pub(crate) fn invalid_net_group_name(name: &str) -> String {
 /// Validate and pre-classify the global `[network.groups]` table into a [`NetGroups`] map. Each
 /// group's name is charset-validated (an invalid name is skipped with a warning), and each entry
 /// is classified like an `allow`/`deny` entry — a malformed one is dropped with a warning naming
-/// the group. A nested reference (`@other` inside a group) is rejected: a group is a flat list of
+/// the group, and how many were dropped stays with the group ([`NetGroup`]) for the list that
+/// references it to weigh. A nested reference (`@other` inside a group) is rejected: a group is a flat list of
 /// egress entries in this version, so an unbounded or cyclic expansion is impossible by
 /// construction. Building every defined group here (not only referenced ones) surfaces a typo in
 /// an unused group early rather than only when some app first references it.
@@ -4680,8 +4705,10 @@ fn build_net_groups(warnings: &mut Vec<String>, raw: BTreeMap<String, Vec<String
             continue;
         }
         let mut rules = Vec::new();
+        let mut dropped = 0;
         for entry in entries {
             if entry.trim().starts_with('@') {
+                dropped += 1;
                 warnings.push(format!(
                     "{GLOBAL_CONFIG}: net group `{name}`: ignoring nested reference `{}` — a group \
                      is a flat list of egress entries and may not reference another group",
@@ -4697,12 +4724,15 @@ fn build_net_groups(warnings: &mut Vec<String>, raw: BTreeMap<String, Vec<String
                     rule.group = Some(name.clone());
                     rules.push(rule);
                 }
-                Err(e) => warnings.push(format!(
-                    "{GLOBAL_CONFIG}: net group `{name}`: ignoring entry `{entry}` — {e}"
-                )),
+                Err(e) => {
+                    dropped += 1;
+                    warnings.push(format!(
+                        "{GLOBAL_CONFIG}: net group `{name}`: ignoring entry `{entry}` — {e}"
+                    ));
+                }
             }
         }
-        groups.insert(name, rules);
+        groups.insert(name, NetGroup { rules, dropped });
     }
     groups
 }
