@@ -1869,13 +1869,17 @@ fn the_staged_router_is_a_posix_sh_script_that_exits_zero() {
         staged.starts_with("#!/bin/sh\n"),
         "the router is a /bin/sh script"
     );
+    let out = std::process::Command::new("/bin/sh")
+        .args(["-c", &staged, "xdg-open", "https://example.com/verify"])
+        .output()
+        .expect("run the router");
     assert!(
-        staged.contains("exit 0"),
-        "it exits 0 so the caller treats the open as non-fatal"
+        out.status.success(),
+        "it exits 0 so the caller treats the open as non-fatal: {out:?}"
     );
     assert!(
-        staged.contains("\"$@\""),
-        "it surfaces the argument the tool passed"
+        String::from_utf8_lossy(&out.stderr).contains("https://example.com/verify"),
+        "it surfaces the argument the tool passed: {out:?}"
     );
 }
 
