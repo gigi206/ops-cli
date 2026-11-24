@@ -193,10 +193,10 @@ impl std::fmt::Debug for SignerRing {
 
 impl SignerRing {
     /// The events past `after`, as [`super::lens::Ring::snapshot`] reads them, for the tests that
-    /// check what a signature left; a session reads them through [`serve`]. Nothing else of the ring
-    /// is handed out: it stays behind [`SignerRing::push_detail`], the one door an event comes in by,
-    /// where its detail is sanitised and capped, and a `Deref` to it would open a second door,
-    /// through which an event would arrive uncleaned.
+    /// check what a signature left; a session reads them through [`serve`]. Nothing else of the
+    /// ring is handed out: it stays behind [`SignerRing::push_detail`], the one door an event
+    /// comes in by, where its detail is sanitised and capped, and a `Deref` to it would open a
+    /// second door, through which an event would arrive uncleaned.
     #[cfg(test)]
     pub(crate) fn snapshot(&self, after: Option<u64>) -> SignerSnapshot {
         self.0.snapshot(after)
