@@ -1392,9 +1392,9 @@ pub(super) fn validate_service(
 ) -> BTreeMap<String, ServiceSpec> {
     let mut out = BTreeMap::new();
     for (name, entry) in raw {
-        // The name reaches a log file name and every diagnostic, so hold it to the same shape as a
+        // The name reaches a log file name and every diagnostic, so hold it to the charset of a
         // bundle or group name rather than discovering a path separator in it later.
-        if !is_valid_group_name(&name) {
+        if !has_name_charset(&name) {
             warnings.push(format!(
                 "{source}: ignoring `[service]` entry `{name}` — a name is letters, digits, `.`, \
                  `_` or `-` (64 max)"

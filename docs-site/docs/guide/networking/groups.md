@@ -139,7 +139,9 @@ sbx net groups import ci-hosts.toml --force    # overwrite a name that already e
 ```
 
 `import` copies the file into `net-groups/<name>.toml`, where the loader reads it. The
-name comes from the file: its own stem, or `--as`. That directory is trusted by location,
+name comes from the file: its own stem, or `--as`. A group name is 1–64 characters of
+`[A-Za-z0-9._-]`, is not `.`/`..`, and does not begin with `-`, which `sbx net groups`
+reads as an option. That directory is trusted by location,
 so the deliberate command *is* the consent, an agent inside a cage cannot run it, and
 there is no interactive prompt. A name that already exists is **refused** unless
 `--force`. A group carrying an entry that will not resolve (malformed or nested) is

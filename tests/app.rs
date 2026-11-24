@@ -1586,6 +1586,59 @@ fn an_import_refuses_a_name_that_begins_with_a_dash() {
     assert!(fx.profile_path("dashless").exists());
 }
 
+/// The same trap on the two other files an import names: a bundle or a group whose file name begins
+/// with `-` would be filed under a name `sbx bundle` and `sbx net groups` read as an option. Both
+/// imports refuse it and point at `--as`, take the name that gives, and refuse one it gives that is
+/// no better, without pointing back at it.
+#[test]
+fn a_bundle_or_group_import_refuses_a_name_that_begins_with_a_dash() {
+    for (verb, dir, body) in [
+        (
+            &["bundle", "import"][..],
+            "bundles",
+            "[packages]\ntool = \"nix:hello\"\n",
+        ),
+        (
+            &["net", "groups", "import"][..],
+            "net-groups",
+            "entries = [\"api.example.com\"]\n",
+        ),
+    ] {
+        let fx = Project::new("app");
+        let source = fx.proj.path().join("-x.toml");
+        std::fs::write(&source, body).unwrap();
+        let dir = fx.config_home.path().join("sbx").join(dir);
+        for (flags, points) in [(&["--"][..], true), (&["--as=.", "--"][..], false)] {
+            let out = fx.run_with_path(&[verb, flags].concat(), &source, &[]);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "`{verb:?} {flags:?}` must refuse the name: {}",
+                text(&out)
+            );
+            assert!(
+                err.contains("not beginning with `-`"),
+                "`{verb:?} {flags:?}` must say why: {err}"
+            );
+            assert_eq!(
+                err.contains("--as <name>"),
+                points,
+                "`{verb:?} {flags:?}` points at `--as` for a name the file gave: {err}"
+            );
+            assert!(!dir.exists(), "`{verb:?} {flags:?}` wrote nothing");
+        }
+
+        let renamed = fx.run_with_path(&[verb, &["--as", "dashless", "--"]].concat(), &source, &[]);
+        assert!(
+            renamed.status.success(),
+            "the name `--as` gives is taken: {}",
+            text(&renamed)
+        );
+        assert!(dir.join("dashless.toml").exists());
+    }
+}
+
 #[test]
 fn bundle_import_reports_the_groups_the_bundle_itself_references() {
     let fx = Project::new("app");

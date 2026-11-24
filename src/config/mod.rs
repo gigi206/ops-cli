@@ -33,7 +33,7 @@ pub(crate) mod view;
 pub(crate) use types::*;
 
 pub(crate) use apps::{
-    AppContract, AppHomeScope, ResolvedApp, ends_with_shell_payload, is_valid_app_name,
+    AppContract, AppHomeScope, NAME_RULE, ResolvedApp, ends_with_shell_payload, is_valid_app_name,
 };
 pub(crate) use gate::{is_trust_drop, untrusted_reason};
 pub(crate) use grants::{Grant, Risk, grants, mise_grants, sort_grants};
@@ -4685,7 +4685,7 @@ fn take_net_groups(field: &mut Option<NetworkField>) -> BTreeMap<String, Vec<Str
 /// so must the inventory verbs, or `sbx net groups` describes a group no policy will ever have.
 pub(crate) fn invalid_net_group_name(name: &str) -> String {
     format!(
-        "{GLOBAL_CONFIG}: ignoring net group `{}`: a name must be 1–64 of [A-Za-z0-9._-]",
+        "{GLOBAL_CONFIG}: ignoring net group `{}`: a name must be {NAME_RULE}",
         crate::sandbox::sanitize(name)
     )
 }
@@ -4760,12 +4760,21 @@ fn is_valid_uri_scheme(s: &str) -> bool {
         && s.len() <= 64
 }
 
-/// Whether a `[network.groups]` name is a safe, referenceable identifier. A group name is not a path
-/// component (unlike an app name), so `.`/`..` are harmless; it is charset- and length-bounded so
-/// a reference `@<name>` is unambiguous and the name renders cleanly in warnings and `sbx net`.
-/// Shared with the `sbx net allow/deny` write path so a persisted `@<name>` reference is validated
-/// by the same rule the resolver uses to name a group.
+/// Whether a `[network.groups]` name is a safe, referenceable identifier: the rule an app's name
+/// keeps ([`is_valid_app_name`]). A group is one file named by it, and `sbx net groups` reads an
+/// argument that begins with `-` as an option, so a group named that way could be imported and
+/// never shown. The charset also keeps a reference `@<name>` unambiguous and the name clean in
+/// warnings. Shared with the `sbx net allow/deny` write path so a persisted `@<name>` reference is
+/// validated by the same rule the resolver uses to name a group.
 pub(crate) fn is_valid_group_name(name: &str) -> bool {
+    is_valid_app_name(name)
+}
+
+/// Whether `name` is 1–64 of `[A-Za-z0-9._-]`: no separator, no space, and nothing a warning or a
+/// shell word has to escape. All a `[service]` name is held to, since it is written after a prefix
+/// of its own (`.sbx-service-<name>.log`) and no verb takes it as an argument; a name that is a file
+/// of its own and an argument is held to [`is_valid_app_name`].
+fn has_name_charset(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name

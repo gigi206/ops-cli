@@ -780,7 +780,7 @@ fn read_named_config(path: &Path, kind: &FileKind) -> Result<(String, Vec<u8>), 
         .ok_or_else(|| format!("cannot derive a {} from {}", kind.name_kind, path.display()))?;
     if !(kind.name_ok)(&name) {
         return Err(format!(
-            "{}: `{name}` is not a usable {} (1–64 of [A-Za-z0-9._-])",
+            "{}: `{name}` is not a usable {} ({NAME_RULE})",
             path.display(),
             kind.name_kind
         ));
@@ -1615,7 +1615,7 @@ fn named_toml_files(
         };
         if !(kind.name_ok)(&name) {
             warnings.push(format!(
-                "ignoring {} {}: `{name}` is not a usable {}",
+                "ignoring {} {}: `{name}` is not a usable {} ({NAME_RULE})",
                 kind.one,
                 path.display(),
                 kind.name_kind
@@ -1850,8 +1850,8 @@ fn resolve_use<'a>(
 ) -> Result<&'a RawBundle, String> {
     if !is_valid_bundle_name(name) {
         return Err(format!(
-            "ignoring `use` entry `{}`: a bundle name is 1–64 of [A-Za-z0-9._-], and a launch of \
-             this app stops rather than run without what it named",
+            "ignoring `use` entry `{}`: a bundle name is {NAME_RULE}, and a launch of this app stops \
+             rather than run without what it named",
             crate::diag::visible(name)
         ));
     }
@@ -2308,11 +2308,13 @@ fn extend_deduped<T: PartialEq>(into: &mut Vec<T>, add: Vec<T>) {
     }
 }
 
-/// Whether a `[bundle.<name>]` name is a safe, referenceable identifier — the same rule as a
-/// `[network.groups]` name, for the same reasons: a bundle name is not a path component, so it needs
-/// only to be unambiguous in a `use` list and to render cleanly in a warning.
+/// Whether a bundle's name is a safe, referenceable identifier: the rule an app's name keeps
+/// ([`is_valid_app_name`]), for the same reasons. A bundle is one file named by it, and every
+/// `sbx bundle` verb reads an argument that begins with `-` as an option, so a bundle named that
+/// way could be imported and never shown or removed. The charset also keeps the name unambiguous in
+/// a `use` list and clean in a warning.
 pub(crate) fn is_valid_bundle_name(name: &str) -> bool {
-    is_valid_group_name(name)
+    is_valid_app_name(name)
 }
 
 /// Make the imported profile apps the sole source of the global app layer. A global app lives only

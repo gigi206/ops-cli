@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use crate::cli::import_remedy;
 use crate::{config, diag, help, style};
 
-/// `sbx bundle` — dispatch. `export`/`import` are reserved subcommand verbs, so a bundle named
+/// `sbx bundle` — dispatch. `export`/`import`/`rm` are reserved subcommand verbs, so a bundle named
 /// `export` is listable and usable in a `use` list but not resolvable by bare name here (use the
 /// listing); anything else is the list/show reader.
 pub(crate) fn bundle_cmd(args: &[OsString]) -> ExitCode {
@@ -800,9 +800,11 @@ fn bundle_import(args: &[OsString]) -> ExitCode {
         // The name failed the charset, so it may hold anything, a line feed included: it is
         // written the way `diag::visible` writes it, on the refusal's line.
         diag::error(&format!(
-            "sbx: bundle import: invalid bundle name `{}` (1–64 of [A-Za-z0-9._-]); nothing imported",
-            diag::visible(&name)
+            "sbx: bundle import: invalid bundle name `{}` ({}); nothing imported",
+            diag::visible(&name),
+            config::NAME_RULE
         ));
+        crate::cli::hint_at_as_name(&parsed);
         return ExitCode::from(2);
     }
     // Read through the same safety gate every config file passes, then validate it is a bundle

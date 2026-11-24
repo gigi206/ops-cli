@@ -276,6 +276,47 @@ fn a_net_group_the_resolver_refuses_is_withheld_from_the_listing_too() {
     assert_eq!(*why, super::invalid_net_group_name("bad name"));
 }
 
+/// A tool bundle and an egress group keep the name rule an app keeps, being as it is a file of
+/// their own and an argument of their verbs: one that begins with `-` would be read as an option. A
+/// `[service]` name is neither, and is held to the characters alone.
+#[test]
+fn a_bundle_and_a_group_keep_the_name_rule_of_an_app() {
+    type Rule = fn(&str) -> bool;
+    let (longest, too_long) = ("x".repeat(64), "x".repeat(65));
+    for (family, valid) in [
+        ("app", is_valid_app_name as Rule),
+        ("bundle", is_valid_bundle_name),
+        ("group", is_valid_group_name),
+    ] {
+        for bad in [
+            "-x", "--force", "-", ".", "..", "", "a/b", "a b", "a\n", &too_long,
+        ] {
+            assert!(!valid(bad), "{family} `{bad}` is refused");
+        }
+        for good in ["x", "a-b", "a-", "_x", ".x", "...", "a.b", "X9", &longest] {
+            assert!(valid(good), "{family} `{good}` is taken");
+        }
+    }
+
+    let mut warnings = Vec::new();
+    let service = |name: &str| {
+        (
+            name.to_string(),
+            schema::RawService::Argv(RawCmd::Line("true".to_string())),
+        )
+    };
+    let kept = validate::validate_service(
+        &mut warnings,
+        "test",
+        BTreeMap::from([service("-x"), service(".."), service("a/b")]),
+    );
+    assert_eq!(
+        kept.keys().collect::<Vec<_>>(),
+        vec!["-x", ".."],
+        "{warnings:?}"
+    );
+}
+
 /// A capture ceiling written alone in an amending overlay bounds the capture below it.
 ///
 /// The overlay inherits the layer's level, so a `capture_max_kb` on its own is a ceiling on the

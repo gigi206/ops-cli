@@ -56,7 +56,7 @@ credential in any case, a `[secret]` names a *source* (`env://`, `sops://`), and
 real value is read on the host at launch and never enters the cage.
 
 A name that matches no bundle is an error naming what *is* declared, never a blank
-success. `export` and `import` are reserved subcommand verbs, so a bundle named
+success. `export`, `import` and `rm` are reserved subcommand verbs, so a bundle named
 `export` is listable and usable in a `use` list but not resolvable by bare name here.
 
 ## `sbx bundle export`
@@ -81,7 +81,9 @@ sbx bundle import claude-code.toml --force
 ```
 
 `--as <name>` may be written `--as=<name>`, and a `--` ends the flags, so a file whose name
-begins with `-` can still be imported.
+begins with `-` can still be read. Its bundle is named with `--as`: a bundle name is 1–64
+characters of `[A-Za-z0-9._-]`, is not `.`/`..`, and does not begin with `-`, which every
+`sbx bundle` verb reads as an option.
 
 Copies the file into `bundles/<name>.toml`, where the loader reads it. The name comes
 from the file: its own stem, or `--as <name>`. The bytes are copied verbatim, so the
@@ -206,5 +208,5 @@ is the moment to run `sbx bundle <name>` before wiring it into an app.
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | the write failed, there was nothing to export, or `rm` found no such bundle |
+| 1 | the write or the removal failed, or there was nothing to export |
 | 2 | usage error, an unknown bundle name, an invalid name, or a file that is not a bundle |

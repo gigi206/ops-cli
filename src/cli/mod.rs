@@ -419,7 +419,7 @@ pub(crate) struct ImportArgs {
 ///
 /// `--as=<name>` is the same flag written inline, held to the same refusals as the separate form,
 /// the spelling the launch parsers accept for every flag that takes a value. A `--` ends the flags,
-/// so a file whose name begins with `-` can still be imported.
+/// so a file whose name begins with `-` can still be read, and its entry named with `--as`.
 pub(crate) fn import_args(
     args: &[OsString],
     path: &[&str],
@@ -498,6 +498,14 @@ pub(crate) fn imported_name(args: &ImportArgs, path: &[&str]) -> Result<String, 
             ));
             Err(ExitCode::from(2))
         }
+    }
+}
+
+/// Point at `--as` after a refused name that came from the file: it is the one the user did not
+/// choose, and `--as` chooses one.
+pub(crate) fn hint_at_as_name(args: &ImportArgs) {
+    if args.as_name.is_none() {
+        diag::hint("       give it a usable name with `--as <name>`.");
     }
 }
 

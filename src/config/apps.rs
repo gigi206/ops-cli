@@ -375,16 +375,16 @@ pub(super) fn resolve_apps(
 /// Nor may a name begin with `-`, the rule a task's name keeps for the same reason: every `sbx app`
 /// verb reads such an argument as an option, so the app could be imported but never named on the
 /// command line again, not even to remove it.
+///
+/// A tool bundle and an egress group keep the same rule ([`is_valid_bundle_name`],
+/// [`is_valid_group_name`]), for the same two reasons: each is a file named by it, and an argument.
 pub(crate) fn is_valid_app_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name != "."
-        && name != ".."
-        && !name.starts_with('-')
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    has_name_charset(name) && name != "." && name != ".." && !name.starts_with('-')
 }
+
+/// [`is_valid_app_name`]'s rule as a refusal states it, for an app, a tool bundle and an egress
+/// group alike.
+pub(crate) const NAME_RULE: &str = "1–64 of [A-Za-z0-9._-], not beginning with `-`, not `.`/`..`";
 
 /// Resolve one app: layer its global definition (trusted by location) under its project
 /// definition (gated by the project's verdict), reusing the baseline's per-field gating. The

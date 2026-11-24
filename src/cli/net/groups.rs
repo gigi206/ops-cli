@@ -275,9 +275,11 @@ pub(super) fn net_groups_import(args: &[OsString]) -> ExitCode {
         // The name failed the charset, so it may hold anything, a line feed included: it is
         // written the way `diag::visible` writes it, on the refusal's line.
         diag::error(&format!(
-            "sbx: net groups import: invalid group name `{}` (1–64 of [A-Za-z0-9._-]); nothing imported",
-            diag::visible(&name)
+            "sbx: net groups import: invalid group name `{}` ({}); nothing imported",
+            diag::visible(&name),
+            config::NAME_RULE
         ));
+        crate::cli::hint_at_as_name(&parsed);
         return ExitCode::from(2);
     }
     let bytes = match config::safety::read_safe_bytes(&parsed.file) {

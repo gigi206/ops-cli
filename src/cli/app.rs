@@ -528,14 +528,11 @@ fn app_import(args: &[OsString]) -> ExitCode {
         // The name failed the charset, so it may hold anything, a line feed included: it is
         // written the way `diag::visible` writes it, on the refusal's line.
         diag::error(&format!(
-            "sbx: '{}' is not a usable app name (1–64 of [A-Za-z0-9._-], not beginning with `-`, \
-             not `.`/`..`)",
-            diag::visible(&name)
+            "sbx: '{}' is not a usable app name ({})",
+            diag::visible(&name),
+            config::NAME_RULE
         ));
-        // A name taken from the file is the one the user did not choose, and `--as` chooses one.
-        if parsed.as_name.is_none() {
-            diag::hint("       give it a usable name with `--as <name>`.");
-        }
+        crate::cli::hint_at_as_name(&parsed);
         return ExitCode::from(2);
     }
 
@@ -691,8 +688,9 @@ fn dep_plan(
         // question "which file declares this" would answer "none" and hide why.
         if !config::is_valid_bundle_name(&m.name) {
             return Err(format!(
-                "invalid bundle name `{}` (1–64 of [A-Za-z0-9._-]); nothing was written",
-                diag::visible(&m.name)
+                "invalid bundle name `{}` ({}); nothing was written",
+                diag::visible(&m.name),
+                config::NAME_RULE
             ));
         }
         let Some(file) = m.file.as_ref() else {
@@ -720,8 +718,9 @@ fn dep_plan(
         // Before the file question, for the reason the bundle loop above states.
         if !config::is_valid_group_name(&m.name) {
             return Err(format!(
-                "invalid group name `{}` (1–64 of [A-Za-z0-9._-]); nothing was written",
-                diag::visible(&m.name)
+                "invalid group name `{}` ({}); nothing was written",
+                diag::visible(&m.name),
+                config::NAME_RULE
             ));
         }
         let Some(file) = m.file.as_ref() else {

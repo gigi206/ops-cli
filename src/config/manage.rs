@@ -830,7 +830,8 @@ pub(crate) fn admit_egress_rule(rule: &str, slot: crate::allowlist::Slot) -> Res
     if let Some(group) = trimmed.strip_prefix('@') {
         if !super::is_valid_group_name(group) {
             return Err(format!(
-                "invalid group reference {rule:?}: a group name must be 1–64 of [A-Za-z0-9._-]"
+                "invalid group reference {rule:?}: a group name must be {}",
+                super::NAME_RULE
             ));
         }
         return Ok(());
