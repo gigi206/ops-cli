@@ -16,43 +16,51 @@ use std::path::Path;
 /// staying readable; the scope unit name has a far larger ceiling, so this bounds both.
 const MAX_SLUG: usize = 50;
 
-/// Fold a common accented Latin letter to its base ASCII letter (lowercase), so an accented
-/// project directory yields a legible slug (`café-app` → `cafe-app`) rather than dropping the
-/// accent to a separator. Covers the Latin-1 Supplement and common Latin Extended-A letters;
-/// anything outside that (other scripts) is left for the caller to treat as a separator. This
-/// is deliberately a slug transliteration, not linguistically exact (`ß` → `s`, `þ` → `t`).
+/// Fold an accented Latin letter to its base ASCII letter (lowercase), so an accented project
+/// directory yields a legible slug (`café-app` → `cafe-app`) rather than dropping the letter to
+/// a separator. Covers the letters from `À` to `ſ`, the Latin-1 Supplement's and Latin
+/// Extended-A's, and the Romanian `ș` and `ț`; anything outside that (other scripts) is left for
+/// the caller to treat as a separator. This is deliberately a slug transliteration, not
+/// linguistically exact (`ß` → `s`, `þ` → `t`, `œ` → `o`).
 fn ascii_fold(ch: char) -> Option<char> {
     Some(match ch {
-        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'æ' | 'ā' | 'ă' | 'ą' => 'a',
         'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => 'c',
         'ð' | 'ď' | 'đ' => 'd',
         'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => 'e',
         'ĝ' | 'ğ' | 'ġ' | 'ģ' => 'g',
-        'ì' | 'í' | 'î' | 'ï' | 'ī' | 'ĭ' | 'į' | 'ı' => 'i',
-        'ĺ' | 'ļ' | 'ľ' | 'ł' => 'l',
-        'ñ' | 'ń' | 'ņ' | 'ň' => 'n',
-        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => 'o',
+        'ĥ' | 'ħ' => 'h',
+        'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' | 'ĳ' => 'i',
+        'ĵ' => 'j',
+        'ķ' | 'ĸ' => 'k',
+        'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => 'l',
+        'ñ' | 'ń' | 'ņ' | 'ň' | 'ŉ' | 'ŋ' => 'n',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' | 'œ' => 'o',
         'ŕ' | 'ŗ' | 'ř' => 'r',
-        'ß' | 'ś' | 'ŝ' | 'ş' | 'š' => 's',
-        'ţ' | 'ť' | 'ŧ' | 'þ' => 't',
-        'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => 'u',
-        'ý' | 'ÿ' => 'y',
+        'ß' | 'ś' | 'ŝ' | 'ş' | 'š' | 'ſ' | 'ș' => 's',
+        'ţ' | 'ť' | 'ŧ' | 'þ' | 'ț' => 't',
+        'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => 'u',
+        'ŵ' => 'w',
+        'ý' | 'ÿ' | 'ŷ' => 'y',
         'ź' | 'ż' | 'ž' => 'z',
         _ => return None,
     })
 }
 
 /// Reduce an arbitrary label to the character set shared by a systemd unit name and a
-/// DNS hostname label: lowercase ASCII alphanumerics and `-`. A common accented Latin letter
-/// is transliterated to its base (`café` → `cafe`); every other non-alphanumeric byte becomes
-/// a separator, runs of separators collapse, leading/trailing separators are trimmed, and the
-/// result is bounded — so a project directory with accents, spaces, dots, or other-script
-/// characters still yields a clean, valid, bounded token. An input that reduces to nothing
-/// (e.g. `/`, a name of only punctuation, or an all-CJK name) falls back to `cage`.
+/// DNS hostname label: lowercase ASCII alphanumerics and `-`. An accented Latin letter is
+/// transliterated to its base (`café` → `cafe`), whether the accent is part of the letter or a
+/// combining mark after it; every other non-alphanumeric character becomes a separator, runs of
+/// separators collapse, leading/trailing separators are trimmed, and the result is bounded — so a
+/// project directory with accents, spaces, dots, or other-script characters still yields a clean,
+/// valid, bounded token. An input that reduces to nothing (e.g. `/`, a name of only punctuation,
+/// or an all-CJK name) falls back to `cage`.
 pub(crate) fn sanitize_label(input: &str) -> String {
     let mut out = String::with_capacity(input.len().min(MAX_SLUG));
     let mut last_was_sep = true; // true so a leading separator is dropped
-    for ch in input.chars() {
+    // The combining diacritical marks go: the letter before one is already the base one.
+    let marks = '\u{300}'..='\u{36f}';
+    for ch in input.chars().filter(|ch| !marks.contains(ch)) {
         // Unicode-aware lowercase first, so an uppercase accent (`É`) folds like its lowercase
         // form (`é`); `next()` takes the base where a lowercasing expands to several chars.
         let lower = ch.to_lowercase().next().unwrap_or(ch);
@@ -155,6 +163,37 @@ mod tests {
         assert_eq!(sanitize_label("straße"), "strase");
         // A name in another script has nothing to fold, so it still falls back.
         assert_eq!(sanitize_label("プロジェクト"), "cage");
+    }
+
+    /// Every letter the fold says it covers keeps a letter, in either case.
+    #[test]
+    fn sanitize_keeps_a_letter_of_every_latin_one() {
+        let dropped: String = ('À'..='ſ')
+            .chain(['Ș', 'ș', 'Ț', 'ț'])
+            .filter(|ch| !matches!(ch, '×' | '÷'))
+            .filter(|ch| {
+                let kept = sanitize_label(&format!("1{ch}1"));
+                kept.len() != 3 || !kept.as_bytes()[1].is_ascii_lowercase()
+            })
+            .collect();
+        assert_eq!(dropped, "");
+        assert_eq!(sanitize_label("œuvre"), "ouvre");
+        assert_eq!(sanitize_label("Ærø"), "aro");
+    }
+
+    /// A name whose accents are combining marks reads as the same name with its accents part of
+    /// the letters.
+    #[test]
+    fn sanitize_reads_a_combining_accent_as_the_letter_it_is_on() {
+        for (composed, decomposed) in [
+            ("café déjà", "cafe\u{301} de\u{301}ja\u{300}"),
+            ("Ångström", "A\u{30a}ngstro\u{308}m"),
+            ("garçon", "garc\u{327}on"),
+        ] {
+            assert_eq!(sanitize_label(decomposed), sanitize_label(composed));
+        }
+        assert_eq!(sanitize_label("e\u{301}te\u{301}"), "ete");
+        assert_eq!(sanitize_label("\u{301}"), "cage");
     }
 
     #[test]
