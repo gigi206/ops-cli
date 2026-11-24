@@ -74,6 +74,19 @@ pub(crate) fn sanitize_detail(s: &str) -> String {
     out
 }
 
+/// Whether a plugin's free text shows a reader nothing once cleaned: it is empty, or made only
+/// of whitespace and of characters [`super::sanitize`] turns into blanks. Such a text is no
+/// text: joined to a detail after a separator, it would end the line on that separator with
+/// nothing visible after it.
+///
+/// Decided character by character. `str::trim` alone would keep a control character, which is not
+/// whitespace and reaches the reader as a blank all the same; the cleaned text would keep a blank
+/// longer than [`super::SANITIZED_CHARS`], since its cut ends it in `…`.
+pub(crate) fn shows_nothing(text: &str) -> bool {
+    text.chars()
+        .all(|c| c.is_whitespace() || super::observe_feed::blanked(c))
+}
+
 use crate::sandbox::locks::locked;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};

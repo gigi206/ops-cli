@@ -102,6 +102,13 @@ fn command_of(info: &ProcInfo) -> String {
 /// The most characters [`sanitize`] keeps of a value; a longer one keeps one fewer and ends in `…`.
 pub(crate) const SANITIZED_CHARS: usize = 512;
 
+/// Whether [`sanitize`] turns `c` into a space: a control character, one that reorders a line
+/// ([`crate::diag::reorders`]), or a line or paragraph separator
+/// ([`crate::diag::separates_lines`]).
+pub(crate) fn blanked(c: char) -> bool {
+    c.is_control() || crate::diag::reorders(c) || crate::diag::separates_lines(c)
+}
+
 /// Replace ASCII/Unicode control characters with a space and cap the length (on a char boundary), so
 /// the value is safe on the line-based control wire, the stderr feed, and any terminal reading
 /// either. A Linux filename may carry a newline exactly as a hostile argv can. The characters that
@@ -148,13 +155,7 @@ pub(crate) fn sanitize(s: &str) -> String {
     const MAX: usize = SANITIZED_CHARS;
     let cleaned: String = s
         .chars()
-        .map(|c| {
-            if c.is_control() || crate::diag::reorders(c) || crate::diag::separates_lines(c) {
-                ' '
-            } else {
-                c
-            }
-        })
+        .map(|c| if blanked(c) { ' ' } else { c })
         .collect();
     if cleaned.chars().count() <= MAX {
         cleaned

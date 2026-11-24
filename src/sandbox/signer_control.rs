@@ -167,7 +167,7 @@ pub(crate) fn signer_detail(
     needles: &[SecretNeedle],
 ) -> String {
     let detail = match claimed {
-        Some(c) if !c.is_empty() => format!("{signer}: {observed} — {c}"),
+        Some(c) if !super::lens::shows_nothing(c) => format!("{signer}: {observed} — {c}"),
         _ => format!("{signer}: {observed}"),
     };
     let (redacted, _) = crate::sandbox::redact::redact_string(
@@ -413,6 +413,44 @@ mod tests {
             "not even its leading bytes survive: {detail}"
         );
         assert!(detail.contains("${aws_secret}"), "{detail}");
+    }
+
+    /// A label that shows nothing once cleaned is no label: its separator would end the line with
+    /// nothing a reader can see after it. A blank, a tab and a control character are each such a
+    /// label, and the last is not whitespace. So is a blank longer than the cleaning keeps, whose
+    /// cleaned text ends in the `…` of its cut.
+    #[test]
+    fn a_label_that_shows_nothing_adds_no_separator() {
+        let ring = ring();
+        let observed = "GET s3.example.com/bucket set Authorization";
+        let long = " ".repeat(crate::sandbox::SANITIZED_CHARS + 1);
+        let blanks = ["  ", "\t", "\u{1}", long.as_str()];
+        for blank in blanks {
+            push(
+                &ring,
+                SignerKind::Sign,
+                "demo-sigv4",
+                observed,
+                Some(blank),
+                &[],
+            );
+        }
+        let wrong: Vec<String> = ring
+            .snapshot(None)
+            .events
+            .iter()
+            .zip(blanks)
+            .filter(|(event, _)| event.detail != format!("demo-sigv4: {observed}"))
+            .map(|(event, blank)| {
+                let shown: String = blank.chars().take(8).collect();
+                format!(
+                    "{} chars {shown:?}… gave {:?}",
+                    blank.chars().count(),
+                    event.detail
+                )
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
