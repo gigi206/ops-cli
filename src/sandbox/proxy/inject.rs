@@ -2459,6 +2459,26 @@ mod tests {
         );
     }
 
+    // `find_in` is where an empty needle is declined, and the walks that loop on it (the text-sink
+    // substitution, the wire's in-place mask) take their termination from that: an empty needle
+    // matching at every offset would consume nothing and never let them move on. Asked directly, so
+    // a change to it fails here rather than leaving those walks to hang.
+    #[test]
+    fn an_empty_needle_is_found_nowhere() {
+        let empty = SecretNeedle::named("test-secret", Vec::new());
+        for from in [0, 3, 6] {
+            assert_eq!(empty.find_in(b"abcdef", from), None, "from {from}");
+        }
+        assert_eq!(empty.find_in(b"", 0), None);
+        let needle = SecretNeedle::named("test-secret", b"cd".to_vec());
+        assert_eq!(needle.find_in(b"abcdef", 0), Some(2));
+        assert_eq!(
+            needle.find_in(b"abcdef", 7),
+            None,
+            "a start past the end finds nothing"
+        );
+    }
+
     /// A signer scripted to answer, so the injection path is exercised without a sandbox.
     struct FakeSigner(Result<crate::sandbox::signer::Signature, String>);
 
