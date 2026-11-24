@@ -391,6 +391,21 @@ fn split_scope(args: &[OsString]) -> Result<ScopeArgs, String> {
     })
 }
 
+/// [`split_scope`] for a verb that takes no `--trust`: every caller outside `sbx config`.
+///
+/// `--trust` is read for `sbx config set|add|rm|unset|edit`, which bless the file they write only
+/// when asked. A rule write re-trusts a project config it wrote whether asked or not, and the other
+/// callers write no file, so for them the flag asks for nothing: read and dropped, it would look as
+/// though it had been honored. It is refused in the words [`split_scope`] refuses any flag the verb
+/// does not know.
+fn split_scope_without_trust(args: &[OsString]) -> Result<ScopeArgs, String> {
+    let parsed = split_scope(args)?;
+    if parsed.trust {
+        return Err("unknown flag `--trust`".to_string());
+    }
+    Ok(parsed)
+}
+
 /// `--session` (load the rule into the live overlay of the running session(s) instead of a config
 /// file) and its `--all` scope widener, lifted out before [`split_scope`], which rejects any flag it
 /// does not know. The config-scope flags (`--local`/`--global`/`-c`) and `-a` ride that call.
@@ -466,7 +481,7 @@ fn split_one_rule(
     verb: &str,
     args: &[OsString],
 ) -> Result<(ScopeArgs, String), ExitCode> {
-    let parsed = match split_scope(args) {
+    let parsed = match split_scope_without_trust(args) {
         Ok(p) => p,
         Err(e) => {
             diag::error(&format!("sbx: {e}"));

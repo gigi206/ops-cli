@@ -15,7 +15,7 @@ use crate::{
     asked_sessions, config_cwd, egress_dir_or_fail, egress_write_target, in_scope,
     interval_seconds, pending_session_context, persist_egress_rule, precheck_local_save,
     say_unread_registry, session, session_app_of, session_pids_for_app, session_pids_for_project,
-    split_scope,
+    split_scope_without_trust,
 };
 use crate::{config, diag, help, sandbox, style};
 
@@ -605,7 +605,7 @@ pub(super) fn net_pending_answer(
     // unambiguous (it can never answer one project's requests into another's config). Without `--save`,
     // a scope flag is meaningless (there is no file to write), so it is refused.
     if all {
-        let parsed = match split_scope(&rest) {
+        let parsed = match split_scope_without_trust(&rest) {
             Ok(p) => p,
             Err(e) => {
                 diag::error(&format!("sbx: {e}"));
@@ -636,7 +636,7 @@ pub(super) fn net_pending_answer(
         }
         return net_pending_answer_all(verdict, session, parsed.app.as_deref());
     }
-    let parsed = match split_scope(&rest) {
+    let parsed = match split_scope_without_trust(&rest) {
         Ok(p) => p,
         Err(e) => {
             diag::error(&format!("sbx: {e}"));

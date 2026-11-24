@@ -168,6 +168,44 @@ fn a_verb_taking_a_path_still_refuses_an_unknown_flag() {
     }
 }
 
+/// Verbs that read the scope flags and have no use for `--trust`, one per reader of them.
+///
+/// `--trust` belongs to `sbx config set|add|rm|unset|edit`, which bless a file only when asked; a
+/// rule write re-trusts the project config it wrote on its own, and the others write no file. None
+/// of these answers or writes anything once it has refused, so a verb that dropped the flag would
+/// write into the throwaway home at most.
+const VERBS_THAT_TAKE_NO_TRUST: &[&[&str]] = &[
+    // The single-rule front of the three rule families, on its add and its remove path.
+    &["fs", "deny", "prod.key"],
+    &["fs", "undeny", "prod.key"],
+    &["net", "allow", "a.example"],
+    &["proc", "deny", "curl"],
+    // The live overlay listing.
+    &["proc", "rules"],
+    // An answer to every parked request, and one to a single request by its id.
+    &["net", "pending", "allow", "--all"],
+    &["net", "pending", "allow", "999999.1"],
+];
+
+#[test]
+fn a_verb_outside_config_refuses_trust() {
+    let home = TmpDir::new("argv");
+    let mut accepted = Vec::new();
+    for verb in VERBS_THAT_TAKE_NO_TRUST {
+        let mut args = verb.to_vec();
+        args.push("--trust");
+        let (code, out) = run(&args, home.path());
+        if !(refused(code, &out) && out.contains("`--trust`")) {
+            accepted.push(format!("sbx {} (exit {code})\n{out}", args.join(" ")));
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "these verbs took `--trust` and dropped it:\n{}",
+        accepted.join("\n")
+    );
+}
+
 #[test]
 fn no_read_only_verb_accepts_a_surplus_argument() {
     let home = TmpDir::new("argv");

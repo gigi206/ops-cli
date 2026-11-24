@@ -15,7 +15,7 @@ use crate::{
     ALL_NEEDS_SESSION, SESSION_IGNORES_FILE_SCOPE, ScopeFilter, egress_dir_or_fail,
     format_log_time, in_scope, interval_seconds, persist_proc_rule, pids_of_app,
     removal_takes_no_session_flags, report_rule_write, resolve_session_target, session_scope_pids,
-    sessions_of_project, split_one_rule, split_scope, split_session_flags,
+    sessions_of_project, split_one_rule, split_scope_without_trust, split_session_flags,
 };
 use crate::{
     config, config_cwd, diag, help, layout_or_fail, live_sessions, observe, proc_policy, sandbox,
@@ -298,7 +298,7 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
         .filter(|a| a.to_str() != Some("--all"))
         .cloned()
         .collect();
-    let parsed = match split_scope(&rest) {
+    let parsed = match split_scope_without_trust(&rest) {
         Ok(p) => p,
         Err(e) => {
             diag::error(&format!("sbx: {e}"));
