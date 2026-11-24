@@ -564,14 +564,12 @@ mod tests {
     /// whole.
     #[test]
     fn an_exported_group_fragment_lands_whole_in_a_destination_directory_that_did_not_exist() {
-        let name = format!("sbx-net-groups-export-{}", std::process::id());
-        let base = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_dir_all(&base);
+        let base = crate::testutil::TmpDir::new();
         let dir = base.join("2026-08");
         let path = dir.join("groups.toml");
         let fragment = "entries = [\"api.test\"]\n";
 
-        let _ = write_group_file(&path, "ci", fragment);
+        let code = write_group_file(&path, "ci", fragment);
 
         let written = std::fs::read_to_string(&path);
         // What the destination directory holds afterwards: the export and nothing else — the
@@ -584,8 +582,12 @@ mod tests {
             Err(_) => Vec::new(),
         };
         left.sort();
-        let _ = std::fs::remove_dir_all(&base);
 
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "a fragment that landed is reported as exported"
+        );
         assert_eq!(
             written.ok().as_deref(),
             Some(fragment),
