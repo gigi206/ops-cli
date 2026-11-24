@@ -10,15 +10,17 @@
 //!
 //! Security mirrors the exec control socket exactly. The socket is bound under the `0700` data dir and
 //! is **never** bound into the cage: in Mode B the in-cage agent is the adversary, so it must not reach
-//! the socket that records what it writes. The ring is never written to disk and never crosses into the
-//! cage; it is the supervisor's owner-only RAM for the session's lifetime and dies with it.
+//! the socket that records what it writes. The ring never crosses into the cage: it is the
+//! supervisor's owner-only RAM for the session's lifetime and dies with it, and a launch that keeps a
+//! record writes the same events, redacted, to an owner-only file beside the socket
+//! ([`super::lens::Recorder`]).
 //!
 //! The wire protocol is line-based and minimal (one command per connection): `LOG` returns the retained
 //! events (a `dropped=` line when a `--follow` cursor fell behind the ring, a `head=` cursor, then one
 //! `event …` line each) then `ok`; `LOG after=<seq>` returns only events past that cursor. A path
 //! carries spaces (and a Linux filename may even carry a newline), so it is emitted **last** on an event
-//! line and taken verbatim by the reader; the watcher sanitises it of control characters, so it can
-//! never inject a second line.
+//! line and taken verbatim by the reader; [`FsRing::push`] sanitises it of control characters, so it
+//! can never inject a second line.
 
 use std::io;
 use std::os::unix::net::UnixListener;
@@ -66,7 +68,7 @@ impl FsKind {
 
 /// One observed filesystem event: a path in the cage's project tree that changed, as the supervisor's
 /// inotify watch saw it. `path` is project-relative and already sanitised of control characters and
-/// length-capped by the watcher — so it is safe to carry on the line-based wire and to print.
+/// length-capped by [`FsRing::push`] — so it is safe to carry on the line-based wire and to print.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FsEvent {
     pub(crate) seq: u64,
@@ -83,8 +85,8 @@ impl super::lens::Event for FsEvent {
     }
 
     /// The fixed fields are `key=value` tokens; `path` is emitted **last** and taken verbatim by the
-    /// reader (the path carries spaces). The watcher has stripped control characters from the path,
-    /// so it cannot inject a second line.
+    /// reader (the path carries spaces). [`FsRing::push`] has stripped control characters from the
+    /// path, so it cannot inject a second line.
     fn format_line(&self) -> String {
         format!(
             "event seq={} at={} kind={} path={}\n",
@@ -135,14 +137,20 @@ impl FsRing {
         self
     }
 
-    /// Append one observed change. `path` must already be sanitised of control characters and
-    /// length-capped by the caller. Returns the assigned sequence number.
+    /// Append one observed change, its path cleaned and capped by [`super::sanitize`] on the way in.
+    /// Returns the assigned sequence number.
+    ///
+    /// This is the one door an event comes in by, as each lens's `push` is for its own: a path is the
+    /// cage's to choose, and a Linux name may carry a newline that would write a second wire line,
+    /// an escape that drives the terminal reading it, or a character that turns that line around.
     pub(crate) fn push(&self, kind: FsKind, path: &str) -> u64 {
-        self.0.push_with(|seq, at_epoch_ms| FsEvent {
+        // Cleaned before rather than in here: `push_with` runs its closure under the ring's lock.
+        let path = super::sanitize(path);
+        self.0.push_with(move |seq, at_epoch_ms| FsEvent {
             seq,
             at_epoch_ms,
             kind,
-            path: path.to_string(),
+            path,
         })
     }
 }
@@ -202,6 +210,25 @@ mod tests {
         assert_eq!(snap.events[0].path, "src/main.rs");
         assert_eq!(snap.events[1].kind, FsKind::Create);
         assert_eq!(snap.events[1].path, "src/new.rs");
+    }
+
+    /// Whoever pushes, the path that lands in the ring is the cleaned one: it can neither write a
+    /// second line on the wire nor drive or reorder the terminal that prints it.
+    #[test]
+    fn a_path_is_cleaned_at_the_rings_door() {
+        let ring = FsRing::new(10);
+        let raw = "evil\n\u{1b}[31mred\u{202e}txt.sh\u{2028}end";
+        ring.push(FsKind::Write, raw);
+        let snap = ring.snapshot(None);
+        assert_eq!(snap.events[0].path, super::super::sanitize(raw));
+        assert!(
+            !snap.events[0]
+                .path
+                .chars()
+                .any(super::super::observe_feed::blanked),
+            "{:?}",
+            snap.events[0].path
+        );
     }
 
     #[test]

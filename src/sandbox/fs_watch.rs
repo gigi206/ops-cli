@@ -579,12 +579,11 @@ fn classify(mask: u32) -> Class {
     }
 }
 
-/// Push one project-relative change into the ring, sanitised of control characters and length-capped
-/// (a Linux filename may carry a newline, which would otherwise inject a second line on the control
-/// wire — the same protection the exec feed applies to a command).
+/// Push one project-relative change into the ring, which cleans and caps the path on the way in
+/// ([`FsRing::push`]): a Linux filename may carry a newline, which would otherwise inject a second
+/// line on the control wire.
 fn push_rel(ring: &FsRing, rel: &Path, kind: FsKind) {
-    let s = super::observe_feed::sanitize(&rel.to_string_lossy());
-    ring.push(kind, &s);
+    ring.push(kind, &rel.to_string_lossy());
 }
 
 /// The size of the fixed inotify event header; the variable-length name follows it in the read buffer.
@@ -674,9 +673,9 @@ mod tests {
     }
 
     /// A filename is the cage's to choose, and Linux lets it carry a newline, an escape sequence, a
-    /// character that turns a line around or a line separator. [`push_rel`] blanks each before the
-    /// ring, and the readers downstream of it (the control wire, the record, `sbx fs logs`) print
-    /// the path as it arrives.
+    /// character that turns a line around or a line separator. The ring blanks each as the watcher
+    /// pushes ([`FsRing::push`]), and the readers downstream of it (the control wire, the record,
+    /// `sbx fs logs`) print the path as it arrives.
     #[test]
     fn a_name_the_cage_chose_reaches_the_ring_cleaned() {
         let dir = TmpDir::new();
