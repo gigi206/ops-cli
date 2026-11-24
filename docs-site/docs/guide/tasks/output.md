@@ -20,9 +20,11 @@ benign text and leak the value through the positions of its own placeholders. Th
 unless a trusted layer set [`[redact] min_len`](../secrets/redaction#the-length-floor), and it is the
 same one the egress tripwires use, so a value watched for on the wire is watched for here too. A
 spelling left below the floor is named at launch: the command still receives the credential, and it
-would otherwise look substituted without being. Substitution runs on bytes, longest
-needle first (a value containing another is named after the longest match), left to
-right without overlap; an empty needle is declined rather than matched everywhere.
+would otherwise look substituted without being. Substitution runs on bytes, in one walk left to
+right without overlap: the occurrence that starts first is replaced, and of two that start on the
+same byte the longer, so a value containing another is named after the whole of it. What a
+substitution wrote is never scanned again, and an empty needle is declined rather than matched
+everywhere.
 
 The refusal paths are on that list because they are text the **command** composed rather than text it
 printed: a program name is chosen by whoever calls `execve`, so a command that built one out of its

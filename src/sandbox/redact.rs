@@ -65,9 +65,16 @@ impl Placeholder {
 /// Operates on **bytes**, never on a lossily-decoded string: a command's output is arbitrary bytes,
 /// and decoding first could split a value across a replacement character and hide it from the scan.
 ///
-/// Needles are applied **longest first**, so a value that contains another (a plaintext and an
-/// encoding of it that share a prefix, two credentials where one is a substring of the other) is
-/// named after the longest match rather than being broken up by a shorter one.
+/// One walk, left to right: from where it stands it takes the occurrence that starts first, and of
+/// those that start on the same byte the longest. So a value that contains another (a plaintext and
+/// an encoding of it that share a prefix, two credentials where one is a substring of the other) is
+/// named after the whole of it rather than being broken up by the shorter one.
+///
+/// Every occurrence is searched for in the **input**, and the output is written as the walk goes:
+/// nothing it wrote is scanned again, neither a placeholder nor the bytes on either side of one, and
+/// the count is of occurrences the producer really printed. A value may spell part of a
+/// placeholder, a name and a `}` say, and scanning the rewritten text would break that placeholder
+/// and count a match nobody printed.
 ///
 /// Every needle handed in is substituted: the length floor is applied where a needle is built (see
 /// [`MIN_LEN_DEFAULT`]), so a set that reached here is one this sink and the wire agree on.
@@ -81,37 +88,42 @@ pub(crate) fn redact_named(
     needles: &[SecretNeedle],
     placeholder: &Placeholder,
 ) -> (Vec<u8>, usize) {
-    // Longest first. Sorting borrowed references keeps the caller's needle set untouched.
-    let mut order: Vec<&SecretNeedle> = needles.iter().collect();
-    order.sort_by_key(|n| std::cmp::Reverse(n.as_bytes().len()));
-
-    let mut out = buf.to_vec();
+    let rendered: Vec<Vec<u8>> = needles
+        .iter()
+        .map(|n| placeholder.render(n.name()).into_bytes())
+        .collect();
+    // Each needle's next occurrence at or after the walk, searched for again only once the walk has
+    // gone past it. An empty needle has none: `find_in` declines it, so the walk cannot stall on it.
+    let mut ahead: Vec<Option<usize>> = needles.iter().map(|n| n.find_in(buf, 0)).collect();
+    let mut out = Vec::with_capacity(buf.len());
     let mut count = 0;
-    for needle in order {
-        // A needle that does not occur is skipped rather than rebuilt around: the loop below would
-        // allocate a second full-size buffer, copy the whole of `out` into it and free the original
-        // to produce byte-identical bytes, once per needle. The usual case is that none of a
-        // launch's needles appears in the output at all, so this is the path that runs. An empty
-        // needle lands here too — `find_in` declines it — which is where its termination now comes
-        // from.
-        if needle.find_in(&out, 0).is_none() {
-            continue;
+    let mut i = 0;
+    loop {
+        let mut best: Option<(usize, usize)> = None;
+        for (k, needle) in needles.iter().enumerate() {
+            if ahead[k].is_some_and(|at| at < i) {
+                ahead[k] = needle.find_in(buf, i);
+            }
+            let Some(at) = ahead[k] else { continue };
+            let first = match best {
+                None => true,
+                Some((best_at, best_k)) => {
+                    at < best_at
+                        || (at == best_at
+                            && needle.as_bytes().len() > needles[best_k].as_bytes().len())
+                }
+            };
+            if first {
+                best = Some((at, k));
+            }
         }
-        let len = needle.as_bytes().len();
-        let replacement = placeholder.render(needle.name()).into_bytes();
-        let mut next = Vec::with_capacity(out.len());
-        // Left to right, non-overlapping: a match is replaced and the search resumes past it, so a
-        // needle cannot match inside the placeholder its own occurrence just produced.
-        let mut i = 0;
-        while let Some(at) = needle.find_in(&out, i) {
-            next.extend_from_slice(&out[i..at]);
-            next.extend_from_slice(&replacement);
-            i = at + len;
-            count += 1;
-        }
-        next.extend_from_slice(&out[i..]);
-        out = next;
+        let Some((at, k)) = best else { break };
+        out.extend_from_slice(&buf[i..at]);
+        out.extend_from_slice(&rendered[k]);
+        i = at + needles[k].as_bytes().len();
+        count += 1;
     }
+    out.extend_from_slice(&buf[i..]);
     (out, count)
 }
 
@@ -165,8 +177,8 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    // Longest-first matters: when one needle contains another, the containing value must be named
-    // as a whole instead of being cut apart by the shorter one.
+    // The longest match wins where two start together: when one needle contains another, the
+    // containing value must be named as a whole instead of being cut apart by the shorter one.
     #[test]
     fn a_longer_needle_wins_over_a_contained_shorter_one() {
         let needles = vec![
@@ -178,6 +190,25 @@ mod tests {
             out, b"v=${long}",
             "the longest match names the value; the shorter needle must not fragment it"
         );
+    }
+
+    // A placeholder already written is not text a later needle may match in. A value that spells
+    // part of another credential's placeholder (here its name and the closing brace) is substituted
+    // where it occurs in the output, and never inside a placeholder the walk wrote, which would
+    // break that placeholder and count an occurrence the output never held.
+    #[test]
+    fn a_placeholder_already_written_is_not_scanned_again() {
+        let needles = vec![
+            needle("gh_token", "ghp-abcdefgh"),
+            needle("odd", "gh_token}"),
+        ];
+        let (out, count) = redact_named(
+            b"tok=ghp-abcdefgh and gh_token}",
+            &needles,
+            &Placeholder::Plain,
+        );
+        assert_eq!(out, b"tok=${gh_token} and ${odd}");
+        assert_eq!(count, 2);
     }
 
     // The length floor belongs to the builders, not here: a short needle that was admitted (a
