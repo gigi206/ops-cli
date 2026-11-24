@@ -211,6 +211,16 @@ mod tests {
         assert_eq!(count, 2);
     }
 
+    // Where two values overlap without one containing the other, the walk names the one that starts
+    // first and moves on past it; what it did not cover of the other stays as it was printed.
+    #[test]
+    fn of_two_overlapping_values_the_one_that_starts_first_is_named() {
+        let needles = vec![needle("long", "ABCDEFGHIJ"), needle("early", "xxABCDEF")];
+        let (out, count) = redact_named(b"v=xxABCDEFGHIJ", &needles, &Placeholder::Plain);
+        assert_eq!(out, b"v=${early}GHIJ");
+        assert_eq!(count, 1);
+    }
+
     // The length floor belongs to the builders, not here: a short needle that was admitted (a
     // launch that lowered `[redact] min_len`) is substituted like any other, rather than being
     // silently declined by a second threshold this sink would apply on its own.
