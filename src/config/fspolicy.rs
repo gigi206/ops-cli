@@ -90,21 +90,9 @@ impl FsPolicy {
     /// remove one, so a project (or an app) folded onto the global config can only close more of
     /// the tree than the layer below it did.
     pub(crate) fn union(&mut self, extra: FsPolicy) {
-        for entry in extra.deny {
-            if !self.deny.contains(&entry) {
-                self.deny.push(entry);
-            }
-        }
-        for entry in extra.readonly {
-            if !self.readonly.contains(&entry) {
-                self.readonly.push(entry);
-            }
-        }
-        for entry in extra.scan {
-            if !self.scan.contains(&entry) {
-                self.scan.push(entry);
-            }
-        }
+        union_entries(&mut self.deny, extra.deny);
+        union_entries(&mut self.readonly, extra.readonly);
+        union_entries(&mut self.scan, extra.scan);
         // The **larger** window wins, which is the tighter policy for this field however it reads.
         //
         // `scan_max_kb` is how many bytes of a file the content lens examines before letting the
@@ -134,6 +122,22 @@ impl FsPolicy {
             self.git_writable = extra.git_writable;
         }
     }
+}
+
+/// Append to `list` each entry of `extra` it does not hold yet, in order.
+///
+/// Through a set rather than a search per entry: any project may fill these lists up to the size a
+/// config file may have, and a search per entry made every command in its directory wait on the
+/// square of their count.
+pub(super) fn union_entries(list: &mut Vec<String>, extra: Vec<String>) {
+    let mut seen: std::collections::HashSet<&str> = list.iter().map(String::as_str).collect();
+    let fresh: Vec<bool> = extra.iter().map(|entry| seen.insert(entry)).collect();
+    list.extend(
+        extra
+            .into_iter()
+            .zip(fresh)
+            .filter_map(|(entry, fresh)| fresh.then_some(entry)),
+    );
 }
 
 /// Validate one mask entry lexically and return it normalised, or the reason it was refused.
@@ -197,11 +201,11 @@ pub(crate) fn validate_entry(entry: &str) -> Result<String, String> {
     }
     let parts: Vec<&str> = body.split('/').collect();
     for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() || *part == "." {
+        if part.is_empty() {
             return Err("has an empty path component".to_string());
         }
-        if *part == ".." {
-            return Err("must not contain a `..` component".to_string());
+        if *part == "." || *part == ".." {
+            return Err(format!("must not contain a `{part}` component"));
         }
         let last = i + 1 == parts.len();
         if !last && has_wildcard(part) {
@@ -399,6 +403,13 @@ mod tests {
         assert!(validate_entry("/").unwrap_err().contains("relative"));
         assert!(validate_entry("./").unwrap_err().contains("project root"));
         assert!(validate_entry("a//b").unwrap_err().contains("empty path"));
+        for (entry, component) in [("a/./b", "`.`"), ("a/../b", "`..`"), ("././a", "`.`")] {
+            assert_eq!(
+                validate_entry(entry).unwrap_err(),
+                format!("must not contain a {component} component"),
+                "{entry}"
+            );
+        }
     }
 
     #[test]

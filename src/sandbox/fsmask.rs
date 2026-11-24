@@ -54,7 +54,7 @@ use super::binds::ExtraBind;
 use super::spec::Mount;
 use crate::config::fspolicy::{FsPolicy, has_wildcard, matches_component};
 use crate::diag::visible;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -580,28 +580,25 @@ fn expand_against(
     //
     // One warning per config *entry*, not per path: a `deny = ["secrets/", "secrets/*.key"]` should
     // say one thing, not one thing per key.
-    let denied_dirs: Vec<PathBuf> = out
+    let denied_dirs: HashSet<PathBuf> = out
         .denied
         .iter()
         .filter(|m| m.is_dir)
         .map(|m| m.path.clone())
         .collect();
-    let denied_paths: BTreeSet<PathBuf> = out.denied.iter().map(|m| m.path.clone()).collect();
+    let denied_paths: HashSet<PathBuf> = out.denied.iter().map(|m| m.path.clone()).collect();
     let mut covered: Vec<(&str, String)> = Vec::new();
+    let mut told: HashSet<(&str, String)> = HashSet::new();
     out.denied.retain(|m| {
-        let hit = denied_dirs
-            .iter()
-            .any(|d| *d != m.path && m.path.starts_with(d));
-        if hit && !covered.contains(&("deny", m.pattern.clone())) {
+        let hit = m.path.ancestors().skip(1).any(|a| denied_dirs.contains(a));
+        if hit && told.insert(("deny", m.pattern.clone())) {
             covered.push(("deny", m.pattern.clone()));
         }
         !hit
     });
     out.readonly.retain(|ro| {
-        let hit = denied_paths
-            .iter()
-            .any(|d| ro.path == *d || ro.path.starts_with(d));
-        if hit && !covered.contains(&("readonly", ro.pattern.clone())) {
+        let hit = ro.path.ancestors().any(|a| denied_paths.contains(a));
+        if hit && told.insert(("readonly", ro.pattern.clone())) {
             covered.push(("readonly", ro.pattern.clone()));
         }
         !hit
@@ -712,31 +709,19 @@ fn expand_against(
 /// command this reaches is `submodule absorbgitdirs`, which moves a submodule's repository into a
 /// held `.git` and is refused with nothing changed.
 fn holding_dirs(expanded: &Expanded) -> Vec<PathBuf> {
-    let read_only_dirs: Vec<&Path> = expanded
+    let read_only_dirs: HashSet<&Path> = expanded
         .readonly
         .iter()
         .filter(|m| m.is_dir)
         .map(|m| m.path.as_path())
         .collect();
+    let reopened: HashSet<&Path> = expanded.reopened.iter().map(PathBuf::as_path).collect();
     // Read-only when the deepest of the read-only directories and the reopened repositories above
-    // it, itself included, is a read-only one.
+    // it, itself included, is a read-only one, a directory that is both being read-only.
     let read_only = |dir: &Path| {
-        let depth = |at: &Path| at.components().count();
-        let held = read_only_dirs
-            .iter()
-            .filter(|ro| dir.starts_with(ro))
-            .map(|ro| depth(ro))
-            .max();
-        let open = expanded
-            .reopened
-            .iter()
-            .filter(|open| dir.starts_with(open))
-            .map(|open| depth(open))
-            .max();
-        match (held, open) {
-            (Some(held), Some(open)) => held >= open,
-            (held, _) => held.is_some(),
-        }
+        dir.ancestors()
+            .find(|at| read_only_dirs.contains(at) || reopened.contains(at))
+            .is_some_and(|at| read_only_dirs.contains(at))
     };
     let mut pins: BTreeSet<PathBuf> = BTreeSet::new();
     for m in expanded.denied.iter().chain(&expanded.readonly) {
@@ -749,7 +734,7 @@ fn holding_dirs(expanded: &Expanded) -> Vec<PathBuf> {
             .skip(1)
             .take_while(|d| *d != root && d.starts_with(root))
         {
-            if !read_only(dir) && !expanded.reopened.iter().any(|open| open == dir) {
+            if !read_only(dir) && !reopened.contains(dir) {
                 pins.insert(dir.to_path_buf());
             }
         }
@@ -3524,6 +3509,9 @@ fn resolve_list(
     refused: &mut Option<String>,
 ) -> Vec<Masked> {
     let mut out: Vec<Masked> = Vec::new();
+    // The paths of `out`, so that a wildcard over a directory the cage filled is not a search
+    // through every path before each one.
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     for entry in entries {
         let dir_only = entry.ends_with('/');
         let body = entry.trim_end_matches('/');
@@ -3612,7 +3600,7 @@ fn resolve_list(
                 Ok(Some(masked)) => {
                     matched += 1;
                     // A path already covered by an earlier entry needs no second mount.
-                    if !out.iter().any(|m| m.path == masked.path) {
+                    if seen.insert(masked.path.clone()) {
                         out.push(masked);
                     }
                 }
@@ -3784,7 +3772,10 @@ fn guard_git_tracked(root: &Path, denied: &[Masked], warnings: &mut Vec<String>)
         let Some(rel) = rel.to_str() else { continue };
         let hit = if m.is_dir {
             let prefix = format!("{rel}/");
-            tracked.iter().any(|t| t.starts_with(&prefix))
+            tracked
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|t| t.starts_with(&prefix))
         } else {
             tracked.contains(rel)
         };
@@ -4592,6 +4583,49 @@ mod tests {
             deny: deny.iter().map(|s| s.to_string()).collect(),
             readonly: readonly.iter().map(|s| s.to_string()).collect(),
             ..FsPolicy::default()
+        }
+    }
+
+    /// What a wildcard names is weighed before the ceiling refuses it, and the cage may have filled
+    /// the directory it reads: the launch waits for the paths to be counted, not for each of them
+    /// to be searched for among the others. A path under a denied directory still costs nothing.
+    ///
+    /// The bound is far above what the counting takes and far below what a search per path does.
+    #[test]
+    fn a_wildcard_over_a_directory_the_cage_filled_is_weighed_without_a_search_per_path() {
+        const FILLED: usize = 10_000;
+        let tmp = TmpDir::new();
+        let root = project(&tmp).canonicalize().unwrap();
+        for dir in ["files", "dirs"] {
+            std::fs::create_dir(root.join(dir)).unwrap();
+        }
+        for i in 0..FILLED {
+            std::fs::write(root.join(format!("files/{i}")), b"").unwrap();
+            std::fs::create_dir(root.join(format!("dirs/{i}"))).unwrap();
+        }
+        let (files, dirs) = (&["files/*"][..], &["dirs/*"][..]);
+        for (deny, readonly, masks) in [
+            (files, &[][..], FILLED),
+            (dirs, &[][..], FILLED),
+            (&[][..], files, FILLED),
+            (&[][..], dirs, FILLED),
+            (files, dirs, 2 * FILLED),
+            (&["dirs/", "dirs/*"][..], &["dirs/*"][..], 1),
+        ] {
+            let started = Instant::now();
+            let e = expand(&root, &policy(deny, readonly), &[], None);
+            let took = started.elapsed();
+            let found = e.denied.len() + e.readonly.iter().filter(|m| !m.builtin).count();
+            assert_eq!(found, masks, "deny {deny:?}, readonly {readonly:?}");
+            assert_eq!(
+                e.refused.is_some_and(|why| why.contains("is the ceiling")),
+                masks > MASK_MAX,
+                "deny {deny:?}, readonly {readonly:?}"
+            );
+            assert!(
+                took < Duration::from_secs(10),
+                "deny {deny:?}, readonly {readonly:?}: {took:?}"
+            );
         }
     }
 

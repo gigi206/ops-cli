@@ -2672,7 +2672,12 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
         body_max_mb: None,
         ca_roots: None,
     });
-    let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
+    let moot = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
+    assert!(
+        matches!(&moot, NetworkPolicy::Allowlist(p)
+            if p.default_action() == DefaultAction::Deny && p.ask_timeout().is_none()),
+        "a moot timeout is not kept: {moot:?}"
+    );
     assert!(
         w.iter().any(|m| m.contains("ask_timeout")),
         "a moot timeout must warn: {w:?}"
@@ -2750,7 +2755,12 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
         body_max_mb: None,
         ca_roots: None,
     });
-    let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
+    let moot = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
+    assert!(
+        matches!(&moot, NetworkPolicy::Allowlist(p)
+            if p.default_action() == DefaultAction::Deny && p.ask_notice()),
+        "a moot ask_notice is not kept: {moot:?}"
+    );
     assert!(
         w.iter().any(|m| m.contains("ask_notice")),
         "a moot ask_notice must warn: {w:?}"
@@ -8296,6 +8306,26 @@ fn a_project_can_never_reopen_what_the_global_layer_closed() {
         vec!["Cargo.lock".to_string()],
         "still closed"
     );
+}
+
+/// A project nobody approved may fill its `[fs]` lists to the size a config file may have, and what
+/// the load does with them is then what every command in its directory waits for. The lists are
+/// folded, within a layer and across two, each entry once and in the order it was written.
+///
+/// The bound is far above what the fold takes and far below what a search per entry does.
+#[test]
+fn fs_lists_filled_to_the_config_ceiling_are_folded_without_a_search_per_entry() {
+    let names: Vec<String> = (0..60_000).map(|i| format!("e{i}")).collect();
+    let twice: Vec<&str> = names.iter().chain(&names).map(String::as_str).collect();
+    let started = std::time::Instant::now();
+    let r = resolve_no_plugins(
+        raw_fs(&twice, &twice),
+        Some((raw_fs(&twice, &twice), TrustState::Untrusted)),
+    );
+    let took = started.elapsed();
+    assert!(r.fs.deny == names, "{} kept", r.fs.deny.len());
+    assert!(r.fs.readonly == names, "{} kept", r.fs.readonly.len());
+    assert!(took < std::time::Duration::from_secs(20), "{took:?}");
 }
 
 #[test]

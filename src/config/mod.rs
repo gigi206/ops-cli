@@ -3542,10 +3542,10 @@ fn apply_fs(
     ]
     .map(|(f, e, o)| (f, e.clone(), o))
     {
+        let mut kept = Vec::new();
         for entry in entries {
             match fspolicy::validate_entry(&entry) {
-                Ok(ok) if out.contains(&ok) => {}
-                Ok(ok) => out.push(ok),
+                Ok(ok) => kept.push(ok),
                 Err(reason) => unapplied(format!(
                     "{source}: cannot apply `[fs] {field}` entry `{}` ({reason}), and a launch \
                      stops rather than leave that path open to the cage",
@@ -3553,11 +3553,12 @@ fn apply_fs(
                 )),
             }
         }
+        fspolicy::union_entries(out, kept);
     }
+    let mut kept = Vec::new();
     for entry in raw.scan {
         match crate::open_policy::validate_pattern(&entry) {
-            Ok(()) if policy.scan.contains(&entry) => {}
-            Ok(()) => policy.scan.push(entry),
+            Ok(()) => kept.push(entry),
             // The reason may be the regex library's drawing, over several lines: folded, so the
             // refusal reads as the one line it is.
             Err(reason) => unapplied(format!(
@@ -3568,6 +3569,7 @@ fn apply_fs(
             )),
         }
     }
+    fspolicy::union_entries(&mut policy.scan, kept);
     // Each pattern compiles on its own above; the *set* has its own ceiling, and only building it
     // answers whether this layer's list clears it. It is built here, per layer, so the refusal
     // names the layer whose list does not fit. `[fs]` is the one table an untrusted project may
