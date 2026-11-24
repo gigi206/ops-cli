@@ -244,10 +244,18 @@ fn pump_until_exit(
         // stdin -> pending input. When the user's stdin ends, stop reading it but keep passing on
         // what waits and relaying the master until the child exits.
         if fds[0].fd >= 0 && fds[0].revents != 0 {
+            // No more than there is room for, so that what is read is kept and the rest waits on
+            // the terminal. A graphical cage's input is read whatever the room, for the double
+            // Ctrl+C in it.
+            let room = PENDING_INPUT_MAX.saturating_sub(pending.len());
+            let most = match gui {
+                true => buf.len(),
+                false => buf.len().min(room),
+            };
             // SAFETY: fd 0 is the process's own stdin, which the relay never closes — an EOF
-            // neutralizes only the `pollfd` entry — and `buf` is a live stack array bounded by its
-            // own length.
-            let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+            // neutralizes only the `pollfd` entry — and `buf` is a live stack array no shorter than
+            // `most`.
+            let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), most) };
             if n > 0 {
                 let chunk = &buf[..n as usize];
                 // A graphical app ignores the forwarded SIGINT, so a single Ctrl+C does nothing and
@@ -272,8 +280,8 @@ fn pump_until_exit(
                         CtrlC::None => {}
                     }
                 }
-                // Every byte above was looked at for the double Ctrl+C; what is kept is what fits.
-                let room = PENDING_INPUT_MAX.saturating_sub(pending.len());
+                // Every byte above was looked at for the double Ctrl+C; what is kept is what fits,
+                // which outside a graphical cage is all of it.
                 pending.extend_from_slice(&chunk[..chunk.len().min(room)]);
                 if chunk.len() > room && !said_dropped {
                     said_dropped = true;
@@ -422,7 +430,9 @@ fn retryable(e: &io::Error) -> bool {
 }
 
 /// Write the whole buffer, retrying short writes and interrupts, and waiting out a descriptor
-/// another program left non-blocking ([`retryable`]) until it takes more.
+/// another program left non-blocking ([`retryable`]) until it takes more. A write that takes
+/// nothing and gives no reason is an error, as it is for the standard library: tried again, it
+/// would spin.
 pub(crate) fn write_all(fd: libc::c_int, mut buf: &[u8]) -> io::Result<()> {
     while !buf.is_empty() {
         // SAFETY: `fd` is a descriptor the caller keeps open across the call, and the
@@ -446,6 +456,9 @@ pub(crate) fn write_all(fd: libc::c_int, mut buf: &[u8]) -> io::Result<()> {
                 continue;
             }
             return Err(e);
+        }
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
         }
         buf = &buf[n as usize..];
     }
@@ -1453,6 +1466,91 @@ mod tests {
         );
     }
 
+    /// What is typed past what the relay holds waits on the terminal and is not lost: a child that
+    /// takes its input late takes every byte of it. Only a graphical cage drops any, and says so.
+    #[test]
+    fn a_child_that_reads_late_takes_all_that_was_typed() {
+        let mut term = OnTerminal::start(concat!(
+            module_path!(),
+            "::a_relay_under_a_child_that_reads_late"
+        ));
+        let ran = term.hear(b"ready", 1, Duration::from_secs(10));
+        let bytes = 4 * PENDING_INPUT_MAX;
+        let typed = term
+            .flood(b'a', bytes, Duration::from_secs(10))
+            .join()
+            .expect("the flood");
+        let sent = term
+            .flood(b'z', 1, Duration::from_secs(10))
+            .join()
+            .expect("the last byte");
+        let told = term.hear(b"taken.", 1, Duration::from_secs(10));
+        let ending = term.end(None, Duration::from_secs(10));
+        let errors = &ending.errors;
+        let seen = String::from_utf8_lossy(&term.seen).into_owned();
+        assert!(ran, "the relay never ran: {errors}");
+        assert_eq!(
+            (typed, sent),
+            (bytes, 1),
+            "the flood never went in: {errors}"
+        );
+        assert!(
+            told,
+            "the child never met the last byte typed: {seen} {errors}"
+        );
+        assert!(
+            seen.contains(&format!("took={bytes:08} taken.")),
+            "of {bytes} bytes typed the child took: {seen} {errors}"
+        );
+        assert!(!errors.contains("dropped"), "{errors}");
+    }
+
+    /// The child that takes its input late: it takes the pty as its terminal, in raw mode so what
+    /// is typed is not dropped at a line's end, reads nothing for a second while the flood fills
+    /// what the relay holds, then counts what it reads up to a `z` and says how much that was.
+    fn reads_late(slave: libc::c_int) -> std::convert::Infallible {
+        // SAFETY: `login_tty`, `tcgetattr`, `cfmakeraw`, `tcsetattr`, `write`, `sleep`, `alarm`,
+        // `read` and `_exit` are async-signal-safe or pure, on a local `termios`, stack arrays and
+        // constant bytes; nothing here allocates.
+        unsafe {
+            if libc::login_tty(slave) == 0 {
+                let mut raw: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(0, &mut raw) == 0 {
+                    libc::cfmakeraw(&mut raw);
+                    libc::tcsetattr(0, libc::TCSANOW, &raw);
+                }
+                let ready = b"ready\n";
+                libc::write(1, ready.as_ptr().cast(), ready.len());
+                libc::sleep(1);
+                // Bounded: a `z` that never comes ends the child rather than the harness's wait.
+                libc::alarm(15);
+                let mut buf = [0u8; 4096];
+                let mut taken = 0u32;
+                'reading: loop {
+                    let n = libc::read(0, buf.as_mut_ptr().cast(), buf.len());
+                    if n <= 0 {
+                        break;
+                    }
+                    for byte in &buf[..n as usize] {
+                        if *byte == b'z' {
+                            break 'reading;
+                        }
+                        taken += 1;
+                    }
+                }
+                let mut said = *b"took=00000000 taken.\n";
+                let mut digit = 12;
+                while taken > 0 && digit > 4 {
+                    said[digit] = b'0' + (taken % 10) as u8;
+                    taken /= 10;
+                    digit -= 1;
+                }
+                libc::write(1, said.as_ptr().cast(), said.len());
+            }
+            libc::_exit(0)
+        }
+    }
+
     /// In a graphical cage, which never reads its input, the terminal is read whatever the flood, so
     /// a double Ctrl+C typed after it still force-quits; what does not fit is dropped, and said.
     #[test]
@@ -1722,6 +1820,20 @@ mod tests {
         });
     }
 
+    /// The relay run by [`a_child_that_reads_late_takes_all_that_was_typed`]; anywhere else it does
+    /// nothing. The child ends it, once it has said how much it took.
+    #[test]
+    #[ignore = "run alone by the test that floods it, on a terminal of that test's own"]
+    fn a_relay_under_a_child_that_reads_late() {
+        crate::testutil::when_run_alone(|_| {
+            // SAFETY: the child honours the async-signal-safe contract and never returns.
+            match unsafe { fork_with_pty(false, reads_late) } {
+                Ok(_) => Ok(()),
+                Err(e) => Err(io::Error::other(format!("the relay failed: {e:?}"))),
+            }
+        });
+    }
+
     /// The relay run by [`a_graphical_child_that_reads_nothing_can_still_be_force_quit`]; anywhere
     /// else it does nothing. The double Ctrl+C ends it with the child's code.
     #[test]
@@ -1980,6 +2092,70 @@ mod tests {
         let total = reader.join().expect("the reader");
         assert!(written.is_ok(), "the write gave up: {written:?}");
         assert!(total >= 65536, "the reader got {total} bytes");
+    }
+
+    /// A write that takes nothing and gives no reason is an error: tried again, it would spin. Run
+    /// alone, so a write that spins is ended by the harness's limit.
+    #[test]
+    fn a_write_that_takes_nothing_is_an_error() {
+        let ran = crate::testutil::run_within(
+            &mut crate::testutil::alone(
+                concat!(module_path!(), "::a_write_answered_with_nothing_taken"),
+                "",
+            ),
+            "the write that takes nothing",
+        );
+        assert!(
+            ran.ended_well(),
+            "the process ended with {}: {}{}",
+            ran.status,
+            ran.stdout,
+            ran.stderr
+        );
+    }
+
+    /// The write run by [`a_write_that_takes_nothing_is_an_error`]; anywhere else it does nothing.
+    /// A filter of this process's own answers every write to one pipe with zero bytes taken.
+    #[test]
+    #[ignore = "run alone by the test that reads how it ended, under a filter of its own"]
+    fn a_write_answered_with_nothing_taken() {
+        crate::testutil::when_run_alone(|_| {
+            use seccompiler::{
+                BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
+                SeccompFilter, SeccompRule,
+            };
+            use std::os::fd::AsRawFd as _;
+            let (_reader, writer) = io::pipe()?;
+            let fd = writer.as_raw_fd();
+            let to_it = SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                u64::try_from(fd).expect("a descriptor"),
+            )
+            .expect("a condition on the descriptor");
+            let rule = SeccompRule::new(vec![to_it]).expect("a rule of one condition");
+            let program: BpfProgram = SeccompFilter::new(
+                [(libc::SYS_write, vec![rule])].into_iter().collect(),
+                SeccompAction::Allow,
+                SeccompAction::Errno(0),
+                std::env::consts::ARCH
+                    .try_into()
+                    .expect("this architecture"),
+            )
+            .expect("a filter")
+            .try_into()
+            .expect("a program");
+            seccompiler::apply_filter(&program).expect("the filter is installed");
+            // SAFETY: `fd` is this test's own pipe end, and the byte a constant.
+            let taken = unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
+            assert_eq!(taken, 0, "the filter answers with nothing taken");
+            assert_eq!(
+                write_all(fd, b"x").map_err(|e| e.kind()),
+                Err(io::ErrorKind::WriteZero)
+            );
+            Ok(())
+        });
     }
 
     /// Both ends of the pty are close-on-exec as they are opened, and they are one terminal: what
