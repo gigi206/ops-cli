@@ -400,16 +400,20 @@ fn render_net_groups(
         }
         for e in entries {
             // The entry is config text and reaches a terminal here. A name cannot carry a control
-            // byte (the loader withholds a group whose name is not `[A-Za-z0-9._-]`), an entry can:
-            // the sibling path prints these through `warn_config`, which filters, and this one is
-            // the human render that did not.
-            let e = crate::sandbox::sanitize(e);
-            match net_group_entry_issue(&e) {
+            // byte (the loader withholds a group whose name is not `[A-Za-z0-9._-]`), an entry can,
+            // so what is printed is cleaned: the entry by `sanitize`, as `warn_config` cleans the
+            // resolver's warning about it, and the reason by `diag::visible_lines`, which keeps a
+            // regex parser's caret drawing on its lines. The verdict is read off the entry as
+            // authored, as the resolver and `--json` read it: the cleaned text has its control
+            // characters turned to spaces and is cut short, so it can classify the other way.
+            let shown = crate::sandbox::sanitize(e);
+            match net_group_entry_issue(e) {
                 None => {
-                    let _ = writeln!(o, "  {e}");
+                    let _ = writeln!(o, "  {shown}");
                 }
                 Some(issue) => {
-                    let _ = writeln!(o, "  {e}  {dim}({issue}){r}");
+                    let issue = diag::visible_lines(&issue);
+                    let _ = writeln!(o, "  {shown}  {dim}({issue}){r}");
                 }
             }
         }
@@ -507,6 +511,49 @@ mod tests {
 
         // Empty set: an explicit "none defined" line, not a blank output.
         assert!(render_net_groups(&BTreeMap::new(), &[], &p).contains("none defined"));
+    }
+
+    /// The flag beside an entry is the verdict the resolver and `--json` reach on the entry as
+    /// authored, not on the cleaned text the listing prints: that text has its control characters
+    /// turned to spaces and is cut short, and either can change how it classifies. What is printed
+    /// stays clean, the reason included, which quotes the authored entry back.
+    #[test]
+    fn an_entry_is_flagged_as_the_resolver_reads_it_and_printed_clean() {
+        use std::collections::BTreeMap;
+        // A tab the resolver refuses, which the cleaned text spells as a space it accepts.
+        let tab = "{GET}\thttps://tab.example".to_string();
+        // A valid regex longer than the cleaned text keeps: cut, its group is left open.
+        let long = format!("re:^https://long\\.example/({})$", "a".repeat(600));
+        // A malformed regex carrying a right-to-left override, which is no control character, so
+        // the classifier gets past that check and quotes the pattern in its reason.
+        let rlo = "re:^https://x\u{202e}.example/[".to_string();
+        for (entry, flagged) in [(&tab, true), (&long, false), (&rlo, true)] {
+            assert_eq!(net_group_entry_issue(entry).is_some(), flagged, "{entry}");
+        }
+        let groups: BTreeMap<String, Vec<String>> = [(
+            "ci".to_string(),
+            vec![tab.clone(), long.clone(), rlo.clone()],
+        )]
+        .into_iter()
+        .collect();
+
+        let out = render_net_groups(&groups, &["ci".to_string()], &style::Palette::plain());
+
+        let tab_line = out
+            .lines()
+            .find(|l| l.starts_with("  {GET} https://tab.example"))
+            .unwrap_or_else(|| panic!("the tab entry is listed:\n{out}"));
+        assert!(tab_line.contains("control characters"), "{out}");
+        let long_line = format!("  {}", crate::sandbox::sanitize(&long));
+        assert!(out.lines().any(|l| l == long_line), "{out}");
+        assert!(out.contains("unclosed character class"), "{out}");
+        let stray: Vec<char> = out
+            .chars()
+            .filter(|&c| {
+                (c.is_control() && c != '\n') || diag::reorders(c) || diag::separates_lines(c)
+            })
+            .collect();
+        assert!(stray.is_empty(), "{stray:?} reached the listing:\n{out}");
     }
 
     /// An exported fragment is an artifact whose whole purpose is to be handed back to `sbx net
