@@ -673,6 +673,33 @@ mod tests {
         );
     }
 
+    /// A filename is the cage's to choose, and Linux lets it carry a newline, an escape sequence, a
+    /// character that turns a line around or a line separator. [`push_rel`] blanks each before the
+    /// ring, and the readers downstream of it (the control wire, the record, `sbx fs logs`) print
+    /// the path as it arrives.
+    #[test]
+    fn a_name_the_cage_chose_reaches_the_ring_cleaned() {
+        let dir = TmpDir::new();
+        let root = dir.path().canonicalize().unwrap();
+        let ring = Arc::new(FsRing::new(100));
+        let _watcher = FsWatcher::start(&root, ring.clone()).unwrap();
+
+        let name = "evil\n\u{1b}[31mred\u{202e}txt.sh\u{2028}end";
+        std::fs::write(root.join(name), b"x").unwrap();
+        let cleaned = super::super::observe_feed::sanitize(name);
+        assert!(
+            wait_for(&ring, Duration::from_secs(3), |e| e.path == cleaned),
+            "the write was observed under its cleaned name {cleaned:?}"
+        );
+        let events = ring.snapshot(None).events;
+        assert!(
+            events
+                .iter()
+                .all(|e| !e.path.chars().any(super::super::observe_feed::blanked)),
+            "no event carries a character the feed blanks: {events:?}"
+        );
+    }
+
     #[test]
     fn a_git_write_is_filtered_but_a_nested_source_write_is_not() {
         let dir = TmpDir::new();
