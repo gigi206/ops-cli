@@ -1776,7 +1776,7 @@ fn app_show(args: &[OsString]) -> ExitCode {
 
     let view = match build_app_show(name, app, &resolved.network, &homes, layout.data_dir()) {
         Ok(view) => AppShow {
-            incomplete: config::undeclarable_app(&resolved, name),
+            refused: config::undeclarable_app(&resolved, name),
             ..view
         },
         Err(e) => {
@@ -1876,9 +1876,10 @@ struct AppShow {
     pools: Vec<AppMisePoolShow>,
     total_bytes: u64,
     packages: Vec<PackageShow>,
-    /// Why what the app declares cannot be told ([`config::undeclarable_app`]), when it cannot: the
-    /// packages above may not be all of them, and an orphan may be one it declares.
-    incomplete: Option<String>,
+    /// Why a launch of the app is refused, or its profile was not loaded
+    /// ([`config::undeclarable_app`]): the packages above may then not be all of them, and an
+    /// orphan may be one it declares.
+    refused: Option<String>,
     /// Installed mise tools that no declared package accounts for.
     orphans: Vec<OrphanTool>,
 }
@@ -2026,7 +2027,7 @@ fn build_app_show(
         pools,
         total_bytes,
         packages,
-        incomplete: None,
+        refused: None,
         orphans,
     })
 }
@@ -2197,8 +2198,8 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
     }
     // Packages, each `backend:locator` (the declaration syntax) with its realized state.
     if v.packages.is_empty() {
-        let none = if v.incomplete.is_some() {
-            "unknown"
+        let none = if v.refused.is_some() {
+            "none read"
         } else {
             "none declared"
         };
@@ -2219,14 +2220,14 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
             let _ = writeln!(s, "    {n}{}:{}{r}  {hue}{tag}{r}", p.backend, p.locator);
         }
     }
-    if let Some(why) = &v.incomplete {
-        let _ = writeln!(s, "  {warn}incomplete:{r} {}", diag::visible(why));
+    if let Some(why) = &v.refused {
+        let _ = writeln!(s, "  {warn}refused:{r}  {}", diag::visible(why));
     }
     // Installed mise tools no declared package accounts for — a leftover profile or a mise-pulled
     // dependency. Each `name` already carries the `mise:` backend prefix (see `build_app_show`), so
     // the provider reads like the `packages:` section above (`mise:pipx:demo-agent`).
     if !v.orphans.is_empty() {
-        let which = if v.incomplete.is_some() {
+        let which = if v.refused.is_some() {
             ""
         } else {
             " (undeclared)"
@@ -2640,8 +2641,8 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         // declared tool would read as undeclared. The sweep is left alone rather than run on that
         // reading, in the preview as with `--yes`, as `--stale` leaves a pool whose file it could
         // not read.
-        // An app whose profile is there and could not be loaded is missing from the configuration
-        // altogether, and would read as declaring nothing at all.
+        // An app whose profile is there and could not be loaded is missing from the configuration,
+        // or declared by the project alone, and would read as declaring less than it does.
         let refused = !resolved.refusals.is_empty()
             || crate::config::undeclarable_app(&resolved, app_name).is_some();
         let sweep = !reset && !refused;

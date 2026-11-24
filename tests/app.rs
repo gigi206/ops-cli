@@ -519,8 +519,8 @@ fn show_of_a_home_whose_profile_could_not_be_loaded_does_not_say_nothing_is_decl
     let out = fx.run_ok(&["app", "show", "broken"]);
     let shown = String::from_utf8_lossy(&out.stdout);
     assert!(
-        shown.contains("packages: unknown\n")
-            && shown.contains("incomplete: the profile of app `broken`")
+        shown.contains("packages: none read\n")
+            && shown.contains("refused:  app `broken` has a profile")
             && shown.contains("  installed:\n"),
         "{shown}"
     );
@@ -532,7 +532,7 @@ fn show_of_a_home_whose_profile_could_not_be_loaded_does_not_say_nothing_is_decl
 
     let doc = common::json_of(&fx.run_ok(&["app", "show", "broken", "--json"]));
     assert!(
-        doc["incomplete"]
+        doc["refused"]
             .as_str()
             .is_some_and(|why| why.contains("broken.toml")),
         "{doc}"
@@ -543,7 +543,7 @@ fn show_of_a_home_whose_profile_could_not_be_loaded_does_not_say_nothing_is_decl
     assert!(
         shown.contains("packages: none declared")
             && shown.contains("installed (undeclared):")
-            && !shown.contains("incomplete:"),
+            && !shown.contains("refused:"),
         "{shown}"
     );
 }
@@ -979,6 +979,41 @@ fn prune_leaves_alone_an_app_whose_profile_cannot_be_loaded() {
             "{args:?} pruned the tools of an app it could not read: {s}"
         );
     }
+}
+
+/// The same app, declared by the project too: what the project adds is not what the app declares,
+/// so its sweep is left alone, its launch is refused, and `app show` does not call what it declares
+/// known. The project writes no `cmd`, so none of this can stand up a cage.
+#[test]
+fn an_app_whose_profile_cannot_be_loaded_is_not_the_projects_to_declare() {
+    let fx = fixture_with_a_leftover();
+    fx.write_profile("demo-app", "cmd = \"demo\"\n\n[packages\n");
+    fx.write_project("[app.demo-app.env]\nX = \"1\"\n");
+
+    let out = fx.run(&["app", "prune", "demo-app", "--yes"]);
+    assert!(
+        !out.status.success() && fx.installs_dir("demo-app").join("aqua-demo-keep").is_dir(),
+        "prune took the tools of an app it could not read: {}",
+        text(&out)
+    );
+
+    let out = fx.run(&["app", "run", "demo-app"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(
+        err.contains("app `demo-app`: has a profile")
+            && err
+                .lines()
+                .any(|l| l.contains("ignoring profile") && l.contains("demo-app.toml")),
+        "the refusal names the profile, and the reason it was not loaded: {err}"
+    );
+
+    let shown = fx.run_ok(&["app", "show", "demo-app"]);
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        shown.contains("packages: none read") && shown.contains("refused:  app `demo-app` has"),
+        "{shown}"
+    );
 }
 
 /// An app whose bundle cannot be resolved is missing the tools the bundle declares, so its sweep is

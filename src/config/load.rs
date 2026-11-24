@@ -90,6 +90,7 @@ fn load_layers(
     // Carried out of the branches: a layer that exists and cannot be read is the one fact a launch
     // must weigh before standing anything up, and a single-source view never reads the other layer.
     let mut refusals = Vec::new();
+    let mut loaded_profiles = BTreeSet::new();
     let mut global = if source.includes_global() {
         let (mut global, why) = read_global(&mut warnings);
         if let Some(why) = why {
@@ -98,6 +99,7 @@ fn load_layers(
             ));
         }
         let profiles = read_profile_apps(&mut warnings);
+        loaded_profiles.extend(profiles.keys().cloned());
         merge_profile_apps(&mut global, profiles, &mut warnings);
         global
     } else {
@@ -211,6 +213,11 @@ fn load_layers(
     resolved.mise_ignored = mise_ignored;
 
     settle_bundles(&mut resolved, fold);
+    if source.includes_global()
+        && let Some(dir) = profiles_dir()
+    {
+        refuse_unloaded_profiles(&mut resolved, &loaded_profiles, &dir);
+    }
 
     // A review keeps the binds as declared ([`load_as`]): canonicalizing would drop a path that
     // does not exist yet, and a later launch, once it does, would mount it unreviewed.
@@ -999,25 +1006,56 @@ pub(crate) fn profile_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Why app `name`'s declaration cannot be told from `cfg`, when it cannot: a launch of the app is
-/// refused (a bundle it uses could not be resolved), or `cfg` has no such app while its profile is
-/// there, or cannot be looked at. The load drops a profile it cannot read or parse with a warning,
-/// so such an app reads as declaring nothing. `None` when `cfg` says what the app declares, which
-/// includes an app no file declares any more.
+/// refused (a bundle it uses could not be resolved, its profile could not be loaded), or `cfg` has
+/// no such app while its profile is there, or cannot be looked at. The load drops a profile it
+/// cannot read or parse with a warning, so such an app reads as declaring nothing. `None` when
+/// `cfg` says what the app declares, which includes an app no file declares any more.
 ///
 /// For a verb that removes what an app does not declare: it acts on `cfg` only when this is `None`.
 pub(crate) fn undeclarable_app(cfg: &super::Resolved, name: &str) -> Option<String> {
-    if let Some(app) = cfg.apps.get(name) {
-        return (!app.refusals.is_empty())
-            .then(|| format!("app `{name}` {}", app.refusals.join("; ")));
+    let why = match cfg.apps.get(name) {
+        Some(app) => (!app.refusals.is_empty()).then(|| app.refusals.join("; ")),
+        None => unloaded_profile(&profiles_dir()?, name),
+    };
+    why.map(|why| format!("app `{name}` {why}"))
+}
+
+/// Why the profile of an app no profile was loaded for may declare it all the same: its file is
+/// there under `dir`, or cannot be looked at. `None` when there is none.
+fn unloaded_profile(dir: &Path, name: &str) -> Option<String> {
+    if !is_valid_app_name(name) {
+        return None;
     }
-    let path = profile_path(name)?;
-    match std::fs::metadata(&path) {
+    let path = dir.join(format!("{name}.toml"));
+    // The link itself, not what it names: a dangling one is a profile that could not be loaded.
+    match std::fs::symlink_metadata(&path) {
         Ok(_) => Some(format!(
-            "the profile of app `{name}`, {}, is there and could not be loaded",
+            "has a profile, {}, that is there and could not be loaded",
             path.display()
         )),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => Some(format!("cannot read {}: {e}", path.display())),
+        Err(e) => Some(format!(
+            "may have a profile that could not be loaded: cannot read {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+/// Refuse the launch of each app of `resolved` whose profile under `dir` is not one of `loaded`.
+///
+/// The load drops a profile it cannot read or parse, and a project that names the same app then
+/// declares it alone: its `cmd`, trusted or not, is the app's, and the posture the profile set is
+/// the baseline's. The app is refused, as a configuration file that cannot be read refuses every
+/// launch, and what it declares is not told ([`undeclarable_app`]).
+fn refuse_unloaded_profiles(resolved: &mut Resolved, loaded: &BTreeSet<String>, dir: &Path) {
+    for (name, app) in &mut resolved.apps {
+        if !loaded.contains(name)
+            && let Some(why) = unloaded_profile(dir, name)
+        {
+            app.warnings
+                .push(format!("{why}, so a launch of this app stops"));
+            app.refusals.push(why);
+        }
     }
 }
 
@@ -2333,14 +2371,21 @@ pub(super) fn merge_profile_apps(
         .map(|d| d.display().to_string())
         .unwrap_or_else(|| format!("<config>/{PROFILES_DIR}"));
     for name in global.app.keys() {
-        // Two shapes of the forbidden state need different remedies. When a profile of the same name
-        // already exists it is the one that runs, so the inline block is pure dead weight — say to
-        // delete it. Otherwise the inline block carries the only definition, so point at `export` to
-        // migrate it to a profile before it is dropped.
+        // Three shapes of the forbidden state need different remedies. When a profile of the same
+        // name was loaded it is the one that runs, so the inline block is pure dead weight — say to
+        // delete it. When it is there and was not, it is what has to be fixed. Otherwise the inline
+        // block carries the only definition, so point at `export` to migrate it to a profile before
+        // it is dropped.
         let remedy = if profiles.contains_key(name) {
             format!(
                 "the profile {PROFILES_DIR}/{name}.toml already provides it — delete the inline \
                  [app.{name}] from {GLOBAL_CONFIG}"
+            )
+        } else if profiles_dir().is_some_and(|dir| unloaded_profile(&dir, name).is_some()) {
+            // Exporting would hand the file back as it is, and it would still not load.
+            format!(
+                "the profile {PROFILES_DIR}/{name}.toml could not be loaded — fix it, then delete \
+                 the inline [app.{name}] from {GLOBAL_CONFIG}"
             )
         } else {
             format!(
@@ -3185,6 +3230,104 @@ mod tests {
             warnings.iter().any(|w| w.contains("bad name.toml")),
             "a dropped unsafe-name profile must warn: {warnings:?}"
         );
+    }
+
+    /// A profile the load dropped leaves a project's table of the same name to declare the app
+    /// alone, its `cmd` included. The app's launch is refused, so what the project wrote does not
+    /// run in the profile's place, and what the app declares is not told. An app whose profile was
+    /// loaded, or that has none, is not refused, nor is any in the view of the project alone.
+    #[test]
+    fn an_app_is_refused_while_its_profile_could_not_be_loaded() {
+        let home = TmpDir::new();
+        let apps = home.path().join("sbx").join(PROFILES_DIR);
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(apps.join("broken.toml"), b"cmd = [\"mine\"\n").unwrap();
+        std::fs::write(apps.join("whole.toml"), b"cmd = [\"mine\"]\n").unwrap();
+        std::os::unix::fs::symlink(home.path().join("gone"), apps.join("dangling.toml")).unwrap();
+        let project = TmpDir::new();
+        let text = b"[app.broken]\ncmd = [\"theirs\"]\n\
+                     [app.dangling]\ncmd = [\"theirs\"]\n\
+                     [app.whole]\ncmd = [\"theirs\"]\n\
+                     [app.none]\ncmd = [\"theirs\"]\n";
+
+        let _lock = crate::testutil::env_lock();
+        let _cfg_home = crate::testutil::EnvVar::set("XDG_CONFIG_HOME", home.path());
+        let _data_home = crate::testutil::EnvVar::set("XDG_DATA_HOME", home.path());
+
+        for state in [TrustState::Untrusted, TrustState::Trusted] {
+            let cfg = load_as(project.path(), text, state).expect("the project parses");
+            let broken = &cfg.apps["broken"];
+            assert!(
+                broken.refusals.len() == 1 && broken.refusals[0].contains("broken.toml"),
+                "{state:?}: {:?}",
+                broken.refusals
+            );
+            assert!(
+                broken
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("broken.toml") && w.contains("a launch of this app stops")),
+                "{state:?}: {:?}",
+                broken.warnings
+            );
+            assert!(undeclarable_app(&cfg, "broken").is_some_and(|w| w.contains("broken.toml")));
+            let dangling = &cfg.apps["dangling"].refusals;
+            assert!(
+                dangling.len() == 1 && dangling[0].contains("dangling.toml"),
+                "{state:?}: {dangling:?}"
+            );
+            assert_eq!(undeclarable_apps(&cfg).len(), 2, "{state:?}");
+            for name in ["whole", "none"] {
+                assert_eq!(cfg.apps[name].refusals, Vec::<String>::new(), "{name}");
+                assert_eq!(undeclarable_app(&cfg, name), None);
+            }
+        }
+
+        let raw = schema::parse(text).expect("the project parses");
+        let alone = load_layers(
+            project.path(),
+            Source::Local,
+            Some((raw, TrustState::Trusted, trust::MiseInputs::default())),
+        );
+        assert!(alone.apps.values().all(|app| app.refusals.is_empty()));
+
+        // A profiles directory that cannot be looked into holds a profile for all anyone can say.
+        std::fs::remove_dir_all(&apps).unwrap();
+        std::fs::write(&apps, b"").unwrap();
+        let cfg = load_as(project.path(), text, TrustState::Trusted).expect("the project parses");
+        for (name, app) in &cfg.apps {
+            assert!(
+                app.refusals.iter().any(|w| w.contains("cannot read")),
+                "{name}: {:?}",
+                app.refusals
+            );
+        }
+    }
+
+    /// The inline block of an app whose profile is there and could not be loaded is told to fix
+    /// that profile: `sbx app export` hands the same file back, and deleting the block after it
+    /// would lose what the block declares. With no file there, the export is how it is migrated.
+    #[test]
+    fn an_inline_app_over_a_profile_that_could_not_be_loaded_is_told_to_fix_it() {
+        let home = TmpDir::new();
+        let apps = home.path().join("sbx").join(PROFILES_DIR);
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(apps.join("broken.toml"), b"cmd = [\"mine\"\n").unwrap();
+        let _lock = crate::testutil::env_lock();
+        let _cfg_home = crate::testutil::EnvVar::set("XDG_CONFIG_HOME", home.path());
+
+        for (name, export) in [("broken", false), ("fresh", true)] {
+            let mut global =
+                schema::parse(format!("[app.{name}]\ncmd = [\"inline\"]\n").as_bytes()).unwrap();
+            let mut warnings = Vec::new();
+            merge_profile_apps(&mut global, BTreeMap::new(), &mut warnings);
+            assert!(
+                warnings.len() == 1
+                    && warnings[0].contains("sbx app export") == export
+                    && warnings[0].contains("could not be loaded — fix it") != export,
+                "{name}: {warnings:?}"
+            );
+        }
     }
 
     #[test]

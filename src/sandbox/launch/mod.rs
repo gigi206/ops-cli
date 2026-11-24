@@ -627,6 +627,7 @@ pub(crate) fn app(
     // a restriction one of its layers wrote could not be applied, and the app would run without
     // it. Only this app stops; the others and `sbx run` launch as they did.
     if !app.refusals.is_empty() {
+        warn_before_refusal(&pc.cfg.warnings);
         for why in &app.refusals {
             crate::diag::error(&format!("sbx: app `{name}`: {why}"));
         }

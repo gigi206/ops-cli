@@ -440,8 +440,9 @@ report a built package `not installed`.
 
 A name nothing declares is refused with the apps that are declared, after the warnings the
 configuration was read with: an app whose profile cannot be read or parsed is not declared, and
-the warning says why. When such an app has a home, `show` reports the home, gives its packages as
-`unknown`, and says on an `incomplete:` line (`incomplete` in `--json`) what could not be read.
+the warning says why. When such an app has a home, `show` reports it and says that no package was
+read. Why a launch of the app is refused, or its profile could not be loaded, is on a `refused:`
+line (`refused` in `--json`).
 
 ### What a home is made of
 
@@ -533,8 +534,8 @@ while the configuration cannot be read whole**: a config file that exists and ca
 read declares no tool at all, a bundle the app uses and that cannot be found leaves out the
 tools it carries, a project changed since it was approved waits for its re-approval, and an
 app whose profile is there but could not be loaded, or whose profiles directory cannot be
-read, is missing from the configuration altogether. Every declared tool would otherwise read
-as undeclared. The preview and `--yes` both name the
+read, is missing from the configuration, or holds only what the project adds to it. Every declared
+tool would otherwise read as undeclared. The preview and `--yes` both name the
 reason and the apps left alone, and exit non-zero; under `--all` the apps whose own
 configuration reads whole are still swept. `--stale`, `--drop` and `--reset` read the home
 rather than the configuration, and go on.

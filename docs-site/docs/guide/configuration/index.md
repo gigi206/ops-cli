@@ -140,7 +140,9 @@ than letting it run without what the file says, and so does a project changed si
 re-approved. The global config carries `[proc]`, `[network]` and `[fs]`, whose built-in
 defaults are the permissive end of each; a project's `.sbx.toml` may be what closed its
 paths or narrowed its network, and the layers below it are not what it wrote. That holds
-for a project you have not trusted too, since its `[fs]` applies without trust.
+for a project you have not trusted too, since its `[fs]` applies without trust. An app
+profile that is there and cannot be loaded stops that app alone, even when the project
+declares an app of the same name: what the project wrote does not run in its place.
 Read-only commands such as `sbx config show` still work, set the file aside, and say
 why.
 
