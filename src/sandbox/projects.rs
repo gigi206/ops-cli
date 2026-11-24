@@ -1009,7 +1009,7 @@ pub(crate) fn projects_rm(
                     let next = if live_ids.is_some() {
                         format!(
                             "{h}sbx projects rm:{r} {n}{id}{r} removable ({}) — \
-                             run `sbx projects rm {id}` (without `--dry-run`) to remove.",
+                             run `sbx projects rm {id}` on its own to remove it.",
                             super::gc::human_bytes(bytes)
                         )
                     } else {

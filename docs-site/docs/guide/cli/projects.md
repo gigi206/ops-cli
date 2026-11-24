@@ -112,7 +112,8 @@ than a tree, see [`sbx app show`](app).
 A named `rm <id>` removes **immediately**: you named it, so it is not an accident; pass
 `--dry-run` to preview first. An id that is a path rather than a tree's name (`../x`, `/etc`)
 is a usage error (exit 2), and it stops the whole batch before any tree goes. The bulk selectors `--dead` and `--markerless` **preview by
-default** and require `--yes` to apply, since they act on more than one tree at once.
+default** and require `--yes` to apply, since they act on more than one tree at once. An id
+named beside one of them previews with the sweep, and `--yes` applies both.
 
 Two trees are always protected:
 

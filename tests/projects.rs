@@ -815,6 +815,28 @@ fn gc_all_leaves_a_distribution_tree_alone_when_the_registry_cannot_be_read() {
     );
 }
 
+/// An id named beside a bulk selector previews with the sweep, and every preview of a named id points
+/// at the command that removes it on its own. The pointer said "(without `--dry-run`)", a flag
+/// nobody typed when the preview came from `--dead` or `--markerless`.
+#[test]
+fn a_named_id_previewed_points_at_its_own_removal() {
+    let fx = Project::new("projects");
+    let dir = fx.make_tree("1234567890abcdef", Some(fx.proj.path()));
+    let mut wrong = Vec::new();
+    for flag in ["--dead", "--markerless", "--dry-run"] {
+        let out = fx.run(&["projects", "rm", "1234567890abcdef", flag]);
+        let said = text(&out);
+        if !out.status.success() || !dir.exists() {
+            wrong.push(format!("{flag}: not a preview:\n{said}"));
+        } else if !said.contains("run `sbx projects rm 1234567890abcdef` on its own to remove it") {
+            wrong.push(format!("{flag}: no pointer at the removal alone:\n{said}"));
+        } else if flag != "--dry-run" && said.contains("--dry-run") {
+            wrong.push(format!("{flag}: names a flag nobody typed:\n{said}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn rm_dead_previews_by_default_and_reaps_with_yes() {
     let fx = Project::new("projects");
