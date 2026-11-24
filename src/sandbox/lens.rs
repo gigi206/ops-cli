@@ -1112,7 +1112,7 @@ mod tests {
         derefs.sort();
         assert_eq!(
             derefs,
-            ["src/sandbox/fs_control.rs", "src/sandbox/signer_control.rs",],
+            ["src/sandbox/fs_control.rs"],
             "the lens rings that still hand out the ring underneath"
         );
     }
