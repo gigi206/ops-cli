@@ -4213,6 +4213,54 @@ fn the_shim_refuses_to_run_a_payload_with_no_supervisor() {
     );
 }
 
+/// A supervisor the shim cannot reach is reported by the reason its connect gave: no socket at the
+/// path, a socket nobody listens on any more and a path that runs through a file are three
+/// different faults, and an answer that named none of them would leave each to be guessed at.
+#[test]
+fn the_shim_names_why_it_could_not_reach_its_supervisor() {
+    need_host_programs!("/bin/touch");
+    let dir = TmpDir::new();
+    let shim = materialized_shim(&dir);
+    let file = dir.join("f");
+    std::fs::write(&file, b"").expect("write the file the third path runs through");
+    let stale = dir.join("gone.sock");
+    // Bound, then dropped: the socket file stays, and nothing listens behind it.
+    drop(UnixListener::bind(&stale).expect("bind the socket left behind"));
+    let forms = [
+        ("nothing at the path", dir.join("none.sock"), libc::ENOENT),
+        ("a socket nobody listens on", stale, libc::ECONNREFUSED),
+        ("a path through a file", file.join("s.sock"), libc::ENOTDIR),
+    ];
+
+    let mut failures = Vec::new();
+    for (form, sock, errno) in forms {
+        let marker = dir.join("the-payload-ran");
+        let out = spawn_shim(
+            std::process::Command::new(&shim)
+                .arg(&sock)
+                .arg("--")
+                .arg("/bin/touch")
+                .arg(&marker)
+                .stderr(std::process::Stdio::piped()),
+        )
+        .wait_with_output()
+        .expect("wait for the shim");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let named = format!("(os error {errno})");
+        if out.status.code() != Some(96) || !stderr.contains(&named) || marker.exists() {
+            failures.push(format!(
+                "{form}: exit {:?}, payload ran: {}, stderr {stderr:?}, expected {named}",
+                out.status.code(),
+                marker.exists()
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "an unreachable supervisor must be refused with its cause named: {failures:#?}"
+    );
+}
+
 /// The pieces a [`Deciding`] borrows, owned by the caller so the context has something to point
 /// at. Only the policy is left out: it is what each test below varies.
 struct DecidingParts {

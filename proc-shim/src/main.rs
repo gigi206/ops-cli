@@ -303,19 +303,23 @@ fn install_notif_filter(open_lens: bool) -> io::Result<libc::c_int> {
 
 /// Connect to the host supervisor's socket and send it the listener fd via `SCM_RIGHTS`. Retries the
 /// connect briefly (the supervisor binds before the cage launches, so this normally succeeds at once).
+///
+/// A connect that never succeeds is answered with the error its last attempt gave: no socket at the
+/// path, a socket nobody listens on and a path that cannot reach one are different faults, and only
+/// that error says which.
 fn hand_off(sock: &OsStr, notif_fd: libc::c_int) -> io::Result<()> {
-    let mut stream = None;
-    for _ in 0..200 {
+    const ATTEMPTS: u32 = 200;
+    let mut attempt = 1;
+    loop {
         match UnixStream::connect(Path::new(sock)) {
-            Ok(s) => {
-                stream = Some(s);
-                break;
+            Ok(stream) => return send_fd(&stream, notif_fd),
+            Err(e) if attempt == ATTEMPTS => return Err(e),
+            Err(_) => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(5));
             }
-            Err(_) => std::thread::sleep(Duration::from_millis(5)),
         }
     }
-    let stream = stream.ok_or_else(|| io::Error::other("supervisor socket never accepted"))?;
-    send_fd(&stream, notif_fd)
 }
 
 /// A control buffer for exactly one `SCM_RIGHTS` cmsg, **aligned for a `cmsghdr`**.
