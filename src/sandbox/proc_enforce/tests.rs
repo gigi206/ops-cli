@@ -4224,8 +4224,7 @@ fn the_shim_names_why_it_could_not_reach_its_supervisor() {
     let file = dir.join("f");
     std::fs::write(&file, b"").expect("write the file the third path runs through");
     let stale = dir.join("gone.sock");
-    // Bound, then dropped: the socket file stays, and nothing listens behind it.
-    drop(UnixListener::bind(&stale).expect("bind the socket left behind"));
+    crate::testutil::leave_stale_socket(&stale);
     let forms = [
         ("nothing at the path", dir.join("none.sock"), libc::ENOENT),
         ("a socket nobody listens on", stale, libc::ECONNREFUSED),

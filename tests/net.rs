@@ -3656,7 +3656,7 @@ fn follow_against(
     stand_ins: Vec<FollowStandIn>,
 ) -> (String, String, Vec<Vec<String>>) {
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::process::Stdio;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -3670,6 +3670,12 @@ fn follow_against(
         let asked = Arc::new(Mutex::new(Vec::<String>::new()));
         if s.replies.is_empty() {
             drop(listener);
+            // A child a neighbouring test forked may hold a copy until it execs, which takes a
+            // connect for as long as it does.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while UnixStream::connect(&socket).is_ok() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             return (std::thread::spawn(|| {}), asked);
         }
         let seen = Arc::clone(&asked);

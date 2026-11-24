@@ -236,6 +236,22 @@ pub(crate) fn once_forks_let_go(mut settled: impl FnMut() -> bool) {
     }
 }
 
+/// Leave at `path` the socket of a server that is gone: the name stays, and a connect to it is
+/// refused.
+pub(crate) fn leave_stale_socket(path: &Path) {
+    match std::os::unix::net::UnixListener::bind(path) {
+        Ok(listener) => drop(listener),
+        Err(e) => panic!("cannot bind {}: {e}", path.display()),
+    }
+    once_refused(path);
+}
+
+/// Wait for a connect to the closed listener at `path` to be refused: a copy a neighbour's fork
+/// holds ([`FORK_WINDOW`]) takes one for as long as it lives.
+fn once_refused(path: &Path) {
+    once_forks_let_go(|| std::os::unix::net::UnixStream::connect(path).is_err());
+}
+
 /// A program's standard error that tries each thing a relayed diagnostic can do to the line it is
 /// shown on: break it, return over it, drive the terminal with an escape and a title-setting
 /// sequence, and reorder it with a right-to-left override.
@@ -290,7 +306,7 @@ pub(crate) fn reap(pid: libc::pid_t) -> libc::c_int {
 /// The names the next `count` stagings of `path` would take
 /// ([`crate::sandbox::atomicfile::temp_sibling`]), spelled here rather than asked of the code that
 /// builds them. A span of them, because the sequence number is the process's, shared with whatever
-/// else stages a file while a test runs.
+/// else stages a file while a test runs. The name of `path` is one a temp carries whole.
 pub(crate) fn next_temp_names(path: &Path, count: u64) -> impl Iterator<Item = PathBuf> {
     let dir = path
         .parent()
@@ -301,6 +317,7 @@ pub(crate) fn next_temp_names(path: &Path, count: u64) -> impl Iterator<Item = P
         .and_then(|n| n.to_str())
         .expect("a UTF-8 file name")
         .to_string();
+    assert!(name.len() <= 200, "a name a temp cuts: {name}");
     let next = crate::sandbox::atomicfile::unique() + 1;
     (next..next + count).map(move |n| dir.join(format!(".{name}.tmp.{}.{n}", std::process::id())))
 }
@@ -2059,6 +2076,31 @@ mod helper_tests {
         reap(std::process::id() as libc::pid_t);
     }
 
+    /// A listener closed here that a fork still holds a copy of takes a connect until the copy is
+    /// gone, and is waited for.
+    #[test]
+    fn a_closed_listener_a_fork_still_holds_is_waited_for() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let dir = TmpDir::new();
+        let sock = dir.join("held");
+        let listener = UnixListener::bind(&sock).unwrap();
+        // The copy a child holds from its fork to its exec.
+        let copy = listener.try_clone().unwrap();
+        drop(listener);
+        assert!(
+            UnixStream::connect(&sock).is_ok(),
+            "the copy takes a connect"
+        );
+        let held = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(copy);
+        });
+        once_refused(&sock);
+        let refused = UnixStream::connect(&sock).map(drop).map_err(|e| e.kind());
+        held.join().unwrap();
+        assert_eq!(refused, Err(std::io::ErrorKind::ConnectionRefused));
+    }
+
     /// A socket name that refuses a connect is waited past until a listener takes one, and a server
     /// that is gone is not waited on for the whole bound. A socket left at the name with nothing
     /// listening refuses a connect as a server's does between its `bind` and its `listen`.
@@ -2068,7 +2110,7 @@ mod helper_tests {
         use std::time::{Duration, Instant};
         let dir = TmpDir::new();
         let sock = dir.join("server");
-        drop(UnixListener::bind(&sock).unwrap());
+        leave_stale_socket(&sock);
         let serving_after = Duration::from_millis(300);
         let server = {
             let sock = sock.clone();

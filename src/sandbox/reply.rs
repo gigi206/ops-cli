@@ -191,7 +191,7 @@ mod tests {
             .expect_err("nothing is there");
         assert!(!unanswered(&missing), "{missing}");
         let stale = dir.join("stale.sock");
-        drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind"));
+        crate::testutil::leave_stale_socket(&stale);
         let gone = std::os::unix::net::UnixStream::connect(&stale).expect_err("nobody serves it");
         assert_eq!(gone.kind(), io::ErrorKind::ConnectionRefused, "{gone}");
         assert!(!unanswered(&gone));
@@ -223,11 +223,34 @@ mod tests {
         );
     }
 
+    /// A listener at `socket`, in place of the one an earlier case left there.
+    fn listen(socket: &std::path::Path) -> std::os::unix::net::UnixListener {
+        match std::fs::remove_file(socket) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                panic!("cannot remove {}: {e}", socket.display())
+            }
+            _ => {}
+        }
+        std::os::unix::net::UnixListener::bind(socket)
+            .unwrap_or_else(|e| panic!("cannot bind {}: {e}", socket.display()))
+    }
+
+    /// Wait for a server's thread to end, which it does once its one connection came: a reader that
+    /// never connects fails the test, rather than leaving it waiting for good.
+    fn ended(server: std::thread::JoinHandle<()>) {
+        crate::testutil::returns_within(
+            std::time::Duration::from_secs(30),
+            "a server whose reader was to connect",
+            move || server.join(),
+        )
+        .expect("the server thread");
+    }
+
     /// Bind `socket`, take one connection, read its command line and answer it with `wire`, then
     /// close: a server whose answer is exactly those bytes.
     fn answer_once(socket: &std::path::Path, wire: &'static [u8]) -> std::thread::JoinHandle<()> {
         use std::io::Write;
-        let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
+        let listener = listen(socket);
         std::thread::spawn(move || {
             if let Ok((mut conn, _)) = listener.accept() {
                 let mut command = String::new();
@@ -240,7 +263,7 @@ mod tests {
     /// Bind `socket`, take one connection and close it without reading a byte of it: what the peer
     /// check and the connection ceiling do with a peer they refuse.
     fn refuse_once(socket: &std::path::Path) -> std::thread::JoinHandle<()> {
-        let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
+        let listener = listen(socket);
         std::thread::spawn(move || drop(listener.accept()))
     }
 
@@ -298,10 +321,9 @@ mod tests {
                 ("closed unanswered", &b""[..], Some(false)),
             ] {
                 let socket = dir.join("answer.sock");
-                let _ = std::fs::remove_file(&socket);
                 let server = answer_once(&socket, wire);
                 let read = reader(&socket);
-                server.join().expect("the server thread");
+                ended(server);
                 let cut = read.as_ref().err().is_some_and(unanswered);
                 match whole {
                     Some(true) => assert!(read.is_ok(), "{name}, {shape}: {read:?}"),
@@ -310,10 +332,9 @@ mod tests {
                 }
             }
             let socket = dir.join("answer.sock");
-            let _ = std::fs::remove_file(&socket);
             let server = refuse_once(&socket);
             let read = reader(&socket);
-            server.join().expect("the server thread");
+            ended(server);
             assert!(
                 read.as_ref().err().is_some_and(unanswered),
                 "{name}, refused before its command was read: {read:?}"
@@ -332,10 +353,9 @@ mod tests {
             (&b"err bad-request\n"[..], true),
             (&b""[..], false),
         ] {
-            let _ = std::fs::remove_file(&socket);
             let server = answer_once(&socket, wire);
             let read = control::query_manual(&data_dir, 4242).map(drop);
-            server.join().expect("the server thread");
+            ended(server);
             if wire.starts_with(b"err ") {
                 assert!(
                     read.as_ref().is_err_and(|e| !unanswered(e)),
@@ -345,10 +365,9 @@ mod tests {
                 assert_eq!(read.is_ok(), whole, "egress RULES: {read:?}");
             }
 
-            let _ = std::fs::remove_file(&socket);
             let server = answer_once(&socket, wire);
             let listed = control::list_all_within(&data_dir, std::time::Duration::from_secs(5));
-            server.join().expect("the server thread");
+            ended(server);
             assert_eq!(listed.read.len(), usize::from(whole), "egress LIST");
             assert_eq!(
                 listed

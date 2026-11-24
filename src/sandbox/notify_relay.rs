@@ -1990,7 +1990,7 @@ mod tests {
         use std::os::unix::net::UnixListener;
         let dir = crate::testutil::TmpDir::new();
         let sock = dir.join("bus");
-        drop(UnixListener::bind(&sock).unwrap());
+        crate::testutil::leave_stale_socket(&sock);
         let relay = NotifyRelay::start_on(
             sock.clone(),
             Some(address_of(&dir.join("host"))),
@@ -2038,7 +2038,7 @@ mod tests {
             let sock = dir.join("bus");
             let _private = UnixListener::bind(&sock)?;
             let host = dir.join("host");
-            drop(UnixListener::bind(&host)?);
+            crate::testutil::leave_stale_socket(&host);
             let relay = NotifyRelay::start_on(sock, Some(address_of(&host)), Default::default());
             let started = Instant::now();
             while !relay
