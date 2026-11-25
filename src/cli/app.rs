@@ -1775,10 +1775,15 @@ fn app_show(args: &[OsString]) -> ExitCode {
     let app = resolved.apps.get(name);
 
     let view = match build_app_show(name, app, &resolved.network, &homes, layout.data_dir()) {
-        Ok(view) => AppShow {
-            refused: config::undeclarable_app(&resolved, name),
-            ..view
-        },
+        Ok(view) => {
+            // The whole configuration's refusals and the app's: either may hide what it declares.
+            let mut why = resolved.refusals.clone();
+            why.extend(config::undeclarable_app(&resolved, name));
+            AppShow {
+                refused: (!why.is_empty()).then(|| why.join("; ")),
+                ..view
+            }
+        }
         Err(e) => {
             diag::error(&format!(
                 "sbx: app show: {e}, so what '{name}' holds there cannot be shown"
@@ -1876,9 +1881,10 @@ struct AppShow {
     pools: Vec<AppMisePoolShow>,
     total_bytes: u64,
     packages: Vec<PackageShow>,
-    /// Why a launch of the app is refused, or its profile was not loaded
-    /// ([`config::undeclarable_app`]): the packages above may then not be all of them, and an
-    /// orphan may be one it declares.
+    /// Why a launch of the app is refused, by the configuration as a whole
+    /// ([`config::Resolved::refusals`]) or for the app itself ([`config::undeclarable_app`]), its
+    /// profile not loaded included: the packages above may then not be all of them, and an orphan
+    /// may be one it declares.
     refused: Option<String>,
     /// Installed mise tools that no declared package accounts for.
     orphans: Vec<OrphanTool>,

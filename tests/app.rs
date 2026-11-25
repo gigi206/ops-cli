@@ -546,6 +546,17 @@ fn show_of_a_home_whose_profile_could_not_be_loaded_does_not_say_nothing_is_decl
             && !shown.contains("refused:"),
         "{shown}"
     );
+
+    // Nor is it known while the project's own file cannot be read, which may declare the app.
+    fx.write_project("[app.removed]\ncmd = [\"true\"\n");
+    let shown = fx.run_ok(&["app", "show", "removed"]);
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        shown.contains("packages: none read\n")
+            && shown.contains("refused:  the project config exists but cannot be read")
+            && shown.contains("  installed:\n"),
+        "{shown}"
+    );
 }
 
 /// An app a trusted layer defines with no command, and an untrusted project gives one, is refused
