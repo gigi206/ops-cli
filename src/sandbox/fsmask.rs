@@ -8267,6 +8267,27 @@ mod tests {
             2,
             "one per entry, deny and readonly: {covered:?}"
         );
+
+        // An entry that names several covered paths is told of once for each field.
+        let e = expand(
+            &root,
+            &policy(&["certs/", "certs/*.pem"], &["certs/*.pem"]),
+            &[],
+            None,
+        );
+        let covered: Vec<&str> = e
+            .warnings
+            .iter()
+            .filter(|w| w.contains("already covered"))
+            .filter_map(|w| w.split_once(" is already").map(|(entry, _)| entry))
+            .collect();
+        assert_eq!(
+            covered,
+            [
+                "`[fs] deny` entry `certs/*.pem`",
+                "`[fs] readonly` entry `certs/*.pem`"
+            ]
+        );
     }
 
     #[test]
@@ -9015,24 +9036,56 @@ mod tests {
         assert!(parse_git_index_entries(&long(INDEX_PATH_MAX + 1), SHA1_LEN).is_none());
     }
 
+    /// A version 2 git index listing `paths`.
+    fn index_listing(paths: &[&str]) -> Vec<u8> {
+        let mut data = b"DIRC".to_vec();
+        data.extend_from_slice(&2u32.to_be_bytes());
+        data.extend_from_slice(&(paths.len() as u32).to_be_bytes());
+        for path in paths {
+            let mut e = vec![0u8; 60];
+            e.extend_from_slice(&(path.len() as u16).to_be_bytes());
+            e.extend_from_slice(path.as_bytes());
+            e.push(0);
+            while !e.len().is_multiple_of(8) {
+                e.push(0);
+            }
+            data.extend(e);
+        }
+        data
+    }
+
+    /// A masked directory is named when git tracks a file under it, and not for a file whose path
+    /// only begins as the directory's does, or sorts after it.
+    #[test]
+    fn a_masked_directory_is_named_only_when_git_tracks_a_file_under_it() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        let git = root.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        for (tracked, named) in [
+            (&["certs.txt", "certs/client.pem", "zz"][..], true),
+            (&["certs.txt", "certs0", "zz"], false),
+            (&["a"], false),
+        ] {
+            std::fs::write(git.join("index"), index_listing(tracked)).unwrap();
+            let warned = expand(&root, &policy(&["certs/"], &[]), &[], None).warnings;
+            assert_eq!(
+                warned
+                    .iter()
+                    .any(|w| w.contains("update-index --skip-worktree certs`")),
+                named,
+                "{tracked:?}: {warned:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_git_tracked_mask_warns_with_the_command_that_fixes_it() {
         let tmp = TmpDir::new();
         let root = project(&tmp);
         let git = root.join(".git");
         std::fs::create_dir_all(&git).unwrap();
-        let mut data = b"DIRC".to_vec();
-        data.extend_from_slice(&2u32.to_be_bytes());
-        data.extend_from_slice(&1u32.to_be_bytes());
-        let mut e = vec![0u8; 60];
-        e.extend_from_slice(&8u16.to_be_bytes());
-        e.extend_from_slice(b"prod.key");
-        e.push(0);
-        while !e.len().is_multiple_of(8) {
-            e.push(0);
-        }
-        data.extend(e);
-        std::fs::write(git.join("index"), &data).unwrap();
+        std::fs::write(git.join("index"), index_listing(&["prod.key"])).unwrap();
 
         let warned = expand(&root, &policy(&["prod.key"], &[]), &[], None).warnings;
         assert!(
